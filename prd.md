@@ -1,6 +1,6 @@
 # agent-compose — Product Requirements Document
 
-**Status:** Draft v0.5
+**Status:** Draft v0.8
 **Author:** moldy
 **Last updated:** 2026-08-14
 
@@ -159,7 +159,7 @@ Rules and guarantees:
 - **Sink routes and `detach`**: routes may target non-compute sinks (queues, webhooks, ticketing — this is how agent graphs talk to non-agent infrastructure). Default join semantics wait on *all* routes, including sinks (a failed enqueue is a surfaced failure). Per-route `detach: true` opts into fire-and-forget; detached routes cannot write to reduced state (compile error). **Replay interaction (settled)**: the design is idempotency-key delivery — an `idempotency_key` derived from `execution_id + node + item_index` is passed to the sink automatically, and sinks are documented to dedupe on it. The v0 implementation restricts: `detach` + checkpointing enabled is a validation error pointing at the roadmap (outbox-pattern delivery is not v0 work).
 - **`route_by` is a literal discriminator field in v0**, not an arbitrary CEL expression — this keeps exhaustiveness checking decidable and the agent's contract legible in its schema. CEL-routed maps are a possible later escape hatch that forfeits exhaustiveness (mandatory `default:`).
 - **Codegen**: one construct — the compiled router emits `Send(routes[item.kind], item)` per item onto LangGraph's `Send` API; reducer channels get standard LangGraph reducers; superstep semantics provide the join. Heterogeneous is homogeneous with a lookup table.
-- **Placement synergy**: map instances are the natural unit for `runtime: isolated` (5.8) — one worker per sandbox with zero change to the logical definition.
+- **Placement synergy**: map instances are the natural unit for `runtime: isolated` (5.10) — one worker per sandbox with zero change to the logical definition.
 
 ### 5.7 State — three tiers
 
@@ -169,14 +169,107 @@ Rules and guarantees:
 
 **Data-edge syntax (settled): deferred.** Full explicit data edges are not in v0. Instead, a per-node `writes:` remapping (`writes: { summary: reviewer_summary }`) covers the two real failure modes of name-based wiring — channel collisions between nodes and renames across subgraph boundaries — at a fraction of the grammar cost. Full data edges remain an additive later feature if demand appears.
 
-Persistence (`storage:` section) targets LangGraph checkpointers (Postgres for durable/distributed). Novelty opportunity: the literature consistently punts on cross-session memory and datastores — this is a differentiation area post-v0.
+Persistence of *execution state* targets LangGraph checkpointers (Postgres for durable/distributed). Durable *attachable* storage — the cross-session memory and datastore story the literature punts on — is first-class: see 5.8.
 
-### 5.8 Cloud & distribution — placement annotations, not distributed edges
+### 5.8 Attachable storage — stores as first-class components
+
+Graph state (5.7) is execution state. **Stores** are durable, attachable storage resources — the concrete answer to cross-session memory and datastores, which the surveyed prior art uniformly defers.
+
+```yaml
+store.user_prefs:
+  kind: kv
+  value_schema: { theme: { type: string }, verbosity: { enum: [low, high] } }
+  scope: session
+
+store.docs:
+  kind: vector
+  embed: { model: text-embedding-3-small }
+  metadata_schema: { source: { type: string } }
+  scope: global
+```
+
+- **Address scheme**: new `store.*` namespace; def/use split as everywhere else. Kinds in v0: `kv`, `vector`, `blob`. Relational/SQL is deliberately excluded — it drags query-language semantics into the spec; a `function` node wrapping a DB client is the escape hatch.
+- **Two consumption modes** (mirrors tool vs function, 5.5):
+  1. *Agent-attached* — `stores: [store.docs]` on an agent def; codegen synthesizes LLM-facing tools from the store's schema (`docs_search`, `user_prefs_get/set`). Nondeterministic, agent-invoked, recorded as tool calls.
+  2. *Store-op nodes* — `{ store: store.user_prefs, op: get, key: state.user_id }`. Deterministic, graph-invoked (load context before an agent, persist after). Same definition, two usage surfaces, surface-specific validation.
+- **Scope**: `execution` (dies with the run) | `session` (persists across executions sharing a session key) | `global`. **Triggers supply session identity**: a trigger may declare `session_key: <CEL over payload>`; all session-scoped stores — and conversation history — key off it. Cross-session memory = session-scoped store + trigger-supplied session key, declaratively.
+- **Backend binding (settled — alias-only)**: a store optionally declares `backend: <alias>` — a bare string naming an abstract slot, never provider config. All physical configuration lives in the per-target deploy layer:
+
+  ```yaml
+  # stores/docs.yml — logical, env-invariant
+  store.docs:
+    kind: vector
+    scope: global
+    embed: { model: text-embedding-3-small }
+    backend: docs_db            # abstract alias; omit to use the kind default
+
+  # deploy/staging.yml                 # deploy/prod.yml
+  storage_backends:                    storage_backends:
+    defaults:                            defaults:
+      kv: { provider: redis, url: ${REDIS_URL} }
+    aliases:                             aliases:
+      docs_db:                             docs_db:
+        provider: chroma                     provider: pgvector
+        url: ${CHROMA_URL}                   url: ${DOCS_DB_URL}
+  ```
+
+  - **Resolution**: explicit alias → per-kind `defaults:` → target built-in. `--target local` substitutes SQLite/local disk for every store unconditionally — the zero-infra guarantee.
+  - **Per-target invariant**: `--target <name>` loads `deploy/<name>.yml`. Only the deploy layer (storage_backends, placements, event_sources) forks per environment; `agents/`, `flows/`, `stores/`, `tools/` never do. Terraform-workspace discipline: env differences live in one layer.
+  - **Compile-time validation**: provider config blocks are checked against provider-published schemas; an alias referenced by a store but undefined in the active target is a compile error naming the target; capability checks (e.g. `vector` store → vector-capable provider) apply at the alias definition. Provider config takes `${ENV_VAR}` references only — the spec never contains credentials (syntax checked at `validate`; presence checked at `build`/`serve`).
+  - Rejected alternatives, for the record: address-keyed override maps in deploy.yml (action-at-a-distance) and inline provider config on stores (bakes env-specific choices into logical files, forking them per environment).
+- **Replay discipline**: store ops are effects (activities). Reads are recorded — replay consumes history, not the live store. Writes are at-least-once with idempotency keys derived from `execution_id + node + item_index` — the third application of the **execution-derived idempotency key** principle (detach sinks 5.6, event dedupe 5.11), now a named cross-cutting rule.
+- **Compile checks**: schema-checked ops against `value_schema`/`metadata_schema`; store writes inside a `map` require an item-derived key or a keyed `kv` write — unkeyed blob/global writes from concurrent instances are a validation error; `session`-scoped store usage in a flow with no session-keyed trigger is a validation error.
+
+### 5.9 Providers & models — LLM configuration as first-class components
+
+Two namespaces with the usual def/use split, because the layers change for different reasons: **`provider.*`** holds *connection* (kind, base_url, key ref), **`model.*`** holds *behavior* (model id + settings). Agents reference only `model.*`; swapping a project from hosted to local inference is a one-line provider edit.
+
+```yaml
+# providers.yml
+provider.anthropic:
+  kind: anthropic                  # plugin: anthropic | openai | openai_compatible | bedrock | ...
+  api_key: ${ANTHROPIC_API_KEY}
+
+provider.local:
+  kind: openai_compatible          # ollama, vllm, proxies
+  base_url: ${LOCAL_LLM_URL}
+  api_key: ${LOCAL_LLM_KEY}
+
+# models.yml
+model.smart:
+  provider: provider.anthropic
+  id: claude-sonnet-4-6
+  settings:                        # validated against the provider plugin's schema
+    max_tokens: 8000
+    thinking: { budget_tokens: 4000 }
+
+model.fast:
+  provider: provider.anthropic
+  id: claude-haiku-4-5
+  settings: { temperature: 0.2 }
+
+model.default:
+  route: [model.smart, model.fast]   # ordered fallback
+  route_on: [rate_limit, overloaded, timeout]
+```
+
+- **Provider-specific settings**: each provider `kind` plugin publishes a settings schema; `settings:` blocks are compile-checked against it (`thinking:` on an OpenAI provider → validation error at the model def). Same mechanism as storage provider config (5.8).
+- **Capability checking**: agents require structured output (5.2), so every referenced model's provider must declare structured-output/tool-use capability — an agent bound to a model that cannot honor the contract is a compile error.
+- **Routes**: a `model.*` is either a direct binding or an ordered `route:` with `route_on:` failure conditions (rate limit, overload, timeout). Failover is deterministic runtime behavior recorded in the trace ("served by model.fast, fallback #1"). Route members are validated for capability equivalence so a fallback cannot silently break structured output. Content-based routing is explicitly out of scope — that is what graph edges are for.
+- **No inline settings overrides on agents** — the backends lesson (5.8): one binding form. Different settings ⇒ define another named model. Every LLM configuration in a project stays greppable in one file; codegen stays deterministic.
+- **Providers are logical-layer, not per-target**: unlike storage backends, providers rarely differ structurally per environment (same Anthropic everywhere; keys/URLs vary via env refs). The alias mechanism exists to extend if a real case appears; not pre-built.
+
+**Secrets** (extends the credentials rule of 5.8):
+- Config takes `${ENV_VAR}` references only, never literals. **Env refs survive into the IR unresolved** — resolution happens at process start in generated code, never at compile — so the flat IR stays committable/diffable and generated Python never contains a key.
+- `validate` checks ref syntax; `build`/`serve`/`run` check presence and fail fast naming the missing variable.
+- **Least-privilege distribution**: under `--target distributed` (5.10), an isolated node's deployment receives only the env vars its resolved providers/backends reference — computable statically from the IR, since every secret is a named ref. Blast-radius containment for keys falls out of the design.
+
+### 5.10 Cloud & distribution — placement annotations, not distributed edges
 
 Logical definition and placement are orthogonal (Kubernetes/Terraform lesson):
 
 ```yaml
-# deploy.yml
+# deploy/<target>.yml — selected by --target <name>; see 5.8 per-target invariant
 placements:
   agent.researcher:
     runtime: isolated      # own instance/container; sandbox, creds, network policy
@@ -190,7 +283,7 @@ placements:
 - Isolation is also a **security** feature (per-agent sandboxing, credentials, blast-radius containment for tool-wielding agents) — a declarative story no current framework has.
 - v0: `placements` is parsed and validated but **no-op**.
 
-### 5.9 Invocation & triggers — how executions come to exist
+### 5.11 Invocation & triggers — how executions come to exist
 
 The logical graph defines *what runs*; **triggers** define *what causes an execution to exist*. A trigger is a (source, input binding, response mode) tuple declared in a `triggers:` section. This generalizes `entrypoint`: a project may declare multiple triggers targeting different flows — the entrypoints of a project are exactly the flows that triggers point at.
 
@@ -227,7 +320,7 @@ Rules and semantics:
 - **`respond: sync` (settled)**: sync is a compile-time-constrained mode. A flow exposed via `respond: sync` must be **statically interrupt-free** — no `human` node reachable from its entry, no wait-style constructs — enforced by graph reachability analysis (same static machinery as SCC and exhaustiveness). Sync triggers require a `timeout:` (default 60s); on expiry the response **upgrades to async** (HTTP 202 + execution id + status URL) while the execution continues durably — nothing cancelled, no work lost. Node retries consume the timeout budget with no special casing.
 - **Codegen**: `manual` → the `run` CLI; `http` → a generated FastAPI app wrapping the compiled graph (start / resume / status routes), reusing the same generated Pydantic models for payload validation. Auth on `http` triggers is deliberately out of scope for v0 (deploy behind your own gateway); a declarative auth story belongs with `placements` in M3.
 
-### 5.10 Compiler contract
+### 5.12 Compiler contract
 
 - **Generated code is a build artifact, never hand-edited.** The DSL is the single source of truth.
 - **Deterministic codegen**: same DSL → byte-identical output (stable ordering), so regeneration diffs are meaningful.
@@ -240,11 +333,13 @@ Rules and semantics:
 # main.yml
 version: "0.1"
 imports:
+  - providers.yml
+  - models.yml
   - agents/researcher.yml
   - agents/reviewer.yml
   - tools/web_search.yml
   - flows/review_loop.yml
-  - triggers.yml            # see 5.9 — entrypoints are the flows triggers target
+  - triggers.yml            # see 5.11 — entrypoints are the flows triggers target
 
 state:
   draft: { type: string }
@@ -252,7 +347,7 @@ state:
 
 # agents/reviewer.yml
 agent.reviewer:
-  model: { provider: anthropic, id: claude-sonnet-4-6 }
+  model: model.smart              # see 5.9 — no inline provider/settings
   tools: [tool.web_search]
   output:
     verdict: { enum: [approve, revise] }
@@ -280,13 +375,13 @@ Validator guarantees for this file: all refs resolve and are correctly typed; `v
 ## 7. Milestones
 
 **M0 — Spec & validator (the product's core loop)**
-- Grammar spec + published JSON Schema (editor autocomplete/validation for free). Grammar includes `human` nodes, `writes:` remaps, `context: inherit`, `triggers` (manual/http active; schedule/event reserved), and `placements` (parsed; no-op).
+- Grammar spec + published JSON Schema (editor autocomplete/validation for free). Grammar includes `human` nodes, `writes:` remaps, `context: inherit`, `triggers` (manual/http active; schedule/event reserved), `store.*` definitions with both usage surfaces, `provider.*`/`model.*` definitions with routes, and `placements` (parsed; no-op).
 - Parser → resolver (imports, address scheme) → flat IR.
-- Static checks: reference/type resolution, schema compatibility across edges, routing exhaustiveness (edges and map variants), SCC cycle-termination, fan-out bounding, reducer-channel write rules inside maps, trigger input-binding compatibility, sync-trigger interrupt-free reachability, unreachable nodes, undefined state channels.
+- Static checks: reference/type resolution, schema compatibility across edges, routing exhaustiveness (edges and map variants), SCC cycle-termination, fan-out bounding, reducer-channel write rules inside maps, trigger input-binding compatibility, sync-trigger interrupt-free reachability, store-op schema checks and map-write keying, session-scope/session-key coherence, provider settings-schema and capability checks, route capability equivalence, env-ref syntax, unreachable nodes, undefined state channels.
 - `agent-compose validate` with precise, actionable error messages. Error UX is a feature, not polish — it is the coding-agent feedback loop.
 
 **M1 — Codegen (single process)**
-- IR → deterministic LangGraph Python: state models (incl. tagged unions), node fns, routers with embedded CEL, bounded cycles, homogeneous + discriminator-routed `map`→`Send` with index-tagged reducers, subgraphs, retry/timeout policy.
+- IR → deterministic LangGraph Python: state models (incl. tagged unions), node fns, routers with embedded CEL, bounded cycles, homogeneous + discriminator-routed `map`→`Send` with index-tagged reducers, subgraphs, retry/timeout policy, store-op nodes + synthesized store tools with SQLite/local-disk backends, model routing with trace-recorded failover, env-ref presence checks at process start.
 - `agent-compose build`, `agent-compose run` (manual trigger), `agent-compose serve` (generated FastAPI app for http triggers: start/resume/status), golden-file codegen tests.
 
 **M2 — Ergonomics**
@@ -298,6 +393,8 @@ Validator guarantees for this file: all refs resolve and are correctly typed; `v
 - `--target distributed` via `RemoteGraph`; execute `placements`.
 - Postgres checkpointer wiring; isolation/credential story per placement.
 - Execute `schedule` and `event` triggers; declarative auth for `http` triggers.
+- Production `storage_backends` (Redis, pgvector, S3) behind the store plugin interface.
+- Least-privilege env distribution: isolated deployments receive only statically-referenced secrets.
 
 ## 8. Risks
 
@@ -319,8 +416,10 @@ Formerly open, now settled — rationale lives in the referenced sections:
 4. **Human-in-the-loop** → `human` node type in v0 grammar; runtime may land M2 (5.5).
 5. **Spec versioning** → required `version:` field; semver on the spec; compiler declares a supported range; breaking changes gated behind a major bump + `agent-compose migrate` codemod; old syntax is never silently reinterpreted — refuse and point at the migration. Pre-1.0, minor bumps may break with a migration provided.
 6. **`detach` under durable execution** → idempotency-key design, v0 restriction (5.6).
-7. **`event` backend abstraction** → pluggable consumer interface, backend-agnostic grammar via `event_sources:`, at-least-once + inbound dedupe, one blessed reference backend in M3 (5.9).
-8. **`respond: sync` semantics** → compile-time interrupt-free requirement + mandatory timeout with async upgrade (202 + execution id) (5.9).
+7. **`event` backend abstraction** → pluggable consumer interface, backend-agnostic grammar via `event_sources:`, at-least-once + inbound dedupe, one blessed reference backend in M3 (5.11).
+8. **`respond: sync` semantics** → compile-time interrupt-free requirement + mandatory timeout with async upgrade (202 + execution id) (5.11).
+9. **Store backend binding** → alias-only: stores name abstract slots; per-target deploy files define them; no inline provider config, no address-keyed overrides (5.8).
+10. **LLM providers & models** → `provider.*` (connection) / `model.*` (behavior) split; schema-validated provider settings; ordered failover routes on infrastructure conditions only; no inline overrides on agents; env-ref-only secrets surviving unresolved into the IR (5.9).
 
 ## 10. Open Questions
 
