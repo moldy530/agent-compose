@@ -105,7 +105,7 @@ The spec never contains executable code (Agent Spec's security posture). Code lo
 2. **First-class control constructs** in YAML: guarded edges, bounded loops, `map` fan-out, `when` guards.
 3. **Escape hatches**: `exec`, `http`, `function` — implementation outside the spec, referenced by identifier.
 
-CEL implementation choice (v0): the compiler parses and type-checks expressions with the Rust CEL implementation (`cel` crate); generated routers embed a JS CEL evaluator rather than transpiling CEL→TS. Two interpreters means a semantic-drift risk between `validate` and runtime — mitigated by a shared conformance fixture corpus run against both in CI (§8). Transpilation is a later optimization.
+CEL implementation choice (v0): the compiler parses and type-checks expressions with the Rust CEL implementation (`cel` crate); generated routers embed a JS CEL evaluator rather than transpiling CEL→TS. Two interpreters means a semantic-drift risk between `validate` and runtime — mitigated by a shared conformance fixture corpus run against both in CI. Transpilation is a later optimization.
 
 ### 5.6 Fan-out — agent-controlled cardinality, deterministic dispatch
 
@@ -384,7 +384,7 @@ Validator guarantees for this file: all refs resolve and are correctly typed; `v
 **M1 — Codegen (single process)**
 - IR → deterministic LangGraph TypeScript: state models (incl. tagged unions via Zod), node fns, routers with embedded CEL, bounded cycles, homogeneous + discriminator-routed `map`→`Send` with index-tagged reducers, subgraphs, retry/timeout policy, store-op nodes + synthesized store tools with SQLite/local-disk backends, model routing with trace-recorded failover, env-ref presence checks at process start.
 - `agent-compose build`, `agent-compose run` (manual trigger), `agent-compose serve` (generated Fastify app for http triggers: start/resume/status), golden-file codegen tests.
-- Mock provider server + e2e harness (§8): compiled graphs execute end-to-end in CI with scripted model responses, no API keys.
+- Mock provider server + e2e harness: compiled graphs execute end-to-end in CI with scripted model responses, no API keys.
 
 **M2 — Ergonomics**
 - `agent-compose plan` (topology + validation diff between two specs).
@@ -398,18 +398,7 @@ Validator guarantees for this file: all refs resolve and are correctly typed; `v
 - Production `storage_backends` (Redis, pgvector, S3) behind the store plugin interface.
 - Least-privilege env distribution: isolated deployments receive only statically-referenced secrets.
 
-## 8. Testing & validation strategy
-
-Validation must be strong enough that milestone work is machine-checkable end-to-end: the project is built to be worked on autonomously over long stretches, so "CI green" has to mean "actually done" — no manual verification gates.
-
-- **Compiler unit + snapshot tests (M0)**: every static check gets positive and negative fixture specs; parser/resolver output is locked with IR snapshot tests. The invalid-spec corpus asserts on exact error messages — error UX is a feature (G3), and a regression in an error message is a test failure.
-- **Golden-file codegen tests (M1)**: same DSL in → byte-identical TypeScript out; goldens are reviewed in PRs like any other code.
-- **Generated-code checks (M1)**: every golden fixture must type-check (`tsc`) and construct its graph under the pinned LangGraph version.
-- **CEL conformance corpus**: shared fixtures (expression + input + expected result) executed against both the Rust validator's interpreter and the JS evaluator embedded in generated code (5.5). Divergence fails CI.
-- **Mock provider server (M1)**: e2e without API keys. A local server implementing the provider wire surface, with a control endpoint to enqueue scripted responses per model ("next call to `model.smart` returns this structured output"). Compiled graphs then run for real — triggers, routing, cycles, fan-out joins, store ops, and model failover (scripted rate-limit responses) — deterministically in CI. This is the primary acceptance harness from M1 onward.
-- **Milestone acceptance is a test suite**: each milestone defines its acceptance criteria as runnable tests before implementation of that milestone begins.
-
-## 9. Risks
+## 8. Risks
 
 | Risk | Mitigation |
 |---|---|
@@ -420,7 +409,7 @@ Validation must be strong enough that milestone work is machine-checkable end-to
 | CEL semantic drift between Rust validator and JS runtime | Shared conformance corpus run against both interpreters in CI; both implementations pinned per compiler release |
 | Scope creep toward bespoke runtime | Hard non-goal; LangGraph owns execution |
 
-## 10. Resolved Questions (log)
+## 9. Resolved Questions (log)
 
 Formerly open, now settled — rationale lives in the referenced sections:
 
@@ -435,13 +424,13 @@ Formerly open, now settled — rationale lives in the referenced sections:
 9. **Store backend binding** → alias-only: stores name abstract slots; per-target deploy files define them; no inline provider config, no address-keyed overrides (5.8).
 10. **LLM providers & models** → `provider.*` (connection) / `model.*` (behavior) split; schema-validated provider settings; ordered failover routes on infrastructure conditions only; no inline overrides on agents; env-ref-only secrets surviving unresolved into the IR (5.9).
 11. **Codegen target** → LangGraph TypeScript first; a Python backend is a possible v2 target (§4, 5.12).
-12. **Compiler implementation** → Rust single-binary CLI (parse/resolve/validate/codegen); CEL via the Rust `cel` crate at validate time and a JS evaluator at runtime, kept in lockstep by a shared conformance corpus (5.5, 5.12, §8).
+12. **Compiler implementation** → Rust single-binary CLI (parse/resolve/validate/codegen); CEL via the Rust `cel` crate at validate time and a JS evaluator at runtime, kept in lockstep by a shared conformance corpus (5.5, 5.12).
 
-## 11. Open Questions
+## 10. Open Questions
 
-_None. New questions raised during grammar/spec work land here and must be resolved (moved to §10) before implementation of the affected area begins._
+_None. New questions raised during grammar/spec work land here and must be resolved (moved to §9) before implementation of the affected area begins._
 
-## 12. References
+## 11. References
 
 - Oracle, *Open Agent Specification* — arXiv 2510.04173
 - Daunis (PayPal), *A Declarative Language for Building And Orchestrating LLM-Powered Agent Workflows* — arXiv 2512.19769
