@@ -1,0 +1,19 @@
+# rule: a map is homogeneous (`node:`) XOR discriminator-routed (`route_by:` + `routes:`), never both (grammar 8.6 / PRD 5.6)
+flow.work:
+  outputs:
+    done: { type: boolean }
+  nodes:
+    plan:
+      agent: agent.planner
+    fan:
+      map:
+        over: plan.output.tasks
+        node: agent.worker
+        route_by: kind
+        routes:
+          auto_fixable: { node: agent.fixer }
+        max_concurrency: 4
+  edges:
+    - { from: start, to: plan }
+    - { from: plan, to: fan }
+    - { from: fan, to: end }

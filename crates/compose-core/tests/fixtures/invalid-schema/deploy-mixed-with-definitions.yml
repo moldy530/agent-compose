@@ -1,0 +1,10 @@
+# rule: spec files and deploy files are disjoint - only the deploy layer forks per target (grammar 1.2 / PRD 5.8)
+version: "0.1"
+placements:
+  agent.fixer:
+    runtime: isolated
+agent.fixer:
+  model: model.fast
+  prompt: Fix the finding.
+  output:
+    patch: { type: string }

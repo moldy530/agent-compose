@@ -1,0 +1,19 @@
+# A sink: how an agent graph talks to non-agent infrastructure (PRD 5.6). The
+# default join waits on sink routes too, so a failed enqueue is a surfaced
+# failure rather than silent data loss.
+tool.review_queue:
+  description: Enqueue a finding for manual review and return the ticket id.
+  input:
+    summary: { type: string }
+    severity: { enum: [low, high, critical] }
+  output:
+    ticket_id: { type: string }
+  http:
+    method: POST
+    url: "https://${QUEUE_HOST}/v1/tickets"
+    headers:
+      authorization: "Bearer ${QUEUE_TOKEN}"
+    body:
+      summary: "input.summary"
+      severity: "input.severity"
+    expect_status: [201]

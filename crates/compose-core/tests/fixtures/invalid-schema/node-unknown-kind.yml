@@ -1,0 +1,10 @@
+# rule: a node carries exactly one kind key from agent | exec | http | function | flow | map | human | store (grammar 7.1 / PRD 5.5)
+flow.simple:
+  outputs:
+    done: { type: boolean }
+  nodes:
+    think:
+      llm: agent.reviewer
+  edges:
+    - { from: start, to: think }
+    - { from: think, to: end }

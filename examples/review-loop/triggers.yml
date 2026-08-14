@@ -1,0 +1,20 @@
+# The entrypoints of a project are exactly the flows its triggers point at
+# (PRD 5.11). There is no `entrypoint:` key.
+triggers:
+  # Implicit for every flow with an input schema; shown for clarity. A manual
+  # trigger declares no `input:` — CLI arguments are validated directly against
+  # the flow's input schema (grammar 13.2).
+  cli:
+    type: manual
+    flow: flow.review_loop
+
+  on_request:
+    type: http
+    flow: flow.review_loop
+    path: /review
+    method: POST
+    input:
+      goal: "payload.body.goal"
+    session_key: "payload.headers['x-session-id']"
+    respond: async
+    callback: "payload.body.callback_url"

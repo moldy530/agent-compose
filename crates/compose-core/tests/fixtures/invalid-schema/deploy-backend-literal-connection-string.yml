@@ -1,0 +1,7 @@
+# rule: connection strings in the deploy layer take ${ENV_VAR} references only (grammar 4.3 / PRD 5.8)
+version: "0.1"
+storage_backends:
+  defaults:
+    kv:
+      provider: redis
+      url: "redis://cache.internal:6379"

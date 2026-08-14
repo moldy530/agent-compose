@@ -1,0 +1,4 @@
+# rule: credentials take ${ENV_VAR} references only, never literals (grammar 4.3 / PRD 5.9)
+provider.anthropic:
+  kind: anthropic
+  api_key: sk-ant-not-a-real-key

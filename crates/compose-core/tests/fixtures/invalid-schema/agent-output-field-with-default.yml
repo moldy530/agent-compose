@@ -1,0 +1,8 @@
+# rule: `default:` is illegal in a result schema - a defaulted model output would manufacture routing values (grammar 3.6 / PRD 5.3)
+agent.reviewer:
+  model: model.smart
+  prompt: Review the draft and return a verdict.
+  output:
+    verdict:
+      enum: [approve, revise]
+      default: approve

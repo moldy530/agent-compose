@@ -1,0 +1,10 @@
+# rule: a flow MUST declare `outputs:` - its I/O surface is interchangeable with a tool's (grammar 7 / PRD 5.1)
+flow.review_loop:
+  inputs:
+    goal: { type: string }
+  nodes:
+    write:
+      agent: agent.researcher
+  edges:
+    - { from: start, to: write }
+    - { from: write, to: end }

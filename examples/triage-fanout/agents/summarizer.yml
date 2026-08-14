@@ -1,0 +1,16 @@
+agent.summarizer:
+  description: Summarizes a completed triage run for a human reviewer.
+  model: model.fast
+  prompt: |
+    Summarize the triage run in at most five sentences: what was fixed
+    automatically, what needs a human, and any risk you noticed.
+  input:
+    report: { type: string }
+    patches:
+      type: array
+      items: { type: string }
+  output:
+    summary:
+      description: The run summary shown to the human reviewer.
+      type: string
+      min_length: 1

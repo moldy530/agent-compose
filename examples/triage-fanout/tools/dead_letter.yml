@@ -1,0 +1,20 @@
+# Target of the map's `default:` route. Used with `detach: true`, so the join
+# does not wait on it and it may not write reduced state. Detached dispatches
+# receive an idempotency key derived from execution_id + node + item_index; the
+# v0 restriction is that `detach` requires checkpointing to be disabled
+# (PRD 5.6), which is the case for this project's local target.
+tool.dead_letter:
+  description: Record an unroutable finding for later inspection.
+  input:
+    kind: { type: string }
+    payload: { type: string }
+  output:
+    accepted: { type: boolean }
+  http:
+    method: POST
+    url: "https://${QUEUE_HOST}/v1/dead-letter"
+    headers:
+      authorization: "Bearer ${QUEUE_TOKEN}"
+    body:
+      kind: "input.kind"
+      payload: "input.payload"

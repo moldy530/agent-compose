@@ -1,0 +1,6 @@
+# rule: references are typed - `model:` takes a model.* address, not a provider.* one (grammar 2.3 / PRD 5.1)
+agent.reviewer:
+  model: provider.anthropic
+  prompt: Review the draft and return a verdict.
+  output:
+    verdict: { enum: [approve, revise] }

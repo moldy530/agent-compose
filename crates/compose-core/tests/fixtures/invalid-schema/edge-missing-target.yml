@@ -1,0 +1,10 @@
+# rule: an edge MUST declare both `from:` and `to:` (grammar 7.2)
+flow.simple:
+  outputs:
+    done: { type: boolean }
+  nodes:
+    write:
+      agent: agent.researcher
+  edges:
+    - { from: start, to: write }
+    - { from: write }

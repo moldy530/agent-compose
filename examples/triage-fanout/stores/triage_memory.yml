@@ -1,0 +1,15 @@
+# Store-op consumption surface (PRD 5.8): read and written by graph nodes in
+# flow.triage. Session scope means every trigger targeting that flow must supply
+# a `session_key:` — cross-session memory, declaratively.
+store.triage_memory:
+  kind: kv
+  scope: session
+  description: What this session has already triaged.
+  value_schema:
+    last_report:
+      description: The most recent report triaged in this session.
+      type: string
+    patch_count:
+      description: How many patches the last run produced.
+      type: integer
+      minimum: 0

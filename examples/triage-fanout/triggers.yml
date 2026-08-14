@@ -1,0 +1,43 @@
+triggers:
+  # Session-scoped stores need a session identity; the CLI supplies it as
+  # `--session <key>`, exposed to the binding as payload.session (PRD 5.8).
+  cli:
+    type: manual
+    flow: flow.triage
+    session_key: "payload.session"
+
+  on_report:
+    type: http
+    flow: flow.triage
+    path: /reports
+    method: POST
+    input:
+      report: "payload.body.report"
+      pattern: "payload.body.pattern"
+    session_key: "payload.body.project"
+    respond: async
+    callback: "payload.body.callback_url"
+
+  # RESERVED grammar (grammar 13.4): parsed, type-checked, and carried into the
+  # IR; nothing schedules an execution in v0.
+  nightly:
+    type: schedule
+    flow: flow.triage
+    cron: "0 3 * * *"
+    timezone: UTC
+    input:
+      report: "'nightly sweep'"
+      pattern: "'TODO|FIXME'"
+    session_key: "'nightly'"
+
+  # RESERVED grammar (grammar 13.5): the trigger names a logical source; the
+  # deploy layer binds it to infrastructure under `event_sources:`.
+  ingest:
+    type: event
+    flow: flow.triage
+    source: bug_reports
+    input:
+      report: "payload.body.text"
+      pattern: "payload.body.pattern"
+    session_key: "payload.body.project"
+    dedupe_key: "payload.id"

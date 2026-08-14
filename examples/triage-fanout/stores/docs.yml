@@ -1,0 +1,18 @@
+# Agent-attached consumption surface (PRD 5.8): listing this store in
+# agent.triage's `stores:` synthesizes an LLM-facing `docs_search` tool.
+# `agent_access: read` withholds the write tool.
+#
+# `backend:` names an abstract slot only. All physical configuration lives in
+# deploy/<target>.yml, so this file never forks per environment.
+store.docs:
+  kind: vector
+  scope: global
+  description: Project documentation, chunked, for grounding triage decisions.
+  embed:
+    model: text-embedding-3-small
+    dimensions: 1536
+  metadata_schema:
+    source: { type: string }
+    updated_at: { type: string, format: date-time }
+  backend: docs_db
+  agent_access: read

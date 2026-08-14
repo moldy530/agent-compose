@@ -1,0 +1,9 @@
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+
+# Same graph, local inference: only the connection layer changes (PRD 5.9).
+provider.local:
+  kind: openai_compatible
+  base_url: ${LOCAL_LLM_URL}
+  api_key: ${LOCAL_LLM_KEY}

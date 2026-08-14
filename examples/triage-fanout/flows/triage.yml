@@ -1,0 +1,155 @@
+flow.triage:
+  description: Triage a bug report, fan out fixes, and get a human sign-off.
+  inputs:
+    report:
+      description: The raw bug report.
+      type: string
+      min_length: 1
+    pattern:
+      description: Repository search pattern used to ground the triage agent.
+      type: string
+  outputs:
+    summary:
+      type: string
+    patches:
+      type: array
+      max_items: 200
+      items: { type: string }
+
+  nodes:
+    # Subgraph instantiation with explicit bindings and an instantiation-site
+    # policy override — the highest level of the resolution chain (grammar 9.3).
+    enrich:
+      flow: flow.enrich
+      input:
+        report: "input.report"
+      context: isolated
+      policy:
+        timeout: 30s
+        on_error: fail
+
+    # A tool definition invoked deterministically as a graph node.
+    scan:
+      function: tool.repo_grep
+      input:
+        pattern: "input.pattern"
+        max_matches: "25"
+
+    classify:
+      agent: agent.triage
+      input:
+        report: "state.report_normalized"
+        matches: "state.matches"
+
+    # Heterogeneous fan-out. Bounding is mandatory on both axes: `max_items` on
+    # the source array (agent.triage) and `max_concurrency` here (PRD 5.6).
+    # Every variant is routed — auto_fixable and needs_human explicitly,
+    # duplicate through `default:` — so no item can be unroutable.
+    dispatch:
+      map:
+        over: classify.output.findings
+        as: finding
+        route_by: kind
+        max_concurrency: 8
+        on_item_error: skip
+        routes:
+          auto_fixable:
+            node: agent.fixer
+            max_concurrency: 4
+            input:
+              file: "finding.file"
+              patch_hint: "finding.patch_hint"
+            writes:
+              patch: patches
+          needs_human:
+            node: tool.review_queue
+            input:
+              summary: "finding.summary"
+              severity: "finding.severity"
+        default:
+          node: tool.dead_letter
+          detach: true
+          input:
+            kind: "finding.kind"
+            payload: "finding.of"
+
+    # Inline subprocess step. The bound input object is passed to the child as
+    # environment variables (grammar 8.2 / PRD 5.5).
+    verify:
+      exec:
+        command: run-checks
+        args: ["--fast"]
+        cwd: "${REPO_ROOT}"
+        env:
+          CI: "true"
+        output:
+          exit_code: { type: integer }
+          stdout: { type: string }
+      input:
+        patches: "state.patches"
+      timeout: 5m
+      on_error: skip
+
+    summarize:
+      agent: agent.summarizer
+      input:
+        report: "state.report_normalized"
+        patches: "state.patches"
+
+    # Store-op node: deterministic, graph-invoked, schema-checked against the
+    # store's value_schema. Session-scoped, so every trigger targeting this flow
+    # supplies a session_key (PRD 5.8, 5.11).
+    remember:
+      store: store.triage_memory
+      op: set
+      key: "execution.session_key"
+      value:
+        last_report: "input.report"
+        patch_count: "size(state.patches)"
+      on_error: skip
+
+    # Human-in-the-loop pause. The output is routable structured output like any
+    # other, and resume payloads are validated against it (PRD 5.11).
+    approve:
+      human:
+        input:
+          summary: { type: string }
+          patch_count: { type: integer }
+        output:
+          decision: { enum: [approve, reject] }
+          note: { type: string }
+        timeout: 24h
+        on_timeout: escalate
+      input:
+        summary: "state.summary"
+        patch_count: "size(state.patches)"
+      writes:
+        decision: human_decision
+
+    escalate:
+      http:
+        method: POST
+        url: "https://${QUEUE_HOST}/v1/escalations"
+        headers:
+          authorization: "Bearer ${QUEUE_TOKEN}"
+        body:
+          summary: "state.summary"
+        output:
+          status: { type: integer }
+      timeout: 10s
+      retry: { max: 3, backoff: 1s }
+
+  edges:
+    - { from: start, to: enrich }
+    - { from: enrich, to: scan }
+    - { from: scan, to: classify }
+    - { from: classify, to: dispatch }
+    # The downstream edge is the fan-out barrier: it fires when every dispatched
+    # instance has completed or been resolved by `on_item_error`.
+    - { from: dispatch, to: verify }
+    - { from: verify, to: summarize }
+    - { from: summarize, to: remember }
+    - { from: remember, to: approve }
+    - { from: approve, to: end, when: "approve.output.decision == 'approve'" }
+    - { from: approve, to: escalate, when: "approve.output.decision == 'reject'" }
+    - { from: escalate, to: end }

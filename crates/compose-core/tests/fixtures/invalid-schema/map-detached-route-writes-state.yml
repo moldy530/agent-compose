@@ -1,0 +1,22 @@
+# rule: a detached (fire-and-forget) route may not write reduced state (grammar 8.6 / PRD 5.6)
+flow.work:
+  outputs:
+    done: { type: boolean }
+  nodes:
+    plan:
+      agent: agent.planner
+    fan:
+      map:
+        over: plan.output.findings
+        route_by: kind
+        max_concurrency: 4
+        routes:
+          needs_human:
+            node: tool.review_queue
+            detach: true
+            writes:
+              ticket_id: tickets
+  edges:
+    - { from: start, to: plan }
+    - { from: plan, to: fan }
+    - { from: fan, to: end }

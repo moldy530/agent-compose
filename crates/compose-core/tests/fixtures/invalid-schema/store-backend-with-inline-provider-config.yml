@@ -1,0 +1,9 @@
+# rule: `backend:` names an abstract alias only - physical provider config lives in the deploy layer (grammar 11.3 / PRD 5.8)
+store.docs:
+  kind: vector
+  scope: global
+  embed:
+    model: text-embedding-3-small
+  backend:
+    provider: chroma
+    url: ${CHROMA_URL}

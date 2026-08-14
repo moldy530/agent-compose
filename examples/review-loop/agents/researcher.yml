@@ -1,0 +1,26 @@
+# Every agent declares a structured output (PRD 5.2): it is what makes routing
+# decidable and every edge serializable.
+agent.researcher:
+  description: Writes and revises a draft until it satisfies the goal.
+  model: model.default
+  prompt: |
+    You are a research writer. Produce a single self-contained draft that
+    satisfies the goal.
+
+    If feedback from a previous review is present, treat every point in it as a
+    required change and rewrite the draft accordingly. Never return an unchanged
+    draft when feedback is present.
+  tools: [tool.web_search]
+  input:
+    goal:
+      description: What the draft must accomplish.
+      type: string
+    feedback:
+      description: Reviewer feedback from the previous pass; empty on the first pass.
+      type: string
+      default: ""
+  output:
+    draft:
+      description: The complete draft, in Markdown.
+      type: string
+      min_length: 1

@@ -1,0 +1,28 @@
+# An `exec` binding used as a `function` node in flow.triage: graph-invoked,
+# deterministic, arguments checked against this signature (PRD 5.5).
+# Object inputs are passed as environment variables; stdout is decoded as JSON
+# against `output`.
+tool.repo_grep:
+  description: Search the repository for a pattern and return matching lines.
+  input:
+    pattern:
+      description: An RE2 regular expression.
+      type: string
+      min_length: 1
+    max_matches:
+      type: integer
+      minimum: 1
+      maximum: 200
+      default: 50
+  output:
+    matches:
+      description: Matching lines, formatted as path:line:text.
+      type: array
+      max_items: 200
+      items: { type: string }
+  exec:
+    command: repo-grep
+    args: ["--format", "json"]
+    cwd: "${REPO_ROOT}"
+    env:
+      RIPGREP_CONFIG_PATH: "${RG_CONFIG_PATH}"

@@ -1,0 +1,13 @@
+# rule: `when:` and `else:` are mutually exclusive on an edge (grammar 7.2, 7.3 / PRD 5.3)
+flow.simple:
+  outputs:
+    done: { type: boolean }
+  nodes:
+    review:
+      agent: agent.reviewer
+  edges:
+    - { from: start, to: review }
+    - from: review
+      to: end
+      when: "review.output.verdict == 'approve'"
+      else: true

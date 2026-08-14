@@ -1,0 +1,39 @@
+# The findings array is a tagged union: cardinality and per-item destination are
+# both data the model produces, and the `map` dispatches over them
+# deterministically (PRD 5.6). `max_items` is enforced at structured-output
+# validation, so the model structurally cannot return an unbounded fan-out.
+agent.triage:
+  description: Classifies bug-report findings into routable variants.
+  model: model.smart
+  prompt: |
+    You triage incoming bug reports.
+
+    Emit one finding per distinct defect. Tag a finding `auto_fixable` only when
+    the fix is mechanical and local to one file. Tag it `needs_human` when it
+    requires judgement, and `duplicate` when the report restates a finding you
+    have already emitted in this run.
+  stores: [store.docs]
+  input:
+    report:
+      description: The raw bug report.
+      type: string
+    matches:
+      description: Grep hits from the repository, for grounding.
+      type: array
+      items: { type: string }
+  output:
+    findings:
+      description: Every distinct defect, tagged for routing.
+      type: array
+      max_items: 50
+      items:
+        discriminator: kind
+        variants:
+          auto_fixable:
+            file: { type: string }
+            patch_hint: { type: string }
+          needs_human:
+            summary: { type: string }
+            severity: { enum: [low, high, critical] }
+          duplicate:
+            of: { type: string }

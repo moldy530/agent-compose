@@ -1,0 +1,4 @@
+# rule: an agent definition MUST declare an output schema (grammar 5 / PRD 5.2)
+agent.reviewer:
+  model: model.smart
+  prompt: Review the draft and return a verdict.
