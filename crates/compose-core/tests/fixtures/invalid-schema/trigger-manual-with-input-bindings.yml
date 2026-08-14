@@ -1,4 +1,5 @@
 # rule: a manual trigger declares no `input:` - CLI arguments are validated directly against the flow's input schema (grammar 13.2 / PRD 5.11)
+# at: /triggers/cli
 triggers:
   cli:
     type: manual

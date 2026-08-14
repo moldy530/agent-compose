@@ -1,4 +1,5 @@
 # rule: definition names are lowercase snake_case identifiers (grammar 2.1)
+# at: <root>
 agent.Reviewer:
   model: model.smart
   prompt: Review the draft.

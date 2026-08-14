@@ -1,4 +1,5 @@
 # rule: a model definition is a direct binding XOR an ordered route, never both (grammar 12.2 / PRD 5.9)
+# at: /model.default
 model.default:
   provider: provider.anthropic
   id: claude-sonnet-4-6

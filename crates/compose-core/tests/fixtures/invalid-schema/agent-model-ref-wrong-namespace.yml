@@ -1,4 +1,5 @@
 # rule: references are typed - `model:` takes a model.* address, not a provider.* one (grammar 2.3 / PRD 5.1)
+# at: /agent.reviewer/model
 agent.reviewer:
   model: provider.anthropic
   prompt: Review the draft and return a verdict.

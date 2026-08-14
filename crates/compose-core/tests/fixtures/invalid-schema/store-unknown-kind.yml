@@ -1,4 +1,5 @@
 # rule: store kinds are exactly kv | vector | blob - relational/SQL is deliberately excluded (grammar 11.1 / PRD 5.8)
+# at: /store.tickets/kind
 store.tickets:
   kind: sql
   scope: global

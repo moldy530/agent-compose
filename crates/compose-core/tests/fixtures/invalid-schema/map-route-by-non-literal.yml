@@ -1,4 +1,5 @@
 # rule: `route_by` is a literal discriminator field name, never a CEL expression - this keeps exhaustiveness decidable (grammar 8.6 / PRD 5.6)
+# at: /flow.triage/nodes/dispatch
 flow.triage:
   outputs:
     done: { type: boolean }

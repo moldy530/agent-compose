@@ -1,8 +1,12 @@
 # Target of the map's `default:` route. Used with `detach: true`, so the join
 # does not wait on it and it may not write reduced state. Detached dispatches
-# receive an idempotency key derived from execution_id + node + item_index; the
-# v0 restriction is that `detach` requires checkpointing to be disabled
-# (PRD 5.6), which is the case for this project's local target.
+# receive an idempotency key derived from execution_id + node + item_index.
+#
+# `detach` is a target-dependent restriction in v0 (grammar 8.6 rule 7 / 14,
+# PRD 5.6): it is legal under `--target local`, which is not durably
+# checkpointed, and rejected under a checkpointed target — so this project
+# validates under `--target local` and reports the detached route under
+# `--target staging` until the outbox-pattern delivery lands.
 tool.dead_letter:
   description: Record an unroutable finding for later inspection.
   input:

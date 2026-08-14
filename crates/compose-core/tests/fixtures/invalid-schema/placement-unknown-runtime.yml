@@ -1,4 +1,5 @@
 # rule: a placement's runtime is `isolated` or `colocated` (grammar 14.1 / PRD 5.10)
+# at: /placements/agent.researcher/runtime
 version: "0.1"
 placements:
   agent.researcher:

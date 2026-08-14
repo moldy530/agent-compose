@@ -66,6 +66,8 @@ flow.triage:
             input:
               summary: "finding.summary"
               severity: "finding.severity"
+        # `default:` is narrowed to the UNROUTED variants (grammar 8.6 rule 4),
+        # here just `duplicate` — which is why `finding.of` type-checks.
         default:
           node: tool.dead_letter
           detach: true
@@ -74,7 +76,9 @@ flow.triage:
             payload: "finding.of"
 
     # Inline subprocess step. The bound input object is passed to the child as
-    # environment variables (grammar 8.2 / PRD 5.5).
+    # environment variables, upper-snake-cased (`patches` -> `PATCHES`), and the
+    # declared output is all envelope fields, so stdout is never parsed
+    # (grammar 8.2 / PRD 5.5).
     verify:
       exec:
         command: run-checks
@@ -126,6 +130,8 @@ flow.triage:
       writes:
         decision: human_decision
 
+    # Inline HTTP step. `status` is an envelope field bound from the response
+    # itself, never decoded out of its body (grammar 8.3).
     escalate:
       http:
         method: POST

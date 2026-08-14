@@ -1,4 +1,5 @@
 # rule: reserved names (CEL roots and the implicit conversation-history channel) may not be state channels (grammar 2.5 / PRD 5.7)
+# at: /state
 state:
   messages:
     type: array

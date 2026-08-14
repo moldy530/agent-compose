@@ -1,4 +1,5 @@
 # rule: a file declaring `imports:` is the entrypoint and MUST declare `version:` (grammar 1.3 / PRD 9.5)
+# at: <root>
 imports:
   - agents/reviewer.yml
   - flows/review_loop.yml

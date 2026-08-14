@@ -1,0 +1,8 @@
+# rule: an agent's declared `input:` has at least one field; omitting `input:` is the only way to get the string-in default (grammar 5.3)
+# at: /agent.reviewer/input
+agent.reviewer:
+  model: model.smart
+  prompt: Review the draft and return a verdict.
+  input: {}
+  output:
+    verdict: { enum: [approve, revise] }

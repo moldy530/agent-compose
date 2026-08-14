@@ -1,4 +1,5 @@
 # rule: `backend:` names an abstract alias only - physical provider config lives in the deploy layer (grammar 11.3 / PRD 5.8)
+# at: /store.docs/backend
 store.docs:
   kind: vector
   scope: global

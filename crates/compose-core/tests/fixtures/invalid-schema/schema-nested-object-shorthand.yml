@@ -1,4 +1,5 @@
 # rule: nested objects are explicit (`type: object` + `properties`); a bare mapping is not a shorthand (grammar 3.4 / PRD 5.2)
+# at: /agent.reviewer/output/author
 agent.reviewer:
   model: model.smart
   prompt: Review the draft.

@@ -98,11 +98,42 @@ fn validation_errors(validator: &Validator, instance: &Value) -> Vec<String> {
         .collect()
 }
 
-/// The `# rule: ...` header every negative fixture must carry.
-fn declared_rule(path: &Path) -> Option<String> {
+/// The header every negative fixture must carry:
+///
+/// ```yaml
+/// # rule: <the grammar rule the fixture violates>
+/// # at: <JSON Pointer where the violation must surface, or `<root>`>
+/// ```
+///
+/// The pointer is what keeps the corpus honest: without it a fixture that
+/// starts failing for an unrelated reason still passes, and the rule it was
+/// written for silently stops being covered.
+struct FixtureHeader {
+    rule: String,
+    /// JSON Pointer into the instance; the empty string is the document root.
+    at: String,
+}
+
+const ROOT_POINTER: &str = "<root>";
+
+fn fixture_header(path: &Path) -> Option<FixtureHeader> {
     let text = fs::read_to_string(path).ok()?;
-    let first = text.lines().next()?.trim().to_string();
-    first.strip_prefix("# rule:").map(|r| r.trim().to_string())
+    let mut rule = None;
+    let mut at = None;
+    for line in text.lines().take_while(|line| line.starts_with('#')) {
+        if let Some(value) = line.strip_prefix("# rule:") {
+            rule.get_or_insert_with(|| value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("# at:") {
+            at.get_or_insert_with(|| match value.trim() {
+                ROOT_POINTER => String::new(),
+                pointer => pointer.to_string(),
+            });
+        }
+    }
+    match (rule, at) {
+        (Some(rule), Some(at)) if !rule.is_empty() => Some(FixtureHeader { rule, at }),
+        _ => None,
+    }
 }
 
 fn examples_dir() -> PathBuf {
@@ -248,7 +279,9 @@ fn every_invalid_fixture_is_rejected_by_the_published_schema() {
     for file in &files {
         let instance = read_yaml_as_json(file);
         if validator.is_valid(&instance) {
-            let rule = declared_rule(file).unwrap_or_else(|| "<undeclared rule>".to_string());
+            let rule = fixture_header(file)
+                .map(|header| header.rule)
+                .unwrap_or_else(|| "<undeclared rule>".to_string());
             accepted.push(format!("{} ({rule})", display(file)));
         }
     }
@@ -260,22 +293,67 @@ fn every_invalid_fixture_is_rejected_by_the_published_schema() {
     );
 }
 
+/// Rejection alone is too weak: a fixture that starts failing somewhere else
+/// keeps the suite green while quietly ceasing to cover its rule. Each fixture
+/// therefore declares *where* the violation surfaces, and the schema must
+/// produce an error at exactly that location.
+#[test]
+fn every_invalid_fixture_fails_at_its_declared_location() {
+    let validator = compile_schema();
+    let files = yaml_files(&invalid_fixtures_dir());
+
+    let mut mislocated = Vec::new();
+    for file in &files {
+        let header = fixture_header(file)
+            .unwrap_or_else(|| panic!("{} is missing its `# rule:`/`# at:` header", display(file)));
+        let instance = read_yaml_as_json(file);
+        let locations: Vec<String> = validator
+            .iter_errors(&instance)
+            .map(|error| error.instance_path().to_string())
+            .collect();
+        if !locations.contains(&header.at) {
+            let expected = if header.at.is_empty() {
+                ROOT_POINTER.to_string()
+            } else {
+                header.at.clone()
+            };
+            mislocated.push(format!(
+                "{} ({})\n  expected an error at {expected}, got: {}",
+                display(file),
+                header.rule,
+                if locations.is_empty() {
+                    "<no errors at all>".to_string()
+                } else {
+                    locations.join(", ")
+                }
+            ));
+        }
+    }
+    assert!(
+        mislocated.is_empty(),
+        "{} invalid fixture(s) no longer fail for the rule they name:\n\n{}",
+        mislocated.len(),
+        mislocated.join("\n\n")
+    );
+}
+
 #[test]
 fn invalid_fixtures_declare_the_rule_they_violate() {
     let files = yaml_files(&invalid_fixtures_dir());
     let mut undeclared = Vec::new();
     let mut rules = BTreeSet::new();
     for file in &files {
-        match declared_rule(file) {
-            Some(rule) if !rule.is_empty() => {
-                rules.insert(rule);
+        match fixture_header(file) {
+            Some(header) => {
+                rules.insert(header.rule);
             }
-            _ => undeclared.push(display(file)),
+            None => undeclared.push(display(file)),
         }
     }
     assert!(
         undeclared.is_empty(),
-        "every negative fixture must open with a `# rule: <violated rule>` comment; missing in:\n  {}",
+        "every negative fixture must open with `# rule: <violated rule>` and \
+         `# at: <json pointer>` comments; missing or incomplete in:\n  {}",
         undeclared.join("\n  ")
     );
     assert_eq!(

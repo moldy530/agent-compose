@@ -1,8 +1,8 @@
-# rule: a human node with `timeout:` MUST declare the `on_timeout:` route (grammar 8.7 / PRD 5.5)
+# rule: a control-transfer target is a flow-local node id or `end`, never `start` — re-entering a flow from a timeout has no defined input (grammar 2.4)
 # at: /flow.approval/nodes/approve
 flow.approval:
   outputs:
-    decision: { type: string }
+    decision: { enum: [approve, reject] }
   nodes:
     approve:
       human:
@@ -11,6 +11,7 @@ flow.approval:
         output:
           decision: { enum: [approve, reject] }
         timeout: 24h
+        on_timeout: start
   edges:
     - { from: start, to: approve }
     - { from: approve, to: end }

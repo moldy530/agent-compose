@@ -1,3 +1,4 @@
 # rule: unknown top-level keys are rejected - the entrypoints of a project are the flows its triggers target, there is no `entrypoint:` (grammar 1.5 / PRD 5.11)
+# at: <root>
 version: "0.1"
 entrypoint: flow.review_loop

@@ -1,4 +1,5 @@
 # rule: an edge MUST declare both `from:` and `to:` (grammar 7.2)
+# at: /flow.simple/edges/1
 flow.simple:
   outputs:
     done: { type: boolean }

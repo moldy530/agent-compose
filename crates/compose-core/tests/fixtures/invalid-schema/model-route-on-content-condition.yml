@@ -1,4 +1,5 @@
 # rule: `route_on` covers infrastructure conditions only - content-based routing is what graph edges are for (grammar 12.2 / PRD 5.9)
+# at: /model.default
 model.default:
   route: [model.smart, model.fast]
   route_on: [long_context]

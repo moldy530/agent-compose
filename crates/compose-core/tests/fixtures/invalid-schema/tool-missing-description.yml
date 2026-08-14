@@ -1,4 +1,5 @@
 # rule: a tool definition MUST carry an LLM-facing description - it is the selection signal (grammar 6 / PRD 5.5)
+# at: /tool.web_search
 tool.web_search:
   input:
     query: { type: string }

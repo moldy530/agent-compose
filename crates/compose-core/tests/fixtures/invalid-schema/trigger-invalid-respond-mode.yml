@@ -1,4 +1,5 @@
 # rule: an http trigger responds `sync` or `async` (grammar 13.3 / PRD 5.11)
+# at: /triggers/on_request
 triggers:
   on_request:
     type: http

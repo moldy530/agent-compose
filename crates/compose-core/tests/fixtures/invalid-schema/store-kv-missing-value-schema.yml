@@ -1,4 +1,5 @@
 # rule: a kv store MUST declare `value_schema:`, and a vector store MUST declare `embed:` (grammar 11.1 / PRD 5.8)
+# at: /store.user_prefs
 store.user_prefs:
   kind: kv
   scope: session

@@ -1,0 +1,16 @@
+# rule: a map node has no output of its own, so node-level `writes:` is illegal — the remap lives in the map block or on a route (grammar 8.6 rule 9)
+# at: /flow.work/nodes/fan
+flow.work:
+  outputs:
+    done: { type: boolean }
+  nodes:
+    fan:
+      map:
+        over: plan.output.tasks
+        node: agent.worker
+        max_concurrency: 4
+      writes:
+        anything: results
+  edges:
+    - { from: start, to: fan }
+    - { from: fan, to: end }

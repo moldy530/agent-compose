@@ -1,4 +1,5 @@
 # rule: `when:` and `else:` are mutually exclusive on an edge (grammar 7.2, 7.3 / PRD 5.3)
+# at: /flow.simple/edges/1
 flow.simple:
   outputs:
     done: { type: boolean }
