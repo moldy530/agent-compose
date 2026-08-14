@@ -259,8 +259,8 @@ error of the form "expected an `agent.*` reference, found `tool.web_search`"
 | node `flow:` | `flow.*` | no recursion |
 | node `store:` | `store.*` | |
 | `map.node`, `map.routes.<tag>.node`, `map.default.node` | `agent.*`, `tool.*`, `flow.*` | dispatch targets are components, not flow-local ids |
-| `on_error.fallback` | flow-local node id | control transfer stays inside one flow |
-| `human.on_timeout` | flow-local node id | |
+| `on_error.fallback` | flow-local node id, `end` | control transfer stays inside one flow (§2.4) |
+| `human.on_timeout` | flow-local node id, `end` | same positions as `on_error.fallback` |
 | edge `from` / `to` | flow-local node id, `start`, `end` | |
 | `triggers.<t>.flow` | `flow.*` | |
 | `placements` keys | `agent.*`, `tool.*`, `flow.*` | deploy layer |
@@ -268,13 +268,17 @@ error of the form "expected an `agent.*` reference, found `tool.web_search`"
 ### 2.4 Flow-local node ids and pseudo-nodes
 
 Node ids are identifiers scoped to their flow; two flows may both have a node
-`review`. `start` and `end` are **pseudo-nodes** usable only in edge `from`/`to`
-positions:
+`review`. `start` and `end` are **pseudo-nodes**:
 
-- `start` — the flow's entry. It has no output; exactly one or more edges MUST
-  leave it, and no edge MAY target it.
+- `start` — the flow's entry. It has no output; one or more edges MUST leave it,
+  and nothing MAY target it. `start` is legal **only** as an edge `from`.
 - `end` — the flow's exit. No edge MAY leave it. Reaching `end` terminates the
-  flow instance and materializes its `outputs` (§7.5).
+  flow instance and materializes its `outputs` (§7.5). `end` is legal as an edge
+  `to` and in the two **control-transfer positions** — `on_error.fallback`
+  (§9.2) and `human.on_timeout` (§8.7) — where it means "finish this flow
+  instance now, materializing whatever the `outputs:` channels currently hold".
+  The two control-transfer positions accept exactly the same targets; nothing
+  else accepts a pseudo-node.
 
 A node MUST NOT be named `start` or `end`.
 
@@ -504,7 +508,7 @@ Referencing anything else is a compile error.
 |---|---|---|
 | edge `when:` | `<from>.output` (the edge's source node only), `input`, `state`, `execution` | bool |
 | `map.over` | `<node>.output` for any node that precedes the map node, `input`, `state` | list (path expression only, §4.2) |
-| `map.input` / `map.routes.<tag>.input` values | `<as-name>` (the item), `item_index`, `input`, `state`, `execution` | field-typed |
+| `map.input` / `map.routes.<tag>.input` values | `<as-name>` (the item), `input`, `state`, `execution` | field-typed |
 | node `input:` bindings | `input`, `state`, `execution` | field-typed |
 | store-op `key`, `value`, `query`, `prefix`, `filter`, `metadata` values | `input`, `state`, `execution` | per §11.4 |
 | inline `http` node `query` / `body` values | `input`, `state`, `execution` | field-typed |
@@ -520,7 +524,12 @@ Root identifier meanings:
   present only inside a `map`-dispatched instance).
 - **`payload`** — the trigger payload; shape per trigger type (§13).
 - **`<node>.output`** — a node's node-scoped output object (PRD 5.7 tier 1).
-- **`<as-name>` / `item_index`** — the per-item bindings of a `map`.
+- **`<as-name>`** — the per-item binding of a `map` (`item` unless renamed with
+  `as:`, §8.6). It is a root only inside that map's per-item expressions.
+
+The per-item **index** has exactly one spelling, `execution.item_index`; there is
+no bare `item_index` root. One spelling means the reserved-name list (§2.5) needs
+only `item`, and a channel can never shadow the index.
 
 **Node outputs are only readable from edge guards and `map.over`**
 (Decision [D42](#d42-node-outputs-are-readable-only-from-edge-guards-and-mapover)).
@@ -656,7 +665,10 @@ prompts diffable (Decision [D13](#d13-prompt-is-required-and-literal)).
 ### 5.3 Input schema and the string-in default
 
 - With `input:` declared, the agent's input is that closed object. The rendered
-  user turn is its JSON serialization.
+  user turn is its JSON serialization. The field map MUST declare at least one
+  field: `input: {}` would render an empty object as the user turn, which is
+  neither the string-in default nor a usable schema, so it is a compile error.
+  (`{}` stays legal on `tool.input`, where it means a no-argument tool — §3.1.)
 - With `input:` omitted, the agent is **string-in**: a single unnamed string. At
   a node position it MUST be bound with the scalar form
   (Decision [D14](#d14-string-in-agents-bind-with-a-scalar-input-at-the-node)):
@@ -745,6 +757,10 @@ validated against `output`, except when `output` declares exactly one
 string-typed property, in which case trimmed raw stdout binds to it. A non-zero
 exit status is a node error subject to §9.
 
+A `tool.*` declares a *domain* result schema, so every one of its fields is
+decoded as above — `exit_code`/`stdout` are not special here. Inline `exec:`
+nodes are the surface that exposes the process envelope; see §8.2.
+
 **`http`**:
 
 ```yaml
@@ -770,7 +786,9 @@ Without `body`/`query`, the bound input object is sent as the JSON body
 (body-bearing methods) or as query parameters (`GET`/`HEAD`). The response body
 is decoded as JSON and validated against `output`, except when `output` declares
 exactly one string-typed property, in which case the raw response text binds to
-it. A status outside `expect_status` is a node error subject to §9.
+it. A status outside `expect_status` is a node error subject to §9. As with
+`exec`, this is the *tool* surface: the response envelope (`status`, raw `body`)
+is exposed by inline `http:` nodes only (§8.3).
 
 **`function`** — host-registered function (escape hatch; breaks spec
 portability — PRD 5.5):
@@ -855,7 +873,7 @@ node.
 | `writes` | map output-field→channel | write remap (PRD 5.7) |
 | `retry` | block | §9.1 |
 | `timeout` | duration | §9.2 |
-| `on_error` | `fail` \| `skip` \| `{ fallback: <node id> }` | §9.2 |
+| `on_error` | `fail` \| `skip` \| `{ fallback: <node id or end> }` | §9.2 |
 | `description` | string | documentation only |
 
 **Rule of thumb**: schemas and implementation config live *inside* the kind
@@ -876,7 +894,7 @@ edges:
 | `from` | node id \| `start` | yes | |
 | `to` | node id \| `end` | yes | |
 | `when` | CEL (bool) | no | guard over the source node's output (§4.1) |
-| `else` | boolean | no | the default edge; mutually exclusive with `when` |
+| `else` | `true` | no | marks the default edge; mutually exclusive with `when`. `true` is the only legal value — `else: false` says nothing (an unguarded edge is already unconditional) and is a compile error |
 | `max_iterations` | integer 1..1000 | no | cycle bound (PRD 5.4) |
 
 Self-edges (`from == to`) are legal and form a one-node SCC, which must be
@@ -913,13 +931,31 @@ why `enum` is string-only and closed (§3.3).
 
 Back-edges are permitted (PRD 5.4). The compiler computes SCCs and requires:
 
-- **Bounding**: every SCC with ≥ 1 edge MUST contain at least one edge carrying
-  `max_iterations`, or at least one edge whose guard is provably falsifiable —
-  in practice `max_iterations` is what the validator accepts as a proof
-  (PRD 5.4). An SCC with no bounded edge is a compile error.
-- **Escape**: the source node of each bounded edge MUST have at least one
-  outgoing edge that leaves the SCC, so exhausting the budget cannot dead-end the
-  execution (Decision [D19](#d19-max_iterations-semantics-and-the-escape-edge-rule)).
+- **Bounding**: every SCC with ≥ 1 edge MUST be *bounded*. An SCC is bounded when
+  at least one of the following holds — PRD 5.4's "`max_iterations` and/or a CEL
+  exit condition on at least one edge in the cycle", made decidable
+  (Decision [D57](#d57-what-counts-as-a-cel-exit-condition)):
+
+  1. **Counting bound** — some edge whose `from` *and* `to` are both in the SCC
+     carries `max_iterations`; or
+  2. **CEL exit condition** — some node `n` in the SCC has an outgoing edge that
+     leaves the SCC and carries a `when:` guard, **and** every outgoing edge of
+     `n` that stays inside the SCC carries a `when:` guard (or an `else:`).
+     Both halves are required: an unguarded in-SCC edge from `n` is
+     unconditional (§7.3 rule 2), so it would re-enter the loop no matter what
+     the exit guard says, and the "exit condition" would never exit.
+
+  An SCC satisfying neither is a compile error naming the SCC's nodes.
+
+  A counting bound is a **static termination proof**; a CEL exit condition is
+  not — its guard is a runtime value, so a model that never emits the exit value
+  keeps looping. PRD 5.4 accepts both, so the validator does too; only clause 1
+  makes the loop provably finite, which is why the examples in this document use
+  it.
+- **Escape**: the source node of each `max_iterations`-carrying edge MUST have at
+  least one outgoing edge that leaves the SCC, so exhausting the budget cannot
+  dead-end the execution (Decision [D19](#d19-max_iterations-semantics-and-the-escape-edge-rule)).
+  Clause 2 already requires such an edge by construction.
 
 `max_iterations` counts **traversals of that edge within one flow instance**.
 Instances of the same flow (including `map`-dispatched ones) count independently.
@@ -986,6 +1022,10 @@ review:
 ```
 
 - Keys MUST be output field names of the node; values MUST be declared channels.
+- Every write — name-based or remapped — is type-checked against the target
+  channel by its reduce policy (§10.2): whole value for an unreduced or
+  `last_wins` channel, one element for an `append` channel, a partial object for
+  a `merge` channel.
 - A remapped field is not also written to its same-named channel.
 - Remapping is the fix for channel collisions between nodes and for renames
   across subgraph boundaries (PRD 5.7).
@@ -1022,7 +1062,7 @@ run_tests:
     output:
       exit_code: { type: integer }
       stdout:    { type: string }
-  input: { PATTERN: "state.test_filter" }
+  input: { pattern: "state.test_filter" }
   on_error: skip
 ```
 
@@ -1032,9 +1072,21 @@ run_tests:
 |---|---|---|---|
 | `output` | field map | no | `{ exit_code: {type: integer}, stdout: {type: string} }` |
 
-The node-level `input:` bindings produce the object passed as environment
-variables (or stdin for a scalar binding), per the §6.1 convention. Decoding of
-stdout follows §6.1.
+The node-level `input:` bindings produce the object passed to the child as
+environment variables — binding keys are identifiers (§2.1) and are
+upper-snake-cased on the way into the environment, so `pattern:` above arrives as
+`PATTERN` — or on stdin for a scalar binding, per the §6.1 convention.
+
+**Result binding.** An inline `exec:` node wraps a *process*, so its result is
+the process envelope, not a decoded payload
+(Decision [D56](#d56-inline-exechttp-node-results-are-envelopes-not-decoded-payloads)).
+`exit_code` (`{type: integer}`), `stdout` (`{type: string}`) and `stderr`
+(`{type: string}`) are **envelope fields**: declaring one in `output` binds it
+from the child process directly, and it is never decoded from stdout. Declaring
+an envelope name with any other type is a compile error. Every *other* declared
+field is decoded from stdout as JSON per §6.1 (whose single-string-property
+shortcut is computed over the decoded fields alone). When `output` declares only
+envelope fields — as the default does — stdout is never parsed.
 
 ### 8.3 `http`
 
@@ -1058,6 +1110,19 @@ notify:
 | Key | Type | Required | Default |
 |---|---|---|---|
 | `output` | field map | no | `{ status: {type: integer}, body: {type: string} }` |
+
+**Result binding.** As with `exec:` (§8.2), an inline `http:` node's result is
+the response envelope. `status` (`{type: integer}`) and `body` (`{type: string}`,
+the raw response text) are **envelope fields**: declared, they bind from the
+response directly and are never decoded from it, and declaring either with
+another type is a compile error. Every other declared field is decoded from the
+response body as JSON per §6.1. So a node declaring only `status:` records the
+HTTP status and never parses the body (this is what the `escalate` node of
+[`examples/triage-fanout`](../examples/triage-fanout/flows/triage.yml) does),
+while a node that also wants the created ticket id declares
+`{ status: {type: integer}, id: {type: string} }` and gets `id` from the decoded
+body
+(Decision [D56](#d56-inline-exechttp-node-results-are-envelopes-not-decoded-payloads)).
 
 ### 8.4 `function`
 
@@ -1096,12 +1161,31 @@ sub:
 | `input` | map field→CEL | yes when the subflow has inputs | — | explicit bindings only |
 | `writes` | map output-field→channel | no | name-based | keys are the subflow's `outputs` fields |
 | `context` | `isolated` \| `inherit` | no | `isolated` | conversation-history scoping (PRD 5.7) |
-| `policy` | `{ retry, timeout, on_error }` | no | — | instantiation-site override, §9.3 |
+| `policy` | `{ retry, timeout, on_error }` | no | — | override for the nodes *inside*, §9.3 |
+| `retry` | block | no | — | policy for *this* node, §9.1 |
+| `timeout` | duration | no | — | policy for *this* node, §9.2 |
+| `on_error` | `fail` \| `skip` \| `{ fallback: … }` | no | — | policy for *this* node, §9.2 |
 
 `context: inherit` shares the caller's conversation-history channel with the
 subflow; `isolated` (the default) gives the subflow a fresh one. Nothing else
 crosses a module boundary implicitly (PRD 5.7). `context:` is legal on `flow:`
 nodes only.
+
+**`policy:` and the node's own policy keys are different things**, and a `flow:`
+node MAY carry both:
+
+- `policy:` is level 1 of the resolution chain (§9.3) for **every node inside**
+  the instantiated subflow, propagated into nested instantiations. It never
+  applies to the instantiating node itself.
+- `retry`/`timeout`/`on_error` at node level are level 2 for **this node**, which
+  treats the whole subgraph instance as one activity: `timeout` bounds the entire
+  instance, `on_error` fires when the instance fails, and `retry` re-executes the
+  instance from its entry as a fresh instance (iteration counters and item
+  indexes reset).
+
+So `{ flow: flow.f, policy: { timeout: 30s }, timeout: 10s }` means "no node
+inside may run longer than 30s, and the whole instance may not run longer than
+10s" — legal, and the tighter outer bound is what ends the instance first.
 
 ### 8.6 `map`
 
@@ -1163,9 +1247,16 @@ A **route** object takes `node` (required) plus optional `max_concurrency`,
 2. **Exactly one dispatch form**: `node:` XOR (`route_by:` + `routes:`).
 3. **Union items require routing**: if the item schema is a discriminated union,
    `route_by` is REQUIRED; if it is not a union, `route_by` is ILLEGAL.
-4. **Exhaustiveness per variant**: every variant of the item union has a route,
-   or `default:` is present. Unknown route tags are errors. Each route's target
-   is type-checked against **its variant's payload only** (narrowing, PRD 5.6).
+4. **Exhaustiveness and narrowing per variant**: every variant of the item union
+   has an entry in `routes:`, or `default:` is present. Route tags that are not
+   variant tags are errors. A named route's target is type-checked against **its
+   variant's payload only** (narrowing, PRD 5.6). The `default:` route's target
+   is type-checked against the **unrouted variants** — those with no entry in
+   `routes:`: its per-item `input:` CEL may select the discriminator field and
+   any field declared by *every* unrouted variant, and nothing else. When exactly
+   one variant is unrouted, that is precisely that variant's payload. A
+   `default:` with no unrouted variant is unreachable and is a compile error
+   (Decision [D30](#d30-union-items-require-route_by-non-union-items-forbid-it-default-is-the-catch-all)).
 5. **Reduced writes**: anything a dispatched instance writes to shared state MUST
    target a channel with a declared `reduce` policy. Appended results are
    automatically index-tagged and reordered by source-item index before the join,
@@ -1174,15 +1265,22 @@ A **route** object takes `node` (required) plus optional `max_concurrency`,
    have completed or been resolved by `on_item_error`. Sink routes are waited on
    like any other route.
 7. **`detach`**: a detached route is fire-and-forget. A detached route MUST NOT
-   declare `writes:` and MUST NOT write reduced state. In v0, `detach: true`
-   combined with checkpointing enabled is a validation error pointing at the
-   roadmap (the outbox-pattern delivery is not v0 work). Detached dispatches
-   receive an `idempotency_key` derived from `execution_id + node + item_index`.
+   declare `writes:` and MUST NOT write reduced state. In v0, `detach: true` is a
+   validation error under any target whose execution state is durably
+   checkpointed — every target except `local` (§14) — pointing at the roadmap
+   (the outbox-pattern delivery is not v0 work). Checkpointing is a property of
+   the target, not a spec construct, so this is a **target-dependent** check like
+   backend alias resolution (§11.3): the same composition is legal under
+   `--target local` and rejected under `--target staging`. Detached dispatches
+   receive an `idempotency_key` derived from
+   `execution_id + node + item_index`.
 8. **`route_by` is a literal field name**, never a CEL expression — this keeps
    exhaustiveness decidable (PRD 5.6).
-9. Node-level `input:` is ILLEGAL on a `map` node (the per-item binding lives in
-   the block); node-level `retry`/`timeout`/`on_error` apply to the map node as a
-   whole, while `on_item_error` governs individual items.
+9. Node-level `input:` and node-level `writes:` are both ILLEGAL on a `map` node:
+   a map node has no input or output of its own, only dispatched instances. The
+   per-item binding lives in the `map:` block (or on a route), and so does the
+   write remap. Node-level `retry`/`timeout`/`on_error` are legal and apply to
+   the map node as a whole, while `on_item_error` governs individual items.
 
 ### 8.7 `human`
 
@@ -1209,7 +1307,7 @@ approve:
 | `input` | field map (input surface) | yes | rendered for the human |
 | `output` | field map (result surface, §3.6) | yes | routable structured output; resume payloads are validated against it (PRD 5.11) |
 | `timeout` | duration | no | wall-clock wait budget |
-| `on_timeout` | node id | required with `timeout` | route taken on expiry |
+| `on_timeout` | flow-local node id, or `end` | required with `timeout` | route taken on expiry; same targets as `on_error.fallback` (§2.4, §9.2) |
 
 Node-level `timeout:` and `retry:` are ILLEGAL on a `human` node — a wait is not
 an activity timeout and re-prompting a human is not a retry
@@ -1274,11 +1372,13 @@ casing (PRD 5.11).
 |---|---|
 | `fail` | abort the execution with the node's error (built-in default) |
 | `skip` | the node produces no output and writes nothing; its **unconditional** and `else` outgoing edges still fire, and guards referencing the missing output evaluate to false |
-| `{ fallback: <node id> }` | transfer control to another node in the same flow (may be `end`, never `start`) |
+| `{ fallback: <node id or end> }` | transfer control to another node in the same flow, or to `end`; never `start` |
 
-`fallback` targets a **flow-local node id**, keeping error routing inside one
-graph where reachability analysis can see it (Decision
-[D21](#d21-on_error-strategies-and-fallback-targets)).
+`fallback` targets a **flow-local node id or `end`** (§2.4), keeping error
+routing inside one graph where reachability analysis can see it — never `start`,
+and never a node of another flow (Decision
+[D21](#d21-on_error-strategies-and-fallback-targets)). `human.on_timeout` (§8.7)
+accepts the same targets.
 
 ### 9.3 Resolution chain
 
@@ -1286,7 +1386,9 @@ For each policy field (`retry`, `timeout`, `on_error`) independently, highest
 precedence first (PRD 5.5's `flow override > node > defaults > fail`):
 
 1. **Flow override** — `policy:` on the `flow:` node that instantiated the
-   enclosing flow, propagated into nested instantiations.
+   enclosing flow, propagated into nested instantiations. It applies to the nodes
+   *inside* that instance only; the instantiating `flow:` node resolves its own
+   policy from levels 1–4 in its own flow (§8.5).
 2. **Node** — the node's own `retry`/`timeout`/`on_error`.
 3. **Defaults** — the composition's `defaults:` section.
 4. **Built-in** — no retry, no timeout, `on_error: fail`.
@@ -1342,14 +1444,39 @@ its `input:` bindings and `writes:` remaps carry across (PRD 5.7).
 
 | Policy | Requires | Semantics |
 |---|---|---|
-| `append` | `type: array` | concatenate; `map` writes are index-tagged and reordered by source-item index before the join (PRD 5.6) |
-| `merge` | `type: object` | shallow key-wise merge; conflicting keys resolve last-writer-wins within one superstep |
+| `append` | `type: array` | each write contributes **one element**; `map` writes are index-tagged and reordered by source-item index before the join (PRD 5.6) |
+| `merge` | `type: object` | shallow key-wise merge of the written object into the channel; conflicting keys resolve last-writer-wins within one superstep |
 | `last_wins` | any | last write in the superstep wins, explicitly declared as concurrency-safe |
 
 A channel **without** `reduce:` is *unreduced*: single-writer, sequential. Writing
 an unreduced channel from inside a `map` — or from two concurrent branches
 (§7.3) — is a compile error (PRD 5.6). Declaring `reduce: last_wins` is how an
 author opts into concurrent overwrite explicitly.
+
+**What a write supplies, and how it is type-checked.** The reduce policy decides
+whether a write carries the channel's whole value or a contribution to it. This
+is the schema-compatibility rule for state wiring (§8.0, §10.3), and it is
+decided from declared types alone
+(Decision [D58](#d58-append-channels-take-one-element-per-write)):
+
+| Channel | A write supplies | Accepted written type |
+|---|---|---|
+| unreduced | the channel's whole value | the channel's type |
+| `last_wins` | the channel's whole value | the channel's type |
+| `append` | one element | the channel's `items` type |
+| `merge` | a partial object | an object whose properties are a subset of the channel's, with matching types |
+
+Consequences worth stating outright:
+
+- A node whose output field is an **array** may set an unreduced or `last_wins`
+  array channel wholesale — `writes: { matches: matches }` where both sides are
+  `array<string>` — because that write replaces the value.
+- An `append` channel of `items: {type: string}` accepts a write of a **string**,
+  never of an `array<string>`. This is what makes fan-in work: one dispatched
+  `map` instance contributes exactly one element (§8.6 rule 5).
+- Appending several values in one write is deliberately not expressible. Fan out
+  with a `map` so each element is its own write, or declare the channel
+  `last_wins` and set it whole.
 
 ### 10.3 Wiring
 
@@ -1711,6 +1838,18 @@ error naming the target.
 layer forks per environment (PRD 5.8 per-target invariant); `agents/`, `flows/`,
 `stores/`, `tools/` never do.
 
+**Checkpointing is a property of the target, not a spec construct.** v0 declares
+no grammar for configuring a checkpointer — that lands with the distributed
+target in M3 (PRD 5.10). The rule the grammar depends on is fixed instead:
+`--target local` runs with an in-memory checkpointer and is therefore **not**
+durably checkpointed; every other target is. Exactly one static check keys off
+this — `detach: true` (§8.6 rule 7) — which makes it target-dependent in the same
+way backend alias resolution is (§11.3). Commands that name no target
+(`agent-compose validate main.yml`) resolve the target as `local`; target-dependent
+rules are then checked against `local`, and `validate --target <t>` checks them
+against `<t>`
+(Decision [D59](#d59-checkpointing-is-a-target-property-and-detach-is-checked-per-target)).
+
 ```yaml
 # deploy/staging.yml
 version: "0.1"
@@ -1958,11 +2097,15 @@ as settled. *PRD 5.5.*
 
 ### D21. `on_error` strategies and `fallback` targets
 
-`fail` | `skip` | `{ fallback: <flow-local node id> }`, applied after retries;
-`skip` suppresses writes and lets unconditional/`else` edges fire.
+`fail` | `skip` | `{ fallback: <flow-local node id or end> }`, applied after
+retries; `skip` suppresses writes and lets unconditional/`else` edges fire.
 **Rationale**: PRD 5.5 lists the strategies; restricting `fallback` to a
 flow-local node keeps error routing visible to reachability analysis instead of
-creating an invisible cross-module edge. *PRD 5.5.*
+creating an invisible cross-module edge. `end` is admitted because "give up and
+finish this instance" is the commonest error route and is already expressible as
+an edge; `start` is not, because re-entering a flow from an error has no defined
+input. `human.on_timeout` (D52) accepts exactly the same targets — the two
+control-transfer positions are deliberately identical (§2.4). *PRD 5.5.*
 
 ### D22. Durations are single-segment `<int><unit>`
 
@@ -2025,17 +2168,26 @@ which is also what makes them the natural unit for `runtime: isolated`.
 
 ### D30. Union items require `route_by`; non-union items forbid it; `default:` is the catch-all
 
+The `default:` route's target is narrowed to the **unrouted** variants — the
+discriminator field plus the fields every unrouted variant declares — and a
+`default:` with no unrouted variant is an unreachable-route error.
 **Rationale**: PRD 5.6 offers exactly two modes (homogeneous, discriminator-routed)
 and requires per-variant exhaustiveness with an explicit default. Allowing a union
-to be dispatched to a single target would silently give up narrowing. *PRD 5.6.*
+to be dispatched to a single target would silently give up narrowing. Narrowing
+`default:` to the *whole* union would make it strictly less typed than a named
+route, forcing every catch-all sink to accept a lowest-common-denominator item —
+the exact shape PRD 5.6 rejects; narrowing to the unrouted variants keeps the
+common single-unrouted-variant case fully typed (as in
+[`examples/triage-fanout`](../examples/triage-fanout), whose `default:` sees the
+`duplicate` variant's `of` field). *PRD 5.6.*
 
 ### D31. `detach` rules
 
 Legal on routes and on the homogeneous form; a detached dispatch MUST NOT declare
-`writes:` or write reduced state, and `detach: true` with checkpointing enabled is
-a v0 validation error. **Rationale**: verbatim from PRD 5.6's settled position on
-detach under durable execution; idempotency keys are supplied automatically.
-*PRD 5.6.*
+`writes:` or write reduced state, and `detach: true` under a durably checkpointed
+target is a v0 validation error (D59 fixes which targets those are).
+**Rationale**: verbatim from PRD 5.6's settled position on detach under durable
+execution; idempotency keys are supplied automatically. *PRD 5.6.*
 
 ### D32. Reduce policies are typed and `last_wins` is explicit
 
@@ -2180,9 +2332,12 @@ keeps termination reasoning complete. *PRD 5.4, 5.5.*
 
 Schemas, `timeout`, and `on_timeout` live inside the `human:` block;
 `on_timeout` is required with `timeout`; node-level `timeout`/`retry` are
-illegal. **Rationale**: PRD 5.5 gives the human node both schemas plus timeout
-and route; separating the human wait from an activity timeout prevents two keys
-named `timeout` meaning different things on one node. *PRD 5.5, 5.11.*
+illegal; `on_timeout` accepts a flow-local node id or `end`, exactly as
+`on_error.fallback` does (D21). **Rationale**: PRD 5.5 gives the human node both
+schemas plus timeout and route; separating the human wait from an activity
+timeout prevents two keys named `timeout` meaning different things on one node.
+Two control-transfer positions with different target sets would be a trap with no
+rationale behind it. *PRD 5.5, 5.11.*
 
 ### D53. Flow outputs are name-based from state
 
@@ -2204,6 +2359,90 @@ Files and definitions may appear in any order; the resolver emits definitions
 sorted by address and preserves author order only where it is semantic (edge
 declaration order, `route:` lists, `imports:`). **Rationale**: PRD 5.12 requires
 deterministic, byte-identical output for the same input. *PRD 5.12.*
+
+### D56. Inline `exec`/`http` node results are envelopes, not decoded payloads
+
+On an inline `exec:` node, `exit_code`/`stdout`/`stderr` are synthesized from the
+child process; on an inline `http:` node, `status`/`body` are synthesized from the
+response. They are never decoded from the payload, their types are fixed, and any
+*other* declared field is decoded per §6.1. Envelope names carry no special
+meaning in a `tool.*` result schema. **Rationale**: §6.1's decoding rule and the
+kind defaults (`{exit_code, stdout}`, `{status, body}`) are otherwise in direct
+contradiction — `npm test` would have to print `{"exit_code":0,…}` for the
+*default* schema to work. The split follows the surfaces' purposes: a `tool.*`
+declares a domain result, while an inline node is a one-off wrapper whose
+interesting result is the process/response envelope. Fixing the envelope types
+keeps the rule decidable per node and lets codegen emit the binding without
+inference. *PRD 5.5.*
+
+### D57. What counts as a CEL exit condition
+
+An SCC is bounded by (1) an in-SCC edge carrying `max_iterations`, or (2) a node
+in the SCC with a guarded edge leaving it *and* only guarded edges staying in it.
+**Rationale**: PRD 5.4 settles "`max_iterations` **and/or** a CEL exit condition",
+so refusing CEL-only cycles would contradict a settled position, while "provably
+falsifiable" is not a decidable predicate. Clause 2 is the decidable core of what
+an exit condition means under this document's multicast routing (§7.3): if any
+in-SCC edge of that node is unconditional, the loop re-enters regardless of the
+exit guard, so the guard is not an exit condition at all. The trade-off is stated
+in §7.4: only clause 1 is a static termination proof. *PRD 5.4.*
+
+### D58. `append` channels take one element per write
+
+A write to an `append` channel supplies one element typed as the channel's
+`items`; unreduced and `last_wins` writes supply the whole value; `merge` writes
+supply a partial object. **Rationale**: PRD 5.6's join is "one dispatched
+instance contributes its result, index-tagged and reordered by source-item
+index", which is element-wise by construction, and PRD 5.7 requires wiring to be
+schema-checked — undefined write arity would leave that check with nothing to
+compare. Accepting both an element and a whole array would be ambiguous the
+moment `items` is itself an array. *PRD 5.6, 5.7.*
+
+### D59. Checkpointing is a target property, and `detach` is checked per target
+
+`--target local` is not durably checkpointed; every other target is; v0 has no
+grammar for configuring a checkpointer. `detach: true` is therefore a
+target-dependent validation error, resolved like a backend alias (§11.3), with
+`local` assumed when no target is named. **Rationale**: PRD 5.6 states the
+restriction ("`detach` + checkpointing enabled is a validation error") but PRD
+5.7/5.10 put checkpointer configuration in the M3 distributed target, so no v0
+spec construct can express it. Inventing a `checkpointer:` key now would ship
+grammar for an unbuilt feature; keying off the target makes the rule
+implementable today with the machinery target-dependent checks already need.
+*PRD 5.6, 5.10.*
+
+### D60. A `flow:` node carries both its own policy and a `policy:` override for its children
+
+`policy:` is level 1 of §9.3 for the nodes *inside* the instance;
+`retry`/`timeout`/`on_error` on the same node are level 2 for the instance
+*itself*, treated as one activity. **Rationale**: PRD 5.5 places the override at
+the instantiation site so a caller can harden a reused module, which says nothing
+about bounding the instance as a whole — and a subgraph is a node like any other,
+so denying it the common node keys would be a special case with no PRD backing.
+Naming the two levels separately is what keeps `policy: {timeout: 30s}` next to
+`timeout: 10s` unambiguous. *PRD 5.5, 5.1.*
+
+### D61. `else:` takes the literal `true`
+
+`else: false` is a compile error. **Rationale**: §7.3 gives meaning only to
+`else: true`, and an edge with neither `when:` nor `else:` is already
+unconditional — so `else: false` would be a key that changes nothing, which is
+exactly the silent no-op the error-UX posture (PRD G3) rejects. *PRD 5.3, G3.*
+
+### D62. An agent's declared `input:` has at least one field
+
+`input: {}` on an agent is a compile error; omitting `input:` is the only way to
+get the string-in default. **Rationale**: PRD 5.2 defines exactly two agent input
+contracts, string-in and a declared object; an empty object is neither, and would
+render an empty JSON object as the user turn. `{}` remains meaningful on
+`tool.input`, where a no-argument tool is a real thing. *PRD 5.2.*
+
+### D63. The per-item index is spelled `execution.item_index`
+
+There is no bare `item_index` CEL root. **Rationale**: one spelling means one
+type-checker rule and one reserved name (`item`, §2.5); a bare root would also
+have to be reserved as a channel name to stay unambiguous, for no gain. *PRD
+5.6, 5.7.*
 
 ---
 
@@ -2295,7 +2534,9 @@ model.<name>:    { route: [model.<a>, model.<b>], route_on: [...] }
 # ---- node shapes ------------------------------------------------------------
 { agent: agent.<a>,  input: <bindings>, writes: {...}, retry/timeout/on_error }
 { function: tool.<t>, input: <bindings>, writes: {...} }
-{ flow: flow.<f>,    input: <bindings>, writes: {...}, context: isolated|inherit, policy: {...} }
+{ flow: flow.<f>,    input: <bindings>, writes: {...}, context: isolated|inherit,
+                     policy: {...},                    # for the nodes inside
+                     retry/timeout/on_error }          # for the instance itself
 { exec: { command, args?, cwd?, env?, output? },  input: <bindings> }
 { http: { method, url, headers?, query?, body?, expect_status?, output? } }
 { human: { input, output, timeout?, on_timeout? }, input: <bindings> }
