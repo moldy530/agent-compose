@@ -1,0 +1,11 @@
+[package]
+name = "agent-compose"
+description = "Declarative YAML DSL for agent graphs, compiled to LangGraph TypeScript"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+compose-core = { workspace = true }
+clap = { workspace = true }
