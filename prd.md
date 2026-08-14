@@ -1,8 +1,8 @@
 # agent-compose — Product Requirements Document
 
-**Status:** Draft v0.1
+**Status:** Draft v0.5
 **Author:** moldy
-**Last updated:** 2026-08-13
+**Last updated:** 2026-08-14
 
 ---
 
@@ -93,7 +93,10 @@ Loops are prominent (evaluator-optimizer, ReAct, plan-revise); DAG-only loses. D
 | `http` | HTTP request | httpx wrapper |
 | `function` | host-registered function by name (escape hatch; breaks spec portability — documented) | registry lookup |
 | `flow` | subgraph instantiation | LangGraph subgraph |
-| `map` | fan-out over a collection | LangGraph `Send` API |
+| `map` | fan-out over an agent-produced collection, homogeneous or discriminator-routed (see 5.6) | LangGraph `Send` API |
+| `human` | human-in-the-loop pause: input schema (what the human sees), output schema (what they return, routable like any structured output), `timeout` + `on_timeout` route | LangGraph `interrupt()` (grammar in v0; runtime support may land in M2, same reserved-grammar move as `placements`) |
+
+**Tool vs function — separate keywords (settled).** `tools:` on agent defs (LLM-discovered, nondeterministically selected, requires an LLM-facing description) and `function` as a node type (graph-invoked, deterministic, args checked against a signature) stay distinct: they differ in call semantics, validation, and trace semantics. The *definition* is unified — a single `tool.web_search` component can be attached to an agent's tool list and invoked as a function node (Agent Spec's def/use split).
 
 Temporal-inspired discipline: the compiled graph is the *workflow* (deterministic, replayable); nodes are *activities* (effectful, retryable). Per-node `retry` / `timeout` / `on_error` policy is declared in YAML with duckflux's resolution chain: flow override > node > defaults > fail. Strategies: `fail`, `skip`, `retry` (exponential backoff), `fallback: <node ref>`.
 
@@ -104,15 +107,71 @@ The spec never contains executable code (Agent Spec's security posture). Code lo
 
 CEL implementation choice (v0): embed `cel-python` in generated routers rather than transpiling CEL→Python. Semantic fidelity between `validate` and runtime beats zero-dep purity; transpilation is a later optimization.
 
-### 5.6 State — three tiers
+### 5.6 Fan-out — agent-controlled cardinality, deterministic dispatch
+
+The routing reframe (5.3) extends from *which edge* to *how many instances* and *which destination per item*. An agent never spawns work directly; it emits an **array in its structured output**, and the `map` construct dispatches over it deterministically. Cardinality and destination are data.
+
+**Homogeneous fan-out:**
+
+```yaml
+nodes:
+  plan: { agent: agent.planner }        # output.tasks: array, max_items: 20
+  work:
+    map:
+      over: plan.output.tasks           # CEL path to the array
+      as: task                          # per-instance input binding
+      node: agent.worker                # any node ref, including flow.* subgraphs
+      max_concurrency: 5
+      on_item_error: skip               # fail | skip | retry per item
+```
+
+**Heterogeneous fan-out (per-item routing)** — motivating case: a bug-triage agent sends some findings to fixer agents and others to a manual-review queue. Items are a **tagged union** with a discriminator field; the map routes on it:
+
+```yaml
+agent.triage:
+  output:
+    findings:
+      type: array
+      max_items: 50
+      items:
+        discriminator: kind
+        variants:
+          auto_fixable: { file: { type: string }, patch_hint: { type: string } }
+          needs_human:  { summary: { type: string }, severity: { enum: [low, high, critical] } }
+
+nodes:
+  dispatch:
+    map:
+      over: triage.output.findings
+      route_by: kind
+      routes:
+        auto_fixable: { node: agent.fixer, max_concurrency: 5 }
+        needs_human:  { node: tool.review_queue }   # sink route: enqueue via http/function
+```
+
+Rules and guarantees:
+
+- **Bounding is mandatory** (mirrors the SCC cycle rule): `max_items` on the source array schema (enforced at structured-output validation — the model cannot return more) plus `max_concurrency` at execution. An unbounded fan-out is a compile error.
+- **Exhaustiveness per variant**: every discriminator variant must have a route or an explicit `default:` — compile error otherwise. The agent structurally cannot produce an unroutable item.
+- **Schema narrowing**: each route's target node is validated against its variant's payload shape only (discriminated-union narrowing; Pydantic tagged unions in codegen), not a lowest-common-denominator item type.
+- **Join via reducers**: instances run in isolated item-scoped contexts; writes to shared state must target channels with a declared `reduce` policy (`append`, `merge`, `last_wins`). Writing to a non-reduced channel from inside a `map` is a compile error. The downstream edge is the barrier: it fires when all instances complete, per `on_item_error` policy.
+- **Deterministic ordering**: completion order is nondeterministic, so appended results are automatically index-tagged and reordered by source-item index before the join. Unordered reduces would silently break replay.
+- **Sink routes and `detach`**: routes may target non-compute sinks (queues, webhooks, ticketing — this is how agent graphs talk to non-agent infrastructure). Default join semantics wait on *all* routes, including sinks (a failed enqueue is a surfaced failure). Per-route `detach: true` opts into fire-and-forget; detached routes cannot write to reduced state (compile error). **Replay interaction (settled)**: the design is idempotency-key delivery — an `idempotency_key` derived from `execution_id + node + item_index` is passed to the sink automatically, and sinks are documented to dedupe on it. The v0 implementation restricts: `detach` + checkpointing enabled is a validation error pointing at the roadmap (outbox-pattern delivery is not v0 work).
+- **`route_by` is a literal discriminator field in v0**, not an arbitrary CEL expression — this keeps exhaustiveness checking decidable and the agent's contract legible in its schema. CEL-routed maps are a possible later escape hatch that forfeits exhaustiveness (mandatory `default:`).
+- **Codegen**: one construct — the compiled router emits `Send(routes[item.kind], item)` per item onto LangGraph's `Send` API; reducer channels get standard LangGraph reducers; superstep semantics provide the join. Heterogeneous is homogeneous with a lookup table.
+- **Placement synergy**: map instances are the natural unit for `runtime: isolated` (5.8) — one worker per sandbox with zero change to the logical definition.
+
+### 5.7 State — three tiers
 
 1. **Node-scoped I/O**: typed inputs/outputs per node.
-2. **Shared graph state**: a `state:` section generates the LangGraph `State` schema (TypedDict/Pydantic) with per-channel reducers. Default wiring is name-based (outputs write channels of the same name — Agent Spec's optional-data-edge insight); explicit data edges available for complex graphs. Subgraphs receive parent state only through explicit bindings (PayPal's `passVariables` discipline).
-3. **Conversation history**: an implicit append channel available to agent nodes.
+2. **Shared graph state**: a `state:` section generates the LangGraph `State` schema (TypedDict/Pydantic) with per-channel reducers. Default wiring is name-based (outputs write channels of the same name — Agent Spec's optional-data-edge insight). Subgraphs receive parent state only through explicit bindings (PayPal's `passVariables` discipline).
+3. **Conversation history**: an implicit append channel available to agent nodes. **Scoping (settled): isolated by default across subgraph boundaries** — a flow's behavior must not depend on the caller's conversation, or reusability and the flow-as-tool equivalence break. Opt-in `context: inherit` on the flow-node instantiation for genuine continuation cases. Nothing crosses a module boundary implicitly.
+
+**Data-edge syntax (settled): deferred.** Full explicit data edges are not in v0. Instead, a per-node `writes:` remapping (`writes: { summary: reviewer_summary }`) covers the two real failure modes of name-based wiring — channel collisions between nodes and renames across subgraph boundaries — at a fraction of the grammar cost. Full data edges remain an additive later feature if demand appears.
 
 Persistence (`storage:` section) targets LangGraph checkpointers (Postgres for durable/distributed). Novelty opportunity: the literature consistently punts on cross-session memory and datastores — this is a differentiation area post-v0.
 
-### 5.7 Cloud & distribution — placement annotations, not distributed edges
+### 5.8 Cloud & distribution — placement annotations, not distributed edges
 
 Logical definition and placement are orthogonal (Kubernetes/Terraform lesson):
 
@@ -131,7 +190,44 @@ placements:
 - Isolation is also a **security** feature (per-agent sandboxing, credentials, blast-radius containment for tool-wielding agents) — a declarative story no current framework has.
 - v0: `placements` is parsed and validated but **no-op**.
 
-### 5.8 Compiler contract
+### 5.9 Invocation & triggers — how executions come to exist
+
+The logical graph defines *what runs*; **triggers** define *what causes an execution to exist*. A trigger is a (source, input binding, response mode) tuple declared in a `triggers:` section. This generalizes `entrypoint`: a project may declare multiple triggers targeting different flows — the entrypoints of a project are exactly the flows that triggers point at.
+
+```yaml
+# triggers.yml
+triggers:
+  cli:
+    type: manual                      # implicit for every flow; shown for clarity
+    flow: flow.review_loop
+
+  on_request:
+    type: http
+    flow: flow.review_loop
+    input:
+      goal: payload.body.goal         # CEL over the trigger payload
+    respond: async                    # sync | async
+    callback: payload.body.callback_url   # optional completion webhook (async only)
+
+  nightly:                            # reserved grammar in v0 (the `placements` move)
+    type: schedule
+    flow: flow.triage
+    cron: "0 3 * * *"
+    input: { scope: "'full'" }
+```
+
+Rules and semantics:
+
+- **Input binding is compile-checked**: trigger `input:` mappings are CEL over the trigger payload, validated against the target flow's input schema — the same machinery as edge schema compatibility. A trigger that can produce an input the flow can't accept is a compile error.
+- **`manual`** (v0): CLI/SDK invocation — `agent-compose run <flow> --input k=v`. Implicit for every flow with an input schema.
+- **`http`** (v0): the graph as an endpoint. `respond: sync` blocks and returns the flow's output (only sane for fast graphs); `respond: async` (default) returns an execution id immediately, with an optional completion `callback:` webhook. Async is the natural pairing with durable execution.
+- **`schedule`** and **`event`** (queue/subscription): reserved grammar in v0 — parsed and validated, no-op. Implementing them means owning a scheduler/consumer process (M3 territory), and event-backend plurality (SQS, Redis streams, NATS…) is a design project of its own.
+- **Resume is an invocation.** With `human` nodes (5.5), an interrupted execution must be able to receive the human's response. The generated invocation surface therefore has two verbs — `start(flow, inputs)` and `resume(execution_id, payload)` — and the `http` trigger exposes both. Resume payloads are validated against the interrupting `human` node's output schema. This unifies triggers with the HITL story rather than bolting on a separate callback mechanism.
+- **`event` backends (settled)**: the grammar is backend-agnostic — a trigger declares a logical `source:`; an `event_sources:` config section binds logical names to infrastructure (Redis Streams, SQS, NATS, …), mirroring `placements`' logical-vs-infra separation. Backends implement a minimal consumer contract (subscribe → payload stream + ack/nack) via a plugin interface. Delivery is at-least-once with inbound dedupe on message id — symmetric with the outbound `detach` idempotency-key design (5.6). M3 ships the interface plus one blessed reference backend (Redis Streams); further backends are plugins.
+- **`respond: sync` (settled)**: sync is a compile-time-constrained mode. A flow exposed via `respond: sync` must be **statically interrupt-free** — no `human` node reachable from its entry, no wait-style constructs — enforced by graph reachability analysis (same static machinery as SCC and exhaustiveness). Sync triggers require a `timeout:` (default 60s); on expiry the response **upgrades to async** (HTTP 202 + execution id + status URL) while the execution continues durably — nothing cancelled, no work lost. Node retries consume the timeout budget with no special casing.
+- **Codegen**: `manual` → the `run` CLI; `http` → a generated FastAPI app wrapping the compiled graph (start / resume / status routes), reusing the same generated Pydantic models for payload validation. Auth on `http` triggers is deliberately out of scope for v0 (deploy behind your own gateway); a declarative auth story belongs with `placements` in M3.
+
+### 5.10 Compiler contract
 
 - **Generated code is a build artifact, never hand-edited.** The DSL is the single source of truth.
 - **Deterministic codegen**: same DSL → byte-identical output (stable ordering), so regeneration diffs are meaningful.
@@ -148,8 +244,7 @@ imports:
   - agents/reviewer.yml
   - tools/web_search.yml
   - flows/review_loop.yml
-
-entrypoint: flow.review_loop
+  - triggers.yml            # see 5.9 — entrypoints are the flows triggers target
 
 state:
   draft: { type: string }
@@ -185,14 +280,14 @@ Validator guarantees for this file: all refs resolve and are correctly typed; `v
 ## 7. Milestones
 
 **M0 — Spec & validator (the product's core loop)**
-- Grammar spec + published JSON Schema (editor autocomplete/validation for free).
+- Grammar spec + published JSON Schema (editor autocomplete/validation for free). Grammar includes `human` nodes, `writes:` remaps, `context: inherit`, `triggers` (manual/http active; schedule/event reserved), and `placements` (parsed; no-op).
 - Parser → resolver (imports, address scheme) → flat IR.
-- Static checks: reference/type resolution, schema compatibility across edges, routing exhaustiveness, SCC cycle-termination, unreachable nodes, undefined state channels.
+- Static checks: reference/type resolution, schema compatibility across edges, routing exhaustiveness (edges and map variants), SCC cycle-termination, fan-out bounding, reducer-channel write rules inside maps, trigger input-binding compatibility, sync-trigger interrupt-free reachability, unreachable nodes, undefined state channels.
 - `agent-compose validate` with precise, actionable error messages. Error UX is a feature, not polish — it is the coding-agent feedback loop.
 
 **M1 — Codegen (single process)**
-- IR → deterministic LangGraph Python: state models, node fns, routers with embedded CEL, bounded cycles, `map`→`Send`, subgraphs, retry/timeout policy.
-- `agent-compose build`, `agent-compose run` (thin wrapper), golden-file codegen tests.
+- IR → deterministic LangGraph Python: state models (incl. tagged unions), node fns, routers with embedded CEL, bounded cycles, homogeneous + discriminator-routed `map`→`Send` with index-tagged reducers, subgraphs, retry/timeout policy.
+- `agent-compose build`, `agent-compose run` (manual trigger), `agent-compose serve` (generated FastAPI app for http triggers: start/resume/status), golden-file codegen tests.
 
 **M2 — Ergonomics**
 - `agent-compose plan` (topology + validation diff between two specs).
@@ -202,6 +297,7 @@ Validator guarantees for this file: all refs resolve and are correctly typed; `v
 **M3 — Distribution (design-gated)**
 - `--target distributed` via `RemoteGraph`; execute `placements`.
 - Postgres checkpointer wiring; isolation/credential story per placement.
+- Execute `schedule` and `event` triggers; declarative auth for `http` triggers.
 
 ## 8. Risks
 
@@ -213,15 +309,24 @@ Validator guarantees for this file: all refs resolve and are correctly typed; `v
 | CEL↔Python semantic drift | Embed cel-python (no transpilation) in v0 |
 | Scope creep toward bespoke runtime | Hard non-goal; LangGraph owns execution |
 
-## 9. Open Questions
+## 9. Resolved Questions (log)
 
-1. Data-edge syntax beyond name-based state wiring — needed in v0 or defer?
-2. Conversation-history scoping across subgraph boundaries (inherit, isolate, or explicit binding?).
-3. Tool invocation taxonomy surface: expose PayPal's tool (LLM-invoked) vs function (graph-invoked) distinction as separate keywords, or unify with an `invoked_by` attribute?
-4. Human-in-the-loop nodes (LangGraph interrupts) — v0 grammar or M2?
-5. Spec versioning/migration policy for the DSL itself.
+Formerly open, now settled — rationale lives in the referenced sections:
 
-## 10. References
+1. **Data edges** → deferred; per-node `writes:` remap ships in v0 (5.7).
+2. **Conversation-history scoping** → isolated by default; opt-in `context: inherit` (5.7).
+3. **Tool vs function** → separate keywords, unified definitions (5.5).
+4. **Human-in-the-loop** → `human` node type in v0 grammar; runtime may land M2 (5.5).
+5. **Spec versioning** → required `version:` field; semver on the spec; compiler declares a supported range; breaking changes gated behind a major bump + `agent-compose migrate` codemod; old syntax is never silently reinterpreted — refuse and point at the migration. Pre-1.0, minor bumps may break with a migration provided.
+6. **`detach` under durable execution** → idempotency-key design, v0 restriction (5.6).
+7. **`event` backend abstraction** → pluggable consumer interface, backend-agnostic grammar via `event_sources:`, at-least-once + inbound dedupe, one blessed reference backend in M3 (5.9).
+8. **`respond: sync` semantics** → compile-time interrupt-free requirement + mandatory timeout with async upgrade (202 + execution id) (5.9).
+
+## 10. Open Questions
+
+_None. New questions raised during grammar/spec work land here and must be resolved (moved to §9) before implementation of the affected area begins._
+
+## 11. References
 
 - Oracle, *Open Agent Specification* — arXiv 2510.04173
 - Daunis (PayPal), *A Declarative Language for Building And Orchestrating LLM-Powered Agent Workflows* — arXiv 2512.19769
