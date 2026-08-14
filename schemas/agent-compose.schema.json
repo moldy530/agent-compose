@@ -149,6 +149,13 @@
         { "not": { "enum": ["start", "end"] } }
       ]
     },
+    "controlTarget": {
+      "description": "A control-transfer target: a flow-local node id, or the pseudo-node `end` (finish this flow instance, materializing its outputs). Never `start`. Used by `on_error.fallback` and `human.on_timeout`, which accept exactly the same targets. Grammar 2.4, 9.2.",
+      "allOf": [
+        { "$ref": "#/$defs/identifier" },
+        { "not": { "const": "start" } }
+      ]
+    },
     "agentRef": {
       "description": "A reference to an agent definition, e.g. agent.reviewer.",
       "type": "string",
@@ -229,6 +236,42 @@
       "minProperties": 1,
       "propertyNames": { "$ref": "#/$defs/identifier" },
       "additionalProperties": { "$ref": "#/$defs/outputTypeNode" }
+    },
+
+    "execEnvelopeFields": {
+      "description": "The envelope of an inline `exec:` node: fields synthesized from the child process rather than decoded from its stdout. Declaring one pins its type. Grammar 8.2 / Decision D56.",
+      "properties": {
+        "exit_code": {
+          "description": "The child's exit status, taken from the process (never decoded from stdout). Must be declared as { type: integer }.",
+          "required": ["type"],
+          "properties": { "type": { "const": "integer" } }
+        },
+        "stdout": {
+          "description": "The child's raw stdout, bound as text (never parsed). Must be declared as { type: string }.",
+          "required": ["type"],
+          "properties": { "type": { "const": "string" } }
+        },
+        "stderr": {
+          "description": "The child's raw stderr, bound as text. Must be declared as { type: string }.",
+          "required": ["type"],
+          "properties": { "type": { "const": "string" } }
+        }
+      }
+    },
+    "httpEnvelopeFields": {
+      "description": "The envelope of an inline `http:` node: fields synthesized from the response rather than decoded from its body. Declaring one pins its type. Grammar 8.3 / Decision D56.",
+      "properties": {
+        "status": {
+          "description": "The HTTP status code, taken from the response (never decoded from the body). Must be declared as { type: integer }.",
+          "required": ["type"],
+          "properties": { "type": { "const": "integer" } }
+        },
+        "body": {
+          "description": "The raw response text, bound as-is (never parsed). Must be declared as { type: string }.",
+          "required": ["type"],
+          "properties": { "type": { "const": "string" } }
+        }
+      }
     },
 
     "typeNode": {
@@ -684,7 +727,7 @@
           "properties": {
             "fallback": {
               "description": "A flow-local node id, or `end`.",
-              "allOf": [{ "$ref": "#/$defs/identifier" }, { "not": { "const": "start" } }]
+              "$ref": "#/$defs/controlTarget"
             }
           },
           "additionalProperties": false
@@ -725,7 +768,10 @@
         "model": { "description": "The model binding. Agents reference model.* only - no inline provider or settings overrides (PRD 5.9).", "$ref": "#/$defs/modelRef" },
         "prompt": { "description": "System instructions. Literal text: there is no interpolation; dynamic content travels through the input schema.", "type": "string", "minLength": 1 },
         "output": { "description": "REQUIRED structured output schema. Load-bearing for routing (PRD 5.3) and for making every edge serializable (PRD 5.7).", "$ref": "#/$defs/outputFieldMap" },
-        "input": { "description": "Optional input schema. Omitted means string-in: a single unnamed string bound with the scalar form at the node.", "$ref": "#/$defs/fieldMap" },
+        "input": {
+          "description": "Optional input schema, declaring at least one field. Omitting it is the only way to get the string-in default (a single unnamed string bound with the scalar form at the node); `input: {}` is neither contract and is a compile error.",
+          "allOf": [{ "$ref": "#/$defs/fieldMap" }, { "minProperties": 1 }]
+        },
         "tools": {
           "description": "LLM-discovered tools: tool.* definitions and flow.* modules used as tools.",
           "type": "array",
@@ -880,8 +926,8 @@
           "$ref": "#/$defs/cel"
         },
         "else": {
-          "description": "Marks the default edge: taken only when no guarded sibling edge from the same source was taken. At most one per source node.",
-          "type": "boolean"
+          "description": "Marks the default edge: taken only when no guarded sibling edge from the same source was taken. At most one per source node. `true` is the only legal value - an edge with neither `when` nor `else` is already unconditional, so `else: false` would change nothing.",
+          "const": true
         },
         "max_iterations": {
           "description": "Cycle bound: maximum traversals of this edge within one flow instance. Every SCC needs at least one bounded edge (PRD 5.4).",
@@ -943,8 +989,11 @@
               "additionalProperties": { "$ref": "#/$defs/interpolatedString" }
             },
             "output": {
-              "description": "Result schema (default: { exit_code: integer, stdout: string }).",
-              "$ref": "#/$defs/outputFieldMap"
+              "description": "Result schema (default: { exit_code: integer, stdout: string }). `exit_code`, `stdout`, and `stderr` are envelope fields bound from the child process itself, with fixed types; any other field is decoded from stdout as JSON. Grammar 8.2.",
+              "allOf": [
+                { "$ref": "#/$defs/outputFieldMap" },
+                { "$ref": "#/$defs/execEnvelopeFields" }
+              ]
             }
           },
           "additionalProperties": false
@@ -995,8 +1044,11 @@
               "items": { "type": "integer", "minimum": 100, "maximum": 599 }
             },
             "output": {
-              "description": "Result schema (default: { status: integer, body: string }).",
-              "$ref": "#/$defs/outputFieldMap"
+              "description": "Result schema (default: { status: integer, body: string }). `status` and `body` are envelope fields bound from the response itself, with fixed types; any other field is decoded from the response body as JSON. Grammar 8.3.",
+              "allOf": [
+                { "$ref": "#/$defs/outputFieldMap" },
+                { "$ref": "#/$defs/httpEnvelopeFields" }
+              ]
             }
           },
           "additionalProperties": false,
@@ -1069,7 +1121,7 @@
             "input": { "description": "Schema of what is rendered for the human.", "$ref": "#/$defs/fieldMap" },
             "output": { "description": "Schema of what they return; routable like any structured output, and the contract resume payloads are validated against.", "$ref": "#/$defs/outputFieldMap" },
             "timeout": { "description": "Wall-clock wait budget.", "$ref": "#/$defs/duration" },
-            "on_timeout": { "description": "Node id taken on expiry. Required whenever `timeout` is set.", "$ref": "#/$defs/nodeId" }
+            "on_timeout": { "description": "Where control goes on expiry: a flow-local node id, or `end`. The same targets `on_error.fallback` accepts. Required whenever `timeout` is set.", "$ref": "#/$defs/controlTarget" }
           },
           "additionalProperties": false,
           "dependentRequired": { "timeout": ["on_timeout"] }
@@ -1093,10 +1145,11 @@
         },
         "key": { "description": "CEL key expression. Inside a map-dispatched instance a write's key must derive from the item.", "$ref": "#/$defs/cel" },
         "value": {
-          "description": "Value to write: a field map of CEL expressions (kv set) or a CEL string (vector upsert text, blob put content).",
+          "description": "Value to write. `kv set` takes a field map of CEL expressions, checked against the store's value_schema; `vector upsert` and `blob put` take a single CEL string (the text / the content). Grammar 11.4.",
           "oneOf": [
-            { "$ref": "#/$defs/cel" },
+            { "description": "The text (vector upsert) or content (blob put).", "$ref": "#/$defs/cel" },
             {
+              "description": "Field -> CEL, matching the store's value_schema (kv set).",
               "type": "object",
               "propertyNames": { "$ref": "#/$defs/identifier" },
               "additionalProperties": { "$ref": "#/$defs/cel" }
@@ -1143,6 +1196,26 @@
         {
           "if": { "properties": { "op": { "const": "search" } }, "required": ["op"] },
           "then": { "required": ["query", "top_k"] }
+        },
+        {
+          "if": { "properties": { "op": { "const": "set" } }, "required": ["op"] },
+          "then": {
+            "description": "`kv set` writes a value_schema-shaped object: `value` is a field map of CEL expressions, never a bare expression.",
+            "properties": {
+              "value": {
+                "type": "object",
+                "propertyNames": { "$ref": "#/$defs/identifier" },
+                "additionalProperties": { "$ref": "#/$defs/cel" }
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "op": { "enum": ["upsert", "put"] } }, "required": ["op"] },
+          "then": {
+            "description": "`vector upsert` and `blob put` write one string: `value` is a CEL expression, never a field map.",
+            "properties": { "value": { "$ref": "#/$defs/cel" } }
+          }
         }
       ]
     },
@@ -1208,7 +1281,6 @@
             }
           ]
         },
-        "writes": { "description": "Write remap for the map node as a whole.", "$ref": "#/$defs/writes" },
         "retry": { "$ref": "#/$defs/retry" },
         "timeout": { "description": "Wall-clock bound on the whole fan-out.", "$ref": "#/$defs/duration" },
         "on_error": { "$ref": "#/$defs/onError" },
@@ -1445,10 +1517,19 @@
           "enum": ["sync", "async"]
         },
         "timeout": { "description": "Response budget for respond: sync (default 60s). On expiry the response upgrades to async (202 + execution id) and the execution continues durably.", "$ref": "#/$defs/duration" },
-        "callback": { "description": "CEL over payload producing a completion webhook URL. Async only.", "$ref": "#/$defs/cel" },
+        "callback": { "description": "CEL over payload producing a completion webhook URL. Async only: `callback` with `respond: sync` is a compile error, since a synchronous response already returns the outputs.", "$ref": "#/$defs/cel" },
         "description": { "description": "Documentation.", "type": "string" }
       },
-      "additionalProperties": false
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": { "properties": { "respond": { "const": "sync" } }, "required": ["respond"] },
+          "then": {
+            "description": "A synchronous trigger returns the flow's outputs on the request itself; a completion webhook has nothing left to deliver.",
+            "not": { "required": ["callback"] }
+          }
+        }
+      ]
     },
     "scheduleTrigger": {
       "description": "RESERVED grammar: parsed and validated in v0, executed in M3. Grammar 13.4 / PRD 5.11.",
