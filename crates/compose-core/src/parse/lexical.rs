@@ -9,7 +9,7 @@
 
 use crate::ast::common::{
     Address, Cel, ControlTarget, Duration, DurationUnit, EdgeSource, EdgeTarget, EnvRef, Ident,
-    Interpolated, Namespace, PSEUDO_NODES, PathExpr, PathStep, RESERVED_CHANNEL_NAMES,
+    Interpolated, Namespace, PSEUDO_NODES, PathExpr, PathStep, RESERVED_ROOT_NAMES,
 };
 use crate::diag::{Diagnostic, DiagnosticCode, Spanned};
 use crate::yaml::{Node, Yaml};
@@ -74,7 +74,7 @@ pub(crate) fn channel_name(
     cx: &mut Cx,
 ) -> Option<Spanned<Ident>> {
     let name = identifier(text, subject, cx)?;
-    if RESERVED_CHANNEL_NAMES.contains(&name.value.as_str()) {
+    if RESERVED_ROOT_NAMES.contains(&name.value.as_str()) {
         let reason = if name.value.as_str() == "messages" {
             "`messages` is the implicit conversation-history channel"
         } else {
@@ -88,7 +88,7 @@ pub(crate) fn channel_name(
             )
             .with_help(format!(
                 "reserved channel names are {}",
-                list(RESERVED_CHANNEL_NAMES)
+                list(RESERVED_ROOT_NAMES)
             )),
         );
         return None;
@@ -96,8 +96,36 @@ pub(crate) fn channel_name(
     Some(name)
 }
 
-/// Read a flow-local node id: an identifier that is not a pseudo-node
-/// (grammar 2.4).
+/// Why the reserved-root list refuses a node id (grammar 2.5, Decision D74).
+const RESERVED_NODE_ID_RULE: &str = "a node id is the root of `<node>.output` in an edge guard and in `map.over`, so a node named `input` would make `input.output.x` ambiguous with the flow input object; the reserved names are `input`, `state`, `execution`, `item`, `messages`, `output`, `payload`";
+
+/// Refuse a reserved root name in a position that names a flow-local node id
+/// (grammar 2.5, Decision D74).
+///
+/// The four positions §2.5 governs for node ids are the `nodes:` key itself and
+/// the three that refer to one: an edge's `from`/`to` and the two
+/// control-transfer targets. Refusing the name at every one of them keeps a
+/// composition from spelling a node the `nodes:` map could never declare.
+fn reject_reserved_node_id(name: &Spanned<Ident>, cx: &mut Cx) -> bool {
+    if !RESERVED_ROOT_NAMES.contains(&name.value.as_str()) {
+        return false;
+    }
+    cx.push(
+        Diagnostic::error(
+            DiagnosticCode::ReservedName,
+            name.span.clone(),
+            format!(
+                "`{}` is a reserved name and may not be used as a node id",
+                name.value
+            ),
+        )
+        .with_help(RESERVED_NODE_ID_RULE),
+    );
+    true
+}
+
+/// Read a flow-local node id: an identifier that is neither a pseudo-node
+/// (grammar 2.4) nor a reserved root name (grammar 2.5, Decision D74).
 pub(crate) fn node_id(
     text: &Spanned<String>,
     subject: &str,
@@ -116,6 +144,9 @@ pub(crate) fn node_id(
             )
             .with_help("`start` is a flow's entry and `end` its exit; they are written on edges"),
         );
+        return None;
+    }
+    if reject_reserved_node_id(&name, cx) {
         return None;
     }
     Some(name)
@@ -144,6 +175,9 @@ pub(crate) fn control_target(
         return None;
     }
     let name = identifier(&text, subject, cx)?;
+    if reject_reserved_node_id(&name, cx) {
+        return None;
+    }
     Some(name.map(ControlTarget::Node))
 }
 
@@ -163,7 +197,10 @@ pub(crate) fn edge_source(node: &Node, cx: &mut Cx) -> Option<Spanned<EdgeSource
             );
             None
         }
-        _ => identifier(&text, "`from`", cx).map(|name| name.map(EdgeSource::Node)),
+        _ => {
+            let name = identifier(&text, "`from`", cx)?;
+            (!reject_reserved_node_id(&name, cx)).then(|| name.map(EdgeSource::Node))
+        }
     }
 }
 
@@ -185,7 +222,10 @@ pub(crate) fn edge_target(node: &Node, cx: &mut Cx) -> Option<Spanned<EdgeTarget
             );
             None
         }
-        _ => identifier(&text, "`to`", cx).map(|name| name.map(EdgeTarget::Node)),
+        _ => {
+            let name = identifier(&text, "`to`", cx)?;
+            (!reject_reserved_node_id(&name, cx)).then(|| name.map(EdgeTarget::Node))
+        }
     }
 }
 

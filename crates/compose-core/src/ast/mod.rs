@@ -33,7 +33,7 @@ pub use binding::{
 pub use common::{
     Address, Cel, ControlTarget, Duration, DurationUnit, EdgeSource, EdgeTarget, EnvRef, Ident,
     Interpolated, Literal, LiteralEntry, Namespace, PSEUDO_NODES, PathExpr, PathStep,
-    RESERVED_CHANNEL_NAMES,
+    RESERVED_ROOT_NAMES,
 };
 pub use definition::{
     AgentAccess, AgentDef, Definition, DefinitionBody, DirectModel, EmbedBlock, ModelDef,

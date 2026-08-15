@@ -1,0 +1,14 @@
+# rule: an edge endpoint names a node id, so it may not be a reserved root name (grammar 2.5, Decision D74)
+# code: reserved-name
+# message: `state` is a reserved name and may not be used as a node id
+# at: 14:26
+# help: a node id is the root of `<node>.output` in an edge guard and in `map.over`, so a node named `input` would make `input.output.x` ambiguous with the flow input object; the reserved names are `input`, `state`, `execution`, `item`, `messages`, `output`, `payload`
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    write:
+      agent: agent.researcher
+  edges:
+    - { from: start, to: write }
+    - { from: write, to: state }

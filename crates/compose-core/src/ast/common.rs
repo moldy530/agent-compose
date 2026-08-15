@@ -394,11 +394,20 @@ pub enum EdgeTarget {
     Node(Ident),
 }
 
-/// Identifiers that may not name a state channel (grammar 2.5, Decision D33).
+/// The seven **reserved root names** of grammar 2.5 (Decisions D33, D74).
 ///
-/// They are CEL root identifiers or the implicit conversation-history channel,
-/// so a channel of the same name would make expressions ambiguous.
-pub const RESERVED_CHANNEL_NAMES: &[&str] = &[
+/// Five are CEL roots (`input`, `state`, `execution`, `payload`, and `item`, a
+/// `map`'s default per-item binding); `messages` is the implicit
+/// conversation-history channel (grammar 10.4); and `output` is the fixed
+/// selector half of `<node>.output`, on the list to keep that token to one
+/// meaning rather than because it is a root.
+///
+/// None of them may name a **state channel**, a **flow-local node id** — which
+/// is why they are refused in the two edge endpoints and the two
+/// control-transfer positions that name one — or a `map`'s **`as:`** binding,
+/// where `item` is the one exception, being that binding's own default name
+/// (grammar 2.5).
+pub const RESERVED_ROOT_NAMES: &[&str] = &[
     "input",
     "state",
     "execution",
