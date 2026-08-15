@@ -1,0 +1,25 @@
+# rule: a discriminator-routed map declares `input:` per route (grammar 8.6 rule 7, Decision D85)
+# code: conflicting-keys
+# message: `input` is not legal on a discriminator-routed map
+# at: 17:9
+# help: each route's per-item bindings are narrowed to its own variant's payload, so a map-level `input` would have to type-check against every variant at once: declare it on the routes (grammar 8.6 rule 7)
+flow.demo:
+  outputs:
+    done: { type: boolean }
+  nodes:
+    plan:
+      agent: agent.planner
+    fan:
+      map:
+        over: plan.output.findings
+        route_by: kind
+        max_concurrency: 4
+        input:
+          summary: "finding.summary"
+        routes:
+          auto_fixable: { node: agent.fixer }
+          needs_human: { node: tool.review_queue }
+  edges:
+    - { from: start, to: plan }
+    - { from: plan, to: fan }
+    - { from: fan, to: end }

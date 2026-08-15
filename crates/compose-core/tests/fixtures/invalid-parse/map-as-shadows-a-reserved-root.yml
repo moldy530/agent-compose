@@ -1,0 +1,21 @@
+# rule: a map's `as:` binding may not shadow a root already in scope for its per-item expressions (grammar 2.5, 8.6, Decision D74)
+# code: reserved-name
+# message: `state` is a reserved name and may not be a `map`'s `as` binding
+# at: 15:13
+# help: the per-item binding is itself a root in the map's per-item expressions, so it may not shadow one that is already there; `item` is the one legal reserved name, being this binding's own default
+flow.demo:
+  outputs:
+    done: { type: boolean }
+  nodes:
+    plan:
+      agent: agent.planner
+    fan:
+      map:
+        over: plan.output.tasks
+        as: state
+        node: agent.worker
+        max_concurrency: 4
+  edges:
+    - { from: start, to: plan }
+    - { from: plan, to: fan }
+    - { from: fan, to: end }

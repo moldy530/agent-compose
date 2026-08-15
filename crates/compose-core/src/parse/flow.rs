@@ -14,7 +14,7 @@ use crate::yaml::{Node, Yaml};
 use super::binding::{self, NameForm};
 use super::definition::description;
 use super::lexical;
-use super::policy;
+use super::policy::{self, PolicyLevel};
 use super::reader::{Cx, Fields, expect_mapping, expect_sequence, expect_string, in_range, list};
 use super::schema;
 
@@ -63,10 +63,18 @@ pub(crate) fn flow_def(fields: &mut Fields<'_>, subject: &str, cx: &mut Cx) -> F
                 format!("`edges` of {subject} must declare at least one edge"),
             );
         }
+        // Whether some edge was unreadable. The start-edge rule below is stated
+        // over the whole array, so a partial one cannot answer it: reporting
+        // "no guaranteed edge leaves `start`" on top of the diagnostic that
+        // already explained the broken edge would be a second error for one
+        // mistake.
+        let mut incomplete = false;
         for item in items {
             let Some(edge) = edge(item, cx) else {
+                incomplete = true;
                 continue;
             };
+            incomplete |= edge.from.is_none() || edge.to.is_none();
             if let Some(first) = edges.iter().find(|other| same_edge(other, &edge)) {
                 cx.push(
                     Diagnostic::error(
@@ -81,6 +89,10 @@ pub(crate) fn flow_def(fields: &mut Fields<'_>, subject: &str, cx: &mut Cx) -> F
             }
             edges.push(edge);
         }
+        if !incomplete && !items.is_empty() {
+            check_start_is_guaranteed(&edges, &node.span, subject, cx);
+            check_else_edges_have_a_guarded_sibling(&edges, cx);
+        }
     }
 
     FlowDef {
@@ -89,6 +101,116 @@ pub(crate) fn flow_def(fields: &mut Fields<'_>, subject: &str, cx: &mut Cx) -> F
         outputs,
         nodes,
         edges,
+    }
+}
+
+/// At least one edge leaving `start` must be guaranteed to fire — unconditional
+/// or carrying `else: true` — so an execution always has a first step instead of
+/// dying on "no viable route" before doing any work (grammar 7.6.3 rule 2,
+/// Decision D71).
+///
+/// This is the one no-dead-end rule decidable from a single file: it is stated
+/// over the `edges:` array, which is one value. Its two siblings — every node
+/// having an outgoing edge, and the `on_error: skip` escape — relate an edge to
+/// a node, so they belong to the validator alongside reachability.
+///
+/// The `else: true` spelling carries its own precondition, a `when:`-guarded
+/// sibling, which [`check_else_edges_have_a_guarded_sibling`] decides
+/// separately: this check reads exactly what grammar 7.6.3 rule 2 states, and a
+/// lone `else: true` leaving `start` is refused by the other rule rather than
+/// by a second reading of this one.
+fn check_start_is_guaranteed(edges: &[Edge], span: &Span, subject: &str, cx: &mut Cx) {
+    let leaves_start = |edge: &&Edge| {
+        matches!(
+            edge.from.as_ref().map(|from| &from.value),
+            Some(crate::ast::common::EdgeSource::Start)
+        )
+    };
+    let mut from_start = edges.iter().filter(leaves_start).peekable();
+    if from_start.peek().is_none() {
+        cx.push(
+            Diagnostic::error(
+                DiagnosticCode::MissingKey,
+                span.clone(),
+                format!("no edge leaves `start` in `edges` of {subject}"),
+            )
+            .with_help(
+                "a flow's entry is `start`, and one or more edges leave it: write `- { from: start, to: <node> }` (grammar 2.4)",
+            ),
+        );
+        return;
+    }
+    if from_start.any(|edge| edge.when.is_none()) {
+        return;
+    }
+    cx.push(
+        Diagnostic::error(
+            DiagnosticCode::InvalidValue,
+            span.clone(),
+            format!(
+                "every edge leaving `start` in {subject} is guarded: at least one must be unconditional or carry `else: true`"
+            ),
+        )
+        .with_help(
+            "with every guard false an execution takes no edge at all and fails before its first step; guarded `start` edges are legal, they just cannot be the only ones (grammar 7.6.3)",
+        ),
+    );
+}
+
+/// An edge carrying `else: true` must have a `when:`-guarded sibling leaving the
+/// same node (grammar 7.3, Decision D107).
+///
+/// Grammar 7.3 rule 4 gives an `else:` edge exactly one behaviour — taken iff no
+/// guarded sibling was taken — so with no guarded sibling it fires on every
+/// pass, which is what an edge carrying neither keyword already is. The keyword
+/// then states nothing, while the author who wrote it to mean "only if the other
+/// edge did not fire" gets multicast to both targets: two concurrent branches, a
+/// reduced-channel requirement they did not expect, and possibly an unbalanced
+/// convergence downstream, none of it diagnosed. It is the inert key
+/// Decision D61 already refuses in its `else: false` spelling.
+///
+/// Grammar Appendix B lists this among the rules the *published schema* cannot
+/// express — it relates two items of one `edges:` array through a shared `from`
+/// value. That is a statement about JSON Schema, not about this pass: the rule
+/// needs no resolution, so it is decided here, exactly as `optional:` entries
+/// naming declared properties are (grammar 3.4, Decision D89).
+fn check_else_edges_have_a_guarded_sibling(edges: &[Edge], cx: &mut Cx) {
+    for edge in edges {
+        let Some(else_span) = edge.else_edge.as_ref() else {
+            continue;
+        };
+        let Some(from) = edge.from.as_ref() else {
+            continue;
+        };
+        let has_guarded_sibling = edges.iter().any(|other| {
+            other.when.is_some()
+                && other.from.as_ref().map(|other| &other.value) == Some(&from.value)
+        });
+        if has_guarded_sibling {
+            continue;
+        }
+        cx.push(
+            Diagnostic::error(
+                DiagnosticCode::InvalidValue,
+                else_span.clone(),
+                format!(
+                    "the `else: true` edge leaving `{}` has no `when`-guarded sibling",
+                    describe_source(&from.value)
+                ),
+            )
+            .with_label(from.span.clone(), "no other edge leaving this node is guarded")
+            .with_help(
+                "an `else:` edge is taken when no guarded sibling was taken, so with none it fires on every pass — which is what an edge carrying neither keyword already is: drop the `else:`, or guard the sibling it is meant to be else to (grammar 7.3, Decision D107)",
+            ),
+        );
+    }
+}
+
+/// How an edge's `from` reads in a diagnostic.
+fn describe_source(source: &crate::ast::common::EdgeSource) -> String {
+    match source {
+        crate::ast::common::EdgeSource::Start => "start".to_owned(),
+        crate::ast::common::EdgeSource::Node(id) => id.to_string(),
     }
 }
 
@@ -143,9 +265,28 @@ fn edge(node: &Node, cx: &mut Cx) -> Option<Edge> {
         );
     }
 
-    let max_iterations = fields
-        .integer("max_iterations", cx)
-        .filter(|value| in_range(value, "`max_iterations`", 1..=1000, cx));
+    // An exhausted edge is not taken whatever its guard says (grammar 7.3
+    // rule 5), so a budget on an unconditional or `else:` edge would quietly
+    // withdraw the guarantee four other rules rest on — exhaustiveness clause 1,
+    // the `start` edge, the skip escape, and the cycle escape (Decision D90).
+    let max_iterations = fields.take_entry("max_iterations").and_then(|entry| {
+        if when.is_none() {
+            cx.push(
+                Diagnostic::error(
+                    DiagnosticCode::InvalidValue,
+                    entry.key.span.clone(),
+                    "`max_iterations` is legal only on an edge that also declares `when`",
+                )
+                .with_help(
+                    "an exhausted edge is not taken whatever its guard says, so a budget on an unconditional or `else:` edge would withdraw the guarantee that makes it an escape: bound the guarded back-edge instead (grammar 7.2, Decision D90)",
+                ),
+            );
+            return None;
+        }
+        super::reader::expect_integer(&entry.value, "`max_iterations`", cx)
+    });
+    let max_iterations =
+        max_iterations.filter(|value| in_range(value, "`max_iterations`", 1..=1000, cx));
     fields.finish(cx);
 
     Some(Edge {
@@ -263,7 +404,7 @@ fn node_object(id: Spanned<crate::ast::common::Ident>, node: &Node, cx: &mut Cx)
     };
 
     let policy = match common.retry_timeout {
-        KeyRule::Allowed => policy::policy_fields(&mut fields, &subject, cx),
+        KeyRule::Allowed => policy::policy_fields(&mut fields, &subject, PolicyLevel::Node, cx),
         KeyRule::Rejected(why) => {
             for key in ["retry", "timeout"] {
                 reject_key(&mut fields, key, &subject, why, cx);
@@ -273,7 +414,7 @@ fn node_object(id: Spanned<crate::ast::common::Ident>, node: &Node, cx: &mut Cx)
                 timeout: None,
                 on_error: fields
                     .take("on_error")
-                    .and_then(|node| policy::on_error(node, &subject, cx)),
+                    .and_then(|node| policy::on_error(node, &subject, PolicyLevel::Node, cx)),
             }
         }
     };
@@ -332,6 +473,10 @@ fn node_input(node: &Node, kind: &NodeKind, subject: &str, cx: &mut Cx) -> Optio
     let context = format!("`input` of {subject}");
     // Which kinds bind field by field, and the declaration each one's bindings
     // have to match. Everything else may take the scalar form of grammar 8.0.
+    // The scalar form is legal only where a single unnamed value has a defined
+    // destination: a string-in agent, and an inline `exec:` node's stdin
+    // (grammar 8.0, Decision D88). Every other kind names its fields, so a bare
+    // scalar there names nothing.
     let named = match kind {
         // A subgraph receives parent state only through explicit named
         // bindings (grammar 8.5, PRD 5.7).
@@ -343,6 +488,16 @@ fn node_input(node: &Node, kind: &NodeKind, subject: &str, cx: &mut Cx) -> Optio
         NodeKind::Human(_) => {
             Some("a human node's `input:` field map declares the names to bind (grammar 8.7)")
         }
+        // An inline `http:` node builds an ad-hoc request object out of named
+        // fields — the JSON body, or the query string (grammar 8.3).
+        NodeKind::Http(_) => Some(
+            "an inline `http:` node builds its request out of named fields, which become the JSON body or the query string (grammar 8.3)",
+        ),
+        // A `function:` node's arguments are checked field by field against the
+        // tool's declared `input` (grammar 8.4).
+        NodeKind::Function(_) => Some(
+            "a `function:` node's arguments are checked field by field against the tool's declared `input` (grammar 8.4)",
+        ),
         _ => None,
     };
     match named {
@@ -368,12 +523,6 @@ fn reject_key(fields: &mut Fields<'_>, key: &'static str, subject: &str, why: &s
 const FLOW_CONTEXTS: &[(&str, FlowContext)] = &[
     ("isolated", FlowContext::Isolated),
     ("inherit", FlowContext::Inherit),
-];
-
-const ITEM_ERRORS: &[(&str, ItemError)] = &[
-    ("fail", ItemError::Fail),
-    ("skip", ItemError::Skip),
-    ("retry", ItemError::Retry),
 ];
 
 const STORE_OPS: &[(&str, StoreOp)] = &[
@@ -687,49 +836,53 @@ fn map_block(node: &Node, subject: &str, cx: &mut Cx) -> Option<MapBlock> {
         .and_then(|node| lexical::path_expression(node, "`over`", cx));
     let item_binding = fields
         .string("as", cx)
-        .and_then(|text| lexical::identifier(&text, "the `as` binding", cx));
+        .and_then(|text| lexical::item_binding_name(&text, "the `as` binding", cx));
     let max_concurrency = fields
         .require("max_concurrency", cx)
         .and_then(|node| super::reader::expect_integer(node, "`max_concurrency`", cx))
         .filter(|value| in_range(value, "`max_concurrency`", 1..=256, cx));
     let on_item_error = fields
         .take("on_item_error")
-        .and_then(|node| lexical::keyword(node, "`on_item_error`", ITEM_ERRORS, cx));
-    let input = fields.take("input").and_then(|node| {
-        binding::bindings(
-            node,
-            &format!("`input` of {context}"),
-            NameForm::Identifier,
-            cx,
-        )
-    });
-    let writes = fields
-        .take("writes")
-        .and_then(|node| binding::writes(node, &format!("`writes` of {context}"), cx));
+        .and_then(|node| item_error(node, &context, cx));
 
+    // A dispatch is the other module boundary for conversation history, and its
+    // isolation is unconditional: every instance runs on a fresh history that is
+    // discarded when it completes, and the sharing opt-in is a `flow:` node's
+    // key. Reporting `context:` here as a plain unknown key would leave the
+    // author who wrote it to guess why (grammar 8.6 rule 13, 10.4, Decision
+    // D105).
+    if let Some(entry) = fields.take_entry("context") {
+        cx.push(
+            Diagnostic::error(
+                DiagnosticCode::UnknownKey,
+                entry.key.span.clone(),
+                format!("`context` is not legal in {context}"),
+            )
+            .with_help(
+                "a `map` dispatch always isolates conversation history: inheriting into concurrent instances would either fork the channel or serialize the fan-out, so the opt-in stays a `flow:` node's key (grammar 8.6 rule 13, Decision D105)",
+            ),
+        );
+    }
+
+    // `input:`, `writes:`, and `detach:` each describe a dispatch *target*, so
+    // a map that routes declares them on its routes: a map-level `input:` would
+    // have to type-check against every variant at once, a map-level `writes:`
+    // would name output fields only some route targets declare, and a blanket
+    // `detach:` would silently detach sinks written to be joined (grammar 8.6
+    // rule 7, Decisions D31, D85).
     let routed = fields.contains("route_by") || fields.contains("routes");
-    let detach = fields.take_entry("detach").and_then(|entry| {
-        if routed {
-            cx.push(
-                Diagnostic::error(
-                    DiagnosticCode::ConflictingKeys,
-                    entry.key.span.clone(),
-                    "`detach` is not legal on a discriminator-routed map".to_owned(),
-                )
-                .with_help(
-                    "the routes of a heterogeneous map are independently typed targets: declare `detach` on the routes that want it (grammar 8.6 rule 7)",
-                ),
-            );
-            return None;
-        }
-        match &entry.value.value {
-            Yaml::Bool(value) => Some(Spanned::new(*value, entry.value.span.clone())),
+    let input = per_target_key(&mut fields, "input", routed, cx)
+        .and_then(|node| binding::node_input(node, &format!("`input` of {context}"), cx));
+    let writes = per_target_key(&mut fields, "writes", routed, cx)
+        .and_then(|node| binding::writes(node, &format!("`writes` of {context}"), cx));
+    let detach =
+        per_target_key(&mut fields, "detach", routed, cx).and_then(|node| match &node.value {
+            Yaml::Bool(value) => Some(Spanned::new(*value, node.span.clone())),
             _ => {
-                cx.wrong_type(&entry.value, "`detach`", "a boolean");
+                cx.wrong_type(node, "`detach`", "a boolean");
                 None
             }
-        }
-    });
+        });
     reject_detached_writes(
         detach.as_ref(),
         writes.as_ref().map(|w| &w.span),
@@ -751,6 +904,116 @@ fn map_block(node: &Node, subject: &str, cx: &mut Cx) -> Option<MapBlock> {
         detach,
         span: node.span.clone(),
     })
+}
+
+/// Why a routed map declares each of the three per-dispatch-target keys on its
+/// routes instead (grammar 8.6 rule 7, Decisions D31, D85).
+fn per_target_reason(key: &str) -> &'static str {
+    match key {
+        "input" => {
+            "each route's per-item bindings are narrowed to its own variant's payload, so a map-level `input` would have to type-check against every variant at once: declare it on the routes (grammar 8.6 rule 7)"
+        }
+        "writes" => {
+            "the routes of a heterogeneous map are independently typed targets with their own output schemas, so a map-level `writes` would name fields only some of them declare: declare it on the routes (grammar 8.6 rule 7)"
+        }
+        _ => {
+            "the routes of a heterogeneous map are independently typed targets, and a blanket `detach` would silently detach sinks written to be joined: declare it on the routes that want it (grammar 8.6 rule 7)"
+        }
+    }
+}
+
+/// Take a map-block key that describes a dispatch target, refusing it on the
+/// routed form (grammar 8.6 rule 7).
+fn per_target_key<'a>(
+    fields: &mut Fields<'a>,
+    key: &'static str,
+    routed: bool,
+    cx: &mut Cx,
+) -> Option<&'a Node> {
+    let entry = fields.take_entry(key)?;
+    if !routed {
+        return Some(&entry.value);
+    }
+    cx.push(
+        Diagnostic::error(
+            DiagnosticCode::ConflictingKeys,
+            entry.key.span.clone(),
+            format!("`{key}` is not legal on a discriminator-routed map"),
+        )
+        .with_help(per_target_reason(key)),
+    );
+    None
+}
+
+/// Read `on_item_error:` — `fail`, `skip`, or `{ retry: <retry block> }`
+/// (grammar 8.6 rule 10, Decision D73).
+///
+/// The same enum-or-single-key-object shape `on_error:` uses one section
+/// earlier, so this adds no vocabulary and one reading rule.
+fn item_error(node: &Node, context: &str, cx: &mut Cx) -> Option<Spanned<ItemError>> {
+    let expectation = format!(
+        "`on_item_error` takes {}, or `{{ retry: {{ max: <n>, backoff: <duration> }} }}`",
+        list(["fail", "skip"])
+    );
+    match &node.value {
+        Yaml::String(text) => match text.as_str() {
+            "fail" => Some(Spanned::new(ItemError::Fail, node.span.clone())),
+            "skip" => Some(Spanned::new(ItemError::Skip, node.span.clone())),
+            // A bare `retry` names a behaviour with no count and no backoff,
+            // and there is nowhere for it to inherit one from: `defaults:`
+            // applies to nodes, and a dispatched instance is not a node of this
+            // flow (Decision D73).
+            "retry" => {
+                cx.push(
+                    Diagnostic::error(
+                        DiagnosticCode::InvalidValue,
+                        node.span.clone(),
+                        format!(
+                            "`on_item_error: retry` in {context} must carry its policy inline"
+                        ),
+                    )
+                    .with_help(
+                        "write `on_item_error: { retry: { max: <n>, backoff: <duration> } }`: a retry with no bound is the unbounded loop fan-out bounding exists to prevent, and no chain supplies an item policy (grammar 8.6 rule 10, Decision D73)",
+                    ),
+                );
+                None
+            }
+            other => {
+                cx.push(
+                    Diagnostic::error(
+                        DiagnosticCode::UnknownVariant,
+                        node.span.clone(),
+                        format!("`{other}` is not an `on_item_error` strategy in {context}"),
+                    )
+                    .with_optional_help(Some(expectation)),
+                );
+                None
+            }
+        },
+        Yaml::Mapping(mapping) => {
+            let block = format!("the `on_item_error` block of {context}");
+            let mut fields = Fields::new(mapping, node.span.clone(), &block);
+            let retry = fields
+                .require("retry", cx)
+                .and_then(|node| policy::retry(node, &block, cx));
+            fields.finish(cx);
+            retry.map(|retry| Spanned::new(ItemError::Retry(retry), node.span.clone()))
+        }
+        _ => {
+            cx.push(
+                Diagnostic::error(
+                    DiagnosticCode::WrongType,
+                    node.span.clone(),
+                    format!(
+                        "expected an `on_item_error` strategy for {context}, found {}",
+                        node.description()
+                    ),
+                )
+                .with_help(expectation),
+            );
+            None
+        }
+    }
 }
 
 fn dispatch(
@@ -905,14 +1168,9 @@ fn map_route(
                 );
             }
         });
-    let input = fields.take("input").and_then(|node| {
-        binding::bindings(
-            node,
-            &format!("`input` of {subject}"),
-            NameForm::Identifier,
-            cx,
-        )
-    });
+    let input = fields
+        .take("input")
+        .and_then(|node| binding::node_input(node, &format!("`input` of {subject}"), cx));
     let writes = fields
         .take("writes")
         .and_then(|node| binding::writes(node, &format!("`writes` of {subject}"), cx));

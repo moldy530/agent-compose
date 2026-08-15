@@ -213,11 +213,15 @@ pub(crate) fn exec_block(
     let mapping = expect_mapping(node, subject, cx)?;
     let mut fields = Fields::new(mapping, node.span.clone(), subject);
 
+    // `command` and `args` are class-2 surfaces like `cwd` and `env`: the whole
+    // `exec:` block is interpolable, and nothing in it is shell-interpreted, so
+    // a substituted value is one argv element rather than a re-parsed command
+    // line (grammar 4.3, Decision D92).
     let command = fields
         .require("command", cx)
-        .and_then(|node| expect_string(node, "`command`", cx))
+        .and_then(|node| lexical::interpolated(node, "`command`", cx))
         .filter(|command| {
-            if command.value.is_empty() {
+            if command.value.as_str().is_empty() {
                 cx.error(
                     DiagnosticCode::InvalidValue,
                     &command.span,
@@ -233,7 +237,7 @@ pub(crate) fn exec_block(
         && let Some(items) = expect_sequence(node, "`args`", cx)
     {
         for item in items {
-            if let Some(arg) = expect_string(item, "each entry of `args`", cx) {
+            if let Some(arg) = lexical::interpolated(item, "each entry of `args`", cx) {
                 args.push(arg);
             }
         }
@@ -246,6 +250,7 @@ pub(crate) fn exec_block(
         .take("env")
         .map(|node| interpolated_map(node, "`env`", NameForm::EnvVar, cx))
         .unwrap_or_default();
+    let expect_exit = accepted_outcomes(&mut fields, "expect_exit", "exit status", 0..=255, cx);
     let output = output_schema(&mut fields, subject, allow_output, EXEC_ENVELOPE, cx);
     fields.finish(cx);
 
@@ -254,9 +259,72 @@ pub(crate) fn exec_block(
         args,
         cwd,
         env,
+        expect_exit,
         output,
         span: node.span.clone(),
     })
+}
+
+/// Read an accepted-outcome list: `expect_exit` or `expect_status`
+/// (grammar 6.1, Decisions D84, D100).
+///
+/// One construct on two surfaces, so one reader: a **non-empty** list of
+/// **distinct** members in the key's own range. An empty list accepts no
+/// outcome at all, so every run would be an error; membership is a set test, so
+/// a repeated member changes nothing about which outcomes are accepted. Both
+/// halves are the inert key Decision D61 refuses, in the two spellings this
+/// shape admits.
+fn accepted_outcomes(
+    fields: &mut Fields<'_>,
+    key: &'static str,
+    noun: &str,
+    range: std::ops::RangeInclusive<i64>,
+    cx: &mut Cx,
+) -> Vec<Spanned<i64>> {
+    let mut accepted: Vec<Spanned<i64>> = Vec::new();
+    let Some(node) = fields.take(key) else {
+        return accepted;
+    };
+    let Some(items) = expect_sequence(node, &format!("`{key}`"), cx) else {
+        return accepted;
+    };
+    if items.is_empty() {
+        cx.push(
+            Diagnostic::error(
+                DiagnosticCode::InvalidValue,
+                node.span.clone(),
+                format!("`{key}` must declare at least one {noun}"),
+            )
+            .with_help(format!(
+                "an empty `{key}` accepts no outcome at all, so every call would be a node error"
+            )),
+        );
+    }
+    for item in items {
+        let Some(value) = super::reader::expect_integer(item, &format!("each `{key}` entry"), cx)
+        else {
+            continue;
+        };
+        if !in_range(&value, &format!("an `{key}` entry"), range.clone(), cx) {
+            continue;
+        }
+        if let Some(first) = accepted.iter().find(|other| other.value == value.value) {
+            cx.push(
+                Diagnostic::error(
+                    DiagnosticCode::InvalidValue,
+                    value.span.clone(),
+                    format!("`{key}` lists {} twice", value.value),
+                )
+                .with_label(first.span.clone(), "first listed here")
+                .with_help(format!(
+                    "membership in `{key}` is a set test, so the second entry changes nothing"
+                )),
+            );
+            continue;
+        }
+        accepted.push(value);
+    }
+    accepted
 }
 
 const HTTP_METHODS: &[(&str, HttpMethod)] = &[
@@ -313,28 +381,8 @@ pub(crate) fn http_block(
         bindings(&entry.value, "`body`", NameForm::Identifier, cx)
     });
 
-    let mut expect_status = Vec::new();
-    if let Some(node) = fields.take("expect_status")
-        && let Some(items) = expect_sequence(node, "`expect_status`", cx)
-    {
-        if items.is_empty() {
-            cx.error(
-                DiagnosticCode::InvalidValue,
-                &node.span,
-                "`expect_status` must declare at least one status code",
-            );
-        }
-        for item in items {
-            let Some(status) =
-                super::reader::expect_integer(item, "each `expect_status` entry", cx)
-            else {
-                continue;
-            };
-            if in_range(&status, "an `expect_status` entry", 100..=599, cx) {
-                expect_status.push(status);
-            }
-        }
-    }
+    let expect_status =
+        accepted_outcomes(&mut fields, "expect_status", "status code", 100..=599, cx);
 
     let output = output_schema(&mut fields, subject, allow_output, HTTP_ENVELOPE, cx);
     fields.finish(cx);

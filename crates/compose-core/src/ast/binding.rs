@@ -77,16 +77,26 @@ pub struct InterpolatedEntry {
 
 /// An `exec:` block: a `tool.*` implementation binding (grammar 6.1) or an
 /// inline node's subprocess step (grammar 8.2).
+///
+/// The whole surface is **interpolable**: `command`, every entry of `args`,
+/// `cwd`, and `env` values may embed `${ENV}` references, substituted at
+/// process start (grammar 4.3 class 2, Decision D92). That is orthogonal to
+/// Decision D24's rule that `args` carries no *CEL* — CEL reads graph data at
+/// run time, an env ref reads the process environment at start.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExecBlock {
     /// `command:` — argv[0], never shell-interpreted.
-    pub command: Option<Spanned<String>>,
-    /// `args:` — literal strings, no CEL (Decision D24).
-    pub args: Vec<Spanned<String>>,
+    pub command: Option<Spanned<Interpolated>>,
+    /// `args:` — literal argv entries, no CEL (Decision D24).
+    pub args: Vec<Spanned<Interpolated>>,
     /// `cwd:`.
     pub cwd: Option<Spanned<Interpolated>>,
     /// `env:` — added to the child environment.
     pub env: Vec<InterpolatedEntry>,
+    /// `expect_exit:` — the accepted exit statuses, non-empty and distinct.
+    /// Empty here means the key was not declared, which is the default `[0]`
+    /// (grammar 6.1, Decisions D84, D100).
+    pub expect_exit: Vec<Spanned<i64>>,
     /// `output:` — inline nodes only; a tool declares its result schema on the
     /// definition instead. Defaults to `{ exit_code, stdout }` (grammar 8.2).
     pub output: Option<FieldMap>,
@@ -162,7 +172,9 @@ pub struct HttpBlock {
     pub query: Option<Bindings>,
     /// `body:` — field name to CEL; illegal for `GET`/`HEAD`.
     pub body: Option<Bindings>,
-    /// `expect_status:` — defaults to any 2xx.
+    /// `expect_status:` — the accepted response statuses, non-empty and
+    /// distinct. Empty here means the key was not declared, which is the
+    /// default "any 2xx" (grammar 6.1, Decisions D84, D100).
     pub expect_status: Vec<Spanned<i64>>,
     /// `output:` — inline nodes only. Defaults to `{ status, body }`
     /// (grammar 8.3).

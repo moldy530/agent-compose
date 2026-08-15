@@ -1,0 +1,17 @@
+# rule: an inline `http:` node builds its request from named fields, so a scalar `input:` names nothing (grammar 8.0, 8.3, Decision D88)
+# code: wrong-type
+# message: expected a mapping of bindings for `input` of node `notify`, found a string
+# at: 14:14
+# help: an inline `http:` node builds its request out of named fields, which become the JSON body or the query string (grammar 8.3); the scalar form binds a string-in agent's single unnamed input instead (grammar 5.3, 8.0, Decision D14)
+flow.demo:
+  outputs:
+    done: { type: boolean }
+  nodes:
+    notify:
+      http:
+        method: POST
+        url: "https://${HOOKS_HOST}/notify"
+      input: "state.draft"
+  edges:
+    - { from: start, to: notify }
+    - { from: notify, to: end }

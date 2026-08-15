@@ -152,6 +152,36 @@ pub(crate) fn node_id(
     Some(name)
 }
 
+/// Read a `map`'s `as:` binding: an identifier that shadows no root in scope
+/// for the map's per-item expressions (grammar 2.5, 8.6, Decision D74).
+///
+/// `item` is the one reserved name that is legal here: it is this binding's own
+/// default name, so binding it explicitly renames nothing.
+pub(crate) fn item_binding_name(
+    text: &Spanned<String>,
+    subject: &str,
+    cx: &mut Cx,
+) -> Option<Spanned<Ident>> {
+    let name = identifier(text, subject, cx)?;
+    if name.value.as_str() != "item" && RESERVED_ROOT_NAMES.contains(&name.value.as_str()) {
+        cx.push(
+            Diagnostic::error(
+                DiagnosticCode::ReservedName,
+                name.span.clone(),
+                format!(
+                    "`{}` is a reserved name and may not be a `map`'s `as` binding",
+                    name.value
+                ),
+            )
+            .with_help(
+                "the per-item binding is itself a root in the map's per-item expressions, so it may not shadow one that is already there; `item` is the one legal reserved name, being this binding's own default",
+            ),
+        );
+        return None;
+    }
+    Some(name)
+}
+
 /// Read a control-transfer target: a flow-local node id, or `end`
 /// (grammar 2.4, 9.2).
 pub(crate) fn control_target(

@@ -1,0 +1,13 @@
+# rule: one or more edges leave `start` (grammar 2.4, 7.6.3)
+# code: missing-key
+# message: no edge leaves `start` in `edges` of flow definition `flow.demo`
+# at: 13:5
+# help: a flow's entry is `start`, and one or more edges leave it: write `- { from: start, to: <node> }` (grammar 2.4)
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    write:
+      agent: agent.researcher
+  edges:
+    - { from: write, to: end }

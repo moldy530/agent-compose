@@ -1,0 +1,21 @@
+# rule: `on_item_error: retry` carries its policy inline; a bare `retry` is an error (grammar 8.6 rule 10, Decision D73)
+# code: invalid-value
+# message: `on_item_error: retry` in the `map` block of node `fan` must carry its policy inline
+# at: 17:24
+# help: write `on_item_error: { retry: { max: <n>, backoff: <duration> } }`: a retry with no bound is the unbounded loop fan-out bounding exists to prevent, and no chain supplies an item policy (grammar 8.6 rule 10, Decision D73)
+flow.demo:
+  outputs:
+    done: { type: boolean }
+  nodes:
+    plan:
+      agent: agent.planner
+    fan:
+      map:
+        over: plan.output.tasks
+        node: agent.worker
+        max_concurrency: 4
+        on_item_error: retry
+  edges:
+    - { from: start, to: plan }
+    - { from: plan, to: fan }
+    - { from: fan, to: end }

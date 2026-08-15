@@ -1,0 +1,17 @@
+# rule: `expect_status` members are distinct, on the same rule `expect_exit` obeys (grammar 6.1, Decision D100)
+# code: invalid-value
+# message: `expect_status` lists 200 twice
+# at: 14:30
+# help: membership in `expect_status` is a set test, so the second entry changes nothing
+flow.demo:
+  outputs:
+    done: { type: boolean }
+  nodes:
+    notify:
+      http:
+        method: POST
+        url: "https://${HOOKS_HOST}/notify"
+        expect_status: [200, 200]
+  edges:
+    - { from: start, to: notify }
+    - { from: notify, to: end }

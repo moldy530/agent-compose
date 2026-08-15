@@ -202,8 +202,7 @@ store.docs:
 store.artifacts:
   kind: blob
   scope: session
-  metadata_schema:
-    content_hash: { type: string }
+  description: Generated artifacts, keyed by document id.
 "#,
     );
 }
@@ -268,13 +267,137 @@ flow.demo:
         node: tool.notify
         input: { subject: "task.title" }
         max_concurrency: 16
-        on_item_error: retry
+        on_item_error: { retry: { max: 2, backoff: 1s } }
         detach: true
       timeout: 30s
       on_error: skip
   edges:
     - { from: start, to: fan_out }
     - { from: fan_out, to: end }
+"#,
+    );
+}
+
+/// A routed map declares `input:`, `writes:`, and `detach:` on its routes, and
+/// a dispatch to a string-in agent binds the item with the scalar form
+/// (grammar 8.6 rules 7 and 12, Decisions D75, D85).
+#[test]
+fn a_routed_map_with_per_route_keys_and_a_scalar_per_item_binding() {
+    accepts(
+        "map-routed.yml",
+        r#"
+flow.demo:
+  outputs:
+    done: { type: boolean }
+  nodes:
+    plan:
+      agent: agent.planner
+    fan_out:
+      map:
+        over: plan.output.findings
+        as: finding
+        route_by: kind
+        max_concurrency: 8
+        on_item_error: skip
+        routes:
+          auto_fixable:
+            node: agent.summarize_one
+            input: "finding.summary"
+            max_concurrency: 4
+          needs_human:
+            node: tool.review_queue
+            input: { summary: "finding.summary" }
+            detach: false
+        default:
+          node: tool.dead_letter
+          input: { payload: "finding.of" }
+  edges:
+    - { from: start, to: plan }
+    - { from: plan, to: fan_out }
+    - { from: fan_out, to: end }
+"#,
+    );
+}
+
+/// `default:` is legal on every type-node form but a union, at every input
+/// surface — an object or array default on an input field is ordinary
+/// (grammar 3.6, Decision D77).
+#[test]
+fn object_and_array_defaults_at_an_input_surface() {
+    accepts(
+        "input-defaults.yml",
+        r#"
+tool.publish:
+  description: Publish a document with optional metadata.
+  input:
+    tags:
+      type: array
+      items: { type: string }
+      default: []
+    author:
+      type: object
+      properties:
+        name: { type: string }
+        email: { type: string, format: email }
+      optional: [email]
+      default: { name: "unknown" }
+  output: {}
+  exec:
+    command: publish
+"#,
+    );
+}
+
+/// Both accepted-outcome lists, on the tool-binding surface and on the inline
+/// node surface (grammar 6.1, 8.2, 8.3, Decisions D84, D100).
+#[test]
+fn accepted_outcome_lists_on_both_surfaces() {
+    accepts(
+        "accepted-outcomes.yml",
+        r#"
+tool.run_checks:
+  description: Run the repository checks.
+  input: {}
+  output:
+    report: { type: string }
+  exec:
+    command: run-checks
+    expect_exit: [0, 1]
+
+tool.fetch_ticket:
+  description: Fetch a ticket, tolerating a miss.
+  input:
+    id: { type: string }
+  output:
+    body: { type: string }
+  http:
+    method: GET
+    url: "https://${API_HOST}/tickets"
+    query: { id: "input.id" }
+    expect_status: [200, 404]
+
+flow.demo:
+  outputs:
+    done: { type: boolean }
+  nodes:
+    verify:
+      exec:
+        command: run-checks
+        expect_exit: [0, 1, 2]
+        output:
+          exit_code: { type: integer }
+          stdout: { type: string }
+    notify:
+      http:
+        method: POST
+        url: "https://${HOOKS_HOST}/notify"
+        expect_status: [200, 202]
+        output:
+          status: { type: integer }
+  edges:
+    - { from: start, to: verify }
+    - { from: verify, to: notify }
+    - { from: notify, to: end }
 "#,
     );
 }
@@ -373,6 +496,31 @@ flow.demo:
       when: "review.output.verdict == 'revise'"
       max_iterations: 3
     - { from: review, to: end, else: true }
+"#,
+    );
+}
+
+/// An `else: true` edge is legal beside a guarded sibling leaving the same
+/// node, and a `start` with a single unconditional edge satisfies the
+/// guaranteed-first-step rule (grammar 7.3, 7.6.3, Decisions D107, D71).
+#[test]
+fn an_else_edge_beside_its_guarded_sibling() {
+    accepts(
+        "else-edge.yml",
+        r#"
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    review:  { agent: agent.reviewer }
+    publish: { agent: agent.publisher }
+    rework:  { agent: agent.reworker }
+  edges:
+    - { from: start, to: review }
+    - { from: review, to: publish, when: "review.output.verdict == 'approve'" }
+    - { from: review, to: rework, else: true }
+    - { from: publish, to: end }
+    - { from: rework, to: end }
 "#,
     );
 }

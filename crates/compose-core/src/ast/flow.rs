@@ -6,7 +6,7 @@ use super::binding::{Bindings, ExecBlock, HttpBlock, NodeInput, Writes};
 use super::common::{
     Address, Cel, ControlTarget, Duration, EdgeSource, EdgeTarget, Ident, PathExpr,
 };
-use super::policy::PolicyBlock;
+use super::policy::{PolicyBlock, Retry};
 use super::schema::FieldMap;
 
 /// A `flow.*` definition: a subgraph module with a declared I/O surface
@@ -47,6 +47,13 @@ pub struct Node {
 }
 
 /// The eight node kinds (grammar 7.1, Decision D23).
+///
+/// The variants differ in size because the constructs do — a `map:` block
+/// carries a dispatch form, per-item bindings, and a policy, while an `agent:`
+/// node is one reference. Each is built once per node and matched by reference
+/// from then on, so boxing the large ones would add indirection to every
+/// consumer and buy nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum NodeKind {
     /// `agent: agent.*`
@@ -246,15 +253,29 @@ pub struct StoreOpParams {
     pub content_type: Option<Spanned<String>>,
 }
 
-/// Per-item error strategy on a `map` node (grammar 8.6).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Per-item error strategy on a `map` node (grammar 8.6 rule 10,
+/// Decision D73).
+///
+/// The shape is the enum-or-single-key-object one `on_error:` already uses: a
+/// retry carries its policy **inline**, because a bare `retry` would name a
+/// behaviour with no count and no backoff and there is no chain for it to
+/// inherit one from — `defaults:` applies to nodes, and a dispatched instance
+/// is not a node of this flow.
+///
+/// `Retry` is the large variant for the same reason `on_error:`'s `Fallback`
+/// is: the strategy that takes a parameter carries it inline. Boxing §9.1's
+/// block here would put an allocation behind a value that is written once and
+/// then only read.
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ItemError {
     /// Fail the whole fan-out (the default).
     Fail,
     /// Drop the failing item and carry on.
     Skip,
-    /// Retry the failing item.
-    Retry,
+    /// Retry the failing item under this policy; when the retries are
+    /// exhausted the item resolves as `fail` does.
+    Retry(Spanned<Retry>),
 }
 
 /// A `map:` block: agent-controlled cardinality with deterministic dispatch
@@ -269,13 +290,19 @@ pub struct MapBlock {
     pub dispatch: MapDispatch,
     /// `max_concurrency:` — required (Decision D28).
     pub max_concurrency: Option<Spanned<i64>>,
-    /// `on_item_error:` — defaults to `fail`.
+    /// `on_item_error:` — defaults to `fail`. The one per-item key that stays
+    /// map-wide, because it is a strategy rather than something typed against
+    /// a target (grammar 8.6 rule 7).
     pub on_item_error: Option<Spanned<ItemError>>,
-    /// `input:` — per-item bindings; without it the whole item is passed.
-    pub input: Option<Bindings>,
-    /// `writes:` — write remap; targets must be reduced channels.
+    /// `input:` — per-item bindings, homogeneous form only; without it the
+    /// whole item is passed. Both forms are legal: a field map, or a bare
+    /// scalar binding a string-in agent's single unnamed input (grammar 8.6
+    /// rule 12, Decision D75).
+    pub input: Option<NodeInput>,
+    /// `writes:` — write remap, homogeneous form only; targets must be reduced
+    /// channels (Decision D85).
     pub writes: Option<Writes>,
-    /// `detach:` — homogeneous form only (Decision D31).
+    /// `detach:` — homogeneous form only (Decisions D31, D85).
     pub detach: Option<Spanned<bool>>,
     /// The block's own span.
     pub span: Span,
@@ -312,8 +339,9 @@ pub struct MapRoute {
     pub node: Option<Spanned<Address>>,
     /// `max_concurrency:` — must be at most the map's.
     pub max_concurrency: Option<Spanned<i64>>,
-    /// `input:` — per-item bindings for this route.
-    pub input: Option<Bindings>,
+    /// `input:` — per-item bindings for this route, in either form (grammar
+    /// 8.6 rule 12, Decision D75).
+    pub input: Option<NodeInput>,
     /// `writes:` — write remap for this route.
     pub writes: Option<Writes>,
     /// `detach:` — fire-and-forget dispatch.

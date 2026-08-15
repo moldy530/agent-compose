@@ -2,7 +2,7 @@
 # code: conflicting-keys
 # message: `detach` is not legal on a discriminator-routed map
 # at: 15:9
-# help: the routes of a heterogeneous map are independently typed targets: declare `detach` on the routes that want it (grammar 8.6 rule 7)
+# help: the routes of a heterogeneous map are independently typed targets, and a blanket `detach` would silently detach sinks written to be joined: declare it on the routes that want it (grammar 8.6 rule 7)
 flow.demo:
   outputs:
     draft: { type: string }

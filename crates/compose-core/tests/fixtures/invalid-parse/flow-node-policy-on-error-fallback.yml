@@ -1,0 +1,23 @@
+# rule: the `fallback` form of `on_error` is illegal in a `flow:` node's `policy:` (grammar 9.2, 9.3, Decision D103)
+# code: invalid-value
+# message: `on_error: { fallback: … }` is not legal in the `policy` block of node `sub`
+# at: 16:19
+# help: a fallback names a node of one flow, and this level names no flow: declare the fallback on the node that needs it, and keep `fail` or `skip` here (grammar 9.3, Decision D103)
+flow.caller:
+  outputs:
+    draft: { type: string }
+  nodes:
+    sub:
+      flow: flow.review_loop
+      input:
+        goal: "input.goal"
+      policy:
+        timeout: 30s
+        on_error: { fallback: cleanup }
+    cleanup:
+      exec:
+        command: cleanup
+  edges:
+    - { from: start, to: sub }
+    - { from: sub, to: cleanup }
+    - { from: cleanup, to: end }

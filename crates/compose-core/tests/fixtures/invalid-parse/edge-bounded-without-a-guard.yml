@@ -1,0 +1,19 @@
+# rule: `max_iterations` is legal only on an edge that also carries `when:` (grammar 7.2, Decision D90)
+# code: invalid-value
+# message: `max_iterations` is legal only on an edge that also declares `when`
+# at: 18:34
+# help: an exhausted edge is not taken whatever its guard says, so a budget on an unconditional or `else:` edge would withdraw the guarantee that makes it an escape: bound the guarded back-edge instead (grammar 7.2, Decision D90)
+flow.loop:
+  outputs:
+    draft: { type: string }
+  nodes:
+    write:
+      agent: agent.researcher
+      input: "input.goal"
+    review:
+      agent: agent.reviewer
+  edges:
+    - { from: start, to: write }
+    - { from: write, to: review }
+    - { from: review, to: write, max_iterations: 3 }
+    - { from: review, to: end }

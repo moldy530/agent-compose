@@ -1,0 +1,22 @@
+# rule: at least one edge leaving `start` is unconditional or carries `else: true` (grammar 7.6.3 rule 2, Decision D71)
+# code: invalid-value
+# message: every edge leaving `start` in flow definition `flow.demo` is guarded: at least one must be unconditional or carry `else: true`
+# at: 19:5
+# help: with every guard false an execution takes no edge at all and fails before its first step; guarded `start` edges are legal, they just cannot be the only ones (grammar 7.6.3)
+flow.demo:
+  inputs:
+    mode: { enum: [fast, slow] }
+  outputs:
+    draft: { type: string }
+  nodes:
+    quick:
+      agent: agent.quick
+      input: "input.goal"
+    thorough:
+      agent: agent.thorough
+      input: "input.goal"
+  edges:
+    - { from: start, to: quick,    when: "input.mode == 'fast'" }
+    - { from: start, to: thorough, when: "input.mode == 'slow'" }
+    - { from: quick, to: end }
+    - { from: thorough, to: end }

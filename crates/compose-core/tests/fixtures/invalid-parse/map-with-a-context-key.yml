@@ -1,0 +1,21 @@
+# rule: a `map` block accepts no `context:` key - a dispatch isolates conversation history unconditionally (grammar 8.6 rule 13, 10.4, Decision D105)
+# code: unknown-key
+# message: `context` is not legal in the `map` block of node `fan`
+# at: 17:9
+# help: a `map` dispatch always isolates conversation history: inheriting into concurrent instances would either fork the channel or serialize the fan-out, so the opt-in stays a `flow:` node's key (grammar 8.6 rule 13, Decision D105)
+flow.demo:
+  outputs:
+    done: { type: boolean }
+  nodes:
+    plan:
+      agent: agent.planner
+    fan:
+      map:
+        over: plan.output.tasks
+        node: flow.ingest
+        max_concurrency: 4
+        context: inherit
+  edges:
+    - { from: start, to: plan }
+    - { from: plan, to: fan }
+    - { from: fan, to: end }
