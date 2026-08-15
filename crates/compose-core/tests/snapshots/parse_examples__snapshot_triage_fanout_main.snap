@@ -72,7 +72,7 @@ Spec(
                             span: 36:5..40:3,
                         },
                         reduce: None,
-                        span: 36:5..40:3,
+                        span: 35:3..40:3,
                     },
                     Channel {
                         name: "matches" @ 40:3..40:10,
@@ -96,7 +96,7 @@ Spec(
                             span: 41:5..51:3,
                         },
                         reduce: None,
-                        span: 41:5..51:3,
+                        span: 40:3..51:3,
                     },
                     Channel {
                         name: "patches" @ 51:3..51:10,
@@ -123,7 +123,7 @@ Spec(
                         reduce: Some(
                             Append @ 56:13..56:19,
                         ),
-                        span: 52:5..58:3,
+                        span: 51:3..58:3,
                     },
                     Channel {
                         name: "summary" @ 58:3..58:10,
@@ -142,7 +142,7 @@ Spec(
                             span: 59:5..63:3,
                         },
                         reduce: None,
-                        span: 59:5..63:3,
+                        span: 58:3..63:3,
                     },
                     Channel {
                         name: "human_decision" @ 63:3..63:17,
@@ -166,7 +166,7 @@ Spec(
                             span: 64:5..67:1,
                         },
                         reduce: None,
-                        span: 64:5..67:1,
+                        span: 63:3..67:1,
                     },
                 ],
                 span: 35:3..67:1,

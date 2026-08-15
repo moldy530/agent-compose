@@ -122,7 +122,7 @@ pub(crate) fn state(node: &Node, cx: &mut Cx) -> Option<StateSection> {
                 span: entry.value.span.clone(),
             },
             reduce,
-            span: entry.value.span.clone(),
+            span: entry.key.span.joined(&entry.value.span),
         });
     }
     Some(StateSection {

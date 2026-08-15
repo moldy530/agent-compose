@@ -30,7 +30,8 @@ pub struct Placement {
     pub network: Option<Spanned<Network>>,
     /// `description:`
     pub description: Option<Spanned<String>>,
-    /// The entry's own span.
+    /// The whole entry's span, address and body together. [`Self::address`]
+    /// carries the address alone, for the diagnostics that are about it.
     pub span: Span,
 }
 
@@ -203,7 +204,8 @@ pub struct EventSource {
     pub connection: Vec<ConnectionField>,
     /// Everything else, for the consumer plugin's schema to check.
     pub extra: Vec<LiteralEntry>,
-    /// The entry's own span.
+    /// The whole entry's span, name and body together. [`Self::name`] carries
+    /// the name alone, for the diagnostics that are about the name.
     pub span: Span,
 }
 

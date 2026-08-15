@@ -194,7 +194,8 @@ pub struct Channel {
     pub ty: TypeNode,
     /// `reduce:` — absent means unreduced: single-writer, sequential.
     pub reduce: Option<Spanned<Reduce>>,
-    /// The entry's own span.
+    /// The whole entry's span, name and body together. [`Self::name`] carries
+    /// the name alone, for the diagnostics that are about the name.
     pub span: Span,
 }
 

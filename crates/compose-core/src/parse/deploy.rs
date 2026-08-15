@@ -58,7 +58,7 @@ pub(crate) fn placements(node: &Node, cx: &mut Cx) -> Option<PlacementsSection> 
             runtime,
             network,
             description,
-            span: entry.value.span.clone(),
+            span: entry.key.span.joined(&entry.value.span),
         });
     }
     Some(PlacementsSection {
@@ -207,7 +207,7 @@ pub(crate) fn event_sources(node: &Node, cx: &mut Cx) -> Option<EventSourcesSect
             kind,
             connection,
             extra,
-            span: entry.value.span.clone(),
+            span: entry.key.span.joined(&entry.value.span),
         });
     }
     Some(EventSourcesSection {
