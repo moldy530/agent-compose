@@ -1,0 +1,6 @@
+# rule: `on_error: { fallback: ... }` is illegal in `defaults:` - a fallback target is flow-local and this level names no flow (grammar 9.2, 9.3 / D103)
+# at: /defaults/on_error
+# via: /$defs/compositionOnError/enum
+defaults:
+  timeout: 60s
+  on_error: { fallback: cleanup }

@@ -715,12 +715,12 @@
     },
 
     "policyBlock": {
-      "description": "Node error policy: retry, timeout, on_error. Used by `defaults:`, by a flow node's `policy:` override, and (flattened) on nodes themselves. Grammar 9 / PRD 5.5.",
+      "description": "Policy at a composition-wide level: the `defaults:` section (chain level 3) and a flow node's `policy:` override (level 1). Both reach nodes of flows they do not name, which has two consequences the node-level keys do not share: `on_error:` here takes `fail` or `skip` only (the `fallback` form is flow-local - Decision D103), and neither level supplies `timeout` or `retry` to a `human` node, whose wait is bounded only by `human.timeout:` (Decision D102). Grammar 9.3 / PRD 5.5.",
       "type": "object",
       "properties": {
         "retry": { "$ref": "#/$defs/retry" },
-        "timeout": { "description": "Wall-clock bound on one node execution, retries included.", "$ref": "#/$defs/duration" },
-        "on_error": { "$ref": "#/$defs/onError" }
+        "timeout": { "description": "Wall-clock bound on one node execution, retries included. Not applied to `human` nodes at this level or any other (Decision D102).", "$ref": "#/$defs/duration" },
+        "on_error": { "$ref": "#/$defs/compositionOnError" }
       },
       "additionalProperties": false
     },
@@ -737,8 +737,12 @@
       },
       "additionalProperties": false
     },
+    "compositionOnError": {
+      "description": "Strategy at a composition-wide level - the `defaults:` section (chain level 3) or a flow node's `policy:` (level 1): fail or skip. The `{ fallback: <node id> }` form is ILLEGAL here. A fallback target is a flow-local node id (grammar 9.2, Decision D21), while neither of these levels names a flow: `defaults:` reaches every node of every flow in the composition, and a `policy:` reaches every node of the instantiated subflow and of everything it instantiates in turn - so the id would have to resolve separately inside flows that need not declare it. \"Retry, then give up\" is still expressible here, since `retry` is a field of its own; a node that needs a fallback declares one on itself. Grammar 9.2, 9.3 / Decision D103.",
+      "enum": ["fail", "skip"]
+    },
     "onError": {
-      "description": "Strategy applied after retries are exhausted: fail (default), skip, or transfer control to another node in the same flow. Grammar 9.2.",
+      "description": "Strategy applied after retries are exhausted, as a node's own key: fail (default), skip, or transfer control to another node in the same flow. The fallback form is node-level only - `defaults:` and a flow node's `policy:` take `compositionOnError` instead (Decision D103). Grammar 9.2.",
       "oneOf": [
         { "description": "fail: abort the execution. skip: produce no output and write nothing.", "enum": ["fail", "skip"] },
         {

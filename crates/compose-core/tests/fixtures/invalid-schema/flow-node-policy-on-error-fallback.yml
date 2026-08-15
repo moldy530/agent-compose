@@ -1,0 +1,21 @@
+# rule: `on_error: { fallback: ... }` is illegal in a flow node's `policy:` - the override propagates into nested instantiations, where the target need not exist (grammar 9.2, 9.3 / D103)
+# at: /flow.caller/nodes/sub/policy/on_error
+# via: /$defs/compositionOnError/enum
+flow.caller:
+  outputs:
+    draft: { type: string }
+  nodes:
+    sub:
+      flow: flow.review_loop
+      input:
+        goal: "input.goal"
+      policy:
+        timeout: 30s
+        on_error: { fallback: cleanup }
+    cleanup:
+      exec:
+        command: cleanup
+  edges:
+    - { from: start, to: sub }
+    - { from: sub, to: cleanup }
+    - { from: cleanup, to: end }

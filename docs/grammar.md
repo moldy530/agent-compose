@@ -1940,7 +1940,7 @@ sub:
 | `input` | map field→CEL | yes when the subflow declares an input without a `default:` | — | explicit bindings only; unbound non-defaulted fields are a compile error, never a name-based fallthrough (§8.0, D68) |
 | `writes` | map output-field→channel | no | name-based | keys are the subflow's `outputs` fields |
 | `context` | `isolated` \| `inherit` | no | `isolated` | conversation-history scoping (PRD 5.7) |
-| `policy` | `{ retry, timeout, on_error }` | no | — | override for the nodes *inside*, §9.3 |
+| `policy` | `{ retry, timeout, on_error: fail \| skip }` | no | — | override for the nodes *inside*, §9.3. The `fallback` form of `on_error` is ILLEGAL here — its target is flow-local and this level names no flow (§9.2, D103) |
 | `retry` | block | no | — | policy for *this* node, §9.1 |
 | `timeout` | duration | no | — | policy for *this* node, §9.2 |
 | `on_error` | `fail` \| `skip` \| `{ fallback: … }` | no | — | policy for *this* node, §9.2 |
@@ -2319,6 +2319,22 @@ and never a node of another flow (Decision
 [D21](#d21-on_error-strategies-and-fallback-targets)). `human.on_timeout` (§8.7)
 accepts the same targets.
 
+**The `fallback` form is a node's own key only.** `on_error:` at a
+composition-wide level — the `defaults:` section (§9.3 level 3) and a `flow:`
+node's `policy:` (level 1) — takes `fail` or `skip`, and `{ fallback: … }` there
+is a compile error naming the section or the node (Decision
+[D103](#d103-fallback-is-a-node-level-on_error-form-only)). A fallback target is
+flow-local by construction, while neither of those levels names a flow:
+`defaults:` reaches every node of every flow in the composition, and a `policy:`
+reaches every node of the instantiated subflow and of everything it instantiates
+in turn — so one id would have to resolve separately inside each of them, in
+flows that need not declare it at all. "Retry, then give up" stays expressible at
+both levels, because `retry` is a field of its own and `fail`/`skip` are the
+strategies that need no target; a node that needs a fallback declares one at
+level 2, which is the only place the target is in scope. Both halves are
+decidable in one file, so the published schema refuses the form at both levels
+too (Appendix B).
+
 ### 9.3 Resolution chain
 
 For each policy field (`retry`, `timeout`, `on_error`) independently, highest
@@ -2350,6 +2366,13 @@ on_timeout: escalate }` leaves that wait running for 24 hours; with no
 `human.timeout:` the wait is unbounded. `on_error` is **not** exempt and resolves
 through all four levels as on any other node: it covers delivery failures, which
 are ordinary node errors (§8.7).
+
+**Levels 1 and 3 take no `fallback`.** `on_error:` in `defaults:` and in a
+`flow:` node's `policy:` is `fail` or `skip` only; the
+`{ fallback: <node id or end> }` form is legal at level 2 alone, because its
+target is a node id of the flow the declaring node sits in and those two levels
+name no flow (§9.2, Decision
+[D103](#d103-fallback-is-a-node-level-on_error-form-only)).
 
 ```yaml
 # main.yml
@@ -3317,11 +3340,13 @@ an author one keyword, not an extra edge. Per-instance counting keeps
 
 Flow-node `policy:` override > node > `defaults:` > built-in `fail`; when a
 nesting chain sets one field at several instantiation sites, the outermost wins
-([D79](#d79-the-outermost-instantiation-site-policy-wins)). One node kind is
-partly outside the chain:
+([D79](#d79-the-outermost-instantiation-site-policy-wins)). Two refinements sit
+on top of the four levels:
 [D102](#d102-a-human-node-resolves-no-timeout-and-no-retry-at-any-level) exempts
 a `human` node from `timeout` and `retry` at every level, leaving its `on_error`
-to resolve normally.
+to resolve normally, and
+[D103](#d103-fallback-is-a-node-level-on_error-form-only) confines the `fallback`
+form of `on_error` to level 2.
 **Rationale**: PRD 5.5 names exactly these four; the override is placed at the
 *instantiation site* so a caller can harden a reused module — the only reading
 under which "flow override" beating a node's own declaration makes sense. A
@@ -3334,7 +3359,10 @@ as settled. *PRD 5.5.*
 retries; `skip` suppresses writes and then routes through §7.3 with the
 skipped node's own output reading as false
 ([D97](#d97-a-skip-changes-guard-values-not-the-routing-algorithm) owns exactly
-what a skip changes).
+what a skip changes). The third form is a node's own key only —
+[D103](#d103-fallback-is-a-node-level-on_error-form-only) refuses it in
+`defaults:` and in a flow node's `policy:`, where no flow is named for the target
+to be local to.
 **Rationale**: PRD 5.5 lists the strategies; restricting `fallback` to a
 flow-local node keeps error routing visible to reachability analysis instead of
 creating an invisible cross-module edge. `end` is admitted because "give up and
@@ -4604,6 +4632,34 @@ The cost is that a composition cannot bound its human waits from one place —
 which is what `human.timeout:` is for, one line at the node that owns the wait.
 *PRD 5.5, 5.11, G3.*
 
+### D103. `fallback` is a node-level `on_error` form only
+
+`on_error: { fallback: … }` is legal as a node's own key (§9.3 level 2) and is a
+compile error in the `defaults:` section (level 3) and in a `flow:` node's
+`policy:` (level 1), where `on_error:` takes `fail` or `skip`. The published
+schema enforces it at both levels (§9.2, §9.3, Appendix B).
+**Rationale**: [D21](#d21-on_error-strategies-and-fallback-targets) fixes the
+target as a **flow-local node id**, precisely so error routing stays visible to
+the per-flow analyses (§7.8's reachability, §7.6.2's `dist`) — but levels 1 and 3
+are not attached to a flow. `defaults:` reaches every node of every flow in the
+composition and a `policy:` propagates into nested instantiations, so a
+`fallback: cleanup` written once would have to resolve, per flow, in flows that
+never declare a node by that name. The published schema accepted the form
+(`policyBlock` reused `onError` verbatim) and the text said nothing, leaving a
+validator implementer three defensible behaviors — reject; resolve per flow and
+error wherever the id is missing; apply it where it resolves and silently fall
+back to `fail` elsewhere — the last of which is a silent no-op of the kind
+[D61](#d61-else-takes-the-literal-true) refuses, and the middle of which makes
+one composition-wide default reject flows that have nothing to do with it.
+Refusal is the reading that keeps D21's own justification true: a fallback is
+control flow *inside* one graph, so it belongs on a node of that graph. Nothing
+is lost — `retry` is a separate field, so "retry, then give up" is still one
+`defaults:` block, and the fallback that mattered is one line on the node that
+needs it. The alternative worth naming, a per-flow `defaults:` layer where a
+flow-local target would be in scope, is exactly the flow-definition-level default
+[D20](#d20-the-policy-resolution-chain-has-exactly-four-levels) already
+considered and rejected to keep the chain as PRD 5.5 settles it. *PRD 5.5, G3.*
+
 ---
 
 ## Appendix B — Editor integration
@@ -4671,7 +4727,11 @@ including the confinement of `input:`/`writes:`/`detach:` to the homogeneous for
 (rule 7, D85) — the field-map-only `input:` on the node kinds that name their
 fields (§8.0, D88), the non-empty `expect_exit`/`expect_status` lists (§6.1), the
 direct-XOR-route split on model definitions (§12.2), the `human` timeout/route
-pairing (§8.7), the inline-`http` `input:`-versus-`body:`/`query:` rule (§8.3),
+pairing (§8.7) and the absence of node-level `timeout:`/`retry:` on a `human`
+node (§8.7, D52 — the other two levels of that exemption are resolution
+semantics, with nothing to reject), the `fail`/`skip`-only `on_error:` in
+`defaults:` and in a flow node's `policy:` (§9.3, D103),
+the inline-`http` `input:`-versus-`body:`/`query:` rule (§8.3),
 **identical** duplicate edges and the `max_iterations`/`when:` pairing on one
 edge (§7.2, D90) — `uniqueItems` on `edges:` catches byte-identical edge
 objects, while §7.2's rule keys on `from`/`to`/`when` alone, so two edges
@@ -4718,7 +4778,7 @@ copyable specs see [`examples/`](../examples).
 # ---- spec file --------------------------------------------------------------
 version: "0.1"                      # entrypoint + deploy files
 imports: [ "<relative path>", ... ] # entrypoint only
-defaults: { retry: {...}, timeout: <dur>, on_error: <policy> }
+defaults: { retry: {...}, timeout: <dur>, on_error: fail|skip }  # no fallback (D103)
 state:    { <channel>: <type node + reduce/default> }
 triggers: { <name>: <trigger> }
 
@@ -4762,7 +4822,8 @@ model.<name>:    { route: [model.<a>, model.<b>], route_on: [...] }
                      # scalar input: only for a string-in agent
 { function: tool.<t>, input: <field map>, writes: {...} }
 { flow: flow.<f>,    input: <field map>, writes: {...}, context: isolated|inherit,
-                     policy: {...},                    # for the nodes inside
+                     policy: {...},                    # for the nodes inside —
+                                                       # on_error: fail|skip only
                      retry/timeout/on_error }          # for the instance itself
 { exec: { command, args?, cwd?, env?, expect_exit?, output? },
                      input: <bindings>, writes: {...} }   # scalar input: stdin
