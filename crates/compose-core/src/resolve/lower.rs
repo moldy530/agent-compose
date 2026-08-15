@@ -113,6 +113,7 @@ fn definition(source: &ast_def::Definition) -> Option<ir::Definition> {
             ir::definition::DefinitionBody::Provider(provider(def)?)
         }
         ast_def::DefinitionBody::Model(def) => ir::definition::DefinitionBody::Model(model(def)?),
+        ast_def::DefinitionBody::Invalid => return None,
     };
     Some(ir::Definition {
         address: source.address.clone(),

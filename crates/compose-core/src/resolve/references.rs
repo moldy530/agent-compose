@@ -77,6 +77,11 @@ pub(crate) fn check(index: &Index<'_>, diagnostics: &mut Diagnostics) {
                     }
                 }
             },
+            // A definition whose body the parser could not read has had its
+            // say, and there is nothing left of it to resolve. It is in the
+            // index for its *name*, so that references to it resolve rather
+            // than turning one wrong-type diagnostic into one per use site.
+            DefinitionBody::Invalid => {}
         }
     }
 

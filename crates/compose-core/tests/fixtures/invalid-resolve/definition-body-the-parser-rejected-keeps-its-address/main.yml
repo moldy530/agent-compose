@@ -1,0 +1,25 @@
+# rule: a definition whose body the parser rejected keeps its address, so references to it are not reported as undefined
+# code: wrong-type
+# message: expected a mapping for agent definition `agent.reviewer`, found an integer
+# at: agents.yml:5:17
+# ---
+# `count: 1` is the whole point of this fixture. The composition is complete —
+# `agents.yml` loaded — so the reference pass runs, and it must find
+# `agent.reviewer` in the index: three `undefined-reference` diagnostics here
+# would answer one mistake with four, and a forty-node flow would bury the
+# cause under forty consequences.
+version: "0.1"
+imports:
+  - agents.yml
+
+flow.review:
+  outputs: {}
+  nodes:
+    first: { agent: agent.reviewer }
+    second: { agent: agent.reviewer }
+    third: { agent: agent.reviewer }
+  edges:
+    - { from: start, to: first }
+    - { from: first, to: second }
+    - { from: second, to: third }
+    - { from: third, to: end }

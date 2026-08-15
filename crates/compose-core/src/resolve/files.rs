@@ -33,15 +33,26 @@ pub(crate) struct Composition {
     pub(crate) files: Vec<SpecSource>,
     /// The active target's deploy file, when there is one.
     pub(crate) deploy: Option<DeploySource>,
-    /// Whether every `imports:` entry contributed a spec file.
+    /// Whether the composition's name table is all there.
     ///
-    /// When one did not — it named a file that is not there, is not readable,
-    /// is outside the project root, or is a deploy file — the composition is
-    /// **incomplete**, and every definition that file would have declared is
-    /// missing along with it. Resolving names against what is left would then
-    /// report one diagnostic per reference into it, which is a page of
-    /// consequences for one cause. The cause has already been reported, so the
-    /// consequences are not.
+    /// It is **incomplete** when an `imports:` entry named a file that never
+    /// joined the composition — it is not there, is not readable, is outside
+    /// the project root, or is a deploy file — because every definition that
+    /// file would have declared is missing along with it. Resolving names
+    /// against what is left would then report one diagnostic per reference into
+    /// it, which is a page of consequences for one cause. The cause has already
+    /// been reported, so the consequences are not.
+    ///
+    /// Two things deliberately do *not* make it incomplete, because neither
+    /// loses a definition:
+    ///
+    /// * an entry that repeats a file already imported, or names the entrypoint
+    ///   — the file is in the composition, under the other spelling;
+    /// * a file the parser rejected — a definition whose body could not be read
+    ///   keeps its address in the tree ([`DefinitionBody::Invalid`]), so the
+    ///   name still reaches the index.
+    ///
+    /// [`DefinitionBody::Invalid`]: crate::ast::definition::DefinitionBody::Invalid
     pub(crate) complete: bool,
 }
 
@@ -147,19 +158,17 @@ pub(crate) fn load(
         complete: true,
     };
 
-    let declared = composition.files[0]
-        .file
-        .imports
-        .as_ref()
-        .map_or(0, |section| section.paths.len());
     imports(root, &name, &mut composition, diagnostics);
-    composition.complete = composition.files.len() - 1 == declared;
     composition.files[1..].sort_by(|left, right| left.name.cmp(&right.name));
     composition.deploy = deploy(root, target, &name, diagnostics);
     Some(composition)
 }
 
 /// Follow the entrypoint's `imports:` (grammar 1.4).
+///
+/// An entry that is refused clears [`Composition::complete`] exactly when the
+/// file it named is then absent from the composition — see that field for why
+/// a repeat and a rejected parse are not among those cases.
 fn imports(
     root: &Path,
     entrypoint: &str,
@@ -177,6 +186,7 @@ fn imports(
     let mut seen: Vec<(String, Span)> = Vec::new();
     for (written, span) in entries {
         let Some(normalized) = normalize(&written) else {
+            composition.complete = false;
             diagnostics.push(
                 Diagnostic::error(
                     DiagnosticCode::InvalidImportPath,
@@ -189,6 +199,8 @@ fn imports(
             );
             continue;
         };
+        // Not a loss: the entrypoint is already the first file of the
+        // composition, so everything it declares is in the index.
         if normalized == entrypoint {
             diagnostics.push(
                 Diagnostic::error(
@@ -206,6 +218,7 @@ fn imports(
             .strip_prefix("deploy/")
             .is_some_and(|rest| !rest.is_empty())
         {
+            composition.complete = false;
             diagnostics.push(
                 Diagnostic::error(
                     DiagnosticCode::InvalidImportPath,
@@ -218,6 +231,10 @@ fn imports(
             );
             continue;
         }
+        // Not a loss either: the first entry loaded the file, so the second
+        // adds a diagnostic and nothing else. Withholding every reference
+        // diagnostic until an author fixes a redundant import would hold back a
+        // report over the one thing that is definitely not missing.
         if let Some((_, first)) = seen.iter().find(|(other, _)| *other == normalized) {
             diagnostics.push(
                 Diagnostic::error(
@@ -248,6 +265,7 @@ fn imports(
             },
             diagnostics,
         ) else {
+            composition.complete = false;
             continue;
         };
         match document {
@@ -273,6 +291,7 @@ fn imports(
                 });
             }
             Document::Deploy(file) => {
+                composition.complete = false;
                 let at = deploy_section_span(&file).unwrap_or_else(|| span.clone());
                 diagnostics.push(
                     Diagnostic::error(

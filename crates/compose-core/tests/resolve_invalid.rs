@@ -28,6 +28,11 @@
 //! the only file every fixture has. Error UX is a product feature (PRD G3), so
 //! a change to any of this is a test failure rather than something a reviewer
 //! might miss.
+//!
+//! A few fixtures pin what the resolver **does not** say: a project whose one
+//! real mistake would cascade into a diagnostic per reference site, declaring
+//! the cause and a `count:` that leaves no room for the consequences. They read
+//! like any other case — the suppression is the assertion.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;

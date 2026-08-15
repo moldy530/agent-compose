@@ -1,0 +1,3 @@
+provider.p:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}

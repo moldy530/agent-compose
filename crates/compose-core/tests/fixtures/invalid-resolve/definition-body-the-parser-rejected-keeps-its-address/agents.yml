@@ -1,0 +1,5 @@
+# The body is an integer, so the parser reads not one key of it — and reports
+# exactly that. The address `agent.reviewer` is still the name the author
+# declared, so it reaches the resolver's index and the three references below
+# resolve against it.
+agent.reviewer: 42
