@@ -958,7 +958,7 @@
           "additionalProperties": { "$ref": "#/$defs/node" }
         },
         "edges": {
-          "description": "Control-flow edges, including back-edges. Every SCC must carry a termination guard (PRD 5.4). Two identical edges are an error: the duplicate adds no transition (grammar 7.2).",
+          "description": "Control-flow edges, including back-edges. Every SCC must carry a termination guard (PRD 5.4). Two IDENTICAL edges are an error here: the duplicate adds no transition (grammar 7.2). Grammar 7.2's rule is wider - it keys on `from`/`to`/`when` alone, so two edges differing only in a `max_iterations` are also duplicates - and `uniqueItems` cannot see that, so the validator owns the refinement (Appendix B).",
           "type": "array",
           "minItems": 1,
           "uniqueItems": true,

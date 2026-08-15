@@ -3464,7 +3464,24 @@ arrive with new plugins, additively. *PRD 5.9.*
 No nested routes; route members are direct models; `route_on` defaults to
 `[rate_limit, overloaded, timeout]` and adds `server_error`. **Rationale**: PRD
 5.9's two forms, kept disjoint so failover order is a flat, traceable list;
-nesting would make "served by fallback #1" ambiguous. *PRD 5.9.*
+nesting would make "served by fallback #1" ambiguous.
+
+**On `server_error`**: this is a shape decision *within* a settled class, in the
+same sense
+[D84](#d84-execs-and-https-failure-predicate-is-one-rule-on-both-surfaces-and-both-halves-are-configurable)
+is — not a construct the PRD does not imply, which is what this appendix's
+preamble reserves for D37 and D51. PRD 5.9 and Resolved Question 10 settle the
+*class*: "ordered failover routes on infrastructure conditions only", with
+content-based routing explicitly out of scope. The parenthetical "(rate limit,
+overload, timeout)" names members of that class in prose, and a provider 5xx is
+as plainly an infrastructure condition as an overload is — it is the one
+infrastructure failure a caller can observe without the provider naming it.
+Enumerating the class for the editor schema and the validator is exactly the job
+[D38](#d38-provider-kinds-are-a-closed-v0-set-with-per-kind-required-keys) does
+for provider kinds, and the enumeration has to be closed for a `route_on:` value
+to be checkable at all. Omitting `server_error` would not have kept the
+vocabulary smaller, only made the commonest failover trigger inexpressible in a
+list PRD 5.9 requires to be one. *PRD 5.9, §9 Resolved Question 10.*
 
 ### D40. `settings:` is the only open object in the logical layer
 
@@ -4591,7 +4608,10 @@ including the confinement of `input:`/`writes:`/`detach:` to the homogeneous for
 fields (§8.0, D88), the non-empty `expect_exit`/`expect_status` lists (§6.1), the
 direct-XOR-route split on model definitions (§12.2), the `human` timeout/route
 pairing (§8.7), the inline-`http` `input:`-versus-`body:`/`query:` rule (§8.3),
-duplicate edges and the `max_iterations`/`when:` pairing on one edge (§7.2, D90),
+**identical** duplicate edges and the `max_iterations`/`when:` pairing on one
+edge (§7.2, D90) — `uniqueItems` on `edges:` catches byte-identical edge
+objects, while §7.2's rule keys on `from`/`to`/`when` alone, so two edges
+differing only in a `max_iterations` are a duplicate only the validator sees —
 the presence of one unconditional-or-`else` edge leaving
 `start` (§7.6.3 — an `edges:` array is one value, so this one *is* per-file),
 the reserved-root exclusions on node ids, edge endpoints, control targets, and a
