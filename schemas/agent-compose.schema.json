@@ -761,7 +761,7 @@
     },
 
     "inputBindings": {
-      "description": "Node input bindings on the two kinds where a single unnamed value has a destination (an agent node - only when the agent is string-in - and an exec node, where it becomes stdin): field name -> CEL over input/state/execution, or a bare CEL scalar. Unbound declared fields fall back to the state channel of the same name, then to the flow input of the same name, then to the field's own `default:` if it declares one. Grammar 8.0 / Decisions D14, D88.",
+      "description": "Node input bindings on the two kinds where a single unnamed value has a destination (an agent node - only when the agent is string-in - and an exec node, where it becomes stdin): field name -> CEL over input/state/execution, or a bare CEL scalar. Unbound declared fields fall back to the state channel of the same name, then to the flow input of the same name, then to the field's own `default:` if it declares one - and that name-based source must satisfy the field it lands in, a validator check because the state section may live in another file (Decision D111). Grammar 8.0 / Decisions D14, D88.",
       "oneOf": [
         { "description": "Scalar binding for a string-in target.", "$ref": "#/$defs/cel" },
         {
@@ -953,7 +953,7 @@
       "properties": {
         "description": { "description": "Documentation; REQUIRED when the flow is used in an agent's `tools:` (the LLM needs one).", "type": "string" },
         "inputs": { "description": "The module's parameter surface, in scope as `input.<field>` throughout the flow.", "$ref": "#/$defs/fieldMap" },
-        "outputs": { "description": "REQUIRED result surface; each field is read from the state channel of the same name, once, at quiescence - the step where no node is scheduled because every live branch has retired at `end`. Nothing is snapshotted at the moment a branch reaches `end`, so a value a still-running branch writes is included rather than raced (grammar 7.5, 7.6.3 / Decision D70).", "$ref": "#/$defs/outputFieldMap" },
+        "outputs": { "description": "REQUIRED result surface; each field is read from the state channel of the same name, once, at quiescence - the step where no node is scheduled because every live branch has retired at `end`. Nothing is snapshotted at the moment a branch reaches `end`, so a value a still-running branch writes is included rather than raced (grammar 7.5, 7.6.3 / Decision D70). The validator additionally requires that channel to be declared and to satisfy the field - every value the channel can hold is a legal value of the field, the same requirement a name-based input read carries (grammar 7.5, 8.0, 10.3 / Decision D111); both halves need the state section and so cannot be checked here.", "$ref": "#/$defs/outputFieldMap" },
         "nodes": {
           "description": "Node id -> node object. Each node carries exactly one kind key.",
           "type": "object",

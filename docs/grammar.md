@@ -1400,6 +1400,28 @@ boundaries are checkpoint/resume points.
   (§10) or it is a compile error. There is no `returns:` binding — use a node
   `writes:` remap to feed a differently-named channel
   (Decision [D53](#d53-flow-outputs-are-name-based-from-state)).
+
+  The channel MUST also be able to **satisfy** the field: every value it can
+  hold is a legal value of the field's declared type node, checked at the
+  definition rather than left to fail at materialization (Decision
+  [D111](#d111-name-based-wiring-is-type-checked-in-both-directions)). This is
+  the same requirement a name-based *input* read carries (§8.0) and the read
+  counterpart of the write typing §10.2 tabulates; as there, the relation itself
+  is the validator's (see *Layer split*), and what this document fixes is that
+  the surface is checked, in which direction, and against which two
+  declarations. `outputs: { draft: {type: integer} }` over a channel
+  `draft: { type: string }` is therefore a compile error naming the flow, the
+  field, and the channel.
+
+  Two things do not enter the comparison. A channel's `reduce:` decides what a
+  *write* supplies (§10.2), while materialization always reads the channel's
+  whole value — so an `append` channel of `items: { type: string }` satisfies a
+  field declared `type: array, items: { type: string }`, never one declared
+  `type: string`. A channel's `default:` is legal where the field's surface
+  refuses one (§3.6) and constrains nothing new: it already validates against
+  the channel's own type (§10.1). Whether a `merge` channel actually *holds* a
+  property at quiescence is a runtime question, and it stays
+  [D101](#d101-a-merge-channels-properties-are-unset-until-supplied)'s.
 - **As a node**: `{ flow: flow.review_loop, input: {...} }` — §8.5. Bindings are
   **total**: every input field the subflow declares without a `default:` MUST be
   bound by the instantiating node's `input:`, and an unbound one is a compile
@@ -1791,6 +1813,16 @@ a store op has no input schema, and its parameters are the per-op CEL values of
 Nothing falls through by name there — an omitted `key:` is a missing required
 parameter, never a lookup of a channel named `key`.
 
+**Types across a name-based read.** Step 1 puts a CEL expression between the
+source and the field, so it is typed by its result (§4.1). Steps 2 and 3 put
+nothing there, so the two declarations meet directly and the source MUST
+**satisfy** the field: every value the channel — or the enclosing flow input —
+can hold is a legal value of the field's declared type node, or it is a compile
+error naming both. That is one requirement with a second site, a flow's
+`outputs:` reading its channel (§7.5), and it is the read counterpart of the
+write typing of §10.2 (Decision
+[D111](#d111-name-based-wiring-is-type-checked-in-both-directions)).
+
 ```yaml
 review:
   agent: agent.reviewer
@@ -1824,11 +1856,11 @@ declared `input` (§8.4); a `flow:` node binds the subflow's declared `inputs`
 a bare scalar names no destination, so it is a compile error rather than a
 guessed one.
 
-**Writing.** After a node completes, each field of its output is written to the
-state channel of the same name **if such a channel is declared**; fields with no
-matching channel stay node-scoped and remain readable as `<node>.output.<field>`
-by that node's outgoing edge guards and by `map.over` (PRD 5.7 tier 1). `writes:`
-remaps the destination:
+**Writing.** After a node completes, each field of its output **that the result
+carries** is written to the state channel of the same name **if such a channel is
+declared**; fields with no matching channel stay node-scoped and remain readable
+as `<node>.output.<field>` by that node's outgoing edge guards and by `map.over`
+(PRD 5.7 tier 1). `writes:` remaps the destination:
 
 ```yaml
 review:
@@ -2691,8 +2723,11 @@ into concurrent overwrite explicitly.
 
 **What a write supplies, and how it is type-checked.** The reduce policy decides
 whether a write carries the channel's whole value or a contribution to it. This
-is the schema-compatibility rule for state wiring (§8.0, §10.3), and it is
-decided from declared types alone
+is the **write** half of the schema-compatibility rule for state wiring (§8.0,
+§10.3) — the read half is
+[D111](#d111-name-based-wiring-is-type-checked-in-both-directions)'s, at the two
+places a channel meets a declaration with no expression between them (§8.0
+steps 2–3, §7.5) — and it is decided from declared types alone
 (Decision [D58](#d58-append-channels-take-one-element-per-write)):
 
 | Channel | A write supplies | Accepted written type |
@@ -2720,6 +2755,14 @@ Default wiring is name-based in both directions (§8.0): node output field →
 channel of the same name; node input field → channel of the same name, falling
 back to the flow input of the same name. `writes:` remaps the write side;
 `input:` bindings remap the read side.
+
+Both directions are type-checked, each against the reduce policy or the
+declaration at its far end: a write supplies what §10.2's table accepts (D58),
+and a name-based read requires its source to **satisfy** the field it lands in —
+a node input field resolved by name (§8.0 steps 2–3) and a flow `outputs:` field
+read from its channel (§7.5), the two places nothing stands between the two
+declarations (Decision
+[D111](#d111-name-based-wiring-is-type-checked-in-both-directions)).
 
 Every field of a flow's `outputs:` MUST have a declared channel of that name
 (§7.5). A `writes:` value or `state.*` CEL reference naming an undeclared channel
@@ -2851,8 +2894,8 @@ Rules (PRD 5.8):
 - **A `get` that misses.** `value` is the one output field in this catalog its
   op may not return: the `kv get` and `blob get` rows are
   `{ value: … (optional), found: boolean }`, and a miss returns `found: false`
-  with no `value` at all. Both halves follow the rules those two surfaces state
-  (Decision
+  with no `value` at all. Both halves are what §8.0 states for writing an absent
+  field and §4.1 for reading an absent value (Decision
   [D110](#d110-an-absent-value-fails-the-read-and-an-absent-output-field-writes-nothing)):
 
   - **nothing is written** for `value` — the channel a `writes: { value: … }`
@@ -3951,9 +3994,12 @@ the other: a budget with nowhere to go, or a route nothing can reach — the
 ### D53. Flow outputs are name-based from state
 
 Each `outputs:` field reads the channel of the same name; there is no `returns:`
-binding. **Rationale**: PRD 5.7's default wiring is name-based, and `writes:`
-already covers renames — a second output-binding construct would be the deferred
-data-edge feature under another name. *PRD 5.7.*
+binding, and
+[D111](#d111-name-based-wiring-is-type-checked-in-both-directions)
+fixes the type relation the two declarations stand in. **Rationale**: PRD 5.7's
+default wiring is name-based, and `writes:` already covers renames — a second
+output-binding construct would be the deferred data-edge feature under another
+name. *PRD 5.7.*
 
 ### D54. `description` is required only where it is machine-consumed
 
@@ -5161,10 +5207,11 @@ and the expression that read it. An output field a node's result does not carry
 performs **no write**: the channel it would have written, remapped or
 same-named, keeps whatever it held (§4.1, §8.0, §11.4).
 **Rationale**: §11.4's catalog marks exactly one output field optional —
-`{ value: V (optional), found: boolean }` on `kv get` and `blob get` — and
-neither §8.0's write rule ("each field of its output is written to the state
-channel of the same name") nor §4.1's read scope said what happens on the pass
-where the field is not there. §8.8's own worked example is the case:
+`{ value: V (optional), found: boolean }` on `kv get` and `blob get` — while
+§8.0's write rule (then "each field of its output is written to the state
+channel of the same name", with no clause for a field the result omits) and
+§4.1's read scope both said nothing about the pass where the field is not
+there. §8.8's own worked example is the case:
 `writes: { value: prefs }` on a miss had one codegen skipping the write, another
 writing `null` (a type error against `V`), and a third failing the node, while a
 guard `load_prefs.output.value.theme == 'dark'` could error, read false, or
@@ -5193,6 +5240,56 @@ Nothing here is statically checkable, and nothing needs to be: `found` and
 so there is no shape for the published schema or a negative fixture to reject —
 only a runtime rule two implementations now read the same way. *PRD 5.7, 5.8,
 G3.*
+
+### D111. Name-based wiring is type-checked in both directions
+
+A **name-based read** requires its source to **satisfy** the declaration it
+lands in: every value the source can hold is a legal value of that declared type
+node. Its two sites are a node input field resolved from the same-named channel
+or enclosing flow input (§8.0 steps 2–3) and a flow `outputs:` field read from
+its channel (§7.5); the write side is §10.2's table
+([D58](#d58-append-channels-take-one-element-per-write)), and an explicit
+`input:` binding is typed by its CEL result instead (§4.1). A channel's
+`reduce:` and its `default:` do not enter the read comparison.
+**Rationale**: the write half of name-based wiring has an explicit table and the
+read half had nothing. §7.5 and §10.3 required the channel a flow `outputs:`
+field reads to *exist* and said nothing about its type, and §8.0's steps 2 and 3
+resolve an input field from a channel with no expression to carry a type at all;
+[D101](#d101-a-merge-channels-properties-are-unset-until-supplied) covers only
+presence. So `outputs: { draft: {type: integer} }` over a channel
+`draft: {type: string}` sat between two defensible validators — one folding it
+into schema compatibility and rejecting it, one accepting it and failing at
+materialization — with this document's layer split (schema compatibility is
+specified by the PRD and implemented in the validator) readable as licence for
+either. A flow's `outputs:` is where a module states its contract, and PRD 5.1
+makes that contract interchangeable with a tool's, so "the type of what it
+returns" is the one thing about it that cannot be left unfixed; leaving the
+input half unstated beside it would have been the same hole one construct over.
+
+The direction is the one the data forces: the channel supplies the value and the
+declaration is the promise, so the source must be no wider than the destination,
+never the reverse. Naming the surfaces and the direction is all this decision
+does — the compatibility relation itself stays where the layer split puts it,
+next to the write side's, so the two halves of one wiring cannot drift into two
+subtyping rules. `reduce:` is excluded because §10.2 is about a *write*'s arity
+while a read always takes the whole value: an `append` channel of
+`items: {type: string}` still holds an array. `default:` is excluded because
+§10.1 already makes it validate against the channel's own type, so it adds no
+value the comparison has not seen; it is also the one key legal on a channel and
+illegal on a result field (§3.6), which is why an author meets the two
+declarations spelled differently and has to be told they are still compared.
+
+The rule costs one thing worth naming: a channel with no `max_items` cannot feed
+an `outputs:` field, because
+[D10](#d10-max_items-is-required-on-result-schemas-and-fanned-out-arrays)
+requires the bound on the field and only the channel's own declaration can keep
+that promise. Adding it to the channel is one key, and it is the same bound the
+field already carries — as `examples/triage-fanout`'s `patches` shows on both
+sides. Presence is untouched and stays D78's and D101's: a channel that is unset
+at quiescence, or a `merge` channel missing a property, fails at the read
+(§10.1). Both sites are cross-file by nature — the flow or node in one file,
+`state:` in another — so the check is the validator's alone, and Appendix B
+lists it as such. *PRD 5.1, 5.2, 5.7.*
 
 ---
 
@@ -5226,7 +5323,10 @@ authority. The schema cannot see across files, so it does not check:
   termination, fan-out bounding, reducer-write rules, trigger input
   compatibility, sync-trigger interrupt-freedom, store schema/keying rules,
   session coherence, provider settings/capability checks, env-ref presence,
-  unreachable nodes, undefined channels;
+  unreachable nodes, undefined channels, and schema compatibility — including
+  both sites of a name-based read, a node input field resolved from a channel
+  (§8.0) and a flow `outputs:` field read from one (§7.5, D111), whose two
+  declarations routinely sit in different files;
 - the graph analyses of §7.6, §7.7, and §7.8, which need the whole flow graph
   rather than a key-and-value pair: balanced convergence (§7.6.2), the
   no-dead-end rules of §7.6.3 apart from the `start` edge below, component
@@ -5352,7 +5452,9 @@ tool.<name>:
 flow.<name>:
   description: <text>               # required when used as a tool
   inputs: <field map>
-  outputs: <field map>              # required
+  outputs: <field map>              # required; each field reads the same-named
+                                    # channel, which must satisfy it — as must
+                                    # any name-based input read (D111)
   nodes: { <id>: <node> }
   edges: [ { from, to, when?, else?, max_iterations? } ]
           # else: true needs a when:-guarded sibling (D107);
