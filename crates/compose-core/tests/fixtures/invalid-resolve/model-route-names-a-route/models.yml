@@ -1,0 +1,15 @@
+provider.p:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+
+model.smart:
+  provider: provider.p
+  id: some-smart-model
+
+model.fast:
+  provider: provider.p
+  id: some-fast-model
+
+# A legal route on its own: two distinct direct models, in fallback order.
+model.tier_one:
+  route: [model.smart, model.fast]

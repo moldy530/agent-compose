@@ -19,6 +19,14 @@
 //! table refuses a wrong-namespace *spelling* at the parser — so it is pinned
 //! by a unit test at the bottom of this module, the way `resolve::index` pins
 //! the version-mismatch rule that is dormant for the same kind of reason.
+//!
+//! One position asks a second question once its address has resolved: a model
+//! route's members MUST be **direct** models, never routes of their own
+//! (grammar 2.3's position table, grammar 12.2). That is a property of the
+//! *definition* the member names rather than of the reference, so the parser
+//! cannot decide it the way it decides the route's other two member rules — and
+//! it costs one index lookup rather than a graph or a type, so it does not wait
+//! for the pass that reads the IR either.
 
 use std::collections::BTreeSet;
 
@@ -65,7 +73,7 @@ pub(crate) fn check(index: &Index<'_>, diagnostics: &mut Diagnostics) {
                 }
                 ModelDef::Route(route) => {
                     for member in &route.route {
-                        cx.address(member, &[Namespace::Model]);
+                        cx.route_member(member);
                     }
                 }
             },
@@ -146,6 +154,42 @@ impl Cx<'_, '_> {
                 format!("`{written}` is not defined in this composition"),
             )
             .with_help(help),
+        );
+    }
+
+    /// Resolve one member of a model route: a `model.*` that is itself a
+    /// **direct** model (grammar 2.3's position table, grammar 12.2).
+    ///
+    /// The parser owns the route's other two member rules — a repeated member,
+    /// and a route of fewer than two — because both are decidable from the list
+    /// as written. This one is not: whether a member is a route is a property
+    /// of the *definition* it names, which is a lookup in this pass's index.
+    /// It is still neither a graph nor a type, so it belongs here rather than
+    /// with the checks that read the IR (see [`super`]).
+    fn route_member(&mut self, member: &Spanned<Address>) {
+        self.address(member, &[Namespace::Model]);
+        // An address that did not resolve, or resolved to something that is not
+        // a model, has already been reported by `address`.
+        let Some(declared) = self.index.get(&member.value) else {
+            return;
+        };
+        let DefinitionBody::Model(ModelDef::Route(_)) = &declared.definition.body else {
+            return;
+        };
+        let written = member.value.to_string();
+        self.diagnostics.push(
+            Diagnostic::error(
+                DiagnosticCode::InvalidValue,
+                member.span.clone(),
+                format!("`{written}` is a route, and a route's members are direct models"),
+            )
+            .with_label(
+                declared.definition.address.span.clone(),
+                format!("`{written}` is defined here, in `{}`", declared.file),
+            )
+            .with_help(
+                "a route is an ordered fallback between direct bindings: nesting one inside another hides a second failover policy in the first, and a route that names itself falls back to the model that just failed (grammar 2.3, 12.2)",
+            ),
         );
     }
 
@@ -305,19 +349,14 @@ mod tests {
     use crate::resolve::files::{Composition, SpecSource};
     use crate::resolve::index;
 
-    /// Resolve one reference against a one-file composition, whatever the
-    /// parser would have made of that spelling in a real position.
-    fn resolve_one(
-        source: &str,
-        reference: Address,
-        accepts: &[Namespace],
-    ) -> (Option<String>, Option<String>) {
+    /// One source text as a complete, cleanly parsed one-file composition.
+    fn one_file(source: &str) -> Composition {
         let parsed = crate::parse_str(source, "main.yml");
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let Some(Document::Spec(file)) = parsed.document else {
             panic!("the source is a spec file");
         };
-        let composition = Composition {
+        Composition {
             entrypoint: "main.yml".to_string(),
             target: crate::resolve::DEFAULT_TARGET.to_string(),
             files: vec![SpecSource {
@@ -328,7 +367,30 @@ mod tests {
             }],
             deploy: None,
             complete: true,
-        };
+        }
+    }
+
+    /// Resolve every reference in a one-file composition, the way
+    /// [`super::check`] is called on a real one.
+    fn resolve_all(source: &str) -> Vec<Diagnostic> {
+        let composition = one_file(source);
+        let mut diagnostics = Diagnostics::new();
+        let index = index::build(&composition, &mut diagnostics);
+        assert!(diagnostics.into_vec().is_empty());
+
+        let mut diagnostics = Diagnostics::new();
+        super::check(&index, &mut diagnostics);
+        diagnostics.into_vec()
+    }
+
+    /// Resolve one reference against a one-file composition, whatever the
+    /// parser would have made of that spelling in a real position.
+    fn resolve_one(
+        source: &str,
+        reference: Address,
+        accepts: &[Namespace],
+    ) -> (Option<String>, Option<String>) {
+        let composition = one_file(source);
         let mut diagnostics = Diagnostics::new();
         let index = index::build(&composition, &mut diagnostics);
         assert!(diagnostics.into_vec().is_empty());
@@ -357,6 +419,9 @@ mod tests {
     }
 
     const PROVIDER: &str = "version: \"0.1\"\nprovider.p:\n  kind: anthropic\n  api_key: ${KEY}\n";
+
+    /// One provider and two direct models, for the route cases to build on.
+    const MODELS: &str = "version: \"0.1\"\nprovider.p:\n  kind: anthropic\n  api_key: ${KEY}\nmodel.a:\n  provider: provider.p\n  id: a\nmodel.b:\n  provider: provider.p\n  id: b\n";
 
     /// The wrong-namespace arm: the address *is* defined, in a namespace this
     /// position does not accept. Every position in grammar 2.3's table refuses
@@ -410,6 +475,53 @@ mod tests {
                 &[Namespace::Provider],
             ),
             (None, None)
+        );
+    }
+
+    /// Two direct models in fallback order — the legal shape. The rule below
+    /// refuses a *nested* route, not routes in general, and over-rejection is
+    /// the failure mode a negative corpus cannot catch.
+    #[test]
+    fn a_route_of_direct_models_is_not_reported() {
+        let reported = resolve_all(&format!(
+            "{MODELS}model.tier_one:\n  route: [model.a, model.b]\n"
+        ));
+        assert!(reported.is_empty(), "{reported:?}");
+    }
+
+    /// The degenerate nesting: a route whose second member is the route itself,
+    /// so its fallback is the model that just failed. The corpus fixture
+    /// `model-route-names-a-route` pins the spelling an author writes on
+    /// purpose; this pins the one a reader might expect a special case for, and
+    /// there is none — it is the same lookup and the same diagnostic.
+    #[test]
+    fn a_route_that_names_itself_is_reported_like_any_other_nested_route() {
+        let reported = resolve_all(&format!("{MODELS}model.r:\n  route: [model.a, model.r]\n"));
+        assert_eq!(reported.len(), 1, "{reported:?}");
+        assert_eq!(reported[0].code, DiagnosticCode::InvalidValue);
+        assert_eq!(
+            reported[0].message,
+            "`model.r` is a route, and a route's members are direct models"
+        );
+        assert_eq!(reported[0].labels.len(), 1);
+        assert_eq!(
+            reported[0].labels[0].message,
+            "`model.r` is defined here, in `main.yml`"
+        );
+    }
+
+    /// A member that is not defined at all is reported once, as undefined —
+    /// the route rule needs a definition to read and says nothing without one.
+    #[test]
+    fn an_undefined_route_member_is_reported_only_as_undefined() {
+        let reported = resolve_all(&format!(
+            "{MODELS}model.r:\n  route: [model.a, model.gone]\n"
+        ));
+        assert_eq!(reported.len(), 1, "{reported:?}");
+        assert_eq!(reported[0].code, DiagnosticCode::UndefinedReference);
+        assert_eq!(
+            reported[0].message,
+            "`model.gone` is not defined in this composition"
         );
     }
 

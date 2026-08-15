@@ -23,10 +23,12 @@
 //!   exactly once, both reported at the second site with the first labelled
 //!   (Decision D2).
 //! * **References** (grammar 2.3, 2.4) — every typed address resolves to a
-//!   definition in a namespace its position accepts, every flow-local node id an
-//!   edge or a control transfer names is a node of that flow, and the two
-//!   target-dependent bindings — a store's `backend:` alias and an `event`
-//!   trigger's `source:` — resolve in the active target (grammar 11.3, 13.5).
+//!   definition in a namespace its position accepts, a model route's members
+//!   are direct models rather than routes of their own (grammar 12.2), every
+//!   flow-local node id an edge or a control transfer names is a node of that
+//!   flow, and the two target-dependent bindings — a store's `backend:` alias
+//!   and an `event` trigger's `source:` — resolve in the active target
+//!   (grammar 11.3, 13.5).
 //!
 //! # What it leaves alone
 //!

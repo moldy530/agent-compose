@@ -1,0 +1,17 @@
+# rule: a model route's members are direct models, never routes of their own (grammar 2.3, 12.2)
+# code: invalid-value
+# message: `model.tier_one` is a route, and a route's members are direct models
+# at: main.yml:17:24
+# label: models.yml:14:1 `model.tier_one` is defined here, in `models.yml`
+# help: a route is an ordered fallback between direct bindings: nesting one inside another hides a second failover policy in the first, and a route that names itself falls back to the model that just failed (grammar 2.3, 12.2)
+# ---
+# The parser owns the route's other two member rules — a repeated member, and a
+# route of fewer than two — because both are decidable from the list as
+# written. This one is not: `model.tier_one` is a well-formed `model.*`
+# reference, and only the definition it names says it is a route.
+version: "0.1"
+imports:
+  - models.yml
+
+model.fallback:
+  route: [model.smart, model.tier_one]
