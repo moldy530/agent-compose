@@ -4,12 +4,18 @@
 #
 # `backend:` names an abstract slot only. All physical configuration lives in
 # deploy/<target>.yml, so this file never forks per environment.
+#
+# The two halves of a vector store are deliberately split: `embed:` names the
+# connection that *computes* the vectors and never forks per target, while
+# `backend:` names the slot they *live* in and does. That is what keeps this
+# store's vectors comparable under `local` and under `staging` (D116).
 store.docs:
   kind: vector
   scope: global
   description: Project documentation, chunked, for grounding triage decisions.
   embed:
     model: text-embedding-3-small
+    provider: provider.local
     dimensions: 1536
   metadata_schema:
     source: { type: string }

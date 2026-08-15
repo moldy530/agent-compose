@@ -6,6 +6,7 @@ store.docs:
   scope: global
   embed:
     model: text-embedding-3-small
+    provider: provider.openai
   backend:
     provider: chroma
     url: ${CHROMA_URL}

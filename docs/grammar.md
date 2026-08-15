@@ -260,7 +260,7 @@ error of the form "expected an `agent.*` reference, found `tool.web_search`"
 | `agent.<a>.stores[]` | `store.*` | |
 | `model.<m>.provider` | `provider.*` | direct models only |
 | `model.<m>.route[]` | `model.*` | direct models only, no nested routes |
-| `store.<s>.embed.provider` | `provider.*` | which connection serves embeddings (§11.2); `vector` stores only |
+| `store.<s>.embed.provider` | `provider.*` | REQUIRED; which connection computes the vectors (§11.2); `vector` stores only |
 | node `agent:` | `agent.*` | |
 | node `function:` | `tool.*` | the def/use split of PRD 5.5 |
 | node `flow:` | `flow.*` | no recursion |
@@ -631,8 +631,10 @@ Root identifier meanings:
 - **`execution`** — run metadata: `execution.id` (string), `execution.session_key`
   (string; empty when the invocation supplied no session key — a trigger with no
   `session_key:`, or a CLI run without `--session`, §13.2),
-  `execution.item_index` (integer, present only inside a `map`-dispatched
-  instance).
+  `execution.item_index` (integer; the source-item index of the **innermost**
+  enclosing `map` dispatch — present in that map's own per-item expressions and
+  everywhere inside the instance it dispatches, and **absent** anywhere else,
+  which is the fourth case of the absent-value rule below).
 - **`payload`** — the trigger payload; shape per trigger type (§13).
 - **`<node>.output`** — a node's node-scoped output object (PRD 5.7 tier 1).
 - **`<as-name>`** — the per-item binding of a `map` (`item` unless renamed with
@@ -660,8 +662,9 @@ schemas; `review.output.verdict == 'aprove'` against
 when: "review.output.verdict == 'revise' && size(state.feedback) > 0"
 ```
 
-**Reading a value that is not there.** Presence is a runtime property, and three
-declared things may legitimately be absent when an expression reads them:
+**Reading a value that is not there.** Presence is a runtime property, and four
+things may legitimately be absent when an expression reads them — three the
+composition declares, and one this section does:
 
 - a state channel with no `default:` that nothing has written yet (§10.1,
   [D78](#d78-channel-initial-values-and-reading-an-unset-channel));
@@ -670,7 +673,14 @@ declared things may legitimately be absent when an expression reads them:
 - a property a *value* may legally omit: one listed in an object's `optional:`
   (§3.4), and the `value` field a `kv` or `blob` `get` omits on a miss — the one
   top-level field of any result schema in this grammar that its own node may not
-  return (§11.4).
+  return (§11.4);
+- **`execution.item_index` where no `map` dispatch encloses the expression**
+  (above, §8.6). This one is a property of the *site*, not of the flow: the same
+  `flow.*` may be a dispatch target at one instantiation and a directly
+  instantiated subflow at another, and every flow is additionally runnable as a
+  root instance from the CLI (§13), so no static rule can promise the index is
+  there (Decision
+  [D115](#d115-executionitem_index-is-absent-where-no-map-dispatch-encloses-the-expression)).
 
 Reading one **fails the execution**, naming what was absent and the expression
 that read it (Decision
@@ -2847,7 +2857,7 @@ store.docs:
   kind: vector
   scope: global
   description: Project documentation, chunked.
-  embed: { model: text-embedding-3-small, dimensions: 1536 }
+  embed: { model: text-embedding-3-small, provider: provider.openai, dimensions: 1536 }
   metadata_schema:
     source: { type: string }
   backend: docs_db
@@ -2889,8 +2899,26 @@ by the same key.
 | Key | Type | Required | Notes |
 |---|---|---|---|
 | `model` | string (non-empty) | yes | provider-native embedding model id (a bare string, not a `model.*` ref — D36); no env refs, exactly as a model `id` (§4.3) |
-| `provider` | `provider.*` ref | no | which connection serves it; default resolved from the target's backend |
+| `provider` | `provider.*` ref | **yes** | which connection computes the vectors; never the storage backend (below) |
 | `dimensions` | integer ≥ 1 | no | asserted against the backend's index |
+
+**Embeddings are served by a `provider.*`, and the storage backend never
+computes them** (Decision
+[D116](#d116-embedprovider-is-required-and-no-backend-serves-embeddings)). The two
+layers answer different questions: `backend:` (§11.3) says *where the vectors
+live* and forks per target, while `embed.provider` says *what turns text into a
+vector* and does not — PRD 5.9 settles providers as logical-layer, not
+per-target. A backend-derived default would invert that, and there is nothing
+for it to derive from: §14.2's storage vocabulary declares no embedding
+capability, and under `--target local` no alias and no per-kind default is
+consulted at all (§14). Naming the connection is what keeps one store's
+embeddings identical under `local` and under `staging`, with only the vectors'
+home changing.
+
+The referenced provider MUST be able to serve embeddings, checked against the
+provider plugin's published capabilities — the same mechanism §12.2 applies to
+an agent's model, run at the store definition. `provider:` is a reference
+position, so it accepts `provider.*` and nothing else (§2.3).
 
 ### 11.3 Backends and scope
 
@@ -3058,6 +3086,17 @@ Rules (PRD 5.8):
   *looks* item-derived at the store node. `key: "input.text"`,
   `key: "execution.item_index"`, or dropping the map's `input:` so the whole item
   is passed all satisfy it.
+
+  The per-site reading cuts the other way too, and the `execution.item_index`
+  spelling is where it shows. A site that **no** map encloses is not subject to
+  this rule at all (above) — and at such a site the index has no value, so a
+  `key:` written that way fails the read there rather than keying anything
+  (§4.1, Decision
+  [D115](#d115-executionitem_index-is-absent-where-no-map-dispatch-encloses-the-expression)).
+  A `flow.ingest` that is dispatched by a map *and* instantiated by a plain
+  `flow:` node is therefore checked at the first site and fails at the second,
+  which is the same one-flow-two-sites fact stated once for the static rule and
+  once for the runtime one.
 
   The `kv` exemption is not a loophole: a `kv` write replaces the whole value at
   a slot the author named, so concurrent instances writing one key are a declared
@@ -3333,6 +3372,27 @@ defaulted `session_key:`, exists implicitly for every flow (§13 preamble).
 `payload` shape: `payload.body` (decoded JSON object), `payload.query` (map of
 string), `payload.headers` (map of string, lowercase names), `payload.path`
 (string), `payload.method` (string).
+
+**`payload.body` on a request that carries none.** `method: GET` is legal and a
+`GET` has no body, so the object has to be defined for that case rather than
+left to each generated app (Decision
+[D117](#d117-payloadbody-is-an-empty-object-on-a-bodyless-request)). The
+generated app decodes **no** body on a `GET`, and `payload.body` is then `{}` —
+present and readable, so `has(payload.body.goal)` answers `false` instead of
+erroring, and reading a member it does not carry fails that read like any other
+absent value (§4.1, D110). A body-bearing method sent with an empty body
+presents `{}` on the same rule, while a body that is present but is **not** a
+decodable JSON object is rejected at request time (400) and starts no execution
+— there is no partially-decoded payload for a binding to read.
+
+Consequently a `method: GET` trigger MUST NOT read **through** `payload.body` in
+any of its CEL — `input:`, `session_key:`, `callback:`. The object is `{}` on
+every request such a trigger can receive, so `payload.body.goal` fails on every
+one of them: a statically visible guaranteed runtime failure, refused at compile
+time naming the trigger and the expression, the posture §7.6.3 takes on a
+guaranteed dead end. Bind from `payload.query` instead, which is where a `GET`'s
+parameters are. Reading `payload.body` *whole* stays legal and binds `{}`, where
+a flow input field can accept it.
 
 - `respond: async` returns an execution id immediately; the optional `callback:`
   webhook fires on completion.
@@ -3896,11 +3956,15 @@ nothing stable to bind. *PRD 5.8.*
 requires a session-keyed trigger); defaulting it would hide a validation-relevant
 choice. *PRD 5.8.*
 
-### D36. `embed.model` is a bare provider-native id with an optional `provider:` ref
+### D36. `embed.model` is a bare provider-native id, not a `model.*` ref
 
 **Rationale**: the PRD writes `embed: { model: text-embedding-3-small }`;
 embedding models are not chat models and do not belong in `model.*`, whose
-capability checks are about structured output. *PRD 5.8, 5.9.*
+capability checks are about structured output. The companion `provider:` key —
+which this entry originally called optional, leaving what an omission resolved
+to unstated —
+is [D116](#d116-embedprovider-is-required-and-no-backend-serves-embeddings)'s.
+*PRD 5.8, 5.9.*
 
 ### D37. `agent_access` narrows the synthesized store tool surface
 
@@ -4193,8 +4257,10 @@ render an empty JSON object as the user turn. `{}` remains meaningful on
 
 There is no bare `item_index` CEL root. **Rationale**: one spelling means one
 type-checker rule and one reserved name (`item`, §2.5); a bare root would also
-have to be reserved as a channel name to stay unambiguous, for no gain. *PRD
-5.6, 5.7.*
+have to be reserved as a channel name to stay unambiguous, for no gain. What
+that one spelling evaluates to where no `map` dispatch encloses it is
+[D115](#d115-executionitem_index-is-absent-where-no-map-dispatch-encloses-the-expression)'s.
+*PRD 5.6, 5.7.*
 
 ### D64. Implicit `manual` invocation is a CLI property, not a declared trigger
 
@@ -5301,8 +5367,11 @@ negative fixture to reject. *PRD 5.5, G3.*
 Reading a value that is legally absent — a property listed in an object's
 `optional:` (§3.4) and the `value` a `kv`/`blob` `get` omits on a miss (§11.4),
 alongside [D78](#d78-channel-initial-values-and-reading-an-unset-channel)'s unset
-channel and [D101](#d101-a-merge-channels-properties-are-unset-until-supplied)'s
-unsupplied `merge` property — **fails the execution**, naming what was absent
+channel, [D101](#d101-a-merge-channels-properties-are-unset-until-supplied)'s
+unsupplied `merge` property, and
+[D115](#d115-executionitem_index-is-absent-where-no-map-dispatch-encloses-the-expression)'s
+`execution.item_index` outside a `map` dispatch — **fails the execution**,
+naming what was absent
 and the expression that read it. An output field a node's result does not carry
 performs **no write**: the channel it would have written, remapped or
 same-named, keeps whatever it held (§4.1, §8.0, §11.4).
@@ -5495,6 +5564,163 @@ object and it has no fields" — and the reason to state the pair together is th
 nothing else in the grammar distinguishes an omitted field map from an empty
 one. *PRD 5.8, 5.2, G3.*
 
+### D115. `execution.item_index` is absent where no `map` dispatch encloses the expression
+
+`execution.item_index` holds the source-item index of the **innermost** enclosing
+`map` dispatch — in that map's own per-item expressions and everywhere inside the
+instance it dispatches. Anywhere else it is absent, and reading it fails the
+execution, which is
+[D110](#d110-an-absent-value-fails-the-read-and-an-absent-output-field-writes-nothing)'s
+rule and D110's diagnostic (§4.1, §11.4).
+**Rationale**: §4.1 marked the member "present only inside a `map`-dispatched
+instance" and then enumerated the legitimately-absent values as exactly three —
+an unset channel, an unsupplied `merge` property, a value a result may omit —
+with D110 repeating the same three. The index was a fourth case that neither
+list held, so what a read of it does outside a map had no answer, and the case
+is not exotic: [D83](#d83-item-derivation-is-traced-through-the-dispatch-binding)
+contemplates one flow "dispatched by several maps and instantiated outside every
+map as well", and §11.4's own fix list endorses `key: "execution.item_index"`
+inside such a flow. One implementer rejects that composition at compile time,
+one fails the read at run time, one emits `0` or `null`: different accept sets
+and different runtime values from one spec.
+
+Failing the read is the same choice for the same reason as everywhere else in
+this cluster — a manufactured index is invented data, and `0` is worse than
+invented, because it is a *real* item index that would make a direct
+instantiation silently address whatever the first item addresses.
+
+The static reading is the one worth ruling out explicitly, because it is the
+tempting one. It cannot be made sound: implicit `manual` invocation makes **every
+flow** runnable as a root instance
+([D64](#d64-implicit-manual-invocation-is-a-cli-property-not-a-declared-trigger)),
+so "every path to this flow passes through a map" is false of every flow in
+every composition, and a check enforcing it would reject the very spelling
+§11.4 endorses. A weaker check — refuse the read only in a flow no map dispatches
+at all — is decidable, but it leaves untouched exactly the shape D83 declares
+legal site by site, where the flow is a dispatch target at one site and a plain
+`flow:` instantiation at another; that site still needs a runtime answer. Since
+the runtime rule is required regardless, adding a static one on top would only
+reject compositions D83 already accepts, for no case it actually closes.
+
+The other half this entry fixes is *where* the index is available, which the old
+wording got slightly wrong in the direction D83 depends on. A map's per-item
+`input:` CEL is evaluated in the **enclosing** flow's scope, not inside the
+dispatched instance — yet the index is well defined there, one value per item,
+and D83's item-derivation test reads it there. "Inside a `map`-dispatched
+instance" alone would put that surface outside the index's scope and unground
+D83's first clause. Naming both surfaces, and naming the innermost map as the
+one that supplies the value (§9.4 already says so for the idempotency key),
+leaves one rule with one scope.
+
+Nothing here is statically checkable and nothing needs to be: `execution` is a
+derived root with a fixed member set, so there is no shape for the published
+schema or a negative fixture to reject — only a runtime rule two
+implementations now read the same way, exactly as with D110. *PRD 5.6, 5.7, G3.*
+
+### D116. `embed.provider` is required, and no backend serves embeddings
+
+A `vector` store's `embed:` block MUST name a `provider.*`; the storage backend
+never computes vectors. The referenced provider must publish embedding
+capability, checked at the store definition by §12.2's mechanism (§11.2, §2.3).
+**Rationale**: §11.2 said an omitted `provider:` was "default resolved from the
+target's backend", and no section defines that resolution. §14.2's storage
+vocabulary (`sqlite_vec`, `chroma`, `pgvector`, `qdrant`) publishes no embedding
+capability and its capability checks are about *vector storage*;
+[D36](#d36-embedmodel-is-a-bare-provider-native-id-not-a-model-ref) said only
+that the ref was optional; and under `--target local` the substitution consults
+no alias and no per-kind default at all
+([D87](#d87-local-is-a-reserved-target-and-deploylocalyml-carries-no-storage_backends)),
+so under the zero-infra target the phrase named nothing whatsoever. One
+implementer routes embeddings to chroma's server-side embedder, another errors
+because `pgvector` and `sqlite_vec` cannot embed, and under `local` neither
+`validate` nor codegen has a rule to follow — with M1's store-tool synthesis and
+the mock-provider harness both needing one answer.
+
+The phrase was also against a settled position, which is what decides the
+direction of the fix. PRD 5.9 holds that **providers are logical-layer, not
+per-target** — keys and URLs vary by env ref, the connection does not — while
+`backend:` is the one store key that *does* fork per target (§11.3). Deriving
+the embedding connection from the backend would make one composition embed with
+different models' vector spaces under `staging` and under `local`, which is the
+same store holding incomparable vectors. Splitting the two questions — `backend:`
+says where the vectors live, `embed.provider` says what computes them — is what
+keeps a store's embeddings identical across targets.
+
+That leaves what an omission should mean, and the answer is that it cannot mean
+anything the composition supplies. A "sole declared provider" default is
+ambiguous the moment a project declares two, which
+[`examples/triage-fanout`](../examples/triage-fanout/providers.yml) already does
+— and wrong even when it is unambiguous, since a lone `anthropic` provider is a
+perfectly legal composition and has no embeddings API at all. Deriving from the
+model id would require the grammar to know which vendor owns
+`text-embedding-3-small`, which is precisely the plugin knowledge PRD 5.9 keeps
+out of the spec layer. So requiring the key is not a tightening chosen over a
+workable default; it is the absence of one.
+[D13](#d13-prompt-is-required-and-literal) is the precedent for the shape of the
+move: the PRD's own illustrative snippet omits `prompt:` too, and an agent with
+no instructions is not a specifiable component. Neither is a vector store whose
+embeddings name no connection.
+
+The cost is one line per vector store and the gains are concrete. The rule is
+decidable in one file, so the published schema enforces it and a negative
+fixture pins it (Appendix B) rather than it being a validator-only rule about a
+value that does not exist. And PRD 5.9's least-privilege distribution becomes
+computable for embeddings: an isolated deployment receives the env vars its
+resolved providers reference, which requires the embedding connection to be a
+named ref rather than a target-derived guess. A backend that genuinely embeds
+server-side stays additive — that is a storage-plugin capability and would
+arrive as one, published in §14.2's vocabulary and PRD-gated like any other new
+design surface. *PRD 5.8, 5.9, G3.*
+
+### D117. `payload.body` is an empty object on a bodyless request
+
+On an `http` trigger, `payload.body` is the decoded JSON object of the request
+body; a request that carries no body — every `GET`, and a body-bearing method
+sent with an empty one — presents `{}`. A body that is present but is not a
+decodable JSON object is rejected at request time (400) and starts no execution.
+A `method: GET` trigger MUST NOT read *through* `payload.body` in its `input:`,
+`session_key:`, or `callback:` CEL; reading it whole stays legal (§13.3).
+**Rationale**: §13.3 fixed the member as "decoded JSON object" while listing
+`GET` among the legal methods one row earlier, and a `GET` has no body — so
+whether `payload.body` was then `{}`, absent (failing reads per D110), or a
+request-time rejection was unstated, and a binding `goal: "payload.body.goal"`
+compile-checks under all three. One generated app supplies `{}` and fails the
+member read, another rejects the request: same spec, different HTTP behavior.
+
+`{}` is the reading that keeps the declared shape true. The member stays present
+and readable, so `has(payload.body.goal)` answers `false` instead of erroring,
+and a member the object does not carry falls under
+[D110](#d110-an-absent-value-fails-the-read-and-an-absent-output-field-writes-nothing)
+with no new rule — where declaring the root itself absent would have needed a
+fifth absent-value case for a member this document declares present. The 400 is
+the other half of "decoded JSON object": a body the app could not decode is not
+a payload, and refusing it before the execution exists is what keeps a
+half-decoded object from ever reaching a binding.
+
+Refusing the `GET`-through-`body` read follows this document's standing posture
+on a guaranteed runtime failure that is statically visible — the escape edge of
+[D19](#d19-max_iterations-semantics-and-the-escape-edge-rule), the no-dead-end
+rules of [D71](#d71-no-silent-dead-ends-every-node-exits-and-every-run-starts),
+the inert keyword of
+[D107](#d107-an-else-edge-requires-a-when-guarded-sibling). `payload.body` is
+`{}` on *every* request such a trigger can receive, so the read fails every
+time; accepting it ships a route that can only ever 500, when `payload.query` is
+one word away. Reading the object whole is left alone because it is not that
+case: it binds `{}`, and whether a flow input field accepts an empty object is
+an ordinary type check.
+
+The check is the validator's, not the schema's, and deliberately so. Deciding it
+means reading a CEL expression, and the schema's only instrument is a regex over
+the string — which would also reject a CEL *string literal* that happens to
+contain the text, making the schema stricter than `validate` and inverting
+Appendix B's one-directional invariant, the failure
+[D80](#d80-the-published-schemas-per-file-bounds-are-grammar-rules),
+[D96](#d96-an-inline-exechttp-nodes-output-is-a-result-schema),
+[D100](#d100-both-accepted-outcome-lists-are-non-empty-and-distinct) and
+[D106](#d106-a-provider-kinds-key-row-is-closed) each exist to repair. Appendix B
+already declines CEL surfaces on exactly that reasoning, so this joins the
+validator-owned list rather than being sniffed for. *PRD 5.11, G3.*
+
 ---
 
 ## Appendix B — Editor integration
@@ -5546,6 +5772,12 @@ authority. The schema cannot see across files, so it does not check:
   sibling an `else: true` edge requires (§7.3, D107), which relates two items of
   one `edges:` array through a shared `from` value, and item-derivation of
   a store key (§11.4, D83), which is a path through bindings in other files;
+- rules that turn on what a CEL expression *reads* rather than on its shape: a
+  `method: GET` trigger reading through `payload.body` (§13.3, D117). Both
+  values sit in one trigger object, but deciding it needs the expression
+  grammar — a regex over the string would also reject a CEL *string literal*
+  containing the same text, making the schema stricter than `validate` and
+  inverting the invariant this appendix closes with;
 - rules that key off the file's *name* or the active target rather than its
   content: no `storage_backends:` in `deploy/local.yml` and the existence of
   `deploy/<name>.yml` (§14, D87), and `detach: true` under a checkpointed target
@@ -5565,7 +5797,8 @@ three parameters that are literals rather than CEL — `top_k` and `limit` typed
 as integers in their ranges, `content_type` as a string carrying no env ref
 (§8.8, §11.4) — store definition key sets per `kind`, both the schema each kind
 requires and the ones it refuses, `metadata_schema` being `vector`'s alone
-(§11.1, D113), provider key sets per `kind` — both halves, the required keys and
+(§11.1, D113) and the `provider:` a `vector` store's `embed:` block must name
+(§11.2, D116), provider key sets per `kind` — both halves, the required keys and
 the closed row the optional ones live in (§12.1, D106) — trigger
 keys per `type` (§13) including the `respond`/`timeout` and `respond`/`callback`
 pairings (§13.3), the map form rules and the `on_item_error` shape (§8.6) —
@@ -5673,7 +5906,9 @@ store.<name>:
   scope: execution|session|global   # required
   value_schema: <field map>         # kv only
   metadata_schema: <field map>      # vector only — no blob op reads it (D113)
-  embed: { model, provider?, dimensions? }   # vector
+  embed: { model, provider, dimensions? }    # vector — `provider:` is a
+                                    # provider.* ref and is required; a storage
+                                    # backend never computes vectors (D116)
   backend: <alias>
   agent_access: read|read_write
 

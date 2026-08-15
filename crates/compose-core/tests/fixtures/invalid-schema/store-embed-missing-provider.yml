@@ -1,0 +1,8 @@
+# rule: a vector store's `embed:` MUST name the provider.* connection that computes the vectors - a storage backend never embeds, and there is nothing for an omission to resolve to (grammar 11.2 / Decision D116)
+# at: /store.docs/embed
+# via: /$defs/storeDef/properties/embed/required
+store.docs:
+  kind: vector
+  scope: global
+  embed:
+    model: text-embedding-3-small

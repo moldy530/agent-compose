@@ -1535,15 +1535,15 @@
         "value_schema": { "description": "Stored value shape. REQUIRED for kv; illegal for vector and blob.", "$ref": "#/$defs/outputFieldMap" },
         "metadata_schema": { "description": "Filterable metadata shape, narrowing a vector search. Legal for vector stores only: no blob or kv op reads metadata, so the key would be inert there (grammar 11.1, Decision D113).", "$ref": "#/$defs/outputFieldMap" },
         "embed": {
-          "description": "Embedding configuration. REQUIRED for vector stores, illegal otherwise.",
+          "description": "Embedding configuration. REQUIRED for vector stores, illegal otherwise. Both the model id and the connection that computes the vectors are named here: the storage backend only says where they live (Decision D116).",
           "type": "object",
-          "required": ["model"],
+          "required": ["model", "provider"],
           "properties": {
             "model": {
               "description": "Provider-native embedding model id (a bare string, not a model.* reference). Env references are illegal here, exactly as on a model `id:` (grammar 4.3 class 3, Decision D92): the id is part of the composition's identity, not of its environment.",
               "allOf": [{ "$ref": "#/$defs/noEnvRefString" }, { "minLength": 1 }]
             },
-            "provider": { "description": "Which connection serves embeddings; defaults to the target's backend resolution.", "$ref": "#/$defs/providerRef" },
+            "provider": { "description": "REQUIRED: the provider.* connection that computes the vectors. A storage backend never embeds - `backend:` forks per target and says where vectors live, while the embedding connection is logical-layer and does not, so one store embeds identically under every target (grammar 11.2, Decision D116). The provider must publish embedding capability, checked at this definition.", "$ref": "#/$defs/providerRef" },
             "dimensions": { "description": "Asserted against the backend index.", "type": "integer", "minimum": 1 }
           },
           "additionalProperties": false

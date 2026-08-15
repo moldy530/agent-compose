@@ -6,3 +6,4 @@ store.docs:
   scope: global
   embed:
     model: ${EMBED_MODEL}
+    provider: provider.openai
