@@ -1,4 +1,4 @@
-# rule: at least one edge leaving `start` must be unconditional or carry `else: true`, so an execution always has a first step (grammar 7.6.3 / D70)
+# rule: at least one edge leaving `start` must be unconditional or carry `else: true`, so an execution always has a first step (grammar 7.6.3 / D71)
 # at: /flow.simple/edges
 # via: /$defs/flowDef/properties/edges/contains
 flow.simple:

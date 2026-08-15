@@ -1,0 +1,16 @@
+# rule: `expect_exit:` is a non-empty list of 0..255 - an empty one accepts no outcome at all, making every run an error (grammar 6.1 / D84)
+# at: /tool.run_checks/exec/expect_exit
+# via: /$defs/expectExit/minItems
+tool.run_checks:
+  description: Run the project's fast checks and report what failed.
+  input:
+    pattern: { type: string }
+  output:
+    failures:
+      type: array
+      max_items: 100
+      items: { type: string }
+  exec:
+    command: run-checks
+    args: ["--format", "json"]
+    expect_exit: []

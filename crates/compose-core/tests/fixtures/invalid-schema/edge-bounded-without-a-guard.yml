@@ -1,0 +1,19 @@
+# rule: `max_iterations` requires `when:` on the same edge - an exhausted edge is never taken, so a budget on an unconditional or `else:` edge withdraws a guarantee other rules rest on (grammar 7.2, 7.3.1 / D90)
+# at: /flow.loop/edges/2
+# via: /$defs/edge/dependentRequired
+flow.loop:
+  outputs:
+    draft: { type: string }
+  nodes:
+    write:
+      agent: agent.researcher
+      input: "input.goal"
+    review:
+      agent: agent.reviewer
+      input:
+        draft: "state.draft"
+  edges:
+    - { from: start, to: write }
+    - { from: write, to: review }
+    - { from: review, to: write, max_iterations: 3 }
+    - { from: review, to: end, else: true }
