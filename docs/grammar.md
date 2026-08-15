@@ -432,37 +432,51 @@ tasks:
 - `min_items` — integer ≥ 0, ≤ `max_items`.
 - `unique_items` — boolean, default `false`.
 
+**The result surfaces.** Seven declaration surfaces are **result schemas** — the
+places a node's, module's, or store's *result* is declared:
+
+`agent.output`, `tool.output`, `flow.outputs`, `human.output`, an inline
+`exec:`/`http:` node's `output` (§8.2, §8.3), `store.value_schema`,
+`store.metadata_schema`.
+
+This one list is what §3.5's `max_items` rule and §3.6's `default:` prohibition
+are both stated over, and the inline node outputs are in it (Decision
+[D96](#d96-an-inline-exechttp-nodes-output-is-a-result-schema)). Every other
+declaration surface — `agent.input`, `tool.input`, `flow.inputs`, `human.input`,
+and `state` channels — is an **input surface**.
+
 **`max_items` is REQUIRED** when the array (Decision [D10](#d10-max_items-is-required-on-result-schemas-and-fanned-out-arrays)):
 
-1. appears anywhere inside a **result schema** — `agent.output`, `tool.output`,
-   `flow.outputs`, `human.output`, `store.value_schema`,
-   `store.metadata_schema`. Model-produced cardinality must be bounded, and
-   structured-output validation rejects longer arrays so the model *cannot*
-   return more (PRD 5.6); the same bound keeps every edge payload finite and
-   serializable (PRD 5.7, 5.10); or
+1. appears anywhere inside a **result schema** — the seven surfaces above.
+   Model-produced cardinality must be bounded, and structured-output validation
+   rejects longer arrays so the model *cannot* return more (PRD 5.6); the same
+   bound keeps every edge payload finite and serializable (PRD 5.7, 5.10),
+   which is why the two inline node surfaces are in the list even though
+   nothing they decode is model-produced; or
 2. is the schema a `map.over` path resolves to — unbounded fan-out is a compile
    error (PRD 5.6).
 
-It is OPTIONAL in **input schemas** (`agent.input`, `tool.input`, `flow.inputs`,
-`human.input`) and on state channels, where the value is not model-produced and
-its bound comes from whatever produced it.
+It is OPTIONAL on every **input surface** (`agent.input`, `tool.input`,
+`flow.inputs`, `human.input`, and state channels), where the value is not
+model-produced and its bound comes from whatever produced it.
 
 #### 3.6 `default`, requiredness, and surface rules
 
-- `default:` is legal on **scalar, enum, object, and array** type nodes at
-  **input** surfaces (`agent.input`, `flow.inputs`, `tool.input`,
-  `human.input`), nested inside them, and on **state** channels, where it is the
-  channel's initial value. The literal MUST validate against the type node it
-  sits on — an object default supplies every required property, an array default
-  is an array of the `items:` type (Decision
+- `default:` is legal on **scalar, enum, object, and array** type nodes at every
+  **input surface** (`agent.input`, `flow.inputs`, `tool.input`, `human.input`,
+  and state channels), and nested inside one; on a channel it is the channel's
+  initial value. The literal MUST validate against the type node it sits on — an
+  object default supplies every required property, an array default is an array
+  of the `items:` type (Decision
   [D77](#d77-default-is-legal-on-every-type-node-form-except-a-union)).
 - `default:` is ILLEGAL on a **discriminated union** (§3.7) at every surface. A
   union default would have to name a variant, and manufacturing a discriminator
-  tag is the same silent routing decision the output rule below refuses.
-- `default:` is ILLEGAL in **output** schemas (`agent.output`, `tool.output`,
-  `flow.outputs`, `human.output`) and in `store.value_schema` /
-  `metadata_schema`. A defaulted model output would silently manufacture routing
-  values (PRD 5.3).
+  tag is the same silent routing decision the result-surface rule below refuses.
+- `default:` is ILLEGAL on every **result surface** — the seven listed in §3.5,
+  which includes an inline `exec:`/`http:` node's `output` (D96). A defaulted
+  result would silently manufacture routing values (PRD 5.3): a field the model
+  never emitted, or — on an inline node — a field the process never printed and
+  the response never carried.
 - A property with a `default:` is implicitly optional at its surface.
 
 #### 3.7 Discriminated unions
@@ -515,18 +529,23 @@ snake_case everywhere for one consistent key style.
 
 ### 3.9 Where schemas appear
 
-| Surface | Kind | Required | `{}` legal? |
+The **Class** column is the §3.5 split, and it is the whole of what a surface's
+class decides: a result surface requires `max_items` on every array inside it
+and refuses `default:`; an input surface does the opposite on both counts.
+
+| Surface | Class | Required | `{}` legal? |
 |---|---|---|---|
-| `agent.<a>.output` | field map | REQUIRED (PRD 5.2) | no — ≥ 1 property (§5.1) |
-| `agent.<a>.input` | field map | optional; default string-in (§5.3) | no — omit it instead (D62) |
-| `tool.<t>.input` | field map | REQUIRED | yes (no-argument tool) |
-| `tool.<t>.output` | field map | REQUIRED | yes (no result) |
-| `flow.<f>.inputs` | field map | optional (default: no inputs) | yes |
-| `flow.<f>.outputs` | field map | REQUIRED | yes (no result) |
-| `human.input` / `human.output` | field map | REQUIRED | yes |
-| inline `exec:` / `http:` node `output` | field map | optional (kind default, §8.2/§8.3) | yes |
-| `state` channels | field map + `reduce` | optional section | yes (no channels) |
-| `store.<s>.value_schema` / `metadata_schema` | field map | per kind (§11) | yes |
+| `agent.<a>.output` | field map — **result** | REQUIRED (PRD 5.2) | no — ≥ 1 property (§5.1) |
+| `agent.<a>.input` | field map — input | optional; default string-in (§5.3) | no — omit it instead (D62) |
+| `tool.<t>.input` | field map — input | REQUIRED | yes (no-argument tool) |
+| `tool.<t>.output` | field map — **result** | REQUIRED | yes (no result) |
+| `flow.<f>.inputs` | field map — input | optional (default: no inputs) | yes |
+| `flow.<f>.outputs` | field map — **result** | REQUIRED | yes (no result) |
+| `human.input` | field map — input | REQUIRED | yes |
+| `human.output` | field map — **result** | REQUIRED | yes |
+| inline `exec:` / `http:` node `output` | field map — **result** (D96) | optional (kind default, §8.2/§8.3) | yes |
+| `state` channels | field map — input, + `reduce` | optional section | yes (no channels) |
+| `store.<s>.value_schema` / `metadata_schema` | field map — **result** | per kind (§11) | yes |
 
 **Emptiness.** An empty field map `{}` is a closed object with no properties
 (§3.1) and is legal at every surface above except the two agent surfaces:
@@ -1706,7 +1725,7 @@ in §6.1, plus:
 
 | Key | Type | Required | Default |
 |---|---|---|---|
-| `output` | field map | no | `{ exit_code: {type: integer}, stdout: {type: string} }` |
+| `output` | field map (result surface, §3.5/§3.6) | no | `{ exit_code: {type: integer}, stdout: {type: string} }` |
 
 The node-level `input:` bindings produce the object passed to the child as
 environment variables — binding keys are identifiers (§2.1) and are
@@ -1763,7 +1782,7 @@ notify:
 
 | Key | Type | Required | Default |
 |---|---|---|---|
-| `output` | field map | no | `{ status: {type: integer}, body: {type: string} }` |
+| `output` | field map (result surface, §3.5/§3.6) | no | `{ status: {type: integer}, body: {type: string} }` |
 
 An inline node's `query:`/`body:` CEL is *flow*-scoped — `input`, `state`,
 `execution` (§4.1) — unlike the same keys inside a `tool.*` binding, which see
@@ -3029,9 +3048,10 @@ guard typing. *PRD 5.3.*
 
 ### D10. `max_items` is required on result schemas and fanned-out arrays
 
-Required inside every result schema (`agent.output`, `tool.output`,
-`flow.outputs`, `human.output`, store schemas) and on any array a `map.over`
-resolves to; optional in input schemas and state channels. **Rationale**: PRD 5.6
+Required inside every result schema — the seven surfaces §3.5 lists, which
+include an inline `exec:`/`http:` node's `output`
+([D96](#d96-an-inline-exechttp-nodes-output-is-a-result-schema)) — and on any
+array a `map.over` resolves to; optional on every input surface. **Rationale**: PRD 5.6
 makes fan-out bounding mandatory and enforces it at structured-output validation
 so the model *cannot* return more. Extending the requirement to every result
 schema — one syntactic rule instead of "wherever a map might later consume it" —
@@ -4179,6 +4199,35 @@ transfer fires *instead of* a node's edges, so admitting it here cannot
 manufacture a concurrent branch there (§7.6.2). Three relations, three
 questions, one section each. *PRD 5.3, 5.5, G3.*
 
+### D96. An inline `exec`/`http` node's `output` is a result schema
+
+The result surfaces are seven, not five: `agent.output`, `tool.output`,
+`flow.outputs`, `human.output`, an inline `exec:`/`http:` node's `output`, and
+the two store schemas. Arrays inside any of them MUST declare `max_items` and
+`default:` is illegal in all of them (§3.5, §3.6, §3.9).
+**Rationale**: the published schema already routed `execNode`/`httpNode`
+`output` through the result-surface field map — `max_items` required, `default:`
+refused — while §3.5, §3.6, D10, and Appendix B all enumerated five surfaces and
+omitted the inline pair. That inverts Appendix B's one-directional invariant: an
+inline `exec:` node declaring `names: { type: array, items: {type: string} }`
+passed the grammar text and failed the schema, so the two artifacts described
+two different languages, which is the one thing this document and that file may
+not do. Adding the surfaces was preferred to loosening the schema because the
+justification for the rule reaches them: D10's second reason is that a bounded
+array keeps every **edge payload** finite and serializable, which is what lets
+placement promote an edge to a network boundary (PRD 5.7, 5.10), and an inline
+node's declared fields travel edges exactly as an agent's do. The first reason —
+model-produced cardinality (PRD 5.6) — does not apply here, and does not need
+to: these fields are decoded from a process's stdout or a response body
+([D56](#d56-inline-exechttp-node-results-are-envelopes-not-decoded-payloads),
+[D91](#d91-the-single-string-property-decode-exception-is-a-tool-surface-rule)),
+which are as unbounded as any model. The `default:` half follows from the same
+reading of §3.6: a defaulted result manufactures a routing value the run never
+produced, and nothing about a process makes that safer than a model. Stating the
+list once, in §3.5, and pointing §3.6, §3.9, D10, and Appendix B at it is what
+stops the next surface from being added to three of the five places. *PRD 5.2,
+5.5, 5.6, 5.7, 5.10.*
+
 ---
 
 ## Appendix B — Editor integration
@@ -4230,11 +4279,13 @@ authority. The schema cannot see across files, so it does not check:
   `deploy/<name>.yml` (§14, D87), and `detach: true` under a checkpointed target
   (§8.6 rule 7, D59);
 - context-sensitive schema rules whose surface is not syntactically identifiable
-  in one file. `max_items` is the example of the split: inside `agent.output`,
-  `tool.output`, `flow.outputs`, `human.output`, and store schemas the surface is
-  a named key, so the schema *does* require it (§3.5 clause 1); as the target of
-  a `map.over` path (§3.5 clause 2) it depends on resolving a path through other
-  files, so only the validator can require it there.
+  in one file. `max_items` is the example of the split: on all **seven** result
+  surfaces (§3.5) — `agent.output`, `tool.output`, `flow.outputs`,
+  `human.output`, an inline `exec:`/`http:` node's `output`, and the two store
+  schemas — the surface is a named key, so the schema *does* require it there,
+  and refuses `default:` there, on the same seven (§3.5 clause 1, §3.6, D96); as
+  the target of a `map.over` path (§3.5 clause 2) it depends on resolving a path
+  through other files, so only the validator can require it there.
 
 What the schema *does* enforce beyond plain shape, because the deciding value is
 a literal in the same object: store-op parameter sets per `op` (§11.4), trigger
