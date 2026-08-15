@@ -2353,10 +2353,10 @@ state:
     type: array
     items: { type: string }
     reduce: append
-  totals:
-    type: object
+  totals:                       # no `default:`, so `totals` starts as `{}` and
+    type: object                # each property is unset until a write supplies
     properties: { fixed: { type: integer }, skipped: { type: integer } }
-    reduce: merge
+    reduce: merge               # it — see §10.1, D101
 ```
 
 ### 10.1 Channels
@@ -2385,6 +2385,43 @@ no `default:` declared (Decision
   (§7.5) — fails the execution naming the channel and the reader. Declaring a
   `default:` is how a channel becomes readable before its first write, which is
   what a convergence reached by only one of two branches (§7.6.2) usually wants.
+
+**Partially-supplied `merge` channels.** A `merge` channel is the one channel
+form whose *value* need not validate against its own declared type while the
+flow runs: §10.2 lets each write supply a subset of the channel's properties, so
+it holds `{}` before the first write and, say, `{fixed: 3}` after a partial one.
+Presence is therefore a per-property, per-instant fact, and this document
+answers it one level below D78 (Decision
+[D101](#d101-a-merge-channels-properties-are-unset-until-supplied)):
+
+- reading a property the channel does not currently hold — from a guard, a
+  name-based or explicit `input:` binding, or `outputs:` materialization —
+  **fails the execution**, naming the channel, the property, and the reader. It
+  is D78's unset-channel rule, one level down, for D78's reason: inventing a
+  zero for a declared `integer` manufactures data;
+- **type-checking is unaffected**. `state.totals.skipped` is an `integer`
+  wherever it is legal to read, because presence is a runtime property exactly
+  as an unset channel's is (§4.1 type-checks against declared schemas, never
+  against runtime values);
+- two ways to make a property readable unconditionally. Declare a `default:` on
+  the channel — an object default supplies **every** required property (§3.6,
+  [D77](#d77-default-is-legal-on-every-type-node-form-except-a-union)), so one
+  `default:` makes the whole channel total from step 0 — or ask first with CEL's
+  `has()` (§4.1):
+  `when: "has(state.totals.skipped) && state.totals.skipped > 0"`.
+
+```yaml
+state:
+  totals:
+    type: object
+    properties: { fixed: { type: integer }, skipped: { type: integer } }
+    reduce: merge
+    default: { fixed: 0, skipped: 0 }   # both properties readable from step 0
+```
+
+A flow `outputs:` field fed by a `merge` channel reads every property the field
+declares, so the same rule applies to it at quiescence (§7.6.3) — which is why a
+`merge` channel that a flow returns is the case that most wants the `default:`.
 
 ### 10.2 Reduce policies
 
@@ -3911,7 +3948,10 @@ subsection exists to stop. *PRD 5.2, 5.3, 5.6.*
 
 An `append` channel starts as `[]` and a `merge` channel as `{}`; every other
 channel with no `default:` is unset, and reading an unset channel fails the
-execution naming the channel and the reader (§10.1). **Rationale**: §7.6.2 makes
+execution naming the channel and the reader (§10.1).
+[D101](#d101-a-merge-channels-properties-are-unset-until-supplied) carries the
+same rule one level down, to a property a `merge` channel has not been given
+yet. **Rationale**: §7.6.2 makes
 "what does a convergence see when only one branch ran?" a question the document
 has to answer, and the answer is "the channels as they stand" — which requires
 knowing what a channel that was never written holds. The two reduce policies with
@@ -4452,6 +4492,36 @@ already accepted for a repeated `route:` member, which is the same shape of
 mistake in the same document. Dropping `uniqueItems` instead would have made
 this document's only stated reason for that `route:` rule not apply to its
 nearest neighbour. *PRD 5.5, 5.9, G3.*
+
+### D101. A `merge` channel's properties are unset until supplied
+
+Reading a property a `merge` channel does not currently hold fails the execution
+naming the channel, the property, and the reader; type-checking is unaffected;
+a channel `default:` (which must supply every required property) or a CEL
+`has()` test is how a read becomes unconditional (§10.1).
+**Rationale**: [D78](#d78-channel-initial-values-and-reading-an-unset-channel)
+answered "what does a channel that was never written hold?" per channel, and a
+`merge` channel is the one form where that is not enough. Its declared type is a
+closed object with required properties, but §10.2 and
+[D58](#d58-append-channels-take-one-element-per-write) let a write supply a
+*subset* of them, so the channel legitimately holds `{}` and then partial
+objects — values that do not validate against its own type. A guard
+`when: "state.totals.skipped > 0"` then type-checks (the property is declared
+`integer`) while the key may simply be absent at runtime, and the document said
+nothing: one implementer would fail the run as for an unset channel, another
+would surface a CEL absent-field error, a third would default to `0`. Three
+runtime behaviours from one spec, in the construct §7.6.4 relies on for
+deterministic fan-in.
+
+Field-level unset semantics is the answer that costs no new concept: it is
+D78's rule with the same justification (a manufactured zero for a declared
+`integer` is invented data, and PRD G3 wants the failure to name what to fix)
+and the same escape hatch (`default:`), applied one level down. The alternative
+— requiring every property of a `merge` channel to be present or defaulted
+before any read — would have to be enforced statically, and it cannot be: which
+writes have landed is exactly the runtime question. Admitting `has()` as the
+guarded-read spelling keeps the strict rule usable, and it is already in §4.1's
+supported CEL surface, so this adds no vocabulary either. *PRD 5.6, 5.7, G3.*
 
 ---
 
