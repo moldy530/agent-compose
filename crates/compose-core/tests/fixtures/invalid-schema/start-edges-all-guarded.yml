@@ -1,0 +1,20 @@
+# rule: at least one edge leaving `start` must be unconditional or carry `else: true`, so an execution always has a first step (grammar 7.6.3 / D70)
+# at: /flow.simple/edges
+# via: /$defs/flowDef/properties/edges/contains
+flow.simple:
+  inputs:
+    mode: { enum: [fast, slow] }
+  outputs:
+    draft: { type: string }
+  nodes:
+    quick:
+      agent: agent.quick
+      input: "input.goal"
+    thorough:
+      agent: agent.thorough
+      input: "input.goal"
+  edges:
+    - { from: start, to: quick,    when: "input.mode == 'fast'" }
+    - { from: start, to: thorough, when: "input.mode == 'slow'" }
+    - { from: quick, to: end }
+    - { from: thorough, to: end }

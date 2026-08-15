@@ -1,0 +1,19 @@
+# rule: a map's `as:` binding may not shadow a CEL root in scope for per-item expressions (grammar 2.5, 8.6 / D74)
+# at: /flow.work/nodes/fan/map/as
+# via: /$defs/itemBindingName/allOf/1/not
+flow.work:
+  outputs:
+    done: { type: boolean }
+  nodes:
+    plan:
+      agent: agent.planner
+    fan:
+      map:
+        over: plan.output.tasks
+        as: state
+        node: agent.worker
+        max_concurrency: 4
+  edges:
+    - { from: start, to: plan }
+    - { from: plan, to: fan }
+    - { from: fan, to: end }

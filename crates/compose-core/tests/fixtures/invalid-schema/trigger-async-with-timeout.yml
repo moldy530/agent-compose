@@ -1,0 +1,9 @@
+# rule: `timeout:` bounds a synchronous response; on an async trigger, which has already responded with an execution id, it changes nothing and is an error (grammar 13.3 / D81)
+# at: /triggers/on_request
+# via: /$defs/httpTrigger/allOf/0/else/not
+triggers:
+  on_request:
+    type: http
+    flow: flow.review_loop
+    respond: async
+    timeout: 30s

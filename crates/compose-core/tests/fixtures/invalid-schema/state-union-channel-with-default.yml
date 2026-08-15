@@ -1,0 +1,10 @@
+# rule: `default:` is illegal on a discriminated union - a union default would have to name a variant, manufacturing a discriminator tag (grammar 3.6 / D77)
+# at: /state/finding
+# via: /$defs/stateChannel/oneOf
+state:
+  finding:
+    discriminator: kind
+    variants:
+      auto_fixable: { file: { type: string } }
+      needs_human:  { summary: { type: string } }
+    default: { kind: auto_fixable, file: "src/lib.rs" }

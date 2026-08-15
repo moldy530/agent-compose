@@ -1,0 +1,13 @@
+# rule: a node id may not shadow a reserved CEL root - a node named `input` makes `input.output.x` ambiguous with the flow input object (grammar 2.5 / D74)
+# at: /flow.simple/nodes
+# via: /$defs/nodeId/allOf/2/not
+flow.simple:
+  outputs:
+    draft: { type: string }
+  nodes:
+    input:
+      agent: agent.researcher
+      input: "input.goal"
+  edges:
+    - { from: start, to: input }
+    - { from: input, to: end }
