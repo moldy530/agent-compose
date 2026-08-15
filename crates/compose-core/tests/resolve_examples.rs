@@ -486,6 +486,83 @@ fn a_file_below_deploy_is_an_ordinary_import() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// Grammar 14.2's capability rule is checked on both halves of a backend
+/// config — the per-kind `defaults:` in the parser, the alias here — and a rule
+/// written a little too tight is exactly what a negative corpus cannot catch.
+/// So: every store kind bound to an alias whose provider serves it, two stores
+/// sharing one alias, and a target that resolves clean.
+///
+/// The companion is the `store-binds-an-alias-that-serves-another-kind`
+/// fixture, which pins the rejection and its exact text.
+#[test]
+fn every_kind_bound_to_an_alias_that_serves_it_resolves() {
+    let dir = scratch("backend-capability");
+    write(
+        &dir,
+        "main.yml",
+        concat!(
+            "version: \"0.1\"\n",
+            "provider.embeddings:\n",
+            "  kind: openai\n",
+            "  api_key: ${OPENAI_API_KEY}\n",
+            "store.sessions_a:\n",
+            "  kind: kv\n",
+            "  scope: session\n",
+            "  backend: sessions\n",
+            "  value_schema:\n",
+            "    seen: { type: integer }\n",
+            "store.sessions_b:\n",
+            "  kind: kv\n",
+            "  scope: session\n",
+            "  backend: sessions\n",
+            "  value_schema:\n",
+            "    seen: { type: integer }\n",
+            "store.docs:\n",
+            "  kind: vector\n",
+            "  scope: global\n",
+            "  backend: docs_db\n",
+            "  embed:\n",
+            "    model: text-embedding-3-small\n",
+            "    provider: provider.embeddings\n",
+            "store.artifacts:\n",
+            "  kind: blob\n",
+            "  scope: global\n",
+            "  backend: artifacts\n",
+        ),
+    );
+    write(
+        &dir,
+        "deploy/staging.yml",
+        concat!(
+            "version: \"0.1\"\n",
+            "storage_backends:\n",
+            "  aliases:\n",
+            "    sessions: { provider: redis, url: \"${REDIS_URL}\" }\n",
+            "    docs_db: { provider: chroma, url: \"${CHROMA_URL}\" }\n",
+            "    artifacts: { provider: s3, bucket: acme-artifacts }\n",
+        ),
+    );
+
+    let resolution = resolve_with_target(dir.join("main.yml"), "staging");
+    let ir = resolution.ir.as_ref().unwrap_or_else(|| {
+        panic!(
+            "a store bound to an alias that serves its kind resolves:\n{}",
+            render(&resolution)
+        )
+    });
+    let aliases: Vec<&str> = ir
+        .deploy
+        .storage_backends
+        .as_ref()
+        .expect("the staging target declares `storage_backends:`")
+        .aliases
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(aliases, ["artifacts", "docs_db", "sessions"]);
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// A scratch directory of this test's own, cleaned out before use.
 ///
 /// Named by the process as well as by the test, because it is *emptied* before
