@@ -1,0 +1,956 @@
+//! Flows, nodes, and edges (grammar 7, 8).
+
+use crate::ast::binding::NodeInput;
+use crate::ast::common::Namespace;
+use crate::ast::flow::{
+    Edge, FlowContext, FlowDef, FlowNode, HumanBlock, ItemError, MapBlock, MapDispatch, MapRoute,
+    NODE_KIND_KEYS, Node as FlowNodeAst, NodeKind, StoreNode, StoreOp, StoreOpParams, StoreValue,
+};
+use crate::ast::policy::PolicyBlock;
+use crate::ast::schema::Surface;
+use crate::diag::{Diagnostic, DiagnosticCode, Span, Spanned};
+use crate::yaml::{Node, Yaml};
+
+use super::binding::{self, NameForm};
+use super::definition::description;
+use super::lexical;
+use super::policy;
+use super::reader::{Cx, Fields, expect_mapping, expect_sequence, in_range, list};
+use super::schema;
+
+/// Read a `flow.*` definition (grammar 7).
+pub(crate) fn flow_def(fields: &mut Fields<'_>, subject: &str, cx: &mut Cx) -> FlowDef {
+    let description = description(fields, cx);
+    let inputs = fields.take("inputs").and_then(|node| {
+        schema::field_map(node, &format!("`inputs` of {subject}"), Surface::Input, cx)
+    });
+    let outputs = fields.require("outputs", cx).and_then(|node| {
+        schema::field_map(
+            node,
+            &format!("`outputs` of {subject}"),
+            Surface::Result,
+            cx,
+        )
+    });
+
+    let mut nodes = Vec::new();
+    if let Some(node) = fields.require("nodes", cx)
+        && let Some(mapping) = expect_mapping(node, &format!("`nodes` of {subject}"), cx)
+    {
+        if mapping.is_empty() {
+            cx.error(
+                DiagnosticCode::InvalidValue,
+                &node.span,
+                format!("`nodes` of {subject} must declare at least one node"),
+            );
+        }
+        for entry in mapping.entries() {
+            let Some(id) = lexical::node_id(&entry.key, "node id", cx) else {
+                continue;
+            };
+            nodes.push(node_object(id, &entry.value, cx));
+        }
+    }
+
+    let mut edges: Vec<Edge> = Vec::new();
+    if let Some(node) = fields.require("edges", cx)
+        && let Some(items) = expect_sequence(node, &format!("`edges` of {subject}"), cx)
+    {
+        if items.is_empty() {
+            cx.error(
+                DiagnosticCode::InvalidValue,
+                &node.span,
+                format!("`edges` of {subject} must declare at least one edge"),
+            );
+        }
+        for item in items {
+            let Some(edge) = edge(item, cx) else {
+                continue;
+            };
+            if let Some(first) = edges.iter().find(|other| same_edge(other, &edge)) {
+                cx.push(
+                    Diagnostic::error(
+                        DiagnosticCode::InvalidValue,
+                        edge.span.clone(),
+                        "duplicate edge: the same `from`, `to`, and `when` are already declared",
+                    )
+                    .with_label(first.span.clone(), "first declared here")
+                    .with_help("a second identical edge adds no transition"),
+                );
+                continue;
+            }
+            edges.push(edge);
+        }
+    }
+
+    FlowDef {
+        description,
+        inputs,
+        outputs,
+        nodes,
+        edges,
+    }
+}
+
+fn same_edge(left: &Edge, right: &Edge) -> bool {
+    let endpoints = left.from.as_ref().map(|s| &s.value) == right.from.as_ref().map(|s| &s.value)
+        && left.to.as_ref().map(|s| &s.value) == right.to.as_ref().map(|s| &s.value);
+    let guards = left.when.as_ref().map(|g| g.value.as_str())
+        == right.when.as_ref().map(|g| g.value.as_str());
+    endpoints && guards
+}
+
+fn edge(node: &Node, cx: &mut Cx) -> Option<Edge> {
+    let mapping = expect_mapping(node, "each entry of `edges`", cx)?;
+    let mut fields = Fields::new(mapping, node.span.clone(), "an edge");
+
+    let from = fields
+        .require("from", cx)
+        .and_then(|node| lexical::edge_source(node, cx));
+    let to = fields
+        .require("to", cx)
+        .and_then(|node| lexical::edge_target(node, cx));
+    let when = fields
+        .take("when")
+        .and_then(|node| lexical::cel(node, "`when`", cx));
+
+    let else_edge = fields.take("else").and_then(|node| match &node.value {
+        Yaml::Bool(true) => Some(node.span.clone()),
+        _ => {
+            cx.push(
+                Diagnostic::error(
+                    DiagnosticCode::InvalidValue,
+                    node.span.clone(),
+                    "`else` takes the literal `true`",
+                )
+                .with_help(
+                    "an edge with neither `when` nor `else` is already unconditional, so any other value would change nothing",
+                ),
+            );
+            None
+        }
+    });
+
+    if let (Some(when), Some(else_span)) = (when.as_ref(), else_edge.as_ref()) {
+        cx.push(
+            Diagnostic::error(
+                DiagnosticCode::ConflictingKeys,
+                else_span.clone(),
+                "an edge declares `when` or `else`, never both",
+            )
+            .with_label(when.span.clone(), "the guard is declared here")
+            .with_help("`else` marks the edge taken when no guarded sibling was"),
+        );
+    }
+
+    let max_iterations = fields
+        .integer("max_iterations", cx)
+        .filter(|value| in_range(value, "`max_iterations`", 1..=1000, cx));
+    fields.finish(cx);
+
+    Some(Edge {
+        from,
+        to,
+        when,
+        else_edge,
+        max_iterations,
+        span: node.span.clone(),
+    })
+}
+
+/// Which common keys a node kind accepts (grammar 7.1, 8.6 rule 9, 8.7).
+struct CommonKeys {
+    input: bool,
+    writes: bool,
+    retry_timeout: bool,
+}
+
+fn node_object(id: Spanned<crate::ast::common::Ident>, node: &Node, cx: &mut Cx) -> FlowNodeAst {
+    let subject = format!("node `{}`", id.value);
+    let Some(mapping) = expect_mapping(node, &subject, cx) else {
+        return FlowNodeAst {
+            id,
+            kind: NodeKind::Invalid,
+            input: None,
+            writes: None,
+            policy: PolicyBlock::default(),
+            description: None,
+            span: node.span.clone(),
+        };
+    };
+    let mut fields = Fields::new(mapping, node.span.clone(), &subject);
+    fields.note_known(NODE_KIND_KEYS);
+
+    let declared: Vec<&str> = NODE_KIND_KEYS
+        .iter()
+        .copied()
+        .filter(|key| fields.contains(key))
+        .collect();
+
+    if declared.len() > 1 {
+        for key in &declared[1..] {
+            let span = fields
+                .take_entry(key)
+                .map_or_else(|| fields.span.clone(), |entry| entry.key.span.clone());
+            cx.push(
+                Diagnostic::error(
+                    DiagnosticCode::ConflictingKeys,
+                    span,
+                    format!(
+                        "{subject} declares both `{}` and `{key}`; a node carries exactly one kind key",
+                        declared[0]
+                    ),
+                )
+                .with_help(format!("the node kinds are {}", list(NODE_KIND_KEYS))),
+            );
+        }
+    }
+
+    let (kind, common) = match declared.first().copied() {
+        None => {
+            cx.push(
+                Diagnostic::error(
+                    DiagnosticCode::MissingKey,
+                    fields.span.clone(),
+                    format!(
+                        "{subject} declares no kind key: a node carries exactly one of {}",
+                        list(NODE_KIND_KEYS)
+                    ),
+                )
+                .with_help("the kind key selects what the node does and what config it takes"),
+            );
+            (
+                NodeKind::Invalid,
+                CommonKeys {
+                    input: true,
+                    writes: true,
+                    retry_timeout: true,
+                },
+            )
+        }
+        Some(key) => node_kind(&mut fields, key, &subject, cx),
+    };
+
+    let input = if common.input {
+        fields
+            .take("input")
+            .and_then(|node| node_input(node, &kind, &subject, cx))
+    } else {
+        reject_key(
+            &mut fields,
+            "input",
+            &subject,
+            "a map node has no input of its own: the per-item binding lives in the `map:` block",
+            cx,
+        );
+        None
+    };
+    let writes = if common.writes {
+        fields
+            .take("writes")
+            .and_then(|node| binding::writes(node, &format!("`writes` of {subject}"), cx))
+    } else {
+        reject_key(
+            &mut fields,
+            "writes",
+            &subject,
+            "a map node has no output of its own: the write remap lives in the `map:` block or on a route",
+            cx,
+        );
+        None
+    };
+
+    let policy = if common.retry_timeout {
+        policy::policy_fields(&mut fields, &subject, cx)
+    } else {
+        for key in ["retry", "timeout"] {
+            reject_key(
+                &mut fields,
+                key,
+                &subject,
+                "a human wait is not an activity timeout, and re-prompting a human is not a retry",
+                cx,
+            );
+        }
+        PolicyBlock {
+            retry: None,
+            timeout: None,
+            on_error: fields
+                .take("on_error")
+                .and_then(|node| policy::on_error(node, &subject, cx)),
+        }
+    };
+
+    // An inline `exec:` node's bindings become environment variables, so an
+    // in-block `env:` key of the same name would silently win (Decision D66).
+    if let (NodeKind::Exec(block), Some(NodeInput::Fields(bindings))) = (&kind, input.as_ref()) {
+        let names: Vec<Spanned<String>> = bindings
+            .entries
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect();
+        binding::reject_env_collisions(block, names.iter(), cx);
+    }
+
+    // An inline `http:` node's bindings become the body or the query string, so
+    // declaring the in-block key that would carry them leaves one inert (D66).
+    if let (NodeKind::Http(block), Some(_)) = (&kind, input.as_ref())
+        && let Some(method) = block.method.as_ref()
+    {
+        let (competing, slot) = if method.value.carries_body() {
+            (block.body.as_ref(), "body")
+        } else {
+            (block.query.as_ref(), "query string")
+        };
+        if let Some(competing) = competing {
+            cx.push(
+                Diagnostic::error(
+                    DiagnosticCode::ConflictingKeys,
+                    competing.span.clone(),
+                    format!(
+                        "{subject} declares both `input:` and an in-block `{}`, which both claim the request {slot}",
+                        if method.value.carries_body() { "body" } else { "query" }
+                    ),
+                )
+                .with_help("write the request out in full, or let the bindings build it"),
+            );
+        }
+    }
+
+    let description = description(&mut fields, cx);
+    fields.finish(cx);
+
+    FlowNodeAst {
+        id,
+        kind,
+        input,
+        writes,
+        policy,
+        description,
+        span: node.span.clone(),
+    }
+}
+
+fn node_input(node: &Node, kind: &NodeKind, subject: &str, cx: &mut Cx) -> Option<NodeInput> {
+    let context = format!("`input` of {subject}");
+    match kind {
+        // A subflow's bindings are always per-field: a subgraph receives parent
+        // state only through explicit named bindings (grammar 8.5, PRD 5.7).
+        NodeKind::Flow(_) => {
+            binding::bindings(node, &context, NameForm::Identifier, cx).map(NodeInput::Fields)
+        }
+        _ => binding::node_input(node, &context, cx),
+    }
+}
+
+fn reject_key(fields: &mut Fields<'_>, key: &'static str, subject: &str, why: &str, cx: &mut Cx) {
+    let Some(entry) = fields.take_entry(key) else {
+        return;
+    };
+    cx.push(
+        Diagnostic::error(
+            DiagnosticCode::InvalidValue,
+            entry.key.span.clone(),
+            format!("`{key}` is not legal on {subject}"),
+        )
+        .with_help(why.to_owned()),
+    );
+}
+
+const FLOW_CONTEXTS: &[(&str, FlowContext)] = &[
+    ("isolated", FlowContext::Isolated),
+    ("inherit", FlowContext::Inherit),
+];
+
+const ITEM_ERRORS: &[(&str, ItemError)] = &[
+    ("fail", ItemError::Fail),
+    ("skip", ItemError::Skip),
+    ("retry", ItemError::Retry),
+];
+
+const STORE_OPS: &[(&str, StoreOp)] = &[
+    ("get", StoreOp::Get),
+    ("set", StoreOp::Set),
+    ("delete", StoreOp::Delete),
+    ("list", StoreOp::List),
+    ("search", StoreOp::Search),
+    ("upsert", StoreOp::Upsert),
+    ("put", StoreOp::Put),
+];
+
+fn node_kind(
+    fields: &mut Fields<'_>,
+    key: &str,
+    subject: &str,
+    cx: &mut Cx,
+) -> (NodeKind, CommonKeys) {
+    let all = CommonKeys {
+        input: true,
+        writes: true,
+        retry_timeout: true,
+    };
+    match key {
+        "agent" => {
+            let kind = fields
+                .take("agent")
+                .and_then(|node| lexical::reference(node, "`agent`", &[Namespace::Agent], cx))
+                .map_or(NodeKind::Invalid, NodeKind::Agent);
+            (kind, all)
+        }
+        "function" => {
+            let kind = fields
+                .take("function")
+                .and_then(|node| lexical::reference(node, "`function`", &[Namespace::Tool], cx))
+                .map_or(NodeKind::Invalid, NodeKind::Function);
+            (kind, all)
+        }
+        "exec" => {
+            let kind = fields
+                .take("exec")
+                .and_then(|node| {
+                    binding::exec_block(node, &format!("the `exec` block of {subject}"), true, cx)
+                })
+                .map_or(NodeKind::Invalid, NodeKind::Exec);
+            (kind, all)
+        }
+        "http" => {
+            let kind = fields
+                .take("http")
+                .and_then(|node| {
+                    binding::http_block(node, &format!("the `http` block of {subject}"), true, cx)
+                })
+                .map_or(NodeKind::Invalid, NodeKind::Http);
+            (kind, all)
+        }
+        "flow" => {
+            let flow = fields
+                .take("flow")
+                .and_then(|node| lexical::reference(node, "`flow`", &[Namespace::Flow], cx));
+            let context = fields
+                .take("context")
+                .and_then(|node| lexical::keyword(node, "`context`", FLOW_CONTEXTS, cx));
+            let policy = fields.take("policy").and_then(|node| {
+                policy::policy_block(node, &format!("the `policy` block of {subject}"), cx)
+            });
+            let kind = flow.map_or(NodeKind::Invalid, |flow| {
+                NodeKind::Flow(FlowNode {
+                    flow,
+                    context,
+                    policy,
+                })
+            });
+            (kind, all)
+        }
+        "human" => {
+            let kind = fields
+                .take("human")
+                .and_then(|node| human_block(node, subject, cx))
+                .map_or(NodeKind::Invalid, NodeKind::Human);
+            (
+                kind,
+                CommonKeys {
+                    input: true,
+                    writes: true,
+                    retry_timeout: false,
+                },
+            )
+        }
+        "map" => {
+            let kind = fields
+                .take("map")
+                .and_then(|node| map_block(node, subject, cx))
+                .map_or(NodeKind::Invalid, NodeKind::Map);
+            (
+                kind,
+                CommonKeys {
+                    input: false,
+                    writes: false,
+                    retry_timeout: true,
+                },
+            )
+        }
+        _ => {
+            let store = fields
+                .take("store")
+                .and_then(|node| lexical::reference(node, "`store`", &[Namespace::Store], cx));
+            let op = fields
+                .take("op")
+                .and_then(|node| lexical::keyword(node, "store `op`", STORE_OPS, cx));
+            if op.is_none() && !fields.contains("op") {
+                cx.error(
+                    DiagnosticCode::MissingKey,
+                    &fields.span.clone(),
+                    format!("missing required key `op` in {subject}"),
+                );
+            }
+            let params = store_params(fields, op.as_ref(), subject, cx);
+            let kind = store.map_or(NodeKind::Invalid, |store| {
+                NodeKind::Store(StoreNode { store, op, params })
+            });
+            (
+                kind,
+                CommonKeys {
+                    input: false,
+                    writes: true,
+                    retry_timeout: true,
+                },
+            )
+        }
+    }
+}
+
+/// Every store-op parameter name (grammar 11.4).
+const STORE_PARAMS: &[&str] = &[
+    "key",
+    "value",
+    "query",
+    "prefix",
+    "top_k",
+    "limit",
+    "filter",
+    "metadata",
+    "content_type",
+];
+
+fn store_params(
+    fields: &mut Fields<'_>,
+    op: Option<&Spanned<StoreOp>>,
+    subject: &str,
+    cx: &mut Cx,
+) -> StoreOpParams {
+    fields.note_known(STORE_PARAMS);
+    let mut params = StoreOpParams::default();
+    let Some(op) = op else {
+        // Without a legible `op:` there is no parameter row to check the
+        // parameters against, so take them all rather than reporting each as an
+        // unknown key on top of the diagnostic the op already produced.
+        for name in STORE_PARAMS {
+            let _ = fields.take(name);
+        }
+        return params;
+    };
+
+    let legal: Vec<&str> = op
+        .value
+        .required_parameters()
+        .iter()
+        .chain(op.value.optional_parameters())
+        .copied()
+        .collect();
+
+    for name in STORE_PARAMS {
+        if legal.contains(name) {
+            continue;
+        }
+        let Some(entry) = fields.take_entry(name) else {
+            continue;
+        };
+        cx.push(
+            Diagnostic::error(
+                DiagnosticCode::InvalidValue,
+                entry.key.span.clone(),
+                format!(
+                    "`{name}` is not a parameter of the `{}` op",
+                    op.value.as_str()
+                ),
+            )
+            .with_label(op.span.clone(), "the op is declared here")
+            .with_help(format!("`{}` takes {}", op.value.as_str(), list(&legal))),
+        );
+    }
+
+    for name in op.value.required_parameters() {
+        if !fields.contains(name) {
+            cx.push(
+                Diagnostic::error(
+                    DiagnosticCode::MissingKey,
+                    fields.span.clone(),
+                    format!(
+                        "missing required key `{name}` in {subject}: the `{}` op takes {}",
+                        op.value.as_str(),
+                        list(op.value.required_parameters())
+                    ),
+                )
+                .with_label(op.span.clone(), "the op is declared here"),
+            );
+        }
+    }
+
+    params.key = fields
+        .take("key")
+        .and_then(|node| lexical::cel(node, "`key`", cx));
+    params.query = fields
+        .take("query")
+        .and_then(|node| lexical::cel(node, "`query`", cx));
+    params.prefix = fields
+        .take("prefix")
+        .and_then(|node| lexical::cel(node, "`prefix`", cx));
+    params.top_k = fields
+        .integer("top_k", cx)
+        .filter(|value| in_range(value, "`top_k`", 1..=100, cx));
+    params.limit = fields
+        .integer("limit", cx)
+        .filter(|value| in_range(value, "`limit`", 1..=1000, cx));
+    params.filter = fields
+        .take("filter")
+        .and_then(|node| binding::bindings(node, "`filter`", NameForm::Identifier, cx));
+    params.metadata = fields
+        .take("metadata")
+        .and_then(|node| binding::bindings(node, "`metadata`", NameForm::Identifier, cx));
+    params.content_type = fields
+        .take("content_type")
+        .and_then(|node| lexical::text(node, "`content_type`", cx));
+
+    params.value = fields.take("value").and_then(|node| match op.value {
+        // `kv set` writes a value_schema-shaped object; `vector upsert` and
+        // `blob put` write one string (grammar 11.4).
+        StoreOp::Set => {
+            binding::bindings(node, "`value`", NameForm::Identifier, cx).map(StoreValue::Fields)
+        }
+        _ => lexical::cel(node, "`value`", cx).map(StoreValue::Expression),
+    });
+
+    params
+}
+
+fn human_block(node: &Node, subject: &str, cx: &mut Cx) -> Option<HumanBlock> {
+    let context = format!("the `human` block of {subject}");
+    let mapping = expect_mapping(node, &context, cx)?;
+    let mut fields = Fields::new(mapping, node.span.clone(), &context);
+
+    let input = fields.require("input", cx).and_then(|node| {
+        schema::field_map(node, &format!("`input` of {context}"), Surface::Input, cx)
+    });
+    let output = fields.require("output", cx).and_then(|node| {
+        schema::field_map(node, &format!("`output` of {context}"), Surface::Result, cx)
+    });
+    let timeout = fields
+        .take_entry("timeout")
+        .and_then(|entry| lexical::duration(&entry.value, "`timeout`", cx));
+    let on_timeout = fields
+        .take_entry("on_timeout")
+        .and_then(|entry| lexical::control_target(&entry.value, "`on_timeout`", cx));
+
+    // Jointly optional, jointly required: either half alone is inert
+    // (grammar 8.7, Decision D52).
+    match (fields.contains("timeout"), fields.contains("on_timeout")) {
+        (true, false) => cx.push(
+            Diagnostic::error(
+                DiagnosticCode::MissingKey,
+                timeout
+                    .as_ref()
+                    .map_or_else(|| node.span.clone(), |value| value.span.clone()),
+                format!("missing required key `on_timeout` in {context}: `timeout` declares a wait budget with no route"),
+            )
+            .with_help("`timeout` and `on_timeout` are declared together or not at all"),
+        ),
+        (false, true) => cx.push(
+            Diagnostic::error(
+                DiagnosticCode::MissingKey,
+                on_timeout
+                    .as_ref()
+                    .map_or_else(|| node.span.clone(), |value| value.span.clone()),
+                format!("missing required key `timeout` in {context}: `on_timeout` declares a route nothing can reach"),
+            )
+            .with_help("`timeout` and `on_timeout` are declared together or not at all"),
+        ),
+        _ => {}
+    }
+
+    fields.finish(cx);
+    Some(HumanBlock {
+        input,
+        output,
+        timeout,
+        on_timeout,
+        span: node.span.clone(),
+    })
+}
+
+fn map_block(node: &Node, subject: &str, cx: &mut Cx) -> Option<MapBlock> {
+    let context = format!("the `map` block of {subject}");
+    let mapping = expect_mapping(node, &context, cx)?;
+    let mut fields = Fields::new(mapping, node.span.clone(), &context);
+
+    let over = fields
+        .require("over", cx)
+        .and_then(|node| lexical::path_expression(node, "`over`", cx));
+    let item_binding = fields
+        .string("as", cx)
+        .and_then(|text| lexical::identifier(&text, "the `as` binding", cx));
+    let max_concurrency = fields
+        .require("max_concurrency", cx)
+        .and_then(|node| super::reader::expect_integer(node, "`max_concurrency`", cx))
+        .filter(|value| in_range(value, "`max_concurrency`", 1..=256, cx));
+    let on_item_error = fields
+        .take("on_item_error")
+        .and_then(|node| lexical::keyword(node, "`on_item_error`", ITEM_ERRORS, cx));
+    let input = fields.take("input").and_then(|node| {
+        binding::bindings(
+            node,
+            &format!("`input` of {context}"),
+            NameForm::Identifier,
+            cx,
+        )
+    });
+    let writes = fields
+        .take("writes")
+        .and_then(|node| binding::writes(node, &format!("`writes` of {context}"), cx));
+
+    let routed = fields.contains("route_by") || fields.contains("routes");
+    let detach = fields.take_entry("detach").and_then(|entry| {
+        if routed {
+            cx.push(
+                Diagnostic::error(
+                    DiagnosticCode::ConflictingKeys,
+                    entry.key.span.clone(),
+                    "`detach` is not legal on a discriminator-routed map".to_owned(),
+                )
+                .with_help(
+                    "the routes of a heterogeneous map are independently typed targets: declare `detach` on the routes that want it (grammar 8.6 rule 7)",
+                ),
+            );
+            return None;
+        }
+        match &entry.value.value {
+            Yaml::Bool(value) => Some(Spanned::new(*value, entry.value.span.clone())),
+            _ => {
+                cx.wrong_type(&entry.value, "`detach`", "a boolean");
+                None
+            }
+        }
+    });
+    reject_detached_writes(
+        detach.as_ref(),
+        writes.as_ref().map(|w| &w.span),
+        &context,
+        cx,
+    );
+
+    let dispatch = dispatch(&mut fields, &context, max_concurrency.as_ref(), cx);
+    fields.finish(cx);
+
+    Some(MapBlock {
+        over,
+        item_binding,
+        dispatch,
+        max_concurrency,
+        on_item_error,
+        input,
+        writes,
+        detach,
+        span: node.span.clone(),
+    })
+}
+
+fn dispatch(
+    fields: &mut Fields<'_>,
+    context: &str,
+    max_concurrency: Option<&Spanned<i64>>,
+    cx: &mut Cx,
+) -> MapDispatch {
+    let homogeneous = fields.contains("node");
+    let routed = fields.contains("route_by") || fields.contains("routes");
+    fields.note_known(&["node", "route_by", "routes", "default"]);
+
+    if homogeneous && routed {
+        // Consume both routing keys, not just the one the span comes from:
+        // the conflict is the whole story, and reporting the other as an
+        // unknown key on top of it would be noise.
+        let route_by = fields.take_entry("route_by");
+        let routes = fields.take_entry("routes");
+        let span = route_by
+            .or(routes)
+            .map_or_else(|| fields.span.clone(), |entry| entry.key.span.clone());
+        cx.push(
+            Diagnostic::error(
+                DiagnosticCode::ConflictingKeys,
+                span,
+                format!("{context} declares both a `node:` target and discriminator routing"),
+            )
+            .with_help(
+                "a map dispatches one way or the other: `node:`, or `route_by:` with `routes:`",
+            ),
+        );
+    }
+
+    if homogeneous {
+        if let Some(entry) = fields.take_entry("default") {
+            cx.push(
+                Diagnostic::error(
+                    DiagnosticCode::ConflictingKeys,
+                    entry.key.span.clone(),
+                    "`default` is a catch-all route and is legal only with `route_by`".to_owned(),
+                )
+                .with_help("a homogeneous map has one target, so there is nothing to fall back to"),
+            );
+        }
+        let target = fields.take("node").and_then(|node| {
+            lexical::reference(
+                node,
+                "`node`",
+                &[Namespace::Agent, Namespace::Tool, Namespace::Flow],
+                cx,
+            )
+        });
+        return target.map_or(MapDispatch::Invalid, |node| MapDispatch::Homogeneous {
+            node,
+        });
+    }
+
+    if !routed {
+        cx.push(
+            Diagnostic::error(
+                DiagnosticCode::MissingKey,
+                fields.span.clone(),
+                format!("{context} declares no dispatch target"),
+            )
+            .with_help("a map declares `node:` for a homogeneous fan-out, or `route_by:` with `routes:` for a discriminator-routed one"),
+        );
+        return MapDispatch::Invalid;
+    }
+
+    let route_by = fields
+        .string("route_by", cx)
+        .and_then(|text| lexical::identifier(&text, "`route_by`", cx));
+    if !fields.contains("routes") {
+        cx.error(
+            DiagnosticCode::MissingKey,
+            &fields.span.clone(),
+            format!("missing required key `routes` in {context}"),
+        );
+    }
+
+    let mut routes = Vec::new();
+    if let Some(node) = fields.take("routes")
+        && let Some(mapping) = expect_mapping(node, "`routes`", cx)
+    {
+        if mapping.is_empty() {
+            cx.error(
+                DiagnosticCode::InvalidValue,
+                &node.span,
+                "`routes` must declare at least one route",
+            );
+        }
+        for entry in mapping.entries() {
+            let Some(tag) = lexical::key_identifier(&entry.key, "route tag", cx) else {
+                continue;
+            };
+            let label = format!("route `{}`", tag.value);
+            if let Some(route) = map_route(&entry.value, &label, Some(tag), max_concurrency, cx) {
+                routes.push(route);
+            }
+        }
+    }
+
+    let default = fields
+        .take("default")
+        .and_then(|node| map_route(node, "the `default` route", None, max_concurrency, cx))
+        .map(Box::new);
+
+    match route_by {
+        Some(route_by) => MapDispatch::Routed {
+            route_by,
+            routes,
+            default,
+        },
+        None => MapDispatch::Invalid,
+    }
+}
+
+fn map_route(
+    node: &Node,
+    subject: &str,
+    tag: Option<Spanned<crate::ast::common::Ident>>,
+    map_concurrency: Option<&Spanned<i64>>,
+    cx: &mut Cx,
+) -> Option<MapRoute> {
+    let mapping = expect_mapping(node, subject, cx)?;
+    let mut fields = Fields::new(mapping, node.span.clone(), subject);
+
+    let target = fields.require("node", cx).and_then(|node| {
+        lexical::reference(
+            node,
+            "`node`",
+            &[Namespace::Agent, Namespace::Tool, Namespace::Flow],
+            cx,
+        )
+    });
+    let max_concurrency = fields
+        .integer("max_concurrency", cx)
+        .filter(|value| in_range(value, "`max_concurrency`", 1..=256, cx))
+        .inspect(|value| {
+            if let Some(map) = map_concurrency
+                && value.value > map.value
+            {
+                cx.push(
+                    Diagnostic::error(
+                        DiagnosticCode::ValueOutOfRange,
+                        value.span.clone(),
+                        format!(
+                            "`max_concurrency` of {subject} is {}, above the map's {}",
+                            value.value, map.value
+                        ),
+                    )
+                    .with_label(map.span.clone(), "the map's bound is declared here")
+                    .with_help("a route may only tighten the map's bound (grammar 8.6 rule 1)"),
+                );
+            }
+        });
+    let input = fields.take("input").and_then(|node| {
+        binding::bindings(
+            node,
+            &format!("`input` of {subject}"),
+            NameForm::Identifier,
+            cx,
+        )
+    });
+    let writes = fields
+        .take("writes")
+        .and_then(|node| binding::writes(node, &format!("`writes` of {subject}"), cx));
+    let detach = fields.boolean("detach", cx);
+    reject_detached_writes(
+        detach.as_ref(),
+        writes.as_ref().map(|w| &w.span),
+        subject,
+        cx,
+    );
+    fields.finish(cx);
+
+    Some(MapRoute {
+        tag,
+        node: target,
+        max_concurrency,
+        input,
+        writes,
+        detach,
+        span: node.span.clone(),
+    })
+}
+
+/// A detached dispatch is fire-and-forget, so it has nothing to write back
+/// (grammar 8.6 rule 7).
+fn reject_detached_writes(
+    detach: Option<&Spanned<bool>>,
+    writes: Option<&Span>,
+    subject: &str,
+    cx: &mut Cx,
+) {
+    let (Some(detach), Some(writes)) = (detach, writes) else {
+        return;
+    };
+    if !detach.value {
+        return;
+    }
+    cx.push(
+        Diagnostic::error(
+            DiagnosticCode::ConflictingKeys,
+            writes.clone(),
+            format!("{subject} is detached, so it may not declare `writes`"),
+        )
+        .with_label(detach.span.clone(), "detached here")
+        .with_help(
+            "a fire-and-forget dispatch is not joined, so nothing waits to record its result",
+        ),
+    );
+}

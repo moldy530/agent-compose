@@ -7,6 +7,16 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# Event-level YAML 1.2 parser. Chosen over a tree/serde loader because the
+# compiler needs what only the event stream exposes: byte-accurate spans on
+# every node, duplicate keys (rejected, never last-wins), tags and merge keys
+# as observable events, and explicit anchor/alias ids. Pure Rust, two small
+# transitive dependencies, and a `0.0.x` version pins exactly.
+saphyr-parser = "0.0.11"
+# Edit distance behind the "did you mean `retry`?" help on unknown keys and
+# unknown enum variants. Zero dependencies; Damerau-Levenshtein also catches
+# transpositions, which a hand-rolled Levenshtein would miss.
+strsim = "0.11"
 
 [dev-dependencies]
 # Schema-conformance harness only: the compiler itself does not depend on a
@@ -17,3 +27,6 @@ serde_json = "1"
 # Maintained fork of the (deprecated) `serde_yaml`; used to transcode example
 # and fixture YAML into JSON for validation.
 serde_yaml_ng = "0.10"
+# AST snapshots for the example corpus: a shape change shows up as a reviewable
+# diff instead of silently altering what downstream passes consume.
+insta = "1"
