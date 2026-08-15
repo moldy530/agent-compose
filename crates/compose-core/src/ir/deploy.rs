@@ -84,9 +84,12 @@ pub struct StorageBackends {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct BackendConfig {
     /// The alias name, or the store kind for a per-kind default, repeated from
-    /// the key with its own span.
+    /// the key it sits under — which is what carries the span a diagnostic
+    /// about the entry points at.
     pub name: Spanned<String>,
-    /// The store kind this backend serves, for a per-kind default.
+    /// The store kind this backend serves, present on a per-kind `defaults:`
+    /// entry and absent on an alias. It is what tells the two apart in a value
+    /// read on its own, which is why it stays beside the key that repeats it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<StoreKind>,
     /// `provider:` — the storage plugin.
