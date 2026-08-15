@@ -432,8 +432,16 @@ fn a_single_file_project_resolves() {
 }
 
 /// A scratch directory of this test's own, cleaned out before use.
+///
+/// Named by the process as well as by the test, because it is *emptied* before
+/// use: two `cargo test` runs at once — one per worktree, which is how this
+/// repo is worked on, or two jobs on one CI runner — would otherwise delete
+/// each other's fixtures mid-test and fail for a reason that is not in the
+/// code. `CARGO_TARGET_TMPDIR` is the scratch root Cargo hands integration
+/// tests; the pid is what separates two runs that share one target directory.
 fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("agent-compose-resolve-{name}"));
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("resolve-{name}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).expect("can create a scratch directory");
     dir
