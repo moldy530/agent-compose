@@ -15,7 +15,10 @@
 //! position accepts — and lets the answer carry both failures. That is why the
 //! wrong-namespace arm exists without a fixture of its own: it is the position
 //! table restated where resolution happens, not a second chance to catch a
-//! spelling.
+//! spelling. No corpus project can reach it — every position in grammar 2.3's
+//! table refuses a wrong-namespace *spelling* at the parser — so it is pinned
+//! by a unit test at the bottom of this module, the way `resolve::index` pins
+//! the version-mismatch rule that is dormant for the same kind of reason.
 
 use std::collections::BTreeSet;
 
@@ -111,7 +114,11 @@ impl Cx<'_, '_> {
                 .with_label(
                     declared.definition.address.span.clone(),
                     format!("`{written}` is defined here, in `{}`", declared.file),
-                ),
+                )
+                .with_help(format!(
+                    "a position accepts a fixed set of namespaces whatever the composition happens to define: this one takes {} (grammar 2.3)",
+                    namespace_list(accepts)
+                )),
             );
             return;
         }
@@ -288,8 +295,123 @@ fn expected_namespaces(accepts: &[Namespace]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{expected_namespaces, namespace_list};
-    use crate::ast::common::Namespace;
+    use super::{Cx, expected_namespaces, namespace_list};
+    use crate::ast::common::{Address, Ident, Namespace};
+    use crate::ast::document::Document;
+    use crate::diag::{
+        Diagnostic, DiagnosticCode, Diagnostics, Position, SourceName, Span, Spanned,
+    };
+    use crate::ir::SourceRole;
+    use crate::resolve::files::{Composition, SpecSource};
+    use crate::resolve::index;
+
+    /// Resolve one reference against a one-file composition, whatever the
+    /// parser would have made of that spelling in a real position.
+    fn resolve_one(
+        source: &str,
+        reference: Address,
+        accepts: &[Namespace],
+    ) -> (Option<String>, Option<String>) {
+        let parsed = crate::parse_str(source, "main.yml");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let Some(Document::Spec(file)) = parsed.document else {
+            panic!("the source is a spec file");
+        };
+        let composition = Composition {
+            entrypoint: "main.yml".to_string(),
+            target: crate::resolve::DEFAULT_TARGET.to_string(),
+            files: vec![SpecSource {
+                name: "main.yml".to_string(),
+                role: SourceRole::Entrypoint,
+                clean: true,
+                file,
+            }],
+            deploy: None,
+            complete: true,
+        };
+        let mut diagnostics = Diagnostics::new();
+        let index = index::build(&composition, &mut diagnostics);
+        assert!(diagnostics.into_vec().is_empty());
+
+        let mut diagnostics = Diagnostics::new();
+        let span = Span::new(
+            SourceName::new("main.yml"),
+            0..0,
+            Position::new(9, 3),
+            Position::new(9, 9),
+        );
+        Cx {
+            index: &index,
+            diagnostics: &mut diagnostics,
+        }
+        .address(&Spanned::new(reference, span), accepts);
+        let reported: Vec<Diagnostic> = diagnostics.into_vec();
+        assert!(reported.len() <= 1, "{reported:?}");
+        match reported.into_iter().next() {
+            None => (None, None),
+            Some(diagnostic) => {
+                assert_eq!(diagnostic.code, DiagnosticCode::InvalidReference);
+                (Some(diagnostic.message), diagnostic.help)
+            }
+        }
+    }
+
+    const PROVIDER: &str = "version: \"0.1\"\nprovider.p:\n  kind: anthropic\n  api_key: ${KEY}\n";
+
+    /// The wrong-namespace arm: the address *is* defined, in a namespace this
+    /// position does not accept. Every position in grammar 2.3's table refuses
+    /// that spelling at the parser, so no fixture project reaches this — the
+    /// arm is the position table restated where resolution happens, and this is
+    /// what keeps it honest.
+    #[test]
+    fn a_defined_address_in_a_namespace_the_position_refuses_is_reported_there() {
+        let (message, help) = resolve_one(
+            PROVIDER,
+            Address::new(Namespace::Provider, Ident::new("p")),
+            &[Namespace::Model],
+        );
+        assert_eq!(
+            message.as_deref(),
+            Some("expected a `model.*` reference, found `provider.p`")
+        );
+        assert_eq!(
+            help.as_deref(),
+            Some(
+                "a position accepts a fixed set of namespaces whatever the composition happens to define: this one takes `model.*` (grammar 2.3)"
+            )
+        );
+    }
+
+    /// The same arm with a multi-namespace position, so the help's list is not
+    /// pinned only in its one-element form.
+    #[test]
+    fn the_wrong_namespace_help_names_every_namespace_the_position_takes() {
+        let (_, help) = resolve_one(
+            PROVIDER,
+            Address::new(Namespace::Provider, Ident::new("p")),
+            &[Namespace::Tool, Namespace::Flow],
+        );
+        assert_eq!(
+            help.as_deref(),
+            Some(
+                "a position accepts a fixed set of namespaces whatever the composition happens to define: this one takes `tool.*` or `flow.*` (grammar 2.3)"
+            )
+        );
+    }
+
+    /// The accepting case, so the test above is not passing because every
+    /// reference is refused.
+    #[test]
+    fn a_defined_address_the_position_accepts_is_not_reported() {
+        assert_eq!(
+            resolve_one(
+                PROVIDER,
+                Address::new(Namespace::Provider, Ident::new("p")),
+                &[Namespace::Provider],
+            ),
+            (None, None)
+        );
+    }
 
     #[test]
     fn accepted_namespaces_read_as_a_list() {
