@@ -36,13 +36,18 @@ flow.review_loop:
     - { from: write, to: review }
 
     # Back-edge closing the write <-> review cycle. `max_iterations` is the
-    # termination guard the SCC check requires (PRD 5.4); `review` also has an
-    # edge that leaves the SCC, so exhausting the budget cannot dead-end.
+    # termination guard the SCC check requires (PRD 5.4).
     - from: review
       to: write
       when: "review.output.verdict == 'revise'"
       max_iterations: 3
 
+    # The escape edge the bounded cycle requires (grammar 7.4): it leaves the SCC
+    # and is an `else:`, so it is guaranteed to fire when no guarded sibling was
+    # taken — on `approve`, and equally on the pass where `revise` comes back but
+    # the back-edge's budget is spent. A guarded escape would leave that pass
+    # with no viable route. It is also what makes the `verdict` enum exhaustively
+    # routed (grammar 7.3.1).
     - from: review
       to: end
-      when: "review.output.verdict == 'approve'"
+      else: true

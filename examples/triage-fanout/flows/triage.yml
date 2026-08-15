@@ -68,9 +68,15 @@ flow.triage:
               severity: "finding.severity"
         # `default:` is narrowed to the UNROUTED variants (grammar 8.6 rule 4),
         # here just `duplicate` — which is why `finding.of` type-checks.
+        #
+        # `detach:` is spelled out as false because this project ships a
+        # non-local deploy target: `detach: true` is a v0 validation error under
+        # any durably checkpointed target, i.e. every target except `local`
+        # (grammar 8.6 rule 7 / 14, PRD 5.6), so with `deploy/staging.yml` in the
+        # tree a detached route would make `validate --target staging` fail.
         default:
           node: tool.dead_letter
-          detach: true
+          detach: false
           input:
             kind: "finding.kind"
             payload: "finding.of"

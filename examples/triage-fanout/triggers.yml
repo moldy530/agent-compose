@@ -1,6 +1,7 @@
 triggers:
-  # Session-scoped stores need a session identity; the CLI supplies it as
-  # `--session <key>`, exposed to the binding as payload.session (PRD 5.8).
+  # Session-scoped stores need a session identity. On a manual trigger the CLI
+  # supplies it as `--session <key>`, exposed to the binding as payload.session —
+  # which is also this key's default, spelled out here (grammar 13.2, PRD 5.8).
   cli:
     type: manual
     flow: flow.triage
