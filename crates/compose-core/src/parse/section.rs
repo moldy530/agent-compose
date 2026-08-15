@@ -314,6 +314,20 @@ fn trigger(name: Spanned<crate::ast::common::Ident>, node: &Node, cx: &mut Cx) -
         None => None,
     };
 
+    // Every key past the common four belongs to one trigger type, so without a
+    // legible `type:` there is nothing to check them against — and they are
+    // most likely the keys of the type the author meant: `path`, `method`,
+    // `respond` and `timeout` under a misspelt `type: htttp` are exactly what
+    // grammar 13.3 gives an `http` trigger. Reporting each as "unknown" would
+    // assert a violation the source does not contain and bury the one mistake
+    // it does, so consume them, as `schema::type_body` does for a type node
+    // that declares no form.
+    if !type_name
+        .as_ref()
+        .is_some_and(|type_name| TRIGGER_TYPES.contains(&type_name.value.as_str()))
+    {
+        fields.consume_rest();
+    }
     fields.finish(cx);
     Some(Trigger {
         name,
