@@ -2106,10 +2106,10 @@ A **route** object takes `node` (required) plus optional `max_concurrency`,
    the target, not a spec construct, so this is a **target-dependent** check like
    backend alias resolution (§11.3): the same composition is legal under
    `--target local` and rejected under `--target staging`. Detached dispatches
-   receive an `idempotency_key` derived from
-   `execution_id + node + item_index`; delivery is at-least-once and sinks are
-   documented to dedupe on it (PRD 5.6), which is what makes an unobserved
-   outcome a defensible trade rather than a lost message.
+   receive an `idempotency_key` derived from the execution id and the dispatch's
+   flattened instance path — the form §9.4 fixes; delivery is at-least-once and
+   sinks are documented to dedupe on it (PRD 5.6), which is what makes an
+   unobserved outcome a defensible trade rather than a lost message.
 8. **`route_by` is a literal field name**, never a CEL expression — this keeps
    exhaustiveness decidable (PRD 5.6).
 9. Node-level `input:` and node-level `writes:` are both ILLEGAL on a `map` node:
@@ -2138,9 +2138,10 @@ A **route** object takes `node` (required) plus optional `max_concurrency`,
       (rule 7, [D94](#d94-a-detached-dispatch-is-resolved-at-dispatch)).
     - A retry re-executes the whole dispatched instance from its entry as a fresh
       attempt — iteration counters and the item's own state reset, exactly as a
-      `flow:` node's `retry:` re-executes a subgraph instance (§8.5). The item's
-      `execution.item_index` does not change, so its idempotency key does not
-      either (PRD 5.6, 5.8).
+      `flow:` node's `retry:` re-executes a subgraph instance (§8.5). Nothing the
+      instance path is built from changes — the item keeps its index and the
+      re-executed instance starts its traversal ordinals over — so every attempt
+      derives the same idempotency key (§9.4, PRD 5.6, 5.8).
     - When retries are exhausted the item **fails**, resolving as `fail` does. To
       absorb that, put `on_error:` on the map node itself (rule 9): it applies to
       the fan-out as a whole, so `on_item_error: { retry: {...} }` with
@@ -2387,6 +2388,62 @@ per composition (§1.5), and applies to every node in every flow — with the on
 exemption above, which withholds `timeout` and `retry` from `human` nodes
 (Decision [D20](#d20-the-policy-resolution-chain-has-exactly-four-levels),
 [D102](#d102-a-human-node-resolves-no-timeout-and-no-retry-at-any-level)).
+
+### 9.4 The idempotency key
+
+Retries (§9.1) and at-least-once delivery make one effect issuable more than
+once, so every effect this grammar delivers without observing its outcome carries
+an **idempotency key** that the receiver dedupes on. There are exactly two:
+a **detached** `map` dispatch (§8.6 rule 7) and a **store write** (§11.4). PRD 5.6
+and 5.8 name the key `execution_id + node + item_index`; this section fixes what
+"node" is, because the constructs above make one node id ambiguous within a
+single execution (Decision
+[D104](#d104-the-idempotency-key-is-the-flattened-instance-path)).
+
+An **effect site** is where an effect is issued: a store node, or a `map` node
+paired with one source-item index on a detached route. Its **frame** is
+
+```
+<flow-local node id> "/" <traversal ordinal> [ "/" <source-item index> ]
+```
+
+where the **traversal ordinal** is how many times that node has already begun
+executing in its own flow instance (`0` the first time, `1` on the second
+traversal of a bounded cycle, §7.4), and the third component is present only for
+a `map` node, naming the instance it dispatches.
+
+The key is `execution.id` (§4.1) followed by the frames of every node crossed
+from the **root flow instance** — the one the invocation started (§13) — down to
+the effect site, **outermost first**, joined with `/`. A `flow:` node and a `map`
+node each contribute their own frame on the way in; integers are decimal; node
+ids are identifiers (§2.1), so no component can contain a separator.
+
+```
+exec_01/a/0/save/0          # store node `save`, in flow.ingest instantiated by node `a`
+exec_01/b/0/save/0          # …and by node `b`: a different write, a different key
+exec_01/outer/0/3/inner/0/0/save/0   # `save` under item 0 of `inner`, itself item 3 of `outer`
+exec_01/dispatch/0/7        # the detached dispatch of item 7 by map node `dispatch`
+```
+
+Two properties follow, and they are the whole point of fixing the form:
+
+- **distinct effects get distinct keys.** A flow instantiated twice in one
+  execution, and the repeating item indexes of a nested map, are exactly the
+  cases a bare node id collides on — and a collision under at-least-once
+  semantics is a real write the sink drops as a duplicate;
+- **a repeated attempt at one effect reuses its key.** A node-level retry
+  (§9.1), an item retry (§8.6 rule 10), and a `flow:` node's re-execution of an
+  instance (§8.5) all re-run the *same* attempt: the traversal ordinal counts
+  executions of the node within its instance and a re-executed instance starts
+  over, so every attempt derives one key. That is what makes delivery
+  at-least-once rather than a stream of distinct writes.
+
+The key is derived, never authored: no spec construct sets or overrides it, so
+there is nothing here for `validate` to reject. The rules that *are* checked
+belong to the two carrying constructs — `detach: true` under a checkpointed
+target (§8.6 rule 7) and the map-write keying rule (§11.4). Nor is the key
+writable in CEL: `execution.item_index` exposes only the innermost enclosing
+map's index (§4.1), while a key needs every one of them.
 
 ---
 
@@ -2637,8 +2694,10 @@ Rules (PRD 5.8):
 - `value` on a `kv` `set` is schema-checked against `value_schema`; `filter` and
   `metadata` keys are schema-checked against `metadata_schema`.
 - Store ops are **effects**: reads are recorded and replay consumes history, not
-  the live store; writes are at-least-once carrying an idempotency key derived
-  from `execution_id + node + item_index`.
+  the live store; writes are at-least-once carrying the idempotency key of §9.4 —
+  the execution id plus the store node's flattened instance path, which is what
+  keeps two instantiations of one flow, and the repeating item indexes of nested
+  maps, from deriving one key for two different writes.
 - A store **write** performed inside a `map`-dispatched instance — `kv set`,
   `kv delete`, `vector upsert`, `vector delete`, `blob put`, `blob delete` — MUST
   be one of two forms (PRD 5.8, Decision
@@ -3459,7 +3518,9 @@ NOT declare `writes:`
 or write reduced state, and `detach: true` under a durably checkpointed target is
 a v0 validation error (D59 fixes which targets those are).
 **Rationale**: the restrictions are verbatim from PRD 5.6's settled position on
-detach under durable execution; idempotency keys are supplied automatically.
+detach under durable execution; idempotency keys are supplied automatically, in
+the form §9.4 fixes
+([D104](#d104-the-idempotency-key-is-the-flattened-instance-path)).
 Confining the key to those two positions removes the only reading question the
 shape raises — whether a map-level `detach: true` means "detach every route" or
 "detach the routes that do not say otherwise" — and it costs nothing, since the
@@ -4396,7 +4457,10 @@ mechanism PRD 5.6 pairs with detach: delivery carries an execution-derived
 the sink can dedupe rather than a message the graph silently dropped. The map
 node's own `on_error:` still covers failures that are the *node's* — a dispatch
 that could not be issued — which keeps `on_error:` meaningful without
-reintroducing the wait. *PRD 5.6.*
+reintroducing the wait. The key itself is
+[D104](#d104-the-idempotency-key-is-the-flattened-instance-path)'s: without a
+form that separates one dispatch site from another, the dedupe this trade rests
+on would drop real deliveries. *PRD 5.6.*
 
 ### D95. Node reachability counts edges and the two control-transfer positions
 
@@ -4659,6 +4723,43 @@ needs it. The alternative worth naming, a per-flow `defaults:` layer where a
 flow-local target would be in scope, is exactly the flow-definition-level default
 [D20](#d20-the-policy-resolution-chain-has-exactly-four-levels) already
 considered and rejected to keep the chain as PRD 5.5 settles it. *PRD 5.5, G3.*
+
+### D104. The idempotency key is the flattened instance path
+
+The key an effect carries is the execution id followed by the frames of every
+node crossed from the root flow instance to the effect site, outermost first —
+each frame a node id, that node's traversal ordinal within its flow instance,
+and, for a `map` node, the source-item index of the instance it dispatches
+(§9.4). Its two carriers are a detached `map` dispatch (§8.6 rule 7) and a store
+write (§11.4).
+**Rationale**: PRD 5.6 and 5.8 both write the derivation as
+`execution_id + node + item_index` and 5.8 raises it to "a named cross-cutting
+rule", so the *principle* is settled; what "node" denotes is not, and this
+grammar makes three constructs under which a node id names several distinct
+effects in one execution. A flow instantiated twice — `a: {flow: flow.ingest}`
+and `b: {flow: flow.ingest}` — puts the same store node `save` at two sites with
+no `item_index` at all; nested maps repeat the inner index across outer items, so
+inner item 0 under outer item 0 and inner item 0 under outer item 1 collide; and
+a node inside a bounded cycle (§7.4) executes twice in one instance. Under
+at-least-once delivery a collision is not a cosmetic defect: the sink or store
+dedupes the second write away, so the design meant to stop a message being lost
+loses one. Reading "node" as the *occurrence* — the path that identifies which
+instantiation, which item, and which traversal — is the only reading under which
+the PRD's own dedupe rule preserves data, so it is a refinement of the settled
+principle rather than a departure from it (prd.md's shorthand phrasing stands as
+written; the precise form lives here). The traversal ordinal is the component
+that does not fall out of "path", and it is required by the same argument: two
+traversals of a store node in a bounded cycle are two writes an author expects to
+land. It also costs nothing on the other side of the trade, because it counts
+*executions within an instance*, which every kind of retry restarts or leaves
+alone — so retried delivery still repeats one key, which is what at-least-once
+means. Fixing a rendering (frames joined with `/`, integers in decimal, node ids
+being identifiers and so separator-free) is what makes two implementations agree
+on the string a sink sees, in the spirit of
+[D34](#d34-the-store-op-catalog-is-normative-including-derived-output-schemas)'s
+fixed output names. Every component is reproduced by a replay, because the
+schedule is a pure function of the graph and the recorded outputs (§7.6.4), so
+the key is stable across a resume. *PRD 5.6, 5.8, 5.12.*
 
 ---
 
