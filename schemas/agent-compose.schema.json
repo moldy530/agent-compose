@@ -14,9 +14,9 @@
       "type": "array",
       "uniqueItems": true,
       "items": {
-        "description": "Relative path to a spec file, ending in .yml or .yaml.",
+        "description": "Relative path to a spec file: `/`-separated segments, each `.`, `..`, or a name matching [A-Za-z0-9_][A-Za-z0-9_.-]*, ending in .yml or .yaml. No leading /, no backslashes, no whitespace - one portable spelling keeps a path identical in the IR, on a command line, and in a diagnostic on every host. Grammar 1.4.",
         "type": "string",
-        "pattern": "^[A-Za-z0-9_.][A-Za-z0-9_./-]*\\.(yml|yaml)$"
+        "pattern": "^(([A-Za-z0-9_][A-Za-z0-9_.-]*|\\.\\.?)/)*[A-Za-z0-9_][A-Za-z0-9_.-]*\\.(yml|yaml)$"
       }
     },
     "defaults": {
@@ -131,29 +131,31 @@
       "type": "string",
       "pattern": "^[a-z][a-z0-9_]{0,63}$"
     },
+    "reservedRootName": {
+      "description": "The CEL root identifiers and the implicit conversation-history channel. None of them may name a state channel or a flow-local node id: a node named `input` would make `input.output.x` ambiguous with the flow input object. Grammar 2.5 / Decision D74.",
+      "enum": ["input", "state", "execution", "item", "messages", "output", "payload"]
+    },
     "channelName": {
       "description": "A state channel name: an identifier that is not a reserved CEL root or the implicit conversation-history channel. Grammar 2.5.",
       "allOf": [
         { "$ref": "#/$defs/identifier" },
-        {
-          "not": {
-            "enum": ["input", "state", "execution", "item", "messages", "output", "payload"]
-          }
-        }
+        { "not": { "$ref": "#/$defs/reservedRootName" } }
       ]
     },
     "nodeId": {
-      "description": "A flow-local node id: an identifier other than the pseudo-nodes `start` and `end`. Grammar 2.4.",
+      "description": "A flow-local node id: an identifier other than the pseudo-nodes `start` and `end` and other than a reserved CEL root. Grammar 2.4, 2.5.",
       "allOf": [
         { "$ref": "#/$defs/identifier" },
-        { "not": { "enum": ["start", "end"] } }
+        { "not": { "enum": ["start", "end"] } },
+        { "not": { "$ref": "#/$defs/reservedRootName" } }
       ]
     },
     "controlTarget": {
-      "description": "A control-transfer target: a flow-local node id, or the pseudo-node `end` (finish this flow instance, materializing its outputs). Never `start`. Used by `on_error.fallback` and `human.on_timeout`, which accept exactly the same targets. Grammar 2.4, 9.2.",
+      "description": "A control-transfer target: a flow-local node id, or the pseudo-node `end` (retire this branch; the instance finishes at quiescence). Never `start`. Used by `on_error.fallback` and `human.on_timeout`, which accept exactly the same targets. Grammar 2.4, 7.6.3, 9.2.",
       "allOf": [
         { "$ref": "#/$defs/identifier" },
-        { "not": { "const": "start" } }
+        { "not": { "const": "start" } },
+        { "not": { "$ref": "#/$defs/reservedRootName" } }
       ]
     },
     "agentRef": {
@@ -485,6 +487,10 @@
           "type": "array",
           "uniqueItems": true,
           "items": { "$ref": "#/$defs/identifier" }
+        },
+        "default": {
+          "description": "Initial/fallback value, supplying every required property. Legal on input surfaces and state channels only; a defaulted field is implicitly optional. Grammar 3.6 / Decision D77.",
+          "type": "object"
         }
       },
       "additionalProperties": false
@@ -531,7 +537,11 @@
           "maximum": 10000
         },
         "min_items": { "description": "Minimum element count.", "type": "integer", "minimum": 0 },
-        "unique_items": { "description": "Whether elements must be unique.", "type": "boolean" }
+        "unique_items": { "description": "Whether elements must be unique.", "type": "boolean" },
+        "default": {
+          "description": "Initial/fallback value, an array of the `items:` type. Legal on input surfaces and state channels only; a defaulted field is implicitly optional. Grammar 3.6 / Decision D77.",
+          "type": "array"
+        }
       },
       "additionalProperties": false
     },
@@ -759,10 +769,23 @@
       ]
     },
     "mapInputBindings": {
-      "description": "Per-field bindings: field name -> CEL over the item binding (`item` unless renamed with `as:`), input, state, and execution. The per-item index is spelled `execution.item_index`; there is no bare `item_index` root. Grammar 4.1 / Decision D63.",
-      "type": "object",
-      "propertyNames": { "$ref": "#/$defs/identifier" },
-      "additionalProperties": { "$ref": "#/$defs/cel" }
+      "description": "Per-item bindings, in the same two forms node-level `input:` takes: a field map (field name -> CEL over the item binding `item` unless renamed with `as:`, plus input/state/execution), or a bare CEL scalar binding a string-in agent's single unnamed input. The per-item index is spelled `execution.item_index`; there is no bare `item_index` root. Grammar 4.1, 8.6 rule 12 / Decisions D63, D75.",
+      "oneOf": [
+        { "description": "Scalar binding for a string-in agent target.", "$ref": "#/$defs/cel" },
+        {
+          "description": "Per-field bindings for a target with a declared input object.",
+          "type": "object",
+          "propertyNames": { "$ref": "#/$defs/identifier" },
+          "additionalProperties": { "$ref": "#/$defs/cel" }
+        }
+      ]
+    },
+    "itemBindingName": {
+      "description": "A map's `as:` binding: an identifier that does not shadow a CEL root in scope for per-item expressions. `item` is legal - it is this binding's own default name. Grammar 2.5, 8.6 / Decision D74.",
+      "allOf": [
+        { "$ref": "#/$defs/identifier" },
+        { "not": { "enum": ["input", "state", "execution", "messages", "output", "payload"] } }
+      ]
     },
     "writes": {
       "description": "Write remap: output field name -> state channel name. A remapped field is not also written to its same-named channel. Fixes channel collisions and cross-subgraph renames (PRD 5.7).",
@@ -918,7 +941,14 @@
           "type": "array",
           "minItems": 1,
           "uniqueItems": true,
-          "items": { "$ref": "#/$defs/edge" }
+          "items": { "$ref": "#/$defs/edge" },
+          "contains": {
+            "description": "At least one edge leaving `start` must be unconditional or carry `else: true`, so an execution always has a first step instead of dying on \"no viable route\" before doing any work. Guarded `start` edges are legal; they just cannot be the only ones. Grammar 7.6.3 / Decision D70.",
+            "type": "object",
+            "required": ["from"],
+            "properties": { "from": { "const": "start" } },
+            "not": { "required": ["when"] }
+          }
         }
       },
       "additionalProperties": false
@@ -930,14 +960,22 @@
       "properties": {
         "from": {
           "description": "Source node id, or the pseudo-node `start`.",
-          "allOf": [{ "$ref": "#/$defs/identifier" }, { "not": { "const": "end" } }]
+          "allOf": [
+            { "$ref": "#/$defs/identifier" },
+            { "not": { "const": "end" } },
+            { "not": { "$ref": "#/$defs/reservedRootName" } }
+          ]
         },
         "to": {
           "description": "Target node id, or the pseudo-node `end`.",
-          "allOf": [{ "$ref": "#/$defs/identifier" }, { "not": { "const": "start" } }]
+          "allOf": [
+            { "$ref": "#/$defs/identifier" },
+            { "not": { "const": "start" } },
+            { "not": { "$ref": "#/$defs/reservedRootName" } }
+          ]
         },
         "when": {
-          "description": "CEL guard over the source node's output plus input/state/execution. The LLM decides the value; the compiled router decides the transition (PRD 5.3).",
+          "description": "CEL guard over the source node's output plus input/state/execution. The LLM decides the value; the compiled router decides the transition (PRD 5.3). Legal on an edge leaving `start` too, where the only roots are input/state/execution.",
           "$ref": "#/$defs/cel"
         },
         "else": {
@@ -1358,8 +1396,8 @@
           "type": "object",
           "required": ["over", "max_concurrency"],
           "properties": {
-            "over": { "description": "Path expression resolving to an array schema that declares max_items.", "$ref": "#/$defs/pathExpression" },
-            "as": { "description": "Name bound to each item in per-item bindings and traces (default `item`).", "$ref": "#/$defs/identifier" },
+            "over": { "description": "Path expression resolving to an array schema that declares max_items. Its root node must dominate this map node - every path from `start` to the map passes through it - so the array is guaranteed to exist when the map dispatches (grammar 8.6 rule 11).", "$ref": "#/$defs/pathExpression" },
+            "as": { "description": "Name bound to each item in per-item bindings and traces (default `item`).", "$ref": "#/$defs/itemBindingName" },
             "node": { "description": "Homogeneous dispatch target. Mutually exclusive with route_by/routes.", "$ref": "#/$defs/mapTargetRef" },
             "route_by": {
               "description": "Literal discriminator field name of the item union - never a CEL expression, which is what keeps exhaustiveness decidable (PRD 5.6).",
@@ -1379,7 +1417,22 @@
               "minimum": 1,
               "maximum": 256
             },
-            "on_item_error": { "description": "Per-item error strategy (default fail).", "enum": ["fail", "skip", "retry"] },
+            "on_item_error": {
+              "description": "Per-item error strategy (default fail). A retry carries its policy inline, in the same enum-or-single-key-object shape `on_error:` uses: a bare `retry` would be a retry with no count and no backoff, which is the unbounded loop PRD 5.6 exists to prevent, and there is nothing for it to inherit one from. Grammar 8.6 rule 10 / Decision D73.",
+              "oneOf": [
+                {
+                  "description": "fail (default): the item's failure fails the fan-out. skip: drop the item and carry on.",
+                  "enum": ["fail", "skip"]
+                },
+                {
+                  "description": "Retry the item under this policy, re-executing the dispatched instance from its entry; when the retries are exhausted the item fails as `fail` does.",
+                  "type": "object",
+                  "required": ["retry"],
+                  "properties": { "retry": { "$ref": "#/$defs/retry" } },
+                  "additionalProperties": false
+                }
+              ]
+            },
             "input": { "description": "Per-item input bindings; without it the whole item is passed.", "$ref": "#/$defs/mapInputBindings" },
             "writes": { "description": "Write remap; targets must be channels with a declared reduce policy.", "$ref": "#/$defs/writes" },
             "detach": { "description": "Fire-and-forget dispatch, homogeneous form only. Illegal here alongside `route_by:` - a discriminator-routed map declares detach per route. A detached dispatch may not write reduced state, and detach + checkpointing is a v0 validation error.", "type": "boolean" }
@@ -1663,7 +1716,7 @@
           "description": "async (default) returns an execution id immediately; sync blocks and returns the flow's outputs, and requires the flow to be statically interrupt-free.",
           "enum": ["sync", "async"]
         },
-        "timeout": { "description": "Response budget for respond: sync (default 60s). On expiry the response upgrades to async (202 + execution id) and the execution continues durably.", "$ref": "#/$defs/duration" },
+        "timeout": { "description": "Response budget for respond: sync (default 60s). On expiry the response upgrades to async (202 + execution id) and the execution continues durably. Illegal on an async trigger, which has already responded: there is no response left for a budget to bound.", "$ref": "#/$defs/duration" },
         "callback": { "description": "CEL over payload producing a completion webhook URL. Async only: `callback` with `respond: sync` is a compile error, since a synchronous response already returns the outputs.", "$ref": "#/$defs/cel" },
         "description": { "description": "Documentation.", "type": "string" }
       },
@@ -1674,6 +1727,10 @@
           "then": {
             "description": "A synchronous trigger returns the flow's outputs on the request itself; a completion webhook has nothing left to deliver.",
             "not": { "required": ["callback"] }
+          },
+          "else": {
+            "description": "`respond:` defaults to async, and an async trigger has already responded with an execution id - so `timeout:` bounds nothing observable and is an error rather than a silently inert key (grammar 13.3, Decision D81).",
+            "not": { "required": ["timeout"] }
           }
         }
       ]
