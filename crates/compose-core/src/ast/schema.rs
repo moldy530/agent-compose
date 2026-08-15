@@ -14,34 +14,29 @@ use super::common::{Ident, Literal};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Surface {
     /// `agent.input`, `tool.input`, `flow.inputs`, `human.input`: `default:` is
-    /// legal on scalars and enums, `max_items` is optional.
+    /// legal on every form but a union, `max_items` is optional.
     Input,
     /// `agent.output`, `tool.output`, `flow.outputs`, `human.output`, store
     /// schemas, and inline `exec:`/`http:` node outputs: `default:` is illegal
     /// and every array declares `max_items`.
     Result,
-    /// A `state:` channel: `default:` is the channel's initial value and is
-    /// legal on any form, `max_items` is optional (grammar 10.1).
+    /// A `state:` channel: `default:` is the channel's initial value,
+    /// `max_items` is optional (grammar 10.1).
     Channel,
 }
 
 impl Surface {
-    /// Whether a **scalar or enum** type node may carry `default:` here
-    /// (grammar 3.3's constraint table, 3.6).
+    /// Whether a type node may carry `default:` here (grammar 3.6,
+    /// Decision D77).
+    ///
+    /// Everywhere but a result surface. The form matters too — a discriminated
+    /// union never takes one, at any surface, because a union default would
+    /// have to manufacture a discriminator tag — but that is a property of the
+    /// form rather than of the place it was written, so it lives with the union
+    /// rather than here.
     #[must_use]
     pub const fn allows_default(self) -> bool {
         !matches!(self, Self::Result)
-    }
-
-    /// Whether an **object or array** type node may carry `default:` here.
-    ///
-    /// Only a state channel. Grammar 3.3 admits `default` on scalars and enums
-    /// alone, and 3.6 legalises it at input surfaces for exactly those forms; a
-    /// channel's `default` is a different key — the channel-only initial value
-    /// of grammar 10.1, which any form may take.
-    #[must_use]
-    pub const fn allows_composite_default(self) -> bool {
-        matches!(self, Self::Channel)
     }
 
     /// Whether arrays must declare `max_items` at this surface.
@@ -274,8 +269,8 @@ pub struct ObjectType {
     pub properties: FieldMap,
     /// Properties that are not required (grammar 3.4, Decision D7).
     pub optional: Vec<Spanned<Ident>>,
-    /// `default:`, channels only — nested objects at input surfaces take no
-    /// default (grammar 3.3's table lists `default` for scalars and enums).
+    /// `default:`, input surfaces and channels only; the literal supplies every
+    /// required property (grammar 3.6, Decision D77).
     pub default: Option<Spanned<Literal>>,
 }
 
@@ -292,7 +287,8 @@ pub struct ArrayType {
     pub min_items: Option<Spanned<i64>>,
     /// `unique_items`, default `false`.
     pub unique_items: Option<Spanned<bool>>,
-    /// `default:`, channels only.
+    /// `default:`, input surfaces and channels only; the literal is an array of
+    /// the `items:` type (grammar 3.6, Decision D77).
     pub default: Option<Spanned<Literal>>,
 }
 

@@ -446,7 +446,7 @@ fn scalar_form(
         }
     }
 
-    scalar.default = default_value(fields, subject, surface, DefaultForm::Simple, cx)
+    scalar.default = default_value(fields, subject, surface, cx)
         .inspect(|value| check_default_kind(value, kind, subject, cx));
 
     TypeForm::Scalar(scalar)
@@ -566,14 +566,7 @@ fn object_form(
         }
     }
 
-    let default = default_value(
-        fields,
-        subject,
-        surface,
-        DefaultForm::Composite("object"),
-        cx,
-    )
-    .inspect(|value| {
+    let default = default_value(fields, subject, surface, cx).inspect(|value| {
         if !matches!(value.value, Literal::Mapping(_)) {
             cx.error(
                 DiagnosticCode::InvalidValue,
@@ -650,14 +643,7 @@ fn array_form(
     }
 
     let unique_items = fields.boolean("unique_items", cx);
-    let default = default_value(
-        fields,
-        subject,
-        surface,
-        DefaultForm::Composite("array"),
-        cx,
-    )
-    .inspect(|value| {
+    let default = default_value(fields, subject, surface, cx).inspect(|value| {
         if !matches!(value.value, Literal::Sequence(_)) {
             cx.error(
                 DiagnosticCode::InvalidValue,
@@ -722,7 +708,7 @@ fn enum_form(fields: &mut Fields<'_>, subject: &str, surface: Surface, cx: &mut 
         }
     }
 
-    let default = default_value(fields, subject, surface, DefaultForm::Simple, cx)
+    let default = default_value(fields, subject, surface, cx)
         .inspect(|value| check_enum_default(value, &variants, cx));
 
     TypeForm::Enum(EnumType { variants, default })
@@ -770,6 +756,24 @@ fn union_form(
         .take("discriminator")
         .and_then(|node| expect_string(node, &format!("`discriminator` in {subject}"), cx))
         .and_then(|text| lexical::identifier(&text, "discriminator field name", cx));
+
+    // A union takes no `default:`, at any surface — including a state channel,
+    // where every other form's default is the channel's initial value. The
+    // literal would have to name a variant, and manufacturing a discriminator
+    // tag is the same silent routing decision the result-surface prohibition
+    // refuses (grammar 3.6, Decision D77).
+    if let Some(node) = fields.take("default") {
+        cx.push(
+            Diagnostic::error(
+                DiagnosticCode::InvalidValue,
+                node.span.clone(),
+                format!("`default` is not allowed on the discriminated union in {subject}"),
+            )
+            .with_help(
+                "a union default would have to name a variant, which manufactures a discriminator tag: give the channel or the field one of the union's variants as its own type instead (grammar 3.6, Decision D77)",
+            ),
+        );
+    }
 
     let mut variants = Vec::new();
     if let Some(node) = fields.require("variants", cx)
@@ -835,26 +839,16 @@ fn union_form(
     }
 }
 
-/// Which form is asking for a `default:`. The two are legal in different
-/// places, so the form decides the rule alongside the surface.
-#[derive(Clone, Copy)]
-enum DefaultForm {
-    /// A scalar or an enum: legal at input surfaces and on state channels
-    /// (grammar 3.3, 3.6).
-    Simple,
-    /// An object or an array, named by its `type:` keyword: legal only on a
-    /// state channel, where `default` is the channel's initial value rather
-    /// than a schema constraint (grammar 10.1).
-    Composite(&'static str),
-}
-
-/// Read a `default:`, rejecting it where the surface or the form forbids one
-/// (grammar 3.3, 3.6, 10.1).
+/// Read a `default:`, rejecting it where the surface forbids one (grammar 3.6,
+/// Decision D77).
+///
+/// Every type-node form but a discriminated union accepts one, at every input
+/// surface and on a state channel; a union never does, at any surface, which is
+/// [`union_form`]'s rule because it is a property of the form.
 fn default_value(
     fields: &mut Fields<'_>,
     subject: &str,
     surface: Surface,
-    form: DefaultForm,
     cx: &mut Cx,
 ) -> Option<Spanned<Literal>> {
     let node = fields.take("default")?;
@@ -867,23 +861,6 @@ fn default_value(
             )
             .with_help(
                 "a defaulted model output would silently manufacture routing values (grammar 3.6)",
-            ),
-        );
-        return None;
-    }
-    if let DefaultForm::Composite(keyword) = form
-        && !surface.allows_composite_default()
-    {
-        cx.push(
-            Diagnostic::error(
-                DiagnosticCode::InvalidValue,
-                node.span.clone(),
-                format!(
-                    "`default` applies to scalar and enum type nodes, but {subject} declares `type: {keyword}`"
-                ),
-            )
-            .with_help(
-                "on an object or an array, `default` is a state-channel key — the channel's initial value; a defaulted field here would have to be defaulted property by property (grammar 3.3, 10.1)",
             ),
         );
         return None;
