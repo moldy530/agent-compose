@@ -1579,12 +1579,12 @@
     },
 
     "providerDef": {
-      "description": "An inference connection: kind plus connection config. Credentials are ${ENV} references, never literals. Grammar 12.1 / PRD 5.9.",
+      "description": "An inference connection: kind plus connection config. Credentials are ${ENV} references, never literals. A kind's row in grammar 12.1 is closed: beyond `kind:` and `description:`, a provider takes exactly the keys its own kind admits, and a key belonging to another kind is an error rather than ignored config (Decision D106). Grammar 12.1 / PRD 5.9.",
       "type": "object",
       "required": ["kind"],
       "properties": {
         "kind": {
-          "description": "Provider plugin. Each kind publishes the settings schema that model `settings:` blocks are checked against.",
+          "description": "Provider plugin. Each kind publishes the settings schema that model `settings:` blocks are checked against, and fixes the rest of this definition's key set (grammar 12.1 / Decisions D38, D106).",
           "enum": ["anthropic", "openai", "openai_compatible", "azure_openai", "bedrock", "vertex"]
         },
         "api_key": { "description": "API key, as an ${ENV} reference.", "$ref": "#/$defs/envRef" },
@@ -1610,24 +1610,114 @@
       "additionalProperties": false,
       "allOf": [
         {
-          "if": { "properties": { "kind": { "enum": ["anthropic", "openai"] } }, "required": ["kind"] },
-          "then": { "required": ["api_key"] }
+          "if": { "properties": { "kind": { "const": "anthropic" } }, "required": ["kind"] },
+          "then": {
+            "description": "An `anthropic` provider takes `api_key` (required), `base_url`, and `headers`. Every other kind's key is refused here: a plugin never reads it, so an accepted one would be a connection setting its author believes is in effect and is not. Grammar 12.1 / Decision D106.",
+            "required": ["api_key"],
+            "properties": {
+              "api_version": false,
+              "organization": false,
+              "region": false,
+              "location": false,
+              "project": false,
+              "profile": false,
+              "access_key_id": false,
+              "secret_access_key": false,
+              "session_token": false,
+              "credentials_json": false
+            }
+          }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "openai" } }, "required": ["kind"] },
+          "then": {
+            "description": "An `openai` provider takes `api_key` (required), `base_url`, `headers`, and `organization`. Grammar 12.1 / Decision D106.",
+            "required": ["api_key"],
+            "properties": {
+              "api_version": false,
+              "region": false,
+              "location": false,
+              "project": false,
+              "profile": false,
+              "access_key_id": false,
+              "secret_access_key": false,
+              "session_token": false,
+              "credentials_json": false
+            }
+          }
         },
         {
           "if": { "properties": { "kind": { "const": "openai_compatible" } }, "required": ["kind"] },
-          "then": { "required": ["base_url"] }
+          "then": {
+            "description": "An `openai_compatible` provider takes `base_url` (required), `api_key`, and `headers`. Grammar 12.1 / Decision D106.",
+            "required": ["base_url"],
+            "properties": {
+              "api_version": false,
+              "organization": false,
+              "region": false,
+              "location": false,
+              "project": false,
+              "profile": false,
+              "access_key_id": false,
+              "secret_access_key": false,
+              "session_token": false,
+              "credentials_json": false
+            }
+          }
         },
         {
           "if": { "properties": { "kind": { "const": "azure_openai" } }, "required": ["kind"] },
-          "then": { "required": ["base_url", "api_key", "api_version"] }
+          "then": {
+            "description": "An `azure_openai` provider takes `base_url`, `api_key`, and `api_version` (all required) plus `headers`. Grammar 12.1 / Decision D106.",
+            "required": ["base_url", "api_key", "api_version"],
+            "properties": {
+              "organization": false,
+              "region": false,
+              "location": false,
+              "project": false,
+              "profile": false,
+              "access_key_id": false,
+              "secret_access_key": false,
+              "session_token": false,
+              "credentials_json": false
+            }
+          }
         },
         {
           "if": { "properties": { "kind": { "const": "bedrock" } }, "required": ["kind"] },
-          "then": { "required": ["region"] }
+          "then": {
+            "description": "A `bedrock` provider takes `region` (required) plus the AWS credential keys `access_key_id`, `secret_access_key`, `session_token`, and `profile`. It is reached through the AWS SDK rather than a bare endpoint, so `base_url`, `api_key`, and `headers` are not its keys. Grammar 12.1 / Decision D106.",
+            "required": ["region"],
+            "properties": {
+              "api_key": false,
+              "base_url": false,
+              "api_version": false,
+              "organization": false,
+              "location": false,
+              "project": false,
+              "credentials_json": false,
+              "headers": false
+            }
+          }
         },
         {
           "if": { "properties": { "kind": { "const": "vertex" } }, "required": ["kind"] },
-          "then": { "required": ["project", "location"] }
+          "then": {
+            "description": "A `vertex` provider takes `project` and `location` (both required) plus `credentials_json`. It is reached through the Google SDK rather than a bare endpoint, so `base_url`, `headers`, and the `api_key` credential form are not its keys. Grammar 12.1 / Decision D106.",
+            "required": ["project", "location"],
+            "properties": {
+              "api_key": false,
+              "base_url": false,
+              "api_version": false,
+              "organization": false,
+              "region": false,
+              "profile": false,
+              "access_key_id": false,
+              "secret_access_key": false,
+              "session_token": false,
+              "headers": false
+            }
+          }
         }
       ]
     },

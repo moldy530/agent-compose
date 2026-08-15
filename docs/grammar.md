@@ -681,6 +681,14 @@ compile error (Decision [D41](#d41-env-ref-forms-and-the-secret-field-list)):
 | `api_key`, `api_secret`, `token`, `password`, `access_key_id`, `secret_access_key`, `session_token`, `credentials_json` | `provider.*`, `storage_backends.*`, `event_sources.*` |
 | `url`, `base_url`, `endpoint`, `dsn` | `provider.*`, `storage_backends.*`, `event_sources.*` |
 
+The table classifies these field *names* wherever they occur; it never makes one
+legal where its section's own key rules do not admit it. A `provider.*` takes
+the keys of its `kind`'s row and no others (§12.1, Decision
+[D106](#d106-a-provider-kinds-key-row-is-closed)), so `token:` on a provider is
+an unknown key whatever this table says about the name, while `storage_backends`
+and `event_sources` configs are plugin objects (D50) where the wider list is
+live.
+
 **The classification is total.** Every string-valued surface in this grammar
 falls in exactly one of three classes, and class 3 is the default: a surface
 this section does not place in class 1 or class 2 is in class 3 (Decision
@@ -2837,16 +2845,19 @@ provider.local:
 
 ### 12.1 Provider definitions
 
+Two keys are legal on every provider; every other key belongs to the `kind` rows
+that name it.
+
 | Key | Type | Required | Notes |
 |---|---|---|---|
-| `kind` | enum (below) | yes | selects the provider plugin and its config schema |
-| `api_key` | env-ref value | per kind | never a literal (§4.3) |
-| `base_url` | env-ref value | required for `openai_compatible` | |
-| `headers` | map name→string (interpolable) | no | extra request headers |
-| `description` | string | no | documentation only (D54) |
-| kind-specific keys | per plugin | per kind | validated against the plugin's published schema |
+| `kind` | enum (below) | yes | selects the provider plugin and its config schema — and with it the rest of this definition's key set |
+| `description` | string | no | documentation only (D54); legal on every kind |
+| `api_key` | env-ref value | per kind (below) | never a literal (§4.3) |
+| `base_url` | env-ref value | per kind (below) | never a literal (§4.3) |
+| `headers` | map name→string (interpolable) | optional on the kinds that take it | extra request headers |
+| kind-specific keys | per plugin | per kind (below) | validated against the plugin's published schema |
 
-v0 provider kinds and their kind-specific keys:
+v0 provider kinds and the keys each one takes, `kind:` and `description:` aside:
 
 | `kind` | Required | Optional |
 |---|---|---|
@@ -2860,6 +2871,25 @@ v0 provider kinds and their kind-specific keys:
 `region`, `location`, `project`, `organization`, `profile`, and `api_version` are
 plain strings and MAY be interpolated; the credential keys listed in §4.3 MUST be
 env-ref values.
+
+**A kind's row is closed.** Beyond `kind:` and `description:`, a provider MAY
+declare exactly the keys its own row names. A key that belongs to another kind's
+row is a compile error naming the key and the kind — not an ignored setting
+(Decision [D106](#d106-a-provider-kinds-key-row-is-closed)). `region:` on an
+`anthropic` provider and `api_key:` on a `vertex` one are both refused: the
+plugin never reads them, so accepting one would leave the author believing a
+connection setting is in effect that is not, which is the silent no-op
+[D50](#d50-unknown-keys-are-errors-everywhere-except-plugin-config-objects)
+refuses for a key belonging to no row at all. This is the same shape as §11.4's
+exact per-op parameter list, and it is decidable in one file for the same reason
+— `kind:` is a literal in the same object — so the published schema enforces it
+too (Appendix B).
+
+The two SDK-reached kinds are where the rows differ most visibly from the rest:
+`bedrock` and `vertex` take neither `base_url` nor `headers`, because a
+connection made through a cloud SDK has no bare endpoint to point at and no
+request the spec composes headers onto. A deployment that genuinely needs either
+is reaching a compatible HTTP endpoint, which is what `openai_compatible` is for.
 
 ### 12.2 Model definitions
 
@@ -3609,10 +3639,14 @@ column of §11.5. *PRD 5.8, 5.10.*
 
 ### D38. Provider kinds are a closed v0 set with per-kind required keys
 
-`anthropic`, `openai`, `openai_compatible`, `azure_openai`, `bedrock`, `vertex`.
+`anthropic`, `openai`, `openai_compatible`, `azure_openai`, `bedrock`, `vertex`;
+[D106](#d106-a-provider-kinds-key-row-is-closed) closes each kind's row over its
+*optional* keys as well.
 **Rationale**: PRD 5.9 describes provider plugins publishing config schemas; v0
 ships the blessed set so the editor schema and the validator agree. New kinds
-arrive with new plugins, additively. *PRD 5.9.*
+arrive with new plugins, additively — each publishing a row, since nothing in
+§12.1 is a general-purpose provider key waiting to be honored by a plugin that
+does not list it. *PRD 5.9.*
 
 ### D39. Model defs are direct XOR route
 
@@ -4821,6 +4855,37 @@ the channel N ways (so nothing is shared after all) or serialize the fan-out
 their `context:` key, sharing the instance's fresh history inward, which is all
 the continuation any single item can coherently want. *PRD 5.6, 5.7.*
 
+### D106. A provider kind's key row is closed
+
+Beyond `kind:` and `description:`, a `provider.*` definition takes exactly the
+keys §12.1's row for its own `kind` names; a key from another kind's row is a
+compile error, and the published schema enforces it (§12.1, Appendix B).
+**Rationale**: §12.1 already published a per-kind table with a Required and an
+Optional column, and [D50](#d50-unknown-keys-are-errors-everywhere-except-plugin-config-objects)
+already makes a key belonging to no row an error — but the table's status was
+left unstated, so `{ kind: anthropic, api_key: "${K}", region: us-east-1 }` and
+`{ kind: vertex, project: p, location: l, api_key: "${K}" }` sat in the gap:
+refused by a reading of the table as closed, accepted by a reading of it as
+illustrative, and accepted by the published schema, which branched on `kind:`
+for *required* keys only. That inverts Appendix B's one-directional invariant in
+the direction that matters least visibly — the schema was the *looser* artifact,
+so an editor gave a clean bill of health to a definition `validate` rejects.
+
+Closing the row is the reading that keeps D50's own justification true: an
+ignored key is a setting whose author believes it is in effect, and a credential
+or a region silently dropped is the most consequential form of that mistake —
+the run reaches the wrong account, or reaches nothing and fails at first call
+with a message pointing at the provider rather than at the spec. The alternative,
+declaring the shared keys universal, was rejected because it is not true of the
+two SDK-reached kinds: `bedrock` and `vertex` have no bare endpoint for
+`base_url:` to name and no spec-composed request for `headers:` to ride on, so
+admitting them there would ship keys with nothing to do — and `openai_compatible`
+already exists for the deployment that really is talking to an HTTP endpoint.
+The check costs one `if`/`then` per kind and reads the same literal the required
+keys already branch on, which is what makes it decidable in one file, exactly as
+§11.4's per-op parameter rows are ([D34](#d34-the-store-op-catalog-is-normative-including-derived-output-schemas)).
+*PRD 5.9, G3.*
+
 ---
 
 ## Appendix B — Editor integration
@@ -4881,7 +4946,9 @@ authority. The schema cannot see across files, so it does not check:
   through other files, so only the validator can require it there.
 
 What the schema *does* enforce beyond plain shape, because the deciding value is
-a literal in the same object: store-op parameter sets per `op` (§11.4), trigger
+a literal in the same object: store-op parameter sets per `op` (§11.4), provider
+key sets per `kind` — both halves, the required keys and the closed row the
+optional ones live in (§12.1, D106) — trigger
 keys per `type` (§13) including the `respond`/`timeout` and `respond`/`callback`
 pairings (§13.3), the map form rules and the `on_item_error` shape (§8.6) —
 including the confinement of `input:`/`writes:`/`detach:` to the homogeneous form
@@ -4976,6 +5043,8 @@ store.<name>:
   agent_access: read|read_write
 
 provider.<name>: { kind: ..., api_key: "${ENV}", base_url: "${ENV}", ... }
+                 # keys beyond kind/description are per kind — 12.1's row is
+                 # closed, and another kind's key is an error (D106)
 model.<name>:    { provider: provider.<p>, id: <string>, settings: {...} }
 model.<name>:    { route: [model.<a>, model.<b>], route_on: [...] }
 

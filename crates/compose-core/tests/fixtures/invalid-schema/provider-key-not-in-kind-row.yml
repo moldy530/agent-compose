@@ -1,0 +1,7 @@
+# rule: a provider kind's row is closed, so a key belonging to another kind is an error rather than ignored config - `region:` is bedrock's (grammar 12.1 / D106, D50)
+# at: /provider.main/region
+# via: /$defs/providerDef/allOf/0/then/properties/region
+provider.main:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+  region: us-east-1
