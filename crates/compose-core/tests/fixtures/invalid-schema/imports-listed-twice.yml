@@ -1,0 +1,7 @@
+# rule: `imports:` entries are unique - importing one file twice adds nothing (grammar 1.4 / PRD 5.1)
+# at: /imports
+# via: /properties/imports/uniqueItems
+version: "0.1"
+imports:
+  - agents/reviewer.yml
+  - agents/reviewer.yml

@@ -311,9 +311,15 @@ fn the_corpus_is_substantial() {
 /// The published schema is the editor-facing approximation of the parser, and
 /// `docs/grammar.md` Appendix B fixes the direction of the relationship: a file
 /// that fails the schema always fails `validate`. The parser is the first pass
-/// of `validate` and every rule the schema encodes is decidable per file, so in
-/// practice the parser must reject the whole schema corpus — this test is what
-/// keeps the two implementations from drifting apart.
+/// of `validate` and every rule the schema encodes is decidable per file, so
+/// the parser has to reject everything in the schema's own negative corpus.
+///
+/// What this measures is that corpus, not the whole schema: a rule neither
+/// corpus covers can still drift apart unnoticed, which is exactly how the
+/// routed-map, model-route-arity, input-surface-`default:` and duplicate-import
+/// holes survived a round. The remedy when one turns up is to add the shape to
+/// **both** corpora — `invalid-schema/` so this replay covers it, and
+/// `invalid-parse/` so the diagnostic it produces is pinned exactly.
 #[test]
 fn the_parser_rejects_everything_the_published_schema_rejects() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/invalid-schema");
