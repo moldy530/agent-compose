@@ -4111,7 +4111,10 @@ branch is done" — leaving `on_error: fail` as the one way to abort a run.
 
 Every node MUST have at least one outgoing edge; at least one edge leaving
 `start` MUST be unconditional or `else: true`; a node declaring `on_error: skip`
-MUST have an outgoing edge of one of those two forms (§7.6.3).
+MUST have an outgoing edge of one of those two forms (§7.6.3) — where the
+`else: true` spelling carries its own precondition, a `when:`-guarded sibling
+([D107](#d107-an-else-edge-requires-a-when-guarded-sibling)), which the skip
+rule's node has by its premise and a single-edge `start` does not.
 **Rationale**: [D70](#d70-end-retires-a-branch-and-a-flow-instance-ends-at-quiescence)
 makes `end` the only way a branch retires, so these three rules are what keep
 that statement true rather than aspirational — without them a branch can vanish
