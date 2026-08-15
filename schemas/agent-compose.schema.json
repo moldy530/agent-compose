@@ -222,11 +222,11 @@
       "pattern": "^\\$\\{[A-Z_][A-Z0-9_]*\\}$"
     },
     "interpolatedString": {
-      "description": "A string that may embed ${ENV_NAME} references, e.g. \"https://${API_HOST}/v1\". Use $${ for a literal ${.",
+      "description": "A string on one of grammar 4.3's class 2 surfaces, where ${ENV_NAME} references may be embedded in text, e.g. \"https://${API_HOST}/v1\": http urls and headers, the whole exec block (command, args, cwd, env values), non-secret provider keys, and non-secret deploy config. Substitution happens at process start. Use $${ for a literal ${.",
       "type": "string"
     },
     "noEnvRefString": {
-      "description": "A string on one of the surfaces where environment references are illegal (prompts, descriptions, schemas, CEL, model ids - grammar 4.3): nothing is interpolated here, so an unescaped ${ENV_NAME} token is an error rather than text that silently survives. Write $${ENV_NAME} for a literal ${ENV_NAME}.",
+      "description": "A string on one of the surfaces where environment references are illegal (grammar 4.3 class 3: prompts, descriptions, schemas, CEL, model and embedding model ids, trigger path/cron/timezone, content types, identifiers and references - anything the classification does not place in class 1 or 2). Nothing is interpolated here, so an unescaped ${ENV_NAME} token is an error rather than text that silently survives. Write $${ENV_NAME} for a literal ${ENV_NAME}.",
       "type": "string",
       "not": { "pattern": "(?<!\\$)\\$\\{[A-Z_][A-Z0-9_]*\\}" }
     },
@@ -794,7 +794,7 @@
       ]
     },
     "writes": {
-      "description": "Write remap: output field name -> state channel name. A remapped field is not also written to its same-named channel. Fixes channel collisions and cross-subgraph renames (PRD 5.7).",
+      "description": "Write remap: output field name -> state channel name. A remapped field is not also written to its same-named channel. Fixes channel collisions and cross-subgraph renames (PRD 5.7). The validator additionally requires the node's EFFECTIVE write map - remapped and name-based destinations together - to be injective, so one node never makes two unordered writes to one channel (grammar 8.0, 7.6.4 / Decision D93); that half needs the state section and so cannot be checked here.",
       "type": "object",
       "propertyNames": { "$ref": "#/$defs/identifier" },
       "additionalProperties": { "$ref": "#/$defs/channelName" }
@@ -865,12 +865,15 @@
       "items": { "type": "integer", "minimum": 0, "maximum": 255 }
     },
     "execImpl": {
-      "description": "Subprocess binding. An object input is passed as environment variables; a string input is passed on stdin; stdout is decoded as JSON against `output` (or bound raw into a single string field). An exit status outside `expect_exit` is a node error. Grammar 6.1.",
+      "description": "Subprocess binding. An object input is passed as environment variables; a string input is passed on stdin; stdout is decoded as JSON against `output`, or bound raw into a single string field - a tool-surface exception that inline exec/http nodes do not share (Decision D91). An exit status outside `expect_exit` is a node error. Grammar 6.1.",
       "type": "object",
       "required": ["command"],
       "properties": {
-        "command": { "description": "Executable name or path (argv[0]); never shell-interpreted.", "type": "string", "minLength": 1 },
-        "args": { "description": "Literal arguments; no CEL - data is passed by env vars/stdin.", "type": "array", "items": { "type": "string" } },
+        "command": {
+          "description": "Executable name or path (argv[0]); never shell-interpreted. May embed ${ENV} references (grammar 4.3 class 2, Decision D92).",
+          "allOf": [{ "$ref": "#/$defs/interpolatedString" }, { "minLength": 1 }]
+        },
+        "args": { "description": "Literal argv entries: no CEL - data is passed by env vars/stdin - but ${ENV} references may be embedded (grammar 4.3 class 2, Decisions D24, D92).", "type": "array", "items": { "$ref": "#/$defs/interpolatedString" } },
         "cwd": { "description": "Working directory; may embed ${ENV} references.", "$ref": "#/$defs/interpolatedString" },
         "env": {
           "description": "Extra environment variables for the child process.",
@@ -883,7 +886,7 @@
       "additionalProperties": false
     },
     "httpImpl": {
-      "description": "HTTP binding. Without `body`/`query` the bound input object is sent as the JSON body (body-bearing methods) or as query parameters. The response is decoded as JSON against `output` (or bound raw into a single string field). Grammar 6.1.",
+      "description": "HTTP binding. Without `body`/`query` the bound input object is sent as the JSON body (body-bearing methods) or as query parameters. The response is decoded as JSON against `output`, or bound raw into a single string field - a tool-surface exception that inline exec/http nodes do not share (Decision D91). Grammar 6.1.",
       "type": "object",
       "required": ["method", "url"],
       "properties": {
@@ -1057,9 +1060,12 @@
           "type": "object",
           "required": ["command"],
           "properties": {
-            "command": { "description": "Executable name or path (argv[0]).", "type": "string", "minLength": 1 },
-            "args": { "description": "Literal arguments.", "type": "array", "items": { "type": "string" } },
-            "cwd": { "description": "Working directory.", "$ref": "#/$defs/interpolatedString" },
+            "command": {
+              "description": "Executable name or path (argv[0]); never shell-interpreted. May embed ${ENV} references (grammar 4.3 class 2, Decision D92).",
+              "allOf": [{ "$ref": "#/$defs/interpolatedString" }, { "minLength": 1 }]
+            },
+            "args": { "description": "Literal argv entries: no CEL, but ${ENV} references may be embedded (grammar 4.3 class 2, Decisions D24, D92).", "type": "array", "items": { "$ref": "#/$defs/interpolatedString" } },
+            "cwd": { "description": "Working directory; may embed ${ENV} references.", "$ref": "#/$defs/interpolatedString" },
             "env": {
               "description": "Extra environment variables.",
               "type": "object",
@@ -1068,7 +1074,7 @@
             },
             "expect_exit": { "$ref": "#/$defs/expectExit" },
             "output": {
-              "description": "Result schema (default: { exit_code: integer, stdout: string }). `exit_code`, `stdout`, and `stderr` are envelope fields bound from the child process itself, with fixed types; any other field is decoded from stdout as JSON. Declaring one is a decoding choice and never changes which outcomes are node errors - widening `expect_exit` is what does (Decision D84). Grammar 8.2.",
+              "description": "Result schema (default: { exit_code: integer, stdout: string }). `exit_code`, `stdout`, and `stderr` are envelope fields bound from the child process itself, with fixed types; every other field is decoded from stdout as JSON, unconditionally - §6.1's single-string-property exception is a tool-surface rule and does not apply here, because raw stdout already has a name on this surface (Decision D91). Declaring a field is a decoding choice and never changes which outcomes are node errors - widening `expect_exit` is what does (Decision D84). Grammar 8.2.",
               "allOf": [
                 { "$ref": "#/$defs/outputFieldMap" },
                 { "$ref": "#/$defs/execEnvelopeFields" }
@@ -1123,7 +1129,7 @@
               "items": { "type": "integer", "minimum": 100, "maximum": 599 }
             },
             "output": {
-              "description": "Result schema (default: { status: integer, body: string }). `status` and `body` are envelope fields bound from the response itself, with fixed types; any other field is decoded from the response body as JSON. Grammar 8.3.",
+              "description": "Result schema (default: { status: integer, body: string }). `status` and `body` are envelope fields bound from the response itself, with fixed types; every other field is decoded from the response body as JSON, unconditionally - §6.1's single-string-property exception is a tool-surface rule and does not apply here, because the raw response text already has a name on this surface (Decision D91). Grammar 8.3.",
               "allOf": [
                 { "$ref": "#/$defs/outputFieldMap" },
                 { "$ref": "#/$defs/httpEnvelopeFields" }
@@ -1274,7 +1280,7 @@
           "propertyNames": { "$ref": "#/$defs/identifier" },
           "additionalProperties": { "$ref": "#/$defs/cel" }
         },
-        "content_type": { "description": "Content type for a blob put.", "type": "string" },
+        "content_type": { "description": "Content type for a blob put: a literal media type, not CEL. Env references are illegal (grammar 4.3 class 3, Decision D92).", "$ref": "#/$defs/noEnvRefString" },
         "writes": { "description": "Write remap over the op's derived output fields.", "$ref": "#/$defs/writes" },
         "retry": { "$ref": "#/$defs/retry" },
         "timeout": { "description": "Wall-clock bound on this node.", "$ref": "#/$defs/duration" },
@@ -1432,7 +1438,7 @@
               "maximum": 256
             },
             "on_item_error": {
-              "description": "Per-item error strategy (default fail). A retry carries its policy inline, in the same enum-or-single-key-object shape `on_error:` uses: a bare `retry` would be a retry with no count and no backoff, which is the unbounded loop PRD 5.6 exists to prevent, and there is nothing for it to inherit one from. Grammar 8.6 rule 10 / Decision D73.",
+              "description": "Per-item error strategy (default fail), governing every route whose outcome is observed - a detached route's dispatches are resolved at dispatch and have none (Decision D94). A retry carries its policy inline, in the same enum-or-single-key-object shape `on_error:` uses: a bare `retry` would be a retry with no count and no backoff, which is the unbounded loop PRD 5.6 exists to prevent, and there is nothing for it to inherit one from. Grammar 8.6 rule 10 / Decision D73.",
               "oneOf": [
                 {
                   "description": "fail (default): the item's failure fails the fan-out. skip: drop the item and carry on.",
@@ -1449,7 +1455,7 @@
             },
             "input": { "description": "Per-item input bindings, homogeneous form only; without it the whole item is passed. Illegal here alongside `route_by:` - each route's bindings are narrowed to its own variant's payload, so a map-wide binding would have to type-check against every variant at once (Decision D85).", "$ref": "#/$defs/mapInputBindings" },
             "writes": { "description": "Write remap, homogeneous form only; targets must be channels with a declared reduce policy. Illegal here alongside `route_by:` - route targets have different output schemas, so a map-wide remap would name fields only some of them declare (Decision D85).", "$ref": "#/$defs/writes" },
-            "detach": { "description": "Fire-and-forget dispatch, homogeneous form only. Illegal here alongside `route_by:` - a discriminator-routed map declares detach per route. A detached dispatch may not write reduced state, and detach + checkpointing is a v0 validation error.", "type": "boolean" }
+            "detach": { "description": "Fire-and-forget dispatch, homogeneous form only. Illegal here alongside `route_by:` - a discriminator-routed map declares detach per route. A detached dispatch is resolved at dispatch: the join does not wait for it and `on_item_error` never applies to it (Decision D94), it may not write reduced state, and detach + checkpointing is a v0 validation error.", "type": "boolean" }
           },
           "additionalProperties": false,
           "oneOf": [
@@ -1500,7 +1506,7 @@
         "max_concurrency": { "description": "Per-route bound; must be <= the map's.", "type": "integer", "minimum": 1, "maximum": 256 },
         "input": { "description": "Per-item input bindings for this route.", "$ref": "#/$defs/mapInputBindings" },
         "writes": { "description": "Write remap; targets must be reduced channels.", "$ref": "#/$defs/writes" },
-        "detach": { "description": "Fire-and-forget: the join does not wait on this route and it may not write reduced state.", "type": "boolean" }
+        "detach": { "description": "Fire-and-forget: this route's dispatches are resolved at dispatch, so the join does not wait on them and `on_item_error` never applies to them (Decision D94); it may not write reduced state.", "type": "boolean" }
       },
       "additionalProperties": false,
       "allOf": [
@@ -1528,7 +1534,10 @@
           "type": "object",
           "required": ["model"],
           "properties": {
-            "model": { "description": "Provider-native embedding model id (a bare string, not a model.* reference).", "type": "string", "minLength": 1 },
+            "model": {
+              "description": "Provider-native embedding model id (a bare string, not a model.* reference). Env references are illegal here, exactly as on a model `id:` (grammar 4.3 class 3, Decision D92): the id is part of the composition's identity, not of its environment.",
+              "allOf": [{ "$ref": "#/$defs/noEnvRefString" }, { "minLength": 1 }]
+            },
             "provider": { "description": "Which connection serves embeddings; defaults to the target's backend resolution.", "$ref": "#/$defs/providerRef" },
             "dimensions": { "description": "Asserted against the backend index.", "type": "integer", "minimum": 1 }
           },
@@ -1722,7 +1731,10 @@
       "properties": {
         "type": { "const": "http", "description": "HTTP invocation." },
         "flow": { "description": "The flow this trigger starts.", "$ref": "#/$defs/flowRef" },
-        "path": { "description": "Route path: starts with / and contains no whitespace (default /triggers/<trigger name>). Router-specific parameter syntax such as /reviews/:id is passed through unexamined. Grammar 13.3.", "type": "string", "pattern": "^/\\S*$" },
+        "path": {
+          "description": "Route path: starts with / and contains no whitespace (default /triggers/<trigger name>). Router-specific parameter syntax such as /reviews/:id is passed through unexamined. Env references are illegal: the route is part of the API surface the IR describes (grammar 4.3 class 3, Decision D92). Grammar 13.3.",
+          "allOf": [{ "$ref": "#/$defs/noEnvRefString" }, { "pattern": "^/\\S*$" }]
+        },
         "method": { "description": "HTTP method for the start route (default POST).", "enum": ["POST", "PUT", "GET"] },
         "input": { "description": "Bindings, CEL over payload.body / payload.query / payload.headers / payload.path / payload.method.", "$ref": "#/$defs/triggerInput" },
         "session_key": { "description": "CEL over payload producing the session identity for session-scoped stores and history.", "$ref": "#/$defs/cel" },
@@ -1756,8 +1768,11 @@
       "properties": {
         "type": { "const": "schedule", "description": "Schedule invocation (reserved: no-op in v0)." },
         "flow": { "description": "The flow this trigger starts.", "$ref": "#/$defs/flowRef" },
-        "cron": { "description": "5-field POSIX cron expression.", "type": "string", "pattern": "^\\S+(\\s+\\S+){4}$" },
-        "timezone": { "description": "IANA timezone name (default UTC).", "type": "string" },
+        "cron": {
+          "description": "5-field POSIX cron expression. Shape-checked at compile time, so env references are illegal (grammar 4.3 class 3, Decision D92).",
+          "allOf": [{ "$ref": "#/$defs/noEnvRefString" }, { "pattern": "^\\S+(\\s+\\S+){4}$" }]
+        },
+        "timezone": { "description": "IANA timezone name (default UTC). Shape-checked at compile time, so env references are illegal (grammar 4.3 class 3, Decision D92).", "$ref": "#/$defs/noEnvRefString" },
         "input": { "description": "Bindings, CEL over payload.scheduled_at / payload.trigger.", "$ref": "#/$defs/triggerInput" },
         "session_key": { "description": "CEL over payload producing the session identity.", "$ref": "#/$defs/cel" },
         "description": { "description": "Documentation.", "type": "string" }
