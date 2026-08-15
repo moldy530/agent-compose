@@ -425,7 +425,15 @@ fn parse_duration(text: &str) -> Option<Duration> {
     if digits.is_empty() || digits.starts_with('0') || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    let amount = digits.parse::<u64>().ok()?;
+    // Grammar 4.4 states a form — a positive integer and a unit — and no
+    // ceiling, so a magnitude too large for `u64` is a well-formed duration this
+    // implementation cannot count exactly, not a malformed one. Reporting it
+    // through the failure below would send the author hunting for a syntax
+    // mistake that is not there, and would split two inputs that already mean
+    // the same thing: `18446744073709551615h` fits in `u64` and is accepted, and
+    // `Duration::as_millis` saturates it to the same value this one saturates
+    // to. The text as written survives in the duration's `raw`.
+    let amount = digits.parse::<u64>().unwrap_or(u64::MAX);
     Some(Duration::new(text, amount, unit))
 }
 
@@ -815,6 +823,19 @@ mod tests {
         assert!(parse_duration("5sec").is_none());
         assert!(parse_duration("").is_none());
         assert!(parse_duration("ms").is_none());
+
+        // Grammar 4.4 states a form and no ceiling, so a magnitude past 64 bits
+        // is a well-formed duration this implementation counts saturated —
+        // never a malformed *form*, which is what reporting it as invalid would
+        // tell the author to go looking for. The two absurd magnitudes below
+        // already mean the same thing: `as_millis` saturates both.
+        let representable = parse_duration("18446744073709551615h").unwrap();
+        let past_u64 = parse_duration("99999999999999999999h").unwrap();
+        assert_eq!(representable.as_millis(), u64::MAX);
+        assert_eq!(past_u64.as_millis(), u64::MAX);
+        assert_eq!(past_u64.amount, u64::MAX);
+        // The text survives exactly as written.
+        assert_eq!(past_u64.as_str(), "99999999999999999999h");
     }
 
     #[test]

@@ -256,7 +256,10 @@ impl DurationUnit {
 #[derive(Clone, PartialEq, Eq)]
 pub struct Duration {
     raw: String,
-    /// The integer part.
+    /// The integer part, saturating at [`u64::MAX`]: grammar 4.4 states a form
+    /// and no ceiling, so a magnitude past 64 bits is still a duration, and
+    /// [`Duration::as_millis`] saturates anyway. [`Duration::as_str`] keeps the
+    /// text exactly as written.
     pub amount: u64,
     /// The unit.
     pub unit: DurationUnit,
