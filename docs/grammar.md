@@ -295,27 +295,55 @@ outgoing edge (§7.6.3) and MUST be reachable from `start` (§7.8).
 
 ### 2.5 Reserved names
 
-The **reserved root names** are the CEL root identifiers and the implicit
-channel (§4.1, §10.4):
+The **reserved root names** are the seven identifiers that already have a fixed
+meaning inside an expression (§4.1, §10.4):
 
 `input`, `state`, `execution`, `item`, `messages`, `output`, `payload`
+
+"Reserved root name" is a term of art for this list — it is what D74 and the
+published schema's `reservedRootName` denote, not a claim that all seven are
+roots. Five are: `input`, `state`, `execution`, `payload`, and `item`, the last
+being the default name of a `map`'s per-item binding (§8.6). The other two are
+on the list for their own reasons, and they are exactly the two a reader will
+not find in §4.1's table of roots:
+
+- **`messages`** is the implicit conversation-history channel (§10.4). Reserving
+  it is what puts §10.4's "MUST NOT be declared in `state:`" into this one list
+  rather than leaving it as a lone prohibition three sections away.
+- **`output`** is the fixed **selector** of a node-output path: the second
+  segment of every `<node>.output.<field>` an edge guard or a `map.over` reads
+  (§4.1). No surface exposes a bare `output` root, and that is the point —
+  reserving it keeps the token to one meaning wherever an expression is written.
+  A node id `output` yields `output.output.verdict`, where the same word is the
+  node and then the selector; a binding `as: output` puts
+  `over: plan.output.tasks` and `input: { x: "output.summary" }` in one `map:`
+  block with `output` naming a selector on one line and the item on the next.
+  Neither is ambiguous to a *parser* — which is why this member is reserved for
+  legibility and for the list staying one rule with one diagnostic
+  ([D5](#d5-one-identifier-class-lowercase-snake_case),
+  [D74](#d74-reserved-roots-may-not-be-shadowed-by-node-ids-or-item-bindings)),
+  not because a reading could go two ways.
 
 A reserved root name MUST NOT be used as (Decision
 [D74](#d74-reserved-roots-may-not-be-shadowed-by-node-ids-or-item-bindings)):
 
 | Position | Rule |
 |---|---|
-| a **state channel** name | illegal — the channel would shadow the root in every expression |
+| a **state channel** name | illegal — for the five roots the channel would shadow the root in every expression; `messages` names the implicit channel that already exists (§10.4); `output` is the selector, above |
 | a **flow-local node id** | illegal — a node id is the root of `<node>.output` in edge guards and `map.over` (§4.1), so a node named `input` makes `input.output.x` ambiguous with the flow input object |
 | a `map` **`as:`** binding | illegal, **except `item`**, which is that binding's own default name (§8.6) |
 
 `start` and `end` are additionally reserved as node ids. Definition names have no
-reserved words beyond the identifier grammar: `agent.state` is fine, because a
-namespaced address is never a bare CEL root.
+reserved words beyond the identifier grammar: `agent.state` and `agent.output`
+are both fine, because a namespaced address is never a bare token in expression
+position.
 
 Shadowing is a compile error rather than a precedence rule: there is no reading
 of `input.output.verdict` that is obviously right when a node is named `input`,
 and a document that had to name a winner would be teaching a trap (PRD G3).
+Where no parse could go two ways — `messages` and `output` — the same refusal
+is what keeps the list one rule with one message instead of seven names with two
+behaviors.
 
 ---
 
@@ -3632,8 +3660,14 @@ something an author writes down turns silent overwrite into a reviewed decision.
 ### D33. Reserved channel names
 
 `input`, `state`, `execution`, `item`, `messages`, `output`, `payload` may not be
-channel names. **Rationale**: they are CEL roots or the implicit history channel;
-shadowing them would make expressions ambiguous. *PRD 5.5, 5.7.*
+channel names. **Rationale**: five are CEL roots and `messages` is the implicit
+history channel, so a channel of any of those names shadows something that
+already exists and makes expressions ambiguous. `output` is on the list for a
+different reason, stated in §2.5 so a later editor does not read it as a root
+and drop it: it is the fixed selector half of `<node>.output`, reserved to keep
+that token to one meaning. Refusing the collision rather than resolving it by
+precedence is [D74](#d74-reserved-roots-may-not-be-shadowed-by-node-ids-or-item-bindings)'s
+argument. *PRD 5.5, 5.7.*
 
 ### D34. The store-op catalog is normative, including derived output schemas
 
@@ -4140,8 +4174,14 @@ between the flow input object and that node's output, and `as: state` making
 "the shadow wins", "the root wins" — would have to be memorized and would read
 differently in the two cases; refusing the collision is one rule with one error
 message, the same posture [D5](#d5-one-identifier-class-lowercase-snake_case)
-takes on identifiers generally. Definition names are untouched because a
-namespaced address is never a bare root. *PRD 5.3, 5.5, 5.7, G3.*
+takes on identifiers generally. That one-rule posture is also why the list keeps
+its two non-root members: `messages` is the implicit history channel and
+`output` is the selector half of `<node>.output` (§2.5), neither of which a
+parser could read two ways, but splitting the seven names into "refused" and
+"discouraged" would cost a second rule and a second message to permit
+`output.output.verdict`. Definition names are untouched because a
+namespaced address is never a bare token in expression position.
+*PRD 5.3, 5.5, 5.7, G3.*
 
 ### D75. Map dispatch bindings take both `input:` forms
 

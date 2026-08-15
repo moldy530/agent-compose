@@ -132,18 +132,18 @@
       "pattern": "^[a-z][a-z0-9_]{0,63}$"
     },
     "reservedRootName": {
-      "description": "The CEL root identifiers and the implicit conversation-history channel. None of them may name a state channel or a flow-local node id: a node named `input` would make `input.output.x` ambiguous with the flow input object. Grammar 2.5 / Decision D74.",
+      "description": "The seven identifiers with a fixed meaning inside an expression. Five are CEL roots (input, state, execution, payload, and item, a map's default per-item binding); `messages` is the implicit conversation-history channel; and `output` is the selector half of `<node>.output`, on the list to keep that token to one meaning rather than because it is a root - no surface exposes a bare `output`. None of them may name a state channel or a flow-local node id: a node named `input` would make `input.output.x` ambiguous with the flow input object. Grammar 2.5 / Decisions D33, D74.",
       "enum": ["input", "state", "execution", "item", "messages", "output", "payload"]
     },
     "channelName": {
-      "description": "A state channel name: an identifier that is not a reserved CEL root or the implicit conversation-history channel. Grammar 2.5.",
+      "description": "A state channel name: an identifier that is not one of the seven reserved names - the five CEL roots, the implicit conversation-history channel `messages`, and the node-output selector `output`. Grammar 2.5.",
       "allOf": [
         { "$ref": "#/$defs/identifier" },
         { "not": { "$ref": "#/$defs/reservedRootName" } }
       ]
     },
     "nodeId": {
-      "description": "A flow-local node id: an identifier other than the pseudo-nodes `start` and `end` and other than a reserved CEL root. Grammar 2.4, 2.5.",
+      "description": "A flow-local node id: an identifier other than the pseudo-nodes `start` and `end` and other than one of the seven reserved names of grammar 2.5. A node id is the root of `<node>.output`, which is why `output` is reserved here too: `output.output.verdict` spells the node and the selector with one word. Grammar 2.4, 2.5.",
       "allOf": [
         { "$ref": "#/$defs/identifier" },
         { "not": { "enum": ["start", "end"] } },
