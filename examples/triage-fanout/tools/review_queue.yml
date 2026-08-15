@@ -6,8 +6,15 @@ tool.review_queue:
   input:
     summary: { type: string }
     severity: { enum: [low, high, critical] }
+  # Two declared properties, so the response body is decoded as JSON and both
+  # fields are read out of it. The count that decides this is over the WHOLE
+  # property set (grammar 6.1 / D109): `output: { ticket_id: { type: string } }`
+  # on its own would be exactly one property, string-typed, and the RAW response
+  # text would bind to it — right for a command that prints one line, wrong for
+  # a ticket API that answers `{"ticket_id": "T-1", "queued": true}`.
   output:
     ticket_id: { type: string }
+    queued: { type: boolean }
   http:
     method: POST
     url: "https://${QUEUE_HOST}/v1/tickets"
