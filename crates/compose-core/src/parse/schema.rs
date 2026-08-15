@@ -24,6 +24,12 @@ use super::reader::{
 
 /// The maximum schema nesting depth; the declaration surface counts as one
 /// level (grammar 3.4).
+///
+/// Every way of nesting counts the same level: an object's `properties`, a
+/// union variant's payload, and an array's `items`. Grammar 3.4 states the
+/// limit under "Objects", but a chain of arrays nests exactly as far, and
+/// bounding only the field maps would leave `items: {type: array, items: …}`
+/// bounded by nothing but the YAML loader's collection-depth cap.
 const MAX_DEPTH: usize = 8;
 
 /// The scalar type keywords.
@@ -61,6 +67,24 @@ pub(crate) fn field_map(
     field_map_at(node, subject, surface, 1, cx)
 }
 
+/// Whether this level is past [`MAX_DEPTH`], reporting it if so.
+fn too_deep(node: &Node, subject: &str, depth: usize, cx: &mut Cx) -> bool {
+    if depth <= MAX_DEPTH {
+        return false;
+    }
+    cx.push(
+        Diagnostic::error(
+            DiagnosticCode::InvalidValue,
+            node.span.clone(),
+            format!("{subject} nests more than {MAX_DEPTH} levels deep"),
+        )
+        .with_help(
+            "the declaration surface counts as the first level, and an object's `properties`, a union variant, and an array's `items` each count one more (grammar 3.4)",
+        ),
+    );
+    true
+}
+
 fn field_map_at(
     node: &Node,
     subject: &str,
@@ -69,15 +93,7 @@ fn field_map_at(
     cx: &mut Cx,
 ) -> Option<FieldMap> {
     let mapping = expect_mapping(node, subject, cx)?;
-    if depth > MAX_DEPTH {
-        cx.push(
-            Diagnostic::error(
-                DiagnosticCode::InvalidValue,
-                node.span.clone(),
-                format!("{subject} nests more than {MAX_DEPTH} levels deep"),
-            )
-            .with_help("the declaration surface counts as the first level (grammar 3.4)"),
-        );
+    if too_deep(node, subject, depth, cx) {
         return Some(FieldMap {
             fields: Vec::new(),
             surface,
@@ -169,6 +185,15 @@ pub(crate) fn type_node(
             span: node.span.clone(),
         };
     };
+    // A field map checks its own level, so this only ever fires for a chain of
+    // arrays, whose `items` reach no field map to be checked by.
+    if too_deep(node, subject, depth, cx) {
+        return TypeNode {
+            form: TypeForm::Invalid,
+            description: None,
+            span: node.span.clone(),
+        };
+    }
     let mut fields = Fields::new(mapping, node.span.clone(), subject);
     let (form, description) = type_body(&mut fields, subject, surface, depth, cx);
     fields.finish(cx);
@@ -582,7 +607,7 @@ fn array_form(
                 node,
                 &format!("`items` of {subject}"),
                 nested(surface),
-                depth,
+                depth + 1,
                 cx,
             )
         })

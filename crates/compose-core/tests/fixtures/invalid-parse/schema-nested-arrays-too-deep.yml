@@ -1,0 +1,27 @@
+# rule: an array's `items` counts a nesting level, so a chain of arrays hits the 8-level cap like any other nesting (grammar 3.4, 3.5)
+# code: invalid-value
+# message: `items` of `items` of `items` of `items` of `items` of `items` of `items` of `items` of the schema of `matrix` nests more than 8 levels deep
+# at: 25:28
+# help: the declaration surface counts as the first level, and an object's `properties`, a union variant, and an array's `items` each count one more (grammar 3.4)
+tool.deep:
+  description: Nests one array too far
+  input:
+    matrix:
+      type: array
+      items:
+        type: array
+        items:
+          type: array
+          items:
+            type: array
+            items:
+              type: array
+              items:
+                type: array
+                items:
+                  type: array
+                  items:
+                    type: array
+                    items: { type: string }
+  output: {}
+  function: { name: deep }
