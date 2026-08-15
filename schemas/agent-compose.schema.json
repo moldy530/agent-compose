@@ -1417,7 +1417,7 @@
       "required": ["map"],
       "properties": {
         "map": {
-          "description": "Fan-out configuration. Bounding is mandatory: max_items on the source array plus max_concurrency here.",
+          "description": "Fan-out configuration. Bounding is mandatory: max_items on the source array plus max_concurrency here. The block accepts no `context:` key: a dispatch is the other module boundary for conversation history and its isolation is unconditional - every instance runs on a fresh history that is discarded when it completes, and the sharing opt-in is a flow node's key (grammar 8.6 rule 13, 10.4 / Decision D105).",
           "type": "object",
           "required": ["over", "max_concurrency"],
           "properties": {

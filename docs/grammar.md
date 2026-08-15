@@ -4885,7 +4885,9 @@ a literal in the same object: store-op parameter sets per `op` (§11.4), trigger
 keys per `type` (§13) including the `respond`/`timeout` and `respond`/`callback`
 pairings (§13.3), the map form rules and the `on_item_error` shape (§8.6) —
 including the confinement of `input:`/`writes:`/`detach:` to the homogeneous form
-(rule 7, D85) — the field-map-only `input:` on the node kinds that name their
+(rule 7, D85) and the absence of any `context:` key, which is a `flow:` node's
+alone because a dispatch's history isolation is unconditional (rule 13, D105) —
+the field-map-only `input:` on the node kinds that name their
 fields (§8.0, D88), the non-empty `expect_exit`/`expect_status` lists (§6.1), the
 direct-XOR-route split on model definitions (§12.2), the `human` timeout/route
 pairing (§8.7) and the absence of node-level `timeout:`/`retry:` on a `human`
@@ -5003,7 +5005,9 @@ model.<name>:    { route: [model.<a>, model.<b>], route_on: [...] }
          input?,                   # field map, or a scalar for a string-in agent
          writes?,
          detach? } }               # input/writes/detach: homogeneous form only —
-                                   # a routed map declares all three per route
+                                   # a routed map declares all three per route.
+                                   # no context: — a dispatch always isolates
+                                   # conversation history (D105)
 # route: { node, max_concurrency?, input?, writes?, detach? }
 
 # ---- deploy file ------------------------------------------------------------
