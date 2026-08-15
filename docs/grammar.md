@@ -1555,20 +1555,21 @@ is a compile error naming `f`, `d`, the two edges, and the two distances
 [D69](#d69-execution-is-stepwise-and-convergence-is-a-per-step-join-over-taken-branches),
 [D99](#d99-co-takeability-is-a-relation-on-a-pair-of-sibling-edges),
 [D112](#d112-balanced-convergence-compares-one-distance-from-each-edge-of-the-pair)).
-Both sides have to supply a distance: a `d` that only one edge of the pair
-reaches takes one arrival from this pair however many paths lead to it on that
-side, so the pair delivers once and there is nothing to refuse.
+Both sides have to supply a distance, so a `d` that only one edge of the pair
+reaches is never this pair's error — whatever the paths on that side look like,
+which is the next paragraph's question, not this one's.
 
-**One side's own distances are not this check's business.** `dist(f, e₁, d)` may
-hold two values on its own, where some node inside that branch has two out-edges
-whose paths to `d` differ in length. That node is where the question belongs and
-it is asked there: if its two edges are co-takeable it is a fork in its own
-right and this same check runs on its pair, and if they are exclusive (§7.6.1)
-at most one of the two paths is taken on a pass, so `d` receives one delivery
-from the branch and running twice was never possible. Taking the union of the
-two sides instead would refuse that second shape — a guarded shortcut inside one
-concurrent branch — while naming a pair that cannot deliver the two distances
-the diagnostic reports (Decision
+**One side's own distances are not this pair's business.** `dist(f, e₁, d)` may
+hold two values on its own, where two paths of different lengths run from `f`
+through `e₁` to `d`. Those paths share a prefix and part at some node `g`, and
+`g` is where the question belongs, asked of the two edges they leave it by: if
+those two are co-takeable, `g` is a fork in its own right and this same check
+compares its pair, over exactly the two suffix lengths that differ; if they are
+exclusive (§7.6.1), at most one of the paths is taken on a pass, so `d` receives
+one delivery from the branch and running twice was never possible. Taking the
+union of the two sides instead would refuse that second shape — a guarded
+shortcut inside one concurrent branch — while naming a pair that cannot deliver
+the two distances the diagnostic reports (Decision
 [D112](#d112-balanced-convergence-compares-one-distance-from-each-edge-of-the-pair)).
 
 `end` is exempt: it is not a node, it retires branches instead of running, and
@@ -1830,10 +1831,12 @@ instantiated with `input: { goal: … }` is a compile error naming `draft`, even
 where the caller happens to have a `draft` channel.
 
 Neither chain applies to a **`store:` node**, which declares no `input:` at all:
-a store op has no input schema, and its parameters are the per-op CEL values of
-§11.4, written out in the node and resolved directly against the roots of §4.1.
-Nothing falls through by name there — an omitted `key:` is a missing required
-parameter, never a lookup of a channel named `key`.
+a store op has no input schema, and its parameters are the per-op values of
+§11.4, written out in the node — the CEL ones resolved directly against the
+roots of §4.1, and the three that are literals (`top_k`, `limit`,
+`content_type`) resolved not at all (§8.8). Nothing falls through by name there
+— an omitted `key:` is a missing required parameter, never a lookup of a channel
+named `key`.
 
 **Types across a name-based read.** Step 1 puts a CEL expression between the
 source and the field, so it is typed by its result (§4.1). Steps 2 and 3 put
@@ -2436,13 +2439,12 @@ are one expression each; `value` is one expression on a `vector upsert` and a
 `blob put` and a field map of expressions on a `kv set`; `filter` and `metadata`
 are maps of one expression per entry (§11.4). The other three are **literals**,
 not expressions: `top_k` and `limit` are integers in the ranges §11.4 fixes, and
-`content_type`
-is a media type string, which §4.3 puts in class 3 so it carries no env refs
-either. A CEL string where §11.4 declares an integer is a type error, not a
-computed bound — a fan-out's cardinality is a schema bound (§3.5) and a store
-op's is a written-down one, and both are meant to be readable without running
-the graph. All three are decidable in one file, so the published schema types
-them too (Appendix B).
+`content_type` is a media type string, which §4.3 puts in class 3 so it carries
+no env refs either. A CEL string where §11.4 declares an integer is a type
+error, not a computed bound — a fan-out's cardinality is a schema bound (§3.5)
+and a store op's is a written-down one, and both are meant to be readable
+without running the graph. All three are decidable in one file, so the published
+schema types them too (Appendix B).
 
 `get` is the one op whose result may omit a field. On a miss it returns
 `found: false` and **no `value`**, so the `writes: { value: prefs }` above
@@ -2868,10 +2870,11 @@ store.docs:
 **`metadata_schema` is a `vector` key.** Nothing in this grammar reads a `blob`
 store's metadata: no `blob` op takes a `metadata` or a `filter` parameter — `put`
 takes `key`/`value`/`content_type`, `get` returns `value`/`found`, `list`
-returns `keys` (§11.4) — and the tools a `blob` attachment synthesizes are
-`<name>_get`, `<name>_list`, and `<name>_put` (§11.5). Declared there it would
-be a key every write and every read ignores, so it is a compile error naming the
-store and its kind rather than silence — the posture
+returns `keys` (§11.4) — and none of the tools a `blob` attachment can
+synthesize (`<name>_get`, `<name>_list`, `<name>_put`, §11.5) takes or returns
+it either. Declared there it would be a key every write and every read ignores,
+so it is a compile error naming the store and its kind rather than silence — the
+posture
 [D50](#d50-unknown-keys-are-errors-everywhere-except-plugin-config-objects) and
 [D61](#d61-else-takes-the-literal-true) take on an inert key, and the one §14
 already takes on a `storage_backends:` under `local` (Decision
@@ -2955,8 +2958,9 @@ Rules (PRD 5.8):
     like any other, and the Zod type codegen emits (§3.8) carries three
     properties;
   - `filter:` on a `search` and `metadata:` on an `upsert` have no legal key, so
-    declaring either with any key is a compile error naming the store — the
-    schema check in the bullet above, against a schema with no properties.
+    either of them naming any key is a compile error naming the store: that is
+    the schema check of the bullet above, run against a store that declares no
+    metadata schema for a key to be checked against.
 
   Declaring `metadata_schema: {}` is a *declaration*, not an omission: `M` is
   then the empty closed object (§3.1), the `metadata` field is present and can
@@ -5410,15 +5414,17 @@ conservative static check must not go, with a diagnostic that misattributes the
 two distances to a pair that cannot deliver them.
 
 Nothing is lost on the soundness side, which is why the tightening is safe
-rather than a relaxation of the guarantee. Two paths from `f` through `e₁` to
-`d` diverge at some node along the way, and that node's two out-edges are either
-co-takeable — making it a fork whose own pair this same check compares, at the
-depths that matter — or exclusive, in which case only one of the paths is ever
-taken and there is no second delivery to refuse. So the same-side case is
-already decided one fork down, and the union adds no rejection the check needs;
-it only adds ones it must not make. Stating the comparison across the pair is
-also what makes the error message true: the two distances it prints are the ones
-the two named edges deliver. *PRD 5.3, 5.6, G3.*
+rather than a relaxation of the guarantee. Two paths of different lengths from
+`f` through `e₁` to `d` share a prefix and part at some node `g`, taking
+distinct out-edges of it; their suffix lengths differ, since the prefix is
+shared and the totals do not. So those two out-edges are either co-takeable —
+making `g` a fork whose pair this same check compares, over exactly those two
+suffix lengths, and rejects — or exclusive, in which case only one of the paths
+is ever taken and there is no second delivery to refuse. The same-side case is
+therefore already decided one fork down, and the union adds no rejection the
+check needs; it only adds ones it must not make. Stating the comparison across
+the pair is also what makes the error message true: the two distances it prints
+are the ones the two named edges deliver. *PRD 5.3, 5.6, G3.*
 
 ### D113. `metadata_schema` is a `vector`-only key
 
@@ -5427,9 +5433,10 @@ and a `blob` one; the published schema enforces all three (§11.1, Appendix B).
 **Rationale**: §11.1 declared it "vector/blob optional" and nothing in the
 grammar consumes it on a `blob`. No `blob` op takes `metadata` or `filter`
 (§11.4's rows are `put` = `key`/`value`/`content_type`, `get` = `value`/`found`,
-`list` = `keys`), and §11.5 synthesizes `<name>_get`, `<name>_list`, and
-`<name>_put` with nowhere to put it — so an author following the table's own
-gloss ("filterable metadata") writes a key that every write and every read
+`list` = `keys`), and the tools §11.5 synthesizes for one — `<name>_get`,
+`<name>_list`, and, unless `agent_access: read` withholds it, `<name>_put` —
+have nowhere to put it either. An author following the table's own gloss
+("filterable metadata") therefore writes a key that every write and every read
 ignores, with no diagnostic. That is precisely the silent no-op this document
 refuses for `else: false` ([D61](#d61-else-takes-the-literal-true)), for
 `timeout:` on an async trigger ([D81](#d81-timeout-is-illegal-on-an-async-http-trigger)),
@@ -5466,10 +5473,10 @@ object", and §11.1 makes that key optional
 one kind that keeps it), so a store declaring none left `M` undefined. Two
 implementations follow and they disagree about everything downstream: one
 derives `metadata: {}` and one omits the field, which changes whether
-`search.output.matches[0].metadata` type-checks (§4.1), what a name-based write
-of `matches` must find in its channel (§10.2,
-[D111](#d111-name-based-wiring-is-type-checked-in-both-directions)), and what
-Zod type codegen emits (§3.8). That is the three-way divergence
+`search.output.matches[0].metadata` type-checks (§4.1), which channel type a
+name-based write of `matches` is accepted by (§10.2,
+[D58](#d58-append-channels-take-one-element-per-write)), and what Zod type
+codegen emits (§3.8). That is the three-way divergence
 [D101](#d101-a-merge-channels-properties-are-unset-until-supplied) and
 [D110](#d110-an-absent-value-fails-the-read-and-an-absent-output-field-writes-nothing)
 were added to close for other absent-value corners, one construct over.
@@ -5558,9 +5565,8 @@ three parameters that are literals rather than CEL — `top_k` and `limit` typed
 as integers in their ranges, `content_type` as a string carrying no env ref
 (§8.8, §11.4) — store definition key sets per `kind`, both the schema each kind
 requires and the ones it refuses, `metadata_schema` being `vector`'s alone
-(§11.1, D113), provider
-key sets per `kind` — both halves, the required keys and the closed row the
-optional ones live in (§12.1, D106) — trigger
+(§11.1, D113), provider key sets per `kind` — both halves, the required keys and
+the closed row the optional ones live in (§12.1, D106) — trigger
 keys per `type` (§13) including the `respond`/`timeout` and `respond`/`callback`
 pairings (§13.3), the map form rules and the `on_item_error` shape (§8.6) —
 including the confinement of `input:`/`writes:`/`detach:` to the homogeneous form
@@ -5696,6 +5702,7 @@ model.<name>:    { route: [model.<a>, model.<b>], route_on: [...] }
                      # get/delete: key | set: key,value | list: prefix?,limit
                      # search: query,top_k,filter? | upsert: key,value,metadata?
                      # put: key,value,content_type?
+                     # top_k/limit/content_type are literals, not CEL (8.8)
                      # a get that misses returns found:false and no value:
                      # no write, and reading .output.value fails (D110)
                      writes: {...} }
