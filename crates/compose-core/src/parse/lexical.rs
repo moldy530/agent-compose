@@ -485,6 +485,17 @@ fn scan_env_tokens(text: &str) -> Vec<EnvToken> {
     tokens
 }
 
+/// Whether `text` reaches for an environment substitution at all.
+///
+/// Unlike [`reject_env_refs`], a malformed token counts: this answers "did the
+/// author write `${…}` here", which is the question at a surface that has no
+/// second pass to report a bad env *name* (an `imports:` entry is a path, not a
+/// value read through [`env_ref`]). The `$${` escape is honoured, so an entry
+/// that genuinely spells a literal `${` is not caught by it.
+pub(crate) fn contains_env_token(text: &str) -> bool {
+    !scan_env_tokens(text).is_empty()
+}
+
 /// Whether `text` matches the env-name grammar `[A-Z_][A-Z0-9_]*`.
 #[must_use]
 pub fn is_env_name(text: &str) -> bool {

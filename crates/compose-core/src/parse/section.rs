@@ -29,11 +29,9 @@ pub(crate) fn imports(node: &Node, cx: &mut Cx) -> Option<ImportsSection> {
                 Diagnostic::error(
                     DiagnosticCode::InvalidImportPath,
                     text.span.clone(),
-                    format!("`{}` {problem}", text.value),
+                    format!("`{}` {}", text.value, problem.reason),
                 )
-                .with_help(
-                    "imports are relative paths to `.yml`/`.yaml` spec files, resolved against the entrypoint's directory: there is no directory scanning",
-                ),
+                .with_help(problem.help),
             );
             continue;
         }
@@ -65,6 +63,26 @@ pub(crate) fn imports(node: &Node, cx: &mut Cx) -> Option<ImportsSection> {
     })
 }
 
+/// Why an `imports:` entry is not a legal path, and the help that explains it.
+struct ImportProblem {
+    /// Completes ``` `<path>` … ```.
+    reason: &'static str,
+    help: &'static str,
+}
+
+impl ImportProblem {
+    const fn new(reason: &'static str) -> Option<Self> {
+        Some(Self {
+            reason,
+            help: "imports are relative paths to `.yml`/`.yaml` spec files, resolved against the entrypoint's directory: there is no directory scanning",
+        })
+    }
+
+    const fn with_help(reason: &'static str, help: &'static str) -> Option<Self> {
+        Some(Self { reason, help })
+    }
+}
+
 /// Why an `imports:` entry is not a legal path, if it is not.
 ///
 /// The charset half is grammar 1.4's own rule (Decision D80): `/`-separated
@@ -72,30 +90,43 @@ pub(crate) fn imports(node: &Node, cx: &mut Cx) -> Option<ImportsSection> {
 /// spelling keeps a path identical in the IR, on a command line, and in a
 /// diagnostic on every host, which a path carrying a space or a backslash does
 /// not.
-fn import_problem(path: &str) -> Option<&'static str> {
+///
+/// Order matters where the tests overlap. A `${…}` token is looked for before
+/// the glob check because its braces are glob metacharacters too: the entry is
+/// refused either way, but "is a glob pattern" would send the author looking
+/// for the wrong mistake when what they wrote is plainly an environment
+/// reference, which grammar 4.3 puts in class 3 along with every other
+/// `imports:` entry.
+fn import_problem(path: &str) -> Option<ImportProblem> {
     if path.is_empty() {
-        return Some("is empty");
+        return ImportProblem::new("is empty");
     }
     if path.starts_with('/') || path.starts_with('\\') {
-        return Some("is an absolute path");
+        return ImportProblem::new("is an absolute path");
     }
     if path.contains("://") {
-        return Some("is a URL");
+        return ImportProblem::new("is a URL");
+    }
+    if lexical::contains_env_token(path) {
+        return ImportProblem::with_help(
+            "carries an environment reference",
+            "an import path is part of what the composition *is*, so it is fixed in the file rather than at process start (grammar 4.3); write `$${` for a literal `${`",
+        );
     }
     if path.contains(['*', '?', '[', ']', '{', '}']) {
-        return Some("is a glob pattern");
+        return ImportProblem::new("is a glob pattern");
     }
     if !(path.ends_with(".yml") || path.ends_with(".yaml")) {
-        return Some("does not name a `.yml` or `.yaml` file");
+        return ImportProblem::new("does not name a `.yml` or `.yaml` file");
     }
     if path.contains('\\') {
-        return Some("contains a backslash");
+        return ImportProblem::new("contains a backslash");
     }
     if path.chars().any(char::is_whitespace) {
-        return Some("contains whitespace");
+        return ImportProblem::new("contains whitespace");
     }
     if !path.split('/').all(is_portable_segment) {
-        return Some("is outside the portable path charset");
+        return ImportProblem::new("is outside the portable path charset");
     }
     None
 }
