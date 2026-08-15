@@ -260,6 +260,7 @@ error of the form "expected an `agent.*` reference, found `tool.web_search`"
 | `agent.<a>.stores[]` | `store.*` | |
 | `model.<m>.provider` | `provider.*` | direct models only |
 | `model.<m>.route[]` | `model.*` | direct models only, no nested routes |
+| `store.<s>.embed.provider` | `provider.*` | which connection serves embeddings (§11.2); `vector` stores only |
 | node `agent:` | `agent.*` | |
 | node `function:` | `tool.*` | the def/use split of PRD 5.5 |
 | node `flow:` | `flow.*` | no recursion |
@@ -289,8 +290,8 @@ Node ids are identifiers scoped to their flow; two flows may both have a node
   "this branch is done", never "stop the run". The two control-transfer
   positions accept exactly the same targets; nothing else accepts a pseudo-node.
 
-A node MUST NOT be named `start` or `end`, and every node MUST have at least one
-outgoing edge (§7.6.3).
+A node MUST NOT be named `start` or `end`; every node MUST have at least one
+outgoing edge (§7.6.3) and MUST be reachable from `start` (§7.8).
 
 ### 2.5 Reserved names
 
@@ -661,14 +662,51 @@ compile error (Decision [D41](#d41-env-ref-forms-and-the-secret-field-list)):
 | `api_key`, `api_secret`, `token`, `password`, `access_key_id`, `secret_access_key`, `session_token`, `credentials_json` | `provider.*`, `storage_backends.*`, `event_sources.*` |
 | `url`, `base_url`, `endpoint`, `dsn` | `provider.*`, `storage_backends.*`, `event_sources.*` |
 
-Interpolated refs are legal in: `http` node/tool `url` and `headers` values,
-`exec` `env` values and `cwd`, and non-secret deploy config values.
-Env refs are ILLEGAL in: prompts, descriptions, schemas, CEL expressions, model
-`id`, and any identifier or reference position. Nothing is interpolated there, so
-an unescaped `${NAME}` token in one of those positions is a **compile error**
-naming the field rather than text that silently survives into the output — the
-author who wrote it expected a substitution. The `$${` escape (above) is how a
-literal `${NAME}` is written where one is genuinely wanted.
+**The classification is total.** Every string-valued surface in this grammar
+falls in exactly one of three classes, and class 3 is the default: a surface
+this section does not place in class 1 or class 2 is in class 3 (Decision
+[D92](#d92-the-env-ref-classification-is-total-over-string-surfaces)). No string
+surface is left to an implementer's judgement.
+
+| Class | Surfaces | Rule |
+|---|---|---|
+| **1. Env-ref value only** | the secret and connection fields tabulated above | the whole string is one `${NAME}` reference; a literal is a compile error |
+| **2. Interpolable** | `http` node and `http:` tool-binding `url` and `headers` values; the whole `exec:` surface — `command`, every entry of `args`, `cwd`, and `env` values, on both the tool binding (§6.1) and the inline node (§8.2); provider `headers` values and the non-secret provider keys of §12.1 (`region`, `location`, `project`, `organization`, `profile`, `api_version`); non-secret `storage_backends` and `event_sources` config values (§14.2, §14.3) | embedded `${NAME}` tokens are substituted at process start |
+| **3. No refs** | **everything else** | an unescaped `${NAME}` token is a **compile error** naming the field |
+
+Class 3 therefore covers, among others: prompts; every `description:`; every
+part of a schema (`enum` members, `pattern`, `format`, `default:` literals); CEL
+expressions on every surface; model `id` and every value inside `settings:`;
+`embed.model` (§11.2); every identifier and reference position (node ids,
+channel names, typed addresses, a store's `backend:` alias, a tool's
+`function.name`, an event trigger's `source:`); `version:`; `imports:` entries;
+a trigger's `path:`, `cron:`, and `timezone:` (§13.3, §13.4); a `blob put`'s
+`content_type:` (§11.4); and every enum-valued key.
+
+Nothing is interpolated in class 3, so an unescaped token there is an error
+rather than text that silently survives into the output — the author who wrote
+it expected a substitution. The `$${` escape (above) is how a literal `${NAME}`
+is written where one is genuinely wanted.
+
+Two boundaries are worth stating outright, because they are the ones an author
+is most likely to guess at:
+
+- **The `exec:` block is interpolable end to end.** A process invocation is the
+  archetypal env-parameterized value (`command: "${TOOLBIN}/rg"`,
+  `args: ["--host=${DB_HOST}"]`), `cwd` and `env` were interpolable already, and
+  nothing here is shell-interpreted — a substituted value is one argv element or
+  one variable, never a re-parsed command line (§6.1). This is orthogonal to
+  [D24](#d24-function-nodes-reference-tool-defs-inline-exechttp-nodes-stay-for-one-offs)'s
+  rule that `args` carries no **CEL**: CEL reads graph data at run time, an env
+  ref reads the process environment at start, and the two restrictions are
+  independent.
+- **Compile-time-checked and identity-bearing strings take no refs.** A cron
+  expression, an IANA timezone, a route `path:`, a model `id`, an
+  `embed.model` and a `content_type:` are either shape-checked by the validator
+  or part of what the composition *is*; a value that only exists at process
+  start is a value neither `validate` nor a diff can see. `settings:` is in this
+  class for PRD 5.9's reason — every LLM configuration in a project stays
+  greppable in one file.
 
 Env refs **survive unresolved into the IR**. `validate` checks syntax only;
 `build`/`serve`/`run` check presence and fail fast naming the missing variable
@@ -831,8 +869,8 @@ exec:
 
 | Key | Type | Required | Notes |
 |---|---|---|---|
-| `command` | string (non-empty) | yes | executable name/path; never shell-interpreted |
-| `args` | array of string | no | literal; no CEL (D24) |
+| `command` | string (non-empty, interpolable) | yes | executable name/path; never shell-interpreted |
+| `args` | array of string (interpolable) | no | literal argv entries: no CEL (D24), env refs legal (§4.3) |
 | `cwd` | string (interpolable) | no | |
 | `env` | map env-var-name (`[A-Za-z_][A-Za-z0-9_]*`) → string (interpolable) | no | added to the child environment |
 | `expect_exit` | **non-empty** array of integer in `0..=255` | no | accepted exit statuses; default `[0]`. An empty list would accept no outcome at all, making every run an error — the inert key [D61](#d61-else-takes-the-literal-true) rejects, exactly as for `expect_status` (D84) |
@@ -842,6 +880,14 @@ variables (`UPPER_SNAKE_CASE` of each field, JSON-encoded for non-scalars); a
 string input is passed on stdin. The child's **stdout** is decoded as JSON and
 validated against `output`, except when `output` declares exactly one
 string-typed property, in which case trimmed raw stdout binds to it.
+
+That single-string-property exception is a **`tool.*`-surface rule**. A tool
+declares a *domain* result and has no other way to name raw text, so the
+exception is how a tool wrapping a text-emitting command stays expressible.
+Inline `exec:`/`http:` nodes do have another way — the envelope fields `stdout`
+and `body` (§8.2, §8.3) — so the exception does not apply there and a
+non-envelope field is always decoded (Decision
+[D91](#d91-the-single-string-property-decode-exception-is-a-tool-surface-rule)).
 
 **Failure.** An exit status outside `expect_exit` is a node error subject to §9;
 a status inside it completes the node normally. `expect_exit: [0, 1]` is
@@ -886,7 +932,9 @@ Without `body`/`query`, the bound input object is sent as the JSON body
 (body-bearing methods) or as query parameters (`GET`/`HEAD`). The response body
 is decoded as JSON and validated against `output`, except when `output` declares
 exactly one string-typed property, in which case the raw response text binds to
-it. A status outside `expect_status` is a node error subject to §9, and a status
+it — the same `tool.*`-surface exception the `exec` binding carries above, and
+inapplicable on inline nodes for the same reason (D91). A status outside
+`expect_status` is a node error subject to §9, and a status
 inside it completes the node — `expect_status: [200, 404]` makes a 404 routable
 data rather than a failure, exactly as `expect_exit` does for an exit code
 (D84). As with `exec`, this is the *tool* surface: the response envelope
@@ -1220,8 +1268,10 @@ The instance finishes when that union is empty (§7.6.3).
 A node **completes** when its own work is done. For the two composite kinds:
 
 - a `flow:` node completes when its subflow instance reaches quiescence;
-- a `map` node completes when every dispatched instance has completed or been
-  resolved by `on_item_error` — this is the fan-out barrier (§8.6 rule 6).
+- a `map` node completes when every dispatched instance has completed, been
+  resolved by `on_item_error`, or been detached — a detached dispatch is
+  resolved the moment it is issued. This is the fan-out barrier (§8.6 rules 6
+  and 7).
 
 Two properties follow, and a conforming implementation MUST preserve both:
 
@@ -1300,6 +1350,14 @@ a compile error naming `f`, `d`, and the differing distances (Decision
 branches legitimately reach it at different depths (§7.6.3). Where a cycle lies
 between the fork and the convergence the distance is not static, `dist` is not
 computed there, and the runtime rule above is what governs.
+
+`dist` counts **edges** only. A control transfer — `on_error: { fallback: … }`,
+`human.on_timeout:` — fires *instead of* the node's outgoing edges (§9.2, §8.7),
+never alongside them, so it can never add a second concurrent arrival at a
+convergence; and where an error path does deliver to a convergence at some other
+depth, the runtime rule above governs, exactly as it does around a cycle. The two
+positions are reachability edges for §7.8 and are not steps here: different
+question, different relation.
 
 **Worked example — the diamond.**
 
@@ -1394,10 +1452,13 @@ and the instances of a `map`. Completion order among them is nondeterministic
 3. A `flow:` node is a **single** writer at this level, at its own node id: the
    subflow instance orders its internals by these same rules, and only its
    `outputs:`, materialized at its quiescence, cross the boundary.
-4. Within one writer there is at most one write per channel. `writes:` MUST be
-   **injective** — two output fields may not name the same channel — and a
-   remapped field is not also written to its same-named channel (§8.0). A
-   non-injective `writes:` is a compile error.
+4. Within one writer there is at most one write per channel, and that is
+   guaranteed rather than assumed: a node's **effective** write map — every
+   output field paired with the channel it writes, name-based destinations
+   included — MUST be injective (§8.0, Decision
+   [D93](#d93-the-effective-write-map-is-what-must-be-injective)), and a
+   remapped field is not also written to its same-named channel. A
+   non-injective effective map is a compile error.
 
 The reduce policy is then applied in that order: `append` appends in it (which
 for a `map` is source-item order, PRD 5.6's requirement, arrived at as a
@@ -1451,6 +1512,45 @@ interrupt-free; a session-scoped store reached through a map-dispatched flow
 still needs a session identity; and recursion through a tool attachment is still
 recursion. Clause 4 — traversal into `tools:` — is the one every earlier
 per-check wording left unstated.
+
+This relation answers "can this flow *cause* that component to run". It is not
+§7.8's relation, which asks whether a node of one flow is reachable from that
+flow's `start`. The two are deliberately separate: different domains (components
+across the composition versus node ids inside one flow) and different questions,
+so neither is defined in terms of the other.
+
+### 7.8 Node reachability
+
+Every node of a flow MUST be reachable from that flow's `start`. A node that is
+not is a compile error naming the flow and the node — the unreachable-node check
+of PRD §7 M0 (Decision
+[D95](#d95-node-reachability-counts-edges-and-the-two-control-transfer-positions)).
+
+Reachability is computed per flow, over the flow's own **control-transfer
+relation**: node `n` transfers to node `m` when
+
+1. an edge (§7.2) declares `from: n, to: m` — `start` is the root, so an edge
+   `from: start` makes its target reachable; or
+2. `n` declares `on_error: { fallback: m }` (§9.2); or
+3. `n` is a `human` node declaring `on_timeout: m` (§8.7).
+
+A node is reachable when some chain of those transfers leads to it from `start`.
+Guards are ignored: an edge with a `when:` transfers control for this purpose,
+because whether it fires is a runtime question and this check is about whether a
+node is *ever* addressable (§7.3.1 is where guard coverage is decided).
+
+Clauses 2 and 3 are the load-bearing ones. They are the document's two
+**control-transfer positions** (§2.4) and they schedule a node exactly as an
+edge does (§9.2, §8.7), so a node addressed only by one of them is live code: a
+dedicated `cleanup` node reached solely by `on_error: { fallback: cleanup }` is
+an ordinary pattern, and an edge-only reading would reject it while accepting
+the same node the moment an unrelated inbound edge appeared. `end` is not a node
+and is never asked about; `start` needs no inbound transfer.
+
+Reachability constrains *entry*, and §7.6.3's rules constrain *exit*: every node
+must be reachable from `start` and must have an outgoing edge. A node targeted
+only by a fallback still needs one — `- { from: cleanup, to: end }` is the usual
+line — because retiring a branch is what `end` is for (§7.6.3 rule 1).
 
 ---
 
@@ -1539,9 +1639,22 @@ review:
 ```
 
 - Keys MUST be output field names of the node; values MUST be declared channels.
-- `writes:` MUST be **injective**: two output fields may not name the same
-  channel, which would leave one node making two unordered writes to one channel
-  (§7.6.4). A non-injective `writes:` is a compile error naming both fields.
+- A node's **effective write map** is the whole picture of where its output
+  goes: each output field paired with the channel it actually writes — the
+  `writes:` value when the field is remapped, otherwise the same-named channel
+  when one is declared, and nothing at all when neither applies (that field
+  stays node-scoped). The effective write map MUST be **injective**: no two
+  output fields may land on one channel, which would leave one node making two
+  unordered writes to it (§7.6.4). A non-injective effective map is a compile
+  error naming both fields and the channel (Decision
+  [D93](#d93-the-effective-write-map-is-what-must-be-injective)).
+
+  Both spellings of the collision are caught. Two remaps onto one channel
+  (`writes: { a: c, b: c }`) is the obvious one; the other is a remap landing on
+  a sibling's name-based destination — output `{a, b}` with `writes: { a: b }`
+  and a declared channel `b`, whose effective map is `{a → b, b → b}`. That
+  second form passes a check that reads `writes:` alone, which is why the rule
+  is stated over the effective map rather than over the remap.
 - Every write — name-based or remapped — is type-checked against the target
   channel by its reduce policy (§10.2): whole value for an unreduced or
   `last_wins` channel, one element for an `append` channel, a partial object for
@@ -1620,9 +1733,14 @@ the process envelope, not a decoded payload
 (`{type: string}`) are **envelope fields**: declaring one in `output` binds it
 from the child process directly, and it is never decoded from stdout. Declaring
 an envelope name with any other type is a compile error. Every *other* declared
-field is decoded from stdout as JSON per §6.1 (whose single-string-property
-shortcut is computed over the decoded fields alone). When `output` declares only
-envelope fields — as the default does — stdout is never parsed.
+field is decoded from stdout as JSON — **always**, whatever its type and however
+many fields there are. §6.1's single-string-property exception is a
+`tool.*`-surface rule and does not apply here: raw stdout already has a name on
+this surface, `stdout`, so a non-envelope string field is a decoded field rather
+than a second spelling of the raw stream (Decision
+[D91](#d91-the-single-string-property-decode-exception-is-a-tool-surface-rule)).
+When `output` declares only envelope fields — as the default does — stdout is
+never parsed.
 
 ### 8.3 `http`
 
@@ -1678,13 +1796,18 @@ the response envelope. `status` (`{type: integer}`) and `body` (`{type: string}`
 the raw response text) are **envelope fields**: declared, they bind from the
 response directly and are never decoded from it, and declaring either with
 another type is a compile error. Every other declared field is decoded from the
-response body as JSON per §6.1. So a node declaring only `status:` records the
-HTTP status and never parses the body (this is what the `escalate` node of
+response body as JSON — **always**, on the same rule §8.2 states for `exec`:
+§6.1's single-string-property exception is a `tool.*`-surface rule, and `body`
+is how an inline node names the raw response text (D91). So a node declaring
+only `status:` records the HTTP status and never parses the body (this is what
+the `escalate` node of
 [`examples/triage-fanout`](../examples/triage-fanout/flows/triage.yml) does),
 while a node that also wants the created ticket id declares
 `{ status: {type: integer}, id: {type: string} }` and gets `id` from the decoded
-body
-(Decision [D56](#d56-inline-exechttp-node-results-are-envelopes-not-decoded-payloads)).
+body — one declared string field beside an envelope field, decoded like any
+other (Decisions
+[D56](#d56-inline-exechttp-node-results-are-envelopes-not-decoded-payloads),
+[D91](#d91-the-single-string-property-decode-exception-is-a-tool-surface-rule)).
 
 ### 8.4 `function`
 
@@ -1832,12 +1955,17 @@ A **route** object takes `node` (required) plus optional `max_concurrency`,
    highest-indexed item's write, and a `last_wins` channel to the highest-indexed
    item's write outright. Nothing here depends on which instance finished first,
    so replay is deterministic.
-6. **Join**: the map node completes when every instance has completed or been
-   resolved by `on_item_error`; its outgoing edges are evaluated in the next step
-   (§7.6, P1). Sink routes are waited on like any other route. A dispatch of
+6. **Join**: the map node completes when every instance has completed, been
+   resolved by `on_item_error`, or been **detached** (rule 7); its outgoing edges
+   are evaluated in the next step (§7.6, P1). Sink routes are waited on like any
+   other route — that is PRD 5.6's default, and `detach: true` is the only opt-out
+   of it. A **detached** instance is *resolved at dispatch*: the join counts it
+   the moment the dispatch is issued and never waits for its outcome (Decision
+   [D94](#d94-a-detached-dispatch-is-resolved-at-dispatch)). A dispatch of
    **zero** instances — an empty source array, or a producer that was skipped
    (rule 11) — completes immediately, writes nothing, and its outgoing edges fire
-   exactly as if every instance had finished.
+   exactly as if every instance had finished; a map every one of whose dispatches
+   is detached completes in the same way, for the same reason.
 7. **`input:`, `writes:`, and `detach:` describe a dispatch target**, so each is
    declared in exactly two positions: as a map-block key on the **homogeneous**
    form (`node:`), or on an individual **route**. A map block that declares
@@ -1854,8 +1982,26 @@ A **route** object takes `node` (required) plus optional `max_concurrency`,
    is typed against a target — one bounds the node, the other is a strategy
    (rules 1, 10).
 
-   A detached dispatch is fire-and-forget: it MUST NOT declare `writes:` and
-   MUST NOT write reduced state. In v0, `detach: true` is a
+   A detached dispatch is fire-and-forget, and **that is a statement about the
+   join**, not only about state: it MUST NOT declare `writes:` and MUST NOT
+   write reduced state, and it is **resolved at dispatch** for every purpose
+   this section defines (Decision
+   [D94](#d94-a-detached-dispatch-is-resolved-at-dispatch)) —
+
+   - the map's join (rule 6) counts it as resolved when the dispatch is issued,
+     so the map node can complete — and its outgoing edges fire — while the
+     delivery is still in flight;
+   - `on_item_error` (rule 10) never applies to it: there is no observed item
+     outcome to apply a strategy to, so a detached delivery that fails is not an
+     item error, is not retried by the item policy, and does not reach the map
+     node's own `on_error:`. `on_error:` on the map still covers the node's own
+     failures, including a dispatch that could not be issued at all;
+   - nothing it does can fail or delay the enclosing flow instance, which is
+     precisely what an author asks for by writing the key — and precisely why
+     the default is `false` and PRD 5.6 makes a failed enqueue a surfaced
+     failure otherwise.
+
+   In v0, `detach: true` is a
    validation error under any target whose execution state is durably
    checkpointed — every target except `local` (§14) — pointing at the roadmap
    (the outbox-pattern delivery is not v0 work). Checkpointing is a property of
@@ -1863,7 +2009,9 @@ A **route** object takes `node` (required) plus optional `max_concurrency`,
    backend alias resolution (§11.3): the same composition is legal under
    `--target local` and rejected under `--target staging`. Detached dispatches
    receive an `idempotency_key` derived from
-   `execution_id + node + item_index`.
+   `execution_id + node + item_index`; delivery is at-least-once and sinks are
+   documented to dedupe on it (PRD 5.6), which is what makes an unobserved
+   outcome a defensible trade rather than a lost message.
 8. **`route_by` is a literal field name**, never a CEL expression — this keeps
    exhaustiveness decidable (PRD 5.6).
 9. Node-level `input:` and node-level `writes:` are both ILLEGAL on a `map` node:
@@ -1886,7 +2034,10 @@ A **route** object takes `node` (required) plus optional `max_concurrency`,
       `fail`. `defaults:` (§9.3 level 3) applies to **nodes**, and a dispatched
       instance is not a node of this flow ([D29](#d29-map-targets-are-component-references-not-flow-local-node-ids)),
       so nothing supplies an item policy behind the author's back. Routes do not
-      carry `on_item_error:`; the map-block value governs every route.
+      carry `on_item_error:`; the map-block value governs every route whose
+      outcome is observed — which excludes a **detached** route, whose instances
+      are resolved at dispatch and have no outcome for a strategy to act on
+      (rule 7, [D94](#d94-a-detached-dispatch-is-resolved-at-dispatch)).
     - A retry re-executes the whole dispatched instance from its entry as a fresh
       attempt — iteration counters and the item's own state reset, exactly as a
       `flow:` node's `retry:` re-executes a subgraph instance (§8.5). The item's
@@ -2033,7 +2184,8 @@ casing (PRD 5.11).
 | `{ fallback: <node id or end> }` | the node's own outgoing edges are **not** evaluated; the fallback target is scheduled in the next step instead (§7.6), or the branch retires if the target is `end`. A node in the same flow only; never `start` |
 
 `fallback` targets a **flow-local node id or `end`** (§2.4), keeping error
-routing inside one graph where reachability analysis can see it — never `start`,
+routing inside one graph where reachability analysis can see it — a fallback
+target is reachable *because* it is one (§7.8 clause 2) — never `start`,
 and never a node of another flow (Decision
 [D21](#d21-on_error-strategies-and-fallback-targets)). `human.on_timeout` (§8.7)
 accepts the same targets.
@@ -2222,7 +2374,7 @@ store.docs:
 
 | Key | Type | Required | Notes |
 |---|---|---|---|
-| `model` | string (non-empty) | yes | provider-native embedding model id (a bare string, not a `model.*` ref — D36) |
+| `model` | string (non-empty) | yes | provider-native embedding model id (a bare string, not a `model.*` ref — D36); no env refs, exactly as a model `id` (§4.3) |
 | `provider` | `provider.*` ref | no | which connection serves it; default resolved from the target's backend |
 | `dimensions` | integer ≥ 1 | no | asserted against the backend's index |
 
@@ -2506,8 +2658,8 @@ Implicit invocation is **not** a trigger, and the difference is normative:
 - a flow that no declared trigger names is still a complete, legal definition:
   it is reachable through the CLI, through `flow:` nodes, and through
   flow-as-tool attachment, so there is no unreachable-*flow* error. Unreachable
-  *node* analysis (PRD §7 M0) is per flow, computed from that flow's `start`
-  pseudo-node, and is unaffected by which flows have triggers.
+  *node* analysis is §7.8's: per flow, computed from that flow's `start`
+  pseudo-node, and unaffected by which flows have triggers.
 
 ```yaml
 # triggers.yml
@@ -2587,7 +2739,7 @@ defaulted `session_key:`, exists implicitly for every flow (§13 preamble).
 
 | Key | Type | Required | Default | Notes |
 |---|---|---|---|---|
-| `path` | string starting `/`, no whitespace | no | `/triggers/<name>` | route of the generated app; router parameter syntax (`/reviews/:id`) passes through unexamined |
+| `path` | string starting `/`, no whitespace | no | `/triggers/<name>` | route of the generated app; router parameter syntax (`/reviews/:id`) passes through unexamined; no env refs (§4.3) |
 | `method` | `POST` \| `PUT` \| `GET` | no | `POST` | |
 | `input` | map field→CEL over `payload` | no | — | |
 | `respond` | `sync` \| `async` | no | `async` | |
@@ -2630,8 +2782,8 @@ nightly:
 
 | Key | Type | Required | Notes |
 |---|---|---|---|
-| `cron` | string, 5-field POSIX cron | yes | validated for shape at compile time |
-| `timezone` | IANA tz name | no (default `UTC`) | |
+| `cron` | string, 5-field POSIX cron | yes | validated for shape at compile time, so no env refs (§4.3) |
+| `timezone` | IANA tz name | no (default `UTC`) | no env refs (§4.3) |
 | `input` | map field→CEL over `payload` | no | `payload.scheduled_at` (RFC 3339 string), `payload.trigger` (name) |
 
 Everything is parsed, type-checked, and carried into the IR; nothing schedules an
@@ -3305,7 +3457,9 @@ deterministic, byte-identical output for the same input. *PRD 5.12.*
 On an inline `exec:` node, `exit_code`/`stdout`/`stderr` are synthesized from the
 child process; on an inline `http:` node, `status`/`body` are synthesized from the
 response. They are never decoded from the payload, their types are fixed, and any
-*other* declared field is decoded per §6.1. Envelope names carry no special
+*other* declared field is decoded as JSON from stdout or from the response body
+([D91](#d91-the-single-string-property-decode-exception-is-a-tool-surface-rule)
+fixes that "decoded" is unconditional here). Envelope names carry no special
 meaning in a `tool.*` result schema. **Rationale**: §6.1's decoding rule and the
 kind defaults (`{exit_code, stdout}`, `{status, body}`) are otherwise in direct
 contradiction — `npm test` would have to print `{"exit_code":0,…}` for the
@@ -3535,7 +3689,8 @@ is well-defined (§4.1) — they just cannot be the *only* edges. *PRD 5.3, 5.4,
 ### D72. Concurrent writes are applied in a canonical order
 
 Writers within a step are ordered by node id, a `map`'s instances by source-item
-index, a `flow:` node counts as one writer, and `writes:` MUST be injective; the
+index, a `flow:` node counts as one writer, and a node's effective write map MUST
+be injective ([D93](#d93-the-effective-write-map-is-what-must-be-injective)); the
 reduce policy is applied in that order (§7.6.4). **Rationale**: PRD 5.6 index-tags
 and reorders `append` writes "so replay is deterministic" and calls unordered
 reduces a silent break of replay — but `merge` and `last_wins` had no order at
@@ -3545,7 +3700,9 @@ makes PRD 5.6's append rule a consequence rather than a special case. Node id
 rather than declaration order is deliberate: it makes the order a property of the
 graph, not of file layout, so reordering `nodes:` provably cannot change a run —
 [D55](#d55-definition-order-is-irrelevant-ir-order-is-canonical)'s canonical-IR
-posture extended to execution. Injectivity is what makes "at most one write per
+posture extended to execution. Injectivity of the *effective* map — not of
+`writes:` alone ([D93](#d93-the-effective-write-map-is-what-must-be-injective)) —
+is what makes "at most one write per
 channel per writer" true, which is what makes the order total. Forbidding the
 combination outright — no `merge`/`last_wins` from concurrent contexts — was the
 other option, and was rejected because it would delete the only expressible
@@ -3888,6 +4045,140 @@ is the way *out*. `when: "true"` remains writable and remains a guarded edge, so
 it can carry a budget and still cannot serve as any rule's guarantee. *PRD 5.3,
 5.4, G3.*
 
+### D91. The single-string-property decode exception is a `tool.*`-surface rule
+
+§6.1's "except when `output` declares exactly one string-typed property, in which
+case the raw text binds to it" applies to `tool.*` `exec:`/`http:` bindings only.
+On an inline `exec:`/`http:` node, every non-envelope declared field is decoded
+as JSON unconditionally (§8.2, §8.3).
+**Rationale**: §8.2 said the exception was "computed over the decoded fields
+alone" while §8.3's worked example declared
+`{ status: {type: integer}, id: {type: string} }` and got `id` "from the decoded
+body" — and under §8.2's own sentence that node's decoded set is exactly one
+string-typed property, so the exception would bind the whole raw response text to
+`id` instead. Two conforming codegens produced different runtime values for the
+document's own example, so one of the two sentences had to go. The exception is
+the one that goes, because on an inline node it has no job: raw text already has
+a name there — `stdout`, `body` — which is exactly what
+[D56](#d56-inline-exechttp-node-results-are-envelopes-not-decoded-payloads)
+established the envelope for, and `writes: { stdout: <channel> }` renames it. A
+`tool.*` has no envelope and no other way to name raw text, which is why the
+exception exists at all and why it stays there. Keeping it on both surfaces was
+the alternative and is worse in both directions: it would make
+`{ report_normalized: {type: string} }` on an inline node mean "the whole
+response body", which no author writing a field name means, and it would make a
+node's decoding depend on how many of its *other* fields happen to be strings —
+adding `id: {type: string}` beside a lone `status:` would silently stop the body
+from being parsed. One rule per surface, each justified by what that surface can
+name. *PRD 5.5.*
+
+### D92. The env-ref classification is total over string surfaces
+
+§4.3 sorts every string-valued surface into env-ref-value-only, interpolable, or
+no-refs, with no-refs as the default for anything the section does not list. The
+`exec:` block is interpolable end to end (`command`, `args` entries, `cwd`,
+`env` values); `embed.model`, model `settings:` values, a trigger's
+`path:`/`cron:`/`timezone:`, and a `blob put`'s `content_type:` take no refs.
+**Rationale**: the previous wording gave a legal list and an illegal list and
+left the gap between them undefined — `exec` `command:`/`args:`, `embed.model`,
+trigger `path:`, and `content_type:` were in neither, so `args: ["--host=${DB_HOST}"]`
+had three defensible behaviors (interpolate, reject, pass the six characters
+through) and the compile-error rule, which is scoped to the illegal list, decided
+none of them. A partial classification cannot be implemented twice the same way,
+so the fix is to make it total by construction rather than to extend a list and
+leave the next surface unclassified. The split itself follows what each surface
+is: an `exec:` block is a process invocation, the archetypal env-parameterized
+value, and nothing in it is shell-interpreted, so a substituted value is one
+argv element or one variable — never a re-parsed command line. The no-refs side
+collects the strings the validator shape-checks (a cron expression, an IANA
+zone, a route path) and the strings that are part of what the composition *is*
+(a model id, an embedding model id, a content type, `settings:` values): a value
+that first exists at process start is a value neither `validate` nor a diff can
+see, and PRD 5.9 wants every LLM configuration greppable in one file. This is
+orthogonal to
+[D24](#d24-function-nodes-reference-tool-defs-inline-exechttp-nodes-stay-for-one-offs)'s
+no-CEL rule for `args:` — CEL reads graph data at run time, an env ref reads the
+environment at process start — and it keeps [D41](#d41-env-ref-forms-and-the-secret-field-list)'s
+posture intact: where a ref cannot be substituted it is an error, never text that
+silently survives. *PRD 5.8, 5.9, G3.*
+
+### D93. The *effective* write map is what must be injective
+
+A node's effective write map pairs each output field with the channel it writes —
+the `writes:` value if remapped, otherwise the same-named channel if one is
+declared — and MUST be injective (§8.0, §7.6.4 rule 4).
+**Rationale**: [D72](#d72-concurrent-writes-are-applied-in-a-canonical-order)
+rests on "within one writer there is at most one write per channel", and
+injectivity of `writes:` alone does not deliver it. A node with output `{a, b}`,
+`writes: { a: b }`, and a declared channel `b` satisfies every stated rule — the
+keys are output fields, the value is a declared channel, a one-entry map is
+trivially injective, and "a remapped field is not also written to its same-named
+channel" only stops `a` → channel `a` — while `b` still writes channel `b` by
+name. That is two writes to one channel from one writer, with no order between
+them: on an `append` channel the element order is unspecified, and on an
+unreduced channel the single-writer premise of §10.2 is violated without any
+check firing. Since the canonical order (§7.6.4) is defined *per writer*, the
+hole is directly a replay-determinism hole in the construct D72 exists to close.
+Stating the rule over the effective map closes it with the same one-line
+diagnostic and no new vocabulary; the alternative — inventing an intra-writer
+tie-break, say output-field declaration order — would define an order for a
+construct that has no reason to exist, since the author who wants both fields on
+one channel can say so with an explicit `reduce:` policy and two nodes, or fix
+the collision with a second remap. *PRD 5.6, 5.7, 5.12.*
+
+### D94. A detached dispatch is resolved at dispatch
+
+`detach: true` takes the instance out of the map's join and out of
+`on_item_error`: the join counts it the moment the dispatch is issued, its
+outcome is never observed, and a failed delivery is neither an item error nor a
+map-node error (§8.6 rules 6, 7, 10).
+**Rationale**: PRD 5.6 settles both halves — "Default join semantics wait on
+*all* routes, including sinks (a failed enqueue is a surfaced failure)" and
+"Per-route `detach: true` opts into fire-and-forget" — but §8.6 rule 6
+quantified the join over "every instance" with no carve-out while rule 7 said
+only that a detached dispatch may not write reduced state. Under `--target
+local`, where `detach: true` is legal and M1 must implement it, one implementer
+waits at the barrier (making the key observably meaningless, which contradicts
+the second settled half) and another does not; and whether a locally-failed
+detached POST is an item error subject to `on_item_error: { retry: … }` had no
+answer at all. "Fire-and-forget" has exactly one coherent reading — the dispatch
+is the last thing the graph knows about that item — so both consequences follow
+from it rather than being separate choices. The trade is bounded by the same
+mechanism PRD 5.6 pairs with detach: delivery carries an execution-derived
+`idempotency_key` and is at-least-once, so an unobserved outcome is a delivery
+the sink can dedupe rather than a message the graph silently dropped. The map
+node's own `on_error:` still covers failures that are the *node's* — a dispatch
+that could not be issued — which keeps `on_error:` meaningful without
+reintroducing the wait. *PRD 5.6.*
+
+### D95. Node reachability counts edges and the two control-transfer positions
+
+Every node MUST be reachable from its flow's `start` over edges,
+`on_error: { fallback: … }`, and `human.on_timeout:`; an unreachable node is a
+compile error (§7.8).
+**Rationale**: PRD §7 M0 lists "unreachable nodes" among the static checks this
+grammar feeds, and it was the one check in that list with no defining section —
+only an aside in §13 saying the analysis is per flow. Two implementations
+followed: over `edges:` alone, which rejects a node targeted solely by
+`on_error: { fallback: cleanup }` or by `human.on_timeout:`, and over edges plus
+those two positions, which accepts it. The second is right, and not marginally:
+§2.4 already calls those the **control-transfer positions**, §9.2 and §8.7 give
+them scheduling semantics identical to an edge's, and a dedicated error-handling
+or timeout node with no inbound edge is a natural shape — one keystroke away from
+`examples/triage-fanout`'s `escalate`, which passes an edge-only check only
+because it happens to also carry an inbound edge. Guards are ignored because the
+question is addressability, not whether a path fires; §7.3.1 is where coverage is
+decided, and folding the two questions together would make an unroutable-in-
+practice node either an error twice or an error nowhere. §7.7's component
+relation deliberately does not govern here: it is about which *components* a flow
+can cause to run, across flows, and it says fallback and `on_timeout` targets are
+"already covered by clause 1" for that purpose only. Nor does this relation feed
+§7.6.2's `dist`, which counts edges because it measures steps, while this one
+counts control transfers because it asks about addressability — a control
+transfer fires *instead of* a node's edges, so admitting it here cannot
+manufacture a concurrent branch there (§7.6.2). Three relations, three
+questions, one section each. *PRD 5.3, 5.5, G3.*
+
 ---
 
 ## Appendix B — Editor integration
@@ -3921,12 +4212,15 @@ authority. The schema cannot see across files, so it does not check:
   compatibility, sync-trigger interrupt-freedom, store schema/keying rules,
   session coherence, provider settings/capability checks, env-ref presence,
   unreachable nodes, undefined channels;
-- the graph analyses of §7.6 and §7.7, which need the whole flow graph rather
-  than a key-and-value pair: balanced convergence (§7.6.2), the no-dead-end rules
-  of §7.6.3 apart from the `start` edge below, component reachability (§7.7) and
-  the three checks over it, `map.over` dominance (§8.6 rule 11), the totality of
-  `flow:`-node bindings (§8.0, D68), and the injectivity of `writes:` (JSON
-  Schema constrains property *names*, never the set of values);
+- the graph analyses of §7.6, §7.7, and §7.8, which need the whole flow graph
+  rather than a key-and-value pair: balanced convergence (§7.6.2), the
+  no-dead-end rules of §7.6.3 apart from the `start` edge below, component
+  reachability (§7.7) and the three checks over it, node reachability from
+  `start` (§7.8, D95), `map.over` dominance (§8.6 rule 11), the totality of
+  `flow:`-node bindings (§8.0, D68), and the injectivity of a node's *effective*
+  write map (§8.0, D93) — JSON Schema constrains property *names*, never the set
+  of values, and the name-based half of that map is decided by the `state:`
+  section in another file;
 - rules relating two siblings whose correspondence JSON Schema cannot express:
   `optional:` entries naming declared properties (§3.4, D89) — an array's items
   cannot be constrained against a sibling object's keys — and item-derivation of
@@ -3957,7 +4251,12 @@ the presence of one unconditional-or-`else` edge leaving
 the reserved-root exclusions on node ids, edge endpoints, control targets, and a
 map's `as:` (§2.5), and the absence of `${ENV}` tokens on the surfaces where §4.3
 makes them illegal and a single string is the whole surface (`prompt:`, model
-`id:`).
+`id:`, `embed.model:`, a trigger's `path:`/`cron:`/`timezone:`, and a
+`blob put`'s `content_type:` — §4.3 class 3, D92). The validator owns the rest of
+class 3: CEL surfaces need the expression grammar, and descriptions and schema
+literals would need the same `not` repeated on dozens of properties, which the
+one-directional invariant does not require — a file the schema lets through is
+still rejected by `validate`.
 
 **Diagnostics.** Where a construct has variants, the schema branches on the
 literal that selects the variant — a node's kind key, a trigger's `type:`, a
