@@ -1206,12 +1206,40 @@ Back-edges are permitted (PRD 5.4). The compiler computes SCCs and requires:
 
   1. **Counting bound** — some edge whose `from` *and* `to` are both in the SCC
      carries `max_iterations` (and therefore a `when:` guard, §7.2); or
-  2. **CEL exit condition** — some node `n` in the SCC has an outgoing edge that
-     leaves the SCC and carries a `when:` guard, **and** every outgoing edge of
-     `n` that stays inside the SCC carries a `when:` guard (or an `else:`).
-     Both halves are required: an unguarded in-SCC edge from `n` is
-     unconditional (§7.3 rule 2), so it would re-enter the loop no matter what
-     the exit guard says, and the "exit condition" would never exit.
+  2. **CEL exit condition** — some node `n` in the SCC satisfies both of:
+
+     - **2(i) — there is a way out**: at least one outgoing edge of `n`
+       **leaves** the SCC; and
+     - **2(ii) — there is a pass that takes it**: `n`'s outgoing edges admit a
+       pass on which **no** edge staying inside the SCC is taken. Decided
+       syntactically (Decision
+       [D98](#d98-a-cel-exit-condition-is-about-the-in-scc-edges-going-false)):
+       no outgoing edge of `n` that stays inside the SCC is unconditional, and
+       if one of them carries `else: true`, then `n` also has a `when:`-guarded
+       outgoing edge that **leaves** the SCC.
+
+     Both halves are load-bearing. Without 2(i), the pass on which the in-SCC
+     guards all go false takes no edge at all — that is §7.3 rule 7's dead end,
+     not an exit. Without 2(ii) the loop re-enters whatever the guards say: an
+     unguarded in-SCC edge is unconditional (§7.3 rule 2) and fires every pass,
+     and an in-SCC `else: true` edge fires unless a **guarded sibling was
+     taken** (§7.3 rule 4) — so only a taken guarded sibling *that leaves the
+     SCC* can suppress it without re-entering.
+
+     Which edge carries the guard is not fixed, because it is the in-SCC edges
+     going false that ends the loop. Both spellings below are bounded, and they
+     are the same loop:
+
+     ```yaml
+     # guarded back-edge + guarded exit
+     - { from: review, to: write, when: "review.output.verdict == 'revise'" }
+     - { from: review, to: end,   when: "review.output.verdict != 'revise'" }
+
+     # guarded back-edge + else: escape — the shape §7.4's escape rule,
+     # §7.3.1 clause 1 and D19 all call the usual spelling
+     - { from: review, to: write, when: "review.output.verdict == 'revise'" }
+     - { from: review, to: end,   else: true }
+     ```
 
   An SCC satisfying neither is a compile error naming the SCC's nodes.
 
@@ -1236,9 +1264,12 @@ Back-edges are permitted (PRD 5.4). The compiler computes SCCs and requires:
   budget while that guard is false takes no edge at all. A bounded edge whose
   source has no escape of this form is a compile error naming the edge
   (Decision [D19](#d19-max_iterations-semantics-and-the-escape-edge-rule)).
-  Clause 2's exit edge satisfies (a) but is guarded, so it does not by itself
-  satisfy (b): a CEL-bounded SCC that *also* carries `max_iterations` must still
-  provide the unconditional or `else:` escape.
+  Clause 2's exit edge always satisfies (a); whether it satisfies (b) depends on
+  which spelling it is. The `else: true` spelling does, so an SCC bounded that
+  way needs nothing further even if it *also* carries `max_iterations`; a
+  `when:`-guarded exit does not, so that SCC must provide the unconditional or
+  `else:` escape separately. The escape rule is stated over the bounded edge's
+  source node and is checked independently of which clause bounded the SCC.
 
 `max_iterations` counts **traversals of that edge within one flow instance**.
 Instances of the same flow (including `map`-dispatched ones) count independently.
@@ -1323,14 +1354,24 @@ prove they are never taken together:
    `verdict == 'approve'` and `size(state.xs) > 0` are **not**: the second guard
    is possible for every variant, which is the conservative answer.
 
-Any other pair is **co-takeable**. A node with two or more co-takeable outgoing
-edges is a **fork**.
+Any other pair is **co-takeable**. Co-takeability is a relation on a **pair** of
+sibling out-edges and is never a property of one edge on its own: an edge is not
+"co-takeable" or "exclusive" in isolation, it is one or the other *with respect
+to a named sibling*. Every use below therefore names the pair (Decision
+[D99](#d99-co-takeability-is-a-relation-on-a-pair-of-sibling-edges)).
+
+A node with two distinct outgoing edges that are co-takeable **with each other**
+is a **fork**, and each such pair is a **co-takeable pair** of that fork. A fork
+may have out-edges belonging to no co-takeable pair — an `else:` edge among
+guarded siblings is the ordinary case — and those edges are, correctly, compared
+with nothing: such an edge fires only on the passes where none of the others did.
 
 Two nodes are **concurrent** when both are reachable from a common fork through
-two *distinct* co-takeable out-edges of it and neither is reachable from the
-other. Wherever this document says "concurrent contexts" — the reduced-channel
-rules of §8.0, §10.2, and §8.6 rule 5 — it means exactly that, plus the
-instances of one `map` node, which are concurrent with each other.
+the two edges of **one co-takeable pair** of it — one node through each — and
+neither is reachable from the other. Wherever this document says "concurrent
+contexts" — the reduced-channel rules of §8.0, §10.2, and §8.6 rule 5 — it means
+exactly that, plus the instances of one `map` node, which are concurrent with
+each other.
 
 The analysis is deliberately conservative: a guard pair it cannot prove
 exclusive is co-takeable, so it may ask for a `reduce:` policy on a channel two
@@ -1358,12 +1399,19 @@ Arrivals in **different** steps schedule the node again: a convergence reached a
 step *k* and again at step *k+2* runs twice. Well-defined, rarely intended — so
 the statically visible case is refused:
 
-**Balanced convergence.** For a fork `f`, let `dist(n)` be the set of step
-distances from `f` to `n` over paths that leave `f` by a co-takeable edge and
-traverse no node belonging to a cycle (§7.4); every edge counts as one step. If
-any node `d` has `|dist(d)| > 1`, the convergence at `d` is **unbalanced** and is
-a compile error naming `f`, `d`, and the differing distances (Decision
-[D69](#d69-execution-is-stepwise-and-convergence-is-a-per-step-join-over-taken-branches)).
+**Balanced convergence.** The check is per fork and per **co-takeable pair**,
+because only two edges that can both be taken can deliver twice (§7.6.1,
+[D99](#d99-co-takeability-is-a-relation-on-a-pair-of-sibling-edges)).
+
+For a fork `f`, one of its co-takeable pairs `(e₁, e₂)`, and a node `n`, let
+`dist(f, e, n)` be the set of step distances from `f` to `n` over paths that
+leave `f` by the edge `e` and traverse no node belonging to a cycle (§7.4);
+every edge counts as one step. If for some node `d` the set
+`dist(f, e₁, d) ∪ dist(f, e₂, d)` holds two different values, the convergence at
+`d` is **unbalanced** and is a compile error naming `f`, `d`, the two edges, and
+the differing distances (Decisions
+[D69](#d69-execution-is-stepwise-and-convergence-is-a-per-step-join-over-taken-branches),
+[D99](#d99-co-takeability-is-a-relation-on-a-pair-of-sibling-edges)).
 
 `end` is exempt: it is not a node, it retires branches instead of running, and
 branches legitimately reach it at different depths (§7.6.3). Where a cycle lies
@@ -1409,9 +1457,13 @@ flow.diamond:
   are materialized (§7.6.3).
 
 Adding `- { from: plan, to: merge, when: "plan.output.trivial" }` makes
-`dist(merge) = {1, 2}`: `merge` would run in step 1 and again in step 2. That is
-the unbalanced-convergence compile error; the fixes are to route the short branch
-through the same depth, or to make the branches exclusive with `else:`.
+`(plan→merge, plan→draft)` a co-takeable pair — neither guard excludes the other
+— whose distances to `merge` are `{1}` and `{2}`: `merge` would run in step 1 and
+again in step 2. That is the unbalanced-convergence compile error; the fixes are
+to route the short branch through the same depth, or to make the pair exclusive
+(`else: true` on the short edge, or guards §7.6.1 rule 2 can prove disjoint),
+which removes it from the check because two edges that cannot both fire cannot
+both deliver.
 
 Both guards false is a *different* error — §7.3 rule 7's "no viable route" at
 `plan` — which is what §7.4's escape rule and an `else:` edge exist to prevent.
@@ -1450,9 +1502,15 @@ reachable only when every branch got there. Three static rules keep that true
    before doing any work.
 3. **A node declaring `on_error: skip` MUST have an outgoing edge that is
    unconditional or carries `else: true`.** A skipped node produces no output, so
-   its guarded edges evaluate false (§9.2) and it would dead-end on §7.3 rule 7 —
-   the same failure [D19](#d19-max_iterations-semantics-and-the-escape-edge-rule)'s
-   escape rule removes for an exhausted cycle budget.
+   every guard of its that *references that output* evaluates false (§9.2);
+   guards over `input`/`state`/`execution` are unaffected and may still fire. A
+   node whose outgoing edges are all guarded therefore has a pass on which none
+   is taken — the one where the state-only guards happen to be false too — and
+   it would dead-end on §7.3 rule 7, the same failure
+   [D19](#d19-max_iterations-semantics-and-the-escape-edge-rule)'s escape rule
+   removes for an exhausted cycle budget. One unconditional or `else: true` edge
+   removes it: the first fires always, the second whenever no guarded sibling
+   was taken (§7.3 rule 4), so some edge is always taken.
 
 #### 7.6.4 Canonical write order
 
@@ -2199,8 +2257,32 @@ casing (PRD 5.11).
 | Value | Semantics |
 |---|---|
 | `fail` | abort the execution with the node's error (built-in default); sibling branches stop with it |
-| `skip` | the node produces no output and writes nothing; its **unconditional** and `else` outgoing edges still fire, and guards referencing the missing output evaluate to false. A node declaring `skip` MUST have one of those two edge forms leaving it (§7.6.3) |
+| `skip` | the node produces no output and writes nothing; **routing then proceeds exactly as §7.3 specifies**, with one substitution: a guard that references the missing output evaluates to `false`. A node declaring `skip` MUST have an unconditional or `else: true` outgoing edge (§7.6.3 rule 3) |
 | `{ fallback: <node id or end> }` | the node's own outgoing edges are **not** evaluated; the fallback target is scheduled in the next step instead (§7.6), or the branch retires if the target is `end`. A node in the same flow only; never `start` |
+
+**Routing after a `skip`.** There is no second routing algorithm. A skipped node
+routes through §7.3 unchanged — declaration order, multicast, `else:` last, an
+exhausted budget untakeable — and the *only* thing the skip changes is the value
+of one class of guard (Decision
+[D97](#d97-a-skip-changes-guard-values-not-the-routing-algorithm)):
+
+- a `when:` guard that references the skipped node's output (`<n>.output.…`)
+  evaluates to **`false`**: there is no output object to read, and failing the
+  execution the way an unset channel read does (§10.1) would make `skip` a
+  synonym for `fail`;
+- a `when:` guard that references only `input`, `state`, or `execution` — legal
+  on any edge (§4.1) and used in §7.3.1's own worked example — evaluates
+  **normally**. The skip says nothing about those values;
+- an **unconditional** edge fires, as always (§7.3 rule 2);
+- an **`else: true`** edge fires iff no guarded sibling was **taken** (§7.3
+  rule 4) — so a state-only guard that came out true suppresses it, exactly as
+  it would after a successful run.
+
+§7.6.3 rule 3 is what makes this total: with an unconditional or `else:` edge
+present, at least one edge is always taken, so a skip can never dead-end the
+branch on §7.3 rule 7. Note which of the two does the work in each case — the
+unconditional edge fires unconditionally; the `else:` edge fires unless a
+state-only guard already routed the branch somewhere.
 
 `fallback` targets a **flow-local node id or `end`** (§2.4), keeping error
 routing inside one graph where reachability analysis can see it — a fallback
@@ -3163,7 +3245,10 @@ as settled. *PRD 5.5.*
 ### D21. `on_error` strategies and `fallback` targets
 
 `fail` | `skip` | `{ fallback: <flow-local node id or end> }`, applied after
-retries; `skip` suppresses writes and lets unconditional/`else` edges fire.
+retries; `skip` suppresses writes and then routes through §7.3 with the
+skipped node's own output reading as false
+([D97](#d97-a-skip-changes-guard-values-not-the-routing-algorithm) owns exactly
+what a skip changes).
 **Rationale**: PRD 5.5 lists the strategies; restricting `fallback` to a
 flow-local node keeps error routing visible to reachability analysis instead of
 creating an invisible cross-module edge. `end` is admitted because "give up and
@@ -3495,7 +3580,10 @@ is one rule on both surfaces, and declaring an envelope field never changes it
 ### D57. What counts as a CEL exit condition
 
 An SCC is bounded by (1) an in-SCC edge carrying `max_iterations`, or (2) a node
-in the SCC with a guarded edge leaving it *and* only guarded edges staying in it.
+in the SCC with an edge leaving it *and* a pass on which none of its in-SCC edges
+is taken —
+[D98](#d98-a-cel-exit-condition-is-about-the-in-scc-edges-going-false) fixes the
+syntactic form of clause 2, which this entry originally stated too narrowly.
 **Rationale**: PRD 5.4 settles "`max_iterations` **and/or** a CEL exit condition",
 so refusing CEL-only cycles would contradict a settled position, while "provably
 falsifiable" is not a decidable predicate. Clause 2 is the decidable core of what
@@ -4227,6 +4315,99 @@ produced, and nothing about a process makes that safer than a model. Stating the
 list once, in §3.5, and pointing §3.6, §3.9, D10, and Appendix B at it is what
 stops the next surface from being added to three of the five places. *PRD 5.2,
 5.5, 5.6, 5.7, 5.10.*
+
+### D97. A `skip` changes guard values, not the routing algorithm
+
+After `on_error: skip`, routing runs through §7.3 unchanged; the single
+substitution is that a `when:` guard referencing the skipped node's output
+evaluates `false`, while a guard over `input`/`state`/`execution` evaluates
+normally and an `else:` edge keeps its §7.3 rule 4 meaning — taken iff no
+guarded sibling was taken (§9.2, §7.6.3 rule 3).
+**Rationale**: three statements in this document disagreed the moment a skipped
+node carried a state-only guard, which §4.1 explicitly permits and §7.3.1's own
+worked example uses. §9.2's cell said unconditional *and* `else` edges "still
+fire"; §7.3 rule 4 says an `else:` edge fires only when no guarded sibling was
+taken; and §7.6.3 rule 3 paraphrased §9.2 as "its guarded edges evaluate false",
+which is false of a guard the missing output has nothing to do with. Take
+`{when: "size(state.xs) > 0"}` and `{else: true}` leaving a skipped node with a
+non-empty `state.xs`: the first sentence fires both edges, the second fires only
+the first, the third fires only the `else:`. Three conforming codegens, three
+different control flows, one spec.
+
+The fix is to stop restating routing in the error section. A skip is a fact
+about one node's *output*, so it can only change what an expression reading that
+output evaluates to; everything else — multicast, declaration order, `else:`,
+exhausted budgets — is §7.3's, stated once. Choosing `false` for the
+output-referencing guard rather than a failed read (§10.1's rule for an unset
+channel) is what keeps `skip` distinct from `fail`: a strategy whose whole
+purpose is to continue past a failure cannot fail the execution at the next
+guard. And the choice leaves §7.6.3 rule 3 doing exactly the job
+[D71](#d71-no-silent-dead-ends-every-node-exits-and-every-run-starts) gave it —
+guaranteeing one taken edge — with the `else:` half now honest about *how*:
+either a state-only guard routed the branch, or the `else:` did. *PRD 5.3, 5.5,
+G3.*
+
+### D98. A CEL exit condition is about the in-SCC edges going false
+
+§7.4 clause 2 asks two questions of a node `n` in the SCC — does an edge leave
+(2(i)), and is there a pass on which no in-SCC edge of `n` is taken (2(ii)) — and
+puts no requirement on the *exit* edge's own shape beyond the one case where an
+in-SCC `else: true` needs a guarded sibling to suppress it.
+**Rationale**: the earlier clause 2 required the SCC-leaving edge to "carry a
+`when:` guard", which rejected the exact loop this document endorses everywhere
+else. Drop `max_iterations` from `examples/review-loop`'s cycle and it is
+`{when: "verdict == 'revise'"}` back plus `{else: true}` out — the shape
+§7.4's escape rule requires, §7.3.1 clause 1 accepts, and
+[D19](#d19-max_iterations-semantics-and-the-escape-edge-rule) calls "the usual
+spelling" — yet clause 2 called it an unbounded SCC while accepting the
+semantically identical `{when: "verdict != 'revise'"}` rewrite. Two spellings of
+one loop, opposite verdicts, with PRD 5.4's own words ("a CEL exit condition on
+at least one edge in the cycle") satisfied by both: an `else:` edge fires exactly
+when no guarded sibling fired, which is a condition, expressed in CEL, on an edge
+in the cycle.
+
+Fixing it by adding `else:` to the list of accepted exit shapes would have
+patched the symptom. The real error was locating the exit condition on the wrong
+edge: under multicast routing (§7.3 rule 6) a loop continues iff some in-SCC edge
+fires, so termination is a property of the in-SCC edges going false, and the
+leaving edge's only job is to give that pass somewhere to go. Restating clause 2
+that way accepts both spellings, still rejects an unconditional in-SCC edge (it
+fires every pass), and newly rejects a shape the old wording quietly allowed
+through its "(or an `else:`)" parenthesis — an in-SCC `else: true` whose only
+exit is unconditional, where the `else:` has no guarded sibling to suppress it
+and so fires forever. The rule is decided from edge shapes alone, so it stays
+one linear scan of `n`'s out-edges, exactly as before. *PRD 5.4.*
+
+### D99. Co-takeability is a relation on a *pair* of sibling edges
+
+An edge is never co-takeable on its own; it is co-takeable *with a named
+sibling*. A fork is a node with two out-edges co-takeable with each other, and
+each such pair is one **co-takeable pair**. §7.6.1's concurrency relation and
+§7.6.2's `dist` are both stated per pair: two nodes are concurrent when one
+co-takeable pair reaches one each, and balanced convergence compares the two
+distances of one pair (§7.6.1, §7.6.2).
+**Rationale**: §7.6.1 defined co-takeability pairwise and then §7.6.2 used it as
+a unary predicate — "paths that leave `f` by a co-takeable edge" — leaving an
+out-edge that is exclusive with *every* sibling undecided: in or out of `dist`?
+The two readings disagree on real specs. Take `e₁ when: "n.output.f == 'x'"`,
+`e₂ when: "size(state.q) > 0"` (co-takeable, so `f` is a fork), and
+`e₃ else: true` (exclusive with both by §7.6.1 rule 1), with `e₃` reaching a
+convergence `d` in one step and `e₁`'s path in two. Reading it as "belongs to
+some co-takeable pair" excludes `e₃`, gives `dist(d) = {2}`, and compiles;
+reading it as "any out-edge of a fork" gives `{1, 2}` and an unbalanced-
+convergence error. Two validators, two languages.
+
+The pairwise reading is the correct one, and not merely by fiat: `e₃` is an
+`else:` edge, so it fires **only** on the passes where neither guarded sibling
+did (§7.3 rule 4) — it cannot deliver to `d` alongside `e₁`, so there is no
+second arrival, so there is nothing for the check to refuse. Rejecting it would
+refuse a runtime-safe composition, which is the one direction a conservative
+static check must not go: elsewhere this document errs toward asking for an
+`else:`, never toward forbidding one. Stating `dist` per pair rather than per
+fork is what makes that fall out of the definition instead of needing a
+carve-out, and it costs nothing — a fork has finitely many pairs, and the
+per-pair distances are the same walk the per-fork version already did. *PRD 5.3,
+5.6, G3.*
 
 ---
 
