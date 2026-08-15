@@ -442,6 +442,16 @@ fn node_object(id: Spanned<crate::ast::common::Ident>, node: &Node, cx: &mut Cx)
 
     let (kind, common) = match declared.first().copied() {
         None => {
+            // The kind key selects which further keys the node takes, so
+            // without one there is nothing to check the rest against — and
+            // they are most likely the keys of the kind the author left out:
+            // `op:` and `key:` here are exactly what grammar 8.8/11.4 gives a
+            // `store:` node. Reporting each as "unknown" would contradict the
+            // diagnostic below, so consume them, as `schema::type_body` does
+            // for a type node that declares no form. The common keys are still
+            // read and checked afterwards: `Fields::take` finds a key whatever
+            // its consumed flag says.
+            fields.consume_rest();
             cx.push(
                 Diagnostic::error(
                     DiagnosticCode::MissingKey,

@@ -1,0 +1,18 @@
+# rule: a node that declares no kind key is one mistake, not one more per key the kind it left out would have taken (grammar 7.1)
+# code: missing-key
+# message: node `load` declares no kind key: a node carries exactly one of `agent`, `exec`, `http`, `function`, `flow`, `map`, `human`, `store`
+# at: 14:7
+# help: the kind key selects what the node does and what config it takes
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    # `op:` and `key:` are exactly the keys grammar 8.8 and 11.4 give a `store:`
+    # node — the kind key this node left out — so reporting each as an unknown
+    # key would contradict the diagnostic that names the node.
+    load:
+      op: get
+      key: "execution.session_key"
+  edges:
+    - { from: start, to: load }
+    - { from: load, to: end }
