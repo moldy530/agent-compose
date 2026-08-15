@@ -1543,12 +1543,29 @@ because only two edges that can both be taken can deliver twice (§7.6.1,
 For a fork `f`, one of its co-takeable pairs `(e₁, e₂)`, and a node `n`, let
 `dist(f, e, n)` be the set of step distances from `f` to `n` over paths that
 leave `f` by the edge `e` and traverse no node belonging to a cycle (§7.4);
-every edge counts as one step. If for some node `d` the set
-`dist(f, e₁, d) ∪ dist(f, e₂, d)` holds two different values, the convergence at
-`d` is **unbalanced** and is a compile error naming `f`, `d`, the two edges, and
-the differing distances (Decisions
+every edge counts as one step. The two edges are compared **against each
+other**: if for some node `d` there are distances `a ∈ dist(f, e₁, d)` and
+`b ∈ dist(f, e₂, d)` with `a ≠ b`, the convergence at `d` is **unbalanced** and
+is a compile error naming `f`, `d`, the two edges, and the two distances
+(Decisions
 [D69](#d69-execution-is-stepwise-and-convergence-is-a-per-step-join-over-taken-branches),
-[D99](#d99-co-takeability-is-a-relation-on-a-pair-of-sibling-edges)).
+[D99](#d99-co-takeability-is-a-relation-on-a-pair-of-sibling-edges),
+[D112](#d112-balanced-convergence-compares-one-distance-from-each-edge-of-the-pair)).
+Both sides have to supply a distance: a `d` that only one edge of the pair
+reaches takes one arrival from this pair however many paths lead to it on that
+side, so the pair delivers once and there is nothing to refuse.
+
+**One side's own distances are not this check's business.** `dist(f, e₁, d)` may
+hold two values on its own, where some node inside that branch has two out-edges
+whose paths to `d` differ in length. That node is where the question belongs and
+it is asked there: if its two edges are co-takeable it is a fork in its own
+right and this same check runs on its pair, and if they are exclusive (§7.6.1)
+at most one of the two paths is taken on a pass, so `d` receives one delivery
+from the branch and running twice was never possible. Taking the union of the
+two sides instead would refuse that second shape — a guarded shortcut inside one
+concurrent branch — while naming a pair that cannot deliver the two distances
+the diagnostic reports (Decision
+[D112](#d112-balanced-convergence-compares-one-distance-from-each-edge-of-the-pair)).
 
 `end` is exempt: it is not a node, it retires branches instead of running, and
 branches legitimately reach it at different depths (§7.6.3). Where a cycle lies
@@ -1595,9 +1612,10 @@ flow.diamond:
 
 Adding `- { from: plan, to: merge, when: "plan.output.trivial" }` makes
 `(plan→merge, plan→draft)` a co-takeable pair — neither guard excludes the other
-— whose distances to `merge` are `{1}` and `{2}`: `merge` would run in step 1 and
-again in step 2. That is the unbalanced-convergence compile error; the fixes are
-to route the short branch through the same depth, or to make the pair exclusive
+— whose distances to `merge`, one from each edge of the pair, are `{1}` and
+`{2}`: `merge` would run in step 1 and again in step 2. That is the
+unbalanced-convergence compile error; the fixes are to route the short branch
+through the same depth, or to make the pair exclusive
 (`else: true` on the short edge, or guards §7.6.1 rule 2 can prove disjoint),
 which removes it from the check because two edges that cannot both fire cannot
 both deliver.
@@ -4221,7 +4239,10 @@ branches are still live, which is not decidable ahead of time, so a false guard
 would deadlock the join. Per-step joining has the opposite property — nothing
 waits, so nothing deadlocks — and the only residue, a node re-firing when the
 branches have different lengths, is refused statically wherever the distance is
-computable (no cycle on the path) and defined explicitly where it is not.
+computable (no cycle on the path) and defined explicitly where it is not;
+[D112](#d112-balanced-convergence-compares-one-distance-from-each-edge-of-the-pair)
+fixes which two lengths "the branches" names, one per edge of a co-takeable
+pair.
 Exclusivity is proved from `else:` and from enum-equality guards because those
 are the two shapes §7.3/§7.3.1 already read; anything else is conservatively
 concurrent. *PRD 5.3, 5.5, 5.6, 5.12.*
@@ -4873,7 +4894,10 @@ sibling*. A fork is a node with two out-edges co-takeable with each other, and
 each such pair is one **co-takeable pair**. §7.6.1's concurrency relation and
 §7.6.2's `dist` are both stated per pair: two nodes are concurrent when one
 co-takeable pair reaches one each, and balanced convergence compares the two
-distances of one pair (§7.6.1, §7.6.2).
+distances of one pair (§7.6.1, §7.6.2) — one distance from each edge of it,
+which is
+[D112](#d112-balanced-convergence-compares-one-distance-from-each-edge-of-the-pair)'s
+half of the same reading.
 **Rationale**: §7.6.1 defined co-takeability pairwise and then §7.6.2 used it as
 a unary predicate — "paths that leave `f` by a co-takeable edge" — leaving an
 out-edge that is exclusive with *every* sibling undecided: in or out of `dist`?
@@ -4881,9 +4905,10 @@ The two readings disagree on real specs. Take `e₁ when: "n.output.f == 'x'"`,
 `e₂ when: "size(state.q) > 0"` (co-takeable, so `f` is a fork), and
 `e₃ else: true` (exclusive with both by §7.6.1 rule 1), with `e₃` reaching a
 convergence `d` in one step and `e₁`'s path in two. Reading it as "belongs to
-some co-takeable pair" excludes `e₃`, gives `dist(d) = {2}`, and compiles;
-reading it as "any out-edge of a fork" gives `{1, 2}` and an unbalanced-
-convergence error. Two validators, two languages.
+some co-takeable pair" excludes `e₃`, leaves the pair `(e₁, e₂)` to be compared
+on its own, and compiles; reading it as "any out-edge of a fork" pools `e₃`'s
+`{1}` with `e₁`'s `{2}` and reports an unbalanced convergence. Two validators,
+two languages.
 
 The pairwise reading is the correct one, and not merely by fiat: `e₃` is an
 `else:` edge, so it fires **only** on the passes where neither guarded sibling
@@ -5291,6 +5316,39 @@ at quiescence, or a `merge` channel missing a property, fails at the read
 `state:` in another — so the check is the validator's alone, and Appendix B
 lists it as such. *PRD 5.1, 5.2, 5.7.*
 
+### D112. Balanced convergence compares one distance from each edge of the pair
+
+For a fork `f`, a co-takeable pair `(e₁, e₂)` of it, and a node `d`, the
+convergence at `d` is unbalanced when some `a ∈ dist(f, e₁, d)` differs from
+some `b ∈ dist(f, e₂, d)` — one distance from each edge, never the union of the
+two sides, and never a comparison inside one side (§7.6.2).
+**Rationale**: the union reading fires where a single edge of the pair reaches
+`d` at two depths and the other reaches it at none, which is not a second
+arrival at all. Take a fork with co-takeable edges `e₁ → A` and `e₂ → B` (two
+unconditional edges, as `classify` in
+[`examples/triage-fanout`](../examples/triage-fanout/flows/triage.yml)), a
+guarded shortcut inside `A`'s branch — `A → C when: g`, `A → D else: true`,
+`D → C` — and a `B` branch that retires at `end`. Then
+`dist(f, e₁, C) = {2, 3}`, `dist(f, e₂, C) = ∅`, the union holds two values, and
+the union reading demands a compile error naming a pair one of whose edges never
+reaches `C`. At run time `A`'s two out-edges are exclusive by §7.6.1 rule 1, so
+`C` takes exactly one delivery per pass and never runs twice: a runtime-safe,
+ordinary shape refused, which is the one direction
+[D99](#d99-co-takeability-is-a-relation-on-a-pair-of-sibling-edges) says a
+conservative static check must not go, with a diagnostic that misattributes the
+two distances to a pair that cannot deliver them.
+
+Nothing is lost on the soundness side, which is why the tightening is safe
+rather than a relaxation of the guarantee. Two paths from `f` through `e₁` to
+`d` diverge at some node along the way, and that node's two out-edges are either
+co-takeable — making it a fork whose own pair this same check compares, at the
+depths that matter — or exclusive, in which case only one of the paths is ever
+taken and there is no second delivery to refuse. So the same-side case is
+already decided one fork down, and the union adds no rejection the check needs;
+it only adds ones it must not make. Stating the comparison across the pair is
+also what makes the error message true: the two distances it prints are the ones
+the two named edges deliver. *PRD 5.3, 5.6, G3.*
+
 ---
 
 ## Appendix B — Editor integration
@@ -5328,7 +5386,7 @@ authority. The schema cannot see across files, so it does not check:
   (§8.0) and a flow `outputs:` field read from one (§7.5, D111), whose two
   declarations routinely sit in different files;
 - the graph analyses of §7.6, §7.7, and §7.8, which need the whole flow graph
-  rather than a key-and-value pair: balanced convergence (§7.6.2), the
+  rather than a key-and-value pair: balanced convergence (§7.6.2, D112), the
   no-dead-end rules of §7.6.3 apart from the `start` edge below, component
   reachability (§7.7) and the three checks over it, node reachability from
   `start` (§7.8, D95), `map.over` dominance (§8.6 rule 11), the totality of

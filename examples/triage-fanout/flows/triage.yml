@@ -221,11 +221,12 @@ flow.triage:
     - { from: classify, to: announce }
     # The downstream edge is the fan-out barrier: it fires when every dispatched
     # instance has completed or been resolved by `on_item_error`. The branches
-    # converge on `verify` at equal depth — dist(verify) = {2} from `classify` —
-    # so `verify` runs ONCE with both branches' writes already applied
-    # (grammar 7.6.2 P2), rather than once per arrival. An unbalanced
-    # convergence, say a third edge `classify -> verify`, would be a compile
-    # error.
+    # converge on `verify` at equal depth — the balanced-convergence check
+    # compares one distance from each edge of the co-takeable pair leaving
+    # `classify`, and both are {2} — so `verify` runs ONCE with both branches'
+    # writes already applied (grammar 7.6.2 P2), rather than once per arrival. A
+    # third edge `classify -> verify` would pair {1} against {2} and be the
+    # unbalanced-convergence compile error.
     - { from: dispatch, to: verify }
     - { from: announce, to: verify }
     # `announce_failed` has no INBOUND edge — it is reached through `announce`'s
