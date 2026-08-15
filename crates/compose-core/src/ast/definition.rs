@@ -240,12 +240,15 @@ impl ProviderKind {
 
     /// Every key this kind accepts, required ones included (grammar 12.1).
     ///
-    /// `kind`, `headers`, and `description` belong to every provider
-    /// definition: the first table of grammar 12.1 lists them without naming a
-    /// kind, and neither is connection config. Everything else comes from the
-    /// kind's own row of the second table, so a `region:` pasted onto an
-    /// `anthropic` provider is a diagnostic rather than a key that builds and
-    /// then does nothing (Decision D50).
+    /// `kind` and `description` are the two keys grammar 12.1 states are legal
+    /// on every provider; everything else — `headers` included — comes from the
+    /// kind's own row of the second table, which is closed. A `region:` pasted
+    /// onto an `anthropic` provider is therefore a diagnostic rather than a key
+    /// that builds and then does nothing (Decision D106, Decision D50), and so
+    /// is a `headers:` on one of the two SDK-reached kinds: `bedrock` and
+    /// `vertex` take neither `base_url` nor `headers`, because a connection
+    /// made through a cloud SDK has no bare endpoint to point at and no request
+    /// the spec composes headers onto.
     #[must_use]
     pub const fn keys(self) -> &'static [&'static str] {
         match self {
@@ -274,7 +277,6 @@ impl ProviderKind {
                 "secret_access_key",
                 "session_token",
                 "profile",
-                "headers",
                 "description",
             ],
             Self::Vertex => &[
@@ -282,7 +284,6 @@ impl ProviderKind {
                 "project",
                 "location",
                 "credentials_json",
-                "headers",
                 "description",
             ],
         }
@@ -308,6 +309,44 @@ mod provider_kind_tests {
                     kind.as_str()
                 );
             }
+        }
+    }
+
+    /// Grammar 12.1 names the two SDK-reached kinds outright: `bedrock` and
+    /// `vertex` take neither `base_url` nor `headers`, because a connection
+    /// made through a cloud SDK has no bare endpoint to point at and no request
+    /// the spec composes headers onto. The published schema refuses both keys
+    /// on both kinds, so accepting one here would break Appendix B's
+    /// one-directional invariant as well as D106's closed row.
+    #[test]
+    fn the_sdk_reached_kinds_take_neither_base_url_nor_headers() {
+        for kind in [ProviderKind::Bedrock, ProviderKind::Vertex] {
+            for key in ["base_url", "headers"] {
+                assert!(
+                    !kind.keys().contains(&key),
+                    "`{}` must not accept `{key}` (grammar 12.1)",
+                    kind.as_str()
+                );
+            }
+        }
+    }
+
+    /// The other half of the same row rule: every kind reached over plain HTTP
+    /// does take `headers:`, so the exclusion above stays a statement about two
+    /// rows rather than a retreat from the key.
+    #[test]
+    fn every_http_reached_kind_takes_headers() {
+        for kind in [
+            ProviderKind::Anthropic,
+            ProviderKind::OpenAi,
+            ProviderKind::OpenAiCompatible,
+            ProviderKind::AzureOpenAi,
+        ] {
+            assert!(
+                kind.keys().contains(&"headers"),
+                "`{}` must accept `headers` (grammar 12.1)",
+                kind.as_str()
+            );
         }
     }
 }

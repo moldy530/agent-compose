@@ -1,0 +1,8 @@
+# rule: a connection made through a cloud SDK has no bare endpoint to point at, so `base_url:` is not a key of the `bedrock` or `vertex` row (grammar 12.1 / D106)
+# at: /provider.gcp/base_url
+# via: /$defs/providerDef/allOf/5/then/properties/base_url
+provider.gcp:
+  kind: vertex
+  project: acme-prod
+  location: us-central1
+  base_url: ${VERTEX_ENDPOINT}

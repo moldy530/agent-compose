@@ -71,7 +71,9 @@ tool.rerank:
 ///
 /// The parser closes a provider definition against the keys of *other* kinds, so
 /// this is the guard that the closing did not take a key its own row lists with
-/// it.
+/// it. It lists exactly the rows, which is why `bedrock` and `vertex` carry no
+/// `headers:` here: neither row names one, and a fixture asserting otherwise
+/// would pin the parser to a file the published schema rejects.
 #[test]
 fn every_provider_kind_with_every_key_its_row_lists() {
     accepts(
@@ -115,7 +117,6 @@ provider.aws:
   secret_access_key: ${AWS_SECRET_ACCESS_KEY}
   session_token: ${AWS_SESSION_TOKEN}
   profile: dev
-  headers: { x-trace-id: "${TRACE_ID}" }
   description: The Bedrock connection.
 
 provider.gcp:
@@ -123,7 +124,6 @@ provider.gcp:
   project: acme-prod
   location: us-central1
   credentials_json: ${GOOGLE_CREDENTIALS_JSON}
-  headers: { x-trace-id: "${TRACE_ID}" }
   description: The Vertex connection.
 "#,
     );

@@ -1,0 +1,8 @@
+# rule: a connection made through a cloud SDK has no request the spec composes headers onto, so `headers:` is not a key of the `bedrock` or `vertex` row (grammar 12.1 / D106)
+# at: /provider.aws/headers
+# via: /$defs/providerDef/allOf/4/then/properties/headers
+provider.aws:
+  kind: bedrock
+  region: us-east-1
+  headers:
+    x-trace-id: "${TRACE_ID}"
