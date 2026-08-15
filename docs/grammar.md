@@ -2454,7 +2454,7 @@ decided from declared types alone
 | unreduced | the channel's whole value | the channel's type |
 | `last_wins` | the channel's whole value | the channel's type |
 | `append` | one element | the channel's `items` type |
-| `merge` | a partial object | an object whose properties are a subset of the channel's, with matching types |
+| `merge` | a partial object | an object whose properties are a subset of the channel's, with matching types — which is why a property may be absent when someone reads it (§10.1, [D101](#d101-a-merge-channels-properties-are-unset-until-supplied)) |
 
 Consequences worth stating outright:
 
@@ -3184,10 +3184,11 @@ guard typing. *PRD 5.3.*
 
 ### D10. `max_items` is required on result schemas and fanned-out arrays
 
-Required inside every result schema — the surfaces §3.5 lists, which
-include an inline `exec:`/`http:` node's `output`
+Required inside every result schema — the surfaces §3.5 lists, which include an
+inline `exec:`/`http:` node's `output`
 ([D96](#d96-an-inline-exechttp-nodes-output-is-a-result-schema)) — and on any
-array a `map.over` resolves to; optional on every input surface. **Rationale**: PRD 5.6
+array a `map.over` resolves to; optional on every input surface.
+**Rationale**: PRD 5.6
 makes fan-out bounding mandatory and enforces it at structured-output validation
 so the model *cannot* return more. Extending the requirement to every result
 schema — one syntactic rule instead of "wherever a map might later consume it" —
