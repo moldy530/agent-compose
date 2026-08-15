@@ -1,0 +1,16 @@
+# rule: three of a store op's nine parameters are literals rather than CEL, so `top_k` inside its op's row is read as an integer (grammar 8.8, 11.4)
+# code: wrong-type
+# message: expected an integer for `top_k`, found a string
+# at: 13:14
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    find:
+      store: store.docs
+      op: search
+      query: "input.question"
+      top_k: "state.k"
+  edges:
+    - { from: start, to: find }
+    - { from: find, to: end }

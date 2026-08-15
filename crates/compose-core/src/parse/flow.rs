@@ -15,7 +15,9 @@ use super::binding::{self, NameForm};
 use super::definition::description;
 use super::lexical;
 use super::policy::{self, PolicyLevel};
-use super::reader::{Cx, Fields, expect_mapping, expect_sequence, expect_string, in_range, list};
+use super::reader::{
+    Cx, Fields, expect_integer, expect_mapping, expect_sequence, expect_string, in_range, list,
+};
 use super::schema;
 
 /// Read a `flow.*` definition (grammar 7).
@@ -772,32 +774,26 @@ fn store_params(
         }
     }
 
-    params.key = fields
-        .take("key")
-        .and_then(|node| lexical::cel(node, "`key`", cx));
-    params.query = fields
-        .take("query")
-        .and_then(|node| lexical::cel(node, "`query`", cx));
-    params.prefix = fields
-        .take("prefix")
-        .and_then(|node| lexical::cel(node, "`prefix`", cx));
-    params.top_k = fields
-        .integer("top_k", cx)
+    params.key =
+        store_param(fields, &legal, "key").and_then(|node| lexical::cel(node, "`key`", cx));
+    params.query =
+        store_param(fields, &legal, "query").and_then(|node| lexical::cel(node, "`query`", cx));
+    params.prefix =
+        store_param(fields, &legal, "prefix").and_then(|node| lexical::cel(node, "`prefix`", cx));
+    params.top_k = store_param(fields, &legal, "top_k")
+        .and_then(|node| expect_integer(node, "`top_k`", cx))
         .filter(|value| in_range(value, "`top_k`", 1..=100, cx));
-    params.limit = fields
-        .integer("limit", cx)
+    params.limit = store_param(fields, &legal, "limit")
+        .and_then(|node| expect_integer(node, "`limit`", cx))
         .filter(|value| in_range(value, "`limit`", 1..=1000, cx));
-    params.filter = fields
-        .take("filter")
+    params.filter = store_param(fields, &legal, "filter")
         .and_then(|node| binding::bindings(node, "`filter`", NameForm::Identifier, cx));
-    params.metadata = fields
-        .take("metadata")
+    params.metadata = store_param(fields, &legal, "metadata")
         .and_then(|node| binding::bindings(node, "`metadata`", NameForm::Identifier, cx));
-    params.content_type = fields
-        .take("content_type")
+    params.content_type = store_param(fields, &legal, "content_type")
         .and_then(|node| lexical::text(node, "`content_type`", cx));
 
-    params.value = fields.take("value").and_then(|node| match op.value {
+    params.value = store_param(fields, &legal, "value").and_then(|node| match op.value {
         // `kv set` writes a value_schema-shaped object; `vector upsert` and
         // `blob put` write one string (grammar 11.4).
         StoreOp::Set => {
@@ -807,6 +803,27 @@ fn store_params(
     });
 
     params
+}
+
+/// The value under one store-op parameter, unless the op's row does not admit
+/// the name.
+///
+/// The loop above has already refused every parameter outside the row, by name
+/// and with the row quoted back. Reading one anyway would parse it a second
+/// time and report its YAML type too, so `{ op: get, top_k: "state.k" }` — one
+/// mistake — would draw both "`top_k` is not a parameter of the `get` op" and
+/// "expected an integer for `top_k`". Every sibling rejection helper
+/// (`reject_key`, `per_target_key`, `provider_key`) returns `None` for the same
+/// reason.
+fn store_param<'a>(
+    fields: &mut Fields<'a>,
+    legal: &[&str],
+    name: &'static str,
+) -> Option<&'a Node> {
+    if !legal.contains(&name) {
+        return None;
+    }
+    fields.take(name)
 }
 
 fn human_block(node: &Node, subject: &str, cx: &mut Cx) -> Option<HumanBlock> {
