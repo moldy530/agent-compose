@@ -1004,7 +1004,7 @@
           "$ref": "#/$defs/cel"
         },
         "else": {
-          "description": "Marks the default edge: taken only when no guarded sibling edge from the same source was taken. At most one per source node. `true` is the only legal value - an edge with neither `when` nor `else` is already unconditional, so `else: false` would change nothing.",
+          "description": "Marks the default edge: taken only when no guarded sibling edge from the same source was taken. At most one per source node. `true` is the only legal value - an edge with neither `when` nor `else` is already unconditional, so `else: false` would change nothing (Decision D61). The edge also requires a `when:`-guarded sibling leaving the same node: with none, nothing can suppress it, so it fires on every pass and the keyword says nothing either (grammar 7.3 / Decision D107). That half relates two items of this array through a shared `from` value, which JSON Schema cannot express, so the validator owns it (Appendix B).",
           "const": true
         },
         "max_iterations": {

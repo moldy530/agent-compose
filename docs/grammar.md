@@ -1098,7 +1098,7 @@ edges:
 | `from` | node id \| `start` | yes | |
 | `to` | node id \| `end` | yes | |
 | `when` | CEL (bool) | no | guard over the source node's output (§4.1). Legal on an edge leaving `start` too, where the only roots are `input`/`state`/`execution`; at least one `start` edge must still be unconditional or `else:` (§7.6.3) |
-| `else` | `true` | no | marks the default edge; mutually exclusive with `when`. `true` is the only legal value — `else: false` says nothing (an unguarded edge is already unconditional) and is a compile error |
+| `else` | `true` | no | marks the default edge; mutually exclusive with `when`. `true` is the only legal value — `else: false` says nothing (an unguarded edge is already unconditional) and is a compile error (D61). REQUIRES a `when:`-guarded sibling edge leaving the same node: with none there is nothing for the edge to be *else* to, and it is unconditional under another name (§7.3, D107) |
 | `max_iterations` | integer 1..1000 | no | cycle bound (PRD 5.4); the source node then also needs an unconditional or `else:` edge leaving the cycle (§7.4). REQUIRES `when:` on the same edge — an unconditional or `else:` edge is a guarantee, and a guarantee a budget can withdraw is not one (§7.3.1, D90) |
 
 Self-edges (`from == to`) are legal and form a one-node SCC, which must be
@@ -1128,6 +1128,27 @@ Deterministic, and evaluated after the source node's output has been validated
    are all false fails before its first step. The validator rejects
    statically-provable instances (exhaustiveness, §7.3.1; escape edges, §7.4;
    the guaranteed `start` edge and the `on_error: skip` escape, §7.6.3).
+
+**An `else:` edge needs a guarded sibling.** An edge carrying `else: true` MUST
+have at least one sibling outgoing edge from the same node carrying `when:`.
+With none, rule 4's suppression clause can never fire — no guarded sibling can
+be taken — so the edge is taken on every pass, which is exactly what an edge
+carrying neither keyword already is (rule 2). The keyword then states nothing,
+while the author who wrote it to mean "only if the other edge did not fire" gets
+multicast to both targets. It is a compile error naming the node and the edge
+(Decision [D107](#d107-an-else-edge-requires-a-when-guarded-sibling)), the same
+inert key [D61](#d61-else-takes-the-literal-true) refuses in the other spelling.
+The rule is decided from edge shapes alone, before any guard is read, and the
+validator owns it: JSON Schema cannot relate two items of an `edges:` array
+through a shared `from` value (Appendix B).
+
+Every other site where this document offers "unconditional or `else: true`" as
+the guaranteed-to-fire form sits beside a guarded edge by construction —
+§7.3.1 clause 1 and §7.6.3 rule 3 are about nodes whose other out-edges carry
+guards, and §7.4's escape is the sibling of a `when:`-guarded budgeted edge
+(§7.2, [D90](#d90-max_iterations-is-legal-only-on-a-guarded-edge)). §7.6.3
+rule 2 is the one worth naming: a `start` with a single outgoing edge satisfies
+it with an unconditional edge, never with a lone `else: true`.
 
 #### 7.3.1 Exhaustiveness
 
@@ -1282,7 +1303,10 @@ Back-edges are permitted (PRD 5.4). The compiler computes SCCs and requires:
   is not taken (§7.3 rule 5) and so cannot suppress it (§7.3 rule 4). The escape
   itself carries no budget to exhaust: `max_iterations` requires a `when:` guard
   (§7.2, [D90](#d90-max_iterations-is-legal-only-on-a-guarded-edge)) and an
-  escape edge by definition has no `when:`. Exhausting
+  escape edge by definition has no `when:`. Where the escape is spelled
+  `else: true`, §7.3's guarded-sibling requirement
+  ([D107](#d107-an-else-edge-requires-a-when-guarded-sibling)) is discharged by
+  that same budgeted edge, which carries a `when:` by D90. Exhausting
   a budget therefore always leaves the cycle instead of dead-ending on §7.3
   rule 7. A **guarded** escape is not enough: with
   `when: "…verdict == 'approve'"` as the only way out, the pass that exhausts the
@@ -1536,6 +1560,12 @@ reachable only when every branch got there. Three static rules keep that true
    removes for an exhausted cycle budget. One unconditional or `else: true` edge
    removes it: the first fires always, the second whenever no guarded sibling
    was taken (§7.3 rule 4), so some edge is always taken.
+
+In rules 2 and 3 the *unconditional* edge is the form that needs nothing else.
+The `else: true` spelling carries its own precondition — a `when:`-guarded
+sibling leaving the same node (§7.3,
+[D107](#d107-an-else-edge-requires-a-when-guarded-sibling)) — which rule 3's
+node has by its own premise, and which a `start` with one edge does not.
 
 #### 7.6.4 Canonical write order
 
@@ -3892,7 +3922,10 @@ Naming the two levels separately is what keeps `policy: {timeout: 30s}` next to
 
 ### D61. `else:` takes the literal `true`
 
-`else: false` is a compile error. **Rationale**: §7.3 gives meaning only to
+`else: false` is a compile error;
+[D107](#d107-an-else-edge-requires-a-when-guarded-sibling) refuses the other
+spelling of the same no-op, an `else: true` with no guarded sibling to be else
+to. **Rationale**: §7.3 gives meaning only to
 `else: true`, and an edge with neither `when:` nor `else:` is already
 unconditional — so `else: false` would be a key that changes nothing, which is
 exactly the silent no-op the error-UX posture (PRD G3) rejects. *PRD 5.3, G3.*
@@ -4886,6 +4919,42 @@ keys already branch on, which is what makes it decidable in one file, exactly as
 §11.4's per-op parameter rows are ([D34](#d34-the-store-op-catalog-is-normative-including-derived-output-schemas)).
 *PRD 5.9, G3.*
 
+### D107. An `else:` edge requires a `when:`-guarded sibling
+
+An edge carrying `else: true` MUST have at least one sibling outgoing edge from
+the same node carrying `when:`; with none it is a compile error naming the node
+and the edge (§7.2, §7.3). The check reads edge shapes only and is the
+validator's, not the schema's.
+**Rationale**: §7.3 rule 4 gives an `else:` edge exactly one behavior — taken
+iff no guarded sibling was taken — so with no guarded sibling it is taken on
+every pass, which is rule 2's unconditional edge under a keyword. That is the
+inert key [D61](#d61-else-takes-the-literal-true) already refuses in its
+`else: false` spelling, and refusing one while accepting the other would say
+that a keyword meaning nothing is a mistake when it is written `false` and fine
+when it is written `true`. The failure it prevents is not cosmetic:
+`[{from: a, to: b}, {from: a, to: c, else: true}]` reads to its author as "go to
+`c` only when the edge to `b` did not fire", and what it does is multicast to
+both — two concurrent branches (§7.3 rule 6), a reduced-channel requirement the
+author did not expect (§10.2), and possibly an unbalanced convergence downstream
+(§7.6.2), none of it diagnosed. An unconditional edge is how "always go here" is
+written, so nothing is lost by refusing the second spelling of it.
+
+The rule is deliberately weaker than the two places a guarded sibling has to do
+more than exist. §7.4 clause 2(ii) needs an in-SCC `else:` edge's guarded
+sibling to *leave the SCC*
+([D98](#d98-a-cel-exit-condition-is-about-the-in-scc-edges-going-false)), and
+§7.3.1 clause 2 needs the guards to *cover* an enum's variants; satisfying this
+rule satisfies neither of those, and it is stated separately because it is about
+whether the keyword means anything at all, which is a question every `else:`
+edge answers whether or not it sits in a cycle or beside an enum.
+
+JSON Schema cannot express it — it relates two items of an `edges:` array
+through a shared `from` value, and the schema constrains items without reference
+to each other's values — so it joins `optional:` entries
+([D89](#d89-optional-entries-must-name-declared-properties)) on Appendix B's
+validator-owned list rather than being dropped for want of a per-file check.
+*PRD 5.3, G3.*
+
 ---
 
 ## Appendix B — Editor integration
@@ -4930,7 +4999,9 @@ authority. The schema cannot see across files, so it does not check:
   section in another file;
 - rules relating two siblings whose correspondence JSON Schema cannot express:
   `optional:` entries naming declared properties (§3.4, D89) — an array's items
-  cannot be constrained against a sibling object's keys — and item-derivation of
+  cannot be constrained against a sibling object's keys — the `when:`-guarded
+  sibling an `else: true` edge requires (§7.3, D107), which relates two items of
+  one `edges:` array through a shared `from` value, and item-derivation of
   a store key (§11.4, D83), which is a path through bindings in other files;
 - rules that key off the file's *name* or the active target rather than its
   content: no `storage_backends:` in `deploy/local.yml` and the existence of
@@ -5033,6 +5104,8 @@ flow.<name>:
   outputs: <field map>              # required
   nodes: { <id>: <node> }
   edges: [ { from, to, when?, else?, max_iterations? } ]
+          # else: true needs a when:-guarded sibling (D107);
+          # max_iterations needs a when: on its own edge (D90)
 
 store.<name>:
   kind: kv|vector|blob              # required

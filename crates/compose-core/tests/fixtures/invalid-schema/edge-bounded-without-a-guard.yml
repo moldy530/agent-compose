@@ -16,4 +16,7 @@ flow.loop:
     - { from: start, to: write }
     - { from: write, to: review }
     - { from: review, to: write, max_iterations: 3 }
-    - { from: review, to: end, else: true }
+    # unconditional rather than `else: true`: with no `when:`-guarded sibling
+    # leaving `review`, an `else:` here would violate D107 as well, and a
+    # negative fixture names exactly one rule.
+    - { from: review, to: end }
