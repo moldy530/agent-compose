@@ -226,9 +226,9 @@
       "type": "string"
     },
     "noEnvRefString": {
-      "description": "A string on one of the surfaces where environment references are illegal (grammar 4.3 class 3: prompts, descriptions, schemas, CEL, model and embedding model ids, trigger path/cron/timezone, content types, identifiers and references - anything the classification does not place in class 1 or 2). Nothing is interpolated here, so an unescaped ${ENV_NAME} token is an error rather than text that silently survives. Write $${ENV_NAME} for a literal ${ENV_NAME}.",
+      "description": "A string on one of the surfaces where environment references are illegal (grammar 4.3 class 3: prompts, descriptions, schemas, CEL, model and embedding model ids, trigger path/cron/timezone, content types, identifiers and references - anything the classification does not place in class 1 or 2). Nothing is interpolated here, so an unescaped ${ENV_NAME} token is an error rather than text that silently survives. Write $${ENV_NAME} for a literal ${ENV_NAME}. The pattern spells \"unescaped\" as an explicit alternation - at the start of the string, or after one character that is not the `$` of the `$${` escape - rather than as a lookbehind, which is outside the interoperable regex subset this schema keeps to (Decision D108).",
       "type": "string",
-      "not": { "pattern": "(?<!\\$)\\$\\{[A-Z_][A-Z0-9_]*\\}" }
+      "not": { "pattern": "(^|[^$])\\$\\{[A-Z_][A-Z0-9_]*\\}" }
     },
 
     "fieldMap": {

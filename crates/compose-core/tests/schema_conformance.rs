@@ -175,6 +175,90 @@ fn published_schema_is_a_valid_json_schema_2020_12() {
     compile_schema();
 }
 
+/// Every `pattern` keyword in `schema`, paired with the JSON Pointer that
+/// locates it, so a failure can name the offending keyword.
+fn collect_patterns(node: &Value, path: &str, out: &mut Vec<(String, String)>) {
+    match node {
+        Value::Object(map) => {
+            for (key, value) in map {
+                let child = format!("{path}/{key}");
+                match (key.as_str(), value.as_str()) {
+                    ("pattern", Some(pattern)) => out.push((child, pattern.to_string())),
+                    _ => collect_patterns(value, &child, out),
+                }
+            }
+        }
+        Value::Array(items) => {
+            for (index, value) in items.iter().enumerate() {
+                collect_patterns(value, &format!("{path}/{index}"), out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Constructs outside the interoperable regex subset (Decision D108), each with
+/// the reason a failure should quote.
+fn non_portable_regex_construct(pattern: &str) -> Option<&'static str> {
+    const LOOKAROUND: &str =
+        "lookaround is outside both the ECMA-262 subset JSON Schema recommends and RE2";
+    const BACKREFERENCE: &str = "a backreference is outside RE2";
+
+    if ["(?=", "(?!", "(?<"]
+        .iter()
+        .any(|opener| pattern.contains(opener))
+    {
+        return Some(LOOKAROUND);
+    }
+
+    let bytes = pattern.as_bytes();
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte != b'\\' {
+            continue;
+        }
+        // `\1`..`\9` is a group reference; `\0` is a NUL escape. A backslash
+        // that is itself escaped (`\\1`) introduces neither, so the run of
+        // backslashes before this one has to be even for it to count.
+        let escaped_by = bytes[..index].iter().rev().take_while(|b| **b == b'\\');
+        let digit = bytes.get(index + 1).copied();
+        if digit.is_some_and(|d| d.is_ascii_digit() && d != b'0') && escaped_by.count() % 2 == 0 {
+            return Some(BACKREFERENCE);
+        }
+    }
+    None
+}
+
+/// Decision D108: the published schema is read by every editor and CI validator
+/// a project points at it, so its own patterns are held to the portability
+/// standard D12 imposes on a spec author's `pattern:`. The failure this guards
+/// is worse than a divergence — an RE2-backed engine cannot *compile* a schema
+/// containing `(?<!...)`, so it rejects every file with a regex error at
+/// `$defs`, including the correct ones.
+#[test]
+fn published_schema_patterns_stay_in_the_interoperable_regex_subset() {
+    let mut patterns = Vec::new();
+    collect_patterns(&read_schema(), "", &mut patterns);
+    assert!(
+        patterns.len() >= 20,
+        "expected the schema to constrain many values with `pattern`, found {}",
+        patterns.len()
+    );
+
+    let offenders: Vec<String> = patterns
+        .iter()
+        .filter_map(|(path, pattern)| {
+            non_portable_regex_construct(pattern)
+                .map(|reason| format!("  at {path}: {pattern}\n    {reason}"))
+        })
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "{} schema pattern(s) leave the interoperable regex subset (Decision D108):\n{}",
+        offenders.len(),
+        offenders.join("\n")
+    );
+}
+
 #[test]
 fn published_schema_version_enum_matches_supported_spec_versions() {
     let schema = read_schema();

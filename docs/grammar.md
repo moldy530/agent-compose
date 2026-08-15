@@ -4955,6 +4955,30 @@ to each other's values — so it joins `optional:` entries
 validator-owned list rather than being dropped for want of a per-file check.
 *PRD 5.3, G3.*
 
+### D108. The published schema's patterns stay in the interoperable regex subset
+
+Every `pattern` in `schemas/agent-compose.schema.json` uses only the constructs
+common to ECMA-262 and RE2: no lookahead, no lookbehind, no backreferences. The
+no-`${ENV}` check therefore spells "unescaped" as the alternation
+`(^|[^$])\$\{…\}` rather than as a lookbehind (§4.3, Appendix B).
+**Rationale**: [D12](#d12-pattern-is-re2-format-is-a-closed-list) holds a spec
+author's own `pattern:` to RE2 because a regex has to mean the same thing in the
+Rust validator, in generated JS validation, and in a provider's
+structured-output engine. The published schema is read by strictly more engines
+than that — every editor and CI validator a project points at it — so the same
+standard has to hold for the artifact, and the failure mode is worse than a
+divergence: an RE2-backed validator cannot *compile* a schema containing
+`(?<!…)`, so it rejects every file with a regex-compile error at `$defs`,
+including the files that are correct. A rule the grammar states and the schema
+enforces everywhere except on one class of toolchain is not the one-directional
+invariant Appendix B claims.
+
+The alternation is exactly equivalent, not an approximation: `${NAME}` is
+unescaped when it starts the string or follows one character that is not the
+`$` of `$${`, which is what the lookbehind asserted. The reason to record the
+choice is that the lookbehind reads better and a future editor would otherwise
+restore it as a simplification. *PRD 5.2, 5.12, G3.*
+
 ---
 
 ## Appendix B — Editor integration
@@ -5058,6 +5082,18 @@ underlines the entire node and names nothing; branching reports the real error
 against the offending key. The conformance suite pins this: each negative fixture
 declares both the instance location and the schema keyword that must reject it
 (`crates/compose-core/tests/schema_conformance.rs`).
+
+**Regex dialect.** Every `pattern` in the schema stays inside the interoperable
+subset — the ECMA-262 constructs RE2 also implements, so no lookaround and no
+backreferences (Decision
+[D108](#d108-the-published-schemas-patterns-stay-in-the-interoperable-regex-subset)).
+This is [D12](#d12-pattern-is-re2-format-is-a-closed-list)'s standard for a spec
+author's `pattern:`, applied to the artifact that checks it: a schema an
+RE2-backed validator cannot compile rejects *every* file with a regex error
+rather than validating any of them. The one place it costs a spelling is the
+no-`${ENV}` check, which reads `(^|[^$])\$\{…\}` — start-of-string, or one
+character that is not the `$${` escape's `$` — where a lookbehind would say the
+same thing more briefly.
 
 A file that passes the schema and fails `validate` is normal and expected; a file
 that fails the schema always fails `validate`. Keeping that direction is why the
