@@ -1,5 +1,6 @@
 # rule: arrays in a result schema MUST declare max_items - unbounded fan-out is a compile error (grammar 3.5 / PRD 5.6)
 # at: /agent.planner/output/tasks
+# via: /$defs/outputTypeNode/oneOf
 agent.planner:
   model: model.smart
   prompt: Break the goal into tasks.

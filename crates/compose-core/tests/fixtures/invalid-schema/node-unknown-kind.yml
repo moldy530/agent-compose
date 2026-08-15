@@ -1,5 +1,6 @@
 # rule: a node carries exactly one kind key from agent | exec | http | function | flow | map | human | store (grammar 7.1 / PRD 5.5)
 # at: /flow.simple/nodes/think
+# via: /$defs/node/oneOf
 flow.simple:
   outputs:
     done: { type: boolean }

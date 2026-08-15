@@ -1,5 +1,6 @@
 # rule: a detached (fire-and-forget) route may not write reduced state (grammar 8.6 / PRD 5.6)
-# at: /flow.work/nodes/fan
+# at: /flow.work/nodes/fan/map/routes/needs_human
+# via: /$defs/mapRoute/allOf/0/then/not
 flow.work:
   outputs:
     done: { type: boolean }

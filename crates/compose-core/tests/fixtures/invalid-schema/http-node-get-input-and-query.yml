@@ -1,0 +1,18 @@
+# rule: on a GET/HEAD inline http node the bound `input:` object IS the query string, so declaring `query:` too leaves one of them inert (grammar 8.3 / D66)
+# at: /flow.work/nodes/fetch
+# via: /$defs/httpNode/allOf/1/not
+flow.work:
+  outputs:
+    status: { type: integer }
+  nodes:
+    fetch:
+      http:
+        method: GET
+        url: "https://${API_HOST}/items"
+        query:
+          q: "state.term"
+      input:
+        q: "state.term"
+  edges:
+    - { from: start, to: fetch }
+    - { from: fetch, to: end }

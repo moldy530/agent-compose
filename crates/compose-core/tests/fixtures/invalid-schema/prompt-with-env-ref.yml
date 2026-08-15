@@ -1,0 +1,8 @@
+# rule: nothing is interpolated in a prompt, so an unescaped ${ENV} token is an error rather than text that silently survives (grammar 4.3)
+# at: /agent.reviewer/prompt
+# via: /$defs/noEnvRefString/not
+agent.reviewer:
+  model: model.smart
+  prompt: "Review the draft. Authenticate with ${SECRET_KEY} when you call the API."
+  output:
+    verdict: { enum: [approve, revise] }

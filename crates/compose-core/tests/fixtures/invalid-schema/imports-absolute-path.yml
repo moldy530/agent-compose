@@ -1,5 +1,6 @@
 # rule: imports are relative paths to .yml/.yaml files - no absolute paths, URLs, or globs (grammar 1.4 / PRD 5.1)
 # at: /imports/0
+# via: /properties/imports/items/pattern
 version: "0.1"
 imports:
   - /etc/agent-compose/agents/reviewer.yml

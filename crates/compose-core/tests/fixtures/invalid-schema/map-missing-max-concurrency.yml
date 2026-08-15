@@ -1,5 +1,6 @@
 # rule: a map MUST declare max_concurrency - execution bounding is mandatory (grammar 8.6 / PRD 5.6)
-# at: /flow.work/nodes/fan
+# at: /flow.work/nodes/fan/map
+# via: /$defs/mapNode/properties/map/required
 flow.work:
   outputs:
     done: { type: boolean }

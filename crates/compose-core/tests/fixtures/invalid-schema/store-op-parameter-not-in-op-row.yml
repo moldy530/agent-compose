@@ -1,5 +1,6 @@
 # rule: a store-op node takes exactly the parameters of its op's row, so `top_k:` on a `get` is an error, not an ignored key (grammar 11.4 / D34, D50)
-# at: /flow.work/nodes/load
+# at: /flow.work/nodes/load/top_k
+# via: /$defs/storeNode/allOf/0/then/properties/top_k
 flow.work:
   outputs:
     done: { type: boolean }

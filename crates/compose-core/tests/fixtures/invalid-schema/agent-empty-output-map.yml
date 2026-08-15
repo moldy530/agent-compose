@@ -1,5 +1,6 @@
 # rule: an agent's `output:` declares at least one property - it is what routing reads and what makes every edge serializable (grammar 5.1 / PRD 5.2)
 # at: /agent.reviewer/output
+# via: /$defs/agentOutputFieldMap/minProperties
 agent.reviewer:
   model: model.smart
   prompt: Review the draft and return a verdict.

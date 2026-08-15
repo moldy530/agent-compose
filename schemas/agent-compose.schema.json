@@ -223,6 +223,11 @@
       "description": "A string that may embed ${ENV_NAME} references, e.g. \"https://${API_HOST}/v1\". Use $${ for a literal ${.",
       "type": "string"
     },
+    "noEnvRefString": {
+      "description": "A string on one of the surfaces where environment references are illegal (prompts, descriptions, schemas, CEL, model ids - grammar 4.3): nothing is interpolated here, so an unescaped ${ENV_NAME} token is an error rather than text that silently survives. Write $${ENV_NAME} for a literal ${ENV_NAME}.",
+      "type": "string",
+      "not": { "pattern": "(?<!\\$)\\$\\{[A-Z_][A-Z0-9_]*\\}" }
+    },
 
     "fieldMap": {
       "description": "An input-surface schema: field name -> type node, denoting a closed object whose properties are all required unless listed in `optional:`. Defaults are permitted here. Grammar 3.1.",
@@ -772,7 +777,10 @@
       "required": ["model", "prompt", "output"],
       "properties": {
         "model": { "description": "The model binding. Agents reference model.* only - no inline provider or settings overrides (PRD 5.9).", "$ref": "#/$defs/modelRef" },
-        "prompt": { "description": "System instructions. Literal text: there is no interpolation; dynamic content travels through the input schema.", "type": "string", "minLength": 1 },
+        "prompt": {
+          "description": "System instructions. Literal text: there is no interpolation, so an unescaped ${ENV} reference is an error (grammar 4.3) and dynamic content travels through the input schema instead.",
+          "allOf": [{ "$ref": "#/$defs/noEnvRefString" }, { "minLength": 1 }]
+        },
         "output": { "description": "REQUIRED structured output schema, declaring at least one property. Load-bearing for routing (PRD 5.3) and for making every edge serializable (PRD 5.7).", "$ref": "#/$defs/agentOutputFieldMap" },
         "input": {
           "description": "Optional input schema, declaring at least one field. Omitting it is the only way to get the string-in default (a single unnamed string bound with the scalar form at the node); `input: {}` is neither contract and is a compile error.",
@@ -854,13 +862,13 @@
           "additionalProperties": { "$ref": "#/$defs/interpolatedString" }
         },
         "query": {
-          "description": "Query parameters, each a CEL expression.",
+          "description": "Query parameters, each a CEL expression over `input` - the tool's own declared input object, the only root in scope inside a tool binding (grammar 4.1, 6.1, D65).",
           "type": "object",
           "propertyNames": { "type": "string", "pattern": "^[a-zA-Z0-9_-]+$" },
           "additionalProperties": { "$ref": "#/$defs/cel" }
         },
         "body": {
-          "description": "JSON body fields, each a CEL expression. Illegal for GET/HEAD.",
+          "description": "JSON body fields, each a CEL expression over `input` - the tool's own declared input object, the only root in scope inside a tool binding (grammar 4.1, 6.1, D65). Illegal for GET/HEAD.",
           "type": "object",
           "propertyNames": { "$ref": "#/$defs/identifier" },
           "additionalProperties": { "$ref": "#/$defs/cel" }
@@ -906,9 +914,10 @@
           "additionalProperties": { "$ref": "#/$defs/node" }
         },
         "edges": {
-          "description": "Control-flow edges, including back-edges. Every SCC must carry a termination guard (PRD 5.4).",
+          "description": "Control-flow edges, including back-edges. Every SCC must carry a termination guard (PRD 5.4). Two identical edges are an error: the duplicate adds no transition (grammar 7.2).",
           "type": "array",
           "minItems": 1,
+          "uniqueItems": true,
           "items": { "$ref": "#/$defs/edge" }
         }
       },
@@ -950,14 +959,24 @@
       "description": "A flow node: exactly one kind key (agent, exec, http, function, flow, map, human, store) plus bindings and policy. Grammar 8 / PRD 5.5, 5.8.",
       "type": "object",
       "oneOf": [
-        { "$ref": "#/$defs/agentNode" },
-        { "$ref": "#/$defs/execNode" },
-        { "$ref": "#/$defs/httpNode" },
-        { "$ref": "#/$defs/functionNode" },
-        { "$ref": "#/$defs/flowNode" },
-        { "$ref": "#/$defs/mapNode" },
-        { "$ref": "#/$defs/humanNode" },
-        { "$ref": "#/$defs/storeNode" }
+        { "description": "An agent node.", "required": ["agent"] },
+        { "description": "An inline exec node.", "required": ["exec"] },
+        { "description": "An inline http node.", "required": ["http"] },
+        { "description": "A function node.", "required": ["function"] },
+        { "description": "A subflow node.", "required": ["flow"] },
+        { "description": "A map node.", "required": ["map"] },
+        { "description": "A human node.", "required": ["human"] },
+        { "description": "A store-op node.", "required": ["store"] }
+      ],
+      "allOf": [
+        { "if": { "required": ["agent"] }, "then": { "$ref": "#/$defs/agentNode" } },
+        { "if": { "required": ["exec"] }, "then": { "$ref": "#/$defs/execNode" } },
+        { "if": { "required": ["http"] }, "then": { "$ref": "#/$defs/httpNode" } },
+        { "if": { "required": ["function"] }, "then": { "$ref": "#/$defs/functionNode" } },
+        { "if": { "required": ["flow"] }, "then": { "$ref": "#/$defs/flowNode" } },
+        { "if": { "required": ["map"] }, "then": { "$ref": "#/$defs/mapNode" } },
+        { "if": { "required": ["human"] }, "then": { "$ref": "#/$defs/humanNode" } },
+        { "if": { "required": ["store"] }, "then": { "$ref": "#/$defs/storeNode" } }
       ]
     },
     "agentNode": {
@@ -1032,13 +1051,13 @@
               "additionalProperties": { "$ref": "#/$defs/interpolatedString" }
             },
             "query": {
-              "description": "Query parameters, each a CEL expression.",
+              "description": "Query parameters, each a CEL expression over the flow-scoped roots `input`, `state`, `execution` (grammar 4.1) - unlike the same key inside a tool binding, which sees only the tool's own `input`.",
               "type": "object",
               "propertyNames": { "type": "string", "pattern": "^[a-zA-Z0-9_-]+$" },
               "additionalProperties": { "$ref": "#/$defs/cel" }
             },
             "body": {
-              "description": "JSON body fields, each a CEL expression.",
+              "description": "JSON body fields, each a CEL expression over the flow-scoped roots `input`, `state`, `execution` (grammar 4.1).",
               "type": "object",
               "propertyNames": { "$ref": "#/$defs/identifier" },
               "additionalProperties": { "$ref": "#/$defs/cel" }
@@ -1065,14 +1084,39 @@
             }
           ]
         },
-        "input": { "description": "Input bindings.", "$ref": "#/$defs/inputBindings" },
+        "input": { "description": "Input bindings. The bound object becomes the JSON body (body-bearing methods) or the query string (GET/HEAD) - so it may not be combined with the in-block key that would otherwise carry it.", "$ref": "#/$defs/inputBindings" },
         "writes": { "description": "Write remap.", "$ref": "#/$defs/writes" },
         "retry": { "$ref": "#/$defs/retry" },
         "timeout": { "description": "Wall-clock bound on this node.", "$ref": "#/$defs/duration" },
         "on_error": { "$ref": "#/$defs/onError" },
         "description": { "description": "Node documentation.", "type": "string" }
       },
-      "additionalProperties": false
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "description": "Node-level `input:` and an in-block `body:` both claim the request body; declaring both leaves one of them inert, so it is an error (grammar 8.3, D66).",
+          "not": {
+            "allOf": [
+              { "required": ["input"] },
+              { "required": ["http"], "properties": { "http": { "required": ["body"] } } }
+            ]
+          }
+        },
+        {
+          "description": "On GET/HEAD the bound input object becomes the query string, so node-level `input:` and an in-block `query:` both claim it; declaring both is an error (grammar 8.3, D66).",
+          "not": {
+            "allOf": [
+              { "required": ["input"] },
+              {
+                "required": ["http"],
+                "properties": {
+                  "http": { "required": ["query"], "properties": { "method": { "enum": ["GET", "HEAD"] } } }
+                }
+              }
+            ]
+          }
+        }
+      ]
     },
     "functionNode": {
       "description": "Deterministic, graph-invoked use of a tool definition; arguments are checked against the tool's input schema. Grammar 8.4 / PRD 5.5.",
@@ -1127,10 +1171,10 @@
             "input": { "description": "Schema of what is rendered for the human.", "$ref": "#/$defs/fieldMap" },
             "output": { "description": "Schema of what they return; routable like any structured output, and the contract resume payloads are validated against.", "$ref": "#/$defs/outputFieldMap" },
             "timeout": { "description": "Wall-clock wait budget.", "$ref": "#/$defs/duration" },
-            "on_timeout": { "description": "Where control goes on expiry: a flow-local node id, or `end`. The same targets `on_error.fallback` accepts. Required whenever `timeout` is set.", "$ref": "#/$defs/controlTarget" }
+            "on_timeout": { "description": "Where control goes on expiry: a flow-local node id, or `end`. The same targets `on_error.fallback` accepts. The pair is jointly optional and jointly required: `timeout` without `on_timeout` has no route, and `on_timeout` without `timeout` declares a route that can never be taken.", "$ref": "#/$defs/controlTarget" }
           },
           "additionalProperties": false,
-          "dependentRequired": { "timeout": ["on_timeout"] }
+          "dependentRequired": { "timeout": ["on_timeout"], "on_timeout": ["timeout"] }
         },
         "input": { "description": "Input bindings for the human-facing schema.", "$ref": "#/$defs/inputBindings" },
         "writes": { "description": "Write remap.", "$ref": "#/$defs/writes" },
@@ -1508,45 +1552,49 @@
     },
 
     "modelDef": {
-      "description": "A model: either a direct provider binding or an ordered failover route - never both. Grammar 12.2 / PRD 5.9.",
+      "description": "A model: either a direct provider binding or an ordered failover route - never both. `route:` selects the form, so the rest of the definition is checked against that form alone. Grammar 12.2 / PRD 5.9.",
       "type": "object",
-      "oneOf": [
-        {
-          "description": "Direct binding.",
-          "type": "object",
-          "required": ["provider", "id"],
-          "properties": {
-            "provider": { "description": "The connection this model is served over.", "$ref": "#/$defs/providerRef" },
-            "id": { "description": "Provider-native model id. No ${ENV} references.", "type": "string", "minLength": 1 },
-            "settings": { "$ref": "#/$defs/modelSettings" },
-            "description": { "description": "Documentation.", "type": "string" }
-          },
-          "additionalProperties": false
+      "if": { "required": ["route"] },
+      "then": { "$ref": "#/$defs/modelRouteForm" },
+      "else": { "$ref": "#/$defs/modelDirectForm" }
+    },
+    "modelDirectForm": {
+      "description": "Direct binding: a provider connection plus the provider-native model id.",
+      "type": "object",
+      "required": ["provider", "id"],
+      "properties": {
+        "provider": { "description": "The connection this model is served over.", "$ref": "#/$defs/providerRef" },
+        "id": {
+          "description": "Provider-native model id. Env references are illegal here (grammar 4.3): the id is part of the composition's identity, not of its environment.",
+          "allOf": [{ "$ref": "#/$defs/noEnvRefString" }, { "minLength": 1 }]
         },
-        {
-          "description": "Ordered fallback route. Members must be direct models (no nested routes) and capability-equivalent, so failover cannot silently break structured output.",
-          "type": "object",
-          "required": ["route"],
-          "properties": {
-            "route": {
-              "description": "Ordered model.* members; the first that serves the call wins, and the failover is recorded in the trace.",
-              "type": "array",
-              "minItems": 2,
-              "uniqueItems": true,
-              "items": { "$ref": "#/$defs/modelRef" }
-            },
-            "route_on": {
-              "description": "Infrastructure failure conditions that trigger failover (default [rate_limit, overloaded, timeout]). Content-based routing is out of scope - that is what graph edges are for.",
-              "type": "array",
-              "minItems": 1,
-              "uniqueItems": true,
-              "items": { "enum": ["rate_limit", "overloaded", "timeout", "server_error"] }
-            },
-            "description": { "description": "Documentation.", "type": "string" }
-          },
-          "additionalProperties": false
-        }
-      ]
+        "settings": { "$ref": "#/$defs/modelSettings" },
+        "description": { "description": "Documentation.", "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "modelRouteForm": {
+      "description": "Ordered fallback route. Members must be direct models (no nested routes) and capability-equivalent, so failover cannot silently break structured output. A route carries no `provider:`/`id:`/`settings:` of its own - those belong to its members.",
+      "type": "object",
+      "required": ["route"],
+      "properties": {
+        "route": {
+          "description": "Ordered model.* members; the first that serves the call wins, and the failover is recorded in the trace.",
+          "type": "array",
+          "minItems": 2,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/modelRef" }
+        },
+        "route_on": {
+          "description": "Infrastructure failure conditions that trigger failover (default [rate_limit, overloaded, timeout]). Content-based routing is out of scope - that is what graph edges are for.",
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "enum": ["rate_limit", "overloaded", "timeout", "server_error"] }
+        },
+        "description": { "description": "Documentation.", "type": "string" }
+      },
+      "additionalProperties": false
     },
     "modelSettings": {
       "description": "Model behavior settings, validated by the compiler against the provider plugin's published schema (e.g. `thinking:` on an OpenAI provider is an error). This is the one open object in the logical layer: plugin-specific keys are accepted here. Grammar 12.2 / PRD 5.9.",
@@ -1566,13 +1614,20 @@
     },
 
     "trigger": {
-      "description": "One trigger: a (source, input binding, response mode) tuple targeting a flow. Grammar 13 / PRD 5.11.",
+      "description": "One trigger: a (source, input binding, response mode) tuple targeting a flow. `type:` selects the shape, so the rest of the entry is checked against that shape alone. Grammar 13 / PRD 5.11.",
       "type": "object",
-      "oneOf": [
-        { "$ref": "#/$defs/manualTrigger" },
-        { "$ref": "#/$defs/httpTrigger" },
-        { "$ref": "#/$defs/scheduleTrigger" },
-        { "$ref": "#/$defs/eventTrigger" }
+      "required": ["type"],
+      "properties": {
+        "type": {
+          "description": "Which invocation source this trigger declares. manual and http are active in v0; schedule and event are reserved grammar (parsed and validated, no-op).",
+          "enum": ["manual", "http", "schedule", "event"]
+        }
+      },
+      "allOf": [
+        { "if": { "properties": { "type": { "const": "manual" } }, "required": ["type"] }, "then": { "$ref": "#/$defs/manualTrigger" } },
+        { "if": { "properties": { "type": { "const": "http" } }, "required": ["type"] }, "then": { "$ref": "#/$defs/httpTrigger" } },
+        { "if": { "properties": { "type": { "const": "schedule" } }, "required": ["type"] }, "then": { "$ref": "#/$defs/scheduleTrigger" } },
+        { "if": { "properties": { "type": { "const": "event" } }, "required": ["type"] }, "then": { "$ref": "#/$defs/eventTrigger" } }
       ]
     },
     "triggerInput": {
@@ -1600,7 +1655,7 @@
       "properties": {
         "type": { "const": "http", "description": "HTTP invocation." },
         "flow": { "description": "The flow this trigger starts.", "$ref": "#/$defs/flowRef" },
-        "path": { "description": "Route path (default /triggers/<trigger name>).", "type": "string", "pattern": "^/[A-Za-z0-9_./{}-]*$" },
+        "path": { "description": "Route path: starts with / and contains no whitespace (default /triggers/<trigger name>). Router-specific parameter syntax such as /reviews/:id is passed through unexamined. Grammar 13.3.", "type": "string", "pattern": "^/\\S*$" },
         "method": { "description": "HTTP method for the start route (default POST).", "enum": ["POST", "PUT", "GET"] },
         "input": { "description": "Bindings, CEL over payload.body / payload.query / payload.headers / payload.path / payload.method.", "$ref": "#/$defs/triggerInput" },
         "session_key": { "description": "CEL over payload producing the session identity for session-scoped stores and history.", "$ref": "#/$defs/cel" },
@@ -1745,7 +1800,7 @@
         "url": { "description": "Connection URL, as an ${ENV} reference.", "$ref": "#/$defs/envRef" },
         "stream": { "description": "Stream name (redis_streams).", "type": "string" },
         "consumer_group": { "description": "Consumer group (redis_streams).", "type": "string" },
-        "queue_url": { "description": "Queue URL, as an ${ENV} reference (sqs).", "$ref": "#/$defs/envRef" },
+        "queue_url": { "description": "Queue URL (sqs). Not a credential and not on the closed secret-field list of grammar 4.3, so a literal is legal; ${ENV} references may be embedded.", "$ref": "#/$defs/interpolatedString" },
         "region": { "description": "Cloud region (sqs).", "type": "string" },
         "subject": { "description": "Subject (nats).", "type": "string" },
         "durable_name": { "description": "Durable consumer name (nats).", "type": "string" }

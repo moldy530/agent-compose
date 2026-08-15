@@ -1,0 +1,18 @@
+# rule: on an inline http node the bound `input:` object IS the request body, so declaring `body:` too leaves one of them inert (grammar 8.3 / D66)
+# at: /flow.work/nodes/notify
+# via: /$defs/httpNode/allOf/0/not
+flow.work:
+  outputs:
+    status: { type: integer }
+  nodes:
+    notify:
+      http:
+        method: POST
+        url: "https://${HOOKS_HOST}/notify"
+        body:
+          draft: "state.draft"
+      input:
+        draft: "state.draft"
+  edges:
+    - { from: start, to: notify }
+    - { from: notify, to: end }

@@ -1,5 +1,6 @@
 # rule: a map is homogeneous (`node:`) XOR discriminator-routed (`route_by:` + `routes:`), never both (grammar 8.6 / PRD 5.6)
-# at: /flow.work/nodes/fan
+# at: /flow.work/nodes/fan/map
+# via: /$defs/mapNode/properties/map/oneOf
 flow.work:
   outputs:
     done: { type: boolean }
