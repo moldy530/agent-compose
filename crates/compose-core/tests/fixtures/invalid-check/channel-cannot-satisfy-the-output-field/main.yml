@@ -1,0 +1,37 @@
+# rule: a channel must satisfy the `outputs:` field it materializes (grammar 7.5, Decision D111)
+# code: type-mismatch
+# message: the channel `patches` cannot satisfy the output `patches` of `flow.f`: expected a `max_items` of 10, found no declared `max_items`
+# at: main.yml:27:5
+# label: main.yml:15:3 the channel is declared here
+# help: materialization reads the channel's whole value with nothing between the two declarations, so the channel must satisfy the field — a channel with no `max_items` cannot feed a bounded one (grammar 7.5, Decision D111)
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+state:
+  patches:
+    type: array
+    items: { type: string }
+agent.a:
+  model: model.m
+  prompt: Do the thing.
+  input:
+    text: { type: string }
+  output:
+    result: { type: string }
+flow.f:
+  outputs:
+    patches:
+      type: array
+      max_items: 10
+      items: { type: string }
+  nodes:
+    n:
+      agent: agent.a
+      input: { text: "'x'" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }

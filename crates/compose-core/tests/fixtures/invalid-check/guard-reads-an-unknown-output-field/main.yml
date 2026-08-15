@@ -1,0 +1,28 @@
+# rule: a path from a typed root resolves against its declared schema (grammar 4.1)
+# code: unknown-field
+# message: `n.output.verdict` names no field of `n`'s output
+# at: main.yml:28:33
+# help: the declared fields are `result`
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.a:
+  model: model.m
+  prompt: Do the thing.
+  input:
+    text: { type: string }
+  output:
+    result: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.a
+      input: { text: "'x'" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end, when: "n.output.verdict == 'approve'" }

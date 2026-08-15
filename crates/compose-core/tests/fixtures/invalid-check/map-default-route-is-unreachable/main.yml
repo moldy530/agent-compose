@@ -1,0 +1,68 @@
+# rule: a `default:` with no unrouted variant is unreachable (grammar 8.6 rule 4, Decision D30)
+# code: invalid-value
+# message: the `default:` route of the `map` of node `dispatch` is unreachable
+# at: main.yml:63:11
+# help: every variant of the item union already has a route, so nothing reaches the catch-all: drop it, or drop the route that covers the variant it was written for (grammar 8.6 rule 4, Decision D30)
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.triage:
+  model: model.m
+  prompt: Triage.
+  input:
+    text: { type: string }
+  output:
+    findings:
+      type: array
+      max_items: 10
+      items:
+        discriminator: kind
+        variants:
+          auto_fixable:
+            file: { type: string }
+          needs_human:
+            summary: { type: string }
+agent.fixer:
+  model: model.m
+  prompt: Fix.
+  input:
+    file: { type: string }
+  output:
+    patch: { type: string }
+agent.reviewer:
+  model: model.m
+  prompt: Review.
+  input:
+    summary: { type: string }
+  output:
+    ticket: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    classify:
+      agent: agent.triage
+      input: { text: "'x'" }
+    dispatch:
+      map:
+        over: "classify.output.findings"
+        as: finding
+        route_by: kind
+        max_concurrency: 4
+        routes:
+          auto_fixable:
+            node: agent.fixer
+            input: { file: "finding.file" }
+          needs_human:
+            node: agent.reviewer
+            input: { summary: "finding.summary" }
+        default:
+          node: agent.reviewer
+          input: { summary: "'x'" }
+  edges:
+    - { from: start, to: classify }
+    - { from: classify, to: dispatch }
+    - { from: dispatch, to: end }

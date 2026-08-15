@@ -1,0 +1,35 @@
+# rule: a dispatched instance writes only reduced channels (grammar 8.6 rule 5)
+# code: unreduced-write
+# message: the `map` of node `work` writes the unreduced channel `result`
+# at: main.yml:30:9
+# label: main.yml:19:3 the channel is declared here
+# help: dispatched instances are concurrent writers, so the channel they write needs a declared `reduce:` policy — `append`, `merge`, or an explicit `last_wins` (grammar 8.6 rule 5, 10.2)
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+state:
+  tasks:
+    type: array
+    max_items: 5
+    items: { type: string }
+  result: { type: string, default: "" }
+agent.worker:
+  model: model.m
+  prompt: Do the thing.
+  output:
+    result: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    work:
+      map:
+        over: "state.tasks"
+        node: agent.worker
+        max_concurrency: 4
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }

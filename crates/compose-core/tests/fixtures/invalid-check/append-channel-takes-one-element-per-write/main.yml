@@ -1,0 +1,37 @@
+# rule: an `append` write supplies one element (grammar 10.2, Decision D58)
+# code: type-mismatch
+# message: `patches` of node `n` cannot be written to `patches`: an `append` write supplies one element: expected a string, found an array of strings
+# at: main.yml:33:7
+# label: main.yml:15:3 the channel is declared here
+# help: appending several values in one write is deliberately not expressible: fan out with a `map` so each element is its own write, or declare the channel `last_wins` and set it whole (grammar 10.2, Decision D58)
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+state:
+  patches:
+    type: array
+    items: { type: string }
+    reduce: append
+agent.a:
+  model: model.m
+  prompt: Do the thing.
+  input:
+    text: { type: string }
+  output:
+    patches:
+      type: array
+      max_items: 5
+      items: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.a
+      input: { text: "'x'" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }

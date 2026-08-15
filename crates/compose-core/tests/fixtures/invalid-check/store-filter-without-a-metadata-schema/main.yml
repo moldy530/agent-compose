@@ -1,0 +1,34 @@
+# rule: a store with no `metadata_schema` has no legal filter key (grammar 11.4, Decision D114)
+# code: unknown-field
+# message: `source` is not a metadata field: `store.docs` declares no `metadata_schema`
+# at: main.yml:31:9
+# help: a `vector` store that declares no `metadata_schema` has no metadata at all, so `filter:` and `metadata:` have no legal key; `metadata_schema: {}` is the other spelling, declaring one that is always empty (grammar 11.4, Decision D114)
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+provider.local:
+  kind: openai_compatible
+  base_url: ${U}
+store.docs:
+  kind: vector
+  scope: global
+  embed:
+    model: text-embedding-3-small
+    provider: provider.local
+flow.f:
+  outputs: {}
+  nodes:
+    find:
+      store: store.docs
+      op: search
+      query: "'q'"
+      top_k: 5
+      filter:
+        source: "'docs'"
+  edges:
+    - { from: start, to: find }
+    - { from: find, to: end }

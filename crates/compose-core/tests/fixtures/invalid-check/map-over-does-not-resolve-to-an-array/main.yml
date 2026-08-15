@@ -1,0 +1,31 @@
+# rule: `over` resolves to an array (grammar 8.6 rule 1)
+# code: type-mismatch
+# message: `over` of the `map` of node `work` must resolve to an array, and `state.draft` resolves to a string
+# at: main.yml:26:15
+# label: main.yml:15:10 it is declared here
+# help: a `map` fans out over an array: an agent emits one and the map dispatches over it (grammar 8.6 rule 1)
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+state:
+  draft: { type: string, default: "" }
+agent.worker:
+  model: model.m
+  prompt: Do the thing.
+  output:
+    result: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    work:
+      map:
+        over: "state.draft"
+        node: agent.worker
+        max_concurrency: 4
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }

@@ -1,0 +1,39 @@
+# rule: a `merge` write supplies a subset of the channel's properties (grammar 10.2)
+# code: type-mismatch
+# message: `totals` of node `n` cannot be written to `totals`: a `merge` write supplies a subset of the channel's properties, and `skipped` is not one of them
+# at: main.yml:35:7
+# label: main.yml:15:3 the channel is declared here
+# help: the channel declares `fixed`
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+state:
+  totals:
+    type: object
+    properties:
+      fixed: { type: integer }
+    reduce: merge
+agent.a:
+  model: model.m
+  prompt: Do the thing.
+  input:
+    text: { type: string }
+  output:
+    totals:
+      type: object
+      properties:
+        fixed: { type: integer }
+        skipped: { type: integer }
+flow.f:
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.a
+      input: { text: "'x'" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }

@@ -1,0 +1,28 @@
+# rule: the expression surface is the set grammar 4.1 enumerates (grammar 4.1)
+# code: invalid-expression
+# message: `string` is not a function this expression surface supports
+# at: main.yml:25:22
+# help: the supported set is `size`, `has`, `startsWith`, `endsWith`, `contains`, `matches`, `all`, `exists`, `exists_one`, `filter`, `map` plus the standard operators; there are no custom extension functions in v0 (grammar 4.1)
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.a:
+  model: model.m
+  prompt: Do the thing.
+  input:
+    text: { type: string }
+  output:
+    result: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.a
+      input: { text: "string(1)" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }

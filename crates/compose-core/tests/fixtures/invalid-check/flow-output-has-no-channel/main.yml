@@ -1,0 +1,29 @@
+# rule: every `outputs:` field reads a declared channel (grammar 7.5)
+# code: undefined-channel
+# message: `flow.f` declares the output `draft`, which no state channel supplies
+# at: main.yml:22:5
+# help: each `outputs:` field is read from the state channel of the same name at quiescence: declare it in `state:`, or feed a differently-named channel with a node `writes:` remap (grammar 7.5, Decision D53)
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.a:
+  model: model.m
+  prompt: Do the thing.
+  input:
+    text: { type: string }
+  output:
+    result: { type: string }
+flow.f:
+  outputs:
+    draft: { type: string }
+  nodes:
+    n:
+      agent: agent.a
+      input: { text: "'x'" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }

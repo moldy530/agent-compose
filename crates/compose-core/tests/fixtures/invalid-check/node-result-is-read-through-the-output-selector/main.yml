@@ -1,0 +1,28 @@
+# rule: a node's result is `<node>.output.<field>` (grammar 4.1)
+# code: unknown-field
+# message: `n.result` is not how a node's result is read
+# at: main.yml:28:33
+# help: a node's output object is `n.output.<field>`, and it is readable only from an edge guard and from `map.over` (grammar 4.1, Decision D42)
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.a:
+  model: model.m
+  prompt: Do the thing.
+  input:
+    text: { type: string }
+  output:
+    result: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.a
+      input: { text: "'x'" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end, when: "n.result == 'x'" }

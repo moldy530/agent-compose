@@ -1,0 +1,42 @@
+# rule: a flow used as an agent tool declares a `description:` (grammar 5.4, Decision D26)
+# code: missing-key
+# message: `agent.a` attaches `flow.helper` as a tool, and it declares no `description:`
+# at: main.yml:29:11
+# label: main.yml:14:1 the flow is defined here
+# help: a flow used as an agent tool takes a tool's contract: its `inputs`/`outputs` become the parameter and result schemas, and the description is what the model selects on (grammar 5.4, 7.5)
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+flow.helper:
+  inputs:
+    text: { type: string }
+  outputs: {}
+  nodes:
+    n:
+      exec:
+        command: echo
+      input: "input.text"
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }
+agent.a:
+  model: model.m
+  prompt: Do the thing.
+  tools: [flow.helper]
+  input:
+    text: { type: string }
+  output:
+    result: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.a
+      input: { text: "'x'" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }

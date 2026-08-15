@@ -1,0 +1,33 @@
+# rule: a `kv set` value is checked against `value_schema` (grammar 11.4)
+# code: unknown-field
+# message: `extra` is not a field `store.memory` declares
+# at: main.yml:30:9
+# label: main.yml:18:5 the store's schema is declared here
+# help: the declared fields are `last_report`, `patch_count`
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+store.memory:
+  kind: kv
+  scope: global
+  value_schema:
+    last_report: { type: string }
+    patch_count: { type: integer }
+flow.f:
+  outputs: {}
+  nodes:
+    remember:
+      store: store.memory
+      op: set
+      key: "'k'"
+      value:
+        last_report: "'r'"
+        patch_count: "1"
+        extra: "'x'"
+  edges:
+    - { from: start, to: remember }
+    - { from: remember, to: end }

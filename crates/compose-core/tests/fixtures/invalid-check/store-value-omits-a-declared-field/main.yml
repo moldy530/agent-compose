@@ -1,0 +1,31 @@
+# rule: a `kv set` supplies every field of `value_schema` (grammar 11.4)
+# code: missing-key
+# message: `value` of node `remember` does not supply `patch_count`
+# at: main.yml:28:9
+# label: main.yml:19:5 the store declares it here
+# help: a `kv set` writes the whole value at its key, so it supplies every field of the store's `value_schema` (grammar 11.4)
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+store.memory:
+  kind: kv
+  scope: global
+  value_schema:
+    last_report: { type: string }
+    patch_count: { type: integer }
+flow.f:
+  outputs: {}
+  nodes:
+    remember:
+      store: store.memory
+      op: set
+      key: "'k'"
+      value:
+        last_report: "'r'"
+  edges:
+    - { from: start, to: remember }
+    - { from: remember, to: end }

@@ -1,0 +1,49 @@
+# rule: a node inside a dispatched flow writes only reduced channels (grammar 8.6 rule 5)
+# code: unreduced-write
+# message: the map `work` of `flow.f` dispatches `flow.sub`, whose node `n` writes the unreduced channel `note`
+# at: main.yml:33:7
+# label: main.yml:19:3 the channel is declared here
+# help: dispatched instances are concurrent writers, so every channel they write needs a declared `reduce:` policy (grammar 8.6 rule 5, 10.2)
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+state:
+  tasks:
+    type: array
+    max_items: 5
+    items: { type: string }
+  note: { type: string, default: "" }
+agent.worker:
+  model: model.m
+  prompt: Work.
+  input:
+    text: { type: string }
+  output:
+    note: { type: string }
+flow.sub:
+  inputs:
+    text: { type: string }
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.worker
+      input: { text: "input.text" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }
+flow.f:
+  outputs: {}
+  nodes:
+    work:
+      map:
+        over: "state.tasks"
+        node: flow.sub
+        max_concurrency: 4
+        input: { text: "item" }
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }

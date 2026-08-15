@@ -1,0 +1,30 @@
+# rule: a `state.*` reference names a declared channel (grammar 10.3)
+# code: undefined-channel
+# message: `state.drafts` names no declared state channel
+# at: main.yml:27:22
+# help: did you mean `state.draft`?
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+state:
+  draft: { type: string, default: "" }
+agent.a:
+  model: model.m
+  prompt: Do the thing.
+  input:
+    text: { type: string }
+  output:
+    result: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.a
+      input: { text: "state.drafts" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }

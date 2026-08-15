@@ -1,0 +1,41 @@
+# rule: nothing falls through a module boundary (grammar 8.0, Decision D68)
+# code: missing-binding
+# message: `goal` of node `child` is not bound
+# at: main.yml:38:7
+# label: main.yml:25:5 the input field is declared here
+# help: a module boundary binds every input explicitly: the state channel and the flow input of the same name do not cross it (grammar 8.0, Decision D68)
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+state:
+  goal: { type: string, default: "" }
+agent.a:
+  model: model.m
+  prompt: Do the thing.
+  input:
+    text: { type: string }
+  output:
+    result: { type: string }
+flow.sub:
+  inputs:
+    goal: { type: string }
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.a
+      input: { text: "input.goal" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }
+flow.f:
+  outputs: {}
+  nodes:
+    child:
+      flow: flow.sub
+  edges:
+    - { from: start, to: child }
+    - { from: child, to: end }

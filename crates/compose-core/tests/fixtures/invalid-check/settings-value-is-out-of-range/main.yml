@@ -1,0 +1,13 @@
+# rule: a settings value is within the range its schema publishes (grammar 12.2)
+# code: value-out-of-range
+# message: `temperature` of `model.m` is 5, outside the range 0 to 2
+# at: main.yml:13:5
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+  settings:
+    temperature: 5

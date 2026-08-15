@@ -1,0 +1,28 @@
+# rule: an explicit binding is typed by its result (grammar 8.0)
+# code: type-mismatch
+# message: the binding for `text` expects a string, found an integer
+# at: main.yml:25:22
+# label: main.yml:17:11 the destination is declared here
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.a:
+  model: model.m
+  prompt: Do the thing.
+  input:
+    text: { type: string }
+  output:
+    result: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.a
+      input: { text: "1" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }

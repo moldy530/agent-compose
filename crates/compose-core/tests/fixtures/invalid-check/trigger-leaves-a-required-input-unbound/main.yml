@@ -1,0 +1,38 @@
+# rule: every flow input without a `default:` is bound by the trigger (grammar 13.1)
+# code: missing-binding
+# message: the trigger `on_request` binds no `goal`, which `flow.f` requires
+# at: main.yml:26:7
+# label: main.yml:29:5 the flow input is declared here
+# help: a trigger's `input:` is checked against its flow's `inputs:`: every field without a `default:` must be bound (grammar 13.1)
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.a:
+  model: model.m
+  prompt: Do the thing.
+  input:
+    text: { type: string }
+  output:
+    result: { type: string }
+triggers:
+  on_request:
+    type: http
+    flow: flow.f
+    input:
+      other: "payload.body.other"
+flow.f:
+  inputs:
+    goal: { type: string }
+    other: { type: string }
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.a
+      input: { text: "input.goal" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }

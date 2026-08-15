@@ -1,0 +1,29 @@
+# rule: an explicit `input:` binds a subset of the target's declared fields (grammar 8.0)
+# code: unknown-field
+# message: `extra` is not an input field of node `n`'s target
+# at: main.yml:26:29
+# label: main.yml:18:5 the input schema is declared here
+# help: the declared fields are `text`
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.a:
+  model: model.m
+  prompt: Do the thing.
+  input:
+    text: { type: string }
+  output:
+    result: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.a
+      input: { text: "'x'", extra: "'y'" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }

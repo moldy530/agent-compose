@@ -1,0 +1,32 @@
+# rule: node configuration never reads another node's output (grammar 4.1, Decision D42)
+# code: unknown-root
+# message: `first` is not a root in scope here
+# at: main.yml:28:22
+# help: the `input:` binding of node `second` exposes `input`, `state`, `execution` (grammar 4.1)
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.a:
+  model: model.m
+  prompt: Do the thing.
+  input:
+    text: { type: string }
+  output:
+    result: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    first:
+      agent: agent.a
+      input: { text: "'x'" }
+    second:
+      agent: agent.a
+      input: { text: "first.output.result" }
+  edges:
+    - { from: start, to: first }
+    - { from: first, to: second }
+    - { from: second, to: end }

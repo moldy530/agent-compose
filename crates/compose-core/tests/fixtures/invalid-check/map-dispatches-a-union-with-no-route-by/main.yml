@@ -1,0 +1,60 @@
+# rule: union items require routing (grammar 8.6 rule 3)
+# code: missing-key
+# message: the `map` of node `dispatch` dispatches a `kind` union with no `route_by:`
+# at: main.yml:52:9
+# label: main.yml:24:9 the item type is declared here
+# help: union items require routing: declare `route_by:` and a `routes:` entry per variant, so each target is type-checked against its own variant's payload (grammar 8.6 rules 3, 4)
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.triage:
+  model: model.m
+  prompt: Triage.
+  input:
+    text: { type: string }
+  output:
+    findings:
+      type: array
+      max_items: 10
+      items:
+        discriminator: kind
+        variants:
+          auto_fixable:
+            file: { type: string }
+          needs_human:
+            summary: { type: string }
+agent.fixer:
+  model: model.m
+  prompt: Fix.
+  input:
+    file: { type: string }
+  output:
+    patch: { type: string }
+agent.reviewer:
+  model: model.m
+  prompt: Review.
+  input:
+    summary: { type: string }
+  output:
+    ticket: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    classify:
+      agent: agent.triage
+      input: { text: "'x'" }
+    dispatch:
+      map:
+        over: "classify.output.findings"
+        as: finding
+        node: agent.fixer
+        max_concurrency: 4
+        input: { file: "'x'" }
+  edges:
+    - { from: start, to: classify }
+    - { from: classify, to: dispatch }
+    - { from: dispatch, to: end }

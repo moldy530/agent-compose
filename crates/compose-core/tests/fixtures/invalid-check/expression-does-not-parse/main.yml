@@ -1,0 +1,28 @@
+# rule: a CEL expression must parse (grammar 4.1)
+# code: invalid-expression
+# message: `'x' +` is not a valid CEL expression: Syntax error: mismatched input '<EOF>' expecting {'[', '{', '(', '.', '-', '!', 'true', 'false', 'null', NUM_FLOAT, NUM_INT, NUM_UINT, STRING, BYTES, IDENTIFIER}
+# at: main.yml:25:22
+# help: the `input:` binding of node `n` takes a CEL expression (grammar 4.1)
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.a:
+  model: model.m
+  prompt: Do the thing.
+  input:
+    text: { type: string }
+  output:
+    result: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.a
+      input: { text: "'x' +" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }

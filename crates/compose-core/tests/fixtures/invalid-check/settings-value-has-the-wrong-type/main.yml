@@ -1,0 +1,13 @@
+# rule: a settings value has the type its schema publishes (grammar 12.2)
+# code: type-mismatch
+# message: `max_tokens` of `model.m` takes an integer, found a string
+# at: main.yml:13:5
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+  settings:
+    max_tokens: "lots"
