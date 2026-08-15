@@ -426,23 +426,7 @@ fn schedule_trigger(fields: &mut Fields<'_>, cx: &mut Cx) -> ScheduleTrigger {
     let cron = fields
         .require("cron", cx)
         .and_then(|node| lexical::text(node, "`cron`", cx))
-        .filter(|cron| {
-            let fields_count = cron.value.split_whitespace().count();
-            if fields_count == 5 {
-                return true;
-            }
-            cx.push(
-                Diagnostic::error(
-                    DiagnosticCode::InvalidValue,
-                    cron.span.clone(),
-                    format!(
-                        "`cron` takes a 5-field POSIX cron expression, found {fields_count} field(s)"
-                    ),
-                )
-                .with_help("the fields are minute, hour, day-of-month, month, and day-of-week"),
-            );
-            false
-        });
+        .filter(|cron| cron_shape(cron, cx));
     let timezone = fields
         .take("timezone")
         .and_then(|node| lexical::non_empty_text(node, "`timezone`", cx));
@@ -452,6 +436,46 @@ fn schedule_trigger(fields: &mut Fields<'_>, cx: &mut Cx) -> ScheduleTrigger {
         timezone,
         input,
     }
+}
+
+/// Whether `cron` has the shape grammar 13.4 fixes: five whitespace-separated
+/// fields and nothing around them (Decision D46).
+///
+/// The published schema spells the same shape as `^\S+(\s+\S+){4}$`, and the
+/// anchors are the load-bearing part. Counting the fields alone would accept
+/// `"0 3 * * * "`, which the schema rejects — and cron shape is not on PRD §7
+/// M0's static-check list, so no later pass would recover it, leaving this pass
+/// looser than the schema on a rule it owns (Appendix B).
+fn cron_shape(cron: &Spanned<String>, cx: &mut Cx) -> bool {
+    if cron.value.trim() != cron.value {
+        cx.push(
+            Diagnostic::error(
+                DiagnosticCode::InvalidValue,
+                cron.span.clone(),
+                format!(
+                    "`cron` must not begin or end with whitespace, found {:?}",
+                    cron.value
+                ),
+            )
+            .with_help(
+                "the expression is five whitespace-separated fields and nothing else, so a leading or trailing space belongs to no field: drop it",
+            ),
+        );
+        return false;
+    }
+    let fields_count = cron.value.split_whitespace().count();
+    if fields_count == 5 {
+        return true;
+    }
+    cx.push(
+        Diagnostic::error(
+            DiagnosticCode::InvalidValue,
+            cron.span.clone(),
+            format!("`cron` takes a 5-field POSIX cron expression, found {fields_count} field(s)"),
+        )
+        .with_help("the fields are minute, hour, day-of-month, month, and day-of-week"),
+    );
+    false
 }
 
 fn event_trigger(fields: &mut Fields<'_>, cx: &mut Cx) -> EventTrigger {
