@@ -169,6 +169,11 @@ model.smart:
     max_tokens: 8000
     thinking: { budget_tokens: 4000 }
     plugin_specific_knob: [1, 2, 3]
+    # `settings:` carries no environment references (grammar 4.3), so a value
+    # that must contain the six characters `${HOME}` writes the escape — at any
+    # depth, since the object is open.
+    system_suffix: "explain $${HOME} to the user"
+    nested: { deeper: ["$${HOME}"] }
 
 model.default:
   route: [model.smart, model.fast]

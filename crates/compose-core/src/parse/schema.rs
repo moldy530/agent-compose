@@ -879,8 +879,10 @@ fn default_value(
 /// Reject every `${NAME}` token a literal carries, at any depth.
 ///
 /// A composite `default:` on a state channel is a whole initial value, so the
-/// token can hide in a nested string or a mapping key rather than at the top.
-fn reject_env_refs_in_literal(value: &Spanned<Literal>, subject: &str, cx: &mut Cx) {
+/// token can hide in a nested string or a mapping key rather than at the top;
+/// the same is true of a model's `settings:`, which is the other surface
+/// grammar 4.3 puts in class 3 as a whole subtree rather than a single string.
+pub(crate) fn reject_env_refs_in_literal(value: &Spanned<Literal>, subject: &str, cx: &mut Cx) {
     match &value.value {
         Literal::String(text) => {
             lexical::reject_env_refs(&Spanned::new(text.clone(), value.span.clone()), subject, cx)

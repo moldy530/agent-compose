@@ -578,15 +578,28 @@ fn model(fields: &mut Fields<'_>, subject: &str, cx: &mut Cx) -> ModelDef {
         .and_then(|node| lexical::non_empty_text(node, "model `id`", cx));
     let settings = fields.take("settings").and_then(|node| {
         let mapping = expect_mapping(node, "`settings`", cx)?;
+        let entries: Vec<crate::ast::common::LiteralEntry> = mapping
+            .entries()
+            .iter()
+            .map(|entry| crate::ast::common::LiteralEntry {
+                key: entry.key.clone(),
+                value: literal(&entry.value),
+            })
+            .collect();
+        // Grammar 4.3 names "model `id` and every value inside `settings:`" in
+        // one class-3 breath, for PRD 5.9's reason: every LLM configuration in
+        // a project stays greppable in one file. `settings:` is open and
+        // arbitrarily deep, so the token can sit in a nested mapping or an
+        // array as easily as at the top — and with nothing downstream reading
+        // it as a reference, an unescaped one would reach the IR as the
+        // characters the author did not intend.
+        let context = format!("`settings` of {subject}");
+        for entry in &entries {
+            lexical::reject_env_refs(&entry.key, &context, cx);
+            schema::reject_env_refs_in_literal(&entry.value, &context, cx);
+        }
         Some(Settings {
-            entries: mapping
-                .entries()
-                .iter()
-                .map(|entry| crate::ast::common::LiteralEntry {
-                    key: entry.key.clone(),
-                    value: literal(&entry.value),
-                })
-                .collect(),
+            entries,
             span: node.span.clone(),
         })
     });
