@@ -25,6 +25,17 @@ serde = { version = "1", features = ["derive"] }
 # the output unchanged, which is what makes the emitted artifact byte-identical
 # for byte-identical input (PRD 5.12).
 serde_json = "1"
+# CEL, the spec's one expression language (grammar 4.1). `cel` is the maintained
+# successor of `cel-interpreter` from the same repository (cel-rust): it carries
+# the ANTLR-generated grammar the CEL specification publishes, so what parses
+# here is what the specification defines rather than a hand-written subset.
+# Pinned to an exact version — CLAUDE.md requires both interpreters pinned per
+# compiler release, because the shared conformance corpus
+# (`tests/fixtures/cel-conformance/`) is only evidence of agreement if the two
+# implementations it runs against are fixed. `regex` backs `matches()`, which
+# grammar 4.1 puts on the supported surface; `chrono` is off because no surface
+# in this grammar produces a timestamp or a duration value.
+cel = { version = "=0.14.3", default-features = false, features = ["regex"] }
 
 [dev-dependencies]
 # Schema-conformance harness only: the compiler itself does not depend on a

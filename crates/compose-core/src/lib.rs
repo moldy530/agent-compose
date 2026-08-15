@@ -14,16 +14,18 @@
 //! * [`resolve`] — [`resolve`](resolve()), following the entrypoint's
 //!   `imports:` and binding every name to what it names;
 //! * [`ir`] — the flat, self-contained JSON artifact resolution produces
-//!   (PRD 5.1).
+//!   (PRD 5.1);
+//! * [`cel`] — the expression front-end: one CEL string in, its type, what it
+//!   reads, and what is wrong with it (grammar 4.1).
 //!
 //! Everything the parser reports is decidable from a single file, and
 //! everything the resolver reports is decidable from names, files, and
-//! addresses. The static checks that need the composition's *graphs* —
-//! exhaustiveness, cycle termination, schema compatibility, CEL typing — read
-//! the IR in a later pass; `docs/grammar.md` Appendix B is the normative
-//! account of that split.
+//! addresses. The static checks that read the artifact — schema compatibility,
+//! CEL typing, and then the graph analyses — are the pass after it;
+//! `docs/grammar.md` Appendix B is the normative account of that split.
 
 pub mod ast;
+pub mod cel;
 pub mod diag;
 pub mod ir;
 pub mod parse;
