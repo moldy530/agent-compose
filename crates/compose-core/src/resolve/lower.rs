@@ -48,10 +48,10 @@ pub(crate) fn composition(source: &Composition, index: &Index<'_>) -> Option<ir:
         definitions.insert(address.clone(), definition(declared.definition)?);
     }
 
-    let mut state = BTreeMap::new();
-    for section in index.state.iter() {
+    let state = optional(index.state.as_ref(), |section| {
+        let mut entries = BTreeMap::new();
         for channel in &section.value.channels {
-            state.insert(
+            entries.insert(
                 channel.name.value.as_str().to_string(),
                 ir::Channel {
                     name: channel.name.clone(),
@@ -61,14 +61,22 @@ pub(crate) fn composition(source: &Composition, index: &Index<'_>) -> Option<ir:
                 },
             );
         }
-    }
+        Some(ir::Section {
+            entries,
+            span: section.value.span.clone(),
+        })
+    })?;
 
-    let mut triggers = BTreeMap::new();
-    for section in index.triggers.iter() {
+    let triggers = optional(index.triggers.as_ref(), |section| {
+        let mut entries = BTreeMap::new();
         for declared in &section.value.triggers {
-            triggers.insert(declared.name.value.as_str().to_string(), trigger(declared)?);
+            entries.insert(declared.name.value.as_str().to_string(), trigger(declared)?);
         }
-    }
+        Some(ir::Section {
+            entries,
+            span: section.value.span.clone(),
+        })
+    })?;
 
     let mut sources: Vec<ir::Source> = source
         .files
@@ -92,7 +100,10 @@ pub(crate) fn composition(source: &Composition, index: &Index<'_>) -> Option<ir:
         target: source.target.clone(),
         sources,
         defaults: optional(index.defaults.as_ref(), |section| {
-            policy(&section.value.value)
+            Some(Spanned::new(
+                policy(&section.value.value)?,
+                section.value.span.clone(),
+            ))
         })?,
         state,
         triggers,
@@ -621,16 +632,16 @@ fn deploy(source: &Composition) -> Option<ir::Deploy> {
         return Some(ir::Deploy {
             target: source.target.clone(),
             source: None,
-            placements: BTreeMap::new(),
+            placements: None,
             storage_backends: None,
-            event_sources: BTreeMap::new(),
+            event_sources: None,
         });
     };
 
-    let mut placements = BTreeMap::new();
-    for section in file.file.placements.iter() {
+    let placements = optional(file.file.placements.as_ref(), |section| {
+        let mut entries = BTreeMap::new();
         for placement in &section.placements {
-            placements.insert(
+            entries.insert(
                 placement.address.value.to_string(),
                 ir::deploy::Placement {
                     address: placement.address.clone(),
@@ -641,7 +652,11 @@ fn deploy(source: &Composition) -> Option<ir::Deploy> {
                 },
             );
         }
-    }
+        Some(ir::Section {
+            entries,
+            span: section.span.clone(),
+        })
+    })?;
 
     let storage_backends = optional(file.file.storage_backends.as_ref(), |section| {
         let mut defaults = BTreeMap::new();
@@ -679,10 +694,10 @@ fn deploy(source: &Composition) -> Option<ir::Deploy> {
         })
     })?;
 
-    let mut event_sources = BTreeMap::new();
-    for section in file.file.event_sources.iter() {
+    let event_sources = optional(file.file.event_sources.as_ref(), |section| {
+        let mut entries = BTreeMap::new();
         for entry in &section.sources {
-            event_sources.insert(
+            entries.insert(
                 entry.name.value.as_str().to_string(),
                 ir::deploy::EventSource {
                     name: entry.name.clone(),
@@ -693,7 +708,11 @@ fn deploy(source: &Composition) -> Option<ir::Deploy> {
                 },
             );
         }
-    }
+        Some(ir::Section {
+            entries,
+            span: section.span.clone(),
+        })
+    })?;
 
     Some(ir::Deploy {
         target: source.target.clone(),

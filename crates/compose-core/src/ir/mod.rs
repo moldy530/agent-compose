@@ -22,6 +22,11 @@
 //! }
 //! ```
 //!
+//! Each of those sections is written with the region it was declared in, so
+//! `state` is `{"entries": {…}, "span": …}` and `defaults` is `{"value": {…},
+//! "span": …}` (see [Spans](#spans)). `definitions` is the one map that is not
+//! a section and is written as the bare map it is.
+//!
 //! **Self-contained.** Nothing in it refers to a file that has to be read to
 //! understand it. Every definition is inlined under the address it is reached
 //! by, every reference has been resolved against those addresses, and every
@@ -49,8 +54,9 @@
 //! > in.
 //!
 //! Canonicalized, therefore: [`Ir::definitions`] (sorted by address —
-//! Decision D55), [`Ir::state`] and [`Ir::triggers`] (sorted by name), the
-//! deploy layer's placements, aliases, and event sources, a model's
+//! Decision D55), every [`Section::entries`] map — [`Ir::state`] and
+//! [`Ir::triggers`], the deploy layer's placements and event sources — sorted
+//! by name, a backend section's aliases and per-kind defaults, a model's
 //! `settings:`, a plugin config's keys, and [`Ir::sources`] — which is in
 //! resolution order, the entrypoint, then its imports **sorted by path**, then
 //! the deploy file, and so does not move when an import list is reordered.
@@ -72,6 +78,22 @@
 //! the construct carrying them, which is spanned. The one boolean that keeps
 //! its span is `detach:`, because whether it is legal depends on the active
 //! target and the diagnostic is about that key (grammar 8.6 rule 7).
+//!
+//! **A section is a construct too**, and every one of them is written the same
+//! way: `defaults:`, `state:`, `triggers:`, and the deploy layer's
+//! `placements:`, `storage_backends:`, and `event_sources:` each carry the
+//! region the section itself was written in alongside what it declares
+//! ([`Section`]). A rule whose subject is a whole section — a channel set that
+//! declares nothing a flow writes, a target that binds no backend for a kind a
+//! store needs — then has a place to point that is neither one arbitrary entry
+//! nor the whole file. It also makes a declared-but-empty section distinct from
+//! an absent one, which is the distinction grammar 14 already draws when it
+//! refuses an empty `storage_backends:` under `local`.
+//!
+//! `definitions:` is deliberately not one of them: definitions are not written
+//! under a section key at all, but at the top level of every file that declares
+//! any (grammar 1.5), so there is no single region to record. Each definition
+//! carries its own.
 //!
 //! [`leaf`] fixes how a span reaches JSON: one string, `file:line:col..line:col`.
 //!
@@ -131,17 +153,18 @@ pub struct Ir {
     /// Every file the composition was read from, in resolution order: the
     /// entrypoint, then its imports sorted by path, then the deploy file.
     pub sources: Vec<Source>,
-    /// `defaults:` — level 3 of the policy resolution chain (grammar 9.3).
+    /// `defaults:` — level 3 of the policy resolution chain (grammar 9.3),
+    /// with the span of the section that declares it.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub defaults: Option<Policy>,
+    pub defaults: Option<Spanned<Policy>>,
     /// `state:` — the channel set, which is composition-global in shape while
     /// each flow instance holds its own values (grammar 10.1).
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub state: BTreeMap<String, Channel>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<Section<Channel>>,
     /// `triggers:` — the **declared** triggers, which are the deployed surface
     /// (grammar 13, Decision D64).
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub triggers: BTreeMap<String, Trigger>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub triggers: Option<Section<Trigger>>,
     /// Every definition, inlined under its typed address (grammar 2.2).
     pub definitions: BTreeMap<String, Definition>,
     /// The active target's deploy layer.
@@ -174,6 +197,49 @@ impl Ir {
     #[must_use]
     pub fn definition(&self, address: &str) -> Option<&Definition> {
         self.definitions.get(address)
+    }
+}
+
+/// One section of the composition or of the deploy layer: what it declares,
+/// keyed by name, and the region the section itself was written in.
+///
+/// Sections that are a map of named entries — `state:`, `triggers:`,
+/// `placements:`, `event_sources:` — are all this one shape. The two that are
+/// not still carry their span the same way: `defaults:` is a single policy
+/// block, so it is a [`Spanned<Policy>`](Spanned), and `storage_backends:` has
+/// two maps rather than one, so it is [its own
+/// struct](deploy::StorageBackends). See the module docs on spans.
+///
+/// An `Option<Section<_>>` that is `None` means the section was **not
+/// declared**, which is not the same as one that declares nothing.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Section<T> {
+    /// The entries, sorted by name: a section's declaration order comes from
+    /// file layout, which the artifact may not depend on (see the module docs).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub entries: BTreeMap<String, T>,
+    /// The section's own span.
+    pub span: Span,
+}
+
+impl<T> Section<T> {
+    /// The entry declared under this name, if the section declares one.
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<&T> {
+        self.entries.get(name)
+    }
+
+    /// How many entries the section declares.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the section declares nothing. A declared section may be empty;
+    /// an absent one is `None` rather than an empty `Section`.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 }
 

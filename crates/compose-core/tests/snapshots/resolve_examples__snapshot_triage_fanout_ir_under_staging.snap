@@ -70,302 +70,311 @@ expression: "resolve_clean(\"examples/triage-fanout\", \"staging\")"
     }
   ],
   "defaults": {
-    "retry": {
-      "max": 1,
-      "backoff": {
-        "value": "2s",
-        "span": "main.yml:33:29..33:31"
+    "value": {
+      "retry": {
+        "max": 1,
+        "backoff": {
+          "value": "2s",
+          "span": "main.yml:33:29..33:31"
+        },
+        "span": "main.yml:33:10..33:33"
       },
-      "span": "main.yml:33:10..33:33"
+      "timeout": {
+        "value": "90s",
+        "span": "main.yml:32:12..32:15"
+      },
+      "on_error": {
+        "strategy": "fail",
+        "span": "main.yml:34:13..34:17"
+      }
     },
-    "timeout": {
-      "value": "90s",
-      "span": "main.yml:32:12..32:15"
-    },
-    "on_error": {
-      "strategy": "fail",
-      "span": "main.yml:34:13..34:17"
-    }
+    "span": "main.yml:32:3..36:1"
   },
   "state": {
-    "human_decision": {
-      "name": {
-        "value": "human_decision",
-        "span": "main.yml:65:3..65:17"
-      },
-      "type": {
-        "description": {
-          "value": "What the reviewer decided about the run as a whole.",
-          "span": "main.yml:66:18..66:69"
+    "entries": {
+      "human_decision": {
+        "name": {
+          "value": "human_decision",
+          "span": "main.yml:65:3..65:17"
         },
-        "span": "main.yml:66:5..69:1",
-        "form": "enum",
-        "variants": [
-          {
-            "value": "approve",
-            "span": "main.yml:67:12..67:19"
+        "type": {
+          "description": {
+            "value": "What the reviewer decided about the run as a whole.",
+            "span": "main.yml:66:18..66:69"
           },
-          {
-            "value": "reject",
-            "span": "main.yml:67:21..67:27"
+          "span": "main.yml:66:5..69:1",
+          "form": "enum",
+          "variants": [
+            {
+              "value": "approve",
+              "span": "main.yml:67:12..67:19"
+            },
+            {
+              "value": "reject",
+              "span": "main.yml:67:21..67:27"
+            }
+          ],
+          "default": {
+            "value": "approve",
+            "span": "main.yml:68:14..68:21"
           }
-        ],
-        "default": {
-          "value": "approve",
-          "span": "main.yml:68:14..68:21"
-        }
-      },
-      "span": "main.yml:65:3..69:1"
-    },
-    "matches": {
-      "name": {
-        "value": "matches",
-        "span": "main.yml:42:3..42:10"
-      },
-      "type": {
-        "description": {
-          "value": "Raw grep hits handed to the triage agent.",
-          "span": "main.yml:43:18..43:59"
         },
-        "span": "main.yml:43:5..53:3",
-        "form": "array",
-        "items": {
-          "span": "main.yml:45:12..45:28",
+        "span": "main.yml:65:3..69:1"
+      },
+      "matches": {
+        "name": {
+          "value": "matches",
+          "span": "main.yml:42:3..42:10"
+        },
+        "type": {
+          "description": {
+            "value": "Raw grep hits handed to the triage agent.",
+            "span": "main.yml:43:18..43:59"
+          },
+          "span": "main.yml:43:5..53:3",
+          "form": "array",
+          "items": {
+            "span": "main.yml:45:12..45:28",
+            "form": "scalar",
+            "type": "string"
+          }
+        },
+        "span": "main.yml:42:3..53:3"
+      },
+      "patches": {
+        "name": {
+          "value": "patches",
+          "span": "main.yml:53:3..53:10"
+        },
+        "type": {
+          "description": {
+            "value": "Patches produced by the fixer instances.",
+            "span": "main.yml:54:18..54:58"
+          },
+          "span": "main.yml:54:5..60:3",
+          "form": "array",
+          "items": {
+            "span": "main.yml:57:12..57:28",
+            "form": "scalar",
+            "type": "string"
+          },
+          "max_items": 200
+        },
+        "reduce": "append",
+        "span": "main.yml:53:3..60:3"
+      },
+      "report_normalized": {
+        "name": {
+          "value": "report_normalized",
+          "span": "main.yml:37:3..37:20"
+        },
+        "type": {
+          "description": {
+            "value": "The report after flow.enrich has normalized it.",
+            "span": "main.yml:38:18..38:65"
+          },
+          "span": "main.yml:38:5..42:3",
           "form": "scalar",
-          "type": "string"
-        }
-      },
-      "span": "main.yml:42:3..53:3"
-    },
-    "patches": {
-      "name": {
-        "value": "patches",
-        "span": "main.yml:53:3..53:10"
-      },
-      "type": {
-        "description": {
-          "value": "Patches produced by the fixer instances.",
-          "span": "main.yml:54:18..54:58"
+          "type": "string",
+          "default": {
+            "value": "",
+            "span": "main.yml:40:14..40:16"
+          }
         },
-        "span": "main.yml:54:5..60:3",
-        "form": "array",
-        "items": {
-          "span": "main.yml:57:12..57:28",
+        "span": "main.yml:37:3..42:3"
+      },
+      "summary": {
+        "name": {
+          "value": "summary",
+          "span": "main.yml:60:3..60:10"
+        },
+        "type": {
+          "description": {
+            "value": "Human-readable summary of the triage run.",
+            "span": "main.yml:61:18..61:59"
+          },
+          "span": "main.yml:61:5..65:3",
           "form": "scalar",
-          "type": "string"
+          "type": "string",
+          "default": {
+            "value": "",
+            "span": "main.yml:63:14..63:16"
+          }
         },
-        "max_items": 200
-      },
-      "reduce": "append",
-      "span": "main.yml:53:3..60:3"
+        "span": "main.yml:60:3..65:3"
+      }
     },
-    "report_normalized": {
-      "name": {
-        "value": "report_normalized",
-        "span": "main.yml:37:3..37:20"
-      },
-      "type": {
-        "description": {
-          "value": "The report after flow.enrich has normalized it.",
-          "span": "main.yml:38:18..38:65"
-        },
-        "span": "main.yml:38:5..42:3",
-        "form": "scalar",
-        "type": "string",
-        "default": {
-          "value": "",
-          "span": "main.yml:40:14..40:16"
-        }
-      },
-      "span": "main.yml:37:3..42:3"
-    },
-    "summary": {
-      "name": {
-        "value": "summary",
-        "span": "main.yml:60:3..60:10"
-      },
-      "type": {
-        "description": {
-          "value": "Human-readable summary of the triage run.",
-          "span": "main.yml:61:18..61:59"
-        },
-        "span": "main.yml:61:5..65:3",
-        "form": "scalar",
-        "type": "string",
-        "default": {
-          "value": "",
-          "span": "main.yml:63:14..63:16"
-        }
-      },
-      "span": "main.yml:60:3..65:3"
-    }
+    "span": "main.yml:37:3..69:1"
   },
   "triggers": {
-    "cli": {
-      "name": {
-        "value": "cli",
-        "span": "triggers.yml:5:3..5:6"
+    "entries": {
+      "cli": {
+        "name": {
+          "value": "cli",
+          "span": "triggers.yml:5:3..5:6"
+        },
+        "flow": {
+          "value": "flow.triage",
+          "span": "triggers.yml:7:11..7:22"
+        },
+        "session_key": {
+          "value": "payload.session",
+          "span": "triggers.yml:8:18..8:35"
+        },
+        "span": "triggers.yml:6:5..10:3",
+        "type": "manual"
       },
-      "flow": {
-        "value": "flow.triage",
-        "span": "triggers.yml:7:11..7:22"
-      },
-      "session_key": {
-        "value": "payload.session",
-        "span": "triggers.yml:8:18..8:35"
-      },
-      "span": "triggers.yml:6:5..10:3",
-      "type": "manual"
-    },
-    "ingest": {
-      "name": {
-        "value": "ingest",
-        "span": "triggers.yml:36:3..36:9"
-      },
-      "flow": {
-        "value": "flow.triage",
-        "span": "triggers.yml:38:11..38:22"
-      },
-      "session_key": {
-        "value": "payload.body.project",
-        "span": "triggers.yml:43:18..43:40"
-      },
-      "span": "triggers.yml:37:5..45:1",
-      "type": "event",
-      "source": {
-        "value": "bug_reports",
-        "span": "triggers.yml:39:13..39:24"
-      },
-      "input": {
-        "entries": [
-          {
-            "name": {
-              "value": "report",
-              "span": "triggers.yml:41:7..41:13"
+      "ingest": {
+        "name": {
+          "value": "ingest",
+          "span": "triggers.yml:36:3..36:9"
+        },
+        "flow": {
+          "value": "flow.triage",
+          "span": "triggers.yml:38:11..38:22"
+        },
+        "session_key": {
+          "value": "payload.body.project",
+          "span": "triggers.yml:43:18..43:40"
+        },
+        "span": "triggers.yml:37:5..45:1",
+        "type": "event",
+        "source": {
+          "value": "bug_reports",
+          "span": "triggers.yml:39:13..39:24"
+        },
+        "input": {
+          "entries": [
+            {
+              "name": {
+                "value": "report",
+                "span": "triggers.yml:41:7..41:13"
+              },
+              "value": {
+                "value": "payload.body.text",
+                "span": "triggers.yml:41:15..41:34"
+              }
             },
-            "value": {
-              "value": "payload.body.text",
-              "span": "triggers.yml:41:15..41:34"
+            {
+              "name": {
+                "value": "pattern",
+                "span": "triggers.yml:42:7..42:14"
+              },
+              "value": {
+                "value": "payload.body.pattern",
+                "span": "triggers.yml:42:16..42:38"
+              }
             }
-          },
-          {
-            "name": {
-              "value": "pattern",
-              "span": "triggers.yml:42:7..42:14"
-            },
-            "value": {
-              "value": "payload.body.pattern",
-              "span": "triggers.yml:42:16..42:38"
-            }
-          }
-        ],
-        "span": "triggers.yml:41:7..43:5"
+          ],
+          "span": "triggers.yml:41:7..43:5"
+        },
+        "dedupe_key": {
+          "value": "payload.id",
+          "span": "triggers.yml:44:17..44:29"
+        }
       },
-      "dedupe_key": {
-        "value": "payload.id",
-        "span": "triggers.yml:44:17..44:29"
+      "nightly": {
+        "name": {
+          "value": "nightly",
+          "span": "triggers.yml:24:3..24:10"
+        },
+        "flow": {
+          "value": "flow.triage",
+          "span": "triggers.yml:26:11..26:22"
+        },
+        "session_key": {
+          "value": "'nightly'",
+          "span": "triggers.yml:32:18..32:29"
+        },
+        "span": "triggers.yml:25:5..36:3",
+        "type": "schedule",
+        "cron": {
+          "value": "0 3 * * *",
+          "span": "triggers.yml:27:11..27:22"
+        },
+        "timezone": {
+          "value": "UTC",
+          "span": "triggers.yml:28:15..28:18"
+        },
+        "input": {
+          "entries": [
+            {
+              "name": {
+                "value": "report",
+                "span": "triggers.yml:30:7..30:13"
+              },
+              "value": {
+                "value": "'nightly sweep'",
+                "span": "triggers.yml:30:15..30:32"
+              }
+            },
+            {
+              "name": {
+                "value": "pattern",
+                "span": "triggers.yml:31:7..31:14"
+              },
+              "value": {
+                "value": "'TODO|FIXME'",
+                "span": "triggers.yml:31:16..31:30"
+              }
+            }
+          ],
+          "span": "triggers.yml:30:7..32:5"
+        }
+      },
+      "on_report": {
+        "name": {
+          "value": "on_report",
+          "span": "triggers.yml:10:3..10:12"
+        },
+        "flow": {
+          "value": "flow.triage",
+          "span": "triggers.yml:12:11..12:22"
+        },
+        "session_key": {
+          "value": "payload.body.project",
+          "span": "triggers.yml:18:18..18:40"
+        },
+        "span": "triggers.yml:11:5..24:3",
+        "type": "http",
+        "path": {
+          "value": "/reports",
+          "span": "triggers.yml:13:11..13:19"
+        },
+        "method": "POST",
+        "input": {
+          "entries": [
+            {
+              "name": {
+                "value": "report",
+                "span": "triggers.yml:16:7..16:13"
+              },
+              "value": {
+                "value": "payload.body.report",
+                "span": "triggers.yml:16:15..16:36"
+              }
+            },
+            {
+              "name": {
+                "value": "pattern",
+                "span": "triggers.yml:17:7..17:14"
+              },
+              "value": {
+                "value": "payload.body.pattern",
+                "span": "triggers.yml:17:16..17:38"
+              }
+            }
+          ],
+          "span": "triggers.yml:16:7..18:5"
+        },
+        "respond": "async",
+        "callback": {
+          "value": "payload.body.callback_url",
+          "span": "triggers.yml:20:15..20:42"
+        }
       }
     },
-    "nightly": {
-      "name": {
-        "value": "nightly",
-        "span": "triggers.yml:24:3..24:10"
-      },
-      "flow": {
-        "value": "flow.triage",
-        "span": "triggers.yml:26:11..26:22"
-      },
-      "session_key": {
-        "value": "'nightly'",
-        "span": "triggers.yml:32:18..32:29"
-      },
-      "span": "triggers.yml:25:5..36:3",
-      "type": "schedule",
-      "cron": {
-        "value": "0 3 * * *",
-        "span": "triggers.yml:27:11..27:22"
-      },
-      "timezone": {
-        "value": "UTC",
-        "span": "triggers.yml:28:15..28:18"
-      },
-      "input": {
-        "entries": [
-          {
-            "name": {
-              "value": "report",
-              "span": "triggers.yml:30:7..30:13"
-            },
-            "value": {
-              "value": "'nightly sweep'",
-              "span": "triggers.yml:30:15..30:32"
-            }
-          },
-          {
-            "name": {
-              "value": "pattern",
-              "span": "triggers.yml:31:7..31:14"
-            },
-            "value": {
-              "value": "'TODO|FIXME'",
-              "span": "triggers.yml:31:16..31:30"
-            }
-          }
-        ],
-        "span": "triggers.yml:30:7..32:5"
-      }
-    },
-    "on_report": {
-      "name": {
-        "value": "on_report",
-        "span": "triggers.yml:10:3..10:12"
-      },
-      "flow": {
-        "value": "flow.triage",
-        "span": "triggers.yml:12:11..12:22"
-      },
-      "session_key": {
-        "value": "payload.body.project",
-        "span": "triggers.yml:18:18..18:40"
-      },
-      "span": "triggers.yml:11:5..24:3",
-      "type": "http",
-      "path": {
-        "value": "/reports",
-        "span": "triggers.yml:13:11..13:19"
-      },
-      "method": "POST",
-      "input": {
-        "entries": [
-          {
-            "name": {
-              "value": "report",
-              "span": "triggers.yml:16:7..16:13"
-            },
-            "value": {
-              "value": "payload.body.report",
-              "span": "triggers.yml:16:15..16:36"
-            }
-          },
-          {
-            "name": {
-              "value": "pattern",
-              "span": "triggers.yml:17:7..17:14"
-            },
-            "value": {
-              "value": "payload.body.pattern",
-              "span": "triggers.yml:17:16..17:38"
-            }
-          }
-        ],
-        "span": "triggers.yml:16:7..18:5"
-      },
-      "respond": "async",
-      "callback": {
-        "value": "payload.body.callback_url",
-        "span": "triggers.yml:20:15..20:42"
-      }
-    }
+    "span": "triggers.yml:5:3..45:1"
   },
   "definitions": {
     "agent.fixer": {
@@ -2583,23 +2592,26 @@ expression: "resolve_clean(\"examples/triage-fanout\", \"staging\")"
     "target": "staging",
     "source": "deploy/staging.yml",
     "placements": {
-      "agent.fixer": {
-        "address": {
-          "value": "agent.fixer",
-          "span": "deploy/staging.yml:10:3..10:14"
+      "entries": {
+        "agent.fixer": {
+          "address": {
+            "value": "agent.fixer",
+            "span": "deploy/staging.yml:10:3..10:14"
+          },
+          "runtime": "isolated",
+          "network": "egress",
+          "span": "deploy/staging.yml:10:3..13:3"
         },
-        "runtime": "isolated",
-        "network": "egress",
-        "span": "deploy/staging.yml:10:3..13:3"
+        "flow.triage": {
+          "address": {
+            "value": "flow.triage",
+            "span": "deploy/staging.yml:13:3..13:14"
+          },
+          "runtime": "colocated",
+          "span": "deploy/staging.yml:13:3..16:1"
+        }
       },
-      "flow.triage": {
-        "address": {
-          "value": "flow.triage",
-          "span": "deploy/staging.yml:13:3..13:14"
-        },
-        "runtime": "colocated",
-        "span": "deploy/staging.yml:13:3..16:1"
-      }
+      "span": "deploy/staging.yml:10:3..16:1"
     },
     "storage_backends": {
       "defaults": {
@@ -2650,36 +2662,39 @@ expression: "resolve_clean(\"examples/triage-fanout\", \"staging\")"
       "span": "deploy/staging.yml:17:3..31:1"
     },
     "event_sources": {
-      "bug_reports": {
-        "name": {
-          "value": "bug_reports",
-          "span": "deploy/staging.yml:32:3..32:14"
-        },
-        "kind": "redis_streams",
-        "connection": {
-          "url": {
-            "value": {
-              "env_ref": "REDIS_URL"
-            },
-            "span": "deploy/staging.yml:34:5..34:22"
-          }
-        },
-        "extra": {
-          "consumer_group": {
-            "value": {
-              "text": "agent-compose"
-            },
-            "span": "deploy/staging.yml:36:5..36:34"
+      "entries": {
+        "bug_reports": {
+          "name": {
+            "value": "bug_reports",
+            "span": "deploy/staging.yml:32:3..32:14"
           },
-          "stream": {
-            "value": {
-              "text": "bug-reports"
+          "kind": "redis_streams",
+          "connection": {
+            "url": {
+              "value": {
+                "env_ref": "REDIS_URL"
+              },
+              "span": "deploy/staging.yml:34:5..34:22"
+            }
+          },
+          "extra": {
+            "consumer_group": {
+              "value": {
+                "text": "agent-compose"
+              },
+              "span": "deploy/staging.yml:36:5..36:34"
             },
-            "span": "deploy/staging.yml:35:5..35:24"
-          }
-        },
-        "span": "deploy/staging.yml:32:3..37:1"
-      }
+            "stream": {
+              "value": {
+                "text": "bug-reports"
+              },
+              "span": "deploy/staging.yml:35:5..35:24"
+            }
+          },
+          "span": "deploy/staging.yml:32:3..37:1"
+        }
+      },
+      "span": "deploy/staging.yml:32:3..37:1"
     }
   }
 }

@@ -112,7 +112,15 @@ fn no_target_named_resolves_local() {
     // `local` substitutes local storage unconditionally and may not carry a
     // backend section at all, so the artifact carries none either.
     assert!(ir.deploy.storage_backends.is_none());
-    assert!(!ir.deploy.placements.is_empty());
+    // `placements:` is reserved grammar, and reserved is not inert: `local`
+    // carries the section it was declared with, span and all (D87).
+    let placements = ir
+        .deploy
+        .placements
+        .as_ref()
+        .expect("`deploy/local.yml` declares `placements:`");
+    assert!(!placements.is_empty());
+    assert_eq!(placements.span.source.as_str(), "deploy/local.yml");
 }
 
 /// Under a named target the same composition carries that target's layer, and
@@ -448,7 +456,8 @@ fn a_single_file_project_resolves() {
         .unwrap_or_else(|| panic!("a one-file project resolves:\n{}", render(&resolution)));
     assert_eq!(ir.sources.len(), 1);
     assert_eq!(ir.definitions.len(), 1);
-    assert!(ir.state.is_empty() && ir.triggers.is_empty());
+    // A section nobody declared is absent from the artifact, not empty in it.
+    assert!(ir.state.is_none() && ir.triggers.is_none() && ir.defaults.is_none());
     assert!(ir.deploy.source.is_none(), "`local` needs no deploy file");
     let _ = fs::remove_dir_all(&dir);
 }
@@ -483,6 +492,54 @@ fn a_file_below_deploy_is_an_ordinary_import() {
     });
     assert_eq!(ir.sources.len(), 2);
     assert!(ir.definition("provider.p").is_some());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Every section carries the region it was declared in, and an absent section
+/// is not an empty one.
+///
+/// The distinction is only worth drawing if both sides are reachable, and they
+/// are: `state: {}` is a composition that declares a channel set and leaves it
+/// empty, while no `state:` at all is one that declares none. A rule whose
+/// subject is a whole section reports against the first and has nothing to say
+/// about the second — which is why the artifact keeps them apart rather than
+/// writing both as an empty map.
+#[test]
+fn a_declared_section_carries_its_span_even_when_it_declares_nothing() {
+    let dir = scratch("empty-sections");
+    write(
+        &dir,
+        "main.yml",
+        concat!(
+            "version: \"0.1\"\n",
+            "defaults: {}\n",
+            "state: {}\n",
+            "triggers: {}\n",
+        ),
+    );
+    let resolution = resolve(dir.join("main.yml"));
+    let ir = resolution.ir.as_ref().unwrap_or_else(|| {
+        panic!(
+            "a project whose sections declare nothing resolves:\n{}",
+            render(&resolution)
+        )
+    });
+
+    let state = ir.state.as_ref().expect("`state:` was declared");
+    assert!(state.is_empty());
+    assert_eq!(state.span.start.line, 3);
+    let triggers = ir.triggers.as_ref().expect("`triggers:` was declared");
+    assert!(triggers.is_empty());
+    assert_eq!(triggers.span.start.line, 4);
+    let defaults = ir.defaults.as_ref().expect("`defaults:` was declared");
+    assert_eq!(defaults.span.start.line, 2);
+
+    // What reaches the document is the span, not an empty map.
+    let json = ir.to_json().expect("the artifact serializes");
+    assert!(
+        json.contains("\"state\": {\n    \"span\": \"main.yml:3:8..3:10\"\n  }"),
+        "a section that declares nothing is written as its span alone:\n{json}"
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 

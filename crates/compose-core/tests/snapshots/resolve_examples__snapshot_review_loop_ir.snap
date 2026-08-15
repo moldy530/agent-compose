@@ -42,111 +42,120 @@ expression: "resolve_clean(\"examples/review-loop\", \"local\")"
     }
   ],
   "defaults": {
-    "timeout": {
-      "value": "120s",
-      "span": "main.yml:21:12..21:16"
+    "value": {
+      "timeout": {
+        "value": "120s",
+        "span": "main.yml:21:12..21:16"
+      },
+      "on_error": {
+        "strategy": "fail",
+        "span": "main.yml:22:13..22:17"
+      }
     },
-    "on_error": {
-      "strategy": "fail",
-      "span": "main.yml:22:13..22:17"
-    }
+    "span": "main.yml:21:3..27:1"
   },
   "state": {
-    "draft": {
-      "name": {
-        "value": "draft",
-        "span": "main.yml:28:3..28:8"
-      },
-      "type": {
-        "description": {
-          "value": "The current draft, rewritten on every pass.",
-          "span": "main.yml:29:18..29:61"
+    "entries": {
+      "draft": {
+        "name": {
+          "value": "draft",
+          "span": "main.yml:28:3..28:8"
         },
-        "span": "main.yml:29:5..32:3",
-        "form": "scalar",
-        "type": "string",
-        "default": {
-          "value": "",
-          "span": "main.yml:31:14..31:16"
-        }
+        "type": {
+          "description": {
+            "value": "The current draft, rewritten on every pass.",
+            "span": "main.yml:29:18..29:61"
+          },
+          "span": "main.yml:29:5..32:3",
+          "form": "scalar",
+          "type": "string",
+          "default": {
+            "value": "",
+            "span": "main.yml:31:14..31:16"
+          }
+        },
+        "span": "main.yml:28:3..32:3"
       },
-      "span": "main.yml:28:3..32:3"
+      "feedback": {
+        "name": {
+          "value": "feedback",
+          "span": "main.yml:32:3..32:11"
+        },
+        "type": {
+          "description": {
+            "value": "The reviewer's most recent feedback, fed back into the writer.",
+            "span": "main.yml:33:18..33:80"
+          },
+          "span": "main.yml:33:5..36:1",
+          "form": "scalar",
+          "type": "string",
+          "default": {
+            "value": "",
+            "span": "main.yml:35:14..35:16"
+          }
+        },
+        "span": "main.yml:32:3..36:1"
+      }
     },
-    "feedback": {
-      "name": {
-        "value": "feedback",
-        "span": "main.yml:32:3..32:11"
-      },
-      "type": {
-        "description": {
-          "value": "The reviewer's most recent feedback, fed back into the writer.",
-          "span": "main.yml:33:18..33:80"
-        },
-        "span": "main.yml:33:5..36:1",
-        "form": "scalar",
-        "type": "string",
-        "default": {
-          "value": "",
-          "span": "main.yml:35:14..35:16"
-        }
-      },
-      "span": "main.yml:32:3..36:1"
-    }
+    "span": "main.yml:28:3..36:1"
   },
   "triggers": {
-    "cli": {
-      "name": {
-        "value": "cli",
-        "span": "triggers.yml:9:3..9:6"
+    "entries": {
+      "cli": {
+        "name": {
+          "value": "cli",
+          "span": "triggers.yml:9:3..9:6"
+        },
+        "flow": {
+          "value": "flow.review_loop",
+          "span": "triggers.yml:11:11..11:27"
+        },
+        "span": "triggers.yml:10:5..13:3",
+        "type": "manual"
       },
-      "flow": {
-        "value": "flow.review_loop",
-        "span": "triggers.yml:11:11..11:27"
-      },
-      "span": "triggers.yml:10:5..13:3",
-      "type": "manual"
-    },
-    "on_request": {
-      "name": {
-        "value": "on_request",
-        "span": "triggers.yml:13:3..13:13"
-      },
-      "flow": {
-        "value": "flow.review_loop",
-        "span": "triggers.yml:15:11..15:27"
-      },
-      "session_key": {
-        "value": "payload.headers['x-session-id']",
-        "span": "triggers.yml:20:18..20:51"
-      },
-      "span": "triggers.yml:14:5..23:1",
-      "type": "http",
-      "path": {
-        "value": "/review",
-        "span": "triggers.yml:16:11..16:18"
-      },
-      "method": "POST",
-      "input": {
-        "entries": [
-          {
-            "name": {
-              "value": "goal",
-              "span": "triggers.yml:19:7..19:11"
-            },
-            "value": {
-              "value": "payload.body.goal",
-              "span": "triggers.yml:19:13..19:32"
+      "on_request": {
+        "name": {
+          "value": "on_request",
+          "span": "triggers.yml:13:3..13:13"
+        },
+        "flow": {
+          "value": "flow.review_loop",
+          "span": "triggers.yml:15:11..15:27"
+        },
+        "session_key": {
+          "value": "payload.headers['x-session-id']",
+          "span": "triggers.yml:20:18..20:51"
+        },
+        "span": "triggers.yml:14:5..23:1",
+        "type": "http",
+        "path": {
+          "value": "/review",
+          "span": "triggers.yml:16:11..16:18"
+        },
+        "method": "POST",
+        "input": {
+          "entries": [
+            {
+              "name": {
+                "value": "goal",
+                "span": "triggers.yml:19:7..19:11"
+              },
+              "value": {
+                "value": "payload.body.goal",
+                "span": "triggers.yml:19:13..19:32"
+              }
             }
-          }
-        ],
-        "span": "triggers.yml:19:7..20:5"
-      },
-      "respond": "async",
-      "callback": {
-        "value": "payload.body.callback_url",
-        "span": "triggers.yml:22:15..22:42"
+          ],
+          "span": "triggers.yml:19:7..20:5"
+        },
+        "respond": "async",
+        "callback": {
+          "value": "payload.body.callback_url",
+          "span": "triggers.yml:22:15..22:42"
+        }
       }
-    }
+    },
+    "span": "triggers.yml:9:3..23:1"
   },
   "definitions": {
     "agent.researcher": {

@@ -20,6 +20,8 @@ use crate::ast::definition::StoreKind;
 use crate::ast::deploy::{BackendProvider, EventSourceKind, Network, PluginValue, Runtime};
 use crate::diag::{Span, Spanned};
 
+use super::Section;
+
 /// The active target's deploy layer.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Deploy {
@@ -31,17 +33,19 @@ pub struct Deploy {
     pub source: Option<String>,
     /// `placements:` — reserved grammar, keyed by the component address, which
     /// resolves in the composition (grammar 14.1).
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub placements: BTreeMap<String, Placement>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub placements: Option<Section<Placement>>,
     /// `storage_backends:` — absent means the section was not declared, which
     /// is not the same as an empty one: under a named target a store's alias
-    /// still has to resolve somewhere (grammar 11.3).
+    /// still has to resolve somewhere (grammar 11.3). It carries its span the
+    /// way every section does; what keeps it from being a [`Section`] is that
+    /// it holds two maps rather than one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storage_backends: Option<StorageBackends>,
     /// `event_sources:` — reserved grammar, keyed by the logical name an
     /// `event` trigger's `source:` names (grammar 14.3).
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub event_sources: BTreeMap<String, EventSource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_sources: Option<Section<EventSource>>,
 }
 
 /// Where a component runs (grammar 14.1, Decision D47).
