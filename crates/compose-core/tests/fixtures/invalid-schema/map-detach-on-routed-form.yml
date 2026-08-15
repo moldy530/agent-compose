@@ -1,0 +1,21 @@
+# rule: a discriminator-routed map declares `detach` per route; a map-level `detach:` alongside `route_by:` is illegal (grammar 8.6 rule 7 / D31)
+# at: /flow.work/nodes/fan
+flow.work:
+  outputs:
+    done: { type: boolean }
+  nodes:
+    plan:
+      agent: agent.planner
+    fan:
+      map:
+        over: plan.output.findings
+        route_by: kind
+        max_concurrency: 4
+        detach: true
+        routes:
+          needs_human:
+            node: tool.review_queue
+  edges:
+    - { from: start, to: plan }
+    - { from: plan, to: fan }
+    - { from: fan, to: end }
