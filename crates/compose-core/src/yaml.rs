@@ -618,8 +618,8 @@ fn char_offsets(source: &str) -> Vec<usize> {
 /// Quoted and block scalars are always strings; plain scalars are null,
 /// boolean, integer, or float when they match the core schema's productions,
 /// and strings otherwise. An integer too large for an `i64` is kept as a float
-/// rather than silently truncated — no legal spec value is affected, and the
-/// value still reports as a number.
+/// rather than silently truncated or demoted to a string — no legal spec value
+/// is affected, and the value still reports as a number.
 fn resolve_scalar(text: &str, style: ScalarStyle) -> Yaml {
     if style != ScalarStyle::Plain {
         return Yaml::String(text.to_owned());
@@ -631,7 +631,7 @@ fn resolve_scalar(text: &str, style: ScalarStyle) -> Yaml {
         _ => {}
     }
     if let Some(value) = parse_core_int(text) {
-        return Yaml::Int(value);
+        return value;
     }
     if let Some(value) = parse_core_float(text) {
         return Yaml::Float(value);
@@ -640,22 +640,43 @@ fn resolve_scalar(text: &str, style: ScalarStyle) -> Yaml {
 }
 
 /// `[-+]?[0-9]+`, `0o[0-7]+`, or `0x[0-9a-fA-F]+`.
-fn parse_core_int(text: &str) -> Option<i64> {
+///
+/// Matching the production is what decides that the scalar is a number; whether
+/// it *fits* an `i64` only decides which number. One too wide stays a number, as
+/// a float — falling through to a string would make `123…456` a legal value
+/// wherever a string is expected, and report "found a string" wherever a number
+/// is.
+fn parse_core_int(text: &str) -> Option<Yaml> {
     if let Some(digits) = text.strip_prefix("0x") {
-        return (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_hexdigit()))
-            .then(|| i64::from_str_radix(digits, 16).ok())
-            .flatten();
+        return radix_int(digits, 16);
     }
     if let Some(digits) = text.strip_prefix("0o") {
-        return (!digits.is_empty() && digits.bytes().all(|b| (b'0'..=b'7').contains(&b)))
-            .then(|| i64::from_str_radix(digits, 8).ok())
-            .flatten();
+        return radix_int(digits, 8);
     }
     let digits = text.strip_prefix(['-', '+']).unwrap_or(text);
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    text.trim_start_matches('+').parse::<i64>().ok()
+    let text = text.trim_start_matches('+');
+    Some(match text.parse::<i64>() {
+        Ok(value) => Yaml::Int(value),
+        // Wider than an `i64`. `f64` accepts every decimal digit string, and the
+        // digits were validated above, so the fallback cannot itself fail.
+        Err(_) => Yaml::Float(text.parse::<f64>().unwrap_or(f64::NAN)),
+    })
+}
+
+/// A `0x`/`0o` integer body, once its prefix is stripped.
+fn radix_int(digits: &str, radix: u32) -> Option<Yaml> {
+    if digits.is_empty() || !digits.chars().all(|digit| digit.is_digit(radix)) {
+        return None;
+    }
+    Some(match i64::from_str_radix(digits, radix) {
+        Ok(value) => Yaml::Int(value),
+        Err(_) => Yaml::Float(digits.chars().fold(0.0_f64, |value, digit| {
+            value * f64::from(radix) + f64::from(digit.to_digit(radix).unwrap_or_default())
+        })),
+    })
 }
 
 /// `[-+]?(\.[0-9]+|[0-9]+(\.[0-9]*)?)([eE][-+]?[0-9]+)?`, `[-+]?.inf`, `.nan`.
@@ -751,6 +772,38 @@ mod tests {
         assert_eq!(
             resolve_scalar("on", ScalarStyle::Plain),
             Yaml::String("on".into())
+        );
+    }
+
+    #[test]
+    fn an_integer_wider_than_i64_stays_a_number() {
+        // Matching the integer production is what makes the scalar a number;
+        // the width of an `i64` only decides which kind of number it becomes.
+        assert_eq!(
+            resolve_scalar("123456789012345678901234567890", ScalarStyle::Plain),
+            Yaml::Float(1.234_567_890_123_456_8e29)
+        );
+        assert_eq!(
+            resolve_scalar("-99999999999999999999", ScalarStyle::Plain),
+            Yaml::Float(-1e20)
+        );
+        // Eighteen `F`s: 2^72 - 1.
+        assert_eq!(
+            resolve_scalar("0xFFFFFFFFFFFFFFFFFF", ScalarStyle::Plain),
+            Yaml::Float(4.722_366_482_869_645e21)
+        );
+        assert_eq!(
+            resolve_scalar(&i64::MAX.to_string(), ScalarStyle::Plain),
+            Yaml::Int(i64::MAX)
+        );
+        // Still not integers, and still not numbers.
+        assert_eq!(
+            resolve_scalar("0x", ScalarStyle::Plain),
+            Yaml::String("0x".into())
+        );
+        assert_eq!(
+            resolve_scalar("0o99", ScalarStyle::Plain),
+            Yaml::String("0o99".into())
         );
     }
 

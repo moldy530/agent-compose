@@ -1,0 +1,8 @@
+# rule: a plain integer too wide for an i64 is still a number, never a string (grammar 1.1)
+# code: invalid-value
+# message: `default` in state channel `attempts` must be a string, found a number
+# at: 8:14
+state:
+  attempts:
+    type: string
+    default: 123456789012345678901234567890
