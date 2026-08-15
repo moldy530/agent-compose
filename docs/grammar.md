@@ -418,7 +418,7 @@ author:
   in an instance are invalid (Decision [D8](#d8-objects-are-closed)).
 - Nesting depth is limited to **8** levels (declaration surface counts as 1).
 
-#### 3.5 Arrays
+#### 3.5 Arrays, and the result surfaces
 
 ```yaml
 tasks:
@@ -432,7 +432,7 @@ tasks:
 - `min_items` — integer ≥ 0, ≤ `max_items`.
 - `unique_items` — boolean, default `false`.
 
-**The result surfaces.** Seven declaration surfaces are **result schemas** — the
+**The result surfaces.** These declaration surfaces are **result schemas** — the
 places a node's, module's, or store's *result* is declared:
 
 `agent.output`, `tool.output`, `flow.outputs`, `human.output`, an inline
@@ -447,7 +447,7 @@ and `state` channels — is an **input surface**.
 
 **`max_items` is REQUIRED** when the array (Decision [D10](#d10-max_items-is-required-on-result-schemas-and-fanned-out-arrays)):
 
-1. appears anywhere inside a **result schema** — the seven surfaces above.
+1. appears anywhere inside a **result schema** — any surface named above.
    Model-produced cardinality must be bounded, and structured-output validation
    rejects longer arrays so the model *cannot* return more (PRD 5.6); the same
    bound keeps every edge payload finite and serializable (PRD 5.7, 5.10),
@@ -472,8 +472,8 @@ model-produced and its bound comes from whatever produced it.
 - `default:` is ILLEGAL on a **discriminated union** (§3.7) at every surface. A
   union default would have to name a variant, and manufacturing a discriminator
   tag is the same silent routing decision the result-surface rule below refuses.
-- `default:` is ILLEGAL on every **result surface** — the seven listed in §3.5,
-  which includes an inline `exec:`/`http:` node's `output` (D96). A defaulted
+- `default:` is ILLEGAL on every **result surface** — the ones §3.5 names,
+  which include an inline `exec:`/`http:` node's `output` (D96). A defaulted
   result would silently manufacture routing values (PRD 5.3): a field the model
   never emitted, or — on an inline node — a field the process never printed and
   the response never carried.
@@ -769,7 +769,7 @@ agent.reviewer:
 |---|---|---|---|---|
 | `model` | `model.*` ref | **yes** | — | PRD 5.9; no inline provider or settings overrides |
 | `prompt` | string (non-empty) | **yes** | — | system instructions; literal text, no templating (D13) |
-| `output` | field map (result surface, §3.6) | **yes** | — | PRD 5.2; MUST have ≥ 1 property |
+| `output` | field map (result surface, §3.5) | **yes** | — | PRD 5.2; MUST have ≥ 1 property |
 | `input` | field map (input surface) | no | string-in | §5.3 |
 | `tools` | array of `tool.*` / `flow.*` | no | `[]` | PRD 5.5, 5.1 |
 | `stores` | array of `store.*` | no | `[]` | PRD 5.8 |
@@ -860,7 +860,7 @@ tool.web_search:
 |---|---|---|---|
 | `description` | string (non-empty) | **yes** | LLM-facing; the selection signal (PRD 5.5) |
 | `input` | field map (input surface) | **yes** | tool parameters; `{}` for no-arg tools |
-| `output` | field map (result surface, §3.6) | **yes** | result schema; makes edges serializable (PRD 5.7) |
+| `output` | field map (result surface, §3.5) | **yes** | result schema; makes edges serializable (PRD 5.7) |
 | `exec` \| `http` \| `function` | block | **exactly one** | implementation binding |
 
 ### 6.1 Implementation bindings
@@ -1037,7 +1037,7 @@ flow.review_loop:
 |---|---|---|---|
 | `nodes` | map node-id→node | **yes** | ≥ 1 node |
 | `edges` | array of edge | **yes** | ≥ 1 edge |
-| `outputs` | field map (result surface, §3.6) | **yes** | the module's result surface (PRD 5.1) |
+| `outputs` | field map (result surface, §3.5) | **yes** | the module's result surface (PRD 5.1) |
 | `inputs` | field map (input surface) | no | default: no inputs |
 | `description` | string | no | REQUIRED when the flow is used as an agent tool |
 
@@ -1281,12 +1281,12 @@ Back-edges are permitted (PRD 5.4). The compiler computes SCCs and requires:
   budget while that guard is false takes no edge at all. A bounded edge whose
   source has no escape of this form is a compile error naming the edge
   (Decision [D19](#d19-max_iterations-semantics-and-the-escape-edge-rule)).
-  Clause 2's exit edge always satisfies (a); whether it satisfies (b) depends on
-  which spelling it is. The `else: true` spelling does, so an SCC bounded that
-  way needs nothing further even if it *also* carries `max_iterations`; a
-  `when:`-guarded exit does not, so that SCC must provide the unconditional or
-  `else:` escape separately. The escape rule is stated over the bounded edge's
-  source node and is checked independently of which clause bounded the SCC.
+  This rule is stated over the **source node of the bounded edge** and is checked
+  there, whatever else bounds the SCC. Clause 2's exit edge always satisfies (a),
+  and satisfies (b) only in its `else: true` spelling — so where clause 2's node
+  `n` is also the source of a `max_iterations` edge, an `else:` exit discharges
+  both rules at once and a `when:`-guarded exit discharges neither. Where they
+  are different nodes, the two rules are simply independent.
 
 `max_iterations` counts **traversals of that edge within one flow instance**.
 Instances of the same flow (including `map`-dispatched ones) count independently.
@@ -1800,7 +1800,7 @@ in §6.1, plus:
 
 | Key | Type | Required | Default |
 |---|---|---|---|
-| `output` | field map (result surface, §3.5/§3.6) | no | `{ exit_code: {type: integer}, stdout: {type: string} }` |
+| `output` | field map (result surface, §3.5) | no | `{ exit_code: {type: integer}, stdout: {type: string} }` |
 
 The node-level `input:` bindings produce the object passed to the child as
 environment variables — binding keys are identifiers (§2.1) and are
@@ -1857,7 +1857,7 @@ notify:
 
 | Key | Type | Required | Default |
 |---|---|---|---|
-| `output` | field map (result surface, §3.5/§3.6) | no | `{ status: {type: integer}, body: {type: string} }` |
+| `output` | field map (result surface, §3.5) | no | `{ status: {type: integer}, body: {type: string} }` |
 
 An inline node's `query:`/`body:` CEL is *flow*-scoped — `input`, `state`,
 `execution` (§4.1) — unlike the same keys inside a `tool.*` binding, which see
@@ -2196,7 +2196,7 @@ approve:
 | Key (inside `human:`) | Type | Required | Notes |
 |---|---|---|---|
 | `input` | field map (input surface) | yes | rendered for the human |
-| `output` | field map (result surface, §3.6) | yes | routable structured output; resume payloads are validated against it (PRD 5.11) |
+| `output` | field map (result surface, §3.5) | yes | routable structured output; resume payloads are validated against it (PRD 5.11) |
 | `timeout` | duration | no | wall-clock wait budget |
 | `on_timeout` | flow-local node id, or `end` | with `timeout`, never without | route taken on expiry; same targets as `on_error.fallback` (§2.4, §9.2) |
 
@@ -2518,8 +2518,8 @@ store.docs:
 |---|---|---|---|
 | `kind` | `kv` \| `vector` \| `blob` | yes | relational/SQL deliberately excluded (PRD 5.8) |
 | `scope` | `execution` \| `session` \| `global` | yes | explicit lifetimes (D35) |
-| `value_schema` | field map (result surface, §3.6) | `kv` REQUIRED; `vector`/`blob` illegal | stored value shape |
-| `metadata_schema` | field map (result surface, §3.6) | `vector`/`blob` optional; `kv` illegal | filterable metadata |
+| `value_schema` | field map (result surface, §3.5) | `kv` REQUIRED; `vector`/`blob` illegal | stored value shape |
+| `metadata_schema` | field map (result surface, §3.5) | `vector`/`blob` optional; `kv` illegal | filterable metadata |
 | `embed` | block | `vector` required; others illegal | §11.2 |
 | `backend` | identifier (bare alias) | no | abstract slot; never provider config |
 | `description` | string | no | LLM-facing for agent-attached stores |
@@ -3184,7 +3184,7 @@ guard typing. *PRD 5.3.*
 
 ### D10. `max_items` is required on result schemas and fanned-out arrays
 
-Required inside every result schema — the seven surfaces §3.5 lists, which
+Required inside every result schema — the surfaces §3.5 lists, which
 include an inline `exec:`/`http:` node's `output`
 ([D96](#d96-an-inline-exechttp-nodes-output-is-a-result-schema)) — and on any
 array a `map.over` resolves to; optional on every input surface. **Rationale**: PRD 5.6
@@ -4365,14 +4365,14 @@ questions, one section each. *PRD 5.3, 5.5, G3.*
 
 ### D96. An inline `exec`/`http` node's `output` is a result schema
 
-The result surfaces are seven, not five: `agent.output`, `tool.output`,
-`flow.outputs`, `human.output`, an inline `exec:`/`http:` node's `output`, and
-the two store schemas. Arrays inside any of them MUST declare `max_items` and
-`default:` is illegal in all of them (§3.5, §3.6, §3.9).
+The result surfaces are `agent.output`, `tool.output`, `flow.outputs`,
+`human.output`, an inline `exec:`/`http:` node's `output`, and the two store
+schemas. Arrays inside any of them MUST declare `max_items` and `default:` is
+illegal in all of them (§3.5, §3.6, §3.9).
 **Rationale**: the published schema already routed `execNode`/`httpNode`
 `output` through the result-surface field map — `max_items` required, `default:`
-refused — while §3.5, §3.6, D10, and Appendix B all enumerated five surfaces and
-omitted the inline pair. That inverts Appendix B's one-directional invariant: an
+refused — while §3.5, §3.6, D10, and Appendix B each enumerated the same shorter
+list and omitted the inline pair. That inverts Appendix B's one-directional invariant: an
 inline `exec:` node declaring `names: { type: array, items: {type: string} }`
 passed the grammar text and failed the schema, so the two artifacts described
 two different languages, which is the one thing this document and that file may
@@ -4389,7 +4389,7 @@ which are as unbounded as any model. The `default:` half follows from the same
 reading of §3.6: a defaulted result manufactures a routing value the run never
 produced, and nothing about a process makes that safer than a model. Stating the
 list once, in §3.5, and pointing §3.6, §3.9, D10, and Appendix B at it is what
-stops the next surface from being added to three of the five places. *PRD 5.2,
+stops the next surface from being added to three of the four places. *PRD 5.2,
 5.5, 5.6, 5.7, 5.10.*
 
 ### D97. A `skip` changes guard values, not the routing algorithm
@@ -4591,11 +4591,11 @@ authority. The schema cannot see across files, so it does not check:
   `deploy/<name>.yml` (§14, D87), and `detach: true` under a checkpointed target
   (§8.6 rule 7, D59);
 - context-sensitive schema rules whose surface is not syntactically identifiable
-  in one file. `max_items` is the example of the split: on all **seven** result
-  surfaces (§3.5) — `agent.output`, `tool.output`, `flow.outputs`,
+  in one file. `max_items` is the example of the split: on **every** result
+  surface (§3.5) — `agent.output`, `tool.output`, `flow.outputs`,
   `human.output`, an inline `exec:`/`http:` node's `output`, and the two store
   schemas — the surface is a named key, so the schema *does* require it there,
-  and refuses `default:` there, on the same seven (§3.5 clause 1, §3.6, D96); as
+  and refuses `default:` there, on the same list (§3.5 clause 1, §3.6, D96); as
   the target of a `map.over` path (§3.5 clause 2) it depends on resolving a path
   through other files, so only the validator can require it there.
 

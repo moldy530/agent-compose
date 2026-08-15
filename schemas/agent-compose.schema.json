@@ -238,7 +238,7 @@
       "additionalProperties": { "$ref": "#/$defs/typeNode" }
     },
     "outputFieldMap": {
-      "description": "A result-surface schema: field name -> type node. The result surfaces are the seven grammar 3.5 lists - agent output, tool output, flow outputs, human output, an inline exec/http node's `output` (Decision D96), and the two store schemas. Defaults are illegal here and every array must declare max_items. `{}` is legal and denotes a result with no fields. Grammar 3.5, 3.6, 3.9 / PRD 5.2, 5.6.",
+      "description": "A result-surface schema: field name -> type node. The result surfaces are the ones grammar 3.5 lists - agent output, tool output, flow outputs, human output, an inline exec/http node's `output` (Decision D96), and the two store schemas. Defaults are illegal here and every array must declare max_items. `{}` is legal and denotes a result with no fields. Grammar 3.5, 3.6, 3.9 / PRD 5.2, 5.6.",
       "type": "object",
       "propertyNames": { "$ref": "#/$defs/identifier" },
       "additionalProperties": { "$ref": "#/$defs/outputTypeNode" }
@@ -1078,7 +1078,7 @@
             },
             "expect_exit": { "$ref": "#/$defs/expectExit" },
             "output": {
-              "description": "Result schema (default: { exit_code: integer, stdout: string }). `exit_code`, `stdout`, and `stderr` are envelope fields bound from the child process itself, with fixed types; every other field is decoded from stdout as JSON, unconditionally - §6.1's single-string-property exception is a tool-surface rule and does not apply here, because raw stdout already has a name on this surface (Decision D91). Declaring a field is a decoding choice and never changes which outcomes are node errors - widening `expect_exit` is what does (Decision D84). This is one of the seven RESULT surfaces, so every array inside it must declare `max_items` and `default:` is illegal (grammar 3.5, 3.6 / Decision D96). Grammar 8.2.",
+              "description": "Result schema (default: { exit_code: integer, stdout: string }). `exit_code`, `stdout`, and `stderr` are envelope fields bound from the child process itself, with fixed types; every other field is decoded from stdout as JSON, unconditionally - §6.1's single-string-property exception is a tool-surface rule and does not apply here, because raw stdout already has a name on this surface (Decision D91). Declaring a field is a decoding choice and never changes which outcomes are node errors - widening `expect_exit` is what does (Decision D84). This is a RESULT surface, so every array inside it must declare `max_items` and `default:` is illegal (grammar 3.5, 3.6 / Decision D96). Grammar 8.2.",
               "allOf": [
                 { "$ref": "#/$defs/outputFieldMap" },
                 { "$ref": "#/$defs/execEnvelopeFields" }
@@ -1130,7 +1130,7 @@
               "$ref": "#/$defs/expectStatus"
             },
             "output": {
-              "description": "Result schema (default: { status: integer, body: string }). `status` and `body` are envelope fields bound from the response itself, with fixed types; every other field is decoded from the response body as JSON, unconditionally - §6.1's single-string-property exception is a tool-surface rule and does not apply here, because the raw response text already has a name on this surface (Decision D91). This is one of the seven RESULT surfaces, so every array inside it must declare `max_items` and `default:` is illegal (grammar 3.5, 3.6 / Decision D96). Grammar 8.3.",
+              "description": "Result schema (default: { status: integer, body: string }). `status` and `body` are envelope fields bound from the response itself, with fixed types; every other field is decoded from the response body as JSON, unconditionally - §6.1's single-string-property exception is a tool-surface rule and does not apply here, because the raw response text already has a name on this surface (Decision D91). This is a RESULT surface, so every array inside it must declare `max_items` and `default:` is illegal (grammar 3.5, 3.6 / Decision D96). Grammar 8.3.",
               "allOf": [
                 { "$ref": "#/$defs/outputFieldMap" },
                 { "$ref": "#/$defs/httpEnvelopeFields" }
