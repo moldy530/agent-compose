@@ -231,7 +231,13 @@
       "additionalProperties": { "$ref": "#/$defs/typeNode" }
     },
     "outputFieldMap": {
-      "description": "A result-surface schema (agent/tool/human output, flow outputs, store schemas): field name -> type node. Defaults are illegal here and every array must declare max_items. Grammar 3.6 / PRD 5.2, 5.6.",
+      "description": "A result-surface schema (tool/human output, flow outputs, store schemas): field name -> type node. Defaults are illegal here and every array must declare max_items. `{}` is legal and denotes a result with no fields. Grammar 3.6, 3.9 / PRD 5.2, 5.6.",
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/identifier" },
+      "additionalProperties": { "$ref": "#/$defs/outputTypeNode" }
+    },
+    "agentOutputFieldMap": {
+      "description": "An agent's result schema: as `outputFieldMap`, but it must declare at least one property - the structured output is what routing reads and what makes every edge serializable, so an empty one is a compile error. Grammar 5.1 / PRD 5.2, 5.3.",
       "type": "object",
       "minProperties": 1,
       "propertyNames": { "$ref": "#/$defs/identifier" },
@@ -736,7 +742,7 @@
     },
 
     "inputBindings": {
-      "description": "Node input bindings: field name -> CEL over input/state/execution. Unbound declared fields fall back to the state channel of the same name, then to the flow input of the same name. A bare string binds a string-in agent's single unnamed input. Grammar 8.0.",
+      "description": "Node input bindings: field name -> CEL over input/state/execution. Unbound declared fields fall back to the state channel of the same name, then to the flow input of the same name, then to the field's own `default:` if it declares one. A bare string binds a string-in agent's single unnamed input. Grammar 8.0.",
       "oneOf": [
         { "description": "Scalar binding for a string-in target.", "$ref": "#/$defs/cel" },
         {
@@ -748,7 +754,7 @@
       ]
     },
     "mapInputBindings": {
-      "description": "Per-field bindings, CEL over the item binding, item_index, input, state, and execution.",
+      "description": "Per-field bindings: field name -> CEL over the item binding (`item` unless renamed with `as:`), input, state, and execution. The per-item index is spelled `execution.item_index`; there is no bare `item_index` root. Grammar 4.1 / Decision D63.",
       "type": "object",
       "propertyNames": { "$ref": "#/$defs/identifier" },
       "additionalProperties": { "$ref": "#/$defs/cel" }
@@ -767,7 +773,7 @@
       "properties": {
         "model": { "description": "The model binding. Agents reference model.* only - no inline provider or settings overrides (PRD 5.9).", "$ref": "#/$defs/modelRef" },
         "prompt": { "description": "System instructions. Literal text: there is no interpolation; dynamic content travels through the input schema.", "type": "string", "minLength": 1 },
-        "output": { "description": "REQUIRED structured output schema. Load-bearing for routing (PRD 5.3) and for making every edge serializable (PRD 5.7).", "$ref": "#/$defs/outputFieldMap" },
+        "output": { "description": "REQUIRED structured output schema, declaring at least one property. Load-bearing for routing (PRD 5.3) and for making every edge serializable (PRD 5.7).", "$ref": "#/$defs/agentOutputFieldMap" },
         "input": {
           "description": "Optional input schema, declaring at least one field. Omitting it is the only way to get the string-in default (a single unnamed string bound with the scalar form at the node); `input: {}` is neither contract and is a compile error.",
           "allOf": [{ "$ref": "#/$defs/fieldMap" }, { "minProperties": 1 }]
@@ -1183,19 +1189,98 @@
       "allOf": [
         {
           "if": { "properties": { "op": { "enum": ["get", "delete"] } }, "required": ["op"] },
-          "then": { "required": ["key"] }
+          "then": {
+            "description": "`get`/`delete` address one key and take no other parameter. Grammar 11.4.",
+            "required": ["key"],
+            "properties": {
+              "value": false,
+              "query": false,
+              "top_k": false,
+              "prefix": false,
+              "limit": false,
+              "filter": false,
+              "metadata": false,
+              "content_type": false
+            }
+          }
         },
         {
           "if": { "properties": { "op": { "enum": ["set", "upsert", "put"] } }, "required": ["op"] },
           "then": { "required": ["key", "value"] }
         },
         {
+          "if": { "properties": { "op": { "const": "set" } }, "required": ["op"] },
+          "then": {
+            "description": "`kv set` takes `key` and `value` only. Grammar 11.4.",
+            "properties": {
+              "query": false,
+              "top_k": false,
+              "prefix": false,
+              "limit": false,
+              "filter": false,
+              "metadata": false,
+              "content_type": false
+            }
+          }
+        },
+        {
+          "if": { "properties": { "op": { "const": "upsert" } }, "required": ["op"] },
+          "then": {
+            "description": "`vector upsert` takes `key`, `value`, and optional `metadata`. Grammar 11.4.",
+            "properties": {
+              "query": false,
+              "top_k": false,
+              "prefix": false,
+              "limit": false,
+              "filter": false,
+              "content_type": false
+            }
+          }
+        },
+        {
+          "if": { "properties": { "op": { "const": "put" } }, "required": ["op"] },
+          "then": {
+            "description": "`blob put` takes `key`, `value`, and optional `content_type`. Grammar 11.4.",
+            "properties": {
+              "query": false,
+              "top_k": false,
+              "prefix": false,
+              "limit": false,
+              "filter": false,
+              "metadata": false
+            }
+          }
+        },
+        {
           "if": { "properties": { "op": { "const": "list" } }, "required": ["op"] },
-          "then": { "required": ["limit"] }
+          "then": {
+            "description": "`list` takes an optional `prefix` and a required `limit`. Grammar 11.4.",
+            "required": ["limit"],
+            "properties": {
+              "key": false,
+              "value": false,
+              "query": false,
+              "top_k": false,
+              "filter": false,
+              "metadata": false,
+              "content_type": false
+            }
+          }
         },
         {
           "if": { "properties": { "op": { "const": "search" } }, "required": ["op"] },
-          "then": { "required": ["query", "top_k"] }
+          "then": {
+            "description": "`vector search` takes `query`, `top_k`, and an optional metadata `filter`. Grammar 11.4.",
+            "required": ["query", "top_k"],
+            "properties": {
+              "key": false,
+              "value": false,
+              "prefix": false,
+              "limit": false,
+              "metadata": false,
+              "content_type": false
+            }
+          }
         },
         {
           "if": { "properties": { "op": { "const": "set" } }, "required": ["op"] },
@@ -1253,7 +1338,7 @@
             "on_item_error": { "description": "Per-item error strategy (default fail).", "enum": ["fail", "skip", "retry"] },
             "input": { "description": "Per-item input bindings; without it the whole item is passed.", "$ref": "#/$defs/mapInputBindings" },
             "writes": { "description": "Write remap; targets must be channels with a declared reduce policy.", "$ref": "#/$defs/writes" },
-            "detach": { "description": "Fire-and-forget dispatch. A detached dispatch may not write reduced state, and detach + checkpointing is a v0 validation error.", "type": "boolean" }
+            "detach": { "description": "Fire-and-forget dispatch, homogeneous form only. Illegal here alongside `route_by:` - a discriminator-routed map declares detach per route. A detached dispatch may not write reduced state, and detach + checkpointing is a v0 validation error.", "type": "boolean" }
           },
           "additionalProperties": false,
           "oneOf": [
@@ -1278,6 +1363,13 @@
             {
               "if": { "properties": { "detach": { "const": true } }, "required": ["detach"] },
               "then": { "not": { "required": ["writes"] } }
+            },
+            {
+              "if": { "required": ["route_by"] },
+              "then": {
+                "description": "A discriminator-routed map declares `detach` per route, never map-wide. Grammar 8.6 rule 7 / Decision D31.",
+                "properties": { "detach": false }
+              }
             }
           ]
         },
@@ -1490,13 +1582,13 @@
       "additionalProperties": { "$ref": "#/$defs/cel" }
     },
     "manualTrigger": {
-      "description": "CLI/SDK invocation: `agent-compose run <flow> --input k=v`. Declares no `input:` bindings - CLI arguments are validated directly against the flow's input schema. Grammar 13.2.",
+      "description": "CLI/SDK invocation: `agent-compose run <flow> --input k=v`. Declares no `input:` bindings - CLI arguments are validated against the flow's input schema at run start instead. Declaring it is optional: the same CLI entry exists implicitly for every flow (grammar 13, Decision D64); writing it out documents the entry and lets it carry `description:` or a `session_key:` remap. Grammar 13.2.",
       "type": "object",
       "required": ["type", "flow"],
       "properties": {
         "type": { "const": "manual", "description": "Manual (CLI/SDK) invocation." },
         "flow": { "description": "The flow this trigger starts.", "$ref": "#/$defs/flowRef" },
-        "session_key": { "description": "CEL over payload producing the session identity (`--session <key>` is exposed as payload.session).", "$ref": "#/$defs/cel" },
+        "session_key": { "description": "CEL over payload producing the session identity. Defaults to \"payload.session\" - the CLI's `--session <key>`, the manual payload's only member - so a manual trigger always satisfies the session-coherence check statically (grammar 11.3).", "$ref": "#/$defs/cel" },
         "description": { "description": "Documentation.", "type": "string" }
       },
       "additionalProperties": false
