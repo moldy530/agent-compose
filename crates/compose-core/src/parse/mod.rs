@@ -16,12 +16,29 @@
 //! of this pass, and `tests/parse_invalid.rs` replays its negative corpus here
 //! to keep the two from drifting. The direction of the relationship is fixed by
 //! Appendix B and it is one-directional: a file the schema rejects must fail
-//! `validate`, never the reverse. This pass may therefore be stricter, and may
-//! not be looser — nowhere, on no rule. The one place they used to part is
-//! closed: the `imports:` pattern the schema publishes is grammar 1.4's own
-//! segment charset (Decision D80) rather than a constraint of its own, and
-//! `section.rs` enforces exactly that charset, so a relative path carrying a
-//! space is refused by both.
+//! `validate`, never the reverse. `validate` is more than this pass, though —
+//! it parses, resolves, and then runs the static checks — so the invariant
+//! *this module* can be held to is the same claim narrowed to its own scope:
+//! **on every rule this pass owns, it is at least as strict as the schema, and
+//! it may be stricter.** Two rules where it used to be looser are closed. The
+//! `imports:` pattern the schema publishes is grammar 1.4's own segment charset
+//! (Decision D80) rather than a constraint of its own, and `section.rs`
+//! enforces exactly that charset, so a relative path carrying a space is
+//! refused by both. And `cron:` is anchored here the way the schema anchors it
+//! (`^\S+(\s+\S+){4}$`), so a trailing space is refused rather than swallowed
+//! by a field count that ignores it.
+//!
+//! Where the schema is tighter than this pass, the rule belongs to a later one
+//! by Appendix B's own assignment, and `settings:` is the case to know. The
+//! schema types the nine keys it recognises — `max_tokens` at least 1, a
+//! numeric `temperature`, `stop` as an array of strings — while this pass reads
+//! the block as an open literal and checks only what grammar 4.3 makes its
+//! business, that no value inside it reaches for an environment reference.
+//! Appendix B gives provider settings and capability checks to the validator,
+//! because whether `thinking:` is even a key depends on the provider the model
+//! names, which is another file. So `model.m: { …, settings: { max_tokens: 0 } }`
+//! parses clean and fails later: the replay above says nothing about `settings:`
+//! shape, and neither does anything else here.
 //!
 //! What it deliberately leaves alone:
 //!
