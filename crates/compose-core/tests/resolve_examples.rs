@@ -279,6 +279,136 @@ fn import_order_does_not_change_the_artifact() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// No object in the artifact may repeat a key.
+///
+/// The IR writes several constructs by merging a tagged variant into its
+/// container — a node's kind onto the node, a type node's form onto the type
+/// node, a definition's body onto the definition — which is what keeps the
+/// document reading like the DSL. The hazard that comes with it is a name
+/// colliding across the merge, and JSON's own answer to a repeated key is to
+/// keep one silently: the artifact would parse, and a field would be gone. A
+/// `flow:` node is the case that has both halves — its own `timeout:` (level 2
+/// of grammar 9.3) and a `policy:` override for the nodes inside it (level 1,
+/// Decision D60) — so it is built here explicitly rather than left to whether
+/// an example happens to declare one.
+#[test]
+fn no_object_in_the_artifact_repeats_a_key() {
+    let dir = scratch("unique-keys");
+    write(
+        &dir,
+        "main.yml",
+        concat!(
+            "version: \"0.1\"\n",
+            "flow.inner:\n",
+            "  outputs: {}\n",
+            "  nodes:\n",
+            "    step: { exec: { command: \"true\" } }\n",
+            "  edges:\n",
+            "    - { from: start, to: step }\n",
+            "    - { from: step, to: end }\n",
+            "flow.outer:\n",
+            "  outputs: {}\n",
+            "  nodes:\n",
+            "    sub:\n",
+            "      flow: flow.inner\n",
+            "      policy: { timeout: 30s }\n",
+            "      timeout: 10s\n",
+            "      on_error: skip\n",
+            "  edges:\n",
+            "    - { from: start, to: sub }\n",
+            "    - { from: sub, to: end }\n",
+        ),
+    );
+
+    for json in [
+        resolve(dir.join("main.yml"))
+            .ir
+            .expect("the nesting project resolves")
+            .to_json()
+            .expect("the artifact serializes"),
+        resolve_clean("examples/review-loop", "local"),
+        resolve_clean("examples/triage-fanout", "staging"),
+    ] {
+        serde_json::from_str::<unique::Object>(&json).unwrap_or_else(|error| {
+            panic!("the artifact repeats a key: {error}");
+        });
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A JSON value that refuses to deserialize when any object in it repeats a
+/// key. `serde_json`'s own `Value` keeps the last of a repeated pair, so the
+/// check has to be made while the keys go past.
+mod unique {
+    use std::collections::BTreeSet;
+    use std::fmt;
+
+    use serde::Deserialize;
+    use serde::de::{Deserializer, Error, MapAccess, SeqAccess, Visitor};
+
+    pub struct Object;
+
+    impl<'de> Deserialize<'de> for Object {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            deserializer.deserialize_any(Any)
+        }
+    }
+
+    struct Any;
+
+    impl<'de> Visitor<'de> for Any {
+        type Value = Object;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("any JSON value whose objects have distinct keys")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut seen: BTreeSet<String> = BTreeSet::new();
+            while let Some(key) = map.next_key::<String>()? {
+                map.next_value::<Object>()?;
+                if !seen.insert(key.clone()) {
+                    return Err(A::Error::custom(format!("`{key}` appears twice")));
+                }
+            }
+            Ok(Object)
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            while seq.next_element::<Object>()?.is_some() {}
+            Ok(Object)
+        }
+
+        fn visit_str<E: Error>(self, _: &str) -> Result<Self::Value, E> {
+            Ok(Object)
+        }
+        fn visit_bool<E: Error>(self, _: bool) -> Result<Self::Value, E> {
+            Ok(Object)
+        }
+        fn visit_i64<E: Error>(self, _: i64) -> Result<Self::Value, E> {
+            Ok(Object)
+        }
+        fn visit_u64<E: Error>(self, _: u64) -> Result<Self::Value, E> {
+            Ok(Object)
+        }
+        fn visit_f64<E: Error>(self, _: f64) -> Result<Self::Value, E> {
+            Ok(Object)
+        }
+        fn visit_unit<E: Error>(self) -> Result<Self::Value, E> {
+            Ok(Object)
+        }
+        fn visit_none<E: Error>(self) -> Result<Self::Value, E> {
+            Ok(Object)
+        }
+        fn visit_some<D: Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Self::Value, D::Error> {
+            deserializer.deserialize_any(Any)
+        }
+    }
+}
+
 /// A single-file project is a composition too: no `imports:`, no deploy file,
 /// and the zero-config `local` target (grammar 1.4, 14).
 #[test]

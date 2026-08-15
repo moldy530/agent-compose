@@ -778,24 +778,22 @@ expression: "resolve_clean(\"examples/triage-fanout\", \"staging\")"
             "value": "fetch",
             "span": "flows/enrich.yml:11:5..11:10"
           },
-          "policy": {
-            "retry": {
-              "max": 2,
-              "backoff": {
-                "value": "1s",
-                "span": "flows/enrich.yml:29:33..29:35"
-              },
-              "multiplier": 3.0,
-              "max_backoff": {
-                "value": "20s",
-                "span": "flows/enrich.yml:29:67..29:70"
-              },
-              "span": "flows/enrich.yml:29:14..29:72"
+          "retry": {
+            "max": 2,
+            "backoff": {
+              "value": "1s",
+              "span": "flows/enrich.yml:29:33..29:35"
             },
-            "timeout": {
-              "value": "15s",
-              "span": "flows/enrich.yml:28:16..28:19"
-            }
+            "multiplier": 3.0,
+            "max_backoff": {
+              "value": "20s",
+              "span": "flows/enrich.yml:29:67..29:70"
+            },
+            "span": "flows/enrich.yml:29:14..29:72"
+          },
+          "timeout": {
+            "value": "15s",
+            "span": "flows/enrich.yml:28:16..28:19"
           },
           "span": "flows/enrich.yml:12:7..30:3",
           "kind": "http",
@@ -1102,11 +1100,9 @@ expression: "resolve_clean(\"examples/triage-fanout\", \"staging\")"
             "value": "dispatch",
             "span": "flows/triage.yml:48:5..48:13"
           },
-          "policy": {
-            "on_error": {
-              "strategy": "skip",
-              "span": "flows/triage.yml:98:17..98:21"
-            }
+          "on_error": {
+            "strategy": "skip",
+            "span": "flows/triage.yml:98:17..98:21"
           },
           "span": "flows/triage.yml:49:7..104:5",
           "kind": "map",
@@ -1280,19 +1276,17 @@ expression: "resolve_clean(\"examples/triage-fanout\", \"staging\")"
             "value": "announce",
             "span": "flows/triage.yml:104:5..104:13"
           },
-          "policy": {
-            "timeout": {
-              "value": "10s",
-              "span": "flows/triage.yml:114:16..114:19"
+          "timeout": {
+            "value": "10s",
+            "span": "flows/triage.yml:114:16..114:19"
+          },
+          "on_error": {
+            "strategy": "fallback",
+            "target": {
+              "value": "announce_failed",
+              "span": "flows/triage.yml:118:29..118:44"
             },
-            "on_error": {
-              "strategy": "fallback",
-              "target": {
-                "value": "announce_failed",
-                "span": "flows/triage.yml:118:29..118:44"
-              },
-              "span": "flows/triage.yml:118:17..118:46"
-            }
+            "span": "flows/triage.yml:118:17..118:46"
           },
           "span": "flows/triage.yml:105:7..130:5",
           "kind": "http",
@@ -1367,11 +1361,9 @@ expression: "resolve_clean(\"examples/triage-fanout\", \"staging\")"
             "value": "announce_failed",
             "span": "flows/triage.yml:130:5..130:20"
           },
-          "policy": {
-            "on_error": {
-              "strategy": "skip",
-              "span": "flows/triage.yml:134:17..134:21"
-            }
+          "on_error": {
+            "strategy": "skip",
+            "span": "flows/triage.yml:134:17..134:21"
           },
           "span": "flows/triage.yml:131:7..147:5",
           "kind": "exec",
@@ -1428,15 +1420,13 @@ expression: "resolve_clean(\"examples/triage-fanout\", \"staging\")"
               "span": "flows/triage.yml:159:9..160:7"
             }
           },
-          "policy": {
-            "timeout": {
-              "value": "5m",
-              "span": "flows/triage.yml:160:16..160:18"
-            },
-            "on_error": {
-              "strategy": "skip",
-              "span": "flows/triage.yml:161:17..161:21"
-            }
+          "timeout": {
+            "value": "5m",
+            "span": "flows/triage.yml:160:16..160:18"
+          },
+          "on_error": {
+            "strategy": "skip",
+            "span": "flows/triage.yml:161:17..161:21"
           },
           "span": "flows/triage.yml:148:7..163:5",
           "kind": "exec",
@@ -1558,11 +1548,9 @@ expression: "resolve_clean(\"examples/triage-fanout\", \"staging\")"
             "value": "remember",
             "span": "flows/triage.yml:172:5..172:13"
           },
-          "policy": {
-            "on_error": {
-              "strategy": "skip",
-              "span": "flows/triage.yml:179:17..179:21"
-            }
+          "on_error": {
+            "strategy": "skip",
+            "span": "flows/triage.yml:179:17..179:21"
           },
           "span": "flows/triage.yml:173:7..183:5",
           "kind": "store",
@@ -1738,19 +1726,17 @@ expression: "resolve_clean(\"examples/triage-fanout\", \"staging\")"
             "value": "escalate",
             "span": "flows/triage.yml:201:5..201:13"
           },
-          "policy": {
-            "retry": {
-              "max": 3,
-              "backoff": {
-                "value": "1s",
-                "span": "flows/triage.yml:212:33..212:35"
-              },
-              "span": "flows/triage.yml:212:14..212:37"
+          "retry": {
+            "max": 3,
+            "backoff": {
+              "value": "1s",
+              "span": "flows/triage.yml:212:33..212:35"
             },
-            "timeout": {
-              "value": "10s",
-              "span": "flows/triage.yml:211:16..211:19"
-            }
+            "span": "flows/triage.yml:212:14..212:37"
+          },
+          "timeout": {
+            "value": "10s",
+            "span": "flows/triage.yml:211:16..211:19"
           },
           "span": "flows/triage.yml:202:7..214:3",
           "kind": "http",

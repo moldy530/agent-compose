@@ -433,15 +433,13 @@ expression: "resolve_clean(\"examples/review-loop\", \"local\")"
               "span": "flows/review_loop.yml:22:9..24:7"
             }
           },
-          "policy": {
-            "retry": {
-              "max": 2,
-              "backoff": {
-                "value": "5s",
-                "span": "flows/review_loop.yml:24:33..24:35"
-              },
-              "span": "flows/review_loop.yml:24:14..24:37"
-            }
+          "retry": {
+            "max": 2,
+            "backoff": {
+              "value": "5s",
+              "span": "flows/review_loop.yml:24:33..24:35"
+            },
+            "span": "flows/review_loop.yml:24:14..24:37"
           },
           "span": "flows/review_loop.yml:20:7..26:5",
           "kind": "agent",
@@ -483,19 +481,17 @@ expression: "resolve_clean(\"examples/review-loop\", \"local\")"
               "span": "flows/review_loop.yml:29:9..31:7"
             }
           },
-          "policy": {
-            "timeout": {
-              "value": "90s",
-              "span": "flows/review_loop.yml:31:16..31:19"
+          "timeout": {
+            "value": "90s",
+            "span": "flows/review_loop.yml:31:16..31:19"
+          },
+          "on_error": {
+            "strategy": "fallback",
+            "target": {
+              "value": "end",
+              "span": "flows/review_loop.yml:32:29..32:32"
             },
-            "on_error": {
-              "strategy": "fallback",
-              "target": {
-                "value": "end",
-                "span": "flows/review_loop.yml:32:29..32:32"
-              },
-              "span": "flows/review_loop.yml:32:17..32:34"
-            }
+            "span": "flows/review_loop.yml:32:17..32:34"
           },
           "span": "flows/review_loop.yml:27:7..34:3",
           "kind": "agent",

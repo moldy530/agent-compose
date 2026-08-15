@@ -51,7 +51,13 @@ pub struct Node {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub writes: Option<Writes>,
     /// `retry`/`timeout`/`on_error` for this node — level 2 of grammar 9.3.
-    #[serde(skip_serializing_if = "Policy::is_empty")]
+    ///
+    /// Written out as the three keys themselves, because that is how a node
+    /// writes them (grammar 7.1) and because `policy` means something else on a
+    /// node: a `flow:` node's `policy:` is the level-1 override for the nodes
+    /// *inside* the instance, a different field of a different level
+    /// (Decision D60). One key, one meaning.
+    #[serde(flatten)]
     pub policy: Policy,
     /// `description:` — documentation only.
     #[serde(skip_serializing_if = "Option::is_none")]
