@@ -1,0 +1,17 @@
+# rule: a store op takes its parameters as its own keys, never through `input:` (grammar 8.8, 11.4)
+# code: invalid-value
+# message: `input` is not legal on node `load`
+# at: 14:7
+# help: a store op takes its parameters as its own keys — `key:`, `value:`, `query:` — rather than through `input:` (grammar 8.8, 11.4)
+flow.demo:
+  outputs:
+    done: { type: boolean }
+  nodes:
+    load:
+      store: store.prefs
+      op: get
+      key: "execution.session_key"
+      input: { session: "state.session" }
+  edges:
+    - { from: start, to: load }
+    - { from: load, to: end }

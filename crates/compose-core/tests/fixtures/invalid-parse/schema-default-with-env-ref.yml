@@ -1,0 +1,9 @@
+# rule: a schema `default:` interpolates nothing, so a `${NAME}` token in one is an error (grammar 4.3, Decision D41)
+# code: unexpected-env-ref
+# message: `default` in state channel `home` never interpolates environment references, but it contains `${HOME}`
+# at: 9:14
+# help: write `$${HOME}` for a literal `${HOME}`
+state:
+  home:
+    type: string
+    default: "${HOME}"

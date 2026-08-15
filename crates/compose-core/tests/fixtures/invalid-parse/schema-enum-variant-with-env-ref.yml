@@ -1,0 +1,12 @@
+# rule: an `enum` variant is schema text, where a `${NAME}` token is an error (grammar 4.3, Decision D41)
+# code: unexpected-env-ref
+# message: an `enum` variant never interpolates environment references, but it contains `${MODE}`
+# at: 9:20
+# help: write `$${MODE}` for a literal `${MODE}`
+tool.pick:
+  description: Picks a mode.
+  input:
+    mode: { enum: ["${MODE}", fast] }
+  output: {}
+  exec:
+    command: pick

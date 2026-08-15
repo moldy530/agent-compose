@@ -238,6 +238,26 @@ pub(crate) fn in_range(
     false
 }
 
+/// Check an integer against a lower bound alone.
+///
+/// The grammar states several constraints as `integer ≥ 0` or `integer ≥ 1`
+/// with no upper bound; saying so beats naming `i64::MAX` as if the width of the
+/// representation were the rule (PRD G3).
+pub(crate) fn at_least(value: &Spanned<i64>, subject: &str, minimum: i64, cx: &mut Cx) -> bool {
+    if value.value >= minimum {
+        return true;
+    }
+    cx.error(
+        DiagnosticCode::ValueOutOfRange,
+        &value.span,
+        format!(
+            "{subject} must be at least {minimum}, found {}",
+            value.value
+        ),
+    );
+    false
+}
+
 /// The closest candidate to `actual`, if one is close enough to be worth
 /// suggesting.
 ///

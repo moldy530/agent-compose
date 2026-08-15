@@ -158,11 +158,30 @@ fn edge(node: &Node, cx: &mut Cx) -> Option<Edge> {
     })
 }
 
-/// Which common keys a node kind accepts (grammar 7.1, 8.6 rule 9, 8.7).
+/// Whether a common key is legal on a node kind, and when it is not, the help
+/// text that says why — every kind that rejects one rejects it for its own
+/// reason, so the note has to come from the kind rather than from the key.
+enum KeyRule {
+    Allowed,
+    Rejected(&'static str),
+}
+
+/// Which common keys a node kind accepts (grammar 7.1, 8.6 rule 9, 8.7, 8.8).
 struct CommonKeys {
-    input: bool,
-    writes: bool,
-    retry_timeout: bool,
+    input: KeyRule,
+    writes: KeyRule,
+    retry_timeout: KeyRule,
+}
+
+impl CommonKeys {
+    /// Every common key, as the six ordinary node kinds take them.
+    const fn all() -> Self {
+        Self {
+            input: KeyRule::Allowed,
+            writes: KeyRule::Allowed,
+            retry_timeout: KeyRule::Allowed,
+        }
+    }
 }
 
 fn node_object(id: Spanned<crate::ast::common::Ident>, node: &Node, cx: &mut Cx) -> FlowNodeAst {
@@ -219,65 +238,43 @@ fn node_object(id: Spanned<crate::ast::common::Ident>, node: &Node, cx: &mut Cx)
                 )
                 .with_help("the kind key selects what the node does and what config it takes"),
             );
-            (
-                NodeKind::Invalid,
-                CommonKeys {
-                    input: true,
-                    writes: true,
-                    retry_timeout: true,
-                },
-            )
+            (NodeKind::Invalid, CommonKeys::all())
         }
         Some(key) => node_kind(&mut fields, key, &subject, cx),
     };
 
-    let input = if common.input {
-        fields
+    let input = match common.input {
+        KeyRule::Allowed => fields
             .take("input")
-            .and_then(|node| node_input(node, &kind, &subject, cx))
-    } else {
-        reject_key(
-            &mut fields,
-            "input",
-            &subject,
-            "a map node has no input of its own: the per-item binding lives in the `map:` block",
-            cx,
-        );
-        None
+            .and_then(|node| node_input(node, &kind, &subject, cx)),
+        KeyRule::Rejected(why) => {
+            reject_key(&mut fields, "input", &subject, why, cx);
+            None
+        }
     };
-    let writes = if common.writes {
-        fields
+    let writes = match common.writes {
+        KeyRule::Allowed => fields
             .take("writes")
-            .and_then(|node| binding::writes(node, &format!("`writes` of {subject}"), cx))
-    } else {
-        reject_key(
-            &mut fields,
-            "writes",
-            &subject,
-            "a map node has no output of its own: the write remap lives in the `map:` block or on a route",
-            cx,
-        );
-        None
+            .and_then(|node| binding::writes(node, &format!("`writes` of {subject}"), cx)),
+        KeyRule::Rejected(why) => {
+            reject_key(&mut fields, "writes", &subject, why, cx);
+            None
+        }
     };
 
-    let policy = if common.retry_timeout {
-        policy::policy_fields(&mut fields, &subject, cx)
-    } else {
-        for key in ["retry", "timeout"] {
-            reject_key(
-                &mut fields,
-                key,
-                &subject,
-                "a human wait is not an activity timeout, and re-prompting a human is not a retry",
-                cx,
-            );
-        }
-        PolicyBlock {
-            retry: None,
-            timeout: None,
-            on_error: fields
-                .take("on_error")
-                .and_then(|node| policy::on_error(node, &subject, cx)),
+    let policy = match common.retry_timeout {
+        KeyRule::Allowed => policy::policy_fields(&mut fields, &subject, cx),
+        KeyRule::Rejected(why) => {
+            for key in ["retry", "timeout"] {
+                reject_key(&mut fields, key, &subject, why, cx);
+            }
+            PolicyBlock {
+                retry: None,
+                timeout: None,
+                on_error: fields
+                    .take("on_error")
+                    .and_then(|node| policy::on_error(node, &subject, cx)),
+            }
         }
     };
 
@@ -384,11 +381,7 @@ fn node_kind(
     subject: &str,
     cx: &mut Cx,
 ) -> (NodeKind, CommonKeys) {
-    let all = CommonKeys {
-        input: true,
-        writes: true,
-        retry_timeout: true,
-    };
+    let all = CommonKeys::all();
     match key {
         "agent" => {
             let kind = fields
@@ -449,9 +442,10 @@ fn node_kind(
             (
                 kind,
                 CommonKeys {
-                    input: true,
-                    writes: true,
-                    retry_timeout: false,
+                    retry_timeout: KeyRule::Rejected(
+                        "a human wait is not an activity timeout, and re-prompting a human is not a retry",
+                    ),
+                    ..CommonKeys::all()
                 },
             )
         }
@@ -463,9 +457,13 @@ fn node_kind(
             (
                 kind,
                 CommonKeys {
-                    input: false,
-                    writes: false,
-                    retry_timeout: true,
+                    input: KeyRule::Rejected(
+                        "a map node has no input of its own: the per-item binding lives in the `map:` block",
+                    ),
+                    writes: KeyRule::Rejected(
+                        "a map node has no output of its own: the write remap lives in the `map:` block or on a route",
+                    ),
+                    retry_timeout: KeyRule::Allowed,
                 },
             )
         }
@@ -490,9 +488,10 @@ fn node_kind(
             (
                 kind,
                 CommonKeys {
-                    input: false,
-                    writes: true,
-                    retry_timeout: true,
+                    input: KeyRule::Rejected(
+                        "a store op takes its parameters as its own keys — `key:`, `value:`, `query:` — rather than through `input:` (grammar 8.8, 11.4)",
+                    ),
+                    ..CommonKeys::all()
                 },
             )
         }

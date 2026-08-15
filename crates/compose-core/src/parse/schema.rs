@@ -18,7 +18,7 @@ use crate::yaml::{Node, Yaml};
 
 use super::lexical;
 use super::reader::{
-    Cx, Fields, expect_mapping, expect_sequence, expect_string, in_range, list, suggest,
+    Cx, Fields, at_least, expect_mapping, expect_sequence, expect_string, in_range, list, suggest,
 };
 
 /// The maximum schema nesting depth; the declaration surface counts as one
@@ -84,6 +84,24 @@ fn field_map_at(
         });
     }
 
+    if is_union_shape(mapping) {
+        cx.push(
+            Diagnostic::error(
+                DiagnosticCode::InvalidValue,
+                node.span.clone(),
+                format!("{subject} is a discriminated union, but a field map belongs here"),
+            )
+            .with_help(
+                "a union is legal as an array's `items:` or as the type of a named property, never as a whole surface: every declaration surface is a field map, so routing fields have names (grammar 3.7, Decision D11)",
+            ),
+        );
+        return Some(FieldMap {
+            fields: Vec::new(),
+            surface,
+            span: node.span.clone(),
+        });
+    }
+
     let mut fields = Vec::new();
     for entry in mapping.entries() {
         let Some(name) = lexical::key_identifier(&entry.key, "field name", cx) else {
@@ -103,6 +121,20 @@ fn field_map_at(
         surface,
         span: node.span.clone(),
     })
+}
+
+/// Whether this mapping is a discriminated union rather than a field map.
+///
+/// The two are told apart by what `discriminator:` holds: a union names a field
+/// with a string, while a field *named* `discriminator` carries a type node,
+/// which is a mapping (grammar 3.1, 3.7). Both keys have to be present, so a
+/// field map that merely mistypes a field called `discriminator` still gets the
+/// diagnostic about that field.
+fn is_union_shape(mapping: &crate::yaml::Mapping) -> bool {
+    mapping.contains_key("variants")
+        && mapping
+            .get("discriminator")
+            .is_some_and(|node| node.as_mapping().is_none())
 }
 
 /// The surface nested schemas sit at.
@@ -308,7 +340,7 @@ fn scalar_form(
         let Some(value) = super::reader::expect_integer(node, &format!("`{key}`"), cx) else {
             continue;
         };
-        if !in_range(&value, &format!("`{key}`"), 0..=i64::MAX, cx) {
+        if !at_least(&value, &format!("`{key}`"), 0, cx) {
             continue;
         }
         if key == "min_length" {
@@ -576,7 +608,7 @@ fn array_form(
 
     let min_items = fields
         .integer("min_items", cx)
-        .filter(|value| in_range(value, "`min_items`", 0..=i64::MAX, cx));
+        .filter(|value| at_least(value, "`min_items`", 0, cx));
     if let (Some(min), Some(max)) = (min_items.as_ref(), max_items.as_ref())
         && min.value > max.value
     {
@@ -636,6 +668,10 @@ fn enum_form(fields: &mut Fields<'_>, subject: &str, surface: Surface, cx: &mut 
             let Some(variant) = expect_string(item, "each `enum` variant", cx) else {
                 continue;
             };
+            // A schema is one of the surfaces where nothing is interpolated, so
+            // a `${NAME}` token here is an error rather than six literal
+            // characters (grammar 4.3, Decision D41).
+            lexical::reject_env_refs(&variant, "an `enum` variant", cx);
             if variant.value.is_empty() {
                 cx.error(
                     DiagnosticCode::InvalidValue,
@@ -825,7 +861,36 @@ fn default_value(
         );
         return None;
     }
-    Some(literal(node))
+    let value = literal(node);
+    // A default is written inside a schema, and a schema interpolates nothing:
+    // an unescaped `${NAME}` here would reach the IR as the six characters the
+    // author did not intend (grammar 4.3, Decision D41).
+    reject_env_refs_in_literal(&value, &format!("`default` in {subject}"), cx);
+    Some(value)
+}
+
+/// Reject every `${NAME}` token a literal carries, at any depth.
+///
+/// A composite `default:` on a state channel is a whole initial value, so the
+/// token can hide in a nested string or a mapping key rather than at the top.
+fn reject_env_refs_in_literal(value: &Spanned<Literal>, subject: &str, cx: &mut Cx) {
+    match &value.value {
+        Literal::String(text) => {
+            lexical::reject_env_refs(&Spanned::new(text.clone(), value.span.clone()), subject, cx)
+        }
+        Literal::Sequence(items) => {
+            for item in items {
+                reject_env_refs_in_literal(item, subject, cx);
+            }
+        }
+        Literal::Mapping(entries) => {
+            for entry in entries {
+                lexical::reject_env_refs(&entry.key, subject, cx);
+                reject_env_refs_in_literal(&entry.value, subject, cx);
+            }
+        }
+        Literal::Null | Literal::Bool(_) | Literal::Int(_) | Literal::Float(_) => {}
+    }
 }
 
 fn check_default_kind(value: &Spanned<Literal>, kind: ScalarKind, subject: &str, cx: &mut Cx) {

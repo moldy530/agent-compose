@@ -67,31 +67,46 @@ tool.rerank:
     );
 }
 
+/// Every key of every row of grammar 12.1's per-kind table, at once.
+///
+/// The parser closes a provider definition against the keys of *other* kinds, so
+/// this is the guard that the closing did not take a key its own row lists with
+/// it.
 #[test]
-fn every_provider_kind_with_its_required_keys() {
+fn every_provider_kind_with_every_key_its_row_lists() {
     accepts(
         "providers.yml",
         r#"
 provider.anthropic:
   kind: anthropic
   api_key: ${ANTHROPIC_API_KEY}
+  base_url: ${ANTHROPIC_BASE_URL}
+  description: The default connection.
   headers:
     x-trace-id: "${TRACE_ID}"
 
 provider.openai:
   kind: openai
   api_key: ${OPENAI_API_KEY}
+  base_url: ${OPENAI_BASE_URL}
   organization: acme
+  headers: { x-trace-id: "${TRACE_ID}" }
+  description: The OpenAI connection.
 
 provider.local:
   kind: openai_compatible
   base_url: ${LOCAL_LLM_URL}
+  api_key: ${LOCAL_LLM_KEY}
+  headers: { x-trace-id: "${TRACE_ID}" }
+  description: A local inference server.
 
 provider.azure:
   kind: azure_openai
   base_url: ${AZURE_ENDPOINT}
   api_key: ${AZURE_API_KEY}
   api_version: "2026-01-01"
+  headers: { x-trace-id: "${TRACE_ID}" }
+  description: The Azure connection.
 
 provider.aws:
   kind: bedrock
@@ -99,12 +114,44 @@ provider.aws:
   access_key_id: ${AWS_ACCESS_KEY_ID}
   secret_access_key: ${AWS_SECRET_ACCESS_KEY}
   session_token: ${AWS_SESSION_TOKEN}
+  profile: dev
+  headers: { x-trace-id: "${TRACE_ID}" }
+  description: The Bedrock connection.
 
 provider.gcp:
   kind: vertex
   project: acme-prod
   location: us-central1
   credentials_json: ${GOOGLE_CREDENTIALS_JSON}
+  headers: { x-trace-id: "${TRACE_ID}" }
+  description: The Vertex connection.
+"#,
+    );
+}
+
+/// A field genuinely *named* `discriminator` is not a union, and a union in a
+/// legal position still parses.
+#[test]
+fn a_field_named_discriminator_beside_a_union_in_an_items_position() {
+    accepts(
+        "discriminator-field.yml",
+        r#"
+tool.classify:
+  description: Reports how it routed.
+  input:
+    discriminator: { type: string }
+    variants: { type: string }
+  output:
+    findings:
+      type: array
+      max_items: 10
+      items:
+        discriminator: kind
+        variants:
+          auto_fixable: { file: { type: string } }
+          needs_human: { summary: { type: string } }
+  exec:
+    command: classify
 "#,
     );
 }
