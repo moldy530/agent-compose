@@ -2911,7 +2911,9 @@ by the same key.
 ### 11.4 Store-op nodes
 
 Legal ops per kind, with their parameters and derived output schema. `V` is the
-store's `value_schema` object; `M` its `metadata_schema` object.
+store's `value_schema` object, which a `kv` store always declares (§11.1); `M`
+is its `metadata_schema` object, which a `vector` store MAY leave undeclared —
+see the `M`-is-absent rule below.
 
 | kind | `op` | Parameters | Output |
 |---|---|---|---|
@@ -2938,6 +2940,25 @@ Rules (PRD 5.8):
   enforces it too (Appendix B).
 - `value` on a `kv` `set` is schema-checked against `value_schema`; `filter` and
   `metadata` keys are schema-checked against `metadata_schema`.
+- **A store with no `M`.** `metadata_schema:` is optional on a `vector` store
+  (§11.1), and a store that declares none has no metadata at all rather than
+  empty metadata (Decision
+  [D114](#d114-a-vector-store-with-no-metadata_schema-derives-matches-with-no-metadata-field)):
+
+  - the derived item type of a `search` is `{ id: string, score: number,
+    text: string }` — the `metadata` field is **absent**, so
+    `find.output.matches[0].metadata` is an unknown field and a compile error
+    like any other, and the Zod type codegen emits (§3.8) carries three
+    properties;
+  - `filter:` on a `search` and `metadata:` on an `upsert` have no legal key, so
+    declaring either with any key is a compile error naming the store — the
+    schema check in the bullet above, against a schema with no properties.
+
+  Declaring `metadata_schema: {}` is a *declaration*, not an omission: `M` is
+  then the empty closed object (§3.1), the `metadata` field is present and can
+  only ever hold `{}`, and the set of legal `filter:`/`metadata:` keys is the
+  same empty one. The difference between the two spellings is exactly whether a
+  match carries the field.
 - **A `get` that misses.** `value` is the one output field in this catalog its
   op may not return: the `kv get` and `blob get` rows are
   `{ value: … (optional), found: boolean }`, and a miss returns `found: false`
@@ -3852,6 +3873,11 @@ Each `kind`/`op` pair fixes its parameters and its output shape (§11.4); the on
 field the catalog marks optional — `value` on a `kv`/`blob` `get` — resolves
 through
 [D110](#d110-an-absent-value-fails-the-read-and-an-absent-output-field-writes-nothing).
+The shapes are fixed *given the store definition* the op names: `V` and `M` come
+from it, and the one field whose very presence the definition decides is a
+match's `metadata`, which
+[D114](#d114-a-vector-store-with-no-metadata_schema-derives-matches-with-no-metadata-field)
+fixes for a store that declares no `metadata_schema`.
 **Rationale**: PRD 5.8 requires schema-checked ops and name-based wiring of their
 results; without fixed output names, `writes:` and downstream guards would have
 nothing stable to bind. *PRD 5.8.*
@@ -5409,6 +5435,42 @@ ratification; removing an inert key needs none, and leaves the additive path
 open. The cost is one key on one kind, and what it bought was never available:
 a `blob` whose attributes must be queryable pairs the blob with a `kv` store
 under the same key, which is two definitions and no new grammar. *PRD 5.8, G3.*
+
+### D114. A `vector` store with no `metadata_schema` derives matches with no `metadata` field
+
+Where a `vector` store declares no `metadata_schema`, a `search`'s derived item
+type is `{ id, score, text }` — the `metadata` field is absent, not an empty
+object — and `filter:`/`metadata:` parameters have no legal key. A declared
+`metadata_schema: {}` is the other spelling: `M` is the empty closed object and
+the field is present (§11.4).
+**Rationale**: §11.4 wrote the item type as
+`{ id, score, text, metadata: M }` with `M` "the store's `metadata_schema`
+object", and §11.1 makes that key optional
+([D113](#d113-metadata_schema-is-a-vector-only-key) leaves it optional on the
+one kind that keeps it), so a store declaring none left `M` undefined. Two
+implementations follow and they disagree about everything downstream: one
+derives `metadata: {}` and one omits the field, which changes whether
+`search.output.matches[0].metadata` type-checks (§4.1), what a name-based write
+of `matches` must find in its channel (§10.2,
+[D111](#d111-name-based-wiring-is-type-checked-in-both-directions)), and what
+Zod type codegen emits (§3.8). That is the three-way divergence
+[D101](#d101-a-merge-channels-properties-are-unset-until-supplied) and
+[D110](#d110-an-absent-value-fails-the-read-and-an-absent-output-field-writes-nothing)
+were added to close for other absent-value corners, one construct over.
+
+Absence is the reading that says what is true: a store with no declared metadata
+has none to return, and objects are closed
+([D8](#d8-objects-are-closed)), so a `metadata: {}` would be a field that can
+hold exactly one value forever — an inert surface the author never asked for,
+which every consumer's channel and every generated type would still have to
+carry. Reading it is then an unknown-field compile error naming the field, which
+is the diagnostic an author who expected metadata should get, rather than a
+silently empty object they read `has()` against. Keeping `metadata_schema: {}`
+distinct costs nothing and is forced by §3.9, which makes `{}` legal at every
+store schema surface: it is a real, if unusual, contract — "there is a metadata
+object and it has no fields" — and the reason to state the pair together is that
+nothing else in the grammar distinguishes an omitted field map from an empty
+one. *PRD 5.8, 5.2, G3.*
 
 ---
 
