@@ -757,7 +757,7 @@
     },
 
     "inputBindings": {
-      "description": "Node input bindings: field name -> CEL over input/state/execution. Unbound declared fields fall back to the state channel of the same name, then to the flow input of the same name, then to the field's own `default:` if it declares one. A bare string binds a string-in agent's single unnamed input. Grammar 8.0.",
+      "description": "Node input bindings on the two kinds where a single unnamed value has a destination (an agent node - only when the agent is string-in - and an exec node, where it becomes stdin): field name -> CEL over input/state/execution, or a bare CEL scalar. Unbound declared fields fall back to the state channel of the same name, then to the flow input of the same name, then to the field's own `default:` if it declares one. Grammar 8.0 / Decisions D14, D88.",
       "oneOf": [
         { "description": "Scalar binding for a string-in target.", "$ref": "#/$defs/cel" },
         {
@@ -768,8 +768,14 @@
         }
       ]
     },
+    "fieldInputBindings": {
+      "description": "Node input bindings on a kind that names its input fields - an inline http node (whose request object is built from named fields), a function node (checked against the tool's input schema), a flow node (the subflow's declared inputs), a human node (its `human.input` field map). The scalar form is illegal here: a bare value names no destination. Grammar 8.0 / Decision D88.",
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/identifier" },
+      "additionalProperties": { "$ref": "#/$defs/cel" }
+    },
     "mapInputBindings": {
-      "description": "Per-item bindings, in the same two forms node-level `input:` takes: a field map (field name -> CEL over the item binding `item` unless renamed with `as:`, plus input/state/execution), or a bare CEL scalar binding a string-in agent's single unnamed input. The per-item index is spelled `execution.item_index`; there is no bare `item_index` root. Grammar 4.1, 8.6 rule 12 / Decisions D63, D75.",
+      "description": "Per-item bindings. A map dispatch is one of the three positions where a single unnamed value has a destination (D88), so both forms are legal: a field map (field name -> CEL over the item binding `item` unless renamed with `as:`, plus input/state/execution), or a bare CEL scalar binding a string-in agent's single unnamed input. The per-item index is spelled `execution.item_index`; there is no bare `item_index` root. Grammar 4.1, 8.6 rule 12 / Decisions D63, D75, D88.",
       "oneOf": [
         { "description": "Scalar binding for a string-in agent target.", "$ref": "#/$defs/cel" },
         {
@@ -851,8 +857,15 @@
         { "description": "function implementation", "required": ["function"] }
       ]
     },
+    "expectExit": {
+      "description": "Accepted exit statuses (default [0]). An exit outside the list is a node error subject to the retry/on_error chain; one inside it completes the node, so `expect_exit: [0, 1]` is how a command whose 1 means \"no match\" or \"tests failed\" becomes routable data. Non-empty: an empty list would accept no outcome at all, making every run an error. Grammar 6.1 / Decision D84.",
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "type": "integer", "minimum": 0, "maximum": 255 }
+    },
     "execImpl": {
-      "description": "Subprocess binding. An object input is passed as environment variables; a string input is passed on stdin; stdout is decoded as JSON against `output` (or bound raw into a single string field). A non-zero exit is a node error. Grammar 6.1.",
+      "description": "Subprocess binding. An object input is passed as environment variables; a string input is passed on stdin; stdout is decoded as JSON against `output` (or bound raw into a single string field). An exit status outside `expect_exit` is a node error. Grammar 6.1.",
       "type": "object",
       "required": ["command"],
       "properties": {
@@ -864,7 +877,8 @@
           "type": "object",
           "propertyNames": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
           "additionalProperties": { "$ref": "#/$defs/interpolatedString" }
-        }
+        },
+        "expect_exit": { "$ref": "#/$defs/expectExit" }
       },
       "additionalProperties": false
     },
@@ -943,7 +957,7 @@
           "uniqueItems": true,
           "items": { "$ref": "#/$defs/edge" },
           "contains": {
-            "description": "At least one edge leaving `start` must be unconditional or carry `else: true`, so an execution always has a first step instead of dying on \"no viable route\" before doing any work. Guarded `start` edges are legal; they just cannot be the only ones. Grammar 7.6.3 / Decision D70.",
+            "description": "At least one edge leaving `start` must be unconditional or carry `else: true`, so an execution always has a first step instead of dying on \"no viable route\" before doing any work. Guarded `start` edges are legal; they just cannot be the only ones. Grammar 7.6.3 / Decision D71 (no silent dead ends).",
             "type": "object",
             "required": ["from"],
             "properties": { "from": { "const": "start" } },
@@ -983,14 +997,15 @@
           "const": true
         },
         "max_iterations": {
-          "description": "Cycle bound: maximum traversals of this edge within one flow instance. Every SCC needs at least one bounded edge (PRD 5.4).",
+          "description": "Cycle bound: maximum traversals of this edge within one flow instance. Every SCC needs at least one bounded edge (PRD 5.4). Requires `when:` on the same edge: an exhausted edge is not taken whatever its guard says, so a budget on an unconditional or `else:` edge would withdraw the guarantee that exhaustiveness, the start-edge rule, the skip escape, and the cycle escape all rest on. Grammar 7.2, 7.3.1 / Decision D90.",
           "type": "integer",
           "minimum": 1,
           "maximum": 1000
         }
       },
       "additionalProperties": false,
-      "not": { "required": ["when", "else"] }
+      "not": { "required": ["when", "else"] },
+      "dependentRequired": { "max_iterations": ["when"] }
     },
 
     "node": {
@@ -1051,8 +1066,9 @@
               "propertyNames": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
               "additionalProperties": { "$ref": "#/$defs/interpolatedString" }
             },
+            "expect_exit": { "$ref": "#/$defs/expectExit" },
             "output": {
-              "description": "Result schema (default: { exit_code: integer, stdout: string }). `exit_code`, `stdout`, and `stderr` are envelope fields bound from the child process itself, with fixed types; any other field is decoded from stdout as JSON. Grammar 8.2.",
+              "description": "Result schema (default: { exit_code: integer, stdout: string }). `exit_code`, `stdout`, and `stderr` are envelope fields bound from the child process itself, with fixed types; any other field is decoded from stdout as JSON. Declaring one is a decoding choice and never changes which outcomes are node errors - widening `expect_exit` is what does (Decision D84). Grammar 8.2.",
               "allOf": [
                 { "$ref": "#/$defs/outputFieldMap" },
                 { "$ref": "#/$defs/execEnvelopeFields" }
@@ -1122,7 +1138,7 @@
             }
           ]
         },
-        "input": { "description": "Input bindings. The bound object becomes the JSON body (body-bearing methods) or the query string (GET/HEAD) - so it may not be combined with the in-block key that would otherwise carry it.", "$ref": "#/$defs/inputBindings" },
+        "input": { "description": "Input bindings, field-map form only: the bound object becomes the JSON body (body-bearing methods) or the query string (GET/HEAD), so it is built from named fields and may not be combined with the in-block key that would otherwise carry it.", "$ref": "#/$defs/fieldInputBindings" },
         "writes": { "description": "Write remap.", "$ref": "#/$defs/writes" },
         "retry": { "$ref": "#/$defs/retry" },
         "timeout": { "description": "Wall-clock bound on this node.", "$ref": "#/$defs/duration" },
@@ -1162,7 +1178,7 @@
       "required": ["function"],
       "properties": {
         "function": { "description": "The tool definition to invoke.", "$ref": "#/$defs/toolRef" },
-        "input": { "description": "Argument bindings, checked field-by-field against the tool's input schema.", "$ref": "#/$defs/inputBindings" },
+        "input": { "description": "Argument bindings, checked field-by-field against the tool's input schema. Field-map form only: a tool always declares a named input object (possibly {}).", "$ref": "#/$defs/fieldInputBindings" },
         "writes": { "description": "Write remap.", "$ref": "#/$defs/writes" },
         "retry": { "$ref": "#/$defs/retry" },
         "timeout": { "description": "Wall-clock bound on this node.", "$ref": "#/$defs/duration" },
@@ -1178,10 +1194,8 @@
       "properties": {
         "flow": { "description": "The flow definition to instantiate. Recursion is a compile error.", "$ref": "#/$defs/flowRef" },
         "input": {
-          "description": "Explicit input bindings; REQUIRED whenever the subflow declares inputs.",
-          "type": "object",
-          "propertyNames": { "$ref": "#/$defs/identifier" },
-          "additionalProperties": { "$ref": "#/$defs/cel" }
+          "description": "Explicit input bindings, field-map form only; REQUIRED whenever the subflow declares an input field with no default. Nothing falls through a module boundary by name (PRD 5.7, Decision D68).",
+          "$ref": "#/$defs/fieldInputBindings"
         },
         "writes": { "description": "Write remap over the subflow's output fields.", "$ref": "#/$defs/writes" },
         "context": {
@@ -1214,7 +1228,7 @@
           "additionalProperties": false,
           "dependentRequired": { "timeout": ["on_timeout"], "on_timeout": ["timeout"] }
         },
-        "input": { "description": "Input bindings for the human-facing schema.", "$ref": "#/$defs/inputBindings" },
+        "input": { "description": "Input bindings for the human-facing schema, field-map form only: `human.input` is a field map, so a bare scalar names no destination.", "$ref": "#/$defs/fieldInputBindings" },
         "writes": { "description": "Write remap.", "$ref": "#/$defs/writes" },
         "on_error": { "description": "Delivery-failure strategy. Node-level `timeout`/`retry` are illegal on a human node: a wait is not an activity timeout.", "$ref": "#/$defs/onError" },
         "description": { "description": "Node documentation.", "type": "string" }
@@ -1433,8 +1447,8 @@
                 }
               ]
             },
-            "input": { "description": "Per-item input bindings; without it the whole item is passed.", "$ref": "#/$defs/mapInputBindings" },
-            "writes": { "description": "Write remap; targets must be channels with a declared reduce policy.", "$ref": "#/$defs/writes" },
+            "input": { "description": "Per-item input bindings, homogeneous form only; without it the whole item is passed. Illegal here alongside `route_by:` - each route's bindings are narrowed to its own variant's payload, so a map-wide binding would have to type-check against every variant at once (Decision D85).", "$ref": "#/$defs/mapInputBindings" },
+            "writes": { "description": "Write remap, homogeneous form only; targets must be channels with a declared reduce policy. Illegal here alongside `route_by:` - route targets have different output schemas, so a map-wide remap would name fields only some of them declare (Decision D85).", "$ref": "#/$defs/writes" },
             "detach": { "description": "Fire-and-forget dispatch, homogeneous form only. Illegal here alongside `route_by:` - a discriminator-routed map declares detach per route. A detached dispatch may not write reduced state, and detach + checkpointing is a v0 validation error.", "type": "boolean" }
           },
           "additionalProperties": false,
@@ -1464,8 +1478,8 @@
             {
               "if": { "required": ["route_by"] },
               "then": {
-                "description": "A discriminator-routed map declares `detach` per route, never map-wide. Grammar 8.6 rule 7 / Decision D31.",
-                "properties": { "detach": false }
+                "description": "A discriminator-routed map declares the three per-dispatch-target keys on its routes, never map-wide: `input:` is narrowed per variant, `writes:` names a target's own output fields, and a blanket `detach:` would silently detach sinks written to be joined. Grammar 8.6 rule 7 / Decisions D31, D85.",
+                "properties": { "detach": false, "input": false, "writes": false }
               }
             }
           ]
