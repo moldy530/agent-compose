@@ -1,0 +1,94 @@
+[
+  {
+    "name": "all-holds-for-every-element",
+    "expression": "[1, 2, 3].all(x, x > 0)",
+    "result": true
+  },
+  {
+    "name": "all-fails-on-one-element",
+    "expression": "[1, 2, 3].all(x, x > 1)",
+    "result": false
+  },
+  {
+    "name": "all-over-an-empty-list-is-vacuously-true",
+    "expression": "[].all(x, x > 1)",
+    "result": true
+  },
+  {
+    "name": "exists-holds-for-one-element",
+    "expression": "[1, 2, 3].exists(x, x > 2)",
+    "result": true
+  },
+  {
+    "name": "exists-fails-when-no-element-holds",
+    "expression": "[1, 2, 3].exists(x, x > 5)",
+    "result": false
+  },
+  {
+    "name": "exists-over-an-empty-list-is-false",
+    "expression": "[].exists(x, x > 1)",
+    "result": false
+  },
+  {
+    "name": "exists-one-holds-for-exactly-one-element",
+    "expression": "[1, 2, 3].exists_one(x, x > 2)",
+    "result": true
+  },
+  {
+    "name": "exists-one-fails-for-two-elements",
+    "expression": "[1, 2, 3].exists_one(x, x > 1)",
+    "result": false
+  },
+  {
+    "name": "filter-keeps-the-matching-elements-in-order",
+    "expression": "[3, 1, 2].filter(x, x > 1)",
+    "result": [3, 2]
+  },
+  {
+    "name": "filter-can-keep-nothing",
+    "expression": "[1, 2].filter(x, x > 5)",
+    "result": []
+  },
+  {
+    "name": "map-transforms-every-element",
+    "expression": "[1, 2].map(x, x * 2)",
+    "result": [2, 4]
+  },
+  {
+    "name": "map-with-a-predicate-filters-and-transforms",
+    "expression": "[1, 2, 3].map(x, x > 1, x * 10)",
+    "result": [20, 30]
+  },
+  {
+    "name": "a-macro-nested-in-another",
+    "expression": "[[1, 2], [3]].map(xs, size(xs))",
+    "result": [2, 1]
+  },
+  {
+    "name": "a-macro-over-a-bound-list",
+    "expression": "state.items.exists(item, item.startsWith('a'))",
+    "input": { "state": { "items": ["b1", "a2"] } },
+    "result": true
+  },
+  {
+    "name": "a-macro-over-a-list-of-objects",
+    "expression": "plan.output.tasks.filter(t, t.ready).map(t, t.title)",
+    "input": {
+      "plan": {
+        "output": {
+          "tasks": [
+            { "title": "first", "ready": true },
+            { "title": "second", "ready": false }
+          ]
+        }
+      }
+    },
+    "result": ["first"]
+  },
+  {
+    "name": "a-macro-binding-shadows-nothing-outside-itself",
+    "expression": "[1, 2].map(state, state * 2)",
+    "input": { "state": { "count": 9 } },
+    "result": [2, 4]
+  }
+]

@@ -1,0 +1,54 @@
+[
+  {
+    "name": "reading-a-member-no-value-carries-fails",
+    "expression": "state.missing",
+    "input": { "state": { "draft": "" } },
+    "error": true
+  },
+  {
+    "name": "reading-through-an-absent-member-fails",
+    "expression": "state.totals.skipped > 0",
+    "input": { "state": { "totals": { "fixed": 3 } } },
+    "error": true
+  },
+  {
+    "name": "an-unbound-root-fails",
+    "expression": "nope",
+    "error": true
+  },
+  {
+    "name": "division-by-zero-fails",
+    "expression": "1 / 0",
+    "error": true
+  },
+  {
+    "name": "modulo-by-zero-fails",
+    "expression": "7 % 0",
+    "error": true
+  },
+  {
+    "name": "an-out-of-bounds-index-fails",
+    "expression": "[1][5]",
+    "error": true
+  },
+  {
+    "name": "an-absent-map-key-fails",
+    "expression": "{'a': 1}['b']",
+    "error": true
+  },
+  {
+    "name": "arithmetic-across-the-numeric-types-fails",
+    "expression": "1 + 2.5",
+    "error": true
+  },
+  {
+    "name": "adding-a-string-to-an-int-fails",
+    "expression": "'a' + 1",
+    "error": true
+  },
+  {
+    "name": "indexing-a-string-fails",
+    "expression": "'abc'[0]",
+    "error": true
+  }
+]

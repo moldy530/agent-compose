@@ -1,0 +1,80 @@
+[
+  {
+    "name": "string-concatenation",
+    "expression": "'a' + 'b'",
+    "result": "ab"
+  },
+  {
+    "name": "size-of-an-ascii-string",
+    "expression": "size('abc')",
+    "result": 3
+  },
+  {
+    "name": "size-of-the-empty-string",
+    "expression": "size('')",
+    "result": 0
+  },
+  {
+    "name": "starts-with",
+    "expression": "'draft-1'.startsWith('draft')",
+    "result": true
+  },
+  {
+    "name": "starts-with-false",
+    "expression": "'draft-1'.startsWith('final')",
+    "result": false
+  },
+  {
+    "name": "ends-with",
+    "expression": "'draft-1'.endsWith('-1')",
+    "result": true
+  },
+  {
+    "name": "contains",
+    "expression": "'a needle here'.contains('needle')",
+    "result": true
+  },
+  {
+    "name": "contains-false",
+    "expression": "'a needle here'.contains('haystack')",
+    "result": false
+  },
+  {
+    "name": "matches-an-anchored-pattern",
+    "expression": "'a1'.matches('^a[0-9]$')",
+    "result": true
+  },
+  {
+    "name": "matches-is-unanchored-by-default",
+    "expression": "'xa1y'.matches('a[0-9]')",
+    "result": true
+  },
+  {
+    "name": "matches-false",
+    "expression": "'ab'.matches('^a[0-9]$')",
+    "result": false
+  },
+  {
+    "name": "a-single-quoted-escape",
+    "expression": "'it\\'s'",
+    "result": "it's"
+  },
+  {
+    "name": "string-from-a-bound-root",
+    "expression": "input.goal + '!'",
+    "input": { "input": { "goal": "ship" } },
+    "result": "ship!"
+  },
+  {
+    "name": "string-predicate-over-a-bound-root",
+    "expression": "state.draft.startsWith('# ')",
+    "input": { "state": { "draft": "# heading" } },
+    "result": true
+  },
+  {
+    "name": "an-enum-valued-field-compares-as-a-string",
+    "expression": "review.output.verdict == 'revise'",
+    "input": { "review": { "output": { "verdict": "revise" } } },
+    "result": true
+  }
+]
