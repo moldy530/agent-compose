@@ -151,6 +151,22 @@ impl Span {
             self.start,
         )
     }
+
+    /// The smallest region covering both spans.
+    ///
+    /// Used where a construct is written as a key and a value — a definition,
+    /// `agent.reviewer:` and its body — and the thing that has to be underlined
+    /// is the whole entry. Both spans are assumed to come from the same file, as
+    /// they do everywhere the parser joins two: it walks one file at a time.
+    #[must_use]
+    pub fn joined(&self, other: &Self) -> Self {
+        Self::new(
+            self.source.clone(),
+            self.bytes.start.min(other.bytes.start)..self.bytes.end.max(other.bytes.end),
+            self.start.min(other.start),
+            self.end.max(other.end),
+        )
+    }
 }
 
 /// `Debug` renders `line:col..line:col` — position only, no byte offsets and no
@@ -631,5 +647,27 @@ mod tests {
             format!("{:?}", Spanned::new("draft", span)),
             "\"draft\" @ 3:5..3:9"
         );
+    }
+
+    #[test]
+    fn joining_spans_covers_both_ends() {
+        let key = Span::new(
+            SourceName::new("main.yml"),
+            10..24,
+            Position::new(3, 1),
+            Position::new(3, 15),
+        );
+        let body = Span::new(
+            SourceName::new("main.yml"),
+            28..90,
+            Position::new(4, 3),
+            Position::new(9, 24),
+        );
+        let joined = key.joined(&body);
+        assert_eq!(format!("{joined:?}"), "3:1..9:24");
+        assert_eq!(joined.bytes, 10..90);
+        // Order does not matter, and a span joined with itself is itself.
+        assert_eq!(body.joined(&key), joined);
+        assert_eq!(key.joined(&key), key);
     }
 }

@@ -200,7 +200,7 @@ Spec(
                         max_tool_iterations: None,
                     },
                 ),
-                span: 5:1..5:13,
+                span: 5:1..40:1,
             },
         ],
         span: 5:1..40:1,

@@ -14,7 +14,9 @@ pub struct Definition {
     pub address: Spanned<Address>,
     /// The definition's body.
     pub body: DefinitionBody,
-    /// The whole entry's span, key and value together.
+    /// The whole entry's span, key and value together — what a diagnostic about
+    /// the definition as a whole underlines. [`Self::address`] carries the key
+    /// alone, for the diagnostics that are about the name.
     pub span: Span,
 }
 

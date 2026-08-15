@@ -360,7 +360,7 @@ fn definition(entry: &Entry, cx: &mut Cx) -> Option<Definition> {
     let address = lexical::address(&entry.key, "a definition key", Namespace::ALL, cx)?;
     let body = definition::definition_body(&address, &entry.value, cx)?;
     Some(Definition {
-        span: entry.key.span.clone(),
+        span: entry.key.span.joined(&entry.value.span),
         address,
         body,
     })
