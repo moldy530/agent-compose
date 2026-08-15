@@ -1,6 +1,6 @@
 //! Lowering the parsed composition into the flat IR.
 //!
-//! This runs **only when nothing has been reported**, and that is what makes it
+//! This runs **only when nothing has been rejected**, and that is what makes it
 //! total. The parser records a missing required key, an unreadable value, and an
 //! unrecognised form as a diagnostic and leaves an `Option::None` or an
 //! `Invalid` variant behind; the resolver does the same for a name that does not

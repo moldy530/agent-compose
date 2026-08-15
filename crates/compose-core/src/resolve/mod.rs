@@ -39,11 +39,14 @@
 //!
 //! # The artifact and the diagnostics
 //!
-//! [`Resolution::ir`] is `Some` exactly when nothing was reported: a composition
-//! with an error has no artifact, because half of one would send the next pass
-//! chasing failures that are really this one's. Diagnostics come back in source
-//! order — by file, then by position — so a report reads top to bottom whatever
-//! order the passes visited constructs in.
+//! [`Resolution::ir`] is `Some` exactly when nothing was **rejected**: a
+//! composition with an error has no artifact, because half of one would send
+//! the next pass chasing failures that are really this one's. The distinction
+//! costs a word and stays true the day this pass emits its first
+//! [warning](Diagnostic::warning) — a composition accepted with a caveat has
+//! both an artifact and a diagnostic. Diagnostics come back in source order —
+//! by file, then by position — so a report reads top to bottom whatever order
+//! the passes visited constructs in.
 
 pub(crate) mod files;
 pub(crate) mod index;
@@ -99,13 +102,12 @@ pub fn resolve_with_target(entrypoint: impl AsRef<Path>, target: &str) -> Resolu
     let mut diagnostics = Diagnostics::new();
     let ir = run(entrypoint.as_ref(), target, &mut diagnostics);
 
-    // Lowering is total on a composition nothing was reported about (see
-    // `lower`), so an artifact may only be missing because something *was*
-    // reported. A silent `None` would leave a caller with no artifact and no
-    // reason for it.
+    // Lowering is total on a composition nothing was rejected in (see `lower`),
+    // so an artifact may only be missing because something *was* rejected. A
+    // silent `None` would leave a caller with no artifact and no reason for it.
     debug_assert!(
         ir.is_some() || diagnostics.has_errors(),
-        "resolution produced neither an artifact nor a diagnostic"
+        "resolution produced neither an artifact nor an error"
     );
 
     diagnostics.sort();
