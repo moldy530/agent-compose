@@ -1,0 +1,9 @@
+# rule: a provider takes only the keys its own `kind:` declares (grammar 12.1, Decision D50)
+# code: unknown-key
+# message: provider definition `provider.main` declares `kind: anthropic`, which has no `region` key
+# at: 9:3
+# help: the keys of `kind: anthropic` are `kind`, `api_key`, `base_url`, `headers`, `description`
+provider.main:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+  region: us-east-1

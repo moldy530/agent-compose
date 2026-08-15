@@ -322,7 +322,7 @@ fn embed_block(node: &Node, subject: &str, cx: &mut Cx) -> Option<EmbedBlock> {
         .and_then(|node| lexical::reference(node, "`provider`", &[Namespace::Provider], cx));
     let dimensions = fields
         .integer("dimensions", cx)
-        .filter(|value| super::reader::in_range(value, "`dimensions`", 1..=i64::MAX, cx));
+        .filter(|value| super::reader::at_least(value, "`dimensions`", 1, cx));
     fields.finish(cx);
     Some(EmbedBlock {
         model,
@@ -345,23 +345,23 @@ fn provider(fields: &mut Fields<'_>, subject: &str, cx: &mut Cx) -> ProviderDef 
     let kind = fields
         .require("kind", cx)
         .and_then(|node| lexical::keyword(node, "provider `kind`", PROVIDER_KINDS, cx));
+    let kind_ref = kind.as_ref();
 
-    let api_key = secret_field(fields, "api_key", cx);
-    let base_url = secret_field(fields, "base_url", cx);
-    let access_key_id = secret_field(fields, "access_key_id", cx);
-    let secret_access_key = secret_field(fields, "secret_access_key", cx);
-    let session_token = secret_field(fields, "session_token", cx);
-    let credentials_json = secret_field(fields, "credentials_json", cx);
+    let api_key = secret_field(fields, "api_key", kind_ref, subject, cx);
+    let base_url = secret_field(fields, "base_url", kind_ref, subject, cx);
+    let access_key_id = secret_field(fields, "access_key_id", kind_ref, subject, cx);
+    let secret_access_key = secret_field(fields, "secret_access_key", kind_ref, subject, cx);
+    let session_token = secret_field(fields, "session_token", kind_ref, subject, cx);
+    let credentials_json = secret_field(fields, "credentials_json", kind_ref, subject, cx);
 
-    let api_version = plain_field(fields, "api_version", cx);
-    let organization = plain_field(fields, "organization", cx);
-    let region = plain_field(fields, "region", cx);
-    let location = plain_field(fields, "location", cx);
-    let project = plain_field(fields, "project", cx);
-    let profile = plain_field(fields, "profile", cx);
+    let api_version = plain_field(fields, "api_version", kind_ref, subject, cx);
+    let organization = plain_field(fields, "organization", kind_ref, subject, cx);
+    let region = plain_field(fields, "region", kind_ref, subject, cx);
+    let location = plain_field(fields, "location", kind_ref, subject, cx);
+    let project = plain_field(fields, "project", kind_ref, subject, cx);
+    let profile = plain_field(fields, "profile", kind_ref, subject, cx);
 
-    let headers = fields
-        .take("headers")
+    let headers = provider_key(fields, "headers", kind_ref, subject, cx)
         .map(|node| binding::interpolated_map(node, "`headers`", binding::NameForm::HeaderLike, cx))
         .unwrap_or_default();
     let description = description(fields, cx);
@@ -403,14 +403,53 @@ fn provider(fields: &mut Fields<'_>, subject: &str, cx: &mut Cx) -> ProviderDef 
     }
 }
 
+/// Read one provider key, rejecting it when the declared kind has no such key
+/// (grammar 12.1).
+///
+/// Without a legible `kind:` every key is read as written: one unreadable kind
+/// should not cascade into a dozen reports about keys that may well be right.
+fn provider_key<'a>(
+    fields: &mut Fields<'a>,
+    key: &'static str,
+    kind: Option<&Spanned<ProviderKind>>,
+    subject: &str,
+    cx: &mut Cx,
+) -> Option<&'a Node> {
+    let entry = fields.take_entry(key)?;
+    let Some(kind) = kind else {
+        return Some(&entry.value);
+    };
+    if kind.value.keys().contains(&key) {
+        return Some(&entry.value);
+    }
+    cx.push(
+        Diagnostic::error(
+            DiagnosticCode::UnknownKey,
+            entry.key.span.clone(),
+            format!(
+                "{subject} declares `kind: {}`, which has no `{key}` key",
+                kind.value.as_str()
+            ),
+        )
+        .with_label(kind.span.clone(), "the kind is declared here")
+        .with_help(format!(
+            "the keys of `kind: {}` are {}",
+            kind.value.as_str(),
+            list(kind.value.keys())
+        )),
+    );
+    None
+}
+
 /// A provider key that must hold an `${ENV}` value-form reference (grammar 4.3).
 fn secret_field(
     fields: &mut Fields<'_>,
     key: &'static str,
+    kind: Option<&Spanned<ProviderKind>>,
+    subject: &str,
     cx: &mut Cx,
 ) -> Option<Spanned<crate::ast::common::EnvRef>> {
-    fields
-        .take(key)
+    provider_key(fields, key, kind, subject, cx)
         .and_then(|node| lexical::env_ref(node, &format!("`{key}`"), cx))
 }
 
@@ -418,10 +457,11 @@ fn secret_field(
 fn plain_field(
     fields: &mut Fields<'_>,
     key: &'static str,
+    kind: Option<&Spanned<ProviderKind>>,
+    subject: &str,
     cx: &mut Cx,
 ) -> Option<Spanned<crate::ast::common::Interpolated>> {
-    fields
-        .take(key)
+    provider_key(fields, key, kind, subject, cx)
         .and_then(|node| lexical::interpolated(node, &format!("`{key}`"), cx))
 }
 

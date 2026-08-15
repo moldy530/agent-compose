@@ -231,6 +231,79 @@ impl ProviderKind {
             Self::Vertex => &["project", "location"],
         }
     }
+
+    /// Every key this kind accepts, required ones included (grammar 12.1).
+    ///
+    /// `kind`, `headers`, and `description` belong to every provider
+    /// definition: the first table of grammar 12.1 lists them without naming a
+    /// kind, and neither is connection config. Everything else comes from the
+    /// kind's own row of the second table, so a `region:` pasted onto an
+    /// `anthropic` provider is a diagnostic rather than a key that builds and
+    /// then does nothing (Decision D50).
+    #[must_use]
+    pub const fn keys(self) -> &'static [&'static str] {
+        match self {
+            Self::Anthropic => &["kind", "api_key", "base_url", "headers", "description"],
+            Self::OpenAi => &[
+                "kind",
+                "api_key",
+                "base_url",
+                "organization",
+                "headers",
+                "description",
+            ],
+            Self::OpenAiCompatible => &["kind", "base_url", "api_key", "headers", "description"],
+            Self::AzureOpenAi => &[
+                "kind",
+                "base_url",
+                "api_key",
+                "api_version",
+                "headers",
+                "description",
+            ],
+            Self::Bedrock => &[
+                "kind",
+                "region",
+                "access_key_id",
+                "secret_access_key",
+                "session_token",
+                "profile",
+                "headers",
+                "description",
+            ],
+            Self::Vertex => &[
+                "kind",
+                "project",
+                "location",
+                "credentials_json",
+                "headers",
+                "description",
+            ],
+        }
+    }
+}
+
+#[cfg(test)]
+mod provider_kind_tests {
+    use super::ProviderKind;
+
+    #[test]
+    fn every_kind_accepts_the_keys_it_requires() {
+        for kind in ProviderKind::ALL {
+            assert!(
+                kind.keys().contains(&"kind"),
+                "`{}` does not accept `kind`",
+                kind.as_str()
+            );
+            for key in kind.required_keys() {
+                assert!(
+                    kind.keys().contains(key),
+                    "`{}` requires `{key}` but does not accept it",
+                    kind.as_str()
+                );
+            }
+        }
+    }
 }
 
 /// A `provider.*` definition: an inference connection (grammar 12.1).
