@@ -443,6 +443,22 @@ fn output_schema(
     cx: &mut Cx,
 ) -> Option<crate::ast::schema::FieldMap> {
     if !allow_output {
+        // Lifting a §8.2 inline node block into a §6.1 tool binding is the
+        // likeliest copy-paste at this surface, and the one `suggest` cannot
+        // rescue: no key of the binding is a near miss for `output`. So the
+        // reason is said here rather than left as a bare unknown key (PRD G3).
+        if let Some(entry) = fields.take_entry("output") {
+            cx.push(
+                Diagnostic::error(
+                    DiagnosticCode::UnknownKey,
+                    entry.key.span.clone(),
+                    format!("unknown key `output` in {subject}"),
+                )
+                .with_help(
+                    "a tool declares its result schema once, as `output:` on the definition; only an inline node's block carries one of its own (grammar 6.1, 8.2)",
+                ),
+            );
+        }
         return None;
     }
     let map = fields.take("output").and_then(|node| {
