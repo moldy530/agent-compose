@@ -182,9 +182,16 @@ fn spans_name_files_relative_to_the_project_root() {
     );
 }
 
-/// A resolution that reports nothing produces an artifact, and one that reports
-/// an error produces none: half an artifact would send the next pass chasing
+/// A resolution that rejects nothing produces an artifact, and one that rejects
+/// something produces none: half an artifact would send the next pass chasing
 /// failures that belong to this one.
+///
+/// An entrypoint that could not be read is also the one diagnostic that names a
+/// file by the path the *command line* typed rather than by its project-relative
+/// name. Nothing else may: every span that reaches the artifact is relative to
+/// the project root so that two machines produce the same bytes (grammar 1.4,
+/// PRD 5.12) — but there is no artifact here, and a bare `does-not-exist.yml`
+/// would never say which directory the compiler looked in.
 #[test]
 fn an_unresolvable_composition_produces_no_artifact() {
     let missing = repo_root().join("examples/review-loop/does-not-exist.yml");
@@ -192,7 +199,22 @@ fn an_unresolvable_composition_produces_no_artifact() {
     assert!(resolution.ir.is_none());
     assert!(resolution.has_errors());
     assert_eq!(resolution.diagnostics.len(), 1);
-    assert_eq!(resolution.diagnostics[0].code.as_str(), "io-error");
+    let reported = &resolution.diagnostics[0];
+    assert_eq!(reported.code.as_str(), "io-error");
+    let typed = missing.display().to_string();
+    assert_eq!(
+        reported.span.source.as_str(),
+        typed,
+        "the diagnostic is anchored at the path the command line named"
+    );
+    assert!(
+        reported
+            .message
+            .starts_with(&format!("cannot read `{typed}`: ")),
+        "an unreadable entrypoint is named by the path the command line typed, \
+         directory and all — got: {}",
+        reported.message
+    );
 }
 
 /// The artifact is a build product: reading `examples/` twice must produce the

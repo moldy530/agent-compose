@@ -9,16 +9,19 @@
 //! artifact reproduce differently on two machines, against PRD 5.12.
 //!
 //! Reading is done here rather than through [`parse_file`](crate::parse_file)
-//! for one reason: an import that cannot be read is a mistake in the
+//! for two reasons. An import that cannot be read is a mistake in the
 //! **entrypoint**, so its diagnostic belongs on the `imports:` entry that named
-//! it, not at the top of a file that does not exist.
+//! it, not at the top of a file that does not exist. And this pass knows what
+//! every file it reads *is*, so it tells the parser
+//! ([`FileRole`](crate::parse::FileRole)) rather than leaving it to infer a
+//! role from one file and assert something this pass can already disprove.
 
 use std::path::{Path, PathBuf};
 
 use crate::ast::document::{DeployFile, Document, SpecFile};
 use crate::diag::{Diagnostic, DiagnosticCode, Diagnostics, SourceName, Span};
 use crate::ir::SourceRole;
-use crate::parse::parse_str;
+use crate::parse::{FileRole, parse_as};
 
 /// Every file of one composition, in canonical order.
 pub(crate) struct Composition {
@@ -96,7 +99,23 @@ pub(crate) fn load(
     let name = name.to_string();
 
     let blame = Span::file_start(SourceName::new(&name));
-    let Parsed { document, clean } = read(entrypoint, &name, &blame, None, diagnostics)?;
+    let Parsed { document, clean } = read(
+        entrypoint,
+        &name,
+        FileRole::Entrypoint,
+        &Unreadable {
+            // The path as the command line typed it, directory and all. Every
+            // span that reaches the artifact is project-relative (grammar 1.4,
+            // PRD 5.12) — but an entrypoint that could not be read produces no
+            // artifact, so nothing is at stake in naming it the way the author
+            // named it, and a bare file name never says which directory the
+            // compiler looked in.
+            at: Span::file_start(SourceName::new(entrypoint.display().to_string())),
+            called: entrypoint.display().to_string(),
+            help: None,
+        },
+        diagnostics,
+    )?;
     let entry = match document {
         Document::Spec(file) => file,
         Document::Deploy(file) => {
@@ -219,10 +238,14 @@ fn imports(
         let Some(Parsed { document, clean }) = read(
             &path,
             &normalized,
-            &span,
-            Some(
-                "imports are relative paths resolved against the entrypoint's directory, and there is no directory scanning: the file has to be there (grammar 1.4)",
-            ),
+            FileRole::Import,
+            &Unreadable {
+                at: span.clone(),
+                called: normalized.clone(),
+                help: Some(
+                    "imports are relative paths resolved against the entrypoint's directory, and there is no directory scanning: the file has to be there (grammar 1.4)",
+                ),
+            },
             diagnostics,
         ) else {
             continue;
@@ -315,7 +338,17 @@ fn deploy(
         return None;
     }
 
-    let Parsed { document, .. } = read(&path, &name, &blame, None, diagnostics)?;
+    let Parsed { document, .. } = read(
+        &path,
+        &name,
+        FileRole::Deploy,
+        &Unreadable {
+            at: blame,
+            called: name.clone(),
+            help: None,
+        },
+        diagnostics,
+    )?;
     match document {
         Document::Deploy(file) => Some(DeploySource { name, file }),
         // A file carrying nothing but `version:` has no section to decide its
@@ -374,12 +407,34 @@ struct Parsed {
     clean: bool,
 }
 
-/// Read and parse one file under its project-relative name.
+/// Where a file that could not be read at all is reported, and what it is
+/// called there.
+///
+/// Kept apart from the project-relative name for one reason: a file that never
+/// opened contributes no span to the artifact, so this diagnostic is free to
+/// name it however the reader will recognise it. An import is named at the
+/// `imports:` entry that asked for it, under the path written there; the
+/// entrypoint is named by the path the command line typed.
+struct Unreadable<'a> {
+    /// The span the diagnostic lands on.
+    at: Span,
+    /// What the diagnostic calls the file.
+    called: String,
+    /// Why it might not be there, when there is something to say.
+    help: Option<&'a str>,
+}
+
+/// Read and parse one file under its project-relative name, in a known role.
+///
+/// `name` is what every span the file contributes carries, and `role` is what
+/// this pass already knows the file to be (grammar 1.2, and see
+/// [`FileRole`](crate::parse::FileRole)). `unreadable` is consulted only where
+/// the file never opened, so it has neither spans nor a role to speak of.
 fn read(
     path: &Path,
     name: &str,
-    blame: &Span,
-    unreadable_help: Option<&str>,
+    role: FileRole,
+    unreadable: &Unreadable<'_>,
     diagnostics: &mut Diagnostics,
 ) -> Option<Parsed> {
     let bytes = match std::fs::read(path) {
@@ -388,10 +443,10 @@ fn read(
             diagnostics.push(
                 Diagnostic::error(
                     DiagnosticCode::IoError,
-                    blame.clone(),
-                    format!("cannot read `{name}`: {error}"),
+                    unreadable.at.clone(),
+                    format!("cannot read `{}`: {error}", unreadable.called),
                 )
-                .with_optional_help(unreadable_help.map(str::to_string)),
+                .with_optional_help(unreadable.help.map(str::to_string)),
             );
             return None;
         }
@@ -402,9 +457,10 @@ fn read(
             diagnostics.push(
                 Diagnostic::error(
                     DiagnosticCode::InvalidEncoding,
-                    blame.clone(),
+                    unreadable.at.clone(),
                     format!(
-                        "`{name}` is not valid UTF-8: invalid byte at offset {}",
+                        "`{}` is not valid UTF-8: invalid byte at offset {}",
+                        unreadable.called,
                         error.utf8_error().valid_up_to()
                     ),
                 )
@@ -413,7 +469,7 @@ fn read(
             return None;
         }
     };
-    let parsed = parse_str(&text, name);
+    let parsed = parse_as(&text, name, role);
     let clean = !parsed.has_errors();
     diagnostics.extend(parsed.diagnostics);
     parsed.document.map(|document| Parsed { document, clean })

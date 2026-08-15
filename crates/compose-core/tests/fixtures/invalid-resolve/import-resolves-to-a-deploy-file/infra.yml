@@ -1,3 +1,5 @@
-version: "0.1"
+# No `version:`: the file is refused for being a deploy file in the import
+# list, and a second diagnostic requiring a deploy file's `version:` would be
+# stated about a file the resolver is holding as an import (grammar 1.3).
 event_sources:
   bugs: { kind: sqs }

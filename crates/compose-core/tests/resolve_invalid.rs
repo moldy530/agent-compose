@@ -9,15 +9,20 @@
 //! `main.yml`, in the shape `tests/parse_invalid.rs` already uses:
 //!
 //! ```yaml
-//! # rule: an imported file may not declare `imports:` (grammar 1.4)
+//! # rule: an imported file may not declare `imports:` (Decision D1)
 //! # code: misplaced-section
 //! # message: `middle.yml` is imported and may not declare `imports:`
-//! # at: middle.yml:3:1
-//! # label: main.yml:8:5 imported here
+//! # at: middle.yml:4:3
+//! # label: main.yml:9:5 imported here
 //! # help: <optional, asserted when present>
 //! # count: <optional, total diagnostics expected; defaults to 1>
 //! # target: <optional, the target to resolve for; defaults to `local`>
 //! ```
+//!
+//! Header reading stops at the first line that is not a `# `-prefixed comment,
+//! and a comment whose key is not one of the eight above is skipped — so a
+//! fixture may carry as much prose after its header as the case needs, which
+//! several of them do.
 //!
 //! `at:` and `label:` take an optional file prefix, defaulting to `main.yml` —
 //! the only file every fixture has. Error UX is a product feature (PRD G3), so
