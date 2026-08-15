@@ -1253,7 +1253,7 @@
       "properties": {
         "store": { "description": "The store definition to operate on.", "$ref": "#/$defs/storeRef" },
         "op": {
-          "description": "The operation. Legal values depend on the store's kind: kv = get|set|delete|list, vector = search|upsert|delete, blob = get|put|delete|list.",
+          "description": "The operation. Legal values depend on the store's kind: kv = get|set|delete|list, vector = search|upsert|delete, blob = get|put|delete|list. Each op's output schema is derived and fixed (grammar 11.4). `get` is the one op whose result may omit a field: a miss returns `found: false` and no `value`, so a `writes:` of `value` performs no write that pass and reading `<node>.output.value` fails the execution - route on `found` instead (Decision D110).",
           "enum": ["get", "set", "delete", "list", "search", "upsert", "put"]
         },
         "key": { "description": "CEL key expression. Inside a map-dispatched instance a write's key must derive from the item.", "$ref": "#/$defs/cel" },

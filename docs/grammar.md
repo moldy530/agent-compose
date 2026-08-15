@@ -441,7 +441,9 @@ author:
   schema cannot check this — JSON Schema constrains an array's items without
   reference to a sibling object's keys (Appendix B) — so it is a validator rule,
   and it is what keeps `optional: [emial]` a diagnostic instead of a silently
-  still-required `email`.
+  still-required `email`. A property listed here may be **absent from a value**
+  at run time; reading an absent property fails the execution (§4.1, Decision
+  [D110](#d110-an-absent-value-fails-the-read-and-an-absent-output-field-writes-nothing)).
 - Objects are **closed**. There is no `additional_properties` knob; unknown keys
   in an instance are invalid (Decision [D8](#d8-objects-are-closed)).
 - Nesting depth is limited to **8** levels (declaration surface counts as 1).
@@ -657,6 +659,28 @@ schemas; `review.output.verdict == 'aprove'` against
 ```yaml
 when: "review.output.verdict == 'revise' && size(state.feedback) > 0"
 ```
+
+**Reading a value that is not there.** Presence is a runtime property, and three
+declared things may legitimately be absent when an expression reads them:
+
+- a state channel with no `default:` that nothing has written yet (§10.1,
+  [D78](#d78-channel-initial-values-and-reading-an-unset-channel));
+- a property of a `merge` channel that no write has supplied (§10.1,
+  [D101](#d101-a-merge-channels-properties-are-unset-until-supplied));
+- a property a *value* may legally omit: one listed in an object's `optional:`
+  (§3.4), and the `value` field a `kv` or `blob` `get` omits on a miss — the one
+  top-level field of any result schema in this grammar that its own node may not
+  return (§11.4).
+
+Reading one **fails the execution**, naming what was absent and the expression
+that read it (Decision
+[D110](#d110-an-absent-value-fails-the-read-and-an-absent-output-field-writes-nothing)).
+`has()` is how an expression asks first, and on a `get` the companion `found`
+field is the idiomatic test. Type-checking is unaffected throughout:
+expressions are checked against **declared** schemas, never against runtime
+values, so `load_prefs.output.value.theme` is a `string` wherever it is legal to
+write — exactly as §10.1 says of an unset channel and of a `merge` channel's
+properties.
 
 ### 4.2 Path expressions
 
@@ -1834,6 +1858,15 @@ review:
   `last_wins` channel, one element for an `append` channel, a partial object for
   a `merge` channel.
 - A remapped field is not also written to its same-named channel.
+- A field the node's result does not carry performs **no write**: the channel it
+  would have written — remapped or same-named — keeps whatever it held. Only a
+  `kv`/`blob` `get` on a miss can produce one (§11.4, Decision
+  [D110](#d110-an-absent-value-fails-the-read-and-an-absent-output-field-writes-nothing)),
+  and a channel that has never been written is unset, so the failure surfaces at
+  the next read of it rather than here (§10.1). The **effective write map** above
+  is unaffected: it is computed from declared schemas, so an absent field
+  contributes no write on that pass and its writer takes no turn in that
+  channel's canonical order (§7.6.4).
 - Remapping is the fix for channel collisions between nodes and for renames
   across subgraph boundaries (PRD 5.7).
 - Writing the same channel from concurrent contexts (§7.6.1: concurrent branches,
@@ -2344,6 +2377,13 @@ resolves by name from a channel or a flow input (§8.0). The op's output schema 
 derived from the store definition (§11.4) and is written by name like any other
 node output.
 
+`get` is the one op whose result may omit a field. On a miss it returns
+`found: false` and **no `value`**, so the `writes: { value: prefs }` above
+performs no write on that pass and `prefs` keeps what it held; a guard wanting
+to know reads `load_prefs.output.found`, because reading the absent `value`
+fails the execution (§11.4, §4.1, Decision
+[D110](#d110-an-absent-value-fails-the-read-and-an-absent-output-field-writes-nothing)).
+
 ---
 
 ## 9. Error policy
@@ -2404,6 +2444,13 @@ present, at least one edge is always taken, so a skip can never dead-end the
 branch on §7.3 rule 7. Note which of the two does the work in each case — the
 unconditional edge fires unconditionally; the `else:` edge fires unless a
 state-only guard already routed the branch somewhere.
+
+A node that *ran* and whose result legally omits a field is the other case and
+resolves the other way: there is an output object, so a guard reading a field it
+does not carry **fails the execution** rather than routing `false` (§4.1, §11.4,
+[D110](#d110-an-absent-value-fails-the-read-and-an-absent-output-field-writes-nothing)).
+The substitution above belongs to `skip` alone, and only because the node
+produced no output at all.
 
 `fallback` targets a **flow-local node id or `end`** (§2.4), keeping error
 routing inside one graph where reachability analysis can see it — a fallback
@@ -2801,6 +2848,30 @@ Rules (PRD 5.8):
   enforces it too (Appendix B).
 - `value` on a `kv` `set` is schema-checked against `value_schema`; `filter` and
   `metadata` keys are schema-checked against `metadata_schema`.
+- **A `get` that misses.** `value` is the one output field in this catalog its
+  op may not return: the `kv get` and `blob get` rows are
+  `{ value: … (optional), found: boolean }`, and a miss returns `found: false`
+  with no `value` at all. Both halves follow the rules those two surfaces state
+  (Decision
+  [D110](#d110-an-absent-value-fails-the-read-and-an-absent-output-field-writes-nothing)):
+
+  - **nothing is written** for `value` — the channel a `writes: { value: … }`
+    names, or the same-named channel when there is no remap, keeps whatever it
+    held (§8.0). A channel that was never written is unset, so a later read of
+    it fails naming *that* channel (§10.1,
+    [D78](#d78-channel-initial-values-and-reading-an-unset-channel)); a
+    `default:` on the channel is what makes a miss readable downstream as
+    "nothing stored yet";
+  - **reading `<node>.output.value` fails the execution** — from an edge guard
+    or a `map.over`, the only two positions that read a node's output (§4.1,
+    [D42](#d42-node-outputs-are-readable-only-from-edge-guards-and-mapover)).
+    Route on the companion instead — `when: "load_prefs.output.found"` — or ask
+    with `has(load_prefs.output.value)`.
+
+  This is not §9.2's `skip`, where a guard over the missing output routes
+  `false` because the node never ran: a `get` *ran*, `found: false` is its
+  answer, and a guard that reads `value` anyway is reading a value the op
+  reported it does not have.
 - Store ops are **effects**: reads are recorded and replay consumes history, not
   the live store; writes are at-least-once carrying the idempotency key of §9.4 —
   the execution id plus the store node's flattened instance path, which is what
@@ -3687,7 +3758,10 @@ argument. *PRD 5.5, 5.7.*
 
 ### D34. The store-op catalog is normative, including derived output schemas
 
-Each `kind`/`op` pair fixes its parameters and its output shape (§11.4).
+Each `kind`/`op` pair fixes its parameters and its output shape (§11.4); the one
+field the catalog marks optional — `value` on a `kv`/`blob` `get` — resolves
+through
+[D110](#d110-an-absent-value-fails-the-read-and-an-absent-output-field-writes-nothing).
 **Rationale**: PRD 5.8 requires schema-checked ops and name-based wiring of their
 results; without fixed output names, `writes:` and downstream guards would have
 nothing stable to bind. *PRD 5.8.*
@@ -4252,7 +4326,10 @@ channel with no `default:` is unset, and reading an unset channel fails the
 execution naming the channel and the reader (§10.1).
 [D101](#d101-a-merge-channels-properties-are-unset-until-supplied) carries the
 same rule one level down, to a property a `merge` channel has not been given
-yet. **Rationale**: §7.6.2 makes
+yet, and
+[D110](#d110-an-absent-value-fails-the-read-and-an-absent-output-field-writes-nothing)
+carries it sideways, to a value a node's own result may legally omit.
+**Rationale**: §7.6.2 makes
 "what does a convergence see when only one branch ran?" a question the document
 has to answer, and the answer is "the channels as they stand" — which requires
 knowing what a channel that was never written holds. The two reduce policies with
@@ -5073,6 +5150,50 @@ under either reading, so this fixes what a conforming implementation *does*, not
 what it accepts, and there is nothing here for the published schema or a
 negative fixture to reject. *PRD 5.5, G3.*
 
+### D110. An absent value fails the read, and an absent output field writes nothing
+
+Reading a value that is legally absent — a property listed in an object's
+`optional:` (§3.4) and the `value` a `kv`/`blob` `get` omits on a miss (§11.4),
+alongside [D78](#d78-channel-initial-values-and-reading-an-unset-channel)'s unset
+channel and [D101](#d101-a-merge-channels-properties-are-unset-until-supplied)'s
+unsupplied `merge` property — **fails the execution**, naming what was absent
+and the expression that read it. An output field a node's result does not carry
+performs **no write**: the channel it would have written, remapped or
+same-named, keeps whatever it held (§4.1, §8.0, §11.4).
+**Rationale**: §11.4's catalog marks exactly one output field optional —
+`{ value: V (optional), found: boolean }` on `kv get` and `blob get` — and
+neither §8.0's write rule ("each field of its output is written to the state
+channel of the same name") nor §4.1's read scope said what happens on the pass
+where the field is not there. §8.8's own worked example is the case:
+`writes: { value: prefs }` on a miss had one codegen skipping the write, another
+writing `null` (a type error against `V`), and a third failing the node, while a
+guard `load_prefs.output.value.theme == 'dark'` could error, read false, or
+require a `has()`. That is the three-way divergence D101 was added to close for
+a `merge` channel's properties, unanswered one level up at a node's output.
+
+Both halves fall out of rules already here rather than adding any. Not writing
+is the only choice that neither invents a value nor fails a node whose op
+succeeded: `null` does not validate against `V`, and §3.6 refuses a defaulted
+result for that reason exactly; failing would make `found: boolean` a field no
+author could act on. The diagnostic is not lost, it moves — the channel is
+unset if nothing else wrote it, so the failure arrives at the next read of it,
+naming that channel, which is D78's rule and D78's message. Failing the *read*
+of the absent value is the same posture one step over, and it is what CEL
+already does when a select finds no such key, so the Rust interpreter and the
+embedded JS evaluator agree without a special case (PRD 5.5's two-interpreter
+discipline). It stays distinct from `skip`, which routes an output-referencing
+guard `false` (§9.2,
+[D97](#d97-a-skip-changes-guard-values-not-the-routing-algorithm)), on D97's own
+line: `skip` continues past a node that never ran, while a `get` that ran and
+answered `found: false` has already named the field an author should test.
+
+Nothing here is statically checkable, and nothing needs to be: `found` and
+`value` are derived rather than authored
+([D34](#d34-the-store-op-catalog-is-normative-including-derived-output-schemas)),
+so there is no shape for the published schema or a negative fixture to reject —
+only a runtime rule two implementations now read the same way. *PRD 5.7, 5.8,
+G3.*
+
 ---
 
 ## Appendix B — Editor integration
@@ -5270,6 +5391,8 @@ model.<name>:    { route: [model.<a>, model.<b>], route_on: [...] }
                      # get/delete: key | set: key,value | list: prefix?,limit
                      # search: query,top_k,filter? | upsert: key,value,metadata?
                      # put: key,value,content_type?
+                     # a get that misses returns found:false and no value:
+                     # no write, and reading .output.value fails (D110)
                      writes: {...} }
 { map: { over, as?, node | (route_by + routes + default?),
          max_concurrency,
