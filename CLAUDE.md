@@ -25,7 +25,7 @@ For any work of **medium-to-high complexity or size**, the main session acts as 
 1. **Implement** — an Opus 5 agent at `xhigh` effort builds the goal in an isolated worktree from a self-contained spec.
 2. **Clean-room adversarial review** — a fresh Opus-xhigh agent with *no implementer context* reviews the full diff and actively tries to break it (correctness, PRD conformance, weak tests).
 3. **Fix** — an Opus-xhigh fixer applies verified findings.
-4. Steps 2–3 repeat until a review round converges (no actionable findings; cap 3 rounds).
+4. Steps 2–3 repeat until a review round converges (no actionable findings). Three rounds is the default budget, not a ceiling: when a round still surfaces new substantive findings, keep looping — convergence is the exit condition, not the round count. Stop extending only when a round comes back clean, findings have decayed to nits, or rounds stop making progress (the same findings recurring, or fix-churn without improvement — that means the goal needs restructuring, not more rounds).
 5. **Lead final review** — the lead reviews the converged result itself and re-runs the gates.
    - Big problems → send the work through the full loop again.
    - Small fixes → delegate a single Opus fix agent, then re-verify.
