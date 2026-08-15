@@ -1,0 +1,15 @@
+# rule: a store op's `top_k` is a literal integer, not a CEL expression — six of the nine parameters are CEL and these three are not (grammar 8.8, 11.4)
+# at: /flow.work/nodes/find/top_k
+# via: /$defs/storeNode/properties/top_k/type
+flow.work:
+  outputs:
+    done: { type: boolean }
+  nodes:
+    find:
+      store: store.docs
+      op: search
+      query: "input.question"
+      top_k: "state.k"
+  edges:
+    - { from: start, to: find }
+    - { from: find, to: end }

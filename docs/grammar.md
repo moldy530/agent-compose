@@ -2422,10 +2422,23 @@ load_prefs:
 | `key`, `value`, `query`, `prefix`, `top_k`, `limit`, `filter`, `metadata`, `content_type` | per op | per op | §11.4 |
 
 A store-op node takes **no `input:` key**: its parameters are exactly the op's
-own row in §11.4, each a CEL value in the scope of §4.1, and none of them
-resolves by name from a channel or a flow input (§8.0). The op's output schema is
-derived from the store definition (§11.4) and is written by name like any other
-node output.
+own row in §11.4, written out in the node, and none of them resolves by name
+from a channel or a flow input (§8.0). The op's output schema is derived from the
+store definition (§11.4) and is written by name like any other node output.
+
+**Which parameters are CEL.** Six of the nine are, and they are exactly the row
+§4.1 scopes to `input`, `state`, and `execution`: `key`, `query`, and `prefix`
+are one expression each; `value` is one expression on a `vector upsert` and a
+`blob put` and a field map of expressions on a `kv set`; `filter` and `metadata`
+are maps of one expression per entry (§11.4). The other three are **literals**,
+not expressions: `top_k` and `limit` are integers in the ranges §11.4 fixes, and
+`content_type`
+is a media type string, which §4.3 puts in class 3 so it carries no env refs
+either. A CEL string where §11.4 declares an integer is a type error, not a
+computed bound — a fan-out's cardinality is a schema bound (§3.5) and a store
+op's is a written-down one, and both are meant to be readable without running
+the graph. All three are decidable in one file, so the published schema types
+them too (Appendix B).
 
 `get` is the one op whose result may omit a field. On a miss it returns
 `found: false` and **no `value`**, so the `writes: { value: prefs }` above
@@ -2893,7 +2906,7 @@ store's `value_schema` object; `M` its `metadata_schema` object.
 | `vector` | `search` | `query` (CEL string), `top_k` (integer 1..100, required), `filter` (map metadata-field→CEL, optional) | `{ matches: array<{ id: string, score: number, text: string, metadata: M }> }` |
 | `vector` | `upsert` | `key`, `value` (CEL string — the text), `metadata` (map field→CEL, optional) | `{ id: string }` |
 | `vector` | `delete` | `key` | `{ deleted: boolean }` |
-| `blob` | `put` | `key`, `value` (CEL string), `content_type` (string, optional) | `{ key: string }` |
+| `blob` | `put` | `key`, `value` (CEL string), `content_type` (literal media type, not CEL; optional) | `{ key: string }` |
 | `blob` | `get` | `key` | `{ value: string (optional), found: boolean }` |
 | `blob` | `delete` | `key` | `{ deleted: boolean }` |
 | `blob` | `list` | `prefix` (CEL string, optional), `limit` (integer 1..1000, required) | `{ keys: array<string> }` |
@@ -5414,7 +5427,10 @@ authority. The schema cannot see across files, so it does not check:
   through other files, so only the validator can require it there.
 
 What the schema *does* enforce beyond plain shape, because the deciding value is
-a literal in the same object: store-op parameter sets per `op` (§11.4), provider
+a literal in the same object: store-op parameter sets per `op` (§11.4) and the
+three parameters that are literals rather than CEL — `top_k` and `limit` typed
+as integers in their ranges, `content_type` as a string carrying no env ref
+(§8.8, §11.4) — provider
 key sets per `kind` — both halves, the required keys and the closed row the
 optional ones live in (§12.1, D106) — trigger
 keys per `type` (§13) including the `respond`/`timeout` and `respond`/`callback`
