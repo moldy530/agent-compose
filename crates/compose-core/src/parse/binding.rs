@@ -107,6 +107,40 @@ pub(crate) fn node_input(node: &Node, subject: &str, cx: &mut Cx) -> Option<Node
     }
 }
 
+/// Read a node's `input:` where only per-field bindings are legal.
+///
+/// The scalar form of grammar 8.0 binds a string-in agent's single unnamed
+/// input (§5.3, Decision D14). A node whose target declares *named* input
+/// fields has nothing for a scalar to bind, so accepting one would drop the
+/// author's expression on the floor — the silently-ignored-key class that
+/// Decisions D61 and D66 exist to reject. `why` names the declaration the
+/// bindings have to match, which differs per node kind.
+pub(crate) fn field_input(node: &Node, subject: &str, why: &str, cx: &mut Cx) -> Option<Bindings> {
+    let Yaml::Mapping(mapping) = &node.value else {
+        cx.push(
+            Diagnostic::error(
+                DiagnosticCode::WrongType,
+                node.span.clone(),
+                format!(
+                    "expected a mapping of bindings for {subject}, found {}",
+                    node.description()
+                ),
+            )
+            .with_help(format!(
+                "{why}; the scalar form binds a string-in agent's single unnamed input instead (grammar 5.3, 8.0, Decision D14)"
+            )),
+        );
+        return None;
+    };
+    Some(bindings_from(
+        mapping,
+        node,
+        subject,
+        NameForm::Identifier,
+        cx,
+    ))
+}
+
 /// Read a mapping of name to CEL expression.
 pub(crate) fn bindings(
     node: &Node,

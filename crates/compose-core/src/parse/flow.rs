@@ -330,13 +330,24 @@ fn node_object(id: Spanned<crate::ast::common::Ident>, node: &Node, cx: &mut Cx)
 
 fn node_input(node: &Node, kind: &NodeKind, subject: &str, cx: &mut Cx) -> Option<NodeInput> {
     let context = format!("`input` of {subject}");
-    match kind {
-        // A subflow's bindings are always per-field: a subgraph receives parent
-        // state only through explicit named bindings (grammar 8.5, PRD 5.7).
+    // Which kinds bind field by field, and the declaration each one's bindings
+    // have to match. Everything else may take the scalar form of grammar 8.0.
+    let named = match kind {
+        // A subgraph receives parent state only through explicit named
+        // bindings (grammar 8.5, PRD 5.7).
         NodeKind::Flow(_) => {
-            binding::bindings(node, &context, NameForm::Identifier, cx).map(NodeInput::Fields)
+            Some("a subflow declares its inputs by name, and each is bound by name (grammar 8.5)")
         }
-        _ => binding::node_input(node, &context, cx),
+        // A human node's own `input:` field map sits in the same node object,
+        // so every binding has a declared name to match (grammar 8.7).
+        NodeKind::Human(_) => {
+            Some("a human node's `input:` field map declares the names to bind (grammar 8.7)")
+        }
+        _ => None,
+    };
+    match named {
+        Some(why) => binding::field_input(node, &context, why, cx).map(NodeInput::Fields),
+        None => binding::node_input(node, &context, cx),
     }
 }
 

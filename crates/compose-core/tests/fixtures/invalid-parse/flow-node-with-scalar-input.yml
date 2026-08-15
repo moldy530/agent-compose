@@ -1,0 +1,15 @@
+# rule: a subflow node binds the subflow's declared inputs by name, never with the scalar form (grammar 8.0, 8.5)
+# code: wrong-type
+# message: expected a mapping of bindings for `input` of node `run`, found a string
+# at: 12:14
+# help: a subflow declares its inputs by name, and each is bound by name (grammar 8.5); the scalar form binds a string-in agent's single unnamed input instead (grammar 5.3, 8.0, Decision D14)
+flow.demo:
+  outputs:
+    summary: { type: string }
+  nodes:
+    run:
+      flow: flow.child
+      input: "input.goal"
+  edges:
+    - { from: start, to: run }
+    - { from: run, to: end }
