@@ -113,6 +113,13 @@ flow.triage:
     # environment variables, upper-snake-cased (`patches` -> `PATCHES`), and the
     # declared output is all envelope fields, so stdout is never parsed
     # (grammar 8.2 / PRD 5.5).
+    #
+    # `expect_exit: [0, 1]` is what makes "the checks failed" DATA rather than a
+    # node error: the failure predicate is the same on both surfaces, and
+    # declaring `exit_code:` does not by itself change it (grammar 6.1, 8.2 /
+    # D84). `on_error: skip` therefore covers what is left — the child failing to
+    # spawn, or the 5m timeout — and the unconditional edge to `summarize` is the
+    # escape a node declaring `skip` requires (grammar 7.6.3 rule 3).
     verify:
       exec:
         command: run-checks
@@ -120,6 +127,7 @@ flow.triage:
         cwd: "${REPO_ROOT}"
         env:
           CI: "true"
+        expect_exit: [0, 1]
         output:
           exit_code: { type: integer }
           stdout: { type: string }
