@@ -245,10 +245,14 @@ fn store(fields: &mut Fields<'_>, subject: &str, cx: &mut Cx) -> StoreDef {
         .and_then(|node| embed_block(node, subject, cx));
 
     if let Some(kind) = kind.as_ref() {
+        // `metadata_schema:` is a `vector` key alone: no `kv` or `blob` op takes
+        // a `metadata` or a `filter` parameter, and none of the tools a `blob`
+        // attachment synthesizes carries one, so declared elsewhere it would be
+        // a key every write and every read ignores (Decision D113).
         let (required, illegal): (&[&str], &[&str]) = match kind.value {
             StoreKind::Kv => (&["value_schema"], &["metadata_schema", "embed"]),
             StoreKind::Vector => (&["embed"], &["value_schema"]),
-            StoreKind::Blob => (&[], &["value_schema", "embed"]),
+            StoreKind::Blob => (&[], &["value_schema", "metadata_schema", "embed"]),
         };
         for key in required {
             if !fields.contains(key) {
@@ -317,8 +321,12 @@ fn embed_block(node: &Node, subject: &str, cx: &mut Cx) -> Option<EmbedBlock> {
     let model = fields
         .require("model", cx)
         .and_then(|node| lexical::non_empty_text(node, "`model`", cx));
+    // `provider:` is REQUIRED: a storage backend never computes vectors, and
+    // there is nothing for an omission to resolve to — §14.2's storage
+    // vocabulary publishes no embedding capability, and under `--target local`
+    // no alias and no per-kind default is consulted at all (Decision D116).
     let provider = fields
-        .take("provider")
+        .require("provider", cx)
         .and_then(|node| lexical::reference(node, "`provider`", &[Namespace::Provider], cx));
     let dimensions = fields
         .integer("dimensions", cx)

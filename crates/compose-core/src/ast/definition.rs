@@ -154,7 +154,10 @@ pub struct StoreDef {
     pub scope: Option<Spanned<StoreScope>>,
     /// `value_schema:` — required for `kv`, illegal otherwise.
     pub value_schema: Option<FieldMap>,
-    /// `metadata_schema:` — legal for `vector` and `blob`.
+    /// `metadata_schema:` — a `vector` key alone. No `kv` or `blob` op takes a
+    /// `metadata` or `filter` parameter and none of the tools a `blob`
+    /// attachment synthesizes carries one, so the key would be inert there
+    /// (grammar 11.1, Decision D113).
     pub metadata_schema: Option<FieldMap>,
     /// `embed:` — required for `vector`, illegal otherwise.
     pub embed: Option<EmbedBlock>,
@@ -171,7 +174,10 @@ pub struct StoreDef {
 pub struct EmbedBlock {
     /// `model:` — a provider-native embedding model id, not a `model.*` ref.
     pub model: Option<Spanned<String>>,
-    /// `provider:` — which connection serves it.
+    /// `provider:` — REQUIRED; the connection that computes the vectors. A
+    /// storage backend never embeds: `backend:` forks per target and says where
+    /// the vectors live, while the embedding connection is logical-layer and
+    /// does not (grammar 11.2, Decision D116).
     pub provider: Option<Spanned<Address>>,
     /// `dimensions:` — asserted against the backend's index.
     pub dimensions: Option<Spanned<i64>>,

@@ -66,6 +66,12 @@ pub(crate) fn imports(node: &Node, cx: &mut Cx) -> Option<ImportsSection> {
 }
 
 /// Why an `imports:` entry is not a legal path, if it is not.
+///
+/// The charset half is grammar 1.4's own rule (Decision D80): `/`-separated
+/// segments, each `.`, `..`, or `[A-Za-z0-9_][A-Za-z0-9_.-]*`. One portable
+/// spelling keeps a path identical in the IR, on a command line, and in a
+/// diagnostic on every host, which a path carrying a space or a backslash does
+/// not.
 fn import_problem(path: &str) -> Option<&'static str> {
     if path.is_empty() {
         return Some("is empty");
@@ -82,7 +88,28 @@ fn import_problem(path: &str) -> Option<&'static str> {
     if !(path.ends_with(".yml") || path.ends_with(".yaml")) {
         return Some("does not name a `.yml` or `.yaml` file");
     }
+    if path.contains('\\') {
+        return Some("contains a backslash");
+    }
+    if path.chars().any(char::is_whitespace) {
+        return Some("contains whitespace");
+    }
+    if !path.split('/').all(is_portable_segment) {
+        return Some("is outside the portable path charset");
+    }
     None
+}
+
+/// Whether one `/`-separated segment matches grammar 1.4's charset.
+fn is_portable_segment(segment: &str) -> bool {
+    if segment == "." || segment == ".." {
+        return true;
+    }
+    let mut bytes = segment.bytes();
+    bytes
+        .next()
+        .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'-')
 }
 
 const REDUCERS: &[(&str, Reduce)] = &[
@@ -268,38 +295,72 @@ fn trigger(name: Spanned<crate::ast::common::Ident>, node: &Node, cx: &mut Cx) -
 }
 
 fn http_trigger(fields: &mut Fields<'_>, subject: &str, cx: &mut Cx) -> HttpTrigger {
-    let path = fields.string("path", cx).filter(|path| {
-        if !path.value.starts_with('/') {
-            cx.push(
-                Diagnostic::error(
+    // The route is part of the API surface the IR describes, so it is a class-3
+    // string: nothing is interpolated and a `${NAME}` token is an error
+    // (grammar 4.3, Decision D92).
+    let path = fields
+        .take("path")
+        .and_then(|node| lexical::text(node, "`path`", cx))
+        .filter(|path| {
+            if !path.value.starts_with('/') {
+                cx.push(
+                    Diagnostic::error(
+                        DiagnosticCode::InvalidValue,
+                        path.span.clone(),
+                        format!("`path` must start with `/`, found `{}`", path.value),
+                    )
+                    .with_help("the default is `/triggers/<trigger name>`"),
+                );
+                return false;
+            }
+            if path.value.chars().any(char::is_whitespace) {
+                cx.error(
                     DiagnosticCode::InvalidValue,
-                    path.span.clone(),
-                    format!("`path` must start with `/`, found `{}`", path.value),
-                )
-                .with_help("the default is `/triggers/<trigger name>`"),
-            );
-            return false;
-        }
-        if path.value.chars().any(char::is_whitespace) {
-            cx.error(
-                DiagnosticCode::InvalidValue,
-                &path.span,
-                format!("`path` must not contain whitespace, found `{}`", path.value),
-            );
-            return false;
-        }
-        true
-    });
+                    &path.span,
+                    format!("`path` must not contain whitespace, found `{}`", path.value),
+                );
+                return false;
+            }
+            true
+        });
     let method = fields
         .take("method")
         .and_then(|node| lexical::keyword(node, "trigger `method`", TRIGGER_METHODS, cx));
     let input = trigger_input(fields, cx);
+    let respond_declared = fields.contains("respond");
     let respond = fields
         .take("respond")
         .and_then(|node| lexical::keyword(node, "`respond`", RESPOND_MODES, cx));
-    let timeout = fields
-        .take("timeout")
-        .and_then(|node| lexical::duration(node, "`timeout`", cx));
+    // `timeout:` bounds the *response*, and an async trigger — declared or
+    // defaulted — has already responded with an execution id, so the key
+    // changes nothing observable (grammar 13.3, Decision D81). An unreadable
+    // `respond:` has been reported already; a second diagnostic keyed off a
+    // value nobody could read would be noise.
+    let timeout = fields.take_entry("timeout").and_then(|entry| {
+        if respond_declared && respond.is_none() {
+            return None;
+        }
+        if respond.as_ref().is_some_and(|r| r.value == Respond::Sync) {
+            return lexical::duration(&entry.value, "`timeout`", cx);
+        }
+        let mut diagnostic = Diagnostic::error(
+            DiagnosticCode::ConflictingKeys,
+            entry.key.span.clone(),
+            if respond_declared {
+                format!("`timeout` is not legal on the `respond: async` {subject}")
+            } else {
+                format!("`timeout` is not legal on {subject}, which responds asynchronously by default")
+            },
+        )
+        .with_help(
+            "an async trigger has already responded with an execution id, so there is no response left for a budget to bound: `timeout` belongs to `respond: sync` (grammar 13.3, Decision D81)",
+        );
+        if let Some(respond) = respond.as_ref() {
+            diagnostic = diagnostic.with_label(respond.span.clone(), "declared asynchronous here");
+        }
+        cx.push(diagnostic);
+        None
+    });
     let callback = fields
         .take_entry("callback")
         .and_then(|entry| {

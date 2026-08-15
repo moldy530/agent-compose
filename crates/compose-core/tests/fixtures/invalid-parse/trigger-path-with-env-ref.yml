@@ -1,0 +1,10 @@
+# rule: an http trigger's `path:` carries no environment references (grammar 4.3 class 3, Decision D92)
+# code: unexpected-env-ref
+# message: `path` never interpolates environment references, but it contains `${REVIEW_ROUTE}`
+# at: 10:11
+# help: write `$${REVIEW_ROUTE}` for a literal `${REVIEW_ROUTE}`
+triggers:
+  on_request:
+    type: http
+    flow: flow.review_loop
+    path: /${REVIEW_ROUTE}

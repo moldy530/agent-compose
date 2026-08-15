@@ -1,0 +1,8 @@
+# rule: an import path stays inside the portable charset - no whitespace, no backslashes (grammar 1.4, Decision D80)
+# code: invalid-import-path
+# message: `my dir/providers.yml` contains whitespace
+# at: 8:5
+# help: imports are relative paths to `.yml`/`.yaml` spec files, resolved against the entrypoint's directory: there is no directory scanning
+version: "0.1"
+imports:
+  - "my dir/providers.yml"
