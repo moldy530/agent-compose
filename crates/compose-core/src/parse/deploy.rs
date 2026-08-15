@@ -1,19 +1,18 @@
 //! The deploy layer's sections (grammar 14).
 
-use crate::ast::common::{LiteralEntry, Namespace};
+use crate::ast::common::Namespace;
 use crate::ast::definition::StoreKind;
 use crate::ast::deploy::{
     BackendAlias, BackendConfig, BackendDefault, BackendProvider, ConnectionField, EventSource,
-    EventSourceKind, EventSourcesSection, Network, Placement, PlacementsSection, Runtime,
-    SECRET_FIELDS, StorageBackendsSection,
+    EventSourceKind, EventSourcesSection, Network, Placement, PlacementsSection, PluginEntry,
+    PluginValue, Runtime, SECRET_FIELDS, StorageBackendsSection,
 };
-use crate::diag::{Diagnostic, DiagnosticCode};
-use crate::yaml::{Mapping, Node};
+use crate::diag::{Diagnostic, DiagnosticCode, Spanned};
+use crate::yaml::{Mapping, Node, Yaml};
 
 use super::definition::description;
 use super::lexical;
 use super::reader::{Cx, Fields, expect_mapping, list};
-use super::schema::literal;
 
 const RUNTIMES: &[(&str, Runtime)] = &[
     ("isolated", Runtime::Isolated),
@@ -219,24 +218,29 @@ pub(crate) fn event_sources(node: &Node, cx: &mut Cx) -> Option<EventSourcesSect
 /// Split an open plugin-config object into the connection fields grammar 4.3
 /// closes over — which must be `${ENV}` value-form references — and everything
 /// else, which the plugin's own published schema checks (Decision D50).
+///
+/// "Everything else" is not unchecked. Grammar 4.3 puts "non-secret
+/// `storage_backends` and `event_sources` config values" in class 2 alongside
+/// the `exec:` block and provider `headers`, so each one is read as an
+/// interpolable string on the way past: a malformed `${…}` token is reported
+/// here, and a well-formed one has its name recorded so the reference survives
+/// unresolved into the IR for `build`/`serve`/`run` to check for presence.
+/// *Which* keys a plugin admits is still the plugin's schema's business.
 fn plugin_config(
     mapping: &Mapping,
     typed: &[&str],
     subject: &str,
     cx: &mut Cx,
-) -> (Vec<ConnectionField>, Vec<LiteralEntry>) {
+) -> (Vec<ConnectionField>, Vec<PluginEntry>) {
     let mut connection = Vec::new();
     let mut extra = Vec::new();
     for entry in mapping.entries() {
         if typed.contains(&entry.key.value.as_str()) {
             continue;
         }
+        let context = format!("`{}` in {subject}", entry.key.value);
         if SECRET_FIELDS.contains(&entry.key.value.as_str()) {
-            let Some(value) = lexical::env_ref(
-                &entry.value,
-                &format!("`{}` in {subject}", entry.key.value),
-                cx,
-            ) else {
+            let Some(value) = lexical::env_ref(&entry.value, &context, cx) else {
                 continue;
             };
             connection.push(ConnectionField {
@@ -245,10 +249,59 @@ fn plugin_config(
             });
             continue;
         }
-        extra.push(LiteralEntry {
+        // A plugin option is *named* by its key, not substituted into it. Class
+        // 2 covers the config values, so Decision D92's totality rule leaves the
+        // keys in class 3 — the same split `settings:` already draws, where the
+        // key is rejected for a token as readily as the value. An unescaped one
+        // here would reach the plugin as the characters the author did not
+        // intend.
+        lexical::reject_env_refs(&entry.key, &format!("a config key of {subject}"), cx);
+        extra.push(PluginEntry {
             key: entry.key.clone(),
-            value: literal(&entry.value),
+            value: plugin_value(&entry.value, &context, cx),
         });
     }
     (connection, extra)
+}
+
+/// Read one value of an open plugin-config object (grammar 4.3 class 2).
+///
+/// A plugin object carries arbitrary YAML, so the walk is recursive: a token
+/// can sit inside a nested mapping or a sequence as easily as at the top, which
+/// is the same reason `settings:` is walked to its leaves for the class-3 rule.
+fn plugin_value(node: &Node, subject: &str, cx: &mut Cx) -> Spanned<PluginValue> {
+    let value = match &node.value {
+        Yaml::Null => PluginValue::Null,
+        Yaml::Bool(value) => PluginValue::Bool(*value),
+        Yaml::Int(value) => PluginValue::Int(*value),
+        Yaml::Float(value) => PluginValue::Float(*value),
+        Yaml::String(text) => {
+            let text = Spanned::new(text.clone(), node.span.clone());
+            PluginValue::Text(lexical::interpolate(text, subject, cx).value)
+        }
+        Yaml::Sequence(items) => PluginValue::Sequence(
+            items
+                .iter()
+                .map(|item| plugin_value(item, subject, cx))
+                .collect(),
+        ),
+        Yaml::Mapping(mapping) => PluginValue::Mapping(
+            mapping
+                .entries()
+                .iter()
+                .map(|entry| {
+                    lexical::reject_env_refs(
+                        &entry.key,
+                        &format!("a nested config key of {subject}"),
+                        cx,
+                    );
+                    PluginEntry {
+                        key: entry.key.clone(),
+                        value: plugin_value(&entry.value, subject, cx),
+                    }
+                })
+                .collect(),
+        ),
+    };
+    Spanned::new(value, node.span.clone())
 }

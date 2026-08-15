@@ -1,0 +1,12 @@
+# rule: a plugin-config key names an option rather than carrying a value, so nothing interpolates it (grammar 4.3 class 3, Decision D92)
+# code: unexpected-env-ref
+# message: a config key of event source `bug_reports` never interpolates environment references, but it contains `${STREAM}`
+# at: 12:5
+# help: write `$${STREAM}` for a literal `${STREAM}`
+version: "0.1"
+
+event_sources:
+  bug_reports:
+    kind: redis_streams
+    url: ${REDIS_URL}
+    "${STREAM}": bug-reports

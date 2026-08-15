@@ -681,6 +681,41 @@ event_sources:
     assert_eq!(document.kind(), DocumentKind::Deploy);
 }
 
+/// Grammar 4.3 puts non-secret `storage_backends`/`event_sources` config values
+/// in class 2, so an embedded `${NAME}` is the point of the surface rather than
+/// a mistake — and a plugin object is arbitrary YAML, so the reference can sit
+/// under a nested mapping or inside a sequence.
+#[test]
+fn deploy_plugin_config_values_that_embed_environment_references() {
+    let document = accepts(
+        "deploy/plugins.yml",
+        r#"
+version: "0.1"
+
+storage_backends:
+  aliases:
+    artifacts:
+      provider: local_fs
+      path: "${DATA_DIR}/artifacts"
+      options:
+        prefix: "${DEPLOY_ENV}-artifacts"
+        retries: 3
+        durable: true
+        tiers: ["${HOT_TIER}", cold]
+        unset: ~
+        ratio: 0.25
+
+event_sources:
+  bug_reports:
+    kind: nats
+    url: ${NATS_URL}
+    subject: "bugs.${DEPLOY_ENV}"
+    durable_name: "consumer-$${LITERAL}"
+"#,
+    );
+    assert_eq!(document.kind(), DocumentKind::Deploy);
+}
+
 #[test]
 fn the_defaults_section_and_every_error_policy_shape() {
     accepts(

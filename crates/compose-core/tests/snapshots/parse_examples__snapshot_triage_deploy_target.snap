@@ -69,9 +69,9 @@ Deploy(
                                 },
                             ],
                             extra: [
-                                LiteralEntry {
+                                PluginEntry {
                                     key: "index" @ 27:7..27:12,
-                                    value: String(
+                                    value: Text(
                                         "project-docs",
                                     ) @ 27:14..27:26,
                                 },
@@ -98,15 +98,15 @@ Deploy(
                             },
                         ],
                         extra: [
-                            LiteralEntry {
+                            PluginEntry {
                                 key: "stream" @ 35:5..35:11,
-                                value: String(
+                                value: Text(
                                     "bug-reports",
                                 ) @ 35:13..35:24,
                             },
-                            LiteralEntry {
+                            PluginEntry {
                                 key: "consumer_group" @ 36:5..36:19,
-                                value: String(
+                                value: Text(
                                     "agent-compose",
                                 ) @ 36:21..36:34,
                             },

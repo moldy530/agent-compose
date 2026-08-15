@@ -421,8 +421,15 @@ pub const RESERVED_ROOT_NAMES: &[&str] = &[
 pub const PSEUDO_NODES: &[&str] = &["start", "end"];
 
 /// A YAML literal, kept as written, for the surfaces that carry data rather
-/// than schema: `default:` values and the open plugin-config objects
-/// (`settings:`, backend configs, event-source configs — Decision D50).
+/// than schema: `default:` values and a model's open `settings:` object
+/// (Decision D50).
+///
+/// Both are grammar 4.3 class 3, which is what lets the value stay opaque —
+/// nothing in it is a reference to anything. The other open plugin-config
+/// objects, a backend config and an event source, carry class-2 values instead
+/// and so are read as
+/// [`PluginValue`](super::deploy::PluginValue), which records the environment
+/// references they may embed.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Literal {
     /// `~` / `null`.

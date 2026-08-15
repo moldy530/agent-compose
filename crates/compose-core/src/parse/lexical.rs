@@ -560,6 +560,20 @@ pub(crate) fn interpolated(
     cx: &mut Cx,
 ) -> Option<Spanned<Interpolated>> {
     let text = expect_string(node, subject, cx)?;
+    Some(interpolate(text, subject, cx))
+}
+
+/// The interpolated form of a string already read, reporting every malformed
+/// `${…}` token it carries (grammar 4.3).
+///
+/// Split out from [`interpolated`] for the surfaces that have already matched
+/// the YAML scalar themselves and so have no "found a mapping" case left to
+/// report — an open plugin-config object walks its own tree.
+pub(crate) fn interpolate(
+    text: Spanned<String>,
+    subject: &str,
+    cx: &mut Cx,
+) -> Spanned<Interpolated> {
     let mut references = Vec::new();
     for token in scan_env_tokens(&text.value) {
         match token.name {
@@ -579,10 +593,7 @@ pub(crate) fn interpolated(
             }
         }
     }
-    Some(Spanned::new(
-        Interpolated::new(text.value, references),
-        text.span,
-    ))
+    Spanned::new(Interpolated::new(text.value, references), text.span)
 }
 
 /// Check that a string carries no environment reference, on the surfaces where

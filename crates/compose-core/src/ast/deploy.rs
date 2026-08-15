@@ -7,7 +7,7 @@
 
 use crate::diag::{Span, Spanned};
 
-use super::common::{Address, EnvRef, Ident, Interpolated, LiteralEntry};
+use super::common::{Address, EnvRef, Ident, Interpolated};
 use super::definition::StoreKind;
 
 /// The `placements:` section (grammar 14.1).
@@ -97,7 +97,7 @@ pub struct BackendConfig {
     /// Connection fields that must be environment references (grammar 4.3).
     pub connection: Vec<ConnectionField>,
     /// Everything else, for the storage plugin's schema to check.
-    pub extra: Vec<LiteralEntry>,
+    pub extra: Vec<PluginEntry>,
     /// The mapping's own span.
     pub span: Span,
 }
@@ -203,7 +203,7 @@ pub struct EventSource {
     /// Connection fields that must be environment references (grammar 4.3).
     pub connection: Vec<ConnectionField>,
     /// Everything else, for the consumer plugin's schema to check.
-    pub extra: Vec<LiteralEntry>,
+    pub extra: Vec<PluginEntry>,
     /// The whole entry's span, name and body together. [`Self::name`] carries
     /// the name alone, for the diagnostics that are about the name.
     pub span: Span,
@@ -253,6 +253,39 @@ pub const SECRET_FIELDS: &[&str] = &[
     "dsn",
 ];
 
-/// A value that may embed environment references, used by the open
-/// plugin-config objects for keys outside [`SECRET_FIELDS`].
-pub type PluginValue = Spanned<Interpolated>;
+/// A value of an open plugin-config object, under a key outside
+/// [`SECRET_FIELDS`] (grammar 14.2, 14.3, Decision D50).
+///
+/// The shape mirrors [`Literal`](super::common::Literal), because a plugin
+/// object carries arbitrary YAML for the plugin's own published schema to
+/// check. What differs is the string arm: grammar 4.3 puts these values in
+/// class 2, so a `${NAME}` token in one is substituted at process start, and
+/// [`Interpolated`] is what carries the references unresolved into the IR for
+/// `build`/`serve`/`run` to check for presence.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PluginValue {
+    /// `~` / `null`.
+    Null,
+    /// A boolean.
+    Bool(bool),
+    /// An integer.
+    Int(i64),
+    /// A float.
+    Float(f64),
+    /// A string, with its environment references recorded.
+    Text(Interpolated),
+    /// A sequence of values.
+    Sequence(Vec<Spanned<PluginValue>>),
+    /// A mapping of values, in declaration order.
+    Mapping(Vec<PluginEntry>),
+}
+
+/// One entry of an open plugin-config object.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PluginEntry {
+    /// The key, spanned. Keys name plugin options rather than carrying values,
+    /// so they stay in grammar 4.3's class 3: nothing interpolates one.
+    pub key: Spanned<String>,
+    /// Its value.
+    pub value: Spanned<PluginValue>,
+}
