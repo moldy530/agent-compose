@@ -109,6 +109,17 @@ pub enum FlowContext {
     Inherit,
 }
 
+impl FlowContext {
+    /// The keyword that names this scoping.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Isolated => "isolated",
+            Self::Inherit => "inherit",
+        }
+    }
+}
+
 /// A `flow:` node: subgraph instantiation (grammar 8.5).
 #[derive(Clone, Debug, PartialEq)]
 pub struct FlowNode {

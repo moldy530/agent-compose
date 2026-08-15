@@ -101,6 +101,17 @@ pub enum Respond {
     Async,
 }
 
+impl Respond {
+    /// The keyword that names this mode.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sync => "sync",
+            Self::Async => "async",
+        }
+    }
+}
+
 /// An `http` trigger (grammar 13.3).
 #[derive(Clone, Debug, PartialEq)]
 pub struct HttpTrigger {

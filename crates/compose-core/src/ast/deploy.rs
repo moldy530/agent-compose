@@ -44,6 +44,17 @@ pub enum Runtime {
     Colocated,
 }
 
+impl Runtime {
+    /// The keyword that names this runtime.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Isolated => "isolated",
+            Self::Colocated => "colocated",
+        }
+    }
+}
+
 /// A placement's sandbox network policy — reserved (grammar 14.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Network {
@@ -53,6 +64,18 @@ pub enum Network {
     Egress,
     /// Unrestricted (the default).
     All,
+}
+
+impl Network {
+    /// The keyword that names this policy.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Egress => "egress",
+            Self::All => "all",
+        }
+    }
 }
 
 /// The `storage_backends:` section (grammar 14.2).

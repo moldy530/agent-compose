@@ -135,6 +135,18 @@ pub enum StoreScope {
     Global,
 }
 
+impl StoreScope {
+    /// The keyword that names this scope.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Execution => "execution",
+            Self::Session => "session",
+            Self::Global => "global",
+        }
+    }
+}
+
 /// How much of a store's surface an attached agent gets (grammar 11.1,
 /// Decision D37).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -143,6 +155,17 @@ pub enum AgentAccess {
     Read,
     /// Read and write tools (the default).
     ReadWrite,
+}
+
+impl AgentAccess {
+    /// The keyword that names this level of access.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::ReadWrite => "read_write",
+        }
+    }
 }
 
 /// A `store.*` definition (grammar 11.1).

@@ -62,3 +62,41 @@ pub use trigger::{
     EventTrigger, HttpTrigger, Respond, ScheduleTrigger, TRIGGER_TYPES, Trigger, TriggerKind,
     TriggerMethod, TriggersSection,
 };
+
+#[cfg(test)]
+mod keyword_tests {
+    use super::*;
+
+    /// Every closed vocabulary spells its variants the way the grammar does.
+    ///
+    /// The spelling is the whole of what these types carry: the parser reads a
+    /// keyword into one and the IR writes one back out, so a variant renamed on
+    /// one side and not the other would change the language quietly. Pinning
+    /// them here keeps the two directions on one list.
+    #[test]
+    fn closed_vocabularies_spell_their_variants_as_the_grammar_does() {
+        assert_eq!(StoreScope::Execution.as_str(), "execution");
+        assert_eq!(StoreScope::Session.as_str(), "session");
+        assert_eq!(StoreScope::Global.as_str(), "global");
+
+        assert_eq!(AgentAccess::Read.as_str(), "read");
+        assert_eq!(AgentAccess::ReadWrite.as_str(), "read_write");
+
+        assert_eq!(Runtime::Isolated.as_str(), "isolated");
+        assert_eq!(Runtime::Colocated.as_str(), "colocated");
+
+        assert_eq!(Network::None.as_str(), "none");
+        assert_eq!(Network::Egress.as_str(), "egress");
+        assert_eq!(Network::All.as_str(), "all");
+
+        assert_eq!(FlowContext::Isolated.as_str(), "isolated");
+        assert_eq!(FlowContext::Inherit.as_str(), "inherit");
+
+        assert_eq!(Respond::Sync.as_str(), "sync");
+        assert_eq!(Respond::Async.as_str(), "async");
+
+        assert_eq!(schema::Surface::Input.as_str(), "input");
+        assert_eq!(schema::Surface::Result.as_str(), "result");
+        assert_eq!(schema::Surface::Channel.as_str(), "channel");
+    }
+}
