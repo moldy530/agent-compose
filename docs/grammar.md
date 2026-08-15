@@ -120,6 +120,12 @@ imports:
   entrypoint (the *project root*).
 - Absolute paths, URLs, and glob/wildcard patterns are parse errors. There is **no
   directory scanning** — "what is in this graph" is the import list (PRD 5.1).
+- **Path form** (Decision [D80](#d80-the-published-schemas-per-file-bounds-are-grammar-rules)):
+  segments separated by `/`; each segment is `.`, `..`, or a name matching
+  `[A-Za-z0-9_][A-Za-z0-9_.-]*`; the last segment ends in `.yml` or `.yaml`
+  (§1.1). No backslashes, no whitespace, no leading `/`. One portable spelling
+  keeps a path identical in the IR, on a command line, and in a diagnostic on
+  every host.
 - A path MAY contain `..` but MUST resolve inside the project root.
 - Entries MUST be unique after path normalization, and MUST NOT name the
   entrypoint itself.
@@ -271,26 +277,44 @@ Node ids are identifiers scoped to their flow; two flows may both have a node
 `review`. `start` and `end` are **pseudo-nodes**:
 
 - `start` — the flow's entry. It has no output; one or more edges MUST leave it,
-  and nothing MAY target it. `start` is legal **only** as an edge `from`.
-- `end` — the flow's exit. No edge MAY leave it. Reaching `end` terminates the
-  flow instance and materializes its `outputs` (§7.5). `end` is legal as an edge
-  `to` and in the two **control-transfer positions** — `on_error.fallback`
-  (§9.2) and `human.on_timeout` (§8.7) — where it means "finish this flow
-  instance now, materializing whatever the `outputs:` channels currently hold".
-  The two control-transfer positions accept exactly the same targets; nothing
-  else accepts a pseudo-node.
+  and nothing MAY target it. `start` is legal **only** as an edge `from`. Edges
+  leaving `start` MAY carry `when:`/`else:`, and at least one of them MUST be
+  unconditional or carry `else: true` so an execution always has a first step
+  (§7.6.3).
+- `end` — the flow's exit. No edge MAY leave it. Reaching `end` **retires the
+  branch that reached it**; the flow instance finishes at quiescence, when every
+  live branch has retired, and materializes its `outputs` then (§7.6.3, §7.5).
+  `end` is legal as an edge `to` and in the two **control-transfer positions** —
+  `on_error.fallback` (§9.2) and `human.on_timeout` (§8.7) — where it means
+  "this branch is done", never "stop the run". The two control-transfer
+  positions accept exactly the same targets; nothing else accepts a pseudo-node.
 
-A node MUST NOT be named `start` or `end`.
+A node MUST NOT be named `start` or `end`, and every node MUST have at least one
+outgoing edge (§7.6.3).
 
 ### 2.5 Reserved names
 
-The following identifiers are reserved and MUST NOT be used as **state channel
-names** (they are CEL root identifiers or implicit channels — §4.1, §10.4):
+The **reserved root names** are the CEL root identifiers and the implicit
+channel (§4.1, §10.4):
 
 `input`, `state`, `execution`, `item`, `messages`, `output`, `payload`
 
-`start` and `end` are reserved as node ids only. Definition names have no
-reserved words beyond the identifier grammar.
+A reserved root name MUST NOT be used as (Decision
+[D74](#d74-reserved-roots-may-not-be-shadowed-by-node-ids-or-item-bindings)):
+
+| Position | Rule |
+|---|---|
+| a **state channel** name | illegal — the channel would shadow the root in every expression |
+| a **flow-local node id** | illegal — a node id is the root of `<node>.output` in edge guards and `map.over` (§4.1), so a node named `input` makes `input.output.x` ambiguous with the flow input object |
+| a `map` **`as:`** binding | illegal, **except `item`**, which is that binding's own default name (§8.6) |
+
+`start` and `end` are additionally reserved as node ids. Definition names have no
+reserved words beyond the identifier grammar: `agent.state` is fine, because a
+namespaced address is never a bare CEL root.
+
+Shadowing is a compile error rather than a precedence rule: there is no reading
+of `input.output.verdict` that is obviously right when a node is named `input`,
+and a document that had to name a winner would be teaching a trap (PRD G3).
 
 ---
 
@@ -358,7 +382,7 @@ started_at: { type: string, format: date-time }
 | `minimum` / `maximum` | integer, number | number | inclusive |
 | `exclusive_minimum` / `exclusive_maximum` | integer, number | number | |
 | `multiple_of` | integer, number | number > 0 | |
-| `default` | scalar, enum | matching literal | input surfaces and state channels only (§3.6) |
+| `default` | scalar, enum, object, array | literal validating against the type node | input surfaces and state channels only; never on a union (§3.6) |
 
 `enum` takes a non-empty array of **unique string literals** (identifier-like
 values are conventional but any non-empty string is legal). `enum` implies
@@ -416,9 +440,16 @@ its bound comes from whatever produced it.
 
 #### 3.6 `default`, requiredness, and surface rules
 
-- `default:` is legal on scalar and enum type nodes at **input** surfaces
-  (`agent.input`, `flow.inputs`, `tool.input`, `human.input`) and on **state**
-  channels, where it is the channel's initial value.
+- `default:` is legal on **scalar, enum, object, and array** type nodes at
+  **input** surfaces (`agent.input`, `flow.inputs`, `tool.input`,
+  `human.input`), nested inside them, and on **state** channels, where it is the
+  channel's initial value. The literal MUST validate against the type node it
+  sits on — an object default supplies every required property, an array default
+  is an array of the `items:` type (Decision
+  [D77](#d77-default-is-legal-on-every-type-node-form-except-a-union)).
+- `default:` is ILLEGAL on a **discriminated union** (§3.7) at every surface. A
+  union default would have to name a variant, and manufacturing a discriminator
+  tag is the same silent routing decision the output rule below refuses.
 - `default:` is ILLEGAL in **output** schemas (`agent.output`, `tool.output`,
   `flow.outputs`, `human.output`) and in `store.value_schema` /
   `metadata_schema`. A defaulted model output would silently manufacture routing
@@ -517,8 +548,9 @@ Referencing anything else is a compile error.
 | Surface | Roots in scope | Result type |
 |---|---|---|
 | edge `when:` | `<from>.output` (the edge's source node only), `input`, `state`, `execution` | bool |
-| `map.over` | `<node>.output` for any node that precedes the map node, `input`, `state` | list (path expression only, §4.2) |
-| `map.input` / `map.routes.<tag>.input` / `map.default.input` values | `<as-name>` (the item), `input`, `state`, `execution` | field-typed |
+| edge `when:` on an edge leaving `start` | `input`, `state`, `execution` — `start` has no output, so there is no `<from>.output` root (§2.4) | bool |
+| `map.over` | `<node>.output` for any node that **dominates** the map node (§8.6 rule 11), `input`, `state` | list (path expression only, §4.2) |
+| `map.input` / `map.routes.<tag>.input` / `map.default.input` values | `<as-name>` (the item), `input`, `state`, `execution` | field-typed, or a single scalar for a string-in target (§8.6 rule 12) |
 | node `input:` bindings | `input`, `state`, `execution` | field-typed |
 | store-op `key`, `value`, `query`, `prefix`, `filter`, `metadata` values | `input`, `state`, `execution` | per §11.4 |
 | inline `http` node `query` / `body` values | `input`, `state`, `execution` | field-typed |
@@ -791,7 +823,7 @@ exec:
 
 | Key | Type | Required | Notes |
 |---|---|---|---|
-| `command` | string | yes | executable name/path; never shell-interpreted |
+| `command` | string (non-empty) | yes | executable name/path; never shell-interpreted |
 | `args` | array of string | no | literal; no CEL (D24) |
 | `cwd` | string (interpolable) | no | |
 | `env` | map env-var-name (`[A-Za-z_][A-Za-z0-9_]*`) → string (interpolable) | no | added to the child environment |
@@ -832,7 +864,7 @@ http:
 | `headers` | map header-name (`[A-Za-z0-9_-]+`) → string (interpolable) | no | header names are case-insensitive |
 | `query` | map param-name (`[A-Za-z0-9_-]+`) → CEL over `input` | no | |
 | `body` | map identifier→CEL over `input` | no | JSON body; illegal for `GET`/`HEAD` |
-| `expect_status` | array of integer | no | default: any 2xx |
+| `expect_status` | **non-empty** array of integer in `100..=599` | no | default: any 2xx. An empty list would accept no response at all, making every call an error — the inert key [D61](#d61-else-takes-the-literal-true) rejects (D80) |
 
 Without `body`/`query`, the bound input object is sent as the JSON body
 (body-bearing methods) or as query parameters (`GET`/`HEAD`). The response body
@@ -954,7 +986,7 @@ edges:
 |---|---|---|---|
 | `from` | node id \| `start` | yes | |
 | `to` | node id \| `end` | yes | |
-| `when` | CEL (bool) | no | guard over the source node's output (§4.1) |
+| `when` | CEL (bool) | no | guard over the source node's output (§4.1). Legal on an edge leaving `start` too, where the only roots are `input`/`state`/`execution`; at least one `start` edge must still be unconditional or `else:` (§7.6.3) |
 | `else` | `true` | no | marks the default edge; mutually exclusive with `when`. `true` is the only legal value — `else: false` says nothing (an unguarded edge is already unconditional) and is a compile error |
 | `max_iterations` | integer 1..1000 | no | cycle bound (PRD 5.4); the source node then also needs an unconditional or `else:` edge leaving the cycle (§7.4) |
 
@@ -977,10 +1009,14 @@ Deterministic, and evaluated after the source node's output has been validated
 6. **All** taken edges fire. Two or more taken edges are concurrent branches
    (Decision [D17](#d17-edge-selection-is-multicast-with-else-not-first-match-wins));
    branches that write the same state channel MUST target a channel with a
-   declared `reduce` policy (§10.2) — the same rule maps obey (PRD 5.6).
+   declared `reduce` policy (§10.2) — the same rule maps obey (PRD 5.6). What
+   those branches then do — when they converge, what a convergence sees, and
+   when the instance is finished — is §7.6.
 7. If no edge is taken, the execution fails with a "no viable route" error naming
-   the node. The validator rejects statically-provable instances of this
-   (exhaustiveness, §7.3.1; escape edges, §7.4).
+   the node. This applies to `start` as well: an execution whose `start` guards
+   are all false fails before its first step. The validator rejects
+   statically-provable instances (exhaustiveness, §7.3.1; escape edges, §7.4;
+   the guaranteed `start` edge and the `on_error: skip` escape, §7.6.3).
 
 **7.3.1 Exhaustiveness.** When a node's outgoing edges are guarded by equality
 against an enum-typed field of its own output, every enum variant MUST be
@@ -1039,14 +1075,17 @@ boundaries are checkpoint/resume points.
 
 - **Inputs**: `flow.<f>.inputs` is the module's parameter surface. Inside the
   flow, `input.<field>` is in scope everywhere (§4.1).
-- **Outputs**: on reaching `end`, each field of `outputs:` is read from the state
-  channel of the same name; that channel MUST be declared in `state:` (§10) or
-  it is a compile error. There is no `returns:` binding — use a node `writes:`
-  remap to feed a differently-named channel
+- **Outputs**: at quiescence (§7.6.3), each field of `outputs:` is read from the
+  state channel of the same name; that channel MUST be declared in `state:`
+  (§10) or it is a compile error. There is no `returns:` binding — use a node
+  `writes:` remap to feed a differently-named channel
   (Decision [D53](#d53-flow-outputs-are-name-based-from-state)).
-- **As a node**: `{ flow: flow.review_loop, input: {...} }` — §8.5. `input:` is
-  REQUIRED whenever the subflow declares inputs: subgraphs receive parent state
-  only through explicit bindings (PRD 5.7).
+- **As a node**: `{ flow: flow.review_loop, input: {...} }` — §8.5. Bindings are
+  **total**: every input field the subflow declares without a `default:` MUST be
+  bound by the instantiating node's `input:`, and an unbound one is a compile
+  error. Nothing falls through by name — subgraphs receive parent state only
+  through explicit bindings (PRD 5.7, §8.0, Decision
+  [D68](#d68-flow-node-bindings-are-total-nothing-falls-through-a-module-boundary)).
 - **As a tool**: listing `flow.review_loop` in an agent's `tools:` makes its
   `inputs`/`outputs` the tool's parameter/result schemas. `description:` is then
   REQUIRED.
@@ -1054,14 +1093,223 @@ boundaries are checkpoint/resume points.
   tool attachment is a compile error naming the cycle
   (Decision [D26](#d26-flow-defs-outputs-required-description-when-tool-no-recursion)).
 
+### 7.6 Concurrency, convergence, and termination
+
+§7.3 rule 6 makes branching first-class: every taken edge fires, so one node can
+start two or more branches. This section defines what those branches do — when a
+node with several predecessors runs, what a branch whose guard was false leaves
+behind, in what order concurrent writes land, and when the flow instance is
+finished. Every rule here is decided from the graph and from recorded node
+outputs alone, so a replay reproduces the live run's schedule and values exactly
+(PRD 5.6, 5.12).
+
+**Steps.** A flow instance executes in **steps**. Step 0 runs the nodes targeted
+by the taken edges leaving `start`. When every node of step *k* has completed,
+its writes are applied to state (§7.6.4) and its outgoing edges are evaluated
+(§7.3); the union of the targets of all edges taken in step *k* is step *k+1*.
+The instance finishes when that union is empty (§7.6.3).
+
+A node **completes** when its own work is done. For the two composite kinds:
+
+- a `flow:` node completes when its subflow instance reaches quiescence;
+- a `map` node completes when every dispatched instance has completed or been
+  resolved by `on_item_error` — this is the fan-out barrier (§8.6 rule 6).
+
+Two properties follow, and a conforming implementation MUST preserve both:
+
+- **P1 — barrier**: a node's outgoing edges are evaluated only after that node
+  has completed, never before.
+- **P2 — one run per step**: a node targeted by two or more edges taken in the
+  *same* step runs **once** in the next step.
+
+*Codegen note.* This is LangGraph's superstep model, which supplies both
+properties directly: a superstep is a barrier, and a node scheduled by several
+triggers within one superstep is scheduled once (PRD 5.5, 5.12). They are stated
+as properties rather than as a wiring recipe so codegen keeps its choice of
+shaping — a conditional edge emitting `Send`s, a deferred join node — which is
+M1's call.
+
+#### 7.6.1 Exclusive edges, forks, and concurrent nodes
+
+Two outgoing edges of the same node are **exclusive** when the validator can
+prove they are never taken together:
+
+1. one carries `else: true` and the other carries `when:` — §7.3 rule 4 makes
+   those mutually exclusive by construction; or
+2. both carry `when:` guards that are equality comparisons of the **same**
+   enum-typed field of the source node's output against **different** literals —
+   the guard shape §7.3.1's exhaustiveness check already reads.
+
+Any other pair is **co-takeable**. A node with two or more co-takeable outgoing
+edges is a **fork**.
+
+Two nodes are **concurrent** when both are reachable from a common fork through
+two *distinct* co-takeable out-edges of it and neither is reachable from the
+other. Wherever this document says "concurrent contexts" — the reduced-channel
+rules of §8.0, §10.2, and §8.6 rule 5 — it means exactly that, plus the
+instances of one `map` node, which are concurrent with each other.
+
+The analysis is deliberately conservative: a guard pair it cannot prove
+exclusive is co-takeable, so it may ask for a `reduce:` policy on a channel two
+branches could not really both write. Declaring the policy is the cost;
+[D32](#d32-reduce-policies-are-typed-and-last_wins-is-explicit) already holds
+that a declared overwrite beats a silent race.
+
+#### 7.6.2 Convergence
+
+A node with two or more incoming edges is a **convergence**. P2 gives it AND-join
+behavior for free within one step: when a fork's branches are the same length,
+every branch that fired delivers in the same step, and the convergence runs once
+with all of their writes already applied.
+
+A branch whose guard was false delivers nothing and is not waited for — **a false
+guard can never deadlock a convergence**, because nothing ever waits. What a
+convergence *reads* is state, never its predecessors: node input bindings see
+`input`, `state`, and `execution` only (§8.0,
+[D42](#d42-node-outputs-are-readable-only-from-edge-guards-and-mapover)). So a
+convergence reached by one of two branches sees the channels that branch wrote,
+while the channels the other branch would have written hold whatever they held
+before (§10.1). That is why a join here needs no data-arrival protocol at all.
+
+Arrivals in **different** steps schedule the node again: a convergence reached at
+step *k* and again at step *k+2* runs twice. Well-defined, rarely intended — so
+the statically visible case is refused:
+
+**Balanced convergence.** For a fork `f`, let `dist(n)` be the set of step
+distances from `f` to `n` over paths that leave `f` by a co-takeable edge and
+traverse no node belonging to a cycle (§7.4); every edge counts as one step. If
+any node `d` has `|dist(d)| > 1`, the convergence at `d` is **unbalanced** and is
+a compile error naming `f`, `d`, and the differing distances (Decision
+[D69](#d69-execution-is-stepwise-and-convergence-is-a-per-step-join-over-taken-branches)).
+
+`end` is exempt: it is not a node, it retires branches instead of running, and
+branches legitimately reach it at different depths (§7.6.3). Where a cycle lies
+between the fork and the convergence the distance is not static, `dist` is not
+computed there, and the runtime rule above is what governs.
+
+**Worked example — the diamond.**
+
+```yaml
+flow.diamond:
+  outputs: { report: { type: string } }
+  nodes:
+    plan:     { agent: agent.planner }
+    draft:    { agent: agent.writer }
+    research: { agent: agent.researcher }
+    merge:    { agent: agent.merger }
+  edges:
+    - { from: start, to: plan }
+    - { from: plan, to: draft,    when: "plan.output.need_draft" }
+    - { from: plan, to: research, when: "plan.output.need_research" }
+    - { from: draft,    to: merge }
+    - { from: research, to: merge }
+    - { from: merge, to: end }
+```
+
+- **Step 0**: `plan`.
+- **Step 1**: whichever of `draft`/`research` the guards selected. The two `when:`
+  guards are not provably exclusive, so `plan` is a fork and the two nodes are
+  concurrent; with both guards true they run in one step and their writes land in
+  the canonical order of §7.6.4.
+- **Step 2**: `merge`, **once** — whether one branch or both delivered (P2). It
+  reads the channels `draft` and `research` wrote; a channel the branch that did
+  not run would have written still holds its previous value.
+- **Step 3**: nothing is scheduled. The instance is quiescent and its `outputs:`
+  are materialized (§7.6.3).
+
+Adding `- { from: plan, to: merge, when: "plan.output.trivial" }` makes
+`dist(merge) = {1, 2}`: `merge` would run in step 1 and again in step 2. That is
+the unbalanced-convergence compile error; the fixes are to route the short branch
+through the same depth, or to make the branches exclusive with `else:`.
+
+Both guards false is a *different* error — §7.3 rule 7's "no viable route" at
+`plan` — which is what §7.4's escape rule and an `else:` edge exist to prevent.
+
+#### 7.6.3 `end`, quiescence, and output materialization
+
+`end` **retires the branch that reaches it**; it does not terminate the instance.
+A flow instance is finished when it reaches **quiescence**: a step whose
+scheduled set is empty, which is to say every live branch has reached `end`
+(Decision [D70](#d70-end-retires-a-branch-and-a-flow-instance-ends-at-quiescence)).
+
+- **Outputs are materialized exactly once, at quiescence**: each field of
+  `outputs:` is read from the state channel of the same name (§7.5) after the
+  final step's writes have been applied. Nothing is snapshotted at the moment a
+  branch reaches `end`, so a value written by a branch that was still running is
+  included rather than raced.
+- Concurrent branches are **never cancelled**. Cancelling on first arrival would
+  make the result depend on completion order — the replay hazard PRD 5.6 names —
+  and would leave already-issued effects (store writes, sinks, HTTP calls)
+  half-applied with no defined state. `on_error: fail` (§9.2) is how an execution
+  is aborted; `end` is not.
+- `end` in a control-transfer position — `on_error: { fallback: end }` (§9.2),
+  `human.on_timeout: end` (§8.7) — retires that branch with the same meaning.
+- Several branches MAY reach `end`; each retires.
+
+**No silent dead ends.** Because a branch retires only at `end`, quiescence is
+reachable only when every branch got there. Three static rules keep that true
+(Decision [D71](#d71-no-silent-dead-ends-every-node-exits-and-every-run-starts)):
+
+1. **Every node MUST have at least one outgoing edge.** A node with none would
+   swallow its branch without reaching `end`. Writing `- { from: n, to: end }` is
+   the one-line way to say "this branch is done here".
+2. **At least one edge leaving `start` MUST be unconditional or carry
+   `else: true`.** §2.4 requires an edge; this requires one that is guaranteed to
+   fire, so an execution always has a first step instead of dying on §7.3 rule 7
+   before doing any work.
+3. **A node declaring `on_error: skip` MUST have an outgoing edge that is
+   unconditional or carries `else: true`.** A skipped node produces no output, so
+   its guarded edges evaluate false (§9.2) and it would dead-end on §7.3 rule 7 —
+   the same failure [D19](#d19-max_iterations-semantics-and-the-escape-edge-rule)'s
+   escape rule removes for an exhausted cycle budget.
+
+#### 7.6.4 Canonical write order
+
+Several writers can write one channel in one step: concurrent branches (§7.6.1)
+and the instances of a `map`. Completion order among them is nondeterministic
+(PRD 5.6), so it is never what decides the result. Writes are applied in a
+**canonical order** computed from the graph alone (Decision
+[D72](#d72-concurrent-writes-are-applied-in-a-canonical-order)):
+
+1. The writers of a step are the nodes that completed in it, ordered by **node
+   id**, ascending byte order over the identifier grammar (§2.1).
+2. A `map` node's writers are its dispatched instances, ordered by **source-item
+   index** ascending, occupying the map node's own place in that order. For a
+   discriminator-routed map that is one order across every route, because the
+   index is over the source array.
+3. A `flow:` node is a **single** writer at this level, at its own node id: the
+   subflow instance orders its internals by these same rules, and only its
+   `outputs:`, materialized at its quiescence, cross the boundary.
+4. Within one writer there is at most one write per channel. `writes:` MUST be
+   **injective** — two output fields may not name the same channel — and a
+   remapped field is not also written to its same-named channel (§8.0). A
+   non-injective `writes:` is a compile error.
+
+The reduce policy is then applied in that order: `append` appends in it (which
+for a `map` is source-item order, PRD 5.6's requirement, arrived at as a
+consequence rather than a special case); `merge` merges in it, so the **last
+writer in canonical order** wins per conflicting key; `last_wins` keeps the last
+write in it. An unreduced channel has at most one writer per step by
+construction — writing one from concurrent contexts is a compile error (§10.2).
+
+Writes from different steps are ordered by step. The channel values entering step
+*k+1* are therefore a pure function of the values entering step *k* and the
+recorded outputs of step *k*'s nodes, which is what makes a replay reproduce the
+live run rather than a plausible alternative to it.
+
 ---
 
 ## 8. Node types
 
 ### 8.0 Input bindings, name-based wiring, and `writes`
 
-**Reading.** A node's input fields are resolved in this order
-(Decision [D15](#d15-node-level-input-is-the-one-binding-mechanism)):
+**Reading.** How a node's input fields are resolved depends on whether the target
+is in the same flow or behind a module boundary
+(Decision [D15](#d15-node-level-input-is-the-one-binding-mechanism), Decision
+[D68](#d68-flow-node-bindings-are-total-nothing-falls-through-a-module-boundary)).
+
+*In-flow targets* — `agent:`, `exec:`, `http:`, `function:`, `human:`, `store:`
+nodes, whose target is invoked inside this flow's own scope:
 
 1. an explicit `input:` binding for that field, if present;
 2. otherwise the state channel of the same name (§10);
@@ -1069,6 +1317,20 @@ boundaries are checkpoint/resume points.
 4. otherwise the field's own `default:`, if it declares one — such a field is
    optional at its surface (§3.6), so it never forces a binding;
 5. otherwise a compile error naming the unbound field.
+
+*Module-boundary targets* — `flow:` nodes (§8.5) and `map` dispatch (§8.6),
+which instantiate a component with its own scope:
+
+1. an explicit binding for that field, if present;
+2. otherwise the field's own `default:`, if it declares one;
+3. otherwise a compile error naming the unbound field.
+
+Steps 2 and 3 of the in-flow chain — the state channel and the enclosing flow
+input of the same name — **do not apply across a module boundary**. Name-based
+wiring is a convenience *within* one flow's scope; nothing crosses a module
+boundary implicitly (PRD 5.7). A subflow that declares `{goal, draft}` and is
+instantiated with `input: { goal: … }` is a compile error naming `draft`, even
+where the caller happens to have a `draft` channel.
 
 ```yaml
 review:
@@ -1078,11 +1340,12 @@ review:
     draft: "state.draft"
 ```
 
-Explicit `input:` MUST bind a subset of the target's declared input fields;
-unbound fields fall through to steps 2–5. For string-in agents the scalar form
-`input: "input.goal"` is used (§5.3). On `flow:` nodes `input:` is REQUIRED when
-the subflow declares inputs (PRD 5.7 `passVariables` discipline). On `map` nodes
-the per-item binding lives inside the `map:` block instead (§8.6).
+Explicit `input:` MUST bind a subset of the target's declared input fields. For
+string-in agents the scalar form `input: "input.goal"` is used (§5.3), at a node
+position and as a `map` dispatch binding alike (§8.6 rule 12). On `flow:` nodes
+`input:` is REQUIRED whenever the subflow declares an input field with no
+`default:` (PRD 5.7 `passVariables` discipline). On `map` nodes the per-item
+binding lives inside the `map:` block instead (§8.6).
 
 **Writing.** After a node completes, each field of its output is written to the
 state channel of the same name **if such a channel is declared**; fields with no
@@ -1097,6 +1360,9 @@ review:
 ```
 
 - Keys MUST be output field names of the node; values MUST be declared channels.
+- `writes:` MUST be **injective**: two output fields may not name the same
+  channel, which would leave one node making two unordered writes to one channel
+  (§7.6.4). A non-injective `writes:` is a compile error naming both fields.
 - Every write — name-based or remapped — is type-checked against the target
   channel by its reduce policy (§10.2): whole value for an unreduced or
   `last_wins` channel, one element for an `append` channel, a partial object for
@@ -1104,8 +1370,9 @@ review:
 - A remapped field is not also written to its same-named channel.
 - Remapping is the fix for channel collisions between nodes and for renames
   across subgraph boundaries (PRD 5.7).
-- Writing the same channel from concurrent contexts (parallel branches, `map`
-  instances) requires a channel with a declared `reduce` policy (§10.2).
+- Writing the same channel from concurrent contexts (§7.6.1: concurrent branches,
+  `map` instances) requires a channel with a declared `reduce` policy (§10.2),
+  and the writes are applied in the canonical order of §7.6.4.
 
 ### 8.1 `agent`
 
@@ -1252,7 +1519,7 @@ sub:
 | Key | Type | Required | Default | Notes |
 |---|---|---|---|---|
 | `flow` | `flow.*` ref | yes | — | no recursion |
-| `input` | map field→CEL | yes when the subflow has inputs | — | explicit bindings only |
+| `input` | map field→CEL | yes when the subflow declares an input without a `default:` | — | explicit bindings only; unbound non-defaulted fields are a compile error, never a name-based fallthrough (§8.0, D68) |
 | `writes` | map output-field→channel | no | name-based | keys are the subflow's `outputs` fields |
 | `context` | `isolated` \| `inherit` | no | `isolated` | conversation-history scoping (PRD 5.7) |
 | `policy` | `{ retry, timeout, on_error }` | no | — | override for the nodes *inside*, §9.3 |
@@ -1270,7 +1537,11 @@ node MAY carry both:
 
 - `policy:` is level 1 of the resolution chain (§9.3) for **every node inside**
   the instantiated subflow, propagated into nested instantiations. It never
-  applies to the instantiating node itself.
+  applies to the instantiating node itself. When two or more instantiation-site
+  overrides reach the same node for the same policy field — flow A instantiates
+  B with `policy: {timeout: 30s}` and a node inside B instantiates C with
+  `policy: {timeout: 10s}` — the **outermost** wins, so C's nodes get 30s
+  (Decision [D79](#d79-the-outermost-instantiation-site-policy-wins)).
 - `retry`/`timeout`/`on_error` at node level are level 2 for **this node**, which
   treats the whole subgraph instance as one activity: `timeout` bounds the entire
   instance, `on_error` fires when the instance fails, and `retry` re-executes the
@@ -1321,11 +1592,11 @@ dispatch:
 | `as` | identifier | no | `item` | names the item in `input:` CEL and in traces |
 | `node` | `agent.*`/`tool.*`/`flow.*` | homogeneous only | — | mutually exclusive with `route_by` |
 | `route_by` | identifier | heterogeneous only | — | MUST equal the item union's `discriminator` |
-| `routes` | map tag→route | with `route_by` | — | keys MUST be variant tags |
+| `routes` | map tag→route, **≥ 1 entry** | with `route_by` | — | keys MUST be variant tags; an empty `routes:` would dispatch a union to one target and give up narrowing (D30) |
 | `default` | route | no | — | catch-all; legal only with `route_by` |
 | `max_concurrency` | integer 1..256 | **yes** | — | node-wide bound (D28) |
-| `on_item_error` | `fail` \| `skip` \| `retry` | no | `fail` | per item (PRD 5.6) |
-| `input` | map field→CEL | no | whole item | per-item input binding |
+| `on_item_error` | `fail` \| `skip` \| `{ retry: <retry block, §9.1> }` | no | `fail` | per item (PRD 5.6); rule 10 |
+| `input` | map field→CEL, or scalar CEL | no | whole item | per-item input binding; rule 12 |
 | `writes` | map output-field→channel | no | name-based | target channels MUST be reduced |
 | `detach` | boolean | homogeneous form only | `false` | fire-and-forget dispatch; ILLEGAL as a map-block key alongside `route_by:` — declare it per route instead (rule 7) |
 
@@ -1352,12 +1623,20 @@ A **route** object takes `node` (required) plus optional `max_concurrency`,
    `default:` with no unrouted variant is unreachable and is a compile error
    (Decision [D30](#d30-union-items-require-route_by-non-union-items-forbid-it-default-is-the-catch-all)).
 5. **Reduced writes**: anything a dispatched instance writes to shared state MUST
-   target a channel with a declared `reduce` policy. Appended results are
-   automatically index-tagged and reordered by source-item index before the join,
+   target a channel with a declared `reduce` policy. Instances are concurrent
+   writers, so their writes land in the canonical order of §7.6.4 — by
+   **source-item index**, never by completion order. Appended results are
+   therefore index-tagged and reordered before the join; a `merge` channel
+   written by several instances resolves each conflicting key to the
+   highest-indexed item's write, and a `last_wins` channel to the highest-indexed
+   item's write outright. Nothing here depends on which instance finished first,
    so replay is deterministic.
-6. **Join**: the downstream edge is the barrier — it fires when all instances
-   have completed or been resolved by `on_item_error`. Sink routes are waited on
-   like any other route.
+6. **Join**: the map node completes when every instance has completed or been
+   resolved by `on_item_error`; its outgoing edges are evaluated in the next step
+   (§7.6, P1). Sink routes are waited on like any other route. A dispatch of
+   **zero** instances — an empty source array, or a producer that was skipped
+   (rule 11) — completes immediately, writes nothing, and its outgoing edges fire
+   exactly as if every instance had finished.
 7. **`detach`**: a detached dispatch is fire-and-forget. It is declared in
    exactly two positions — as a map-block key on the **homogeneous** form
    (`node:`), or on an individual **route** — and a map block that declares
@@ -1381,6 +1660,60 @@ A **route** object takes `node` (required) plus optional `max_concurrency`,
    per-item binding lives in the `map:` block (or on a route), and so does the
    write remap. Node-level `retry`/`timeout`/`on_error` are legal and apply to
    the map node as a whole, while `on_item_error` governs individual items.
+10. **`on_item_error` and per-item policy.** `on_item_error:` takes `fail`,
+    `skip`, or `{ retry: <retry block> }`, where the retry block is §9.1's
+    verbatim (`max` and `backoff` required, `multiplier`/`max_backoff`/`jitter`
+    optional) — the same enum-or-single-key-object shape `on_error:` uses (§9.2).
+    A bare `on_item_error: retry` is a compile error: a retry with no bound is
+    the unbounded loop PRD 5.6 exists to prevent, and there is nowhere for it to
+    inherit one from (Decision
+    [D73](#d73-on_item_error-carries-its-retry-policy-inline)).
+
+    Where the policy comes from is fixed, with no implicit chain:
+
+    - `on_item_error:` is read from the `map:` block alone and defaults to
+      `fail`. `defaults:` (§9.3 level 3) applies to **nodes**, and a dispatched
+      instance is not a node of this flow ([D29](#d29-map-targets-are-component-references-not-flow-local-node-ids)),
+      so nothing supplies an item policy behind the author's back. Routes do not
+      carry `on_item_error:`; the map-block value governs every route.
+    - A retry re-executes the whole dispatched instance from its entry as a fresh
+      attempt — iteration counters and the item's own state reset, exactly as a
+      `flow:` node's `retry:` re-executes a subgraph instance (§8.5). The item's
+      `execution.item_index` does not change, so its idempotency key does not
+      either (PRD 5.6, 5.8).
+    - When retries are exhausted the item **fails**, resolving as `fail` does. To
+      absorb that, put `on_error:` on the map node itself (rule 9): it applies to
+      the fan-out as a whole, so `on_item_error: { retry: {...} }` with
+      `on_error: skip` reads "retry each item, and if one still fails, skip the
+      fan-out".
+    - Nodes *inside* a dispatched `flow.*` are ordinary nodes and resolve
+      `retry`/`timeout`/`on_error` through §9.3 with **level 1 absent** — a `map`
+      has no `policy:` key, so a dispatched subflow's nodes see node →
+      `defaults:` → built-in.
+11. **`over` reads a dominating node.** In `over: <node>.output.…`, `<node>` MUST
+    **dominate** the map node: every path from the flow's `start` to the map node
+    passes through `<node>`. Mere path-existence is not enough — a producer
+    sitting on a guarded sibling branch may not have run when the map dispatches,
+    leaving `over` with no value at all. Dominance is computed on the same flow
+    graph §7.4's SCC analysis already builds and stays decidable with cycles
+    present, because a back-edge adds no new path from `start`
+    (Decision [D76](#d76-mapover-reads-a-node-that-dominates-the-map-node)).
+    When the dominating node produced no output on this pass because it was
+    skipped (§9.2), the map dispatches zero instances per rule 6.
+12. **Per-item bindings take the same two forms node-level `input:` does.** A
+    field map binds the target's declared input fields from the item; a bare
+    scalar CEL string binds a **string-in** agent's single unnamed input
+    ([D14](#d14-string-in-agents-bind-with-a-scalar-input-at-the-node)), so
+    `input: "item.summary"` is how an object item feeds a string-in target. The
+    two forms are not interchangeable: a string-in target takes the scalar form
+    (or no `input:` at all, when the item's own type is `string` and the
+    whole-item default already supplies it), and a target with a declared input
+    object takes the field-map form (or no `input:`, when the whole item is
+    schema-compatible with that object). The other pairing is a compile error
+    naming the target's input contract (Decision
+    [D75](#d75-map-dispatch-bindings-take-both-input-forms)). `tool.*` and
+    `flow.*` targets always declare an input object, so only an agent target can
+    be string-in.
 
 ### 8.7 `human`
 
@@ -1477,9 +1810,9 @@ casing (PRD 5.11).
 
 | Value | Semantics |
 |---|---|
-| `fail` | abort the execution with the node's error (built-in default) |
-| `skip` | the node produces no output and writes nothing; its **unconditional** and `else` outgoing edges still fire, and guards referencing the missing output evaluate to false |
-| `{ fallback: <node id or end> }` | transfer control to another node in the same flow, or to `end`; never `start` |
+| `fail` | abort the execution with the node's error (built-in default); sibling branches stop with it |
+| `skip` | the node produces no output and writes nothing; its **unconditional** and `else` outgoing edges still fire, and guards referencing the missing output evaluate to false. A node declaring `skip` MUST have one of those two edge forms leaving it (§7.6.3) |
+| `{ fallback: <node id or end> }` | the node's own outgoing edges are **not** evaluated; the fallback target is scheduled in the next step instead (§7.6), or the branch retires if the target is `end`. A node in the same flow only; never `start` |
 
 `fallback` targets a **flow-local node id or `end`** (§2.4), keeping error
 routing inside one graph where reachability analysis can see it — never `start`,
@@ -1495,7 +1828,12 @@ precedence first (PRD 5.5's `flow override > node > defaults > fail`):
 1. **Flow override** — `policy:` on the `flow:` node that instantiated the
    enclosing flow, propagated into nested instantiations. It applies to the nodes
    *inside* that instance only; the instantiating `flow:` node resolves its own
-   policy from levels 1–4 in its own flow (§8.5).
+   policy from levels 1–4 in its own flow (§8.5). When several instantiation
+   sites in a nesting chain set the same field, the **outermost** wins — a
+   caller's hardening of a module it does not own cannot be undone by that
+   module's own instantiation of a deeper one
+   (Decision [D79](#d79-the-outermost-instantiation-site-policy-wins)). A `map`
+   contributes no level 1: it has no `policy:` key (§8.6 rule 10).
 2. **Node** — the node's own `retry`/`timeout`/`on_error`.
 3. **Defaults** — the composition's `defaults:` section.
 4. **Built-in** — no retry, no timeout, `on_error: fail`.
@@ -1540,25 +1878,45 @@ A channel is a type node (§3.2) plus two channel-only keys:
 | Key | Type | Required | Default | Notes |
 |---|---|---|---|---|
 | `reduce` | `append` \| `merge` \| `last_wins` | no | *unreduced* | concurrency policy |
-| `default` | literal matching the type | no | — | initial value |
+| `default` | literal validating against the channel's type | no | see below | initial value; ILLEGAL on a union channel (§3.6) |
 
 Channel names are identifiers and MUST NOT be reserved (§2.5). The channel set is
 composition-global in **shape**; each flow instance holds its own **values**, so
 two flows may both use `draft` without interfering, and a subgraph sees only what
 its `input:` bindings and `writes:` remaps carry across (PRD 5.7).
 
+**Initial values.** A channel starts each flow instance at its `default:`. With
+no `default:` declared (Decision
+[D78](#d78-channel-initial-values-and-reading-an-unset-channel)):
+
+- an `append` channel starts as `[]` and a `merge` channel as `{}` — the identity
+  element of the reduce, which is what makes a fan-out that produced zero items
+  (§8.6 rule 6) read as "nothing yet" rather than as an error;
+- every other channel is **unset**. Reading an unset channel — from a CEL
+  expression, a name-based input binding, or a flow's `outputs:` materialization
+  (§7.5) — fails the execution naming the channel and the reader. Declaring a
+  `default:` is how a channel becomes readable before its first write, which is
+  what a convergence reached by only one of two branches (§7.6.2) usually wants.
+
 ### 10.2 Reduce policies
 
 | Policy | Requires | Semantics |
 |---|---|---|
-| `append` | `type: array` | each write contributes **one element**; `map` writes are index-tagged and reordered by source-item index before the join (PRD 5.6) |
-| `merge` | `type: object` | shallow key-wise merge of the written object into the channel; conflicting keys resolve last-writer-wins within one superstep |
-| `last_wins` | any | last write in the superstep wins, explicitly declared as concurrency-safe |
+| `append` | `type: array` | each write contributes **one element**, appended in canonical write order — which for a `map` is source-item index order (§7.6.4, PRD 5.6) |
+| `merge` | `type: object` | shallow key-wise merge of the written object into the channel, applied in canonical write order, so the **last writer in that order** wins a conflicting key |
+| `last_wins` | any | the **last write in canonical write order** wins, explicitly declared as concurrency-safe |
+
+Every one of these is defined against the canonical write order of §7.6.4, never
+against completion order: the writers of one step are ordered by node id, and a
+`map`'s instances by source-item index. Two runs of the same composition over the
+same inputs therefore leave every channel holding the same value, and a replay
+reproduces it — the guarantee PRD 5.6 asks for when it calls unordered reduces a
+silent break of replay.
 
 A channel **without** `reduce:` is *unreduced*: single-writer, sequential. Writing
-an unreduced channel from inside a `map` — or from two concurrent branches
-(§7.3) — is a compile error (PRD 5.6). Declaring `reduce: last_wins` is how an
-author opts into concurrent overwrite explicitly.
+an unreduced channel from inside a `map` — or from two concurrent nodes (§7.6.1) —
+is a compile error (PRD 5.6). Declaring `reduce: last_wins` is how an author opts
+into concurrent overwrite explicitly.
 
 **What a write supplies, and how it is type-checked.** The reduce policy decides
 whether a write carries the channel's whole value or a contribution to it. This
@@ -1646,7 +2004,7 @@ store.docs:
 
 | Key | Type | Required | Notes |
 |---|---|---|---|
-| `model` | string | yes | provider-native embedding model id (a bare string, not a `model.*` ref — D36) |
+| `model` | string (non-empty) | yes | provider-native embedding model id (a bare string, not a `model.*` ref — D36) |
 | `provider` | `provider.*` ref | no | which connection serves it; default resolved from the target's backend |
 | `dimensions` | integer ≥ 1 | no | asserted against the backend's index |
 
@@ -1679,14 +2037,14 @@ store's `value_schema` object; `M` its `metadata_schema` object.
 | `kv` | `get` | `key` (CEL string) | `{ value: V (optional), found: boolean }` |
 | `kv` | `set` | `key`, `value` (map field→CEL matching `V`) | `{ key: string }` |
 | `kv` | `delete` | `key` | `{ deleted: boolean }` |
-| `kv` | `list` | `prefix` (CEL string), `limit` (integer 1..1000, required) | `{ keys: array<string> }` |
+| `kv` | `list` | `prefix` (CEL string, optional), `limit` (integer 1..1000, required) | `{ keys: array<string> }` |
 | `vector` | `search` | `query` (CEL string), `top_k` (integer 1..100, required), `filter` (map metadata-field→CEL, optional) | `{ matches: array<{ id: string, score: number, text: string, metadata: M }> }` |
 | `vector` | `upsert` | `key`, `value` (CEL string — the text), `metadata` (map field→CEL, optional) | `{ id: string }` |
 | `vector` | `delete` | `key` | `{ deleted: boolean }` |
 | `blob` | `put` | `key`, `value` (CEL string), `content_type` (string, optional) | `{ key: string }` |
 | `blob` | `get` | `key` | `{ value: string (optional), found: boolean }` |
 | `blob` | `delete` | `key` | `{ deleted: boolean }` |
-| `blob` | `list` | `prefix`, `limit` (required) | `{ keys: array<string> }` |
+| `blob` | `list` | `prefix` (CEL string, optional), `limit` (integer 1..1000, required) | `{ keys: array<string> }` |
 
 Rules (PRD 5.8):
 
@@ -1702,10 +2060,29 @@ Rules (PRD 5.8):
 - Store ops are **effects**: reads are recorded and replay consumes history, not
   the live store; writes are at-least-once carrying an idempotency key derived
   from `execution_id + node + item_index`.
-- A store **write** performed inside a `map`-dispatched instance MUST derive its
-  key from the item: the `key:` expression MUST reference `input.*` (the item, as
-  bound into the dispatched flow) or `execution.item_index`. Unkeyed blob or
-  global writes from concurrent instances are a compile error.
+- A store **write** performed inside a `map`-dispatched instance — `kv set`,
+  `kv delete`, `vector upsert`, `vector delete`, `blob put`, `blob delete` — MUST
+  be one of two forms (PRD 5.8, Decision
+  [D67](#d67-store-writes-inside-a-map-item-derived-key-or-a-keyed-kv-write)):
+
+  1. **item-derived key** — the `key:` expression references `input.*` (the item,
+     as bound into the dispatched flow) or `execution.item_index`, so concurrent
+     instances address disjoint keys. Legal for every kind.
+  2. **a keyed `kv` write** — `op: set` or `op: delete` on a `kv` store with any
+     legal `key:` expression, including one constant across instances.
+
+  Anything else — a `vector` or `blob` write whose key is not item-derived — is a
+  compile error naming the node and the store.
+
+  The `kv` exemption is not a loophole: a `kv` write replaces the whole value at
+  a slot the author named, so concurrent instances writing one key are a declared
+  overwrite, the store-side counterpart of `reduce: last_wins` (§10.2). Its final
+  value depends on completion order and is therefore *not* deterministic — which
+  is sound here and would not be for a channel, because store reads are recorded
+  and a replay consumes history rather than the live store (PRD 5.8), so no store
+  value ever feeds the graph's own scheduling. A `blob` or `vector` write has no
+  such story: it is bulk content at a document id, so a shared key from N
+  instances is N documents' worth of data landing in one slot.
 
 ### 11.5 Agent-attached stores
 
@@ -1798,7 +2175,7 @@ model.default:
 | Key | Type | Required | Notes |
 |---|---|---|---|
 | `provider` | `provider.*` ref | yes | |
-| `id` | string | yes | provider-native model id; no env refs |
+| `id` | string (non-empty) | yes | provider-native model id; no env refs |
 | `settings` | object | no | validated against the provider plugin's settings schema |
 | `description` | string | no | |
 
@@ -1806,8 +2183,8 @@ model.default:
 
 | Key | Type | Required | Notes |
 |---|---|---|---|
-| `route` | array of `model.*` refs, ≥ 2 | yes | ordered fallback; members MUST be direct models (no nested routes) |
-| `route_on` | array of enum | no (default `[rate_limit, overloaded, timeout]`) | `rate_limit`, `overloaded`, `timeout`, `server_error` |
+| `route` | array of `model.*` refs, ≥ 2, **distinct** | yes | ordered fallback; members MUST be direct models (no nested routes). A repeated member is a fallback to the model that just failed — an inert entry, and a compile error (D80) |
+| `route_on` | **non-empty** array of distinct enum values | no (default `[rate_limit, overloaded, timeout]`) | `rate_limit`, `overloaded`, `timeout`, `server_error`. `route_on: []` would declare a route that never fails over — write a direct model instead (D80) |
 | `description` | string | no | |
 
 Rules (PRD 5.9):
@@ -1943,7 +2320,7 @@ defaulted `session_key:`, exists implicitly for every flow (§13 preamble).
 | `method` | `POST` \| `PUT` \| `GET` | no | `POST` | |
 | `input` | map field→CEL over `payload` | no | — | |
 | `respond` | `sync` \| `async` | no | `async` | |
-| `timeout` | duration | no | `60s` | meaningful for `respond: sync` |
+| `timeout` | duration | `sync` only | `60s` | the response budget; ILLEGAL with `respond: async` (explicit or defaulted) |
 | `callback` | CEL over `payload` → string | no | — | completion webhook; `async` only |
 
 `payload` shape: `payload.body` (decoded JSON object), `payload.query` (map of
@@ -1956,7 +2333,13 @@ string), `payload.headers` (map of string, lowercase names), `payload.path`
   synchronously MUST be statically **interrupt-free**: no `human` node reachable
   from its entry (PRD 5.11). On timeout expiry the response **upgrades to async**
   (HTTP 202 + execution id + status URL); the execution continues durably.
-- `callback:` with `respond: sync` is a compile error.
+- `callback:` with `respond: sync` is a compile error: a synchronous response
+  already carries the outputs, so the webhook would have nothing to deliver.
+- `timeout:` with `respond: async` is a compile error, for the mirror-image
+  reason: an async trigger has already responded, so there is no response for a
+  budget to bound and the key changes nothing. `60s` is the default of the
+  *effective sync* budget, not a value an async trigger carries
+  (Decision [D81](#d81-timeout-is-illegal-on-an-async-http-trigger)).
 - Generated apps expose `start`, `resume`, and `status` routes; resume payloads
   are validated against the interrupting `human` node's output schema (PRD 5.11).
 
@@ -2232,7 +2615,10 @@ one-line explicit binding is the smallest honest answer and avoids magic
 ### D15. Node-level `input:` is the one binding mechanism
 
 Every node kind (except `map`, which binds per item inside its block) accepts
-`input:`; on `flow:` nodes it is required whenever the subflow has inputs.
+`input:`; on `flow:` nodes it is required whenever the subflow declares an input
+field with no `default:`, and unbound fields do **not** fall through by name
+([D68](#d68-flow-node-bindings-are-total-nothing-falls-through-a-module-boundary)
+owns that rule and §8.0 states the two resolution chains).
 **Rationale**: PRD 5.1 calls for Terraform-style module bindings and PRD 5.7
 requires subgraphs to receive parent state only through explicit bindings. Using
 one keyword for both instead of a separate `bindings:` keeps the surface small.
@@ -2252,7 +2638,11 @@ sibling fired. **Rationale**: LangGraph's superstep model makes concurrent
 branches natural, and PRD 5.3 needs an "optional default" for exhaustiveness. A
 first-match rule would make static parallel branching inexpressible; a bare
 unguarded edge cannot serve as the default because it must remain unconditional.
-Concurrent branches obey the same reduced-channel rule as maps. *PRD 5.3, 5.6.*
+Concurrent branches obey the same reduced-channel rule as maps; what they do
+after the fork — convergence, write ordering, termination — is §7.6
+([D69](#d69-execution-is-stepwise-and-convergence-is-a-per-step-join-over-taken-branches),
+[D70](#d70-end-retires-a-branch-and-a-flow-instance-ends-at-quiescence),
+[D72](#d72-concurrent-writes-are-applied-in-a-canonical-order)). *PRD 5.3, 5.6.*
 
 ### D18. Exhaustiveness is computed over enum-typed output fields
 
@@ -2278,7 +2668,9 @@ an author one keyword, not an extra edge. Per-instance counting keeps
 
 ### D20. The policy resolution chain has exactly four levels
 
-Flow-node `policy:` override > node > `defaults:` > built-in `fail`.
+Flow-node `policy:` override > node > `defaults:` > built-in `fail`; when a
+nesting chain sets one field at several instantiation sites, the outermost wins
+([D79](#d79-the-outermost-instantiation-site-policy-wins)).
 **Rationale**: PRD 5.5 names exactly these four; the override is placed at the
 *instantiation site* so a caller can harden a reused module — the only reading
 under which "flow override" beating a node's own declaration makes sense. A
@@ -2499,8 +2891,10 @@ answer for manual entries (D64). *PRD 5.11.*
 ### D45. `http` trigger defaults: path, method, `respond: async`, `timeout: 60s`
 
 **Rationale**: PRD 5.11 settles async as the default and says sync "requires a
-timeout (default 60s)" — reconciled as: the effective timeout always exists,
-defaulting to 60s, and drives the documented async upgrade. Deriving the default
+timeout (default 60s)" — reconciled as: a `respond: sync` trigger always has an
+effective timeout, defaulting to 60s, and it drives the documented async
+upgrade. The key itself belongs to that mode only
+([D81](#d81-timeout-is-illegal-on-an-async-http-trigger)). Deriving the default
 path from the trigger name keeps single-trigger projects zero-config. *PRD 5.11.*
 
 ### D46. Reserved trigger shapes are fully specified
@@ -2725,6 +3119,254 @@ either writes the request out in full or lets the bindings build it.
 Non-competing combinations (`query:` alongside `input:` on a `POST`) stay legal
 because there is no slot to fight over. *PRD 5.5, G3.*
 
+### D67. Store writes inside a `map`: item-derived key **or** a keyed `kv` write
+
+A write from a `map`-dispatched instance is legal when its `key:` derives from
+the item (`input.*` or `execution.item_index`) *or* when it is a `kv`
+`set`/`delete` with any key; a `vector`/`blob` write with a non-item-derived key
+is a compile error (§11.4). **Rationale**: this is PRD 5.8's settled sentence
+verbatim — "an item-derived key or a keyed `kv` write" — and an earlier draft of
+§11.4 tightened it to item-derived keys only, which made the motivating case of
+PRD 5.8 (a session-scoped `kv` memory updated from inside a fan-out,
+`key: execution.session_key`) a compile error. The exemption is defensible on its
+own terms: a `kv` write replaces the whole value at an author-named slot, so
+concurrent instances sharing a key are a declared overwrite, the store-side
+counterpart of `reduce: last_wins`. Its outcome is *not* deterministic, and that
+is sound here where it would not be for a channel: store reads are recorded and
+replay consumes history rather than the live store (PRD 5.8), so no store value
+feeds the graph's own scheduling, whereas a channel value does (§7.6.4). A
+`blob`/`vector` write is bulk content at a document id and has no such story.
+*PRD 5.6, 5.8.*
+
+### D68. Flow-node bindings are total; nothing falls through a module boundary
+
+On a `flow:` node, every input field the subflow declares without a `default:`
+MUST be bound by `input:`; an unbound one is a compile error. The state-channel
+and flow-input fallthrough of §8.0 applies to in-flow targets only.
+**Rationale**: PRD 5.7 is settled — "Subgraphs receive parent state only through
+explicit bindings … Nothing crosses a module boundary implicitly" — and §8.5 and
+§7.5 already said "explicit bindings only", so the single fallthrough sentence in
+§8.0 was the outlier. Name-based wiring is what makes one flow's nodes compose
+without ceremony; extending it across a module boundary would make a flow's
+behavior depend on whether its *caller* happens to have a channel of the right
+name, which is exactly the reusability failure PRD 5.7 names, and it would make
+the same instantiation legal or illegal depending on an unrelated file. The cost
+is one binding line per input, which is the Terraform-module discipline PRD 5.1
+asks for. *PRD 5.1, 5.7.*
+
+### D69. Execution is stepwise, and convergence is a per-step join over taken branches
+
+A flow instance runs in steps; a node's outgoing edges are evaluated only after it
+completes (P1); a node targeted by two or more edges taken in the same step runs
+once (P2); a node reached in two different steps runs twice, and the statically
+visible case of that — an unbalanced convergence — is a compile error (§7.6.1,
+§7.6.2). **Rationale**: P1 and P2 are LangGraph's superstep semantics, the
+compilation target PRD 5.5/5.12 pins, so the join costs no synthetic barrier and
+the schedule is a pure function of the graph and the recorded node outputs —
+replay-safe by construction. The alternative reading, once-per-arriving-edge, is
+not what the substrate does and would fire a node twice for a plain symmetric
+diamond. A true AND-join that waits for every branch was rejected for the reason
+the finding this decision answers names: with guarded branches it must know which
+branches are still live, which is not decidable ahead of time, so a false guard
+would deadlock the join. Per-step joining has the opposite property — nothing
+waits, so nothing deadlocks — and the only residue, a node re-firing when the
+branches have different lengths, is refused statically wherever the distance is
+computable (no cycle on the path) and defined explicitly where it is not.
+Exclusivity is proved from `else:` and from enum-equality guards because those
+are the two shapes §7.3/§7.3.1 already read; anything else is conservatively
+concurrent. *PRD 5.3, 5.5, 5.6, 5.12.*
+
+### D70. `end` retires a branch, and a flow instance ends at quiescence
+
+`end` is a branch sink, not a terminator: the instance finishes when no node is
+scheduled, and `outputs:` are materialized once, at that point. Concurrent
+branches are never cancelled. **Rationale**: the alternative — the first branch
+to reach `end` terminates the instance — makes the materialized output depend on
+which branch finished first, which is completion order, which PRD 5.6 names as
+the thing that silently breaks replay; under a step model "first" is not even
+well-defined inside a step. Cancellation would also leave already-issued effects
+(store writes, sink deliveries, HTTP calls) half-applied with no defined state,
+against PRD 5.8's at-least-once/idempotency-key discipline. Quiescence is what
+LangGraph does natively (a branch routed to `END` simply schedules nothing), so
+it costs no machinery, and it gives the two control-transfer positions
+(`on_error: {fallback: end}`, `human.on_timeout: end`) an honest meaning — "this
+branch is done" — leaving `on_error: fail` as the one way to abort a run.
+*PRD 5.5, 5.6, 5.8.*
+
+### D71. No silent dead ends: every node exits, and every run starts
+
+Every node MUST have at least one outgoing edge; at least one edge leaving
+`start` MUST be unconditional or `else: true`; a node declaring `on_error: skip`
+MUST have an outgoing edge of one of those two forms (§7.6.3).
+**Rationale**: [D70](#d70-end-retires-a-branch-and-a-flow-instance-ends-at-quiescence)
+makes `end` the only way a branch retires, so these three rules are what keep
+that statement true rather than aspirational — without them a branch can vanish
+at a node with no exits, an execution can die before its first step with every
+`start` guard false, and a skipped node whose edges are all guarded dead-ends on
+§7.3 rule 7. Each is the same shape of argument as
+[D19](#d19-max_iterations-semantics-and-the-escape-edge-rule)'s escape-edge rule:
+a construct that is guaranteed to fail at runtime in a statically visible way is
+refused at compile time, and the fix costs one edge or one keyword. Guarded
+`start` edges stay legal — routing on `input.*` at entry is useful and its scope
+is well-defined (§4.1) — they just cannot be the *only* edges. *PRD 5.3, 5.4, G3.*
+
+### D72. Concurrent writes are applied in a canonical order
+
+Writers within a step are ordered by node id, a `map`'s instances by source-item
+index, a `flow:` node counts as one writer, and `writes:` MUST be injective; the
+reduce policy is applied in that order (§7.6.4). **Rationale**: PRD 5.6 index-tags
+and reorders `append` writes "so replay is deterministic" and calls unordered
+reduces a silent break of replay — but `merge` and `last_wins` had no order at
+all, so two codegens (completion-order versus index-order) produced different
+final values from identical runs. Defining one total order for *every* policy
+makes PRD 5.6's append rule a consequence rather than a special case. Node id
+rather than declaration order is deliberate: it makes the order a property of the
+graph, not of file layout, so reordering `nodes:` provably cannot change a run —
+[D55](#d55-definition-order-is-irrelevant-ir-order-is-canonical)'s canonical-IR
+posture extended to execution. Injectivity is what makes "at most one write per
+channel per writer" true, which is what makes the order total. Forbidding the
+combination outright — no `merge`/`last_wins` from concurrent contexts — was the
+other option, and was rejected because it would delete the only expressible
+fan-in aggregate that is not a list. *PRD 5.6, 5.7, 5.12.*
+
+### D73. `on_item_error` carries its retry policy inline
+
+`on_item_error: fail | skip | { retry: <§9.1 retry block> }`; a bare
+`on_item_error: retry` is an error; exhausted item retries resolve as `fail`; no
+implicit chain supplies an item policy (§8.6 rule 10). **Rationale**: PRD 5.6
+lists `retry` as a per-item strategy but gives it no parameters, so "retry" alone
+named a behavior with no count and no backoff — two implementations would emit
+different graphs from one spec, and an author had no way to configure it. Reusing
+§9.1's block verbatim inside an enum-or-single-key object is the shape
+`on_error:` already uses one section earlier, so this adds no vocabulary and one
+reading rule. The chain is stated as *absent* rather than extended because
+`defaults:` applies to nodes and a dispatched instance is not a node of the
+enclosing flow ([D29](#d29-map-targets-are-component-references-not-flow-local-node-ids));
+letting `defaults: { retry: … }` silently become a per-item policy would make the
+fan-out's behavior depend on a file the map does not mention. "Retry then skip"
+stays expressible one level up, as the map node's own `on_error:`. *PRD 5.5, 5.6.*
+
+### D74. Reserved roots may not be shadowed by node ids or item bindings
+
+The reserved root names of §2.5 may not be used as state channel names, as
+flow-local node ids, or as a `map` `as:` binding (except `item`, which is that
+binding's own default). **Rationale**: §2.5 previously reserved them for channels
+only, which left a node named `input` making `input.output.verdict` ambiguous
+between the flow input object and that node's output, and `as: state` making
+`state` ambiguous between the state object and the item. A precedence rule —
+"the shadow wins", "the root wins" — would have to be memorized and would read
+differently in the two cases; refusing the collision is one rule with one error
+message, the same posture [D5](#d5-one-identifier-class-lowercase-snake_case)
+takes on identifiers generally. Definition names are untouched because a
+namespaced address is never a bare root. *PRD 5.3, 5.5, 5.7, G3.*
+
+### D75. Map dispatch bindings take both `input:` forms
+
+A `map`'s per-item `input:` (and a route's) accepts a field map or a bare scalar
+CEL string, with the scalar form binding a string-in agent's single unnamed input
+(§8.6 rule 12). **Rationale**: §5.3 requires a string-in agent to be bound with
+the scalar form, and the map surface accepted only a field map, so a string-in
+agent had no legal binding as a dispatch target at all — an unroutable corner
+where one implementer would allow whole-item pass-through and another would
+reject the target outright. Admitting the form already defined for node positions
+([D14](#d14-string-in-agents-bind-with-a-scalar-input-at-the-node)) closes it
+without new vocabulary, and pairing each form with its target's input contract
+keeps the mismatch (a field map into a string-in agent, a scalar into a declared
+object) an error rather than a coercion. *PRD 5.2, 5.6.*
+
+### D76. `map.over` reads a node that dominates the map node
+
+`over: <node>.output.…` requires `<node>` to dominate the map node; a skipped
+dominator or an empty array dispatches zero instances (§8.6 rules 6, 11).
+**Rationale**: "any node that precedes the map node" had at least three readings —
+path-existence, dominance, declaration order — and under the weakest of them the
+producer can sit on a guarded sibling branch that did not run, leaving `over`
+with no value and the runtime undefined. Dominance is the reading that makes the
+value's existence a *guarantee* rather than a hope, it is computed on the graph
+§7.4 already builds, and it stays well-defined with cycles present because a
+back-edge adds no new path from `start` — where path-existence degenerates
+completely. The zero-instance rule is the companion: a producer that ran but was
+skipped, or produced an empty array, must not be a deadlock, so the map completes
+immediately and its downstream edge fires. *PRD 5.6.*
+
+### D77. `default:` is legal on every type-node form except a union
+
+Scalar, enum, object, and array type nodes accept `default:` at input surfaces
+and on state channels; a discriminated union never does; result surfaces never do
+(§3.6). **Rationale**: §3.6 said "scalar and enum", §10.1 said "literal matching
+the type", and the published schema accepted `default: []` on an array channel
+while refusing one on a union — three positions where there should be one. An
+array or object default on an input field is ordinary and useful (`default: []`
+for an optional list), and nothing about those forms makes a default harder to
+check than a scalar's. A union default is different in kind: it would have to
+name a variant, which is manufacturing a discriminator tag, and manufacturing
+routing values is precisely what the output-surface prohibition in the same
+subsection exists to stop. *PRD 5.2, 5.3, 5.6.*
+
+### D78. Channel initial values, and reading an unset channel
+
+An `append` channel starts as `[]` and a `merge` channel as `{}`; every other
+channel with no `default:` is unset, and reading an unset channel fails the
+execution naming the channel and the reader (§10.1). **Rationale**: §7.6.2 makes
+"what does a convergence see when only one branch ran?" a question the document
+has to answer, and the answer is "the channels as they stand" — which requires
+knowing what a channel that was never written holds. The two reduce policies with
+an identity element get it, so a fan-out that produced zero items reads as
+"nothing yet" rather than as a failure; everything else is unset, because
+inventing a zero value for a `string` or an `enum` channel would manufacture data
+the same way a defaulted output would (§3.6). Failing loudly at the read, naming
+both ends, is the error-UX answer (PRD G3) and it tells the author exactly which
+`default:` to add. *PRD 5.6, 5.7, G3.*
+
+### D79. The outermost instantiation-site `policy:` wins
+
+When several `flow:`-node `policy:` overrides in a nesting chain set the same
+policy field for the same node, the outermost value applies (§8.5, §9.3 level 1).
+**Rationale**: [D20](#d20-the-policy-resolution-chain-has-exactly-four-levels)
+places the override at the instantiation site *so that a caller can harden a
+module it does not own*. Under the innermost-wins reading that module could undo
+the hardening by instantiating a deeper one — the level would guarantee nothing,
+and a module's effective policy would change when its internals were refactored
+into sub-modules. Outermost-wins also keeps resolution independent of nesting
+depth, which is what makes a `policy:` a bound the caller can reason about. The
+cost is that an inner site cannot tighten below an outer one for the same field;
+an author who wants a tighter bound on a whole instance still has the node-level
+`timeout:` of §8.5, which bounds the instance as one activity. *PRD 5.5.*
+
+### D80. The published schema's per-file bounds are grammar rules
+
+Where the editor schema constrains a value the grammar left loose and the
+constraint is decidable in one file, the grammar states it: import path charset
+(§1.4), `expect_status` non-empty and `100..=599` (§6.1), `route:` members
+distinct and `route_on:` non-empty (§12.2), `routes:` non-empty (§8.6),
+non-empty `command`/`id`/`embed.model` (§6.1, §12.2, §11.2).
+**Rationale**: Appendix B's invariant is one-directional — a file that fails the
+schema always fails `validate` — and every one of these was a place the schema
+rejected a file the grammar text permitted, which inverts it and makes the two
+artifacts disagree about the language. Stating the rule was preferred to dropping
+it in each case because each rejects something inert or non-portable: an empty
+`expect_status` accepts no response at all, a repeated `route:` member fails over
+to the model that just failed, an empty `route_on:` never fails over, an empty
+`routes:` dispatches a union to one target with narrowing given up
+([D30](#d30-union-items-require-route_by-non-union-items-forbid-it-default-is-the-catch-all)),
+and a path with spaces or backslashes is a portability trap in a value that ends
+up on command lines and in diagnostics. This is
+[D61](#d61-else-takes-the-literal-true)'s posture applied to the schema's own
+edges. *PRD G3, 5.1, 5.9.*
+
+### D81. `timeout:` is illegal on an `async` http trigger
+
+A trigger with `respond: async` — declared or defaulted — MUST NOT carry
+`timeout:` (§13.3). **Rationale**: the timeout bounds the *response*, and an
+async trigger has already responded with an execution id, so the key changes
+nothing that can be observed; PRD 5.11 attaches the budget to sync's async
+upgrade specifically. `callback:` with `respond: sync` was already an error for
+the mirror-image reason, and leaving the other half accepted would say that one
+inert key is a mistake and its twin is fine. Same posture as
+[D61](#d61-else-takes-the-literal-true) and
+[D52](#d52-human-node-shape)'s timeout/route pairing: a key whose author expected
+it to do something gets a diagnostic, not silence. *PRD 5.11, G3.*
+
 ---
 
 ## Appendix B — Editor integration
@@ -2758,6 +3400,11 @@ authority. The schema cannot see across files, so it does not check:
   compatibility, sync-trigger interrupt-freedom, store schema/keying rules,
   session coherence, provider settings/capability checks, env-ref presence,
   unreachable nodes, undefined channels;
+- the graph analyses of §7.6, which need the whole flow graph rather than a
+  key-and-value pair: balanced convergence (§7.6.2), the no-dead-end rules of
+  §7.6.3 apart from the `start` edge below, `map.over` dominance (§8.6 rule 11),
+  the totality of `flow:`-node bindings (§8.0, D68), and the injectivity of
+  `writes:` (JSON Schema constrains property *names*, never the set of values);
 - context-sensitive schema rules whose surface is not syntactically identifiable
   in one file. `max_items` is the example of the split: inside `agent.output`,
   `tool.output`, `flow.outputs`, `human.output`, and store schemas the surface is
@@ -2767,11 +3414,16 @@ authority. The schema cannot see across files, so it does not check:
 
 What the schema *does* enforce beyond plain shape, because the deciding value is
 a literal in the same object: store-op parameter sets per `op` (§11.4), trigger
-keys per `type` (§13), the map form rules (§8.6), the direct-XOR-route split on
-model definitions (§12.2), the `human` timeout/route pairing (§8.7), the
-inline-`http` `input:`-versus-`body:`/`query:` rule (§8.3), duplicate edges
-(§7.2), and the absence of `${ENV}` tokens on the surfaces where §4.3 makes them
-illegal and a single string is the whole surface (`prompt:`, model `id:`).
+keys per `type` (§13) including the `respond`/`timeout` and `respond`/`callback`
+pairings (§13.3), the map form rules and the `on_item_error` shape (§8.6), the
+direct-XOR-route split on model definitions (§12.2), the `human` timeout/route
+pairing (§8.7), the inline-`http` `input:`-versus-`body:`/`query:` rule (§8.3),
+duplicate edges (§7.2), the presence of one unconditional-or-`else` edge leaving
+`start` (§7.6.3 — an `edges:` array is one value, so this one *is* per-file),
+the reserved-root exclusions on node ids, edge endpoints, control targets, and a
+map's `as:` (§2.5), and the absence of `${ENV}` tokens on the surfaces where §4.3
+makes them illegal and a single string is the whole surface (`prompt:`, model
+`id:`).
 
 **Diagnostics.** Where a construct has variants, the schema branches on the
 literal that selects the variant — a node's kind key, a trigger's `type:`, a
@@ -2857,7 +3509,10 @@ model.<name>:    { route: [model.<a>, model.<b>], route_on: [...] }
                      # put: key,value,content_type?
                      writes: {...} }
 { map: { over, as?, node | (route_by + routes + default?),
-         max_concurrency, on_item_error?, input?, writes?,
+         max_concurrency,
+         on_item_error?,           # fail | skip | { retry: {max, backoff, ...} }
+         input?,                   # field map, or a scalar for a string-in agent
+         writes?,
          detach? } }               # detach: homogeneous form or per route only
 # route: { node, max_concurrency?, input?, writes?, detach? }
 
