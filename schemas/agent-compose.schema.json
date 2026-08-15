@@ -953,7 +953,7 @@
       "properties": {
         "description": { "description": "Documentation; REQUIRED when the flow is used in an agent's `tools:` (the LLM needs one).", "type": "string" },
         "inputs": { "description": "The module's parameter surface, in scope as `input.<field>` throughout the flow.", "$ref": "#/$defs/fieldMap" },
-        "outputs": { "description": "REQUIRED result surface; each field is read from the state channel of the same name on reaching `end`.", "$ref": "#/$defs/outputFieldMap" },
+        "outputs": { "description": "REQUIRED result surface; each field is read from the state channel of the same name, once, at quiescence - the step where no node is scheduled because every live branch has retired at `end`. Nothing is snapshotted at the moment a branch reaches `end`, so a value a still-running branch writes is included rather than raced (grammar 7.5, 7.6.3 / Decision D70).", "$ref": "#/$defs/outputFieldMap" },
         "nodes": {
           "description": "Node id -> node object. Each node carries exactly one kind key.",
           "type": "object",
