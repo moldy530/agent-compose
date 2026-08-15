@@ -171,8 +171,8 @@ tools/*.yml         # tool.* definitions
 flows/*.yml         # flow.* definitions
 stores/*.yml        # store.* definitions
 triggers.yml        # triggers section
-deploy/local.yml    # deploy target (not imported)
-deploy/staging.yml
+deploy/local.yml    # the built-in target (not imported); no storage_backends (§14)
+deploy/staging.yml  # deploy target (not imported)
 ```
 
 A file MAY hold several definitions and MAY mix namespaces; one definition per
@@ -405,6 +405,14 @@ author:
 - `optional` — array of property names that are not required. Every declared
   property is REQUIRED unless listed here
   (Decision [D7](#d7-properties-are-required-by-default-optional-lists-the-exceptions)).
+  Every name in the array MUST be a property the same object declares; an entry
+  naming something else is a compile error listing the unknown names and the
+  declared ones (Decision
+  [D89](#d89-optional-entries-must-name-declared-properties)). The published
+  schema cannot check this — JSON Schema constrains an array's items without
+  reference to a sibling object's keys (Appendix B) — so it is a validator rule,
+  and it is what keeps `optional: [emial]` a diagnostic instead of a silently
+  still-required `email`.
 - Objects are **closed**. There is no `additional_properties` knob; unknown keys
   in an instance are invalid (Decision [D8](#d8-objects-are-closed)).
 - Nesting depth is limited to **8** levels (declaration surface counts as 1).
@@ -827,13 +835,21 @@ exec:
 | `args` | array of string | no | literal; no CEL (D24) |
 | `cwd` | string (interpolable) | no | |
 | `env` | map env-var-name (`[A-Za-z_][A-Za-z0-9_]*`) → string (interpolable) | no | added to the child environment |
+| `expect_exit` | **non-empty** array of integer in `0..=255` | no | accepted exit statuses; default `[0]`. An empty list would accept no outcome at all, making every run an error — the inert key [D61](#d61-else-takes-the-literal-true) rejects, exactly as for `expect_status` (D84) |
 
 Input/output convention (PRD 5.5): an object input is passed as environment
 variables (`UPPER_SNAKE_CASE` of each field, JSON-encoded for non-scalars); a
 string input is passed on stdin. The child's **stdout** is decoded as JSON and
 validated against `output`, except when `output` declares exactly one
-string-typed property, in which case trimmed raw stdout binds to it. A non-zero
-exit status is a node error subject to §9.
+string-typed property, in which case trimmed raw stdout binds to it.
+
+**Failure.** An exit status outside `expect_exit` is a node error subject to §9;
+a status inside it completes the node normally. `expect_exit: [0, 1]` is
+therefore how a command whose `1` means "no match" or "tests failed" becomes
+routable data instead of a failure — the same knob `expect_status` is for `http`,
+and the same predicate on both the tool surface and the inline-node surface
+(§8.2, Decision
+[D84](#d84-execs-and-https-failure-predicate-is-one-rule-on-both-surfaces-and-both-halves-are-configurable)).
 
 A `tool.*` declares a *domain* result schema, so every one of its fields is
 decoded as above — `exit_code`/`stdout` are not special here. Inline `exec:`
@@ -870,9 +886,11 @@ Without `body`/`query`, the bound input object is sent as the JSON body
 (body-bearing methods) or as query parameters (`GET`/`HEAD`). The response body
 is decoded as JSON and validated against `output`, except when `output` declares
 exactly one string-typed property, in which case the raw response text binds to
-it. A status outside `expect_status` is a node error subject to §9. As with
-`exec`, this is the *tool* surface: the response envelope (`status`, raw `body`)
-is exposed by inline `http:` nodes only (§8.3).
+it. A status outside `expect_status` is a node error subject to §9, and a status
+inside it completes the node — `expect_status: [200, 404]` makes a 404 routable
+data rather than a failure, exactly as `expect_exit` does for an exit code
+(D84). As with `exec`, this is the *tool* surface: the response envelope
+(`status`, raw `body`) is exposed by inline `http:` nodes only (§8.3).
 
 **`function`** — host-registered function (escape hatch; breaks spec
 portability — PRD 5.5):
@@ -894,9 +912,10 @@ binding is flagged as non-portable in `validate` output.
 agent's, §3.9) declares a tool with no result: stdout, the response body, or the
 function's return value is **not decoded at all**, and the node contributes
 nothing to state and nothing to its edge guards. The failure signal is still
-observed — a non-zero exit status or a status outside `expect_status` remains a
-node error under §9 — which is what makes a fire-and-forget sink (a queue push,
-a webhook notification) expressible without inventing a placeholder field.
+observed — an exit status outside `expect_exit` or a status outside
+`expect_status` remains a node error under §9 — which is what makes a
+fire-and-forget sink (a queue push, a webhook notification) expressible without
+inventing a placeholder field.
 
 ### 6.2 Policy on tool definitions
 
@@ -961,7 +980,7 @@ node.
 
 | Key | Type | Notes |
 |---|---|---|
-| `input` | map field→CEL, or scalar CEL | input bindings; §8.0 |
+| `input` | map field→CEL, or scalar CEL where §8.0 allows it | input bindings; §8.0 (the scalar form on `agent:`/`exec:` only, D88) |
 | `writes` | map output-field→channel | write remap (PRD 5.7) |
 | `retry` | block | §9.1 |
 | `timeout` | duration | §9.2 |
@@ -988,7 +1007,7 @@ edges:
 | `to` | node id \| `end` | yes | |
 | `when` | CEL (bool) | no | guard over the source node's output (§4.1). Legal on an edge leaving `start` too, where the only roots are `input`/`state`/`execution`; at least one `start` edge must still be unconditional or `else:` (§7.6.3) |
 | `else` | `true` | no | marks the default edge; mutually exclusive with `when`. `true` is the only legal value — `else: false` says nothing (an unguarded edge is already unconditional) and is a compile error |
-| `max_iterations` | integer 1..1000 | no | cycle bound (PRD 5.4); the source node then also needs an unconditional or `else:` edge leaving the cycle (§7.4) |
+| `max_iterations` | integer 1..1000 | no | cycle bound (PRD 5.4); the source node then also needs an unconditional or `else:` edge leaving the cycle (§7.4). REQUIRES `when:` on the same edge — an unconditional or `else:` edge is a guarantee, and a guarantee a budget can withdraw is not one (§7.3.1, D90) |
 
 Self-edges (`from == to`) are legal and form a one-node SCC, which must be
 bounded like any other cycle. Duplicate edges (same `from`, `to`, `when`) are a
@@ -1018,11 +1037,96 @@ Deterministic, and evaluated after the source node's output has been validated
    statically-provable instances (exhaustiveness, §7.3.1; escape edges, §7.4;
    the guaranteed `start` edge and the `on_error: skip` escape, §7.6.3).
 
-**7.3.1 Exhaustiveness.** When a node's outgoing edges are guarded by equality
-against an enum-typed field of its own output, every enum variant MUST be
-routable: some guarded edge can be true for it, or an `else:` edge exists.
-Otherwise it is a compile error naming the unroutable variants (PRD 5.3). This is
-why `enum` is string-only and closed (§3.3).
+#### 7.3.1 Exhaustiveness
+
+PRD 5.3's promise — "enum with 3 variants + node with guarded edges + optional
+default → compile error if any variant is unroutable" — is decided over a
+**closed set of guard shapes**, so that two conforming validators accept exactly
+the same compositions (Decision
+[D82](#d82-exhaustiveness-and-exclusivity-read-one-closed-set-of-guard-shapes)).
+
+**Reading a guard against an enum field.** Let `n` be a node and `f` an
+enum-typed field of `n`'s output with variant set `V`. A guard `g` on an outgoing
+edge of `n` is read against `f` through exactly these shapes — `L` is a string
+literal, and either operand order is accepted:
+
+| Shape of `g` | `guaranteed(g, f)` | `possible(g, f)` |
+|---|---|---|
+| `n.output.f == L` | `{L}` | `{L}` |
+| `n.output.f != L` | `V \ {L}` | `V \ {L}` |
+| `n.output.f in [L₁, …, Lₖ]` | `{L₁ … Lₖ}` | `{L₁ … Lₖ}` |
+| `!g₁` | `V \ possible(g₁, f)` | `V \ guaranteed(g₁, f)` |
+| `g₁ && g₂` | `guaranteed(g₁, f) ∩ guaranteed(g₂, f)` | `possible(g₁, f) ∩ possible(g₂, f)` |
+| `g₁ \|\| g₂` | `guaranteed(g₁, f) ∪ guaranteed(g₂, f)` | `possible(g₁, f) ∪ possible(g₂, f)` |
+| **anything else** | `∅` | `V` |
+
+`guaranteed(g, f)` is the set of variants for which `g` is true *whatever else is
+true of the run*; `possible(g, f)` is the set for which `g` is not provably
+false. Every literal compared against `f` MUST be a member of `V` — a comparison
+against a non-variant is a type error (§4.1) raised before this check runs.
+
+The last row is the load-bearing one. A term the table does not recognize —
+`size(state.feedback) > 0`, any call, a comparison against a different field —
+contributes **no** guarantee and excludes **no** variant. So
+`n.output.f == 'a' && size(state.xs) > 0` is *guaranteed* for nothing (`{a} ∩ ∅`)
+while remaining *possible* only for `a` (`{a} ∩ V`), which is exactly the
+asymmetry the two checks below need.
+
+**When the check fires.** For each enum-typed field `f` of a node's output: the
+node is **routing on `f`** when at least one of its outgoing edges carries a
+`when:` guard whose expression mentions `<node>.output.<f>` syntactically. A node
+routing on at least one field MUST satisfy the rule below. Mixed-guard nodes are
+in scope: a sibling edge whose guard never mentions `f` does not exempt the node
+from the check, it simply contributes `∅` to `f`'s coverage.
+
+**What satisfies it.** A node routing on one or more enum fields is exhaustive
+when either:
+
+1. it has an outgoing edge that is unconditional or carries `else: true` — that
+   edge fires for every value of every field (§7.3 rules 2 and 4); or
+2. there is **one** enum field `f` the node routes on whose variants are fully
+   covered: `⋃ᵢ guaranteed(gᵢ, f) = V(f)` over the node's guarded outgoing edges.
+
+Otherwise it is a compile error naming the node, the field with the largest
+covered set, and that field's uncovered variants (PRD 5.3). One field suffices
+because edges are multicast (§7.3 rule 6): a node may carry extra branches
+guarded on a second field, and full coverage of the first already proves that no
+combination of output values leaves the node with no edge to take.
+
+**A guarantee cannot expire.** An edge whose `max_iterations` budget is exhausted
+is not taken, whatever its guard says (§7.3 rule 5) — so `max_iterations` is
+legal **only on an edge that also carries `when:`** (§7.2, Decision
+[D90](#d90-max_iterations-is-legal-only-on-a-guarded-edge)). Clause 1's edge
+therefore never expires, and neither does the `start` edge of §7.6.3 rule 2, the
+skip escape of rule 3, or §7.4's cycle escape: every edge this document calls
+guaranteed is one whose firing no budget can withdraw. A bounded edge still
+counts toward clause 2's union, which costs nothing — §7.4 independently requires
+the source of a bounded edge to carry a clause-1 edge, so such a node satisfies
+clause 1 already.
+
+**Worked example.**
+
+```yaml
+# agent.reviewer output: verdict: { enum: [approve, revise, escalate] }
+nodes:
+  review: { agent: agent.reviewer }
+edges:
+  - { from: review, to: publish, when: "review.output.verdict == 'approve'" }
+  - { from: review, to: rework,  when: "size(state.feedback) > 0" }
+```
+
+`review` routes on `verdict` — the first guard mentions it. `guaranteed` is
+`{approve}` for the first edge and `∅` for the second (a `size()` call is the
+table's last row), the union is `{approve}`, and there is no unconditional or
+`else:` edge: **compile error**, naming `revise` and `escalate`. Adding
+`- { from: review, to: rework, else: true }` satisfies clause 1; rewriting the
+second guard as `review.output.verdict != 'approve'` satisfies clause 2.
+Accepting the pair as written would leave the node dead-ending on §7.3 rule 7
+at runtime whenever the verdict is `revise` and `state.feedback` is empty —
+the outcome this check exists to make impossible.
+
+This is why `enum` is string-only and closed (§3.3): `V` has to be finite, known
+at compile time, and comparable by literal.
 
 ### 7.4 Cycles and termination
 
@@ -1034,7 +1138,7 @@ Back-edges are permitted (PRD 5.4). The compiler computes SCCs and requires:
   (Decision [D57](#d57-what-counts-as-a-cel-exit-condition)):
 
   1. **Counting bound** — some edge whose `from` *and* `to` are both in the SCC
-     carries `max_iterations`; or
+     carries `max_iterations` (and therefore a `when:` guard, §7.2); or
   2. **CEL exit condition** — some node `n` in the SCC has an outgoing edge that
      leaves the SCC and carries a `when:` guard, **and** every outgoing edge of
      `n` that stays inside the SCC carries a `when:` guard (or an `else:`).
@@ -1055,7 +1159,10 @@ Back-edges are permitted (PRD 5.4). The compiler computes SCCs and requires:
   and (b) is what makes the guarantee hold: an unconditional escape fires on
   every pass, and an `else:` escape fires whenever no guarded sibling was *taken*
   — which includes the pass where the budget runs out, because an exhausted edge
-  is not taken (§7.3 rule 5) and so cannot suppress it (§7.3 rule 4). Exhausting
+  is not taken (§7.3 rule 5) and so cannot suppress it (§7.3 rule 4). The escape
+  itself carries no budget to exhaust: `max_iterations` requires a `when:` guard
+  (§7.2, [D90](#d90-max_iterations-is-legal-only-on-a-guarded-edge)) and an
+  escape edge by definition has no `when:`. Exhausting
   a budget therefore always leaves the cycle instead of dead-ending on §7.3
   rule 7. A **guarded** escape is not enough: with
   `when: "…verdict == 'approve'"` as the only way out, the pass that exhausts the
@@ -1089,8 +1196,9 @@ boundaries are checkpoint/resume points.
 - **As a tool**: listing `flow.review_loop` in an agent's `tools:` makes its
   `inputs`/`outputs` the tool's parameter/result schemas. `description:` is then
   REQUIRED.
-- **Recursion is forbidden**: a flow that reaches itself through `flow:` nodes or
-  tool attachment is a compile error naming the cycle
+- **Recursion is forbidden**: a flow that reaches itself — in the sense §7.7
+  fixes, so through `flow:` nodes, `map` dispatch targets, or tool attachment —
+  is a compile error naming the cycle
   (Decision [D26](#d26-flow-defs-outputs-required-description-when-tool-no-recursion)).
 
 ### 7.6 Concurrency, convergence, and termination
@@ -1136,9 +1244,15 @@ prove they are never taken together:
 
 1. one carries `else: true` and the other carries `when:` — §7.3 rule 4 makes
    those mutually exclusive by construction; or
-2. both carry `when:` guards that are equality comparisons of the **same**
-   enum-typed field of the source node's output against **different** literals —
-   the guard shape §7.3.1's exhaustiveness check already reads.
+2. both carry `when:` guards for which **some** enum-typed field `f` of the
+   source node's output has `possible(g₁, f) ∩ possible(g₂, f) = ∅` — the same
+   closed guard table §7.3.1 fixes, read for disjointness instead of coverage.
+   `verdict == 'approve'` and `verdict == 'revise'` are exclusive
+   (`{approve} ∩ {revise}`), and so are
+   `verdict == 'approve' && size(state.xs) > 0` and `verdict == 'revise'`,
+   because an unrecognized conjunct widens nothing (`{approve} ∩ V`).
+   `verdict == 'approve'` and `size(state.xs) > 0` are **not**: the second guard
+   is possible for every variant, which is the conservative answer.
 
 Any other pair is **co-takeable**. A node with two or more co-takeable outgoing
 edges is a **fork**.
@@ -1297,6 +1411,47 @@ Writes from different steps are ordered by step. The channel values entering ste
 recorded outputs of step *k*'s nodes, which is what makes a replay reproduce the
 live run rather than a plausible alternative to it.
 
+### 7.7 Component reachability
+
+Three static checks ask whether a flow can *reach* something: session coherence
+(§11.3), sync-trigger interrupt-freedom (§13.3, §8.7), and recursion (§7.5). They
+share **one** relation, defined here once so that they cannot drift apart
+(Decision [D86](#d86-component-reachability-is-one-relation-and-it-crosses-every-invocation-edge)).
+
+A flow `F` **reaches** the components and `human` nodes named by the following,
+transitively:
+
+1. **its own nodes** — the `agent.*`, `tool.*`, `flow.*`, or `store.*` address a
+   node's kind key names, and the `human` node itself for a `human:` node;
+2. **its maps' dispatch targets** — `map.node`, `map.routes.<tag>.node`, and
+   `map.default.node` (§8.6);
+3. **the stores an agent it reaches attaches** — that agent's `stores:` list
+   (§5.4);
+4. **the tools an agent it reaches attaches** — that agent's `tools:` list,
+   including its `flow.*` entries. Flow-as-tool attachment is a call, and PRD 5.1
+   makes the two surfaces interchangeable, so it carries exactly the
+   reachability a `flow:` node does;
+5. everything every `flow.*` it reaches — by clause 1, 2, or 4 — reaches in turn.
+
+Nothing else creates reachability. `on_error: { fallback: … }` and
+`human.on_timeout` name flow-local nodes, already covered by clause 1; the deploy
+layer names components without invoking them; and an edge guard reading a node's
+output is not an invocation.
+
+| Check | Quantifies over | Rejects when |
+|---|---|---|
+| session coherence (§11.3) | **declared** triggers (§13) | the trigger's flow reaches a `session`-scoped store and the trigger declares no `session_key:` |
+| interrupt-freedom (§13.3, §8.7) | **declared** `http` triggers with `respond: sync` | the trigger's flow reaches a `human` node |
+| recursion (§7.5) | flow definitions | a flow reaches itself |
+
+The relation is uniform across the three on purpose. An interrupt inside a
+flow-as-tool is still an interrupt in the middle of a synchronous request, and
+PRD 5.11's settled position is that a `respond: sync` flow is *statically*
+interrupt-free; a session-scoped store reached through a map-dispatched flow
+still needs a session identity; and recursion through a tool attachment is still
+recursion. Clause 4 — traversal into `tools:` — is the one every earlier
+per-check wording left unstated.
+
 ---
 
 ## 8. Node types
@@ -1308,8 +1463,8 @@ is in the same flow or behind a module boundary
 (Decision [D15](#d15-node-level-input-is-the-one-binding-mechanism), Decision
 [D68](#d68-flow-node-bindings-are-total-nothing-falls-through-a-module-boundary)).
 
-*In-flow targets* — `agent:`, `exec:`, `http:`, `function:`, `human:`, `store:`
-nodes, whose target is invoked inside this flow's own scope:
+*In-flow targets* — `agent:`, `exec:`, `http:`, `function:`, and `human:` nodes,
+whose target is invoked inside this flow's own scope:
 
 1. an explicit `input:` binding for that field, if present;
 2. otherwise the state channel of the same name (§10);
@@ -1332,6 +1487,12 @@ boundary implicitly (PRD 5.7). A subflow that declares `{goal, draft}` and is
 instantiated with `input: { goal: … }` is a compile error naming `draft`, even
 where the caller happens to have a `draft` channel.
 
+Neither chain applies to a **`store:` node**, which declares no `input:` at all:
+a store op has no input schema, and its parameters are the per-op CEL values of
+§11.4, written out in the node and resolved directly against the roots of §4.1.
+Nothing falls through by name there — an omitted `key:` is a missing required
+parameter, never a lookup of a channel named `key`.
+
 ```yaml
 review:
   agent: agent.reviewer
@@ -1340,12 +1501,30 @@ review:
     draft: "state.draft"
 ```
 
-Explicit `input:` MUST bind a subset of the target's declared input fields. For
-string-in agents the scalar form `input: "input.goal"` is used (§5.3), at a node
-position and as a `map` dispatch binding alike (§8.6 rule 12). On `flow:` nodes
-`input:` is REQUIRED whenever the subflow declares an input field with no
-`default:` (PRD 5.7 `passVariables` discipline). On `map` nodes the per-item
-binding lives inside the `map:` block instead (§8.6).
+Explicit `input:` MUST bind a subset of the target's declared input fields. On
+`flow:` nodes `input:` is REQUIRED whenever the subflow declares an input field
+with no `default:` (PRD 5.7 `passVariables` discipline). On `map` nodes the
+per-item binding lives inside the `map:` block instead (§8.6).
+
+**The two `input:` forms.** A **field map** binds declared input fields by name.
+The **scalar** form (`input: "<CEL>"`) supplies one unnamed value, and is legal
+only where a single unnamed value has a defined destination (Decision
+[D88](#d88-the-scalar-input-form-is-legal-only-where-an-unnamed-value-has-a-destination)):
+
+| Position | Scalar `input:` |
+|---|---|
+| `agent:` node | legal **iff** the agent is string-in — it declares no `input:` (§5.3, [D14](#d14-string-in-agents-bind-with-a-scalar-input-at-the-node)) |
+| `exec:` node | legal — the value is passed on the child's stdin (§6.1, §8.2) |
+| `map` per-item `input:`, and a route's | legal **iff** the dispatch target is a string-in agent (§8.6 rule 12, [D75](#d75-map-dispatch-bindings-take-both-input-forms)) |
+| `http:`, `function:`, `flow:`, `human:` nodes | **ILLEGAL** |
+| `store:` node | no `input:` key at all (above) |
+
+An inline `http:` node builds its request out of named fields (§8.3); a
+`function:` node's arguments are checked field-by-field against the tool's
+declared `input` (§8.4); a `flow:` node binds the subflow's declared `inputs`
+(§8.5); a `human:` node's `human.input` is a field map (§8.7). In each of those
+a bare scalar names no destination, so it is a compile error rather than a
+guessed one.
 
 **Writing.** After a node completes, each field of its output is written to the
 state channel of the same name **if such a channel is declared**; fields with no
@@ -1401,6 +1580,7 @@ run_tests:
     args: ["test", "--silent"]
     cwd: "${REPO_ROOT}"
     env: { CI: "true" }
+    expect_exit: [0, 1]        # 1 = tests failed: data, not a node error
     output:
       exit_code: { type: integer }
       stdout:    { type: string }
@@ -1408,7 +1588,8 @@ run_tests:
   on_error: skip
 ```
 
-`exec:` block keys: `command` (required), `args`, `cwd`, `env` as in §6.1, plus:
+`exec:` block keys: `command` (required), `args`, `cwd`, `env`, `expect_exit` as
+in §6.1, plus:
 
 | Key | Type | Required | Default |
 |---|---|---|---|
@@ -1422,6 +1603,15 @@ in-block `env:` map writes into the same environment, so an `env:` key equal to
 the upper-snake-cased name of an input binding is a collision in which one of the
 two values would be silently discarded, and is a compile error naming both
 (Decision [D66](#d66-an-inline-nodes-input-never-competes-with-its-block-for-the-same-slot)).
+
+**Failure.** §6.1's predicate applies here unchanged: an exit status outside
+`expect_exit` (default `[0]`) is a **node error** subject to §9, and every other
+status completes the node. Declaring `exit_code:` in `output` is a *decoding*
+choice and never by itself turns a failure into data — widening `expect_exit`
+is what does, which is why the two keys are separate (D84). Under the default
+`expect_exit` the envelope's `exit_code` can therefore only ever hold `0`; it
+stays in the kind default because widening the accepted set is a one-key edit
+and `exit_code` is then the routing surface, as `run_tests` above shows.
 
 **Result binding.** An inline `exec:` node wraps a *process*, so its result is
 the process envelope, not a decoded payload
@@ -1461,11 +1651,22 @@ An inline node's `query:`/`body:` CEL is *flow*-scoped — `input`, `state`,
 `execution` (§4.1) — unlike the same keys inside a `tool.*` binding, which see
 only the tool's own `input` (§6.1).
 
+**Failure.** §6.1's predicate applies here unchanged: a response status outside
+`expect_status` (default: any 2xx) is a **node error** subject to §9, and every
+other status completes the node, so a declared `status:` field records an
+accepted status. Declaring `status:` is a *decoding* choice; widening
+`expect_status` is what makes a 404 routable data instead of a failure (D84).
+
 **Request payload.** An inline `http:` node has no declared input schema of its
 own, so the node-level `input:` bindings (§8.0) build an ad-hoc object which
 §6.1's convention sends as the JSON body (body-bearing methods) or as query
 parameters (`GET`/`HEAD`) — but only when the in-block key that would carry it is
-absent. Declaring both is a compile error rather than a silently ignored key
+absent. Those bindings take the **field-map form only**: the ad-hoc object is
+built out of named fields, so a scalar `input:` names nothing and is a compile
+error (§8.0,
+[D88](#d88-the-scalar-input-form-is-legal-only-where-an-unnamed-value-has-a-destination)).
+
+Declaring both is a compile error rather than a silently ignored key
 (Decision [D66](#d66-an-inline-nodes-input-never-competes-with-its-block-for-the-same-slot)):
 `input:` with `body:` on a body-bearing method, or `input:` with `query:` on
 `GET`/`HEAD`. The non-competing combinations stay legal — a `POST` may carry
@@ -1595,10 +1796,10 @@ dispatch:
 | `routes` | map tag→route, **≥ 1 entry** | with `route_by` | — | keys MUST be variant tags; an empty `routes:` would dispatch a union to one target and give up narrowing (D30) |
 | `default` | route | no | — | catch-all; legal only with `route_by` |
 | `max_concurrency` | integer 1..256 | **yes** | — | node-wide bound (D28) |
-| `on_item_error` | `fail` \| `skip` \| `{ retry: <retry block, §9.1> }` | no | `fail` | per item (PRD 5.6); rule 10 |
-| `input` | map field→CEL, or scalar CEL | no | whole item | per-item input binding; rule 12 |
-| `writes` | map output-field→channel | no | name-based | target channels MUST be reduced |
-| `detach` | boolean | homogeneous form only | `false` | fire-and-forget dispatch; ILLEGAL as a map-block key alongside `route_by:` — declare it per route instead (rule 7) |
+| `on_item_error` | `fail` \| `skip` \| `{ retry: <retry block, §9.1> }` | no | `fail` | per item (PRD 5.6); rule 10. The one per-item key that stays map-wide |
+| `input` | map field→CEL, or scalar CEL | homogeneous form only | whole item | per-item input binding; rules 7, 12 |
+| `writes` | map output-field→channel | homogeneous form only | name-based | target channels MUST be reduced; rule 7 |
+| `detach` | boolean | homogeneous form only | `false` | fire-and-forget dispatch; rule 7 |
 
 A **route** object takes `node` (required) plus optional `max_concurrency`,
 `input`, `writes`, `detach` — same meanings, scoped to that route. A route's
@@ -1637,14 +1838,24 @@ A **route** object takes `node` (required) plus optional `max_concurrency`,
    **zero** instances — an empty source array, or a producer that was skipped
    (rule 11) — completes immediately, writes nothing, and its outgoing edges fire
    exactly as if every instance had finished.
-7. **`detach`**: a detached dispatch is fire-and-forget. It is declared in
-   exactly two positions — as a map-block key on the **homogeneous** form
-   (`node:`), or on an individual **route** — and a map block that declares
-   `route_by:` MUST NOT declare a map-level `detach:`
-   (Decision [D31](#d31-detach-rules)): the routes of a heterogeneous map are
-   independently typed dispatch targets, so a blanket value would silently
-   detach sinks that were written to be joined. A detached dispatch MUST NOT
-   declare `writes:` and MUST NOT write reduced state. In v0, `detach: true` is a
+7. **`input:`, `writes:`, and `detach:` describe a dispatch target**, so each is
+   declared in exactly two positions: as a map-block key on the **homogeneous**
+   form (`node:`), or on an individual **route**. A map block that declares
+   `route_by:` MUST NOT declare a map-level `input:`, `writes:`, or `detach:`
+   (Decisions [D31](#d31-detach-rules),
+   [D85](#d85-a-routed-maps-input-writes-and-detach-are-declared-per-route)). The
+   routes of a heterogeneous map are independently typed dispatch targets, each
+   narrowed to its own variant (rule 4) with its own input and output schemas: a
+   map-level `input:` would have to type-check against every variant at once,
+   which is the lowest-common-denominator item type PRD 5.6 rejects; a map-level
+   `writes:` would have to name output fields every route's target declares; and
+   a blanket `detach:` would silently detach sinks that were written to be
+   joined. `max_concurrency:` and `on_item_error:` stay map-wide because neither
+   is typed against a target — one bounds the node, the other is a strategy
+   (rules 1, 10).
+
+   A detached dispatch is fire-and-forget: it MUST NOT declare `writes:` and
+   MUST NOT write reduced state. In v0, `detach: true` is a
    validation error under any target whose execution state is durably
    checkpointed — every target except `local` (§14) — pointing at the roadmap
    (the outbox-pattern delivery is not v0 work). Checkpointing is a property of
@@ -1700,8 +1911,10 @@ A **route** object takes `node` (required) plus optional `max_concurrency`,
     (Decision [D76](#d76-mapover-reads-a-node-that-dominates-the-map-node)).
     When the dominating node produced no output on this pass because it was
     skipped (§9.2), the map dispatches zero instances per rule 6.
-12. **Per-item bindings take the same two forms node-level `input:` does.** A
-    field map binds the target's declared input fields from the item; a bare
+12. **Per-item bindings take both `input:` forms** — a `map` dispatch is one of
+    the three positions where the scalar form has a destination (§8.0,
+    [D88](#d88-the-scalar-input-form-is-legal-only-where-an-unnamed-value-has-a-destination)).
+    A field map binds the target's declared input fields from the item; a bare
     scalar CEL string binds a **string-in** agent's single unnamed input
     ([D14](#d14-string-in-agents-bind-with-a-scalar-input-at-the-node)), so
     `input: "item.summary"` is how an object item feeds a string-in target. The
@@ -1752,8 +1965,10 @@ Either half alone is a compile error naming the missing one
 Node-level `timeout:` and `retry:` are ILLEGAL on a `human` node — a wait is not
 an activity timeout and re-prompting a human is not a retry
 (Decision [D52](#d52-human-node-shape)). `on_error:` remains legal (it covers
-delivery failures). A flow reachable from a `respond: sync` http trigger MUST NOT
-contain a reachable `human` node (PRD 5.11).
+delivery failures). A flow a `respond: sync` http trigger targets MUST NOT
+**reach** a `human` node, in the sense §7.7 fixes — which includes a `human` node
+inside a `map`-dispatched flow and inside a flow attached to an agent's `tools:`
+(PRD 5.11).
 
 ### 8.8 `store`
 
@@ -1774,8 +1989,11 @@ load_prefs:
 | `op` | enum | yes | legal set depends on the store's `kind` (§11.4) |
 | `key`, `value`, `query`, `prefix`, `top_k`, `limit`, `filter`, `metadata`, `content_type` | per op | per op | §11.4 |
 
-The op's output schema is derived from the store definition (§11.4) and is
-written by name like any other node output.
+A store-op node takes **no `input:` key**: its parameters are exactly the op's
+own row in §11.4, each a CEL value in the scope of §4.1, and none of them
+resolves by name from a channel or a flow input (§8.0). The op's output schema is
+derived from the store definition (§11.4) and is written by name like any other
+node output.
 
 ---
 
@@ -2013,15 +2231,19 @@ store.docs:
 - `backend:` names an **abstract alias** defined per target in
   `deploy/<target>.yml` → `storage_backends.aliases` (§14.2). Resolution order:
   explicit alias → per-kind `defaults:` → target built-in. `--target local`
-  substitutes local storage for every store unconditionally (PRD 5.8).
+  substitutes local storage for every store unconditionally (PRD 5.8), so under
+  `local` no alias and no per-kind default is consulted at all (§14).
 - An alias referenced by a store but undefined in the active target is a compile
-  error naming the target.
+  error naming the target. `local` is exempt for the reason above: it resolves no
+  aliases, so it cannot fail to find one (§14).
 - `scope: session` requires the execution to have a session identity, and that
   identity comes from the trigger. The check quantifies over **declared**
   triggers (§13): a declared `http`, `schedule`, or `event` trigger whose target
-  flow reaches a session-scoped store — through its own nodes, through a `flow:`
-  node, or through an agent's `stores:` list — MUST declare `session_key:`, or it
-  is a compile error naming the trigger and the store (PRD 5.8, 5.11).
+  flow **reaches** a session-scoped store — in the sense §7.7 fixes, so through
+  its own nodes, through a `flow:` node, through a `map` dispatch target, through
+  an agent's `stores:` list, or through an agent's `tools:` attachment — MUST
+  declare `session_key:`, or it is a compile error naming the trigger and the
+  store (PRD 5.8, 5.11).
   `manual` triggers, declared or implicit, carry `session_key: "payload.session"`
   by default (§13.2) and therefore satisfy the check statically; supplying the
   value is a run-time requirement (`--session`), checked at run start like
@@ -2065,14 +2287,63 @@ Rules (PRD 5.8):
   be one of two forms (PRD 5.8, Decision
   [D67](#d67-store-writes-inside-a-map-item-derived-key-or-a-keyed-kv-write)):
 
-  1. **item-derived key** — the `key:` expression references `input.*` (the item,
-     as bound into the dispatched flow) or `execution.item_index`, so concurrent
-     instances address disjoint keys. Legal for every kind.
+  1. **item-derived key** — the `key:` expression is *item-derived* in the sense
+     fixed below, so concurrent instances address disjoint keys. Legal for every
+     kind.
   2. **a keyed `kv` write** — `op: set` or `op: delete` on a `kv` store with any
      legal `key:` expression, including one constant across instances.
 
   Anything else — a `vector` or `blob` write whose key is not item-derived — is a
   compile error naming the node and the store.
+
+  **Item-derivation.** A store node lives inside a `flow.*`, so it is inside a
+  fan-out exactly when that flow is a `map` dispatch target, directly or through
+  `flow:` nodes. Derivation is computed **per dispatch site**, because one flow
+  may be dispatched by several maps and instantiated outside every map as well;
+  each site is checked on its own, and a store node no map reaches is not subject
+  to this rule at all (Decision
+  [D83](#d83-item-derivation-is-traced-through-the-dispatch-binding)).
+
+  For one dispatch site, an expression is **item-derived** when it references
+  `execution.item_index`, or when it references `input.<field>` for a field whose
+  binding *at that site* is item-derived. Bindings resolve per §8.6 rule 12:
+
+  - the map (or route) declares **no `input:`** — the whole item is the
+    instance's input, so **every** `input.<field>` is item-derived;
+  - the map declares `input: { <field>: <CEL>, … }` — `input.<field>` is
+    item-derived **iff** that CEL references the item binding (the `as:` name,
+    `item` by default) or `execution.item_index`. A field bound from `state.*`,
+    from the enclosing flow's `input.*`, or from a literal is **not**
+    item-derived, however item-derived its *name* looks;
+  - the map declares the scalar form (`input: "<CEL>"`) — its target is a
+    string-in agent (D75), and an agent contains no store nodes, so there is
+    nothing to resolve.
+
+  Derivation propagates through nested instantiation: inside a dispatched flow, a
+  `flow:` node's `input:` bindings are ordinary CEL in that flow's scope, so the
+  nested flow's `input.<field>` is item-derived iff its binding expression is
+  item-derived there. A nested `map` re-roots the computation at its own item.
+  `state.*` is never item-derived — it is one object shared by the whole instance
+  set — and neither is `execution.session_key`, which is per execution.
+
+  ```yaml
+  work:
+    map:
+      over: plan.output.tasks
+      as: task
+      node: flow.ingest
+      max_concurrency: 8
+      input: { doc_id: "state.topic", text: "task.body" }
+  ```
+
+  Inside `flow.ingest`,
+  `{ store: store.docs, op: upsert, key: "input.doc_id", value: "input.text" }`
+  is a **compile error**: `doc_id` is bound from `state.topic`, which holds the
+  same value in every instance, so N documents would land on one vector key —
+  the hazard form 1 exists to prevent, reached through a binding that merely
+  *looks* item-derived at the store node. `key: "input.text"`,
+  `key: "execution.item_index"`, or dropping the map's `input:` so the whole item
+  is passed all satisfy it.
 
   The `kv` exemption is not a loophole: a `kv` write replaces the whole value at
   a slot the author named, so concurrent instances writing one key are a declared
@@ -2330,9 +2601,12 @@ string), `payload.headers` (map of string, lowercase names), `payload.path`
 - `respond: async` returns an execution id immediately; the optional `callback:`
   webhook fires on completion.
 - `respond: sync` blocks and returns the flow's outputs. A flow exposed
-  synchronously MUST be statically **interrupt-free**: no `human` node reachable
-  from its entry (PRD 5.11). On timeout expiry the response **upgrades to async**
-  (HTTP 202 + execution id + status URL); the execution continues durably.
+  synchronously MUST be statically **interrupt-free**: it MUST NOT reach a
+  `human` node under the reachability relation of §7.7 — its own nodes, its maps'
+  dispatch targets, the flows it instantiates, and the `flow.*` entries in the
+  `tools:` list of any agent it reaches (PRD 5.11). On timeout expiry the
+  response **upgrades to async** (HTTP 202 + execution id + status URL); the
+  execution continues durably.
 - `callback:` with `respond: sync` is a compile error: a synchronous response
   already carries the outputs, so the webhook would have nothing to deliver.
 - `timeout:` with `respond: async` is a compile error, for the mirror-image
@@ -2382,7 +2656,10 @@ ingest:
 | `dedupe_key` | CEL over `payload` → string | no (default `payload.id`) | inbound at-least-once dedupe (PRD 5.11) |
 
 A `source:` not defined in the active target's `event_sources:` is a compile
-error naming the target.
+error naming the target — target-dependent, like backend alias resolution
+(§11.3), and satisfied vacuously under `local`, which runs no consumer process
+and binds no event infrastructure (§14,
+[D87](#d87-local-is-a-reserved-target-and-deploylocalyml-carries-no-storage_backends)).
 
 ---
 
@@ -2403,6 +2680,37 @@ way backend alias resolution is (§11.3). Commands that name no target
 rules are then checked against `local`, and `validate --target <t>` checks them
 against `<t>`
 (Decision [D59](#d59-checkpointing-is-a-target-property-and-detach-is-checked-per-target)).
+
+**`local` is a reserved, built-in target.** It is the target when `--target` is
+omitted, it runs with an in-memory checkpointer (above), and it substitutes
+SQLite/local disk for **every** store unconditionally — PRD 5.8's zero-infra
+guarantee. Four consequences follow, and they are what make `deploy/local.yml`
+well-defined rather than a file the grammar half-recognizes (Decision
+[D87](#d87-local-is-a-reserved-target-and-deploylocalyml-carries-no-storage_backends)):
+
+- `deploy/local.yml` is OPTIONAL. When present it MAY declare `placements:` and
+  `event_sources:` — both are reserved grammar (§15), parsed, type-checked, and
+  carried into the IR under every target including `local`, so neither is inert
+  there.
+- It MUST NOT declare `storage_backends:`. That section is *active* grammar which
+  `local` overrides unconditionally: no alias and no per-kind default is ever
+  consulted, so the block could only be an inert key whose author expected a
+  substitution — a compile error naming the file and the target, not a silent
+  no-op ([D61](#d61-else-takes-the-literal-true),
+  [D50](#d50-unknown-keys-are-errors-everywhere-except-plugin-config-objects)).
+  A store that wants a real backend locally is a `--target` of its own.
+- Under `local`, the two **target-dependent binding checks are satisfied
+  vacuously**: a store's `backend:` alias needs no definition (§11.3) because
+  `local` resolves none, and an `event` trigger's `source:` needs no
+  `event_sources:` entry (§13.5) because `local` is one process running no
+  consumer. This is what lets a project with production infrastructure in
+  `deploy/staging.yml` still `validate` and `run` locally with no infrastructure
+  at all, which is the point of the zero-infra guarantee.
+- `--target <name>` for any name other than `local` REQUIRES `deploy/<name>.yml`
+  to exist: a missing file is a compile error naming the expected path, never a
+  silent fall-back to built-ins.
+- `--target local` with no `deploy/local.yml` is the zero-config path and is not
+  an error.
 
 ```yaml
 # deploy/staging.yml
@@ -2647,9 +2955,12 @@ after the fork — convergence, write ordering, termination — is §7.6
 ### D18. Exhaustiveness is computed over enum-typed output fields
 
 A node whose outgoing guards compare an enum field of its own output must cover
-every variant or declare `else:`. **Rationale**: this is the decidable core of
-PRD 5.3's promise; guards over non-enum values are unconstrained and simply
-require an `else:` or an unconditional edge to avoid a dead end. *PRD 5.3.*
+every variant or declare `else:`;
+[D82](#d82-exhaustiveness-and-exclusivity-read-one-closed-set-of-guard-shapes)
+fixes which guard shapes are read and what "cover" means. **Rationale**: this is
+the decidable core of PRD 5.3's promise; guards over non-enum values are
+unconstrained and simply require an `else:` or an unconditional edge to avoid a
+dead end. *PRD 5.3.*
 
 ### D19. `max_iterations` semantics and the escape-edge rule
 
@@ -2722,7 +3033,10 @@ specified so `output` is always honored. *PRD 5.5.*
 ### D26. Flow defs: outputs required, description when tool, no recursion
 
 `outputs:` is required; `description:` is required only when the flow is used in
-an agent's `tools:`; a flow reaching itself is an error. **Rationale**: PRD 5.1
+an agent's `tools:`; a flow reaching itself — §7.7's relation, so through `flow:`
+nodes, `map` targets, or tool attachment
+([D86](#d86-component-reachability-is-one-relation-and-it-crosses-every-invocation-edge)) —
+is an error. **Rationale**: PRD 5.1
 makes a flow's I/O surface interchangeable with a tool's, which requires a
 declared output; recursion has no termination proof analogous to the SCC rule and
 would break the fan-out bounding guarantees. *PRD 5.1, 5.4.*
@@ -2767,7 +3081,10 @@ common single-unrouted-variant case fully typed (as in
 
 Legal in exactly two positions — as a map-block key on the homogeneous form, and
 on an individual route — so a map block carrying `route_by:` may not carry a
-map-level `detach:` (§8.6 rule 7). A detached dispatch MUST NOT declare `writes:`
+map-level `detach:` (§8.6 rule 7);
+[D85](#d85-a-routed-maps-input-writes-and-detach-are-declared-per-route) extends
+the same confinement to the other two per-target keys. A detached dispatch MUST
+NOT declare `writes:`
 or write reduced state, and `detach: true` under a durably checkpointed target is
 a v0 validation error (D59 fixes which targets those are).
 **Rationale**: the restrictions are verbatim from PRD 5.6's settled position on
@@ -2996,7 +3313,10 @@ contradiction — `npm test` would have to print `{"exit_code":0,…}` for the
 declares a domain result, while an inline node is a one-off wrapper whose
 interesting result is the process/response envelope. Fixing the envelope types
 keeps the rule decidable per node and lets codegen emit the binding without
-inference. *PRD 5.5.*
+inference. This decision is about *decoding* only: which outcomes are node errors
+is one rule on both surfaces, and declaring an envelope field never changes it
+([D84](#d84-execs-and-https-failure-predicate-is-one-rule-on-both-surfaces-and-both-halves-are-configurable)).
+*PRD 5.5.*
 
 ### D57. What counts as a CEL exit condition
 
@@ -3121,11 +3441,13 @@ because there is no slot to fight over. *PRD 5.5, G3.*
 
 ### D67. Store writes inside a `map`: item-derived key **or** a keyed `kv` write
 
-A write from a `map`-dispatched instance is legal when its `key:` derives from
-the item (`input.*` or `execution.item_index`) *or* when it is a `kv`
-`set`/`delete` with any key; a `vector`/`blob` write with a non-item-derived key
-is a compile error (§11.4). **Rationale**: this is PRD 5.8's settled sentence
-verbatim — "an item-derived key or a keyed `kv` write" — and an earlier draft of
+A write from a `map`-dispatched instance is legal when its `key:` is item-derived
+*or* when it is a `kv` `set`/`delete` with any key; a `vector`/`blob` write with
+a non-item-derived key is a compile error (§11.4).
+[D83](#d83-item-derivation-is-traced-through-the-dispatch-binding) fixes what
+item-derived means — the surface test this entry originally gave
+("references `input.*`") is not it.
+**Rationale**: this is PRD 5.8's settled sentence verbatim — "an item-derived key or a keyed `kv` write" — and an earlier draft of
 §11.4 tightened it to item-derived keys only, which made the motivating case of
 PRD 5.8 (a session-scoped `kv` memory updated from inside a fan-out,
 `key: execution.session_key`) a compile error. The exemption is defensible on its
@@ -3367,6 +3689,205 @@ inert key is a mistake and its twin is fine. Same posture as
 [D52](#d52-human-node-shape)'s timeout/route pairing: a key whose author expected
 it to do something gets a diagnostic, not silence. *PRD 5.11, G3.*
 
+### D82. Exhaustiveness and exclusivity read one closed set of guard shapes
+
+§7.3.1 fixes a table of guard shapes and two sets per enum field —
+`guaranteed(g, f)` (true whatever else is true) and `possible(g, f)` (not
+provably false). The exhaustiveness check fires for every enum field a node's
+guards *mention*, and is satisfied by an unconditional/`else:` edge or by one
+field whose variants the `guaranteed` sets cover; §7.6.1's exclusivity test is
+the same table read for disjoint `possible` sets.
+**Rationale**: the previous wording ("some guarded edge *can* be true for it")
+left the flagship PRD 5.3 check with three undefined halves — whether it fires on
+a mixed-guard node, which syntax counts, and what "can be true" means — and the
+two readings disagree about real specs: under the literal one,
+`when: "size(state.feedback) > 0"` routes *every* verdict variant and the check
+guarantees nothing, so a spec it accepts dead-ends on §7.3 rule 7 at runtime.
+Coverage must therefore be a *guarantee*, which is what `guaranteed` is, with
+unrecognized terms contributing `∅`. Exclusivity needs the opposite bound —
+excluding a variant, not guaranteeing one — so the same shapes carry a second
+column rather than a second vocabulary, and §7.6.1 stops pointing at a shape no
+section defined. The tables are closed and syntactic so that "does this
+composition compile?" has one answer; a guard outside them is not rejected, it
+simply proves nothing, which keeps the check conservative in the safe direction
+(it asks for an `else:`, it never invents a route). Firing on *mention* rather
+than on *coverage* is deliberate: a node whose only enum guard is
+`f == 'a' && …` is routing on `f` in every sense the author meant, and the fix
+is one keyword. *PRD 5.3, G3, G4.*
+
+### D83. Item-derivation is traced through the dispatch binding
+
+An expression is item-derived, per dispatch site, when it references
+`execution.item_index` or an `input.<field>` whose binding at that site is itself
+item-derived — with whole-item dispatch making every field item-derived, and
+`state.*`/enclosing-`input.*`/literal bindings making none (§11.4).
+**Rationale**: the earlier operational test — "the `key:` expression references
+`input.*`" — was unsound, and unsound in exactly the direction the rule exists to
+prevent. A map may bind a dispatched flow's input field from the enclosing
+flow's `state` or from a literal (§8.6 rule 12), and then `input.doc_id` is the
+*same* value in every instance: the check would pass while N documents land on
+one vector key, which is PRD 5.8's "unkeyed blob/global writes from concurrent
+instances" wearing a key-shaped mask. Tracing through the binding is the reading
+that makes the check mean what its own justification claims, it is decidable
+(bindings are CEL over a known scope, and the dispatch graph is finite and
+acyclic — recursion is already an error, §7.5), and it composes through nested
+`flow:` nodes and nested maps without a second rule. Per-site evaluation is
+required because derivation is not a property of the store node alone: the same
+flow can be dispatched with an item-derived binding from one map and a constant
+one from another, and both facts are true. The `kv` exemption
+([D67](#d67-store-writes-inside-a-map-item-derived-key-or-a-keyed-kv-write)) is
+untouched — it is PRD 5.8's own second form. *PRD 5.6, 5.8.*
+
+### D84. `exec`'s and `http`'s failure predicate is one rule on both surfaces, and both halves are configurable
+
+An exit status outside `expect_exit` (default `[0]`) and a response status
+outside `expect_status` (default: any 2xx) are node errors under §9 — on a
+`tool.*` binding and on an inline node alike. Declaring an envelope field is a
+*decoding* choice and never changes the predicate; widening the accepted set is
+what turns a failure into routable data (§6.1, §8.2, §8.3).
+**Rationale**: §6.1 stated the predicate on the tool surface only, and
+[D56](#d56-inline-exechttp-node-results-are-envelopes-not-decoded-payloads)
+overrode inline result *binding* without saying whether the failure rule came
+with it — while the inline kind defaults (`{exit_code, stdout}`,
+`{status, body}`) invited the opposite reading, that an inline node observes its
+failure as data. The two readings give the commonest exec use case opposite
+runtime behavior from one spec (skip-and-write-nothing versus
+complete-with-`exit_code: 1`), so the document had to pick. Uniformity wins:
+one predicate for one construct keeps §9's chain meaningful on every surface,
+and it keeps `expect_status` — which the schema and §6.1 already carried — from
+becoming inert on inline nodes, which is the silent no-op
+[D61](#d61-else-takes-the-literal-true) refuses. That left the real gap, which
+is that `exec` had no way to *say* an exit code is expected while `http` did;
+`expect_exit` closes it with the shape already in the document rather than a new
+concept, and it is what makes the `exit_code` envelope field worth declaring.
+This is a shape decision in the class of `expect_status`, not new design
+surface: PRD 5.5 routes node errors through retry/`on_error` without fixing
+which outcomes *are* errors, and one of the two halves had to be nameable for
+the other to mean anything. *PRD 5.5, G3.*
+
+### D85. A routed map's `input:`, `writes:`, and `detach:` are declared per route
+
+All three are map-block keys on the homogeneous form only; a map declaring
+`route_by:` declares them on its routes (§8.6 rule 7). `max_concurrency:` and
+`on_item_error:` stay map-wide.
+**Rationale**: [D31](#d31-detach-rules) confined `detach:` for a reason that
+applies verbatim to the other two — the routes of a heterogeneous map are
+independently typed dispatch targets — but the §8.6 key table left `input:` and
+`writes:` unrestricted, so a routed map could carry a map-level `writes:` naming
+output fields only some route targets declare, with three defensible readings
+(check against every route, apply only where a route is silent, reject) and no
+text choosing one. `input:` is worse: PRD 5.6's narrowing guarantee types each
+route's per-item CEL against *its own variant's* payload, so a map-level `input:`
+would have to type-check against every variant at once, which is precisely the
+lowest-common-denominator item type PRD 5.6 rejects. The two keys that stay
+map-wide are the two that are not typed against a target: `max_concurrency:` is
+a bound on the node (D28) and `on_item_error:` is a strategy (D73). The cost is
+repeating a shared remap across routes, which the narrowing rule usually makes
+impossible to share anyway. *PRD 5.6.*
+
+### D86. Component reachability is one relation, and it crosses every invocation edge
+
+§7.7 defines reaching once — own nodes, `map` dispatch targets, an agent's
+`stores:`, an agent's `tools:` (including `flow.*` entries), transitively — and
+session coherence (§11.3), sync interrupt-freedom (§13.3, §8.7), and recursion
+(§7.5) all use it.
+**Rationale**: the three checks each spelled out their own traversal, and the
+sets differed: §11.3 enumerated nodes, `flow:` nodes, and `stores:`; §13.3 said
+only "reachable from its entry". The gap is not academic — a `respond: sync`
+trigger whose flow contains an agent whose `tools:` lists a `flow.*` containing a
+`human` node is accepted by the narrow reading and interrupts inside a
+synchronous HTTP request, which is the exact outcome PRD 5.11's settled
+"statically interrupt-free" position exists to exclude. Flow-as-tool attachment
+is an invocation (PRD 5.1 makes the tool and flow surfaces interchangeable), and
+so is a `map` dispatch target, so both belong in the relation for every check
+that asks "can this run?". Stating the relation once also removes the class of
+bug where one check is later extended and its siblings silently are not. The
+direction of the change is conservative: it rejects more compositions, and each
+newly rejected one is a spec that would have violated a guarantee at runtime.
+*PRD 5.1, 5.8, 5.11.*
+
+### D87. `local` is a reserved target, and `deploy/local.yml` carries no `storage_backends`
+
+`local` is built in: no deploy file is required, `placements:` and
+`event_sources:` are read from `deploy/local.yml` when it exists,
+`storage_backends:` there is a compile error, neither a store's `backend:` alias
+nor an `event` trigger's `source:` needs a definition under it, and
+`--target <other>` requires its deploy file to exist (§14, §11.3, §13.5).
+**Rationale**: §1.6 listed `deploy/local.yml` as an ordinary target file while
+§11.3/§14 said `local` substitutes local storage *unconditionally*, and the two
+statements together left `storage_backends:` in that file with three readings —
+honored (contradicting PRD 5.8's zero-infra guarantee, which is settled),
+silently ignored (the inert key [D61](#d61-else-takes-the-literal-true) and
+[D50](#d50-unknown-keys-are-errors-everywhere-except-plugin-config-objects)
+refuse), or rejected. The PRD's sentence is senior, so honoring is out and the
+document's own posture picks rejection over silence. The rest of the file stays
+legal because `placements:` and `event_sources:` are not storage and are carried
+into the IR under `local` exactly as under any other target, so nothing there is
+inert. The asymmetry with `event_sources:` is the
+active/reserved split of §15: `storage_backends:` configures something `local`
+overrides *today*, while `event_sources:` is reserved grammar no v0 target
+executes, so it is carried into the IR under every target rather than being dead
+under one. Satisfying both binding checks vacuously under `local` is what keeps
+the zero-infra guarantee real — a project whose staging target names chroma and
+Redis Streams still validates and runs with nothing installed, which is the
+whole point of the guarantee. Requiring a named target's file to exist is the
+same posture one level up: `--target stagng` is a typo, and resolving it to
+built-in backends would deploy against the wrong infrastructure without a
+diagnostic. *PRD 5.8, 5.10, 5.11, G3.*
+
+### D88. The scalar `input:` form is legal only where an unnamed value has a destination
+
+Scalar `input:` binds a string-in agent (node position and `map` dispatch) and an
+inline `exec:` node's stdin; on `http:`, `function:`, `flow:`, and `human:` nodes
+it is a compile error, and `store:` nodes take no `input:` at all (§8.0).
+**Rationale**: [D14](#d14-string-in-agents-bind-with-a-scalar-input-at-the-node)
+and [D75](#d75-map-dispatch-bindings-take-both-input-forms) introduced the form
+for the one contract that has no field names, and §8.2 gave it a second honest
+destination (stdin, from PRD 5.5's own input convention). The published schema
+then offered it wherever it offered bindings, including inline `http:` nodes,
+where §8.3 defines request construction for the field-map case only — so
+`input: "state.draft"` on an `http:` node passed the editor schema with three
+possible meanings (reject, send the bare string as the body, wrap it in an
+object) and no text. Every other kind names its fields: a tool's `input` is a
+field map (possibly `{}`), a subflow's `inputs` is a field map, a `human:`
+node's is too. Listing the two legal positions instead of the six illegal ones
+keeps the rule one line and makes the schema check it per file. *PRD 5.2, 5.5.*
+
+### D89. `optional:` entries must name declared properties
+
+An `optional:` entry naming something the object does not declare is a compile
+error listing the unknown and the declared names (§3.4).
+**Rationale**: §3.4 said only "property names that are not required", which left
+`optional: [emial]` with no stated behavior at all — and the silent reading is
+the harmful one, because the typo's visible effect is that `email` stays
+required, which is the opposite of what the author wrote. This is
+[D50](#d50-unknown-keys-are-errors-everywhere-except-plugin-config-objects)'s
+posture on the one surface where the "key" is an array element rather than a
+mapping key: a name that names nothing is a typo, and error UX is the product
+(PRD G3). The schema cannot see it — JSON Schema constrains an array's items
+without reference to a sibling object's keys — so it is a validator rule, listed
+as such in Appendix B. *PRD 5.2, G3.*
+
+### D90. `max_iterations` is legal only on a guarded edge
+
+An edge carrying `max_iterations` MUST also carry `when:`; on an unconditional
+edge or an `else: true` edge it is a compile error (§7.2, §7.3.1).
+**Rationale**: four rules in this document rest on an edge being *guaranteed to
+fire* — exhaustiveness clause 1 (§7.3.1), the `start` edge and the `on_error:
+skip` escape ([D71](#d71-no-silent-dead-ends-every-node-exits-and-every-run-starts)),
+and the cycle escape ([D19](#d19-max_iterations-semantics-and-the-escape-edge-rule))
+— and all four name the same two edge forms. But §7.3 rule 5 makes an exhausted
+edge untakeable *regardless of its guard*, so a budget on one of those forms
+would quietly withdraw the guarantee on the pass after it ran out, which is the
+runtime dead end the four rules exist to remove, reintroduced by the key meant to
+bound a loop. Restricting the budget to guarded edges makes "guaranteed" mean
+guaranteed everywhere the document says it, and it costs nothing: PRD 5.4's own
+example and every cycle in `examples/` put `max_iterations` on the guarded
+back-edge, which is where a bound belongs — the unconditional or `else:` sibling
+is the way *out*. `when: "true"` remains writable and remains a guarded edge, so
+it can carry a budget and still cannot serve as any rule's guarantee. *PRD 5.3,
+5.4, G3.*
+
 ---
 
 ## Appendix B — Editor integration
@@ -3400,11 +3921,20 @@ authority. The schema cannot see across files, so it does not check:
   compatibility, sync-trigger interrupt-freedom, store schema/keying rules,
   session coherence, provider settings/capability checks, env-ref presence,
   unreachable nodes, undefined channels;
-- the graph analyses of §7.6, which need the whole flow graph rather than a
-  key-and-value pair: balanced convergence (§7.6.2), the no-dead-end rules of
-  §7.6.3 apart from the `start` edge below, `map.over` dominance (§8.6 rule 11),
-  the totality of `flow:`-node bindings (§8.0, D68), and the injectivity of
-  `writes:` (JSON Schema constrains property *names*, never the set of values);
+- the graph analyses of §7.6 and §7.7, which need the whole flow graph rather
+  than a key-and-value pair: balanced convergence (§7.6.2), the no-dead-end rules
+  of §7.6.3 apart from the `start` edge below, component reachability (§7.7) and
+  the three checks over it, `map.over` dominance (§8.6 rule 11), the totality of
+  `flow:`-node bindings (§8.0, D68), and the injectivity of `writes:` (JSON
+  Schema constrains property *names*, never the set of values);
+- rules relating two siblings whose correspondence JSON Schema cannot express:
+  `optional:` entries naming declared properties (§3.4, D89) — an array's items
+  cannot be constrained against a sibling object's keys — and item-derivation of
+  a store key (§11.4, D83), which is a path through bindings in other files;
+- rules that key off the file's *name* or the active target rather than its
+  content: no `storage_backends:` in `deploy/local.yml` and the existence of
+  `deploy/<name>.yml` (§14, D87), and `detach: true` under a checkpointed target
+  (§8.6 rule 7, D59);
 - context-sensitive schema rules whose surface is not syntactically identifiable
   in one file. `max_items` is the example of the split: inside `agent.output`,
   `tool.output`, `flow.outputs`, `human.output`, and store schemas the surface is
@@ -3415,10 +3945,14 @@ authority. The schema cannot see across files, so it does not check:
 What the schema *does* enforce beyond plain shape, because the deciding value is
 a literal in the same object: store-op parameter sets per `op` (§11.4), trigger
 keys per `type` (§13) including the `respond`/`timeout` and `respond`/`callback`
-pairings (§13.3), the map form rules and the `on_item_error` shape (§8.6), the
+pairings (§13.3), the map form rules and the `on_item_error` shape (§8.6) —
+including the confinement of `input:`/`writes:`/`detach:` to the homogeneous form
+(rule 7, D85) — the field-map-only `input:` on the node kinds that name their
+fields (§8.0, D88), the non-empty `expect_exit`/`expect_status` lists (§6.1), the
 direct-XOR-route split on model definitions (§12.2), the `human` timeout/route
 pairing (§8.7), the inline-`http` `input:`-versus-`body:`/`query:` rule (§8.3),
-duplicate edges (§7.2), the presence of one unconditional-or-`else` edge leaving
+duplicate edges and the `max_iterations`/`when:` pairing on one edge (§7.2, D90),
+the presence of one unconditional-or-`else` edge leaving
 `start` (§7.6.3 — an `edges:` array is one value, so this one *is* per-file),
 the reserved-root exclusions on node ids, edge endpoints, control targets, and a
 map's `as:` (§2.5), and the absence of `${ENV}` tokens on the surfaces where §4.3
@@ -3494,15 +4028,18 @@ model.<name>:    { provider: provider.<p>, id: <string>, settings: {...} }
 model.<name>:    { route: [model.<a>, model.<b>], route_on: [...] }
 
 # ---- node shapes ------------------------------------------------------------
+# <bindings> = field map, or a bare CEL scalar where D88 allows one (marked)
 { agent: agent.<a>,  input: <bindings>, writes: {...}, retry/timeout/on_error }
-{ function: tool.<t>, input: <bindings>, writes: {...} }
-{ flow: flow.<f>,    input: <bindings>, writes: {...}, context: isolated|inherit,
+                     # scalar input: only for a string-in agent
+{ function: tool.<t>, input: <field map>, writes: {...} }
+{ flow: flow.<f>,    input: <field map>, writes: {...}, context: isolated|inherit,
                      policy: {...},                    # for the nodes inside
                      retry/timeout/on_error }          # for the instance itself
-{ exec: { command, args?, cwd?, env?, output? },  input: <bindings>, writes: {...} }
+{ exec: { command, args?, cwd?, env?, expect_exit?, output? },
+                     input: <bindings>, writes: {...} }   # scalar input: stdin
 { http: { method, url, headers?, query?, body?, expect_status?, output? },
-                     input: <bindings>, writes: {...} }
-{ human: { input, output, timeout?, on_timeout? }, input: <bindings>, writes: {...} }
+                     input: <field map>, writes: {...} }
+{ human: { input, output, timeout?, on_timeout? }, input: <field map>, writes: {...} }
 { store: store.<s>, op: <op>,     # params are exactly the op's row (11.4):
                      # get/delete: key | set: key,value | list: prefix?,limit
                      # search: query,top_k,filter? | upsert: key,value,metadata?
@@ -3513,7 +4050,8 @@ model.<name>:    { route: [model.<a>, model.<b>], route_on: [...] }
          on_item_error?,           # fail | skip | { retry: {max, backoff, ...} }
          input?,                   # field map, or a scalar for a string-in agent
          writes?,
-         detach? } }               # detach: homogeneous form or per route only
+         detach? } }               # input/writes/detach: homogeneous form only —
+                                   # a routed map declares all three per route
 # route: { node, max_concurrency?, input?, writes?, detach? }
 
 # ---- deploy file ------------------------------------------------------------
