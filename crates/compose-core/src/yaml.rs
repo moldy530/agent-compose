@@ -115,6 +115,7 @@ impl Node {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Mapping {
     entries: Vec<Entry>,
+    dropped: usize,
 }
 
 /// One key/value pair of a [`Mapping`].
@@ -161,6 +162,27 @@ impl Mapping {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// How many entries the source declared that the loader dropped: a
+    /// non-string key, a merge key, or a duplicate (grammar 1.1).
+    ///
+    /// Each one already carries its own diagnostic, so a rule stated over *how
+    /// many* entries a mapping has cannot be answered from what survived —
+    /// "must declare at least one node" of a `nodes:` block the loader emptied
+    /// would be a second diagnostic for one mistake, and false besides: the
+    /// author did declare a node.
+    #[must_use]
+    pub const fn dropped(&self) -> usize {
+        self.dropped
+    }
+
+    /// Whether the source declared no entries at all — the author really did
+    /// write `{}`, rather than writing entries none of which survived
+    /// [`Mapping::dropped`].
+    #[must_use]
+    pub const fn declares_nothing(&self) -> bool {
+        self.entries.is_empty() && self.dropped == 0
     }
 }
 
@@ -499,6 +521,7 @@ impl<'src> Loader<'src, '_> {
                         ),
                     );
                     self.skip_value();
+                    mapping.dropped += 1;
                     continue;
                 }
             };
@@ -513,6 +536,7 @@ impl<'src> Loader<'src, '_> {
                     .with_help("repeat the keys, or alias the whole value with `*anchor`"),
                 );
                 self.skip_value();
+                mapping.dropped += 1;
                 continue;
             }
 
@@ -532,6 +556,7 @@ impl<'src> Loader<'src, '_> {
                     .with_label(first, "first declared here")
                     .with_help("keys are declared once; the second declaration never wins"),
                 );
+                mapping.dropped += 1;
                 continue;
             }
             seen.insert(key.value.clone(), mapping.entries.len());
@@ -878,6 +903,35 @@ mod tests {
         assert_eq!(mapping.len(), 2);
         assert_eq!(mapping.get("a").unwrap().value, Yaml::Int(1));
         assert_eq!(mapping.get("b").unwrap().value, Yaml::Int(3));
+    }
+
+    /// A dropped entry is counted, so a rule stated over how many entries a
+    /// mapping has can tell "the author wrote `{}`" from "the author wrote one
+    /// entry that did not survive" — the second already has its own diagnostic.
+    #[test]
+    fn a_dropped_entry_is_not_an_empty_mapping() {
+        for source in ["1: a\n", "<<: a\n"] {
+            let (node, diagnostics) = load_ok(source);
+            assert_eq!(diagnostics.len(), 1, "{source:?}");
+            let mapping = node.unwrap();
+            let mapping = mapping.as_mapping().unwrap();
+            assert!(mapping.is_empty(), "{source:?}");
+            assert_eq!(mapping.dropped(), 1, "{source:?}");
+            assert!(!mapping.declares_nothing(), "{source:?}");
+        }
+
+        let (node, diagnostics) = load_ok("a: 1\na: 2\n");
+        assert_eq!(codes(&diagnostics), ["duplicate-key"]);
+        let mapping = node.unwrap();
+        let mapping = mapping.as_mapping().unwrap();
+        assert_eq!(mapping.len(), 1);
+        assert_eq!(mapping.dropped(), 1);
+
+        let (node, diagnostics) = load_ok("a: {}\n");
+        assert!(diagnostics.is_empty());
+        let root = node.unwrap();
+        let empty = root.as_mapping().unwrap().get("a").unwrap();
+        assert!(empty.as_mapping().unwrap().declares_nothing());
     }
 
     /// `level` levels of eight-way aliasing, each anchored on the one below.

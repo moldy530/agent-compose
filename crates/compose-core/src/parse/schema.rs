@@ -58,6 +58,15 @@ const DISCRIMINATING_KEYS: &[&str] = &["type", "enum", "discriminator"];
 
 /// Read a declaration surface: `output:`, `input:`, `properties:`, … (grammar
 /// 3.1).
+///
+/// `None` means *this is not a field map the author wrote* — the value is not a
+/// mapping, it is a discriminated union, or every entry in it was rejected — as
+/// opposed to `Some` of an empty one, which is the author writing `{}`. Callers
+/// depend on the difference: the surfaces that require at least one property
+/// (`agent.output`, `agent.input`, grammar 5.1 and 5.3) ask that question of the
+/// map they get back, and asking it of a synthesized empty one would advise an
+/// author to add a property to a surface whose mistake was its shape — a second
+/// diagnostic for one mistake.
 pub(crate) fn field_map(
     node: &Node,
     subject: &str,
@@ -112,11 +121,11 @@ fn field_map_at(
                 "a union is legal as an array's `items:` or as the type of a named property, never as a whole surface: every declaration surface is a field map, so routing fields have names (grammar 3.7, Decision D11)",
             ),
         );
-        return Some(FieldMap {
-            fields: Vec::new(),
-            surface,
-            span: node.span.clone(),
-        });
+        // Not an empty field map — not a field map at all. Handing one back
+        // would let `agent.output`'s ≥1-property rule fire on top of this, and
+        // "must declare at least one property" is wrong-headed advice for a
+        // surface whose mistake is that it is a union.
+        return None;
     }
 
     let mut fields = Vec::new();
@@ -132,6 +141,14 @@ fn field_map_at(
             cx,
         );
         fields.push(Field { name, ty });
+    }
+    // A map whose every field was rejected — by the loader (grammar 1.1) or by
+    // the field-name rule above — is not the empty map either: the author
+    // declared fields, and each one that did not read has its own diagnostic
+    // already. Only a mapping that really is `{}` reaches a caller as an empty
+    // [`FieldMap`].
+    if fields.is_empty() && !mapping.declares_nothing() {
+        return None;
     }
     Some(FieldMap {
         fields,
@@ -779,7 +796,12 @@ fn union_form(
     if let Some(node) = fields.require("variants", cx)
         && let Some(mapping) = expect_mapping(node, &format!("`variants` in {subject}"), cx)
     {
-        if mapping.len() < 2 {
+        // Stated over how many variants the source declares, so it is not asked
+        // of a `variants:` block the loader dropped entries from: each drop
+        // already has its own diagnostic, and "declares 1" of a mapping that
+        // declares two, one of them a duplicate key, is a second diagnostic for
+        // one mistake.
+        if mapping.dropped() == 0 && mapping.len() < 2 {
             cx.push(
                 Diagnostic::error(
                     DiagnosticCode::InvalidValue,
@@ -974,4 +996,96 @@ pub(crate) fn literal(node: &Node) -> Spanned<Literal> {
         ),
     };
     Spanned::new(value, node.span.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::parse_str;
+
+    /// Every diagnostic one source produces, as `code: message`. The whole list
+    /// is compared, so a second diagnostic for one mistake fails the test.
+    fn diagnostics(source: &str) -> Vec<String> {
+        parse_str(source, "test.yml".to_string())
+            .diagnostics
+            .iter()
+            .map(|diagnostic| format!("{}: {}", diagnostic.code, diagnostic.message))
+            .collect()
+    }
+
+    /// An agent whose only variable is its `output:` surface — the surface that
+    /// carries grammar 5.1's ≥1-property rule, which is what a synthesized empty
+    /// field map would trip.
+    fn agent(output: &str) -> String {
+        format!(
+            "agent.a:
+  model: model.m
+  prompt: Write a draft.
+  output:
+{output}"
+        )
+    }
+
+    /// A union at a declaration surface is one mistake about the surface's
+    /// *shape*, so it draws one diagnostic. Handing the caller an empty field
+    /// map instead would add "must declare at least one property", which is
+    /// wrong-headed advice: the surface is not a short field map, it is not a
+    /// field map at all (grammar 3.7, 5.1, Decision D11).
+    #[test]
+    fn a_union_at_a_declaration_surface_is_not_also_an_empty_field_map() {
+        assert_eq!(
+            diagnostics(&agent(
+                "    discriminator: kind\n    variants:\n      a: { x: { type: string } }\n      b: { y: { type: string } }\n"
+            )),
+            [
+                "invalid-value: `output` of agent definition `agent.a` is a discriminated union, but a field map belongs here",
+            ]
+        );
+    }
+
+    /// The same for a field map whose every entry the loader dropped: the author
+    /// declared a property, and the key that was not a string already has its
+    /// own diagnostic (grammar 1.1).
+    #[test]
+    fn a_field_map_whose_only_key_was_dropped_is_not_an_empty_field_map() {
+        assert_eq!(
+            diagnostics(&agent("    1: { type: string }\n")),
+            ["non-string-key: mapping keys must be strings, found an integer"]
+        );
+    }
+
+    /// And for one whose every entry this pass rejected, which is the same
+    /// question one level up: `Verdict` is a mapping key the loader keeps and
+    /// the field-name rule refuses (grammar 2.1).
+    #[test]
+    fn a_field_map_whose_only_field_name_was_rejected_is_not_an_empty_field_map() {
+        assert_eq!(
+            diagnostics(&agent("    Verdict: { type: string }\n")),
+            ["invalid-identifier: field name `Verdict` is not a valid identifier"]
+        );
+    }
+
+    /// An `output: {}` really is the empty field map, and grammar 5.1 refuses
+    /// it — the suppressions above must not swallow the rule they guard.
+    #[test]
+    fn an_empty_output_surface_still_fails_the_one_property_rule() {
+        assert_eq!(
+            diagnostics("agent.a:\n  model: model.m\n  prompt: Write a draft.\n  output: {}\n"),
+            [
+                "invalid-value: `output` of agent definition `agent.a` must declare at least one property",
+            ]
+        );
+    }
+
+    /// A `variants:` arity is stated over how many variants the source declares,
+    /// so a duplicate tag is one mistake: reporting "declares 1" as well would
+    /// count what survived rather than what was written (grammar 1.1, 3.7).
+    #[test]
+    fn a_duplicate_variant_tag_is_not_also_a_one_variant_union() {
+        assert_eq!(
+            diagnostics(&agent(
+                "    r:\n      discriminator: kind\n      variants:\n        x: { a: { type: string } }\n        x: { b: { type: string } }\n"
+            )),
+            ["duplicate-key: duplicate key `x`"]
+        );
+    }
 }

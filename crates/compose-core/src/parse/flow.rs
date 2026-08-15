@@ -39,7 +39,7 @@ pub(crate) fn flow_def(fields: &mut Fields<'_>, subject: &str, cx: &mut Cx) -> F
     if let Some(node) = fields.require("nodes", cx)
         && let Some(mapping) = expect_mapping(node, &format!("`nodes` of {subject}"), cx)
     {
-        if mapping.is_empty() {
+        if mapping.declares_nothing() {
             cx.error(
                 DiagnosticCode::InvalidValue,
                 &node.span,
@@ -1163,7 +1163,7 @@ fn dispatch(
     if let Some(node) = fields.require("routes", cx)
         && let Some(mapping) = expect_mapping(node, "`routes`", cx)
     {
-        if mapping.is_empty() {
+        if mapping.declares_nothing() {
             cx.error(
                 DiagnosticCode::InvalidValue,
                 &node.span,
@@ -1343,6 +1343,25 @@ mod tests {
                 "    - { from: start, to: a }\n    - { from: a, to: b, when: 5 }\n    - { from: a, to: c, else: true }\n"
             )),
             ["wrong-type: expected a CEL expression for `when`, found an integer"]
+        );
+    }
+
+    /// A `nodes:` block whose only entry the loader dropped is not an empty one:
+    /// the author declared a node, and the dropped key already has its own
+    /// diagnostic (grammar 1.1).
+    #[test]
+    fn a_dropped_node_id_does_not_make_the_nodes_block_empty() {
+        let source = "flow.demo:
+  outputs:
+    r: { type: string }
+  nodes:
+    1: { agent: agent.x }
+  edges:
+    - { from: start, to: end }
+";
+        assert_eq!(
+            diagnostics(source),
+            ["non-string-key: mapping keys must be strings, found an integer"]
         );
     }
 
