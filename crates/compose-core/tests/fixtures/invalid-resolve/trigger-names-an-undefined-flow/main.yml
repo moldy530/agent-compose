@@ -1,0 +1,17 @@
+# rule: a trigger's `flow:` resolves to a `flow.*` definition (grammar 2.3)
+# code: undefined-reference
+# message: `flow.g` is not defined in this composition
+# at: main.yml:17:11
+# help: did you mean `flow.f`?
+version: "0.1"
+flow.f:
+  outputs: {}
+  nodes:
+    run: { exec: { command: "true" } }
+  edges:
+    - { from: start, to: run }
+    - { from: run, to: end }
+triggers:
+  cli:
+    type: manual
+    flow: flow.g

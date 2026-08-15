@@ -1,0 +1,13 @@
+# rule: a reference position accepts a fixed set of namespaces (grammar 2.3)
+# code: invalid-reference
+# message: expected a `model.*` reference for `model`, found `provider.p`
+# at: main.yml:10:10
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${KEY}
+agent.a:
+  model: provider.p
+  prompt: Do the thing.
+  output:
+    text: { type: string }

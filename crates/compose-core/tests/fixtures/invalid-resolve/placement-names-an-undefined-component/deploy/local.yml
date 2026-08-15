@@ -1,0 +1,3 @@
+version: "0.1"
+placements:
+  flow.g: { runtime: colocated }

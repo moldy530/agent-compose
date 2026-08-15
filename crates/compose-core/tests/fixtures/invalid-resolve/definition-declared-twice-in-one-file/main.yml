@@ -1,0 +1,16 @@
+# rule: a repeated definition key in one file is the parser's duplicate key, reported once (grammar 1.1)
+# code: duplicate-key
+# message: duplicate key `model.m`
+# at: main.yml:14:1
+# label: main.yml:11:1 first declared here
+# help: keys are declared once; the second declaration never wins
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${KEY}
+model.m:
+  provider: provider.p
+  id: some-model
+model.m:
+  provider: provider.p
+  id: other

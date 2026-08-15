@@ -1,0 +1,6 @@
+version: "0.1"
+imports:
+  - leaf.yml
+provider.p:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}

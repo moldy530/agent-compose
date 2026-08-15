@@ -1,0 +1,4 @@
+version: "0.1"
+storage_backends:
+  defaults:
+    kv: { provider: sqlite }

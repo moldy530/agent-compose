@@ -1,0 +1,14 @@
+# rule: a named target's `deploy/<name>.yml` exists (grammar 14, Decision D87)
+# code: io-error
+# message: `--target staging` requires `deploy/staging.yml`, which does not exist
+# at: deploy/staging.yml:1:1
+# help: a named target's deploy file is required: resolving a missing one to built-in backends would deploy against the wrong infrastructure with no diagnostic (grammar 14, Decision D87)
+# target: staging
+version: "0.1"
+flow.f:
+  outputs: {}
+  nodes:
+    run: { exec: { command: "true" } }
+  edges:
+    - { from: start, to: run }
+    - { from: run, to: end }

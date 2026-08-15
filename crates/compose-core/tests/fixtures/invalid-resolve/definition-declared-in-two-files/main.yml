@@ -1,0 +1,10 @@
+# rule: a typed address is defined once composition-wide (grammar 2.2)
+# code: duplicate-definition
+# message: `provider.p` is defined twice in this composition
+# at: second.yml:1:1
+# label: first.yml:1:1 first defined here, in `first.yml`
+# help: a typed address is global across the composition, whichever file declares it: rename one of the two, or drop the file that duplicates the other (grammar 2.2)
+version: "0.1"
+imports:
+  - first.yml
+  - second.yml

@@ -1,0 +1,8 @@
+# rule: an `imports:` entry resolves inside the project root (grammar 1.4)
+# code: invalid-import-path
+# message: `../outside.yml` resolves outside the project root
+# at: main.yml:8:5
+# help: a path may contain `..`, but every file of a composition sits inside the project root — the entrypoint's own directory — so an entry may not climb out of it (grammar 1.4)
+version: "0.1"
+imports:
+  - ../outside.yml

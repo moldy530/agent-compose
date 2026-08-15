@@ -1,0 +1,19 @@
+# rule: an `imports:` entry names a file that can be read (grammar 1.4)
+# code: io-error
+# message: cannot read `agents/reviewer.yml`: No such file or directory (os error 2)
+# at: main.yml:8:5
+# help: imports are relative paths resolved against the entrypoint's directory, and there is no directory scanning: the file has to be there (grammar 1.4)
+version: "0.1"
+imports:
+  - agents/reviewer.yml
+
+# The composition is incomplete, so the reference below is NOT reported: every
+# name the missing file would have defined is a consequence of the one cause
+# above, and reporting each of them would bury it.
+flow.f:
+  outputs: {}
+  nodes:
+    review: { agent: agent.reviewer }
+  edges:
+    - { from: start, to: review }
+    - { from: review, to: end }

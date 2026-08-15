@@ -1,0 +1,13 @@
+# rule: a node's `agent:` resolves to an `agent.*` definition (grammar 2.3)
+# code: undefined-reference
+# message: `agent.a` is not defined in this composition
+# at: main.yml:10:19
+# help: the composition defines no `agent.*`: a definition is part of it only when the entrypoint imports the file that declares it (grammar 1.4)
+version: "0.1"
+flow.f:
+  outputs: {}
+  nodes:
+    run: { agent: agent.a }
+  edges:
+    - { from: start, to: run }
+    - { from: run, to: end }

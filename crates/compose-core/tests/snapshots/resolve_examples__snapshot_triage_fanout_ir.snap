@@ -1,0 +1,2622 @@
+---
+source: crates/compose-core/tests/resolve_examples.rs
+expression: "resolve_clean(\"examples/triage-fanout\", \"local\")"
+---
+{
+  "ir_version": "1",
+  "spec_version": "0.1",
+  "entrypoint": "main.yml",
+  "target": "local",
+  "sources": [
+    {
+      "path": "main.yml",
+      "role": "entrypoint"
+    },
+    {
+      "path": "agents/fixer.yml",
+      "role": "import"
+    },
+    {
+      "path": "agents/summarizer.yml",
+      "role": "import"
+    },
+    {
+      "path": "agents/triage.yml",
+      "role": "import"
+    },
+    {
+      "path": "flows/enrich.yml",
+      "role": "import"
+    },
+    {
+      "path": "flows/triage.yml",
+      "role": "import"
+    },
+    {
+      "path": "models.yml",
+      "role": "import"
+    },
+    {
+      "path": "providers.yml",
+      "role": "import"
+    },
+    {
+      "path": "stores/docs.yml",
+      "role": "import"
+    },
+    {
+      "path": "stores/triage_memory.yml",
+      "role": "import"
+    },
+    {
+      "path": "tools/dead_letter.yml",
+      "role": "import"
+    },
+    {
+      "path": "tools/repo_grep.yml",
+      "role": "import"
+    },
+    {
+      "path": "tools/review_queue.yml",
+      "role": "import"
+    },
+    {
+      "path": "triggers.yml",
+      "role": "import"
+    },
+    {
+      "path": "deploy/local.yml",
+      "role": "deploy"
+    }
+  ],
+  "defaults": {
+    "retry": {
+      "max": 1,
+      "backoff": {
+        "value": "2s",
+        "span": "main.yml:33:29..33:31"
+      },
+      "span": "main.yml:33:10..33:33"
+    },
+    "timeout": {
+      "value": "90s",
+      "span": "main.yml:32:12..32:15"
+    },
+    "on_error": {
+      "strategy": "fail",
+      "span": "main.yml:34:13..34:17"
+    }
+  },
+  "state": {
+    "human_decision": {
+      "name": {
+        "value": "human_decision",
+        "span": "main.yml:65:3..65:17"
+      },
+      "type": {
+        "description": {
+          "value": "What the reviewer decided about the run as a whole.",
+          "span": "main.yml:66:18..66:69"
+        },
+        "span": "main.yml:66:5..69:1",
+        "form": "enum",
+        "variants": [
+          {
+            "value": "approve",
+            "span": "main.yml:67:12..67:19"
+          },
+          {
+            "value": "reject",
+            "span": "main.yml:67:21..67:27"
+          }
+        ],
+        "default": {
+          "value": "approve",
+          "span": "main.yml:68:14..68:21"
+        }
+      },
+      "span": "main.yml:65:3..69:1"
+    },
+    "matches": {
+      "name": {
+        "value": "matches",
+        "span": "main.yml:42:3..42:10"
+      },
+      "type": {
+        "description": {
+          "value": "Raw grep hits handed to the triage agent.",
+          "span": "main.yml:43:18..43:59"
+        },
+        "span": "main.yml:43:5..53:3",
+        "form": "array",
+        "items": {
+          "span": "main.yml:45:12..45:28",
+          "form": "scalar",
+          "type": "string"
+        }
+      },
+      "span": "main.yml:42:3..53:3"
+    },
+    "patches": {
+      "name": {
+        "value": "patches",
+        "span": "main.yml:53:3..53:10"
+      },
+      "type": {
+        "description": {
+          "value": "Patches produced by the fixer instances.",
+          "span": "main.yml:54:18..54:58"
+        },
+        "span": "main.yml:54:5..60:3",
+        "form": "array",
+        "items": {
+          "span": "main.yml:57:12..57:28",
+          "form": "scalar",
+          "type": "string"
+        },
+        "max_items": 200
+      },
+      "reduce": "append",
+      "span": "main.yml:53:3..60:3"
+    },
+    "report_normalized": {
+      "name": {
+        "value": "report_normalized",
+        "span": "main.yml:37:3..37:20"
+      },
+      "type": {
+        "description": {
+          "value": "The report after flow.enrich has normalized it.",
+          "span": "main.yml:38:18..38:65"
+        },
+        "span": "main.yml:38:5..42:3",
+        "form": "scalar",
+        "type": "string",
+        "default": {
+          "value": "",
+          "span": "main.yml:40:14..40:16"
+        }
+      },
+      "span": "main.yml:37:3..42:3"
+    },
+    "summary": {
+      "name": {
+        "value": "summary",
+        "span": "main.yml:60:3..60:10"
+      },
+      "type": {
+        "description": {
+          "value": "Human-readable summary of the triage run.",
+          "span": "main.yml:61:18..61:59"
+        },
+        "span": "main.yml:61:5..65:3",
+        "form": "scalar",
+        "type": "string",
+        "default": {
+          "value": "",
+          "span": "main.yml:63:14..63:16"
+        }
+      },
+      "span": "main.yml:60:3..65:3"
+    }
+  },
+  "triggers": {
+    "cli": {
+      "name": {
+        "value": "cli",
+        "span": "triggers.yml:5:3..5:6"
+      },
+      "flow": {
+        "value": "flow.triage",
+        "span": "triggers.yml:7:11..7:22"
+      },
+      "session_key": {
+        "value": "payload.session",
+        "span": "triggers.yml:8:18..8:35"
+      },
+      "span": "triggers.yml:6:5..10:3",
+      "type": "manual"
+    },
+    "ingest": {
+      "name": {
+        "value": "ingest",
+        "span": "triggers.yml:36:3..36:9"
+      },
+      "flow": {
+        "value": "flow.triage",
+        "span": "triggers.yml:38:11..38:22"
+      },
+      "session_key": {
+        "value": "payload.body.project",
+        "span": "triggers.yml:43:18..43:40"
+      },
+      "span": "triggers.yml:37:5..45:1",
+      "type": "event",
+      "source": {
+        "value": "bug_reports",
+        "span": "triggers.yml:39:13..39:24"
+      },
+      "input": {
+        "entries": [
+          {
+            "name": {
+              "value": "report",
+              "span": "triggers.yml:41:7..41:13"
+            },
+            "value": {
+              "value": "payload.body.text",
+              "span": "triggers.yml:41:15..41:34"
+            }
+          },
+          {
+            "name": {
+              "value": "pattern",
+              "span": "triggers.yml:42:7..42:14"
+            },
+            "value": {
+              "value": "payload.body.pattern",
+              "span": "triggers.yml:42:16..42:38"
+            }
+          }
+        ],
+        "span": "triggers.yml:41:7..43:5"
+      },
+      "dedupe_key": {
+        "value": "payload.id",
+        "span": "triggers.yml:44:17..44:29"
+      }
+    },
+    "nightly": {
+      "name": {
+        "value": "nightly",
+        "span": "triggers.yml:24:3..24:10"
+      },
+      "flow": {
+        "value": "flow.triage",
+        "span": "triggers.yml:26:11..26:22"
+      },
+      "session_key": {
+        "value": "'nightly'",
+        "span": "triggers.yml:32:18..32:29"
+      },
+      "span": "triggers.yml:25:5..36:3",
+      "type": "schedule",
+      "cron": {
+        "value": "0 3 * * *",
+        "span": "triggers.yml:27:11..27:22"
+      },
+      "timezone": {
+        "value": "UTC",
+        "span": "triggers.yml:28:15..28:18"
+      },
+      "input": {
+        "entries": [
+          {
+            "name": {
+              "value": "report",
+              "span": "triggers.yml:30:7..30:13"
+            },
+            "value": {
+              "value": "'nightly sweep'",
+              "span": "triggers.yml:30:15..30:32"
+            }
+          },
+          {
+            "name": {
+              "value": "pattern",
+              "span": "triggers.yml:31:7..31:14"
+            },
+            "value": {
+              "value": "'TODO|FIXME'",
+              "span": "triggers.yml:31:16..31:30"
+            }
+          }
+        ],
+        "span": "triggers.yml:30:7..32:5"
+      }
+    },
+    "on_report": {
+      "name": {
+        "value": "on_report",
+        "span": "triggers.yml:10:3..10:12"
+      },
+      "flow": {
+        "value": "flow.triage",
+        "span": "triggers.yml:12:11..12:22"
+      },
+      "session_key": {
+        "value": "payload.body.project",
+        "span": "triggers.yml:18:18..18:40"
+      },
+      "span": "triggers.yml:11:5..24:3",
+      "type": "http",
+      "path": {
+        "value": "/reports",
+        "span": "triggers.yml:13:11..13:19"
+      },
+      "method": "POST",
+      "input": {
+        "entries": [
+          {
+            "name": {
+              "value": "report",
+              "span": "triggers.yml:16:7..16:13"
+            },
+            "value": {
+              "value": "payload.body.report",
+              "span": "triggers.yml:16:15..16:36"
+            }
+          },
+          {
+            "name": {
+              "value": "pattern",
+              "span": "triggers.yml:17:7..17:14"
+            },
+            "value": {
+              "value": "payload.body.pattern",
+              "span": "triggers.yml:17:16..17:38"
+            }
+          }
+        ],
+        "span": "triggers.yml:16:7..18:5"
+      },
+      "respond": "async",
+      "callback": {
+        "value": "payload.body.callback_url",
+        "span": "triggers.yml:20:15..20:42"
+      }
+    }
+  },
+  "definitions": {
+    "agent.fixer": {
+      "address": {
+        "value": "agent.fixer",
+        "span": "agents/fixer.yml:4:1..4:12"
+      },
+      "span": "agents/fixer.yml:4:1..20:1",
+      "namespace": "agent",
+      "model": {
+        "value": "model.fast",
+        "span": "agents/fixer.yml:6:10..6:20"
+      },
+      "prompt": {
+        "value": "You write minimal unified diffs. Fix exactly the described defect in the\nnamed file and change nothing else.\n",
+        "span": "agents/fixer.yml:8:5..10:3"
+      },
+      "output": {
+        "surface": "result",
+        "fields": [
+          {
+            "name": {
+              "value": "patch",
+              "span": "agents/fixer.yml:14:5..14:10"
+            },
+            "type": {
+              "description": {
+                "value": "A unified diff.",
+                "span": "agents/fixer.yml:15:20..15:35"
+              },
+              "span": "agents/fixer.yml:15:7..17:5",
+              "form": "scalar",
+              "type": "string"
+            }
+          },
+          {
+            "name": {
+              "value": "explanation",
+              "span": "agents/fixer.yml:17:5..17:16"
+            },
+            "type": {
+              "description": {
+                "value": "One sentence describing the change.",
+                "span": "agents/fixer.yml:18:20..18:55"
+              },
+              "span": "agents/fixer.yml:18:7..20:1",
+              "form": "scalar",
+              "type": "string"
+            }
+          }
+        ],
+        "span": "agents/fixer.yml:14:5..20:1"
+      },
+      "input": {
+        "surface": "input",
+        "fields": [
+          {
+            "name": {
+              "value": "file",
+              "span": "agents/fixer.yml:11:5..11:9"
+            },
+            "type": {
+              "span": "agents/fixer.yml:11:11..11:27",
+              "form": "scalar",
+              "type": "string"
+            }
+          },
+          {
+            "name": {
+              "value": "patch_hint",
+              "span": "agents/fixer.yml:12:5..12:15"
+            },
+            "type": {
+              "span": "agents/fixer.yml:12:17..12:33",
+              "form": "scalar",
+              "type": "string"
+            }
+          }
+        ],
+        "span": "agents/fixer.yml:11:5..13:3"
+      },
+      "description": {
+        "value": "Produces a patch for one mechanically fixable finding.",
+        "span": "agents/fixer.yml:5:16..5:70"
+      }
+    },
+    "agent.summarizer": {
+      "address": {
+        "value": "agent.summarizer",
+        "span": "agents/summarizer.yml:1:1..1:17"
+      },
+      "span": "agents/summarizer.yml:1:1..17:1",
+      "namespace": "agent",
+      "model": {
+        "value": "model.fast",
+        "span": "agents/summarizer.yml:3:10..3:20"
+      },
+      "prompt": {
+        "value": "Summarize the triage run in at most five sentences: what was fixed\nautomatically, what needs a human, and any risk you noticed.\n",
+        "span": "agents/summarizer.yml:5:5..7:3"
+      },
+      "output": {
+        "surface": "result",
+        "fields": [
+          {
+            "name": {
+              "value": "summary",
+              "span": "agents/summarizer.yml:13:5..13:12"
+            },
+            "type": {
+              "description": {
+                "value": "The run summary shown to the human reviewer.",
+                "span": "agents/summarizer.yml:14:20..14:64"
+              },
+              "span": "agents/summarizer.yml:14:7..17:1",
+              "form": "scalar",
+              "type": "string",
+              "min_length": 1
+            }
+          }
+        ],
+        "span": "agents/summarizer.yml:13:5..17:1"
+      },
+      "input": {
+        "surface": "input",
+        "fields": [
+          {
+            "name": {
+              "value": "report",
+              "span": "agents/summarizer.yml:8:5..8:11"
+            },
+            "type": {
+              "span": "agents/summarizer.yml:8:13..8:29",
+              "form": "scalar",
+              "type": "string"
+            }
+          },
+          {
+            "name": {
+              "value": "patches",
+              "span": "agents/summarizer.yml:9:5..9:12"
+            },
+            "type": {
+              "span": "agents/summarizer.yml:10:7..12:3",
+              "form": "array",
+              "items": {
+                "span": "agents/summarizer.yml:11:14..11:30",
+                "form": "scalar",
+                "type": "string"
+              }
+            }
+          }
+        ],
+        "span": "agents/summarizer.yml:8:5..12:3"
+      },
+      "description": {
+        "value": "Summarizes a completed triage run for a human reviewer.",
+        "span": "agents/summarizer.yml:2:16..2:71"
+      }
+    },
+    "agent.triage": {
+      "address": {
+        "value": "agent.triage",
+        "span": "agents/triage.yml:5:1..5:13"
+      },
+      "span": "agents/triage.yml:5:1..40:1",
+      "namespace": "agent",
+      "model": {
+        "value": "model.smart",
+        "span": "agents/triage.yml:7:10..7:21"
+      },
+      "prompt": {
+        "value": "You triage incoming bug reports.\n\nEmit one finding per distinct defect. Tag a finding `auto_fixable` only when\nthe fix is mechanical and local to one file. Tag it `needs_human` when it\nrequires judgement, and `duplicate` when the report restates a finding you\nhave already emitted in this run.\n",
+        "span": "agents/triage.yml:9:5..15:3"
+      },
+      "output": {
+        "surface": "result",
+        "fields": [
+          {
+            "name": {
+              "value": "findings",
+              "span": "agents/triage.yml:25:5..25:13"
+            },
+            "type": {
+              "description": {
+                "value": "Every distinct defect, tagged for routing.",
+                "span": "agents/triage.yml:26:20..26:62"
+              },
+              "span": "agents/triage.yml:26:7..40:1",
+              "form": "array",
+              "items": {
+                "span": "agents/triage.yml:30:9..40:1",
+                "form": "union",
+                "discriminator": {
+                  "value": "kind",
+                  "span": "agents/triage.yml:30:24..30:28"
+                },
+                "variants": [
+                  {
+                    "tag": {
+                      "value": "auto_fixable",
+                      "span": "agents/triage.yml:32:11..32:23"
+                    },
+                    "fields": {
+                      "surface": "result",
+                      "fields": [
+                        {
+                          "name": {
+                            "value": "file",
+                            "span": "agents/triage.yml:33:13..33:17"
+                          },
+                          "type": {
+                            "span": "agents/triage.yml:33:19..33:35",
+                            "form": "scalar",
+                            "type": "string"
+                          }
+                        },
+                        {
+                          "name": {
+                            "value": "patch_hint",
+                            "span": "agents/triage.yml:34:13..34:23"
+                          },
+                          "type": {
+                            "span": "agents/triage.yml:34:25..34:41",
+                            "form": "scalar",
+                            "type": "string"
+                          }
+                        }
+                      ],
+                      "span": "agents/triage.yml:33:13..35:11"
+                    }
+                  },
+                  {
+                    "tag": {
+                      "value": "needs_human",
+                      "span": "agents/triage.yml:35:11..35:22"
+                    },
+                    "fields": {
+                      "surface": "result",
+                      "fields": [
+                        {
+                          "name": {
+                            "value": "summary",
+                            "span": "agents/triage.yml:36:13..36:20"
+                          },
+                          "type": {
+                            "span": "agents/triage.yml:36:22..36:38",
+                            "form": "scalar",
+                            "type": "string"
+                          }
+                        },
+                        {
+                          "name": {
+                            "value": "severity",
+                            "span": "agents/triage.yml:37:13..37:21"
+                          },
+                          "type": {
+                            "span": "agents/triage.yml:37:23..37:54",
+                            "form": "enum",
+                            "variants": [
+                              {
+                                "value": "low",
+                                "span": "agents/triage.yml:37:32..37:35"
+                              },
+                              {
+                                "value": "high",
+                                "span": "agents/triage.yml:37:37..37:41"
+                              },
+                              {
+                                "value": "critical",
+                                "span": "agents/triage.yml:37:43..37:51"
+                              }
+                            ]
+                          }
+                        }
+                      ],
+                      "span": "agents/triage.yml:36:13..38:11"
+                    }
+                  },
+                  {
+                    "tag": {
+                      "value": "duplicate",
+                      "span": "agents/triage.yml:38:11..38:20"
+                    },
+                    "fields": {
+                      "surface": "result",
+                      "fields": [
+                        {
+                          "name": {
+                            "value": "of",
+                            "span": "agents/triage.yml:39:13..39:15"
+                          },
+                          "type": {
+                            "span": "agents/triage.yml:39:17..39:33",
+                            "form": "scalar",
+                            "type": "string"
+                          }
+                        }
+                      ],
+                      "span": "agents/triage.yml:39:13..40:1"
+                    }
+                  }
+                ]
+              },
+              "max_items": 50
+            }
+          }
+        ],
+        "span": "agents/triage.yml:25:5..40:1"
+      },
+      "input": {
+        "surface": "input",
+        "fields": [
+          {
+            "name": {
+              "value": "report",
+              "span": "agents/triage.yml:17:5..17:11"
+            },
+            "type": {
+              "description": {
+                "value": "The raw bug report.",
+                "span": "agents/triage.yml:18:20..18:39"
+              },
+              "span": "agents/triage.yml:18:7..20:5",
+              "form": "scalar",
+              "type": "string"
+            }
+          },
+          {
+            "name": {
+              "value": "matches",
+              "span": "agents/triage.yml:20:5..20:12"
+            },
+            "type": {
+              "description": {
+                "value": "Grep hits from the repository, for grounding.",
+                "span": "agents/triage.yml:21:20..21:65"
+              },
+              "span": "agents/triage.yml:21:7..24:3",
+              "form": "array",
+              "items": {
+                "span": "agents/triage.yml:23:14..23:30",
+                "form": "scalar",
+                "type": "string"
+              }
+            }
+          }
+        ],
+        "span": "agents/triage.yml:17:5..24:3"
+      },
+      "stores": [
+        {
+          "value": "store.docs",
+          "span": "agents/triage.yml:15:12..15:22"
+        }
+      ],
+      "description": {
+        "value": "Classifies bug-report findings into routable variants.",
+        "span": "agents/triage.yml:6:16..6:70"
+      }
+    },
+    "flow.enrich": {
+      "address": {
+        "value": "flow.enrich",
+        "span": "flows/enrich.yml:4:1..4:12"
+      },
+      "span": "flows/enrich.yml:4:1..33:1",
+      "namespace": "flow",
+      "description": {
+        "value": "Normalize a raw bug report through the triage service.",
+        "span": "flows/enrich.yml:5:16..5:70"
+      },
+      "inputs": {
+        "surface": "input",
+        "fields": [
+          {
+            "name": {
+              "value": "report",
+              "span": "flows/enrich.yml:7:5..7:11"
+            },
+            "type": {
+              "span": "flows/enrich.yml:7:13..7:29",
+              "form": "scalar",
+              "type": "string"
+            }
+          }
+        ],
+        "span": "flows/enrich.yml:7:5..8:3"
+      },
+      "outputs": {
+        "surface": "result",
+        "fields": [
+          {
+            "name": {
+              "value": "report_normalized",
+              "span": "flows/enrich.yml:9:5..9:22"
+            },
+            "type": {
+              "span": "flows/enrich.yml:9:24..9:40",
+              "form": "scalar",
+              "type": "string"
+            }
+          }
+        ],
+        "span": "flows/enrich.yml:9:5..10:3"
+      },
+      "nodes": [
+        {
+          "id": {
+            "value": "fetch",
+            "span": "flows/enrich.yml:11:5..11:10"
+          },
+          "policy": {
+            "retry": {
+              "max": 2,
+              "backoff": {
+                "value": "1s",
+                "span": "flows/enrich.yml:29:33..29:35"
+              },
+              "multiplier": 3.0,
+              "max_backoff": {
+                "value": "20s",
+                "span": "flows/enrich.yml:29:67..29:70"
+              },
+              "span": "flows/enrich.yml:29:14..29:72"
+            },
+            "timeout": {
+              "value": "15s",
+              "span": "flows/enrich.yml:28:16..28:19"
+            }
+          },
+          "span": "flows/enrich.yml:12:7..30:3",
+          "kind": "http",
+          "http": {
+            "method": {
+              "value": "POST",
+              "span": "flows/enrich.yml:13:17..13:21"
+            },
+            "url": {
+              "value": {
+                "text": "https://${TRIAGE_HOST}/v1/normalize",
+                "env_refs": [
+                  "TRIAGE_HOST"
+                ]
+              },
+              "span": "flows/enrich.yml:14:14..14:51"
+            },
+            "headers": [
+              {
+                "name": {
+                  "value": "authorization",
+                  "span": "flows/enrich.yml:16:11..16:24"
+                },
+                "value": {
+                  "value": {
+                    "text": "Bearer ${TRIAGE_TOKEN}",
+                    "env_refs": [
+                      "TRIAGE_TOKEN"
+                    ]
+                  },
+                  "span": "flows/enrich.yml:16:26..16:50"
+                }
+              }
+            ],
+            "body": {
+              "entries": [
+                {
+                  "name": {
+                    "value": "report",
+                    "span": "flows/enrich.yml:18:11..18:17"
+                  },
+                  "value": {
+                    "value": "input.report",
+                    "span": "flows/enrich.yml:18:19..18:33"
+                  }
+                }
+              ],
+              "span": "flows/enrich.yml:18:11..19:9"
+            },
+            "expect_status": [
+              200
+            ],
+            "output": {
+              "surface": "result",
+              "fields": [
+                {
+                  "name": {
+                    "value": "report_normalized",
+                    "span": "flows/enrich.yml:27:11..27:28"
+                  },
+                  "type": {
+                    "span": "flows/enrich.yml:27:30..27:46",
+                    "form": "scalar",
+                    "type": "string"
+                  }
+                }
+              ],
+              "span": "flows/enrich.yml:27:11..28:7"
+            },
+            "span": "flows/enrich.yml:13:9..28:7"
+          }
+        }
+      ],
+      "edges": [
+        {
+          "from": {
+            "value": "start",
+            "span": "flows/enrich.yml:31:15..31:20"
+          },
+          "to": {
+            "value": "fetch",
+            "span": "flows/enrich.yml:31:26..31:31"
+          },
+          "span": "flows/enrich.yml:31:7..31:33"
+        },
+        {
+          "from": {
+            "value": "fetch",
+            "span": "flows/enrich.yml:32:15..32:20"
+          },
+          "to": {
+            "value": "end",
+            "span": "flows/enrich.yml:32:26..32:29"
+          },
+          "span": "flows/enrich.yml:32:7..32:31"
+        }
+      ]
+    },
+    "flow.triage": {
+      "address": {
+        "value": "flow.triage",
+        "span": "flows/triage.yml:1:1..1:12"
+      },
+      "span": "flows/triage.yml:1:1..242:1",
+      "namespace": "flow",
+      "description": {
+        "value": "Triage a bug report, fan out fixes, and get a human sign-off.",
+        "span": "flows/triage.yml:2:16..2:77"
+      },
+      "inputs": {
+        "surface": "input",
+        "fields": [
+          {
+            "name": {
+              "value": "report",
+              "span": "flows/triage.yml:4:5..4:11"
+            },
+            "type": {
+              "description": {
+                "value": "The raw bug report.",
+                "span": "flows/triage.yml:5:20..5:39"
+              },
+              "span": "flows/triage.yml:5:7..8:5",
+              "form": "scalar",
+              "type": "string",
+              "min_length": 1
+            }
+          },
+          {
+            "name": {
+              "value": "pattern",
+              "span": "flows/triage.yml:8:5..8:12"
+            },
+            "type": {
+              "description": {
+                "value": "Repository search pattern used to ground the triage agent.",
+                "span": "flows/triage.yml:9:20..9:78"
+              },
+              "span": "flows/triage.yml:9:7..11:3",
+              "form": "scalar",
+              "type": "string"
+            }
+          }
+        ],
+        "span": "flows/triage.yml:4:5..11:3"
+      },
+      "outputs": {
+        "surface": "result",
+        "fields": [
+          {
+            "name": {
+              "value": "summary",
+              "span": "flows/triage.yml:12:5..12:12"
+            },
+            "type": {
+              "span": "flows/triage.yml:13:7..14:5",
+              "form": "scalar",
+              "type": "string"
+            }
+          },
+          {
+            "name": {
+              "value": "patches",
+              "span": "flows/triage.yml:14:5..14:12"
+            },
+            "type": {
+              "span": "flows/triage.yml:15:7..19:3",
+              "form": "array",
+              "items": {
+                "span": "flows/triage.yml:17:14..17:30",
+                "form": "scalar",
+                "type": "string"
+              },
+              "max_items": 200
+            }
+          }
+        ],
+        "span": "flows/triage.yml:12:5..19:3"
+      },
+      "nodes": [
+        {
+          "id": {
+            "value": "enrich",
+            "span": "flows/triage.yml:22:5..22:11"
+          },
+          "input": {
+            "form": "fields",
+            "bindings": {
+              "entries": [
+                {
+                  "name": {
+                    "value": "report",
+                    "span": "flows/triage.yml:25:9..25:15"
+                  },
+                  "value": {
+                    "value": "input.report",
+                    "span": "flows/triage.yml:25:17..25:31"
+                  }
+                }
+              ],
+              "span": "flows/triage.yml:25:9..26:7"
+            }
+          },
+          "span": "flows/triage.yml:23:7..32:5",
+          "kind": "flow",
+          "flow": {
+            "value": "flow.enrich",
+            "span": "flows/triage.yml:23:13..23:24"
+          },
+          "context": "isolated",
+          "policy": {
+            "timeout": {
+              "value": "30s",
+              "span": "flows/triage.yml:28:18..28:21"
+            },
+            "on_error": {
+              "strategy": "fail",
+              "span": "flows/triage.yml:29:19..29:23"
+            }
+          }
+        },
+        {
+          "id": {
+            "value": "scan",
+            "span": "flows/triage.yml:32:5..32:9"
+          },
+          "input": {
+            "form": "fields",
+            "bindings": {
+              "entries": [
+                {
+                  "name": {
+                    "value": "pattern",
+                    "span": "flows/triage.yml:35:9..35:16"
+                  },
+                  "value": {
+                    "value": "input.pattern",
+                    "span": "flows/triage.yml:35:18..35:33"
+                  }
+                },
+                {
+                  "name": {
+                    "value": "max_matches",
+                    "span": "flows/triage.yml:36:9..36:20"
+                  },
+                  "value": {
+                    "value": "25",
+                    "span": "flows/triage.yml:36:22..36:26"
+                  }
+                }
+              ],
+              "span": "flows/triage.yml:35:9..38:5"
+            }
+          },
+          "span": "flows/triage.yml:33:7..38:5",
+          "kind": "function",
+          "function": {
+            "value": "tool.repo_grep",
+            "span": "flows/triage.yml:33:17..33:31"
+          }
+        },
+        {
+          "id": {
+            "value": "classify",
+            "span": "flows/triage.yml:38:5..38:13"
+          },
+          "input": {
+            "form": "fields",
+            "bindings": {
+              "entries": [
+                {
+                  "name": {
+                    "value": "report",
+                    "span": "flows/triage.yml:41:9..41:15"
+                  },
+                  "value": {
+                    "value": "state.report_normalized",
+                    "span": "flows/triage.yml:41:17..41:42"
+                  }
+                },
+                {
+                  "name": {
+                    "value": "matches",
+                    "span": "flows/triage.yml:42:9..42:16"
+                  },
+                  "value": {
+                    "value": "state.matches",
+                    "span": "flows/triage.yml:42:18..42:33"
+                  }
+                }
+              ],
+              "span": "flows/triage.yml:41:9..48:5"
+            }
+          },
+          "span": "flows/triage.yml:39:7..48:5",
+          "kind": "agent",
+          "agent": {
+            "value": "agent.triage",
+            "span": "flows/triage.yml:39:14..39:26"
+          }
+        },
+        {
+          "id": {
+            "value": "dispatch",
+            "span": "flows/triage.yml:48:5..48:13"
+          },
+          "policy": {
+            "on_error": {
+              "strategy": "skip",
+              "span": "flows/triage.yml:98:17..98:21"
+            }
+          },
+          "span": "flows/triage.yml:49:7..104:5",
+          "kind": "map",
+          "map": {
+            "over": {
+              "value": "classify.output.findings",
+              "span": "flows/triage.yml:50:15..50:39"
+            },
+            "item_binding": {
+              "value": "finding",
+              "span": "flows/triage.yml:51:13..51:20"
+            },
+            "max_concurrency": 8,
+            "on_item_error": {
+              "strategy": "retry",
+              "retry": {
+                "max": 2,
+                "backoff": {
+                  "value": "2s",
+                  "span": "flows/triage.yml:62:37..62:39"
+                },
+                "span": "flows/triage.yml:62:18..62:41"
+              },
+              "span": "flows/triage.yml:62:11..63:9"
+            },
+            "span": "flows/triage.yml:50:9..98:7",
+            "dispatch": "routed",
+            "route_by": {
+              "value": "kind",
+              "span": "flows/triage.yml:52:19..52:23"
+            },
+            "routes": [
+              {
+                "tag": {
+                  "value": "auto_fixable",
+                  "span": "flows/triage.yml:64:11..64:23"
+                },
+                "node": {
+                  "value": "agent.fixer",
+                  "span": "flows/triage.yml:65:19..65:30"
+                },
+                "max_concurrency": 4,
+                "input": {
+                  "form": "fields",
+                  "bindings": {
+                    "entries": [
+                      {
+                        "name": {
+                          "value": "file",
+                          "span": "flows/triage.yml:68:15..68:19"
+                        },
+                        "value": {
+                          "value": "finding.file",
+                          "span": "flows/triage.yml:68:21..68:35"
+                        }
+                      },
+                      {
+                        "name": {
+                          "value": "patch_hint",
+                          "span": "flows/triage.yml:69:15..69:25"
+                        },
+                        "value": {
+                          "value": "finding.patch_hint",
+                          "span": "flows/triage.yml:69:27..69:47"
+                        }
+                      }
+                    ],
+                    "span": "flows/triage.yml:68:15..70:13"
+                  }
+                },
+                "writes": {
+                  "entries": [
+                    {
+                      "field": {
+                        "value": "patch",
+                        "span": "flows/triage.yml:71:15..71:20"
+                      },
+                      "channel": {
+                        "value": "patches",
+                        "span": "flows/triage.yml:71:22..71:29"
+                      }
+                    }
+                  ],
+                  "span": "flows/triage.yml:71:15..72:11"
+                },
+                "span": "flows/triage.yml:65:13..72:11"
+              },
+              {
+                "tag": {
+                  "value": "needs_human",
+                  "span": "flows/triage.yml:72:11..72:22"
+                },
+                "node": {
+                  "value": "tool.review_queue",
+                  "span": "flows/triage.yml:73:19..73:36"
+                },
+                "input": {
+                  "form": "fields",
+                  "bindings": {
+                    "entries": [
+                      {
+                        "name": {
+                          "value": "summary",
+                          "span": "flows/triage.yml:75:15..75:22"
+                        },
+                        "value": {
+                          "value": "finding.summary",
+                          "span": "flows/triage.yml:75:24..75:41"
+                        }
+                      },
+                      {
+                        "name": {
+                          "value": "severity",
+                          "span": "flows/triage.yml:76:15..76:23"
+                        },
+                        "value": {
+                          "value": "finding.severity",
+                          "span": "flows/triage.yml:76:25..76:43"
+                        }
+                      }
+                    ],
+                    "span": "flows/triage.yml:75:15..89:9"
+                  }
+                },
+                "span": "flows/triage.yml:73:13..89:9"
+              }
+            ],
+            "default": {
+              "node": {
+                "value": "tool.dead_letter",
+                "span": "flows/triage.yml:90:17..90:33"
+              },
+              "input": {
+                "form": "fields",
+                "bindings": {
+                  "entries": [
+                    {
+                      "name": {
+                        "value": "kind",
+                        "span": "flows/triage.yml:93:13..93:17"
+                      },
+                      "value": {
+                        "value": "finding.kind",
+                        "span": "flows/triage.yml:93:19..93:33"
+                      }
+                    },
+                    {
+                      "name": {
+                        "value": "payload",
+                        "span": "flows/triage.yml:94:13..94:20"
+                      },
+                      "value": {
+                        "value": "finding.of",
+                        "span": "flows/triage.yml:94:22..94:34"
+                      }
+                    }
+                  ],
+                  "span": "flows/triage.yml:93:13..98:7"
+                }
+              },
+              "detach": {
+                "value": false,
+                "span": "flows/triage.yml:91:19..91:24"
+              },
+              "span": "flows/triage.yml:90:11..98:7"
+            }
+          }
+        },
+        {
+          "id": {
+            "value": "announce",
+            "span": "flows/triage.yml:104:5..104:13"
+          },
+          "policy": {
+            "timeout": {
+              "value": "10s",
+              "span": "flows/triage.yml:114:16..114:19"
+            },
+            "on_error": {
+              "strategy": "fallback",
+              "target": {
+                "value": "announce_failed",
+                "span": "flows/triage.yml:118:29..118:44"
+              },
+              "span": "flows/triage.yml:118:17..118:46"
+            }
+          },
+          "span": "flows/triage.yml:105:7..130:5",
+          "kind": "http",
+          "http": {
+            "method": {
+              "value": "POST",
+              "span": "flows/triage.yml:106:17..106:21"
+            },
+            "url": {
+              "value": {
+                "text": "https://${QUEUE_HOST}/v1/triage-started",
+                "env_refs": [
+                  "QUEUE_HOST"
+                ]
+              },
+              "span": "flows/triage.yml:107:14..107:55"
+            },
+            "headers": [
+              {
+                "name": {
+                  "value": "authorization",
+                  "span": "flows/triage.yml:109:11..109:24"
+                },
+                "value": {
+                  "value": {
+                    "text": "Bearer ${QUEUE_TOKEN}",
+                    "env_refs": [
+                      "QUEUE_TOKEN"
+                    ]
+                  },
+                  "span": "flows/triage.yml:109:26..109:49"
+                }
+              }
+            ],
+            "body": {
+              "entries": [
+                {
+                  "name": {
+                    "value": "report",
+                    "span": "flows/triage.yml:111:11..111:17"
+                  },
+                  "value": {
+                    "value": "state.report_normalized",
+                    "span": "flows/triage.yml:111:19..111:44"
+                  }
+                }
+              ],
+              "span": "flows/triage.yml:111:11..112:9"
+            },
+            "output": {
+              "surface": "result",
+              "fields": [
+                {
+                  "name": {
+                    "value": "status",
+                    "span": "flows/triage.yml:113:11..113:17"
+                  },
+                  "type": {
+                    "span": "flows/triage.yml:113:19..113:36",
+                    "form": "scalar",
+                    "type": "integer"
+                  }
+                }
+              ],
+              "span": "flows/triage.yml:113:11..114:7"
+            },
+            "span": "flows/triage.yml:106:9..114:7"
+          }
+        },
+        {
+          "id": {
+            "value": "announce_failed",
+            "span": "flows/triage.yml:130:5..130:20"
+          },
+          "policy": {
+            "on_error": {
+              "strategy": "skip",
+              "span": "flows/triage.yml:134:17..134:21"
+            }
+          },
+          "span": "flows/triage.yml:131:7..147:5",
+          "kind": "exec",
+          "exec": {
+            "command": {
+              "value": {
+                "text": "${OPS_BIN}/log-event",
+                "env_refs": [
+                  "OPS_BIN"
+                ]
+              },
+              "span": "flows/triage.yml:132:18..132:40"
+            },
+            "args": [
+              {
+                "value": {
+                  "text": "--kind=announce-failed"
+                },
+                "span": "flows/triage.yml:133:16..133:40"
+              },
+              {
+                "value": {
+                  "text": "--env=${DEPLOY_ENV}",
+                  "env_refs": [
+                    "DEPLOY_ENV"
+                  ]
+                },
+                "span": "flows/triage.yml:133:42..133:63"
+              }
+            ],
+            "span": "flows/triage.yml:132:9..134:7"
+          }
+        },
+        {
+          "id": {
+            "value": "verify",
+            "span": "flows/triage.yml:147:5..147:11"
+          },
+          "input": {
+            "form": "fields",
+            "bindings": {
+              "entries": [
+                {
+                  "name": {
+                    "value": "patches",
+                    "span": "flows/triage.yml:159:9..159:16"
+                  },
+                  "value": {
+                    "value": "state.patches",
+                    "span": "flows/triage.yml:159:18..159:33"
+                  }
+                }
+              ],
+              "span": "flows/triage.yml:159:9..160:7"
+            }
+          },
+          "policy": {
+            "timeout": {
+              "value": "5m",
+              "span": "flows/triage.yml:160:16..160:18"
+            },
+            "on_error": {
+              "strategy": "skip",
+              "span": "flows/triage.yml:161:17..161:21"
+            }
+          },
+          "span": "flows/triage.yml:148:7..163:5",
+          "kind": "exec",
+          "exec": {
+            "command": {
+              "value": {
+                "text": "run-checks"
+              },
+              "span": "flows/triage.yml:149:18..149:28"
+            },
+            "args": [
+              {
+                "value": {
+                  "text": "--fast"
+                },
+                "span": "flows/triage.yml:150:16..150:24"
+              }
+            ],
+            "cwd": {
+              "value": {
+                "text": "${REPO_ROOT}",
+                "env_refs": [
+                  "REPO_ROOT"
+                ]
+              },
+              "span": "flows/triage.yml:151:14..151:28"
+            },
+            "env": [
+              {
+                "name": {
+                  "value": "CI",
+                  "span": "flows/triage.yml:153:11..153:13"
+                },
+                "value": {
+                  "value": {
+                    "text": "true"
+                  },
+                  "span": "flows/triage.yml:153:15..153:21"
+                }
+              }
+            ],
+            "expect_exit": [
+              0,
+              1
+            ],
+            "output": {
+              "surface": "result",
+              "fields": [
+                {
+                  "name": {
+                    "value": "exit_code",
+                    "span": "flows/triage.yml:156:11..156:20"
+                  },
+                  "type": {
+                    "span": "flows/triage.yml:156:22..156:39",
+                    "form": "scalar",
+                    "type": "integer"
+                  }
+                },
+                {
+                  "name": {
+                    "value": "stdout",
+                    "span": "flows/triage.yml:157:11..157:17"
+                  },
+                  "type": {
+                    "span": "flows/triage.yml:157:19..157:35",
+                    "form": "scalar",
+                    "type": "string"
+                  }
+                }
+              ],
+              "span": "flows/triage.yml:156:11..158:7"
+            },
+            "span": "flows/triage.yml:149:9..158:7"
+          }
+        },
+        {
+          "id": {
+            "value": "summarize",
+            "span": "flows/triage.yml:163:5..163:14"
+          },
+          "input": {
+            "form": "fields",
+            "bindings": {
+              "entries": [
+                {
+                  "name": {
+                    "value": "report",
+                    "span": "flows/triage.yml:166:9..166:15"
+                  },
+                  "value": {
+                    "value": "state.report_normalized",
+                    "span": "flows/triage.yml:166:17..166:42"
+                  }
+                },
+                {
+                  "name": {
+                    "value": "patches",
+                    "span": "flows/triage.yml:167:9..167:16"
+                  },
+                  "value": {
+                    "value": "state.patches",
+                    "span": "flows/triage.yml:167:18..167:33"
+                  }
+                }
+              ],
+              "span": "flows/triage.yml:166:9..172:5"
+            }
+          },
+          "span": "flows/triage.yml:164:7..172:5",
+          "kind": "agent",
+          "agent": {
+            "value": "agent.summarizer",
+            "span": "flows/triage.yml:164:14..164:30"
+          }
+        },
+        {
+          "id": {
+            "value": "remember",
+            "span": "flows/triage.yml:172:5..172:13"
+          },
+          "policy": {
+            "on_error": {
+              "strategy": "skip",
+              "span": "flows/triage.yml:179:17..179:21"
+            }
+          },
+          "span": "flows/triage.yml:173:7..183:5",
+          "kind": "store",
+          "store": {
+            "value": "store.triage_memory",
+            "span": "flows/triage.yml:173:14..173:33"
+          },
+          "op": "set",
+          "params": {
+            "key": {
+              "value": "execution.session_key",
+              "span": "flows/triage.yml:175:12..175:35"
+            },
+            "value": {
+              "form": "fields",
+              "bindings": {
+                "entries": [
+                  {
+                    "name": {
+                      "value": "last_report",
+                      "span": "flows/triage.yml:177:9..177:20"
+                    },
+                    "value": {
+                      "value": "input.report",
+                      "span": "flows/triage.yml:177:22..177:36"
+                    }
+                  },
+                  {
+                    "name": {
+                      "value": "patch_count",
+                      "span": "flows/triage.yml:178:9..178:20"
+                    },
+                    "value": {
+                      "value": "size(state.patches)",
+                      "span": "flows/triage.yml:178:22..178:43"
+                    }
+                  }
+                ],
+                "span": "flows/triage.yml:177:9..179:7"
+              }
+            }
+          }
+        },
+        {
+          "id": {
+            "value": "approve",
+            "span": "flows/triage.yml:183:5..183:12"
+          },
+          "input": {
+            "form": "fields",
+            "bindings": {
+              "entries": [
+                {
+                  "name": {
+                    "value": "summary",
+                    "span": "flows/triage.yml:194:9..194:16"
+                  },
+                  "value": {
+                    "value": "state.summary",
+                    "span": "flows/triage.yml:194:18..194:33"
+                  }
+                },
+                {
+                  "name": {
+                    "value": "patch_count",
+                    "span": "flows/triage.yml:195:9..195:20"
+                  },
+                  "value": {
+                    "value": "size(state.patches)",
+                    "span": "flows/triage.yml:195:22..195:43"
+                  }
+                }
+              ],
+              "span": "flows/triage.yml:194:9..196:7"
+            }
+          },
+          "writes": {
+            "entries": [
+              {
+                "field": {
+                  "value": "decision",
+                  "span": "flows/triage.yml:197:9..197:17"
+                },
+                "channel": {
+                  "value": "human_decision",
+                  "span": "flows/triage.yml:197:19..197:33"
+                }
+              }
+            ],
+            "span": "flows/triage.yml:197:9..201:5"
+          },
+          "span": "flows/triage.yml:184:7..201:5",
+          "kind": "human",
+          "human": {
+            "input": {
+              "surface": "input",
+              "fields": [
+                {
+                  "name": {
+                    "value": "summary",
+                    "span": "flows/triage.yml:186:11..186:18"
+                  },
+                  "type": {
+                    "span": "flows/triage.yml:186:20..186:36",
+                    "form": "scalar",
+                    "type": "string"
+                  }
+                },
+                {
+                  "name": {
+                    "value": "patch_count",
+                    "span": "flows/triage.yml:187:11..187:22"
+                  },
+                  "type": {
+                    "span": "flows/triage.yml:187:24..187:41",
+                    "form": "scalar",
+                    "type": "integer"
+                  }
+                }
+              ],
+              "span": "flows/triage.yml:186:11..188:9"
+            },
+            "output": {
+              "surface": "result",
+              "fields": [
+                {
+                  "name": {
+                    "value": "decision",
+                    "span": "flows/triage.yml:189:11..189:19"
+                  },
+                  "type": {
+                    "span": "flows/triage.yml:189:21..189:48",
+                    "form": "enum",
+                    "variants": [
+                      {
+                        "value": "approve",
+                        "span": "flows/triage.yml:189:30..189:37"
+                      },
+                      {
+                        "value": "reject",
+                        "span": "flows/triage.yml:189:39..189:45"
+                      }
+                    ]
+                  }
+                },
+                {
+                  "name": {
+                    "value": "note",
+                    "span": "flows/triage.yml:190:11..190:15"
+                  },
+                  "type": {
+                    "span": "flows/triage.yml:190:17..190:33",
+                    "form": "scalar",
+                    "type": "string"
+                  }
+                }
+              ],
+              "span": "flows/triage.yml:189:11..191:9"
+            },
+            "timeout": {
+              "value": "24h",
+              "span": "flows/triage.yml:191:18..191:21"
+            },
+            "on_timeout": {
+              "value": "escalate",
+              "span": "flows/triage.yml:192:21..192:29"
+            },
+            "span": "flows/triage.yml:185:9..193:7"
+          }
+        },
+        {
+          "id": {
+            "value": "escalate",
+            "span": "flows/triage.yml:201:5..201:13"
+          },
+          "policy": {
+            "retry": {
+              "max": 3,
+              "backoff": {
+                "value": "1s",
+                "span": "flows/triage.yml:212:33..212:35"
+              },
+              "span": "flows/triage.yml:212:14..212:37"
+            },
+            "timeout": {
+              "value": "10s",
+              "span": "flows/triage.yml:211:16..211:19"
+            }
+          },
+          "span": "flows/triage.yml:202:7..214:3",
+          "kind": "http",
+          "http": {
+            "method": {
+              "value": "POST",
+              "span": "flows/triage.yml:203:17..203:21"
+            },
+            "url": {
+              "value": {
+                "text": "https://${QUEUE_HOST}/v1/escalations",
+                "env_refs": [
+                  "QUEUE_HOST"
+                ]
+              },
+              "span": "flows/triage.yml:204:14..204:52"
+            },
+            "headers": [
+              {
+                "name": {
+                  "value": "authorization",
+                  "span": "flows/triage.yml:206:11..206:24"
+                },
+                "value": {
+                  "value": {
+                    "text": "Bearer ${QUEUE_TOKEN}",
+                    "env_refs": [
+                      "QUEUE_TOKEN"
+                    ]
+                  },
+                  "span": "flows/triage.yml:206:26..206:49"
+                }
+              }
+            ],
+            "body": {
+              "entries": [
+                {
+                  "name": {
+                    "value": "summary",
+                    "span": "flows/triage.yml:208:11..208:18"
+                  },
+                  "value": {
+                    "value": "state.summary",
+                    "span": "flows/triage.yml:208:20..208:35"
+                  }
+                }
+              ],
+              "span": "flows/triage.yml:208:11..209:9"
+            },
+            "output": {
+              "surface": "result",
+              "fields": [
+                {
+                  "name": {
+                    "value": "status",
+                    "span": "flows/triage.yml:210:11..210:17"
+                  },
+                  "type": {
+                    "span": "flows/triage.yml:210:19..210:36",
+                    "form": "scalar",
+                    "type": "integer"
+                  }
+                }
+              ],
+              "span": "flows/triage.yml:210:11..211:7"
+            },
+            "span": "flows/triage.yml:203:9..211:7"
+          }
+        }
+      ],
+      "edges": [
+        {
+          "from": {
+            "value": "start",
+            "span": "flows/triage.yml:215:15..215:20"
+          },
+          "to": {
+            "value": "enrich",
+            "span": "flows/triage.yml:215:26..215:32"
+          },
+          "span": "flows/triage.yml:215:7..215:34"
+        },
+        {
+          "from": {
+            "value": "enrich",
+            "span": "flows/triage.yml:216:15..216:21"
+          },
+          "to": {
+            "value": "scan",
+            "span": "flows/triage.yml:216:27..216:31"
+          },
+          "span": "flows/triage.yml:216:7..216:33"
+        },
+        {
+          "from": {
+            "value": "scan",
+            "span": "flows/triage.yml:217:15..217:19"
+          },
+          "to": {
+            "value": "classify",
+            "span": "flows/triage.yml:217:25..217:33"
+          },
+          "span": "flows/triage.yml:217:7..217:35"
+        },
+        {
+          "from": {
+            "value": "classify",
+            "span": "flows/triage.yml:220:15..220:23"
+          },
+          "to": {
+            "value": "dispatch",
+            "span": "flows/triage.yml:220:29..220:37"
+          },
+          "span": "flows/triage.yml:220:7..220:39"
+        },
+        {
+          "from": {
+            "value": "classify",
+            "span": "flows/triage.yml:221:15..221:23"
+          },
+          "to": {
+            "value": "announce",
+            "span": "flows/triage.yml:221:29..221:37"
+          },
+          "span": "flows/triage.yml:221:7..221:39"
+        },
+        {
+          "from": {
+            "value": "dispatch",
+            "span": "flows/triage.yml:230:15..230:23"
+          },
+          "to": {
+            "value": "verify",
+            "span": "flows/triage.yml:230:29..230:35"
+          },
+          "span": "flows/triage.yml:230:7..230:37"
+        },
+        {
+          "from": {
+            "value": "announce",
+            "span": "flows/triage.yml:231:15..231:23"
+          },
+          "to": {
+            "value": "verify",
+            "span": "flows/triage.yml:231:29..231:35"
+          },
+          "span": "flows/triage.yml:231:7..231:37"
+        },
+        {
+          "from": {
+            "value": "announce_failed",
+            "span": "flows/triage.yml:235:15..235:30"
+          },
+          "to": {
+            "value": "end",
+            "span": "flows/triage.yml:235:36..235:39"
+          },
+          "span": "flows/triage.yml:235:7..235:41"
+        },
+        {
+          "from": {
+            "value": "verify",
+            "span": "flows/triage.yml:236:15..236:21"
+          },
+          "to": {
+            "value": "summarize",
+            "span": "flows/triage.yml:236:27..236:36"
+          },
+          "span": "flows/triage.yml:236:7..236:38"
+        },
+        {
+          "from": {
+            "value": "summarize",
+            "span": "flows/triage.yml:237:15..237:24"
+          },
+          "to": {
+            "value": "remember",
+            "span": "flows/triage.yml:237:30..237:38"
+          },
+          "span": "flows/triage.yml:237:7..237:40"
+        },
+        {
+          "from": {
+            "value": "remember",
+            "span": "flows/triage.yml:238:15..238:23"
+          },
+          "to": {
+            "value": "approve",
+            "span": "flows/triage.yml:238:29..238:36"
+          },
+          "span": "flows/triage.yml:238:7..238:38"
+        },
+        {
+          "from": {
+            "value": "approve",
+            "span": "flows/triage.yml:239:15..239:22"
+          },
+          "to": {
+            "value": "end",
+            "span": "flows/triage.yml:239:28..239:31"
+          },
+          "when": {
+            "value": "approve.output.decision == 'approve'",
+            "span": "flows/triage.yml:239:39..239:78"
+          },
+          "span": "flows/triage.yml:239:7..239:79"
+        },
+        {
+          "from": {
+            "value": "approve",
+            "span": "flows/triage.yml:240:15..240:22"
+          },
+          "to": {
+            "value": "escalate",
+            "span": "flows/triage.yml:240:28..240:36"
+          },
+          "when": {
+            "value": "approve.output.decision == 'reject'",
+            "span": "flows/triage.yml:240:44..240:82"
+          },
+          "span": "flows/triage.yml:240:7..240:83"
+        },
+        {
+          "from": {
+            "value": "escalate",
+            "span": "flows/triage.yml:241:15..241:23"
+          },
+          "to": {
+            "value": "end",
+            "span": "flows/triage.yml:241:29..241:32"
+          },
+          "span": "flows/triage.yml:241:7..241:34"
+        }
+      ]
+    },
+    "model.fast": {
+      "address": {
+        "value": "model.fast",
+        "span": "models.yml:7:1..7:11"
+      },
+      "span": "models.yml:7:1..14:1",
+      "namespace": "model",
+      "form": "direct",
+      "provider": {
+        "value": "provider.anthropic",
+        "span": "models.yml:8:13..8:31"
+      },
+      "id": {
+        "value": "claude-haiku-4-5",
+        "span": "models.yml:9:7..9:23"
+      },
+      "settings": {
+        "max_tokens": {
+          "value": 2000,
+          "span": "models.yml:12:5..12:21"
+        },
+        "temperature": {
+          "value": 0.1,
+          "span": "models.yml:11:5..11:21"
+        }
+      }
+    },
+    "model.offline": {
+      "address": {
+        "value": "model.offline",
+        "span": "models.yml:14:1..14:14"
+      },
+      "span": "models.yml:14:1..19:1",
+      "namespace": "model",
+      "form": "direct",
+      "provider": {
+        "value": "provider.local",
+        "span": "models.yml:15:13..15:27"
+      },
+      "id": {
+        "value": "qwen3-coder-30b",
+        "span": "models.yml:16:7..16:22"
+      },
+      "settings": {
+        "temperature": {
+          "value": 0.2,
+          "span": "models.yml:18:5..18:21"
+        }
+      }
+    },
+    "model.smart": {
+      "address": {
+        "value": "model.smart",
+        "span": "models.yml:1:1..1:12"
+      },
+      "span": "models.yml:1:1..7:1",
+      "namespace": "model",
+      "form": "direct",
+      "provider": {
+        "value": "provider.anthropic",
+        "span": "models.yml:2:13..2:31"
+      },
+      "id": {
+        "value": "claude-sonnet-4-6",
+        "span": "models.yml:3:7..3:24"
+      },
+      "settings": {
+        "max_tokens": {
+          "value": 8000,
+          "span": "models.yml:5:5..5:21"
+        }
+      }
+    },
+    "provider.anthropic": {
+      "address": {
+        "value": "provider.anthropic",
+        "span": "providers.yml:1:1..1:19"
+      },
+      "span": "providers.yml:1:1..6:1",
+      "namespace": "provider",
+      "kind": "anthropic",
+      "api_key": {
+        "value": {
+          "env_ref": "ANTHROPIC_API_KEY"
+        },
+        "span": "providers.yml:3:12..3:32"
+      }
+    },
+    "provider.local": {
+      "address": {
+        "value": "provider.local",
+        "span": "providers.yml:6:1..6:15"
+      },
+      "span": "providers.yml:6:1..10:1",
+      "namespace": "provider",
+      "kind": "openai_compatible",
+      "api_key": {
+        "value": {
+          "env_ref": "LOCAL_LLM_KEY"
+        },
+        "span": "providers.yml:9:12..9:28"
+      },
+      "base_url": {
+        "value": {
+          "env_ref": "LOCAL_LLM_URL"
+        },
+        "span": "providers.yml:8:13..8:29"
+      }
+    },
+    "store.docs": {
+      "address": {
+        "value": "store.docs",
+        "span": "stores/docs.yml:12:1..12:11"
+      },
+      "span": "stores/docs.yml:12:1..25:1",
+      "namespace": "store",
+      "kind": "vector",
+      "scope": "global",
+      "metadata_schema": {
+        "surface": "result",
+        "fields": [
+          {
+            "name": {
+              "value": "source",
+              "span": "stores/docs.yml:21:5..21:11"
+            },
+            "type": {
+              "span": "stores/docs.yml:21:13..21:29",
+              "form": "scalar",
+              "type": "string"
+            }
+          },
+          {
+            "name": {
+              "value": "updated_at",
+              "span": "stores/docs.yml:22:5..22:15"
+            },
+            "type": {
+              "span": "stores/docs.yml:22:17..22:52",
+              "form": "scalar",
+              "type": "string",
+              "format": "date-time"
+            }
+          }
+        ],
+        "span": "stores/docs.yml:21:5..23:3"
+      },
+      "embed": {
+        "model": {
+          "value": "text-embedding-3-small",
+          "span": "stores/docs.yml:17:12..17:34"
+        },
+        "provider": {
+          "value": "provider.local",
+          "span": "stores/docs.yml:18:15..18:29"
+        },
+        "dimensions": 1536,
+        "span": "stores/docs.yml:17:5..20:3"
+      },
+      "backend": {
+        "value": "docs_db",
+        "span": "stores/docs.yml:23:12..23:19"
+      },
+      "description": {
+        "value": "Project documentation, chunked, for grounding triage decisions.",
+        "span": "stores/docs.yml:15:16..15:79"
+      },
+      "agent_access": "read"
+    },
+    "store.triage_memory": {
+      "address": {
+        "value": "store.triage_memory",
+        "span": "stores/triage_memory.yml:4:1..4:20"
+      },
+      "span": "stores/triage_memory.yml:4:1..16:1",
+      "namespace": "store",
+      "kind": "kv",
+      "scope": "session",
+      "value_schema": {
+        "surface": "result",
+        "fields": [
+          {
+            "name": {
+              "value": "last_report",
+              "span": "stores/triage_memory.yml:9:5..9:16"
+            },
+            "type": {
+              "description": {
+                "value": "The most recent report triaged in this session.",
+                "span": "stores/triage_memory.yml:10:20..10:67"
+              },
+              "span": "stores/triage_memory.yml:10:7..12:5",
+              "form": "scalar",
+              "type": "string"
+            }
+          },
+          {
+            "name": {
+              "value": "patch_count",
+              "span": "stores/triage_memory.yml:12:5..12:16"
+            },
+            "type": {
+              "description": {
+                "value": "How many patches the last run produced.",
+                "span": "stores/triage_memory.yml:13:20..13:59"
+              },
+              "span": "stores/triage_memory.yml:13:7..16:1",
+              "form": "scalar",
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
+        "span": "stores/triage_memory.yml:9:5..16:1"
+      },
+      "description": {
+        "value": "What this session has already triaged.",
+        "span": "stores/triage_memory.yml:7:16..7:54"
+      }
+    },
+    "tool.dead_letter": {
+      "address": {
+        "value": "tool.dead_letter",
+        "span": "tools/dead_letter.yml:10:1..10:17"
+      },
+      "span": "tools/dead_letter.yml:10:1..25:1",
+      "namespace": "tool",
+      "description": {
+        "value": "Record an unroutable finding for later inspection.",
+        "span": "tools/dead_letter.yml:11:16..11:66"
+      },
+      "input": {
+        "surface": "input",
+        "fields": [
+          {
+            "name": {
+              "value": "kind",
+              "span": "tools/dead_letter.yml:13:5..13:9"
+            },
+            "type": {
+              "span": "tools/dead_letter.yml:13:11..13:27",
+              "form": "scalar",
+              "type": "string"
+            }
+          },
+          {
+            "name": {
+              "value": "payload",
+              "span": "tools/dead_letter.yml:14:5..14:12"
+            },
+            "type": {
+              "span": "tools/dead_letter.yml:14:14..14:30",
+              "form": "scalar",
+              "type": "string"
+            }
+          }
+        ],
+        "span": "tools/dead_letter.yml:13:5..15:3"
+      },
+      "output": {
+        "surface": "result",
+        "fields": [
+          {
+            "name": {
+              "value": "accepted",
+              "span": "tools/dead_letter.yml:16:5..16:13"
+            },
+            "type": {
+              "span": "tools/dead_letter.yml:16:15..16:32",
+              "form": "scalar",
+              "type": "boolean"
+            }
+          }
+        ],
+        "span": "tools/dead_letter.yml:16:5..17:3"
+      },
+      "binding": "http",
+      "http": {
+        "method": {
+          "value": "POST",
+          "span": "tools/dead_letter.yml:18:13..18:17"
+        },
+        "url": {
+          "value": {
+            "text": "https://${QUEUE_HOST}/v1/dead-letter",
+            "env_refs": [
+              "QUEUE_HOST"
+            ]
+          },
+          "span": "tools/dead_letter.yml:19:10..19:48"
+        },
+        "headers": [
+          {
+            "name": {
+              "value": "authorization",
+              "span": "tools/dead_letter.yml:21:7..21:20"
+            },
+            "value": {
+              "value": {
+                "text": "Bearer ${QUEUE_TOKEN}",
+                "env_refs": [
+                  "QUEUE_TOKEN"
+                ]
+              },
+              "span": "tools/dead_letter.yml:21:22..21:45"
+            }
+          }
+        ],
+        "body": {
+          "entries": [
+            {
+              "name": {
+                "value": "kind",
+                "span": "tools/dead_letter.yml:23:7..23:11"
+              },
+              "value": {
+                "value": "input.kind",
+                "span": "tools/dead_letter.yml:23:13..23:25"
+              }
+            },
+            {
+              "name": {
+                "value": "payload",
+                "span": "tools/dead_letter.yml:24:7..24:14"
+              },
+              "value": {
+                "value": "input.payload",
+                "span": "tools/dead_letter.yml:24:16..24:31"
+              }
+            }
+          ],
+          "span": "tools/dead_letter.yml:23:7..25:1"
+        },
+        "span": "tools/dead_letter.yml:18:5..25:1"
+      }
+    },
+    "tool.repo_grep": {
+      "address": {
+        "value": "tool.repo_grep",
+        "span": "tools/repo_grep.yml:5:1..5:15"
+      },
+      "span": "tools/repo_grep.yml:5:1..29:1",
+      "namespace": "tool",
+      "description": {
+        "value": "Search the repository for a pattern and return matching lines.",
+        "span": "tools/repo_grep.yml:6:16..6:78"
+      },
+      "input": {
+        "surface": "input",
+        "fields": [
+          {
+            "name": {
+              "value": "pattern",
+              "span": "tools/repo_grep.yml:8:5..8:12"
+            },
+            "type": {
+              "description": {
+                "value": "An RE2 regular expression.",
+                "span": "tools/repo_grep.yml:9:20..9:46"
+              },
+              "span": "tools/repo_grep.yml:9:7..12:5",
+              "form": "scalar",
+              "type": "string",
+              "min_length": 1
+            }
+          },
+          {
+            "name": {
+              "value": "max_matches",
+              "span": "tools/repo_grep.yml:12:5..12:16"
+            },
+            "type": {
+              "span": "tools/repo_grep.yml:13:7..17:3",
+              "form": "scalar",
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": {
+                "value": 50,
+                "span": "tools/repo_grep.yml:16:16..16:18"
+              }
+            }
+          }
+        ],
+        "span": "tools/repo_grep.yml:8:5..17:3"
+      },
+      "output": {
+        "surface": "result",
+        "fields": [
+          {
+            "name": {
+              "value": "matches",
+              "span": "tools/repo_grep.yml:18:5..18:12"
+            },
+            "type": {
+              "description": {
+                "value": "Matching lines, formatted as path:line:text.",
+                "span": "tools/repo_grep.yml:19:20..19:64"
+              },
+              "span": "tools/repo_grep.yml:19:7..23:3",
+              "form": "array",
+              "items": {
+                "span": "tools/repo_grep.yml:22:14..22:30",
+                "form": "scalar",
+                "type": "string"
+              },
+              "max_items": 200
+            }
+          }
+        ],
+        "span": "tools/repo_grep.yml:18:5..23:3"
+      },
+      "binding": "exec",
+      "exec": {
+        "command": {
+          "value": {
+            "text": "repo-grep"
+          },
+          "span": "tools/repo_grep.yml:24:14..24:23"
+        },
+        "args": [
+          {
+            "value": {
+              "text": "--format"
+            },
+            "span": "tools/repo_grep.yml:25:12..25:22"
+          },
+          {
+            "value": {
+              "text": "json"
+            },
+            "span": "tools/repo_grep.yml:25:24..25:30"
+          }
+        ],
+        "cwd": {
+          "value": {
+            "text": "${REPO_ROOT}",
+            "env_refs": [
+              "REPO_ROOT"
+            ]
+          },
+          "span": "tools/repo_grep.yml:26:10..26:24"
+        },
+        "env": [
+          {
+            "name": {
+              "value": "RIPGREP_CONFIG_PATH",
+              "span": "tools/repo_grep.yml:28:7..28:26"
+            },
+            "value": {
+              "value": {
+                "text": "${RG_CONFIG_PATH}",
+                "env_refs": [
+                  "RG_CONFIG_PATH"
+                ]
+              },
+              "span": "tools/repo_grep.yml:28:28..28:47"
+            }
+          }
+        ],
+        "span": "tools/repo_grep.yml:24:5..29:1"
+      }
+    },
+    "tool.review_queue": {
+      "address": {
+        "value": "tool.review_queue",
+        "span": "tools/review_queue.yml:4:1..4:18"
+      },
+      "span": "tools/review_queue.yml:4:1..27:1",
+      "namespace": "tool",
+      "description": {
+        "value": "Enqueue a finding for manual review and return the ticket id.",
+        "span": "tools/review_queue.yml:5:16..5:77"
+      },
+      "input": {
+        "surface": "input",
+        "fields": [
+          {
+            "name": {
+              "value": "summary",
+              "span": "tools/review_queue.yml:7:5..7:12"
+            },
+            "type": {
+              "span": "tools/review_queue.yml:7:14..7:30",
+              "form": "scalar",
+              "type": "string"
+            }
+          },
+          {
+            "name": {
+              "value": "severity",
+              "span": "tools/review_queue.yml:8:5..8:13"
+            },
+            "type": {
+              "span": "tools/review_queue.yml:8:15..8:46",
+              "form": "enum",
+              "variants": [
+                {
+                  "value": "low",
+                  "span": "tools/review_queue.yml:8:24..8:27"
+                },
+                {
+                  "value": "high",
+                  "span": "tools/review_queue.yml:8:29..8:33"
+                },
+                {
+                  "value": "critical",
+                  "span": "tools/review_queue.yml:8:35..8:43"
+                }
+              ]
+            }
+          }
+        ],
+        "span": "tools/review_queue.yml:7:5..15:3"
+      },
+      "output": {
+        "surface": "result",
+        "fields": [
+          {
+            "name": {
+              "value": "ticket_id",
+              "span": "tools/review_queue.yml:16:5..16:14"
+            },
+            "type": {
+              "span": "tools/review_queue.yml:16:16..16:32",
+              "form": "scalar",
+              "type": "string"
+            }
+          },
+          {
+            "name": {
+              "value": "queued",
+              "span": "tools/review_queue.yml:17:5..17:11"
+            },
+            "type": {
+              "span": "tools/review_queue.yml:17:13..17:30",
+              "form": "scalar",
+              "type": "boolean"
+            }
+          }
+        ],
+        "span": "tools/review_queue.yml:16:5..18:3"
+      },
+      "binding": "http",
+      "http": {
+        "method": {
+          "value": "POST",
+          "span": "tools/review_queue.yml:19:13..19:17"
+        },
+        "url": {
+          "value": {
+            "text": "https://${QUEUE_HOST}/v1/tickets",
+            "env_refs": [
+              "QUEUE_HOST"
+            ]
+          },
+          "span": "tools/review_queue.yml:20:10..20:44"
+        },
+        "headers": [
+          {
+            "name": {
+              "value": "authorization",
+              "span": "tools/review_queue.yml:22:7..22:20"
+            },
+            "value": {
+              "value": {
+                "text": "Bearer ${QUEUE_TOKEN}",
+                "env_refs": [
+                  "QUEUE_TOKEN"
+                ]
+              },
+              "span": "tools/review_queue.yml:22:22..22:45"
+            }
+          }
+        ],
+        "body": {
+          "entries": [
+            {
+              "name": {
+                "value": "summary",
+                "span": "tools/review_queue.yml:24:7..24:14"
+              },
+              "value": {
+                "value": "input.summary",
+                "span": "tools/review_queue.yml:24:16..24:31"
+              }
+            },
+            {
+              "name": {
+                "value": "severity",
+                "span": "tools/review_queue.yml:25:7..25:15"
+              },
+              "value": {
+                "value": "input.severity",
+                "span": "tools/review_queue.yml:25:17..25:33"
+              }
+            }
+          ],
+          "span": "tools/review_queue.yml:24:7..26:5"
+        },
+        "expect_status": [
+          201
+        ],
+        "span": "tools/review_queue.yml:19:5..27:1"
+      }
+    }
+  },
+  "deploy": {
+    "target": "local",
+    "source": "deploy/local.yml",
+    "placements": {
+      "agent.fixer": {
+        "address": {
+          "value": "agent.fixer",
+          "span": "deploy/local.yml:20:3..20:14"
+        },
+        "runtime": "colocated",
+        "description": {
+          "value": "Isolated under staging; in-process locally, where there is one process.",
+          "span": "deploy/local.yml:22:18..22:89"
+        },
+        "span": "deploy/local.yml:20:3..23:3"
+      },
+      "flow.triage": {
+        "address": {
+          "value": "flow.triage",
+          "span": "deploy/local.yml:23:3..23:14"
+        },
+        "runtime": "colocated",
+        "span": "deploy/local.yml:23:3..25:1"
+      }
+    }
+  }
+}

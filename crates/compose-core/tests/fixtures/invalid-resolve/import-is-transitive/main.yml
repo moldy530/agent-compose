@@ -1,0 +1,9 @@
+# rule: an imported file may not declare `imports:` (Decision D1)
+# code: misplaced-section
+# message: `middle.yml` is imported and may not declare `imports:`
+# at: middle.yml:3:3
+# label: main.yml:9:5 imported here
+# help: imports are not transitive: the entrypoint's list is the whole answer to what is in this graph, which is what keeps it greppable (grammar 1.4, Decision D1)
+version: "0.1"
+imports:
+  - middle.yml

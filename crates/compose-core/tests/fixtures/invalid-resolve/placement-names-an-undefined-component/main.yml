@@ -1,0 +1,13 @@
+# rule: a `placements:` key resolves in the composition (grammar 14.1)
+# code: undefined-reference
+# message: `flow.g` is not defined in this composition
+# at: deploy/local.yml:3:3
+# help: did you mean `flow.f`?
+version: "0.1"
+flow.f:
+  outputs: {}
+  nodes:
+    run: { exec: { command: "true" } }
+  edges:
+    - { from: start, to: run }
+    - { from: run, to: end }

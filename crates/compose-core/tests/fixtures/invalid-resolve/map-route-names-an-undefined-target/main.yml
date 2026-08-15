@@ -1,0 +1,21 @@
+# rule: a `map` route's `node:` resolves to a component (grammar 2.3, 8.6)
+# code: undefined-reference
+# message: `agent.worker` is not defined in this composition
+# at: main.yml:17:24
+# help: the composition defines `flow.f`; a definition is part of it only when the entrypoint imports the file that declares it (grammar 1.4)
+version: "0.1"
+flow.f:
+  outputs: {}
+  nodes:
+    plan: { exec: { command: "true" } }
+    work:
+      map:
+        over: plan.output.stdout
+        max_concurrency: 2
+        route_by: kind
+        routes:
+          one: { node: agent.worker }
+  edges:
+    - { from: start, to: plan }
+    - { from: plan, to: work }
+    - { from: work, to: end }
