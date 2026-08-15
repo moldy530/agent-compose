@@ -453,6 +453,39 @@ fn a_single_file_project_resolves() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// Grammar 1.4 bars `deploy/*.yml` from `imports:` — one path segment under
+/// `deploy/`, which is exactly the set `--target` selects from (grammar 14). A
+/// file one level deeper is not one of them, so it imports like any other spec
+/// file: refusing it would reject a composition for a rule it does not break,
+/// and call the file something it is not while doing so.
+///
+/// The companion is the `import-names-a-deploy-file` fixture, which pins that
+/// `deploy/staging.yml` — a real target file — is still refused.
+#[test]
+fn a_file_below_deploy_is_an_ordinary_import() {
+    let dir = scratch("deploy-subdirectory");
+    write(
+        &dir,
+        "main.yml",
+        "version: \"0.1\"\nimports:\n  - deploy/shared/providers.yml\n",
+    );
+    write(
+        &dir,
+        "deploy/shared/providers.yml",
+        "provider.p:\n  kind: anthropic\n  api_key: ${KEY}\n",
+    );
+    let resolution = resolve(dir.join("main.yml"));
+    let ir = resolution.ir.as_ref().unwrap_or_else(|| {
+        panic!(
+            "a spec file below `deploy/` is not `deploy/<target>.yml`:\n{}",
+            render(&resolution)
+        )
+    });
+    assert_eq!(ir.sources.len(), 2);
+    assert!(ir.definition("provider.p").is_some());
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// A scratch directory of this test's own, cleaned out before use.
 ///
 /// Named by the process as well as by the test, because it is *emptied* before

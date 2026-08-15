@@ -240,9 +240,17 @@ fn imports(
             );
             continue;
         }
+        // `deploy/<target>.yml` and nothing deeper. Grammar 1.4 bars
+        // `deploy/*.yml` — one segment under `deploy/`, which is exactly the set
+        // `--target` selects from (grammar 14). A file at `deploy/sub/extra.yml`
+        // is not one of them, so calling it a deploy file would refuse a
+        // composition for a rule it does not break, and assert something untrue
+        // about the file while doing it. If it turns out to carry a deploy
+        // section, it is caught below on the evidence, where the diagnostic can
+        // point at the section rather than at the path.
         if normalized
             .strip_prefix("deploy/")
-            .is_some_and(|rest| !rest.is_empty())
+            .is_some_and(|rest| !rest.is_empty() && !rest.contains('/'))
         {
             composition.complete = false;
             diagnostics.push(
