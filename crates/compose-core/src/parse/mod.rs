@@ -14,12 +14,14 @@
 //!
 //! The published schema is meant to be the looser, editor-facing approximation
 //! of this pass, and `tests/parse_invalid.rs` replays its negative corpus here
-//! to keep the two from drifting. They differ in one place today, and it is the
-//! schema that is stricter: it constrains the *character set* of an `imports:`
-//! entry with a pattern grammar 1.4 does not state. The parser follows the
-//! grammar — it rejects what 1.4 names a parse error (absolute paths, URLs,
-//! globs, anything not ending `.yml`/`.yaml`) plus a path repeated verbatim,
-//! and accepts a relative path with a space in it.
+//! to keep the two from drifting. The direction of the relationship is fixed by
+//! Appendix B and it is one-directional: a file the schema rejects must fail
+//! `validate`, never the reverse. This pass may therefore be stricter, and may
+//! not be looser — nowhere, on no rule. The one place they used to part is
+//! closed: the `imports:` pattern the schema publishes is grammar 1.4's own
+//! segment charset (Decision D80) rather than a constraint of its own, and
+//! `section.rs` enforces exactly that charset, so a relative path carrying a
+//! space is refused by both.
 //!
 //! What it deliberately leaves alone:
 //!
