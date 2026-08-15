@@ -1,0 +1,15 @@
+# rule: `default:` on an array type node is a state-channel key, illegal at an input surface (grammar 3.3, 3.6, 10.1)
+# code: invalid-value
+# message: `default` applies to scalar and enum type nodes, but the schema of `tags` declares `type: array`
+# at: 15:16
+# help: on an object or an array, `default` is a state-channel key — the channel's initial value; a defaulted field here would have to be defaulted property by property (grammar 3.3, 10.1)
+agent.reviewer:
+  model: model.smart
+  prompt: Review the draft.
+  output:
+    verdict: { enum: [approve, revise] }
+  input:
+    tags:
+      type: array
+      items: { type: string }
+      default: [urgent]

@@ -7,7 +7,7 @@ use crate::ast::definition::{
     ToolImplementation,
 };
 use crate::ast::schema::{FieldMap, Surface};
-use crate::diag::{Diagnostic, DiagnosticCode, Spanned};
+use crate::diag::{Diagnostic, DiagnosticCode, Span, Spanned};
 use crate::yaml::Node;
 
 use super::binding;
@@ -92,8 +92,9 @@ fn agent(fields: &mut Fields<'_>, subject: &str, cx: &mut Cx) -> crate::ast::def
         &[Namespace::Tool, Namespace::Flow],
         subject,
         cx,
-    );
-    let stores = reference_list(fields, "stores", &[Namespace::Store], subject, cx);
+    )
+    .values;
+    let stores = reference_list(fields, "stores", &[Namespace::Store], subject, cx).values;
     let description = description(fields, cx);
     let max_tool_iterations = fields
         .integer("max_tool_iterations", cx)
@@ -434,18 +435,30 @@ const ROUTE_CONDITIONS: &[(&str, RouteCondition)] = &[
 fn model(fields: &mut Fields<'_>, subject: &str, cx: &mut Cx) -> ModelDef {
     if fields.contains("route") {
         let route = reference_list(fields, "route", &[Namespace::Model], subject, cx);
-        if route.len() == 1 {
+        // A route is an ordered fallback of at least two models (grammar 12.2):
+        // one member has nothing to fail over to, and none is not a binding at
+        // all.
+        if let Some(declared) = route.declared
+            && declared < 2
+        {
+            let span = route.span.clone().unwrap_or_else(|| fields.span.clone());
             cx.push(
                 Diagnostic::error(
                     DiagnosticCode::InvalidValue,
-                    route[0].span.clone(),
-                    format!("`route` of {subject} declares 1 member; a route needs at least 2"),
+                    span,
+                    format!(
+                        "`route` of {subject} declares {declared} member{}; a route needs at least 2",
+                        if declared == 1 { "" } else { "s" }
+                    ),
                 )
-                .with_help(
-                    "a one-member route is a direct model: write `provider:` and `id:` instead",
-                ),
+                .with_help(if declared == 1 {
+                    "a one-member route is a direct model: write `provider:` and `id:` instead"
+                } else {
+                    "list the models to fail over to, in order, or write `provider:` and `id:` for a direct model"
+                }),
             );
         }
+        let route = route.values;
         let route_on = fields.take("route_on").map(|node| {
             let mut conditions: Vec<Spanned<RouteCondition>> = Vec::new();
             if let Some(items) = expect_sequence(node, "`route_on`", cx) {
@@ -546,6 +559,23 @@ pub(crate) fn description(fields: &mut Fields<'_>, cx: &mut Cx) -> Option<Spanne
         .and_then(|node| lexical::text(node, "`description`", cx))
 }
 
+/// A `<key>:` list of typed addresses, as read.
+struct ReferenceList {
+    /// The distinct references, in declaration order.
+    values: Vec<Spanned<Address>>,
+    /// How many entries the author wrote, duplicates and unreadable entries
+    /// included. An arity rule is about the source text, so it counts these
+    /// rather than [`Self::values`]: `route: [model.a, model.a]` declares two
+    /// members and one of them is a duplicate, not a route with one member.
+    ///
+    /// `None` when the key was absent or held something that is not a sequence
+    /// at all — there is no count to reason about, and the shape has already
+    /// been reported.
+    declared: Option<usize>,
+    /// The sequence's own span, absent when the key was not declared at all.
+    span: Option<Span>,
+}
+
 /// Read a sequence of typed addresses, rejecting duplicates (grammar 5.4).
 fn reference_list(
     fields: &mut Fields<'_>,
@@ -553,21 +583,28 @@ fn reference_list(
     allowed: &[Namespace],
     subject: &str,
     cx: &mut Cx,
-) -> Vec<Spanned<Address>> {
-    let mut references: Vec<Spanned<Address>> = Vec::new();
+) -> ReferenceList {
+    let mut list = ReferenceList {
+        values: Vec::new(),
+        declared: None,
+        span: None,
+    };
     let Some(node) = fields.take(key) else {
-        return references;
+        return list;
     };
+    list.span = Some(node.span.clone());
     let Some(items) = expect_sequence(node, &format!("`{key}` in {subject}"), cx) else {
-        return references;
+        return list;
     };
+    list.declared = Some(items.len());
     for item in items {
         let Some(reference) =
             lexical::reference(item, &format!("each entry of `{key}`"), allowed, cx)
         else {
             continue;
         };
-        if let Some(first) = references
+        if let Some(first) = list
+            .values
             .iter()
             .find(|other| other.value == reference.value)
         {
@@ -581,9 +618,9 @@ fn reference_list(
             );
             continue;
         }
-        references.push(reference);
+        list.values.push(reference);
     }
-    references
+    list
 }
 
 /// Suggest a definition namespace for a top-level key that looks like one.

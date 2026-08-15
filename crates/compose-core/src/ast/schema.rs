@@ -26,10 +26,22 @@ pub enum Surface {
 }
 
 impl Surface {
-    /// Whether `default:` may appear at this surface.
+    /// Whether a **scalar or enum** type node may carry `default:` here
+    /// (grammar 3.3's constraint table, 3.6).
     #[must_use]
     pub const fn allows_default(self) -> bool {
         !matches!(self, Self::Result)
+    }
+
+    /// Whether an **object or array** type node may carry `default:` here.
+    ///
+    /// Only a state channel. Grammar 3.3 admits `default` on scalars and enums
+    /// alone, and 3.6 legalises it at input surfaces for exactly those forms; a
+    /// channel's `default` is a different key — the channel-only initial value
+    /// of grammar 10.1, which any form may take.
+    #[must_use]
+    pub const fn allows_composite_default(self) -> bool {
+        matches!(self, Self::Channel)
     }
 
     /// Whether arrays must declare `max_items` at this surface.

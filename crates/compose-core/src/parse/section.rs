@@ -19,7 +19,7 @@ use super::schema;
 /// Read the `imports:` section (grammar 1.4).
 pub(crate) fn imports(node: &Node, cx: &mut Cx) -> Option<ImportsSection> {
     let items = expect_sequence(node, "`imports`", cx)?;
-    let mut paths = Vec::new();
+    let mut paths: Vec<Spanned<ImportPath>> = Vec::new();
     for item in items {
         let Some(text) = expect_string(item, "each entry of `imports`", cx) else {
             continue;
@@ -34,6 +34,26 @@ pub(crate) fn imports(node: &Node, cx: &mut Cx) -> Option<ImportsSection> {
                 .with_help(
                     "imports are relative paths to `.yml`/`.yaml` spec files, resolved against the entrypoint's directory: there is no directory scanning",
                 ),
+            );
+            continue;
+        }
+        // Grammar 1.4 requires entries to be unique after normalization.
+        // Normalizing (`./a.yml` against `a.yml`, `..` segments) needs the
+        // project root, so the resolver owns that; a path repeated verbatim is
+        // decidable here, and it is the copy-paste slip a long import list
+        // invites.
+        if let Some(first) = paths
+            .iter()
+            .find(|other| other.value.as_str() == text.value)
+        {
+            cx.push(
+                Diagnostic::error(
+                    DiagnosticCode::InvalidImportPath,
+                    text.span.clone(),
+                    format!("`{}` is imported twice", text.value),
+                )
+                .with_label(first.span.clone(), "first imported here")
+                .with_help("import order does not affect semantics, so the second entry adds nothing: drop it"),
             );
             continue;
         }

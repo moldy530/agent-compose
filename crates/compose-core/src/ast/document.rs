@@ -148,10 +148,10 @@ pub struct ImportsSection {
 /// One `imports:` entry: a relative path to a spec file.
 ///
 /// The parser decides the lexical rules grammar 1.4 calls parse errors — no
-/// absolute paths, URLs, or globs, and a `.yml`/`.yaml` extension. Whether the
-/// path resolves inside the project root, is unique after normalization, or
-/// names the entrypoint itself needs the composition, so the resolver decides
-/// those.
+/// absolute paths, URLs, or globs, and a `.yml`/`.yaml` extension — and rejects
+/// a path repeated verbatim. Whether the path resolves inside the project root,
+/// collides with another *after normalization*, or names the entrypoint itself
+/// needs the composition, so the resolver decides those.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ImportPath(String);
 

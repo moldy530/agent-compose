@@ -388,7 +388,7 @@ fn scalar_form(
         }
     }
 
-    scalar.default = default_value(fields, subject, surface, cx)
+    scalar.default = default_value(fields, subject, surface, DefaultForm::Simple, cx)
         .inspect(|value| check_default_kind(value, kind, subject, cx));
 
     TypeForm::Scalar(scalar)
@@ -507,7 +507,14 @@ fn object_form(
         }
     }
 
-    let default = default_value(fields, subject, surface, cx).inspect(|value| {
+    let default = default_value(
+        fields,
+        subject,
+        surface,
+        DefaultForm::Composite("object"),
+        cx,
+    )
+    .inspect(|value| {
         if !matches!(value.value, Literal::Mapping(_)) {
             cx.error(
                 DiagnosticCode::InvalidValue,
@@ -584,7 +591,14 @@ fn array_form(
     }
 
     let unique_items = fields.boolean("unique_items", cx);
-    let default = default_value(fields, subject, surface, cx).inspect(|value| {
+    let default = default_value(
+        fields,
+        subject,
+        surface,
+        DefaultForm::Composite("array"),
+        cx,
+    )
+    .inspect(|value| {
         if !matches!(value.value, Literal::Sequence(_)) {
             cx.error(
                 DiagnosticCode::InvalidValue,
@@ -645,33 +659,41 @@ fn enum_form(fields: &mut Fields<'_>, subject: &str, surface: Surface, cx: &mut 
         }
     }
 
-    let default = default_value(fields, subject, surface, cx).inspect(|value| match &value.value {
-        Literal::String(text) => {
-            if !variants.is_empty() && !variants.iter().any(|variant| &variant.value == text) {
-                cx.push(
-                    Diagnostic::error(
-                        DiagnosticCode::InvalidValue,
-                        value.span.clone(),
-                        format!("`default` is `{text}`, which is not one of the declared variants"),
-                    )
-                    .with_help(format!(
-                        "the variants are {}",
-                        list(variants.iter().map(|variant| variant.value.as_str()))
-                    )),
-                );
-            }
-        }
-        other => cx.error(
+    let default = default_value(fields, subject, surface, DefaultForm::Simple, cx)
+        .inspect(|value| check_enum_default(value, &variants, cx));
+
+    TypeForm::Enum(EnumType { variants, default })
+}
+
+/// An enum's `default:` names one of its declared variants (grammar 3.3).
+fn check_enum_default(value: &Spanned<Literal>, variants: &[Spanned<String>], cx: &mut Cx) {
+    let Literal::String(text) = &value.value else {
+        cx.error(
             DiagnosticCode::InvalidValue,
             &value.span,
             format!(
                 "`default` for an enum must be one of its string variants, found {}",
-                other.description()
+                value.value.description()
             ),
-        ),
-    });
-
-    TypeForm::Enum(EnumType { variants, default })
+        );
+        return;
+    };
+    // An empty variant list has already been reported; measuring the default
+    // against it would say the same thing twice.
+    if variants.is_empty() || variants.iter().any(|variant| &variant.value == text) {
+        return;
+    }
+    cx.push(
+        Diagnostic::error(
+            DiagnosticCode::InvalidValue,
+            value.span.clone(),
+            format!("`default` is `{text}`, which is not one of the declared variants"),
+        )
+        .with_help(format!(
+            "the variants are {}",
+            list(variants.iter().map(|variant| variant.value.as_str()))
+        )),
+    );
 }
 
 fn union_form(
@@ -750,11 +772,26 @@ fn union_form(
     }
 }
 
-/// Read a `default:`, rejecting it where the surface forbids one (grammar 3.6).
+/// Which form is asking for a `default:`. The two are legal in different
+/// places, so the form decides the rule alongside the surface.
+#[derive(Clone, Copy)]
+enum DefaultForm {
+    /// A scalar or an enum: legal at input surfaces and on state channels
+    /// (grammar 3.3, 3.6).
+    Simple,
+    /// An object or an array, named by its `type:` keyword: legal only on a
+    /// state channel, where `default` is the channel's initial value rather
+    /// than a schema constraint (grammar 10.1).
+    Composite(&'static str),
+}
+
+/// Read a `default:`, rejecting it where the surface or the form forbids one
+/// (grammar 3.3, 3.6, 10.1).
 fn default_value(
     fields: &mut Fields<'_>,
     subject: &str,
     surface: Surface,
+    form: DefaultForm,
     cx: &mut Cx,
 ) -> Option<Spanned<Literal>> {
     let node = fields.take("default")?;
@@ -767,6 +804,23 @@ fn default_value(
             )
             .with_help(
                 "a defaulted model output would silently manufacture routing values (grammar 3.6)",
+            ),
+        );
+        return None;
+    }
+    if let DefaultForm::Composite(keyword) = form
+        && !surface.allows_composite_default()
+    {
+        cx.push(
+            Diagnostic::error(
+                DiagnosticCode::InvalidValue,
+                node.span.clone(),
+                format!(
+                    "`default` applies to scalar and enum type nodes, but {subject} declares `type: {keyword}`"
+                ),
+            )
+            .with_help(
+                "on an object or an array, `default` is a state-channel key — the channel's initial value; a defaulted field here would have to be defaulted property by property (grammar 3.3, 10.1)",
             ),
         );
         return None;

@@ -1,0 +1,7 @@
+# rule: a model route is an ordered fallback of at least two models (grammar 12.2)
+# code: invalid-value
+# message: `route` of model definition `model.default` declares 0 members; a route needs at least 2
+# at: 7:10
+# help: list the models to fail over to, in order, or write `provider:` and `id:` for a direct model
+model.default:
+  route: []

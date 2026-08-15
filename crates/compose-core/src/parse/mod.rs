@@ -4,12 +4,22 @@
 //!
 //! Everything the parser reports is decidable from a **single file**. That is
 //! the same line `docs/grammar.md` Appendix B draws for the published JSON
-//! Schema, and the parser is at least as strict as the schema everywhere: the
+//! Schema, and the parser decides every per-file rule the grammar states: the
 //! YAML profile (grammar 1.1), section placement (1.5), every construct's key
 //! table, the closed vocabularies, the lexical forms of grammar 2 and 4, and
 //! the structural rules whose deciding value is a literal in the same object —
 //! a node's kind key, a trigger's `type:`, a store op's parameter row, the
-//! direct-XOR-route split on models.
+//! direct-XOR-route split on models, the `node:` XOR `route_by:`+`routes:`
+//! split on maps.
+//!
+//! The published schema is meant to be the looser, editor-facing approximation
+//! of this pass, and `tests/parse_invalid.rs` replays its negative corpus here
+//! to keep the two from drifting. They differ in one place today, and it is the
+//! schema that is stricter: it constrains the *character set* of an `imports:`
+//! entry with a pattern grammar 1.4 does not state. The parser follows the
+//! grammar — it rejects what 1.4 names a parse error (absolute paths, URLs,
+//! globs, anything not ending `.yml`/`.yaml`) plus a path repeated verbatim,
+//! and accepts a relative path with a space in it.
 //!
 //! What it deliberately leaves alone:
 //!

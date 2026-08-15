@@ -15,7 +15,7 @@ use super::binding::{self, NameForm};
 use super::definition::description;
 use super::lexical;
 use super::policy;
-use super::reader::{Cx, Fields, expect_mapping, expect_sequence, in_range, list};
+use super::reader::{Cx, Fields, expect_mapping, expect_sequence, expect_string, in_range, list};
 use super::schema;
 
 /// Read a `flow.*` definition (grammar 7).
@@ -810,19 +810,17 @@ fn dispatch(
         return MapDispatch::Invalid;
     }
 
+    // The routed form takes both keys: `routes:` alone has no discriminator to
+    // switch on, and `route_by:` alone has nothing to switch to (grammar 8.6
+    // rule 2). Whichever one is missing is reported as missing, rather than the
+    // pair being silently accepted and the routes dropped.
     let route_by = fields
-        .string("route_by", cx)
+        .require("route_by", cx)
+        .and_then(|node| expect_string(node, "`route_by`", cx))
         .and_then(|text| lexical::identifier(&text, "`route_by`", cx));
-    if !fields.contains("routes") {
-        cx.error(
-            DiagnosticCode::MissingKey,
-            &fields.span.clone(),
-            format!("missing required key `routes` in {context}"),
-        );
-    }
 
     let mut routes = Vec::new();
-    if let Some(node) = fields.take("routes")
+    if let Some(node) = fields.require("routes", cx)
         && let Some(mapping) = expect_mapping(node, "`routes`", cx)
     {
         if mapping.is_empty() {
