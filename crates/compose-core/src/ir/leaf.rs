@@ -50,6 +50,13 @@
 //! { "env_ref": "ANTHROPIC_API_KEY" }
 //! { "text": "https://${SEARCH_HOST}/v1/search", "env_refs": ["SEARCH_HOST"] }
 //! ```
+//!
+//! `text` is the string **exactly as written**, escapes included: `$${` is the
+//! escape for a literal `${`, and it survives into `text` unexpanded. So
+//! `"https://example.test/$${NOT_A_REF}"` is written with its `$${` intact and
+//! *no* `env_refs` key at all. `env_refs` — not a scan of `text` — is the
+//! authoritative list of what a consumer substitutes: it holds every name the
+//! string really carries, and is omitted when the string carries none.
 
 use serde::ser::{SerializeMap, SerializeStruct};
 use serde::{Serialize, Serializer};
@@ -224,8 +231,10 @@ impl Serialize for EnvRef {
 }
 
 /// An interpolable string, kept unsubstituted, with the names it embeds:
-/// `{"text": …, "env_refs": [NAME, …]}`. The list is omitted when the string
-/// carries none.
+/// `{"text": …, "env_refs": [NAME, …]}`. `text` is the string as authored, so an
+/// escaped `$${NAME}` appears in it verbatim and contributes no name; the list
+/// is what says which tokens are real, and is omitted when there are none (see
+/// the module docs).
 impl Serialize for Interpolated {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let fields = if self.references.is_empty() { 1 } else { 2 };
@@ -358,6 +367,19 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&plain).expect("an interpolated string serializes"),
             r#"{"text":"npm"}"#
+        );
+    }
+
+    /// `text` is the string as authored, escapes and all: an escaped `$${NAME}`
+    /// stays escaped and contributes no name. A consumer that substituted by
+    /// scanning `text` for `${…}` would expand the one token the author wrote in
+    /// order *not* to expand, which is why `env_refs` is the authoritative list.
+    #[test]
+    fn an_escaped_token_is_written_as_authored_and_names_nothing() {
+        let escaped = Interpolated::new("https://example.test/$${NOT_A_REF}", Vec::new());
+        assert_eq!(
+            serde_json::to_string(&escaped).expect("an interpolated string serializes"),
+            r#"{"text":"https://example.test/$${NOT_A_REF}"}"#
         );
     }
 
