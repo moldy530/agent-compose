@@ -20,11 +20,19 @@ use super::schema;
 pub(crate) fn imports(node: &Node, cx: &mut Cx) -> Option<ImportsSection> {
     let items = expect_sequence(node, "`imports`", cx)?;
     let mut paths: Vec<Spanned<ImportPath>> = Vec::new();
+    // An entry refused here names a file that will not join the composition, and
+    // a refused entry leaves no trace in `paths` for the resolver to notice. The
+    // count is that trace: it is what tells the resolver the name table may be
+    // short a file's worth of definitions, so it can withhold the reference pass
+    // rather than print one `undefined-reference` per reference into it.
+    let mut dropped = 0;
     for item in items {
         let Some(text) = expect_string(item, "each entry of `imports`", cx) else {
+            dropped += 1;
             continue;
         };
         if let Some(problem) = import_problem(&text.value) {
+            dropped += 1;
             cx.push(
                 Diagnostic::error(
                     DiagnosticCode::InvalidImportPath,
@@ -39,7 +47,8 @@ pub(crate) fn imports(node: &Node, cx: &mut Cx) -> Option<ImportsSection> {
         // Normalizing (`./a.yml` against `a.yml`, `..` segments) needs the
         // project root, so the resolver owns that; a path repeated verbatim is
         // decidable here, and it is the copy-paste slip a long import list
-        // invites.
+        // invites. It is not counted as dropped: the file is in the composition
+        // under the first spelling, so no definition goes missing with it.
         if let Some(first) = paths
             .iter()
             .find(|other| other.value.as_str() == text.value)
@@ -59,6 +68,7 @@ pub(crate) fn imports(node: &Node, cx: &mut Cx) -> Option<ImportsSection> {
     }
     Some(ImportsSection {
         paths,
+        dropped,
         span: node.span.clone(),
     })
 }
@@ -512,4 +522,84 @@ fn trigger_input(fields: &mut Fields<'_>, cx: &mut Cx) -> Option<crate::ast::bin
     fields
         .take("input")
         .and_then(|node| binding::bindings(node, "`input`", NameForm::Identifier, cx))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::ast::document::Document;
+    use crate::parse_str;
+
+    /// The `imports:` entries a file yields, with the drop count the resolver
+    /// reads to decide whether the composition is all there.
+    fn imports(source: &str) -> (Vec<String>, usize) {
+        let document = parse_str(source, "main.yml")
+            .document
+            .expect("the file parses");
+        let Document::Spec(file) = document else {
+            panic!("a file declaring `imports:` is a spec file");
+        };
+        let section = file.imports.expect("the `imports:` section is read");
+        (
+            section
+                .paths
+                .iter()
+                .map(|path| path.value.as_str().to_string())
+                .collect(),
+            section.dropped,
+        )
+    }
+
+    /// An entry the parser refuses names a file that will not join the
+    /// composition, and refusing it leaves nothing in `paths` for the resolver
+    /// to notice. The count is that trace: without it the resolver resolves
+    /// names against a table short a file's worth of definitions and prints one
+    /// `undefined-reference` per reference into it — a page of consequences for
+    /// one cause.
+    #[test]
+    fn a_refused_entry_is_counted_as_dropped() {
+        assert_eq!(
+            imports("imports:\n  - /providers.yml\n  - models.yml\n"),
+            (vec!["models.yml".to_string()], 1),
+            "an absolute path"
+        );
+        assert_eq!(
+            imports("imports:\n  - \"*.yml\"\n  - models.yml\n"),
+            (vec!["models.yml".to_string()], 1),
+            "a glob"
+        );
+        assert_eq!(
+            imports("imports:\n  - { path: models.yml }\n"),
+            (Vec::new(), 1),
+            "a value that is not a string"
+        );
+        assert_eq!(
+            imports("imports:\n  - /a.yml\n  - \"b*.yml\"\n  - c.txt\n"),
+            (Vec::new(), 3),
+            "every refused entry counts"
+        );
+    }
+
+    /// A verbatim repeat is refused too, and is deliberately *not* counted: the
+    /// file is in the composition under the first spelling, so no definition
+    /// goes missing with the second entry and the reference pass has everything
+    /// it needs.
+    #[test]
+    fn a_repeated_entry_loses_no_file_and_is_not_counted() {
+        assert_eq!(
+            imports("imports:\n  - models.yml\n  - models.yml\n"),
+            (vec!["models.yml".to_string()], 0)
+        );
+    }
+
+    /// The ordinary case: nothing refused, nothing dropped.
+    #[test]
+    fn a_clean_import_list_drops_nothing() {
+        assert_eq!(
+            imports("imports:\n  - providers.yml\n  - models.yml\n"),
+            (
+                vec!["providers.yml".to_string(), "models.yml".to_string()],
+                0
+            )
+        );
+    }
 }

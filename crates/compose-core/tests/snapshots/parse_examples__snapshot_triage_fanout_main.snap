@@ -25,6 +25,7 @@ Spec(
                     "flows/triage.yml" @ 28:5..28:21,
                     "triggers.yml" @ 29:5..29:17,
                 ],
+                dropped: 0,
                 span: 17:3..31:1,
             },
         ),

@@ -141,6 +141,18 @@ pub struct ImportsSection {
     /// The imported paths, in declaration order (which is not semantic, but is
     /// preserved for reporting).
     pub paths: Vec<Spanned<ImportPath>>,
+    /// How many entries the parser refused outright — a value that is not a
+    /// string, or a path its lexical rules reject: absolute, a URL, a glob, an
+    /// environment reference, the wrong extension, or outside the portable
+    /// charset. Each one named a file that is now missing from the composition
+    /// along with every definition it declares, and [`Self::paths`] cannot say
+    /// so because a refused entry never reaches it.
+    ///
+    /// An entry the parser refused for being a *verbatim repeat* is not counted:
+    /// the file is in the composition under the first spelling, so nothing is
+    /// missing. The resolver reads this to decide whether the composition's name
+    /// table is all there, and withholds the reference pass when it is not.
+    pub dropped: usize,
     /// The section's own span.
     pub span: Span,
 }

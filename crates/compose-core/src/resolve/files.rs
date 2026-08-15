@@ -35,24 +35,34 @@ pub(crate) struct Composition {
     pub(crate) deploy: Option<DeploySource>,
     /// Whether the composition's name table is all there.
     ///
-    /// It is **incomplete** when an `imports:` entry named a file that never
-    /// joined the composition — it is not there, is not readable, is outside
-    /// the project root, or is a deploy file — because every definition that
-    /// file would have declared is missing along with it. Resolving names
-    /// against what is left would then report one diagnostic per reference into
-    /// it, which is a page of consequences for one cause. The cause has already
-    /// been reported, so the consequences are not.
+    /// It is **incomplete** when an `imports:` entry failed to bring a file into
+    /// the composition, because every definition that file would have declared
+    /// is missing along with it. Either half of the pipeline can lose one:
+    ///
+    /// * the resolver refuses the entry, or cannot read what it names — the file
+    ///   is not there, is not readable, is outside the project root, or is a
+    ///   deploy file;
+    /// * the parser refused the entry outright — it is not a string, or the path
+    ///   breaks grammar 1.4's lexical rules — so the entry never reaches
+    ///   [`ImportsSection::paths`] and is visible here only as
+    ///   [`ImportsSection::dropped`].
+    ///
+    /// Resolving names against what is left would then report one diagnostic per
+    /// reference into the missing file, which is a page of consequences for one
+    /// cause. The cause has already been reported, so the consequences are not.
     ///
     /// Two things deliberately do *not* make it incomplete, because neither
     /// loses a definition:
     ///
     /// * an entry that repeats a file already imported, or names the entrypoint
     ///   — the file is in the composition, under the other spelling;
-    /// * a file the parser rejected — a definition whose body could not be read
-    ///   keeps its address in the tree ([`DefinitionBody::Invalid`]), so the
-    ///   name still reaches the index.
+    /// * a file that joined the composition and *then* failed to parse — a
+    ///   definition whose body could not be read keeps its address in the tree
+    ///   ([`DefinitionBody::Invalid`]), so the name still reaches the index.
     ///
     /// [`DefinitionBody::Invalid`]: crate::ast::definition::DefinitionBody::Invalid
+    /// [`ImportsSection::paths`]: crate::ast::document::ImportsSection::paths
+    /// [`ImportsSection::dropped`]: crate::ast::document::ImportsSection::dropped
     pub(crate) complete: bool,
 }
 
@@ -167,14 +177,30 @@ pub(crate) fn load(
 /// Follow the entrypoint's `imports:` (grammar 1.4).
 ///
 /// An entry that is refused clears [`Composition::complete`] exactly when the
-/// file it named is then absent from the composition — see that field for why
-/// a repeat and a rejected parse are not among those cases.
+/// file it named is then absent from the composition — including the entries
+/// the parser refused before this pass ever saw them. See that field for why a
+/// repeat and a rejected parse are not among those cases.
 fn imports(
     root: &Path,
     entrypoint: &str,
     composition: &mut Composition,
     diagnostics: &mut Diagnostics,
 ) {
+    // An entry the *parser* refused — a value that is not a string, or a path
+    // that breaks grammar 1.4's lexical rules — never reaches `paths`, so it is
+    // invisible here except as a count. It is a loss all the same: the file it
+    // named is not in the composition, and every definition it declares is
+    // missing with it. The cause is already reported, at the entry, so the
+    // consequences are not.
+    if composition.files[0]
+        .file
+        .imports
+        .as_ref()
+        .is_some_and(|section| section.dropped > 0)
+    {
+        composition.complete = false;
+    }
+
     let entries: Vec<(String, Span)> = composition.files[0]
         .file
         .imports

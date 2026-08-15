@@ -1,0 +1,7 @@
+provider.p:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+
+model.m:
+  provider: provider.p
+  id: some-model
