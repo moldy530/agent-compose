@@ -12,7 +12,8 @@
 //! # The code scheme
 //!
 //! Codes are lowercase kebab-case strings drawn from the closed
-//! [`DiagnosticCode`] enum: `unknown-key`, `invalid-duration`, `reserved-name`.
+//! [`DiagnosticCode`] enum: `unknown-key`, `invalid-duration`,
+//! `undefined-reference`.
 //! They are the stable identity of a failure class — test fixtures, editors,
 //! and downstream tooling match on them, so a code is never renamed or reused
 //! for a different meaning once it ships; a new failure class gets a new
@@ -255,7 +256,12 @@ impl fmt::Display for Severity {
 /// The stable identity of a failure class.
 ///
 /// See the module documentation for the scheme. Variants are grouped by the
-/// layer that raises them; the parser raises all of the ones below.
+/// layer that raises them: the parser raises every code down to
+/// [`ReservedName`](Self::ReservedName), and the resolver raises the four after
+/// it — plus [`IoError`](Self::IoError), [`InvalidEncoding`](Self::InvalidEncoding)
+/// and [`InvalidImportPath`](Self::InvalidImportPath), which it shares with the
+/// parser because an unreadable or out-of-tree import is the same failure class
+/// wherever it is noticed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DiagnosticCode {
     // --- file level -------------------------------------------------------
@@ -322,6 +328,18 @@ pub enum DiagnosticCode {
     UnexpectedEnvRef,
     /// An identifier is reserved for another purpose.
     ReservedName,
+
+    // --- resolution (grammar 1, 2, 14) ------------------------------------
+    /// One typed address is defined by two definitions.
+    DuplicateDefinition,
+    /// A section that may appear in at most one file of a composition appears
+    /// in two.
+    DuplicateSection,
+    /// A reference names nothing the composition defines: a typed address, a
+    /// flow-local node id, a storage backend alias, or an event source.
+    UndefinedReference,
+    /// A file's `version:` differs from the entrypoint's.
+    VersionMismatch,
 }
 
 impl DiagnosticCode {
@@ -356,6 +374,10 @@ impl DiagnosticCode {
             Self::InvalidEnvRef => "invalid-env-ref",
             Self::UnexpectedEnvRef => "unexpected-env-ref",
             Self::ReservedName => "reserved-name",
+            Self::DuplicateDefinition => "duplicate-definition",
+            Self::DuplicateSection => "duplicate-section",
+            Self::UndefinedReference => "undefined-reference",
+            Self::VersionMismatch => "version-mismatch",
         }
     }
 }
@@ -590,6 +612,10 @@ mod tests {
             DiagnosticCode::InvalidEnvRef,
             DiagnosticCode::UnexpectedEnvRef,
             DiagnosticCode::ReservedName,
+            DiagnosticCode::DuplicateDefinition,
+            DiagnosticCode::DuplicateSection,
+            DiagnosticCode::UndefinedReference,
+            DiagnosticCode::VersionMismatch,
         ];
         let mut seen = std::collections::BTreeSet::new();
         for code in codes {
