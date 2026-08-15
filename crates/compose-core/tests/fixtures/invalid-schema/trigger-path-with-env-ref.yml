@@ -1,0 +1,8 @@
+# rule: env refs are illegal in an http trigger's `path:` - the route is part of the API surface the IR describes (grammar 4.3 class 3 / Decision D92)
+# at: /triggers/on_request/path
+# via: /$defs/noEnvRefString/not
+triggers:
+  on_request:
+    type: http
+    flow: flow.review_loop
+    path: /${REVIEW_ROUTE}
