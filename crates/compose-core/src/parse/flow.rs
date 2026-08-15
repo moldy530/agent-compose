@@ -70,11 +70,12 @@ pub(crate) fn flow_def(fields: &mut Fields<'_>, subject: &str, cx: &mut Cx) -> F
         // mistake.
         let mut incomplete = false;
         for item in items {
-            let Some(edge) = edge(item, cx) else {
+            let Some(read) = edge(item, cx) else {
                 incomplete = true;
                 continue;
             };
-            incomplete |= edge.from.is_none() || edge.to.is_none();
+            incomplete |= read.incomplete;
+            let edge = read.edge;
             if let Some(first) = edges.iter().find(|other| same_edge(other, &edge)) {
                 cx.push(
                     Diagnostic::error(
@@ -214,7 +215,21 @@ fn describe_source(source: &crate::ast::common::EdgeSource) -> String {
     }
 }
 
+/// Whether two edges declare the same transition (grammar 7.2).
+///
+/// An edge missing an endpoint declares no transition at all, so it is never
+/// the same one as anything: two entries that each merely omit `to:` are two
+/// broken edges, not a duplicate pair, and saying "the same `from`, `to`, and
+/// `when` are already declared" of a `to:` neither one wrote would assert a
+/// violation the source does not contain. Each has its own missing-key
+/// diagnostic already.
 fn same_edge(left: &Edge, right: &Edge) -> bool {
+    if [left, right]
+        .iter()
+        .any(|edge| edge.from.is_none() || edge.to.is_none())
+    {
+        return false;
+    }
     let endpoints = left.from.as_ref().map(|s| &s.value) == right.from.as_ref().map(|s| &s.value)
         && left.to.as_ref().map(|s| &s.value) == right.to.as_ref().map(|s| &s.value);
     let guards = left.when.as_ref().map(|g| g.value.as_str())
@@ -222,7 +237,19 @@ fn same_edge(left: &Edge, right: &Edge) -> bool {
     endpoints && guards
 }
 
-fn edge(node: &Node, cx: &mut Cx) -> Option<Edge> {
+/// One `edges:` entry as read, with whether anything the author wrote in it
+/// failed to read.
+///
+/// The rules stated over the whole `edges:` array cannot be answered from a
+/// partial one, so they are skipped when any entry is incomplete: reporting
+/// them on top of the diagnostic that already explained the broken edge would
+/// be a second error for one mistake.
+struct ReadEdge {
+    edge: Edge,
+    incomplete: bool,
+}
+
+fn edge(node: &Node, cx: &mut Cx) -> Option<ReadEdge> {
     let mapping = expect_mapping(node, "each entry of `edges`", cx)?;
     let mut fields = Fields::new(mapping, node.span.clone(), "an edge");
 
@@ -232,9 +259,15 @@ fn edge(node: &Node, cx: &mut Cx) -> Option<Edge> {
     let to = fields
         .require("to", cx)
         .and_then(|node| lexical::edge_target(node, cx));
-    let when = fields
-        .take("when")
-        .and_then(|node| lexical::cel(node, "`when`", cx));
+    // Whether the author wrote `when:` at all, which is a different question
+    // from whether it read as an expression. Both `max_iterations` below and
+    // the `else:` sibling rule are stated over an edge that *declares* a guard
+    // (grammar 7.2, 7.3), so a `when:` whose value is the wrong YAML kind has
+    // to count as declared: treating it as absent turns one mistake into two
+    // diagnostics, the second of them about a different edge.
+    let when_entry = fields.take_entry("when");
+    let when = when_entry.and_then(|entry| lexical::cel(&entry.value, "`when`", cx));
+    let guard_unreadable = when_entry.is_some() && when.is_none();
 
     let else_edge = fields.take("else").and_then(|node| match &node.value {
         Yaml::Bool(true) => Some(node.span.clone()),
@@ -270,7 +303,7 @@ fn edge(node: &Node, cx: &mut Cx) -> Option<Edge> {
     // withdraw the guarantee four other rules rest on — exhaustiveness clause 1,
     // the `start` edge, the skip escape, and the cycle escape (Decision D90).
     let max_iterations = fields.take_entry("max_iterations").and_then(|entry| {
-        if when.is_none() {
+        if when_entry.is_none() {
             cx.push(
                 Diagnostic::error(
                     DiagnosticCode::InvalidValue,
@@ -289,13 +322,17 @@ fn edge(node: &Node, cx: &mut Cx) -> Option<Edge> {
         max_iterations.filter(|value| in_range(value, "`max_iterations`", 1..=1000, cx));
     fields.finish(cx);
 
-    Some(Edge {
-        from,
-        to,
-        when,
-        else_edge,
-        max_iterations,
-        span: node.span.clone(),
+    let incomplete = from.is_none() || to.is_none() || guard_unreadable;
+    Some(ReadEdge {
+        edge: Edge {
+            from,
+            to,
+            when,
+            else_edge,
+            max_iterations,
+            span: node.span.clone(),
+        },
+        incomplete,
     })
 }
 
@@ -1072,14 +1109,27 @@ fn dispatch(
     }
 
     if !routed {
-        cx.push(
-            Diagnostic::error(
-                DiagnosticCode::MissingKey,
-                fields.span.clone(),
-                format!("{context} declares no dispatch target"),
+        // `default:` is a real `map:` key, so it must be consumed here even
+        // though nothing reads it: left over, `finish` would report the map's
+        // own catch-all as an unknown key. Missing dispatch is the whole
+        // mistake, so it stays one diagnostic and `default:` becomes the label
+        // that says what it was waiting for.
+        let waiting = fields.take_entry("default").map(|entry| {
+            (
+                entry.key.span.clone(),
+                "`default` is a catch-all route, and no `route_by` declares what it falls back from",
             )
-            .with_help("a map declares `node:` for a homogeneous fan-out, or `route_by:` with `routes:` for a discriminator-routed one"),
-        );
+        });
+        let mut diagnostic = Diagnostic::error(
+            DiagnosticCode::MissingKey,
+            fields.span.clone(),
+            format!("{context} declares no dispatch target"),
+        )
+        .with_help("a map declares `node:` for a homogeneous fan-out, or `route_by:` with `routes:` for a discriminator-routed one");
+        if let Some((span, message)) = waiting {
+            diagnostic = diagnostic.with_label(span, message);
+        }
+        cx.push(diagnostic);
         return MapDispatch::Invalid;
     }
 
@@ -1219,4 +1269,117 @@ fn reject_detached_writes(
             "a fire-and-forget dispatch is not joined, so nothing waits to record its result",
         ),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::parse_str;
+
+    /// Every diagnostic one source produces, as `code: message`. The whole list
+    /// is compared, so a second diagnostic for one mistake fails the test.
+    fn diagnostics(source: &str) -> Vec<String> {
+        parse_str(source, "test.yml".to_string())
+            .diagnostics
+            .iter()
+            .map(|diagnostic| format!("{}: {}", diagnostic.code, diagnostic.message))
+            .collect()
+    }
+
+    /// A flow whose only variable is its `edges:` array.
+    fn flow(edges: &str) -> String {
+        format!(
+            "flow.demo:
+  outputs:
+    r: {{ type: string }}
+  nodes:
+    a: {{ agent: agent.x }}
+    b: {{ agent: agent.x }}
+    c: {{ agent: agent.x }}
+  edges:
+{edges}"
+        )
+    }
+
+    /// Two edges that each merely omit `to:` are two broken edges, not a
+    /// duplicate pair: neither declares a transition, so grammar 7.2's
+    /// duplicate rule has nothing to compare. Each already carries its own
+    /// missing-key diagnostic.
+    #[test]
+    fn two_edges_missing_the_same_endpoint_are_not_duplicates_of_each_other() {
+        assert_eq!(
+            diagnostics(&flow("    - { from: a }\n    - { from: a }\n")),
+            [
+                "missing-key: missing required key `to` in an edge",
+                "missing-key: missing required key `to` in an edge",
+            ]
+        );
+    }
+
+    /// A `when:` whose value is the wrong YAML kind is a guard that was
+    /// declared and did not read, so the `else:` edge it is meant to be else to
+    /// keeps its guarded sibling (grammar 7.3, Decision D107). Reporting D107
+    /// here would be a second error, against a different edge, for one mistake.
+    #[test]
+    fn an_unreadable_guard_still_counts_as_a_declared_one() {
+        assert_eq!(
+            diagnostics(&flow(
+                "    - { from: start, to: a }\n    - { from: a, to: b, when: 5 }\n    - { from: a, to: c, else: true }\n"
+            )),
+            ["wrong-type: expected a CEL expression for `when`, found an integer"]
+        );
+    }
+
+    /// The same reading of "declares" on `max_iterations`, which grammar 7.2
+    /// and Decision D90 allow on an edge that declares `when`.
+    #[test]
+    fn an_unreadable_guard_still_carries_a_bound() {
+        assert_eq!(
+            diagnostics(&flow(
+                "    - { from: start, to: a }\n    - { from: a, to: b, when: 5, max_iterations: 3 }\n"
+            )),
+            ["wrong-type: expected a CEL expression for `when`, found an integer"]
+        );
+    }
+
+    /// `default:` is a `map:` key, so a map declaring no dispatch form at all
+    /// reports the missing target once and points at the `default:` that was
+    /// waiting for it — rather than calling the map's own catch-all an unknown
+    /// key and suggesting the author meant `default`.
+    #[test]
+    fn a_default_route_without_a_dispatch_form_is_not_an_unknown_key() {
+        let source = "flow.demo:
+  outputs:
+    r: { type: string }
+  nodes:
+    a: { agent: agent.x }
+    m:
+      map:
+        over: \"a.output.xs\"
+        max_concurrency: 2
+        default: { node: tool.t }
+  edges:
+    - { from: start, to: a }
+    - { from: a, to: m }
+    - { from: m, to: end }
+";
+        let parsed = parse_str(source, "test.yml".to_string());
+        let reported: Vec<String> = parsed
+            .diagnostics
+            .iter()
+            .map(|diagnostic| format!("{}: {}", diagnostic.code, diagnostic.message))
+            .collect();
+        assert_eq!(
+            reported,
+            ["missing-key: the `map` block of node `m` declares no dispatch target"]
+        );
+        let labels: Vec<&str> = parsed.diagnostics[0]
+            .labels
+            .iter()
+            .map(|label| label.message.as_str())
+            .collect();
+        assert_eq!(
+            labels,
+            ["`default` is a catch-all route, and no `route_by` declares what it falls back from"]
+        );
+    }
 }

@@ -1,0 +1,17 @@
+# rule: `default:` is a catch-all route, not a dispatch form, so a map declaring only one still declares no target (grammar 8.6 rule 2)
+# code: missing-key
+# message: the `map` block of node `work` declares no dispatch target
+# at: 12:9
+# help: a map declares `node:` for a homogeneous fan-out, or `route_by:` with `routes:` for a discriminator-routed one
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    work:
+      map:
+        over: plan.output.findings
+        max_concurrency: 4
+        default: { node: agent.fixer }
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }

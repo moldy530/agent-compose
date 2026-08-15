@@ -306,10 +306,17 @@ fn non_finite_name(value: f64) -> &'static str {
 /// The threshold is the usual one third of the longer string (at least one
 /// edit), computed over Damerau-Levenshtein distance so that a transposition —
 /// `retyr` for `retry` — counts as a single edit.
+///
+/// A candidate equal to `actual` is never one: "unknown key `default` … did you
+/// mean `default`?" tells an author nothing, and every caller reaches here
+/// having already refused the name it passes, so an identity match means the
+/// candidate list is wider than the surface rather than that the spelling was
+/// close (PRD G3).
 pub(crate) fn suggest<'k>(actual: &str, candidates: &[&'k str]) -> Option<&'k str> {
     let limit = (actual.chars().count() / 3).max(1);
     candidates
         .iter()
+        .filter(|candidate| **candidate != actual)
         .filter_map(|candidate| {
             let allowed = limit.max(candidate.chars().count() / 3);
             let distance = strsim::damerau_levenshtein(actual, candidate);
@@ -341,6 +348,17 @@ mod tests {
         assert_eq!(suggest("retyr", &keys), Some("retry"));
         assert_eq!(suggest("entrypoint", &keys), None);
         assert_eq!(suggest("", &keys), None);
+    }
+
+    /// A key that *is* one of the candidates is not a near miss. It reaches
+    /// `suggest` only when the surface knows the key but refused it for another
+    /// reason, and echoing it back is the one suggestion guaranteed to be
+    /// useless.
+    #[test]
+    fn never_suggests_the_word_it_was_given() {
+        let keys = ["node", "route_by", "routes", "default"];
+        assert_eq!(suggest("default", &keys), None);
+        assert_eq!(suggest("defualt", &keys), Some("default"));
     }
 
     #[test]
