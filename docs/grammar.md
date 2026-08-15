@@ -1388,7 +1388,11 @@ Back-edges are permitted (PRD 5.4). The compiler computes SCCs and requires:
 
 `max_iterations` counts **traversals of that edge within one flow instance**.
 Instances of the same flow (including `map`-dispatched ones) count independently.
-Codegen emits one counter per bounded edge into the graph state; iteration
+Codegen emits one counter per bounded **edge** into the graph state — so an SCC
+carrying two `max_iterations` edges carries two counters, one budget each, and
+PRD 5.4's "an iteration counter … per bounded cycle" is that same statement for
+the one-bounded-edge shape it describes
+([D19](#d19-max_iterations-semantics-and-the-escape-edge-rule)); iteration
 boundaries are checkpoint/resume points.
 
 ### 7.5 Instantiation, inputs, and outputs
@@ -4709,8 +4713,20 @@ guaranteed everywhere the document says it, and it costs nothing: PRD 5.4's own
 example and every cycle in `examples/` put `max_iterations` on the guarded
 back-edge, which is where a bound belongs — the unconditional or `else:` sibling
 is the way *out*. `when: "true"` remains writable and remains a guarded edge, so
-it can carry a budget and still cannot serve as any rule's guarantee. *PRD 5.3,
-5.4, G3.*
+it can carry a budget and still cannot serve as any rule's guarantee.
+
+**One counter per bounded edge.** The budget is per *edge*, so an SCC with two
+`max_iterations` edges carries two counters and two independent budgets (§7.4).
+PRD 5.4's codegen sentence — "an iteration counter into graph state per bounded
+cycle" — is the same statement for the shape it describes, a cycle bounded by
+one edge, which is what its own example writes and what every cycle in
+`examples/` writes; a per-*cycle* counter cannot be the general form, because it
+would have to say which of two budgets it counts against and `max_iterations`
+counts traversals of the edge it sits on. This document fixes the general form,
+exactly as
+[D104](#d104-the-idempotency-key-is-the-flattened-instance-path) does for what
+"node" denotes in PRD 5.6/5.8's idempotency key: prd.md's shorter phrasing
+stands as written and the precise form lives here. *PRD 5.3, 5.4, G3.*
 
 ### D91. The single-string-property decode exception is a `tool.*`-surface rule
 
