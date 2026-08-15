@@ -926,10 +926,14 @@ pub(crate) fn reject_env_refs_in_literal(value: &Spanned<Literal>, subject: &str
 
 /// Reject every infinity or NaN a literal carries, at any depth.
 ///
-/// A composite `default:` on a state channel is a whole initial value, so the
-/// unwritable number can sit inside an array or an object rather than at the
-/// top (see [`expect_finite`]).
-fn reject_non_finite_in_literal(value: &Spanned<Literal>, subject: &str, cx: &mut Cx) {
+/// Both surfaces that carry a literal are walked to their leaves: a composite
+/// `default:` on a state channel is a whole initial value, and a model's
+/// `settings:` is open and arbitrarily deep, so the unwritable number can sit
+/// inside an array or an object rather than at the top. Every one of them is
+/// lowered into the artifact and from there into JSON (grammar 3.8), which has
+/// no notation for either — so it is refused where it is written, while there
+/// is still a span to point at (see [`expect_finite`]).
+pub(crate) fn reject_non_finite_in_literal(value: &Spanned<Literal>, subject: &str, cx: &mut Cx) {
     match &value.value {
         Literal::Float(number) => {
             expect_finite(*number, subject, &value.span, cx);

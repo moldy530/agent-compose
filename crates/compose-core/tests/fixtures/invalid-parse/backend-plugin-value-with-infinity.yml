@@ -1,0 +1,17 @@
+# rule: a plugin-config value is data lowered to JSON, so it is not infinity or NaN, at any depth (grammar 3.8, 14.2)
+# code: invalid-value
+# message: `pool` in backend alias `cache` must be a finite number, found infinity
+# at: 17:24
+# help: the compiler lowers every declared number to JSON Schema 2020-12 and to generated code (grammar 3.8), neither of which can write infinity or NaN
+#
+# The deploy layer is part of the artifact, and the artifact is JSON. A plugin
+# object carries arbitrary YAML, so the number is nested here for the same
+# reason the `settings:` fixture nests one.
+version: "0.1"
+
+storage_backends:
+  aliases:
+    cache:
+      provider: redis
+      url: ${REDIS_URL}
+      pool: { timeout: .inf }

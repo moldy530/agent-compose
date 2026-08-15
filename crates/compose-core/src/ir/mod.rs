@@ -158,9 +158,12 @@ impl Ir {
     /// # Errors
     ///
     /// Returns the serializer's error. Every value the IR can hold is
-    /// representable in JSON — the parser refuses non-finite numbers where they
-    /// are written, so no float here can be one — but the error is surfaced
-    /// rather than swallowed.
+    /// representable in JSON: the four surfaces that carry a float — a schema
+    /// constraint, a retry `multiplier`, a `default:`/`settings:` literal, and
+    /// a plugin-config value — are each checked for infinity and NaN where they
+    /// are written, so no float here can be one, and `serde_json` would write
+    /// `null` for one that was. The error is surfaced rather than swallowed all
+    /// the same.
     pub fn to_json(&self) -> serde_json::Result<String> {
         let mut json = serde_json::to_string_pretty(self)?;
         json.push('\n');

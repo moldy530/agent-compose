@@ -605,6 +605,17 @@ fn model(fields: &mut Fields<'_>, subject: &str, cx: &mut Cx) -> ModelDef {
         for entry in &entries {
             lexical::reject_env_refs(&entry.key, &context, cx);
             schema::reject_env_refs_in_literal(&entry.value, &context, cx);
+            // `settings:` is open, but it is still data the compiler lowers into
+            // the artifact and from there into a provider call (grammar 3.8):
+            // JSON has no notation for infinity or NaN, so one written here
+            // would otherwise reach the artifact as `null` — a value the author
+            // never wrote. Refused where it is written, and named by the key it
+            // sits under, because a subtree is where it can hide.
+            schema::reject_non_finite_in_literal(
+                &entry.value,
+                &format!("`{}` in {context}", entry.key.value),
+                cx,
+            );
         }
         Some(Settings {
             entries,
