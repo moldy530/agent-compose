@@ -1,10 +1,11 @@
 # examples/triage-fanout — bug triage with heterogeneous fan-out.
 #
-# Exercises: discriminator-routed `map` with per-variant narrowing and a
-# `default:` catch-all sink, an `exec`-backed tool used as a `function` node, kv
-# and vector stores (both consumption surfaces), a `human` node, reduced state
-# channels, and the reserved grammar (schedule + event triggers, placements,
-# event_sources).
+# Exercises: discriminator-routed `map` with per-variant narrowing, per-item
+# retry, and a `default:` catch-all sink, an `exec`-backed tool used as a
+# `function` node, kv and vector stores (both consumption surfaces), a `human`
+# node, reduced state channels, a pair of concurrent branches converging at
+# equal depth (grammar 7.6), and the reserved grammar (schedule + event
+# triggers, placements, event_sources).
 #
 # The project is written to validate under `--target local` AND under the
 # `--target staging` it ships in deploy/ — which is why no route is detached

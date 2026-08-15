@@ -51,7 +51,15 @@ flow.triage:
         as: finding
         route_by: kind
         max_concurrency: 8
-        on_item_error: skip
+        # `on_item_error: retry` carries its policy inline, in the shape §9.1
+        # defines and `on_error:` already uses (grammar 8.6 rule 10). Exhausted
+        # item retries fail the item; the map node's own `on_error:` below is
+        # where that failure is absorbed — "retry each item, and if one still
+        # fails, skip the fan-out". `over` reads `classify.output`, and
+        # `classify` dominates this node, so the array is guaranteed to exist
+        # when the map dispatches (rule 11).
+        on_item_error:
+          retry: { max: 2, backoff: 2s }
         routes:
           auto_fixable:
             node: agent.fixer
@@ -80,6 +88,26 @@ flow.triage:
           input:
             kind: "finding.kind"
             payload: "finding.of"
+      # Applies to the fan-out as a whole (grammar 8.6 rule 9), and the
+      # unconditional edge to `verify` is the escape §7.6.3 rule 3 requires of a
+      # node declaring `skip`.
+      on_error: skip
+
+    # The sibling of `dispatch` in a pair of concurrent branches (grammar 7.3
+    # rule 6): both edges leaving `classify` are unconditional, so both fire and
+    # the two nodes run in one step. Node config CEL never reads another node's
+    # output (D42), so the body comes from a channel.
+    announce:
+      http:
+        method: POST
+        url: "https://${QUEUE_HOST}/v1/triage-started"
+        headers:
+          authorization: "Bearer ${QUEUE_TOKEN}"
+        body:
+          report: "state.report_normalized"
+        output:
+          status: { type: integer }
+      timeout: 10s
 
     # Inline subprocess step. The bound input object is passed to the child as
     # environment variables, upper-snake-cased (`patches` -> `PATCHES`), and the
@@ -155,10 +183,19 @@ flow.triage:
     - { from: start, to: enrich }
     - { from: enrich, to: scan }
     - { from: scan, to: classify }
+    # Two unconditional edges leave `classify`, so both fire: `dispatch` and
+    # `announce` are concurrent branches running in one step (grammar 7.6.1).
     - { from: classify, to: dispatch }
+    - { from: classify, to: announce }
     # The downstream edge is the fan-out barrier: it fires when every dispatched
-    # instance has completed or been resolved by `on_item_error`.
+    # instance has completed or been resolved by `on_item_error`. The branches
+    # converge on `verify` at equal depth — dist(verify) = {2} from `classify` —
+    # so `verify` runs ONCE with both branches' writes already applied
+    # (grammar 7.6.2 P2), rather than once per arrival. An unbalanced
+    # convergence, say a third edge `classify -> verify`, would be a compile
+    # error.
     - { from: dispatch, to: verify }
+    - { from: announce, to: verify }
     - { from: verify, to: summarize }
     - { from: summarize, to: remember }
     - { from: remember, to: approve }
