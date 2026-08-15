@@ -1533,7 +1533,7 @@
           "enum": ["execution", "session", "global"]
         },
         "value_schema": { "description": "Stored value shape. REQUIRED for kv; illegal for vector and blob.", "$ref": "#/$defs/outputFieldMap" },
-        "metadata_schema": { "description": "Filterable metadata shape. Legal for vector and blob only.", "$ref": "#/$defs/outputFieldMap" },
+        "metadata_schema": { "description": "Filterable metadata shape, narrowing a vector search. Legal for vector stores only: no blob or kv op reads metadata, so the key would be inert there (grammar 11.1, Decision D113).", "$ref": "#/$defs/outputFieldMap" },
         "embed": {
           "description": "Embedding configuration. REQUIRED for vector stores, illegal otherwise.",
           "type": "object",
@@ -1563,17 +1563,25 @@
         {
           "if": { "properties": { "kind": { "const": "kv" } }, "required": ["kind"] },
           "then": {
+            "description": "A kv store declares `value_schema` and nothing else about shape: metadata is a vector construct (Decision D113) and embedding is vector-only.",
             "required": ["value_schema"],
-            "not": { "anyOf": [{ "required": ["metadata_schema"] }, { "required": ["embed"] }] }
+            "properties": { "metadata_schema": false, "embed": false }
           }
         },
         {
           "if": { "properties": { "kind": { "const": "vector" } }, "required": ["kind"] },
-          "then": { "required": ["embed"], "not": { "required": ["value_schema"] } }
+          "then": {
+            "description": "A vector store declares `embed:` and MAY declare `metadata_schema:`; `value_schema` is kv's (grammar 11.1).",
+            "required": ["embed"],
+            "properties": { "value_schema": false }
+          }
         },
         {
           "if": { "properties": { "kind": { "const": "blob" } }, "required": ["kind"] },
-          "then": { "not": { "anyOf": [{ "required": ["value_schema"] }, { "required": ["embed"] }] } }
+          "then": {
+            "description": "A blob store declares neither schema: `value_schema` is kv's, and no blob op reads metadata, so `metadata_schema` would be inert (grammar 11.1, Decision D113).",
+            "properties": { "value_schema": false, "metadata_schema": false, "embed": false }
+          }
         }
       ]
     },

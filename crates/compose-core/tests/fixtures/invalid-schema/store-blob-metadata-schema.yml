@@ -1,0 +1,8 @@
+# rule: `metadata_schema:` is a vector-only key — no blob op takes a `metadata` or `filter` parameter, so on a blob store it would be inert (grammar 11.1 / D113)
+# at: /store.artifacts/metadata_schema
+# via: /$defs/storeDef/allOf/2/then/properties/metadata_schema
+store.artifacts:
+  kind: blob
+  scope: global
+  metadata_schema:
+    source: { type: string }

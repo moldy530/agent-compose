@@ -2855,11 +2855,27 @@ store.docs:
 | `kind` | `kv` \| `vector` \| `blob` | yes | relational/SQL deliberately excluded (PRD 5.8) |
 | `scope` | `execution` \| `session` \| `global` | yes | explicit lifetimes (D35) |
 | `value_schema` | field map (result surface, §3.5) | `kv` REQUIRED; `vector`/`blob` illegal | stored value shape |
-| `metadata_schema` | field map (result surface, §3.5) | `vector`/`blob` optional; `kv` illegal | filterable metadata |
+| `metadata_schema` | field map (result surface, §3.5) | `vector` optional; `kv`/`blob` illegal | filterable metadata |
 | `embed` | block | `vector` required; others illegal | §11.2 |
 | `backend` | identifier (bare alias) | no | abstract slot; never provider config |
 | `description` | string | no | LLM-facing for agent-attached stores |
 | `agent_access` | `read` \| `read_write` | no (default `read_write`) | narrows the synthesized tool surface |
+
+**`metadata_schema` is a `vector` key.** Nothing in this grammar reads a `blob`
+store's metadata: no `blob` op takes a `metadata` or a `filter` parameter — `put`
+takes `key`/`value`/`content_type`, `get` returns `value`/`found`, `list`
+returns `keys` (§11.4) — and the tools a `blob` attachment synthesizes are
+`<name>_get`, `<name>_list`, and `<name>_put` (§11.5). Declared there it would
+be a key every write and every read ignores, so it is a compile error naming the
+store and its kind rather than silence — the posture
+[D50](#d50-unknown-keys-are-errors-everywhere-except-plugin-config-objects) and
+[D61](#d61-else-takes-the-literal-true) take on an inert key, and the one §14
+already takes on a `storage_backends:` under `local` (Decision
+[D113](#d113-metadata_schema-is-a-vector-only-key)). Metadata *on* blobs is an
+additive change if a real case appears — parameters on the `blob` rows of §11.4
+and a place in §11.5's synthesized surface — and its absence is what says that
+is not v0. Until then a blob's filterable attributes live in a `kv` store keyed
+by the same key.
 
 ### 11.2 `embed` (vector only)
 
@@ -5362,6 +5378,38 @@ it only adds ones it must not make. Stating the comparison across the pair is
 also what makes the error message true: the two distances it prints are the ones
 the two named edges deliver. *PRD 5.3, 5.6, G3.*
 
+### D113. `metadata_schema` is a `vector`-only key
+
+`metadata_schema:` is legal on a `vector` store and a compile error on a `kv`
+and a `blob` one; the published schema enforces all three (§11.1, Appendix B).
+**Rationale**: §11.1 declared it "vector/blob optional" and nothing in the
+grammar consumes it on a `blob`. No `blob` op takes `metadata` or `filter`
+(§11.4's rows are `put` = `key`/`value`/`content_type`, `get` = `value`/`found`,
+`list` = `keys`), and §11.5 synthesizes `<name>_get`, `<name>_list`, and
+`<name>_put` with nowhere to put it — so an author following the table's own
+gloss ("filterable metadata") writes a key that every write and every read
+ignores, with no diagnostic. That is precisely the silent no-op this document
+refuses for `else: false` ([D61](#d61-else-takes-the-literal-true)), for
+`timeout:` on an async trigger ([D81](#d81-timeout-is-illegal-on-an-async-http-trigger)),
+and for `storage_backends:` under `local`
+([D87](#d87-local-is-a-reserved-target-and-deploylocalyml-carries-no-storage_backends)),
+applied here to one of its own constructs.
+
+The other repair — giving `blob` ops metadata — is the one that does not fit.
+It would add parameters to three rows, a filter predicate the blob providers of
+§14.2 (`local_fs`, `s3`, `gcs`) would each have to implement, and a synthesized
+tool surface, all to answer a question PRD 5.8 never asks: its own example
+declares `metadata_schema` on a vector store, where metadata exists to narrow a
+similarity search, and its compile-check sentence pairs the two schemas with
+*schema-checked ops*, which is exactly what a `blob` has none of. That is new
+design surface, the class this appendix's preamble reserves for
+[D37](#d37-agent_access-narrows-the-synthesized-store-tool-surface) and
+[D51](#d51-agents-carry-max_tool_iterations-default-8), so it would need PRD
+ratification; removing an inert key needs none, and leaves the additive path
+open. The cost is one key on one kind, and what it bought was never available:
+a `blob` whose attributes must be queryable pairs the blob with a `kv` store
+under the same key, which is two definitions and no new grammar. *PRD 5.8, G3.*
+
 ---
 
 ## Appendix B — Editor integration
@@ -5430,7 +5478,9 @@ What the schema *does* enforce beyond plain shape, because the deciding value is
 a literal in the same object: store-op parameter sets per `op` (§11.4) and the
 three parameters that are literals rather than CEL — `top_k` and `limit` typed
 as integers in their ranges, `content_type` as a string carrying no env ref
-(§8.8, §11.4) — provider
+(§8.8, §11.4) — store definition key sets per `kind`, both the schema each kind
+requires and the ones it refuses, `metadata_schema` being `vector`'s alone
+(§11.1, D113), provider
 key sets per `kind` — both halves, the required keys and the closed row the
 optional ones live in (§12.1, D106) — trigger
 keys per `type` (§13) including the `respond`/`timeout` and `respond`/`callback`
@@ -5537,7 +5587,8 @@ flow.<name>:
 store.<name>:
   kind: kv|vector|blob              # required
   scope: execution|session|global   # required
-  value_schema|metadata_schema: <field map>
+  value_schema: <field map>         # kv only
+  metadata_schema: <field map>      # vector only — no blob op reads it (D113)
   embed: { model, provider?, dimensions? }   # vector
   backend: <alias>
   agent_access: read|read_write
