@@ -5,7 +5,7 @@ use crate::diag::{Diagnostic, DiagnosticCode, Spanned};
 use crate::yaml::{Node, Yaml};
 
 use super::lexical;
-use super::reader::{Cx, Fields, expect_mapping, in_range, list};
+use super::reader::{Cx, Fields, expect_finite, expect_mapping, in_range, list};
 
 /// Read a `retry:` block (grammar 9.1).
 pub(crate) fn retry(node: &Node, subject: &str, cx: &mut Cx) -> Option<Spanned<Retry>> {
@@ -29,6 +29,10 @@ pub(crate) fn retry(node: &Node, subject: &str, cx: &mut Cx) -> Option<Spanned<R
                 None
             }
         }?;
+        // Checked before the bound, because NaN passes `< 1.0` by failing it.
+        if !expect_finite(value.value, "`multiplier`", &value.span, cx) {
+            return None;
+        }
         if value.value < 1.0 {
             cx.error(
                 DiagnosticCode::ValueOutOfRange,

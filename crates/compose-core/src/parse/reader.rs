@@ -258,6 +258,48 @@ pub(crate) fn at_least(value: &Spanned<i64>, subject: &str, minimum: i64, cx: &m
     false
 }
 
+/// Check that a number is one a spec file can actually carry.
+///
+/// YAML's core schema resolves `.inf` and `.nan`, and a decimal literal such as
+/// `1e400` — or a plain integer wider than an `f64` — overflows to infinity on
+/// the way in. None of the three survive the pipeline: every number a spec
+/// declares is lowered into the flat IR and from there into JSON Schema
+/// 2020-12 and generated code (grammar 3.8), and JSON has no notation for
+/// infinity or NaN. They also slip past the ordinary bound checks — `.inf`
+/// satisfies "greater than 0" and NaN satisfies every comparison by failing it
+/// — so the parser rejects them where they are written, while there is still a
+/// span to point at (PRD G3).
+pub(crate) fn expect_finite(value: f64, subject: &str, span: &Span, cx: &mut Cx) -> bool {
+    if value.is_finite() {
+        return true;
+    }
+    cx.push(
+        Diagnostic::error(
+            DiagnosticCode::InvalidValue,
+            span.clone(),
+            format!(
+                "{subject} must be a finite number, found {}",
+                non_finite_name(value)
+            ),
+        )
+        .with_help(
+            "the compiler lowers every declared number to JSON Schema 2020-12 and to generated code (grammar 3.8), neither of which can write infinity or NaN",
+        ),
+    );
+    false
+}
+
+/// How a non-finite `f64` is named in a diagnostic.
+fn non_finite_name(value: f64) -> &'static str {
+    if value.is_nan() {
+        "NaN"
+    } else if value.is_sign_positive() {
+        "infinity"
+    } else {
+        "-infinity"
+    }
+}
+
 /// The closest candidate to `actual`, if one is close enough to be worth
 /// suggesting.
 ///

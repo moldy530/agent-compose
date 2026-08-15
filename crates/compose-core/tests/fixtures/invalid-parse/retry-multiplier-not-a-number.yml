@@ -1,0 +1,16 @@
+# rule: a retry `multiplier` is a finite number; NaN passes the "at least 1" bound by failing every comparison (grammar 9.1)
+# code: invalid-value
+# message: `multiplier` must be a finite number, found NaN
+# at: 13:49
+# help: the compiler lowers every declared number to JSON Schema 2020-12 and to generated code (grammar 3.8), neither of which can write infinity or NaN
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    write:
+      agent: agent.writer
+      input: "input.goal"
+      retry: { max: 3, backoff: 1s, multiplier: .nan }
+  edges:
+    - { from: start, to: write }
+    - { from: write, to: end }

@@ -1,0 +1,11 @@
+# rule: a numeric constraint is a finite number; YAML's `.inf` satisfies "greater than 0" but cannot be written as JSON Schema (grammar 3.3, 3.8)
+# code: invalid-value
+# message: `multiple_of` must be a finite number, found infinity
+# at: 9:41
+# help: the compiler lowers every declared number to JSON Schema 2020-12 and to generated code (grammar 3.8), neither of which can write infinity or NaN
+tool.measure:
+  description: Measure something
+  input:
+    ratio: { type: number, multiple_of: .inf }
+  output: {}
+  function: { name: measure }

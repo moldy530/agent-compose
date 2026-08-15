@@ -18,7 +18,8 @@ use crate::yaml::{Node, Yaml};
 
 use super::lexical;
 use super::reader::{
-    Cx, Fields, at_least, expect_mapping, expect_sequence, expect_string, in_range, list, suggest,
+    Cx, Fields, at_least, expect_finite, expect_mapping, expect_sequence, expect_string, in_range,
+    list, suggest,
 };
 
 /// The maximum schema nesting depth; the declaration surface counts as one
@@ -459,7 +460,8 @@ fn is_positive(value: &Number) -> bool {
 fn number(node: &Node, subject: &str, cx: &mut Cx) -> Option<Spanned<Number>> {
     match &node.value {
         Yaml::Int(value) => Some(Spanned::new(Number::Int(*value), node.span.clone())),
-        Yaml::Float(value) => Some(Spanned::new(Number::Float(*value), node.span.clone())),
+        Yaml::Float(value) => expect_finite(*value, subject, &node.span, cx)
+            .then(|| Spanned::new(Number::Float(*value), node.span.clone())),
         _ => {
             cx.wrong_type(node, subject, "a number");
             None
@@ -862,10 +864,13 @@ fn default_value(
         return None;
     }
     let value = literal(node);
+    let context = format!("`default` in {subject}");
     // A default is written inside a schema, and a schema interpolates nothing:
     // an unescaped `${NAME}` here would reach the IR as the six characters the
     // author did not intend (grammar 4.3, Decision D41).
-    reject_env_refs_in_literal(&value, &format!("`default` in {subject}"), cx);
+    reject_env_refs_in_literal(&value, &context, cx);
+    // A default is data, and this data is lowered to JSON (grammar 3.8).
+    reject_non_finite_in_literal(&value, &context, cx);
     Some(value)
 }
 
@@ -890,6 +895,30 @@ fn reject_env_refs_in_literal(value: &Spanned<Literal>, subject: &str, cx: &mut 
             }
         }
         Literal::Null | Literal::Bool(_) | Literal::Int(_) | Literal::Float(_) => {}
+    }
+}
+
+/// Reject every infinity or NaN a literal carries, at any depth.
+///
+/// A composite `default:` on a state channel is a whole initial value, so the
+/// unwritable number can sit inside an array or an object rather than at the
+/// top (see [`expect_finite`]).
+fn reject_non_finite_in_literal(value: &Spanned<Literal>, subject: &str, cx: &mut Cx) {
+    match &value.value {
+        Literal::Float(number) => {
+            expect_finite(*number, subject, &value.span, cx);
+        }
+        Literal::Sequence(items) => {
+            for item in items {
+                reject_non_finite_in_literal(item, subject, cx);
+            }
+        }
+        Literal::Mapping(entries) => {
+            for entry in entries {
+                reject_non_finite_in_literal(&entry.value, subject, cx);
+            }
+        }
+        Literal::Null | Literal::Bool(_) | Literal::Int(_) | Literal::String(_) => {}
     }
 }
 
