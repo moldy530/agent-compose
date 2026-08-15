@@ -4,8 +4,9 @@
 # retry, and a `default:` catch-all sink, an `exec`-backed tool used as a
 # `function` node, kv and vector stores (both consumption surfaces), a `human`
 # node, reduced state channels, a pair of concurrent branches converging at
-# equal depth (grammar 7.6), and the reserved grammar (schedule + event
-# triggers, placements, event_sources).
+# equal depth (grammar 7.6), a node reachable only through an `on_error:`
+# fallback (grammar 7.8), and the reserved grammar (schedule + event triggers,
+# placements, event_sources).
 #
 # The project is written to validate under `--target local` AND under the
 # `--target staging` it ships in deploy/ — which is why no route is detached

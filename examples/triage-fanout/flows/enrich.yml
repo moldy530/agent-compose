@@ -17,6 +17,12 @@ flow.enrich:
         body:
           report: "input.report"
         expect_status: [200]
+        # `report_normalized` is not an envelope name (`status`/`body` are), so
+        # it is DECODED from the JSON response body — always, whatever its type
+        # and however few fields there are. §6.1's single-string-property
+        # exception is a `tool.*`-surface rule and does not reach inline nodes,
+        # which name raw text with the `body` envelope field instead
+        # (grammar 8.3 / D91).
         output:
           report_normalized: { type: string }
       timeout: 15s

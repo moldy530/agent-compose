@@ -82,6 +82,10 @@ flow.triage:
         # any durably checkpointed target, i.e. every target except `local`
         # (grammar 8.6 rule 7 / 14, PRD 5.6), so with `deploy/staging.yml` in the
         # tree a detached route would make `validate --target staging` fail.
+        # Spelling it out also keeps this sink INSIDE the join: a detached
+        # dispatch is resolved at dispatch, so it is neither waited for nor
+        # covered by `on_item_error` (grammar 8.6 rules 6, 7 / D94), and a failed
+        # dead-letter enqueue would pass unnoticed.
         default:
           node: tool.dead_letter
           detach: false
@@ -108,6 +112,26 @@ flow.triage:
         output:
           status: { type: integer }
       timeout: 10s
+      # On failure this node's own edges are NOT evaluated; the fallback target
+      # is scheduled instead (grammar 9.2), so this branch reaches `end` through
+      # `announce_failed` rather than converging on `verify`.
+      on_error: { fallback: announce_failed }
+
+    # Reached ONLY by that fallback — no edge targets it. Node reachability
+    # counts the two control-transfer positions (`on_error: {fallback: ...}` and
+    # `human.on_timeout:`) alongside edges, which is what makes a dedicated
+    # error-handling node legal rather than an unreachable-node error
+    # (grammar 7.8 / D95). It still needs an outgoing edge of its own: reaching
+    # `end` is how a branch retires (grammar 7.6.3 rule 1).
+    #
+    # `command:` and `args:` may embed ${ENV} references — the whole `exec:`
+    # surface is interpolable (grammar 4.3 class 2 / D92) — while carrying no
+    # CEL (D24).
+    announce_failed:
+      exec:
+        command: "${OPS_BIN}/log-event"
+        args: ["--kind=announce-failed", "--env=${DEPLOY_ENV}"]
+      on_error: skip
 
     # Inline subprocess step. The bound input object is passed to the child as
     # environment variables, upper-snake-cased (`patches` -> `PATCHES`), and the
@@ -204,6 +228,10 @@ flow.triage:
     # error.
     - { from: dispatch, to: verify }
     - { from: announce, to: verify }
+    # `announce_failed` has no INBOUND edge — it is reached through `announce`'s
+    # `on_error: { fallback: ... }` (grammar 7.8) — but it still needs an
+    # outgoing one, so its branch retires at `end` instead of vanishing.
+    - { from: announce_failed, to: end }
     - { from: verify, to: summarize }
     - { from: summarize, to: remember }
     - { from: remember, to: approve }
