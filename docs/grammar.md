@@ -475,18 +475,28 @@ snake_case everywhere for one consistent key style.
 
 ### 3.9 Where schemas appear
 
-| Surface | Kind | Required |
-|---|---|---|
-| `agent.<a>.output` | field map | REQUIRED (PRD 5.2) |
-| `agent.<a>.input` | field map | optional; default string-in (§5.3) |
-| `tool.<t>.input` | field map | REQUIRED (may be `{}`) |
-| `tool.<t>.output` | field map | REQUIRED |
-| `flow.<f>.inputs` | field map | optional (default: no inputs) |
-| `flow.<f>.outputs` | field map | REQUIRED |
-| `human.input` / `human.output` | field map | REQUIRED |
-| inline `exec:` / `http:` node `output` | field map | optional (kind default, §8.2/§8.3) |
-| `state` channels | field map + `reduce` | optional section |
-| `store.<s>.value_schema` / `metadata_schema` | field map | per kind (§11) |
+| Surface | Kind | Required | `{}` legal? |
+|---|---|---|---|
+| `agent.<a>.output` | field map | REQUIRED (PRD 5.2) | no — ≥ 1 property (§5.1) |
+| `agent.<a>.input` | field map | optional; default string-in (§5.3) | no — omit it instead (D62) |
+| `tool.<t>.input` | field map | REQUIRED | yes (no-argument tool) |
+| `tool.<t>.output` | field map | REQUIRED | yes (no result) |
+| `flow.<f>.inputs` | field map | optional (default: no inputs) | yes |
+| `flow.<f>.outputs` | field map | REQUIRED | yes (no result) |
+| `human.input` / `human.output` | field map | REQUIRED | yes |
+| inline `exec:` / `http:` node `output` | field map | optional (kind default, §8.2/§8.3) | yes |
+| `state` channels | field map + `reduce` | optional section | yes (no channels) |
+| `store.<s>.value_schema` / `metadata_schema` | field map | per kind (§11) | yes |
+
+**Emptiness.** An empty field map `{}` is a closed object with no properties
+(§3.1) and is legal at every surface above except the two agent surfaces:
+`agent.output` MUST declare ≥ 1 property because it is what routing reads
+(PRD 5.2, 5.3), and `agent.input: {}` is a compile error because omitting
+`input:` is the way to say "no declared input"
+(Decision [D62](#d62-an-agents-declared-input-has-at-least-one-field)). A
+result surface with no fields is a real contract — a tool whose effect is its
+only purpose, a flow that only writes stores — and it stays type-checkable: such
+a node contributes nothing to state and nothing routable to its edge guards.
 
 ---
 
@@ -520,8 +530,10 @@ Root identifier meanings:
 - **`input`** — the enclosing flow instance's input object (`input.goal`).
 - **`state`** — the state object; only declared channels (§10) are members.
 - **`execution`** — run metadata: `execution.id` (string), `execution.session_key`
-  (string, empty when no session-keyed trigger), `execution.item_index` (integer,
-  present only inside a `map`-dispatched instance).
+  (string; empty when the invocation supplied no session key — a trigger with no
+  `session_key:`, or a CLI run without `--session`, §13.2),
+  `execution.item_index` (integer, present only inside a `map`-dispatched
+  instance).
 - **`payload`** — the trigger payload; shape per trigger type (§13).
 - **`<node>.output`** — a node's node-scoped output object (PRD 5.7 tier 1).
 - **`<as-name>`** — the per-item binding of a `map` (`item` unless renamed with
@@ -806,6 +818,14 @@ The registry entry's signature is checked against `input`/`output` at build; a
 missing registration is a build error, and any composition using a `function`
 binding is flagged as non-portable in `validate` output.
 
+**Empty result schema.** `output: {}` (legal at every result surface except an
+agent's, §3.9) declares a tool with no result: stdout, the response body, or the
+function's return value is **not decoded at all**, and the node contributes
+nothing to state and nothing to its edge guards. The failure signal is still
+observed — a non-zero exit status or a status outside `expect_status` remains a
+node error under §9 — which is what makes a fire-and-forget sink (a queue push,
+a webhook notification) expressible without inventing a placeholder field.
+
 ### 6.2 Policy on tool definitions
 
 Tool definitions carry **no** `retry`/`timeout`/`on_error`. Policy is a property
@@ -835,7 +855,7 @@ flow.review_loop:
     - { from: start, to: write }
     - { from: write, to: review }
     - { from: review, to: write, when: "review.output.verdict == 'revise'", max_iterations: 3 }
-    - { from: review, to: end,   when: "review.output.verdict == 'approve'" }
+    - { from: review, to: end,   else: true }   # escape edge, §7.4
 ```
 
 | Key | Type | Required | Notes |
@@ -887,6 +907,7 @@ edges:
     to: write
     when: "review.output.verdict == 'revise'"
     max_iterations: 3
+  - { from: review, to: end, else: true }   # the escape §7.4 requires
 ```
 
 | Key | Type | Required | Notes |
@@ -895,7 +916,7 @@ edges:
 | `to` | node id \| `end` | yes | |
 | `when` | CEL (bool) | no | guard over the source node's output (§4.1) |
 | `else` | `true` | no | marks the default edge; mutually exclusive with `when`. `true` is the only legal value — `else: false` says nothing (an unguarded edge is already unconditional) and is a compile error |
-| `max_iterations` | integer 1..1000 | no | cycle bound (PRD 5.4) |
+| `max_iterations` | integer 1..1000 | no | cycle bound (PRD 5.4); the source node then also needs an unconditional or `else:` edge leaving the cycle (§7.4) |
 
 Self-edges (`from == to`) are legal and form a one-node SCC, which must be
 bounded like any other cycle. Duplicate edges (same `from`, `to`, `when`) are a
@@ -953,9 +974,21 @@ Back-edges are permitted (PRD 5.4). The compiler computes SCCs and requires:
   makes the loop provably finite, which is why the examples in this document use
   it.
 - **Escape**: the source node of each `max_iterations`-carrying edge MUST have at
-  least one outgoing edge that leaves the SCC, so exhausting the budget cannot
-  dead-end the execution (Decision [D19](#d19-max_iterations-semantics-and-the-escape-edge-rule)).
-  Clause 2 already requires such an edge by construction.
+  least one outgoing edge that (a) leaves the SCC **and** (b) is unconditional
+  (no `when:`, no `else:`) or carries `else: true`. Both halves are load-bearing,
+  and (b) is what makes the guarantee hold: an unconditional escape fires on
+  every pass, and an `else:` escape fires whenever no guarded sibling was *taken*
+  — which includes the pass where the budget runs out, because an exhausted edge
+  is not taken (§7.3 rule 5) and so cannot suppress it (§7.3 rule 4). Exhausting
+  a budget therefore always leaves the cycle instead of dead-ending on §7.3
+  rule 7. A **guarded** escape is not enough: with
+  `when: "…verdict == 'approve'"` as the only way out, the pass that exhausts the
+  budget while that guard is false takes no edge at all. A bounded edge whose
+  source has no escape of this form is a compile error naming the edge
+  (Decision [D19](#d19-max_iterations-semantics-and-the-escape-edge-rule)).
+  Clause 2's exit edge satisfies (a) but is guarded, so it does not by itself
+  satisfy (b): a CEL-bounded SCC that *also* carries `max_iterations` must still
+  provide the unconditional or `else:` escape.
 
 `max_iterations` counts **traversals of that edge within one flow instance**.
 Instances of the same flow (including `map`-dispatched ones) count independently.
@@ -993,7 +1026,9 @@ boundaries are checkpoint/resume points.
 1. an explicit `input:` binding for that field, if present;
 2. otherwise the state channel of the same name (§10);
 3. otherwise the enclosing flow input of the same name;
-4. otherwise a compile error naming the unbound field.
+4. otherwise the field's own `default:`, if it declares one — such a field is
+   optional at its surface (§3.6), so it never forces a binding;
+5. otherwise a compile error naming the unbound field.
 
 ```yaml
 review:
@@ -1004,7 +1039,7 @@ review:
 ```
 
 Explicit `input:` MUST bind a subset of the target's declared input fields;
-unbound fields fall through to steps 2–4. For string-in agents the scalar form
+unbound fields fall through to steps 2–5. For string-in agents the scalar form
 `input: "input.goal"` is used (§5.3). On `flow:` nodes `input:` is REQUIRED when
 the subflow declares inputs (PRD 5.7 `passVariables` discipline). On `map` nodes
 the per-item binding lives inside the `map:` block instead (§8.6).
@@ -1233,7 +1268,7 @@ dispatch:
 | `on_item_error` | `fail` \| `skip` \| `retry` | no | `fail` | per item (PRD 5.6) |
 | `input` | map field→CEL | no | whole item | per-item input binding |
 | `writes` | map output-field→channel | no | name-based | target channels MUST be reduced |
-| `detach` | boolean | no | `false` | fire-and-forget dispatch |
+| `detach` | boolean | homogeneous form only | `false` | fire-and-forget dispatch; ILLEGAL as a map-block key alongside `route_by:` — declare it per route instead (rule 7) |
 
 A **route** object takes `node` (required) plus optional `max_concurrency`,
 `input`, `writes`, `detach` — same meanings, scoped to that route. A route's
@@ -1264,7 +1299,13 @@ A **route** object takes `node` (required) plus optional `max_concurrency`,
 6. **Join**: the downstream edge is the barrier — it fires when all instances
    have completed or been resolved by `on_item_error`. Sink routes are waited on
    like any other route.
-7. **`detach`**: a detached route is fire-and-forget. A detached route MUST NOT
+7. **`detach`**: a detached dispatch is fire-and-forget. It is declared in
+   exactly two positions — as a map-block key on the **homogeneous** form
+   (`node:`), or on an individual **route** — and a map block that declares
+   `route_by:` MUST NOT declare a map-level `detach:`
+   (Decision [D31](#d31-detach-rules)): the routes of a heterogeneous map are
+   independently typed dispatch targets, so a blanket value would silently
+   detach sinks that were written to be joined. A detached dispatch MUST NOT
    declare `writes:` and MUST NOT write reduced state. In v0, `detach: true` is a
    validation error under any target whose execution state is durably
    checkpointed — every target except `local` (§14) — pointing at the roadmap
@@ -1551,9 +1592,16 @@ store.docs:
   substitutes local storage for every store unconditionally (PRD 5.8).
 - An alias referenced by a store but undefined in the active target is a compile
   error naming the target.
-- `scope: session` requires the execution to have a session identity: using a
-  session-scoped store in a flow whose triggers declare no `session_key:` is a
-  compile error (PRD 5.8, 5.11).
+- `scope: session` requires the execution to have a session identity, and that
+  identity comes from the trigger. The check quantifies over **declared**
+  triggers (§13): a declared `http`, `schedule`, or `event` trigger whose target
+  flow reaches a session-scoped store — through its own nodes, through a `flow:`
+  node, or through an agent's `stores:` list — MUST declare `session_key:`, or it
+  is a compile error naming the trigger and the store (PRD 5.8, 5.11).
+  `manual` triggers, declared or implicit, carry `session_key: "payload.session"`
+  by default (§13.2) and therefore satisfy the check statically; supplying the
+  value is a run-time requirement (`--session`), checked at run start like
+  env-ref presence (§4.3) rather than at validate time.
 
 ### 11.4 Store-op nodes
 
@@ -1576,6 +1624,13 @@ store's `value_schema` object; `M` its `metadata_schema` object.
 
 Rules (PRD 5.8):
 
+- The parameter list of a row is **exact**: a parameter the op does not take is
+  an error, exactly like an unknown key
+  (Decisions [D34](#d34-the-store-op-catalog-is-normative-including-derived-output-schemas),
+  [D50](#d50-unknown-keys-are-errors-everywhere-except-plugin-config-objects)).
+  `op: get` with `top_k:` is rejected, not ignored. Because `op:` is a literal in
+  the node itself, this is decidable per file and the published JSON Schema
+  enforces it too (Appendix B).
 - `value` on a `kv` `set` is schema-checked against `value_schema`; `filter` and
   `metadata` keys are schema-checked against `metadata_schema`.
 - Store ops are **effects**: reads are recorded and replay consumes history, not
@@ -1710,9 +1765,34 @@ Rules (PRD 5.9):
 
 ## 13. Triggers
 
-Triggers define what causes an execution to exist; the entrypoints of a project
-are exactly the flows its triggers point at (PRD 5.11). There is no `entrypoint:`
-key.
+Triggers define what causes an execution to exist. The `triggers:` section
+declares them, and the entrypoints of a project — the surface a deployment
+exposes — are exactly the flows its **declared** triggers point at (PRD 5.11).
+There is no `entrypoint:` key.
+
+**One entry exists without being declared.** PRD 5.11 also makes `manual`
+invocation universal, so **every flow is runnable from the CLI** —
+`agent-compose run flow.<name> [--input k=v ...] [--session <key>]` — whether or
+not a `manual` trigger names it. (The PRD states this for every flow *with an
+input schema*, which is where `--input` has anything to bind; a flow with no
+`inputs:` takes no `--input` arguments and is otherwise identical.) Writing the
+`manual` trigger out, as [`examples/review-loop`](../examples/review-loop) does,
+documents the intended entry and lets it carry a `description:` or a
+`session_key:` remap; it neither enables nor restricts anything the CLI would
+otherwise do
+(Decision [D64](#d64-implicit-manual-invocation-is-a-cli-property-not-a-declared-trigger)).
+
+Implicit invocation is **not** a trigger, and the difference is normative:
+
+- it contributes no entry to the IR's trigger table and has no name;
+- every rule that quantifies over triggers — input-binding compatibility
+  (§13.1), session coherence (§11.3), `respond: sync` interrupt-freedom (§13.3),
+  `event` source binding (§13.5) — quantifies over **declared** triggers only;
+- a flow that no declared trigger names is still a complete, legal definition:
+  it is reachable through the CLI, through `flow:` nodes, and through
+  flow-as-tool attachment, so there is no unreachable-*flow* error. Unreachable
+  *node* analysis (PRD §7 M0) is per flow, computed from that flow's `start`
+  pseudo-node, and is unaffected by which flows have triggers.
 
 ```yaml
 # triggers.yml
@@ -1742,13 +1822,25 @@ Every trigger has `type` and `flow`.
 |---|---|---|---|
 | `type` | `manual` \| `http` \| `schedule` \| `event` | yes | |
 | `flow` | `flow.*` ref | yes | the execution's entry module |
-| `input` | map flow-input-field→CEL over `payload` | per type | compile-checked against the flow's `inputs` |
-| `session_key` | CEL over `payload` → string | no | supplies session identity for session-scoped stores and history (PRD 5.8) |
+| `input` | map flow-input-field→CEL over `payload` | `http`/`schedule`/`event` only | ILLEGAL on `manual` (§13.2); compile-checked against the flow's `inputs` |
+| `session_key` | CEL over `payload` → string | no (on `manual`, defaults to `"payload.session"`) | supplies session identity for session-scoped stores and history (PRD 5.8) |
 | `description` | string | no | |
 
-Every REQUIRED field of the target flow's `inputs` MUST be bound by `input:`
-(directly or by a schema default); a binding that can produce a value the flow
-cannot accept is a compile error (PRD 5.11).
+**Input binding.** `input:` is legal on `http`, `schedule`, and `event` triggers
+and ILLEGAL on `manual` ones
+(Decision [D44](#d44-manual-triggers-carry-no-input-bindings)). Where it is
+legal, it is compile-checked against the target flow's `inputs` (PRD 5.11):
+
+- every field the flow declares as REQUIRED — one with no `default:`, §3.6 —
+  MUST be bound; a field with a `default:` MAY be omitted and takes its default;
+- a binding for a field the flow does not declare, or whose CEL result type the
+  field cannot accept, is a compile error.
+
+A `manual` trigger binds nothing, so there is nothing to check at compile time.
+The identical check runs against the `--input k=v` arguments at run start,
+against the same flow input schema (§13.2) — the one place this check is
+deferred, for the same reason env-ref presence is (§4.3): the values do not exist
+until the command runs.
 
 ### 13.2 `manual` (active in v0)
 
@@ -1760,9 +1852,21 @@ cli:
 
 CLI/SDK invocation: `agent-compose run flow.review_loop --input goal=...`. A
 manual trigger MUST NOT declare `input:` — CLI arguments are validated directly
-against the flow's input schema
-(Decision [D44](#d44-manual-triggers-carry-no-input-bindings)). `session_key:` is
-legal (the CLI supplies `--session <key>`, exposed as `payload.session`).
+against the flow's input schema, at run start
+(Decision [D44](#d44-manual-triggers-carry-no-input-bindings)). An unknown
+argument name, a missing REQUIRED field, or a value that does not fit the
+declared type fails the run naming the field; fields with a `default:` (§3.6) may
+be omitted.
+
+`session_key:` is legal and defaults to `"payload.session"`. The manual payload
+has exactly one member — `payload.session`, the CLI's `--session <key>` — so a
+manual trigger always has a session identity available, which is what makes the
+session-coherence check of §11.3 satisfiable without a binding. Supplying the
+value is a run-time requirement: `--session` is mandatory for a run whose flow
+reaches a session-scoped store, and omitting it fails at start naming the store.
+
+Declaring a manual trigger is optional: the same CLI entry, with the same
+defaulted `session_key:`, exists implicitly for every flow (§13 preamble).
 
 ### 13.3 `http` (active in v0)
 
@@ -1939,6 +2043,18 @@ Every entry is a place the PRD left the *grammar shape* open. Semantics stay
 inside what the PRD settles; the cross-reference names the section each decision
 must remain consistent with.
 
+Two entries are different in kind and are labelled **PRD-extending**:
+[D37](#d37-agent_access-narrows-the-synthesized-store-tool-surface) and
+[D51](#d51-agents-carry-max_tool_iterations-default-8) each add a key answering a
+question the PRD does not ask. They are consistent with the sections they cite
+and neither contradicts a settled position, but they are *new design surface*,
+not shape decisions — so under CLAUDE.md's PRD discipline each must land in the
+PRD's Open Questions and be resolved there before the affected area (store tool
+synthesis; the agent tool loop) is implemented. If either is declined, dropping
+it from this document costs one key and one default; nothing else in the grammar
+depends on them. No other entry in this appendix introduces a construct the PRD
+does not already imply.
+
 ### D1. Imports are entrypoint-only and non-transitive
 
 Only the entrypoint may declare `imports:`; an imported file that declares
@@ -2081,10 +2197,16 @@ require an `else:` or an unconditional edge to avoid a dead end. *PRD 5.3.*
 
 The budget counts traversals of one edge within one flow instance; an exhausted
 edge is untraversable; the source node of a bounded edge MUST have an outgoing
-edge that leaves the SCC. **Rationale**: PRD 5.4 requires bounded cycles, but a
-bound with no escape merely converts an infinite loop into a runtime dead end.
-Per-instance counting keeps `map`-dispatched subgraph instances independent.
-*PRD 5.4, 5.6.*
+edge that leaves the SCC *and* is unconditional or `else: true`.
+**Rationale**: PRD 5.4 requires bounded cycles, but a bound with no escape merely
+converts an infinite loop into a runtime dead end. Requiring merely *an* exit
+edge does not remove that dead end — if the exit is guarded, the pass that
+exhausts the budget with a false guard takes no edge and fails on §7.3 rule 7 —
+so the rule names the two edge forms that are guaranteed to fire when the budget
+runs out. `else: true` is the usual spelling, and it doubles as the exhaustive
+route for the enum variant that leaves the loop (§7.3.1), so the constraint costs
+an author one keyword, not an extra edge. Per-instance counting keeps
+`map`-dispatched subgraph instances independent. *PRD 5.4, 5.6.*
 
 ### D20. The policy resolution chain has exactly four levels
 
@@ -2183,11 +2305,18 @@ common single-unrouted-variant case fully typed (as in
 
 ### D31. `detach` rules
 
-Legal on routes and on the homogeneous form; a detached dispatch MUST NOT declare
-`writes:` or write reduced state, and `detach: true` under a durably checkpointed
-target is a v0 validation error (D59 fixes which targets those are).
-**Rationale**: verbatim from PRD 5.6's settled position on detach under durable
-execution; idempotency keys are supplied automatically. *PRD 5.6.*
+Legal in exactly two positions — as a map-block key on the homogeneous form, and
+on an individual route — so a map block carrying `route_by:` may not carry a
+map-level `detach:` (§8.6 rule 7). A detached dispatch MUST NOT declare `writes:`
+or write reduced state, and `detach: true` under a durably checkpointed target is
+a v0 validation error (D59 fixes which targets those are).
+**Rationale**: the restrictions are verbatim from PRD 5.6's settled position on
+detach under durable execution; idempotency keys are supplied automatically.
+Confining the key to those two positions removes the only reading question the
+shape raises — whether a map-level `detach: true` means "detach every route" or
+"detach the routes that do not say otherwise" — and it costs nothing, since the
+routed form is precisely the one whose targets are heterogeneous enough that
+"all of them" is rarely meant. *PRD 5.6.*
 
 ### D32. Reduce policies are typed and `last_wins` is explicit
 
@@ -2224,10 +2353,16 @@ capability checks are about structured output. *PRD 5.8, 5.9.*
 
 ### D37. `agent_access` narrows the synthesized store tool surface
 
+**PRD-extending** — see this appendix's preamble.
+
 Default `read_write`, narrowable to `read`. **Rationale**: PRD 5.8 synthesizes
 `get`/`set` pairs, so `read_write` is the settled default; a declarative way to
 withhold writes costs one enum and serves the same least-privilege posture as
-placement isolation. *PRD 5.8, 5.10.*
+placement isolation. **Status**: the PRD asks no least-privilege question about
+store attachment, and this key changes which tools codegen synthesizes, so it is
+new design surface rather than a shape choice — it needs PRD ratification before
+M1 synthesizes those tools. Declining it removes one optional key and the `read`
+column of §11.5. *PRD 5.8, 5.10.*
 
 ### D38. Provider kinds are a closed v0 set with per-kind required keys
 
@@ -2278,8 +2413,11 @@ already restricts `route_by` for the same reason. *PRD 5.6.*
 
 **Rationale**: PRD 5.11 defines manual invocation as `--input k=v` validated
 against the flow's input schema; a second binding layer would create two ways to
-supply the same values. `session_key:` remains legal so CLI runs can join a
-session. *PRD 5.11.*
+supply the same values. The compatibility check §13.1 states for the other
+trigger types is not dropped, only deferred to run start, where the arguments
+exist. `session_key:` remains legal — and defaults to `"payload.session"` — so
+CLI runs can join a session and so §11.3's session-coherence check has a static
+answer for manual entries (D64). *PRD 5.11.*
 
 ### D45. `http` trigger defaults: path, method, `respond: async`, `timeout: 60s`
 
@@ -2324,9 +2462,15 @@ event-source configs) are exactly the objects whose schemas live in plugins.
 
 ### D51. Agents carry `max_tool_iterations`, default 8
 
+**PRD-extending** — see this appendix's preamble.
+
 **Rationale**: PRD 5.4 bounds graph cycles statically; the intra-agent tool loop
 is the one remaining unbounded loop in a compiled graph, and a declarative bound
-keeps termination reasoning complete. *PRD 5.4, 5.5.*
+keeps termination reasoning complete. **Status**: PRD 5.4 is about *graph*
+cycles and says nothing about the tool loop, so both the bound and its default
+are new design surface and need PRD ratification before M1 emits the loop.
+Declining it removes one optional key; the loop then relies on whatever bound the
+runtime imposes. *PRD 5.4, 5.5.*
 
 ### D52. `human` node shape
 
@@ -2444,6 +2588,27 @@ type-checker rule and one reserved name (`item`, §2.5); a bare root would also
 have to be reserved as a channel name to stay unambiguous, for no gain. *PRD
 5.6, 5.7.*
 
+### D64. Implicit `manual` invocation is a CLI property, not a declared trigger
+
+Every flow is runnable as `agent-compose run flow.<name>` without a `manual`
+trigger being declared. The implicit entry contributes no `triggers:` entry and
+no IR record; every check that quantifies over triggers quantifies over declared
+ones; `manual` triggers default `session_key:` to `"payload.session"`; and a CLI
+run's `--input`/`--session` values are checked at run start against the same
+schemas a declared trigger's bindings would be checked against.
+**Rationale**: PRD 5.11 carries two settled statements — "the entrypoints of a
+project are exactly the flows that triggers point at" and "**`manual`** (v0) …
+Implicit for every flow with an input schema". Read as one rule they collide:
+every flow with inputs would be an entrypoint, which empties the first statement,
+and §11.3's session-coherence check would have to reckon with an implicit,
+session-key-less trigger on every flow — rejecting every project that touches a
+session-scoped store. Splitting them by surface keeps both intact: declared
+triggers define the *deployed* surface (generated routes, schedulers, IR entries,
+and everything checked against it), while implicit manual invocation is a
+*development* affordance of the generated CLI. Defaulting the one variable input
+a CLI run carries — the session key — is what keeps the coherence check decidable
+rather than undefined. *PRD 5.11, 5.8.*
+
 ---
 
 ## Appendix B — Editor integration
@@ -2477,10 +2642,16 @@ authority. The schema cannot see across files, so it does not check:
   compatibility, sync-trigger interrupt-freedom, store schema/keying rules,
   session coherence, provider settings/capability checks, env-ref presence,
   unreachable nodes, undefined channels;
-- context-sensitive schema rules such as "`max_items` is required inside an
-  agent output" — which the schema *does* enforce where the surface is
-  syntactically identifiable (agent `output`, `map` sources are checked by the
-  validator).
+- context-sensitive schema rules whose surface is not syntactically identifiable
+  in one file. `max_items` is the example of the split: inside `agent.output`,
+  `tool.output`, `flow.outputs`, `human.output`, and store schemas the surface is
+  a named key, so the schema *does* require it (§3.5 clause 1); as the target of
+  a `map.over` path (§3.5 clause 2) it depends on resolving a path through other
+  files, so only the validator can require it there.
+
+What the schema *does* enforce beyond plain shape, because `op:`, `type:`, and
+`route_by:` are literals in the same object: store-op parameter sets per `op`
+(§11.4), trigger keys per `type` (§13), and the map form rules (§8.6).
 
 A file that passes the schema and fails `validate` is normal and expected; a file
 that fails the schema always fails `validate`.
@@ -2537,12 +2708,19 @@ model.<name>:    { route: [model.<a>, model.<b>], route_on: [...] }
 { flow: flow.<f>,    input: <bindings>, writes: {...}, context: isolated|inherit,
                      policy: {...},                    # for the nodes inside
                      retry/timeout/on_error }          # for the instance itself
-{ exec: { command, args?, cwd?, env?, output? },  input: <bindings> }
-{ http: { method, url, headers?, query?, body?, expect_status?, output? } }
-{ human: { input, output, timeout?, on_timeout? }, input: <bindings> }
-{ store: store.<s>, op: <op>, key?/value?/query?/top_k?/prefix?/limit?/filter? }
+{ exec: { command, args?, cwd?, env?, output? },  input: <bindings>, writes: {...} }
+{ http: { method, url, headers?, query?, body?, expect_status?, output? },
+                     input: <bindings>, writes: {...} }
+{ human: { input, output, timeout?, on_timeout? }, input: <bindings>, writes: {...} }
+{ store: store.<s>, op: <op>,     # params are exactly the op's row (11.4):
+                     # get/delete: key | set: key,value | list: prefix?,limit
+                     # search: query,top_k,filter? | upsert: key,value,metadata?
+                     # put: key,value,content_type?
+                     writes: {...} }
 { map: { over, as?, node | (route_by + routes + default?),
-         max_concurrency, on_item_error?, input?, writes?, detach? } }
+         max_concurrency, on_item_error?, input?, writes?,
+         detach? } }               # detach: homogeneous form or per route only
+# route: { node, max_concurrency?, input?, writes?, detach? }
 
 # ---- deploy file ------------------------------------------------------------
 version: "0.1"
