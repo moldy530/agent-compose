@@ -173,3 +173,19 @@ pub struct UnionVariant {
     /// the compiler synthesizes that as a string constant equal to the tag.
     pub fields: FieldMap,
 }
+
+impl FieldMap {
+    /// The field declared under this name, if the map declares one.
+    #[must_use]
+    pub fn field(&self, name: &str) -> Option<&Field> {
+        self.fields
+            .iter()
+            .find(|field| field.name.value.as_str() == name)
+    }
+
+    /// Whether the map declares no fields (`{}`, grammar 3.1).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.fields.is_empty()
+    }
+}
