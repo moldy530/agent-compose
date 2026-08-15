@@ -933,8 +933,20 @@ exec:
 Input/output convention (PRD 5.5): an object input is passed as environment
 variables (`UPPER_SNAKE_CASE` of each field, JSON-encoded for non-scalars); a
 string input is passed on stdin. The child's **stdout** is decoded as JSON and
-validated against `output`, except when `output` declares exactly one
-string-typed property, in which case trimmed raw stdout binds to it.
+validated against `output`, except when `output` declares **exactly one property
+and that property is string-typed**, in which case trimmed raw stdout binds to
+it.
+
+**The count is over the whole declared property set**, never over its
+string-typed members alone (Decision
+[D109](#d109-the-single-string-property-exception-counts-the-whole-property-set)).
+`output: { text: { type: string } }` takes raw stdout;
+`output: { text: { type: string }, count: { type: integer } }` declares two
+properties, so stdout is decoded as JSON and both fields are read out of it. The
+other reading — "exactly one of the properties is string-typed" — binds one
+field from the raw stream and leaves every field beside it with no source at
+all, and makes a tool's decoding turn on the *types* of the fields the exception
+does not bind.
 
 That single-string-property exception is a **`tool.*`-surface rule**. A tool
 declares a *domain* result and has no other way to name raw text, so the
@@ -986,9 +998,11 @@ http:
 Without `body`/`query`, the bound input object is sent as the JSON body
 (body-bearing methods) or as query parameters (`GET`/`HEAD`). The response body
 is decoded as JSON and validated against `output`, except when `output` declares
-exactly one string-typed property, in which case the raw response text binds to
-it — the same `tool.*`-surface exception the `exec` binding carries above, and
-inapplicable on inline nodes for the same reason (D91). A status outside
+exactly one property and that property is string-typed, in which case the raw
+response text binds to it — the same `tool.*`-surface exception the `exec`
+binding carries above, counted the same way over the whole property set
+([D109](#d109-the-single-string-property-exception-counts-the-whole-property-set)),
+and inapplicable on inline nodes for the same reason (D91). A status outside
 `expect_status` is a node error subject to §9, and a status
 inside it completes the node — `expect_status: [200, 404]` makes a 404 routable
 data rather than a failure, exactly as `expect_exit` does for an exit code
@@ -3573,8 +3587,10 @@ literal (no CEL) because PRD 5.5 specifies input passing by env vars/stdin.
 **Rationale**: the description is the LLM's selection signal (PRD 5.5), the input
 is the checked signature for function-node use, and the output is what makes the
 edge serializable (PRD 5.2, 5.7). Two bindings would make the call semantics
-ambiguous. Result decoding (JSON, or raw text into a single string field) is
-specified so `output` is always honored. *PRD 5.5.*
+ambiguous. Result decoding (JSON, or raw text where the whole `output` is one
+string-typed property —
+[D109](#d109-the-single-string-property-exception-counts-the-whole-property-set))
+is specified so `output` is always honored. *PRD 5.5.*
 
 ### D26. Flow defs: outputs required, description when tool, no recursion
 
@@ -4499,8 +4515,10 @@ it can carry a budget and still cannot serve as any rule's guarantee. *PRD 5.3,
 
 ### D91. The single-string-property decode exception is a `tool.*`-surface rule
 
-§6.1's "except when `output` declares exactly one string-typed property, in which
-case the raw text binds to it" applies to `tool.*` `exec:`/`http:` bindings only.
+§6.1's "except when `output` declares exactly one property and that property is
+string-typed, in which case the raw text binds to it" —
+[D109](#d109-the-single-string-property-exception-counts-the-whole-property-set)
+fixes what that counts — applies to `tool.*` `exec:`/`http:` bindings only.
 On an inline `exec:`/`http:` node, every non-envelope declared field is decoded
 as JSON unconditionally (§8.2, §8.3).
 **Rationale**: §8.2 said the exception was "computed over the decoded fields
@@ -4519,10 +4537,10 @@ exception exists at all and why it stays there. Keeping it on both surfaces was
 the alternative and is worse in both directions: it would make
 `{ report_normalized: {type: string} }` on an inline node mean "the whole
 response body", which no author writing a field name means, and it would make a
-node's decoding depend on how many of its *other* fields happen to be strings —
-adding `id: {type: string}` beside a lone `status:` would silently stop the body
-from being parsed. One rule per surface, each justified by what that surface can
-name. *PRD 5.5.*
+node's decoding depend on how many *other* fields it declares — a lone
+`{ id: {type: string} }` would take the whole raw body, and adding a second
+field beside it would silently start parsing. One rule per surface, each
+justified by what that surface can name. *PRD 5.5.*
 
 ### D92. The env-ref classification is total over string surfaces
 
@@ -5021,6 +5039,39 @@ unescaped when it starts the string or follows one character that is not the
 `$` of `$${`, which is what the lookbehind asserted. The reason to record the
 choice is that the lookbehind reads better and a future editor would otherwise
 restore it as a simplification. *PRD 5.2, 5.12, G3.*
+
+### D109. The single-string-property exception counts the whole property set
+
+§6.1's raw-decode exception applies when a `tool.*` binding's `output` declares
+**exactly one property and that property is string-typed**; the count is over
+the whole declared property set, never over its string-typed members alone
+(§6.1, both bindings).
+**Rationale**: the clause read "declares exactly one string-typed property",
+which is two sentences at once — "declares one property, and it is a string" and
+"exactly one of its properties is a string". They disagree about
+`output: { text: {type: string}, count: {type: integer} }`: the first decodes
+stdout as JSON and reads both fields out of it, the second binds raw stdout to
+`text` and leaves `count` with no source at all. One tool definition, two
+runtime results — the same divergence
+[D91](#d91-the-single-string-property-decode-exception-is-a-tool-surface-rule)
+closed for the question of *which surface* the exception applies to, left open
+one clause earlier for *when* it applies.
+
+The whole-set reading is the one the exception's own justification supports. D91
+keeps the exception on `tool.*` because a tool "has no other way to name raw
+text" — an account of an output that *is* the text, which is one property, not
+of a schema that happens to carry one string beside three integers. The other
+reading has no answer for the fields it does not bind: the JSON that would have
+populated them was never parsed, so they would have to be dropped, defaulted
+(`default:` is illegal on a result surface, §3.6), or the call failed — three
+further readings inside the reading. It would also make decoding turn on the
+types of the fields the exception does *not* bind, so adding
+`count: {type: integer}` beside a string field would silently switch stdout from
+raw to parsed: the "decoding depends on the siblings" hazard D91 rejects a whole
+surface over. Nothing static changes — both shapes are legal tool definitions
+under either reading, so this fixes what a conforming implementation *does*, not
+what it accepts, and there is nothing here for the published schema or a
+negative fixture to reject. *PRD 5.5, G3.*
 
 ---
 

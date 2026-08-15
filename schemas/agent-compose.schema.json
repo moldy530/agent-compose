@@ -876,7 +876,7 @@
       "items": { "type": "integer", "minimum": 100, "maximum": 599 }
     },
     "execImpl": {
-      "description": "Subprocess binding. An object input is passed as environment variables; a string input is passed on stdin; stdout is decoded as JSON against `output`, or bound raw into a single string field - a tool-surface exception that inline exec/http nodes do not share (Decision D91). An exit status outside `expect_exit` is a node error. Grammar 6.1.",
+      "description": "Subprocess binding. An object input is passed as environment variables; a string input is passed on stdin; stdout is decoded as JSON against `output`, or bound raw when `output` declares exactly one property and that property is string-typed - the count is over the whole property set (Decision D109), and the exception is tool-surface only, so inline exec/http nodes never take it (Decision D91). An exit status outside `expect_exit` is a node error. Grammar 6.1.",
       "type": "object",
       "required": ["command"],
       "properties": {
@@ -897,7 +897,7 @@
       "additionalProperties": false
     },
     "httpImpl": {
-      "description": "HTTP binding. Without `body`/`query` the bound input object is sent as the JSON body (body-bearing methods) or as query parameters. The response is decoded as JSON against `output`, or bound raw into a single string field - a tool-surface exception that inline exec/http nodes do not share (Decision D91). Grammar 6.1.",
+      "description": "HTTP binding. Without `body`/`query` the bound input object is sent as the JSON body (body-bearing methods) or as query parameters. The response is decoded as JSON against `output`, or bound raw when `output` declares exactly one property and that property is string-typed - the count is over the whole property set (Decision D109), and the exception is tool-surface only, so inline exec/http nodes never take it (Decision D91). Grammar 6.1.",
       "type": "object",
       "required": ["method", "url"],
       "properties": {
