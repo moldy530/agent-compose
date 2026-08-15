@@ -24,17 +24,54 @@
 //! What it deliberately leaves alone:
 //!
 //! * **`imports:` is a list of strings.** Following it is the resolver's job;
-//!   the parser only rejects the shapes grammar 1.4 calls parse errors
-//!   (absolute paths, URLs, globs, non-`.yml` files).
+//!   the parser only rejects the shapes grammar 1.4 calls parse errors —
+//!   absolute paths, URLs, globs, non-`.yml` files, and a path outside the
+//!   portable segment charset the same section fixes (Decision D80).
 //! * **References are not resolved.** `model: model.smart` is checked for
 //!   *namespace* — the grammar's "expected a `model.*` reference, found
 //!   `tool.web_search`" — but whether `model.smart` exists is a cross-file
 //!   question.
 //! * **CEL stays raw.** Its roots depend on the surface and its types on the
-//!   resolved schemas (grammar 4.1).
+//!   resolved schemas (grammar 4.1). Rules that turn on what an expression
+//!   *reads* rather than on its shape are the validator's for the same reason:
+//!   a `method: GET` trigger reading through `payload.body` (grammar 13.3,
+//!   Decision D117), and the item-derivation of a store key (grammar 11.4,
+//!   Decision D83).
 //! * **Nothing graph-shaped.** Exhaustiveness, SCC termination, fan-out
-//!   bounding through a `map.over` path, reducer-write rules, reachability:
-//!   all need the whole composition.
+//!   bounding through a `map.over` path, `map.over` dominance, reducer-write
+//!   rules, the injectivity of a node's effective write map, balanced
+//!   convergence, and both reachability relations all need more than a key and
+//!   its value.
+//!
+//! # Where the line falls, and why
+//!
+//! The grammar's own conformance language draws it: a *parse error* is a
+//! rejection "before resolution", a *compile error* is anything `validate`
+//! refuses. So the question this pass asks of every rule is **does deciding it
+//! need another file** — not whether the published schema happens to express
+//! it. Appendix B's "the validator owns it" marks the rules JSON Schema cannot
+//! reach, and several of those need nothing but the file in hand:
+//!
+//! * `optional:` entries naming declared properties (grammar 3.4, Decision
+//!   D89) — one type node's own two keys;
+//! * a `when:`-guarded sibling for every `else: true` edge (grammar 7.3,
+//!   Decision D107) — two items of one `edges:` array.
+//!
+//! Both are decided here. Being stricter than the schema is always safe: the
+//! invariant Appendix B closes with is one-directional, so a file the schema
+//! rejects must fail `validate`, and never the reverse.
+//!
+//! Grammar 7.6.3's three no-dead-end rules then split on the same question.
+//! Rule 2 — some edge leaving `start` is unconditional or carries `else: true`
+//! — is stated over the `edges:` array, which is one value, so it is decided
+//! here. Its two siblings are not: "every node has an outgoing edge" and the
+//! `on_error: skip` escape each relate an edge to a *node*, which is the graph
+//! the validator builds.
+//!
+//! The rules that stay out are the ones that genuinely need more: a
+//! `method: GET` trigger reading through `payload.body` (Decision D117) needs
+//! the CEL grammar rather than a regex over the string, and the item-derivation
+//! of a store key (Decision D83) is a path through map bindings in other files.
 //!
 //! # Recovery
 //!
