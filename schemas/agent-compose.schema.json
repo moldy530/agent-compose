@@ -858,11 +858,18 @@
       ]
     },
     "expectExit": {
-      "description": "Accepted exit statuses (default [0]). An exit outside the list is a node error subject to the retry/on_error chain; one inside it completes the node, so `expect_exit: [0, 1]` is how a command whose 1 means \"no match\" or \"tests failed\" becomes routable data. Non-empty: an empty list would accept no outcome at all, making every run an error. Grammar 6.1 / Decision D84.",
+      "description": "Accepted exit statuses (default [0]). An exit outside the list is a node error subject to the retry/on_error chain; one inside it completes the node, so `expect_exit: [0, 1]` is how a command whose 1 means \"no match\" or \"tests failed\" becomes routable data. Non-empty and distinct-membered: an empty list would accept no outcome at all, making every run an error, and membership is a set test, so a repeated member changes nothing (grammar 6.1 / Decisions D84, D100).",
       "type": "array",
       "minItems": 1,
       "uniqueItems": true,
       "items": { "type": "integer", "minimum": 0, "maximum": 255 }
+    },
+    "expectStatus": {
+      "description": "Accepted response status codes (default: any 2xx). A status outside the list is a node error subject to the retry/on_error chain; one inside it completes the node, so `expect_status: [200, 404]` is how a 404 becomes routable data. Non-empty and distinct-membered, on the same rule `expect_exit` obeys - the two keys are one construct on two surfaces (grammar 6.1 / Decisions D84, D100).",
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "type": "integer", "minimum": 100, "maximum": 599 }
     },
     "execImpl": {
       "description": "Subprocess binding. An object input is passed as environment variables; a string input is passed on stdin; stdout is decoded as JSON against `output`, or bound raw into a single string field - a tool-surface exception that inline exec/http nodes do not share (Decision D91). An exit status outside `expect_exit` is a node error. Grammar 6.1.",
@@ -914,10 +921,7 @@
           "additionalProperties": { "$ref": "#/$defs/cel" }
         },
         "expect_status": {
-          "description": "Accepted response status codes (default: any 2xx).",
-          "type": "array",
-          "minItems": 1,
-          "items": { "type": "integer", "minimum": 100, "maximum": 599 }
+          "$ref": "#/$defs/expectStatus"
         }
       },
       "additionalProperties": false,
@@ -1123,10 +1127,7 @@
               "additionalProperties": { "$ref": "#/$defs/cel" }
             },
             "expect_status": {
-              "description": "Accepted response status codes (default: any 2xx).",
-              "type": "array",
-              "minItems": 1,
-              "items": { "type": "integer", "minimum": 100, "maximum": 599 }
+              "$ref": "#/$defs/expectStatus"
             },
             "output": {
               "description": "Result schema (default: { status: integer, body: string }). `status` and `body` are envelope fields bound from the response itself, with fixed types; every other field is decoded from the response body as JSON, unconditionally - §6.1's single-string-property exception is a tool-surface rule and does not apply here, because the raw response text already has a name on this surface (Decision D91). This is one of the seven RESULT surfaces, so every array inside it must declare `max_items` and `default:` is illegal (grammar 3.5, 3.6 / Decision D96). Grammar 8.3.",

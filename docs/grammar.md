@@ -892,7 +892,7 @@ exec:
 | `args` | array of string (interpolable) | no | literal argv entries: no CEL (D24), env refs legal (§4.3) |
 | `cwd` | string (interpolable) | no | |
 | `env` | map env-var-name (`[A-Za-z_][A-Za-z0-9_]*`) → string (interpolable) | no | added to the child environment |
-| `expect_exit` | **non-empty** array of integer in `0..=255` | no | accepted exit statuses; default `[0]`. An empty list would accept no outcome at all, making every run an error — the inert key [D61](#d61-else-takes-the-literal-true) rejects, exactly as for `expect_status` (D84) |
+| `expect_exit` | **non-empty** array of **distinct** integers in `0..=255` | no | accepted exit statuses; default `[0]`. Non-empty and distinct on the same rule `expect_status` obeys — see *Accepted-outcome lists* below (D84, [D100](#d100-both-accepted-outcome-lists-are-non-empty-and-distinct)) |
 
 Input/output convention (PRD 5.5): an object input is passed as environment
 variables (`UPPER_SNAKE_CASE` of each field, JSON-encoded for non-scalars); a
@@ -945,7 +945,7 @@ http:
 | `headers` | map header-name (`[A-Za-z0-9_-]+`) → string (interpolable) | no | header names are case-insensitive |
 | `query` | map param-name (`[A-Za-z0-9_-]+`) → CEL over `input` | no | |
 | `body` | map identifier→CEL over `input` | no | JSON body; illegal for `GET`/`HEAD` |
-| `expect_status` | **non-empty** array of integer in `100..=599` | no | default: any 2xx. An empty list would accept no response at all, making every call an error — the inert key [D61](#d61-else-takes-the-literal-true) rejects (D80) |
+| `expect_status` | **non-empty** array of **distinct** integers in `100..=599` | no | default: any 2xx. Non-empty and distinct on the same rule `expect_exit` obeys — see *Accepted-outcome lists* below (D80, [D100](#d100-both-accepted-outcome-lists-are-non-empty-and-distinct)) |
 
 Without `body`/`query`, the bound input object is sent as the JSON body
 (body-bearing methods) or as query parameters (`GET`/`HEAD`). The response body
@@ -958,6 +958,23 @@ inside it completes the node — `expect_status: [200, 404]` makes a 404 routabl
 data rather than a failure, exactly as `expect_exit` does for an exit code
 (D84). As with `exec`, this is the *tool* surface: the response envelope
 (`status`, raw `body`) is exposed by inline `http:` nodes only (§8.3).
+
+**Accepted-outcome lists.** `expect_exit` and `expect_status` are the same
+construct on two surfaces — a set of outcomes that complete the node, with
+everything else a node error (D84) — so they obey one shape rule, on the tool
+binding and on the inline node alike (§8.2, §8.3, Decision
+[D100](#d100-both-accepted-outcome-lists-are-non-empty-and-distinct)):
+
+- **non-empty**. An empty list accepts no outcome at all, so every run or call
+  would be an error — a key that inverts its own purpose, which is the inert
+  key [D61](#d61-else-takes-the-literal-true) refuses;
+- **distinct members**. Membership is a set test, so a repeated member changes
+  nothing about which outcomes are accepted. `expect_exit: [0, 0]` and
+  `expect_status: [200, 200]` are compile errors, on the same reasoning that
+  makes a repeated `route:` member one (§12.2, D80).
+
+Both halves are decidable in one file, so the published schema enforces them too
+(Appendix B).
 
 **`function`** — host-registered function (escape hatch; breaks spec
 portability — PRD 5.5):
@@ -3924,8 +3941,10 @@ an author who wants a tighter bound on a whole instance still has the node-level
 
 Where the editor schema constrains a value the grammar left loose and the
 constraint is decidable in one file, the grammar states it: import path charset
-(§1.4), `expect_status` non-empty and `100..=599` (§6.1), `route:` members
-distinct and `route_on:` non-empty (§12.2), `routes:` non-empty (§8.6),
+(§1.4), `expect_status` and `expect_exit` non-empty, in range, and
+distinct-membered (§6.1,
+[D100](#d100-both-accepted-outcome-lists-are-non-empty-and-distinct)), `route:`
+members distinct and `route_on:` non-empty (§12.2), `routes:` non-empty (§8.6),
 non-empty `command`/`id`/`embed.model` (§6.1, §12.2, §11.2).
 **Rationale**: Appendix B's invariant is one-directional — a file that fails the
 schema always fails `validate` — and every one of these was a place the schema
@@ -4408,6 +4427,31 @@ fork is what makes that fall out of the definition instead of needing a
 carve-out, and it costs nothing — a fork has finitely many pairs, and the
 per-pair distances are the same walk the per-fork version already did. *PRD 5.3,
 5.6, G3.*
+
+### D100. Both accepted-outcome lists are non-empty and distinct
+
+`expect_exit` and `expect_status` are each a **non-empty** list of **distinct**
+members, on the `tool.*` binding and on the inline node alike (§6.1, §8.2,
+§8.3), and the published schema enforces both halves of both.
+**Rationale**: the two keys are one construct on two surfaces —
+[D84](#d84-execs-and-https-failure-predicate-is-one-rule-on-both-surfaces-and-both-halves-are-configurable)
+says so outright — and they disagreed about duplicates. The schema carried
+`uniqueItems` on `expect_exit` and not on `expect_status`, while §6.1 and
+[D80](#d80-the-published-schemas-per-file-bounds-are-grammar-rules)'s own
+enumeration stated distinctness for neither. `expect_exit: [0, 0]` was therefore
+rejected by the schema and permitted by the grammar text — the inverted
+one-directional invariant D80 exists to close — and `expect_status: [200, 200]`
+was accepted by both, so twin keys behaved differently for no stated reason.
+
+Two ways to reconcile them; the tightening is the right one, for D80's stated
+posture. Membership in an accepted-outcome list is a set test, so a repeated
+member is inert: it changes no run's behavior, and an author who wrote it meant
+something the key cannot do. That is exactly the silent no-op
+[D61](#d61-else-takes-the-literal-true) refuses, and exactly the argument D80
+already accepted for a repeated `route:` member, which is the same shape of
+mistake in the same document. Dropping `uniqueItems` instead would have made
+this document's only stated reason for that `route:` rule not apply to its
+nearest neighbour. *PRD 5.5, 5.9, G3.*
 
 ---
 
