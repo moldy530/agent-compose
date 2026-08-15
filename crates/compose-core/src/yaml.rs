@@ -466,6 +466,16 @@ impl<'src> Loader<'src, '_> {
     fn build_mapping(&mut self, start: RawSpan) -> Node {
         self.depth += 1;
         let mut mapping = Mapping::default();
+        // Where each key already sits in `entries`, so the duplicate check
+        // below costs one hash rather than a scan of everything read so far.
+        // `Mapping` keeps its ordered vec — declaration order is what the IR
+        // and every diagnostic are built on — and this index lives only for
+        // the build. Scanning instead makes one large mapping quadratic, which
+        // `MAX_NODES` does not bound: the cap limits how many nodes a file may
+        // expand to, and a file well inside it would still take seconds, which
+        // is not the millisecond budget the cap is there to protect
+        // (PRD 5.12).
+        let mut seen: HashMap<String, usize> = HashMap::new();
         let mut end = start;
         loop {
             let Some((event, span)) = self.next() else {
@@ -511,18 +521,20 @@ impl<'src> Loader<'src, '_> {
                 None => break,
             };
 
-            if let Some(existing) = mapping.entry(&key.value) {
+            if let Some(existing) = seen.get(&key.value).map(|index| &mapping.entries[*index]) {
+                let first = existing.key.span.clone();
                 self.diagnostics.push(
                     Diagnostic::error(
                         DiagnosticCode::DuplicateKey,
                         key.span,
                         format!("duplicate key `{}`", key.value),
                     )
-                    .with_label(existing.key.span.clone(), "first declared here")
+                    .with_label(first, "first declared here")
                     .with_help("keys are declared once; the second declaration never wins"),
                 );
                 continue;
             }
+            seen.insert(key.value.clone(), mapping.entries.len());
             mapping.entries.push(Entry { key, value });
         }
         self.depth -= 1;
@@ -922,5 +934,70 @@ mod tests {
         ] {
             let _ = load_ok(source);
         }
+    }
+
+    /// A flat mapping of `keys` distinct entries, its last one repeating its
+    /// first so the duplicate check is exercised rather than merely skipped.
+    fn flat_mapping(keys: usize) -> String {
+        let mut source = String::from("version: \"0.1\"\n");
+        for index in 0..keys {
+            source.push_str(&format!("k{index}: 1\n"));
+        }
+        source.push_str("k0: 2\n");
+        source
+    }
+
+    /// The duplicate-key check reports the *first* occurrence, whatever else it
+    /// has read: a lookup index has to keep pointing at the earlier entry, not
+    /// at whichever one it happens to find.
+    #[test]
+    fn a_duplicate_names_the_first_declaration_in_a_large_mapping() {
+        let (node, diagnostics) = load_ok(&flat_mapping(5_000));
+        assert_eq!(codes(&diagnostics), ["duplicate-key"]);
+        assert_eq!(diagnostics[0].message, "duplicate key `k0`");
+        assert_eq!(diagnostics[0].labels[0].span.start.line, 2);
+        assert_eq!(
+            node.expect("a large mapping still loads")
+                .as_mapping()
+                .expect("the root is a mapping")
+                .len(),
+            5_001
+        );
+    }
+
+    /// …and it must not cost a scan of everything read so far to do it.
+    ///
+    /// `MAX_NODES` bounds how far a document may *expand*, not how long reading
+    /// one takes, and the two are not the same guarantee: a flat mapping well
+    /// inside the cap took seconds when every insert rescanned its
+    /// predecessors, which is not the millisecond budget the cap exists to
+    /// protect (PRD 5.12).
+    ///
+    /// The measurement is a *ratio* rather than a wall-clock bound, because a
+    /// bound tight enough to catch quadratic growth on a fast machine is one a
+    /// loaded CI machine trips on for no reason. Quadrupling the key count
+    /// quadruples linear work and multiplies quadratic work by sixteen, so a
+    /// threshold of eight sits a clear factor of two from either. The one-second
+    /// floor keeps a fast host, where both readings are noise, from failing on
+    /// the ratio of two noise samples.
+    #[test]
+    fn a_large_mapping_does_not_cost_a_scan_per_key() {
+        fn read(keys: usize) -> std::time::Duration {
+            let source = flat_mapping(keys);
+            let started = std::time::Instant::now();
+            let (node, _) = load_ok(&source);
+            assert!(node.is_some(), "{keys} keys must still load");
+            started.elapsed()
+        }
+
+        let small = read(8_000);
+        let large = read(32_000);
+        let budget = (small * 8).max(std::time::Duration::from_secs(1));
+        assert!(
+            large < budget,
+            "8,000 keys took {small:?} and 32,000 took {large:?}: four times the keys \
+             should cost about four times the work, so the duplicate check has gone \
+             quadratic again"
+        );
     }
 }
