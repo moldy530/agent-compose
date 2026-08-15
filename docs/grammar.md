@@ -518,16 +518,25 @@ Referencing anything else is a compile error.
 |---|---|---|
 | edge `when:` | `<from>.output` (the edge's source node only), `input`, `state`, `execution` | bool |
 | `map.over` | `<node>.output` for any node that precedes the map node, `input`, `state` | list (path expression only, §4.2) |
-| `map.input` / `map.routes.<tag>.input` values | `<as-name>` (the item), `input`, `state`, `execution` | field-typed |
+| `map.input` / `map.routes.<tag>.input` / `map.default.input` values | `<as-name>` (the item), `input`, `state`, `execution` | field-typed |
 | node `input:` bindings | `input`, `state`, `execution` | field-typed |
 | store-op `key`, `value`, `query`, `prefix`, `filter`, `metadata` values | `input`, `state`, `execution` | per §11.4 |
 | inline `http` node `query` / `body` values | `input`, `state`, `execution` | field-typed |
+| `tool.<t>` `http:` binding `query` / `body` values | `input` **only** (the tool's own input object) | field-typed |
 | trigger `input:` values | `payload` | field-typed |
 | trigger `session_key`, `callback`, `dedupe_key` | `payload` | string |
 
 Root identifier meanings:
 
-- **`input`** — the enclosing flow instance's input object (`input.goal`).
+- **`input`** — the input object of the construct the expression is written
+  inside. On every *flow-scoped* surface (edge guards, node `input:` bindings,
+  an inline `http` node's `query`/`body` values, `map` per-item bindings,
+  store-op parameters) that is the enclosing flow instance's input object
+  (`input.goal`).
+  On a **`tool.*` implementation binding** — the one surface that has no
+  enclosing flow — it is the tool's own declared `input:` object, and it is the
+  only root in scope there (§6.1, Decision
+  [D65](#d65-a-tool-implementation-binding-sees-only-the-tools-own-input)).
 - **`state`** — the state object; only declared channels (§10) are members.
 - **`execution`** — run metadata: `execution.id` (string), `execution.session_key`
   (string; empty when the invocation supplied no session key — a trigger with no
@@ -591,7 +600,18 @@ env-name           = ( "A"…"Z" | "_" ) , { "A"…"Z" | "0"…"9" | "_" } ;
   `api_key: ${ANTHROPIC_API_KEY}`. Matches `^\$\{[A-Z_][A-Z0-9_]*\}$`.
 - **Interpolated form** — references embedded in text:
   `url: "https://${SEARCH_HOST}/v1/search"`.
-- `$${` is an escape producing a literal `${`.
+- `$${` is an escape producing a literal `${`. It is recognized wherever a
+  `${…}` token is, which includes the surfaces where env refs are illegal: a
+  prompt that must contain the six characters `${FOO}` writes `$${FOO}`.
+
+**Quoting.** A `${…}` reference is only *bare*-writable in YAML block context
+(`api_key: ${ANTHROPIC_API_KEY}`). YAML forbids the indicators `{`, `}`, `[`,
+`]`, and `,` inside a plain scalar in **flow** context, so a reference written
+inside a `{ … }` mapping or `[ … ]` sequence MUST be quoted —
+`kv: { provider: redis, url: "${REDIS_URL}" }` — exactly as `version:` must be
+quoted for a different reason (§1.3). Unquoted, it is a YAML syntax error before
+the compiler sees the file. Quoting is always legal, so quoting every env ref is
+the safe habit.
 
 **Secret-bearing fields take the env-ref value form only** — a literal is a
 compile error (Decision [D41](#d41-env-ref-forms-and-the-secret-field-list)):
@@ -604,7 +624,11 @@ compile error (Decision [D41](#d41-env-ref-forms-and-the-secret-field-list)):
 Interpolated refs are legal in: `http` node/tool `url` and `headers` values,
 `exec` `env` values and `cwd`, and non-secret deploy config values.
 Env refs are ILLEGAL in: prompts, descriptions, schemas, CEL expressions, model
-`id`, and any identifier or reference position.
+`id`, and any identifier or reference position. Nothing is interpolated there, so
+an unescaped `${NAME}` token in one of those positions is a **compile error**
+naming the field rather than text that silently survives into the output — the
+author who wrote it expected a substitution. The `$${` escape (above) is how a
+literal `${NAME}` is written where one is genuinely wanted.
 
 Env refs **survive unresolved into the IR**. `validate` checks syntax only;
 `build`/`serve`/`run` check presence and fail fast naming the missing variable
@@ -744,6 +768,16 @@ tool.web_search:
 
 ### 6.1 Implementation bindings
 
+**Scope inside a binding.** A tool definition is a top-level definition: it is
+invocable from any flow and from any agent's tool list, so it has no enclosing
+flow and no state. The CEL values a binding may contain — an `http:` binding's
+`query:` and `body:` values — therefore see exactly **one** root, `input`, the
+tool's own declared `input:` object; `state`, `execution`, and `<node>.output`
+are not in scope, and referencing one is a compile error (§4.1, Decision
+[D65](#d65-a-tool-implementation-binding-sees-only-the-tools-own-input)).
+Everything a tool needs arrives through its declared parameters, which is what
+makes the same definition usable from both surfaces.
+
 **`exec`** — shell/subprocess (PRD 5.5):
 
 ```yaml
@@ -773,6 +807,12 @@ A `tool.*` declares a *domain* result schema, so every one of its fields is
 decoded as above — `exit_code`/`stdout` are not special here. Inline `exec:`
 nodes are the surface that exposes the process envelope; see §8.2.
 
+Because the input object arrives as environment variables, an `env:` key equal to
+the upper-snake-cased name of a declared `input:` field is a collision in which
+one value would silently win, and is a compile error naming both — the same rule
+inline `exec:` nodes obey (§8.2, Decision
+[D66](#d66-an-inline-nodes-input-never-competes-with-its-block-for-the-same-slot)).
+
 **`http`**:
 
 ```yaml
@@ -790,8 +830,8 @@ http:
 | `method` | enum `GET POST PUT PATCH DELETE HEAD OPTIONS` | yes | explicit; effects are never defaulted |
 | `url` | string (interpolable) | yes | |
 | `headers` | map header-name (`[A-Za-z0-9_-]+`) → string (interpolable) | no | header names are case-insensitive |
-| `query` | map param-name (`[A-Za-z0-9_-]+`) → CEL | no | |
-| `body` | map identifier→CEL | no | JSON body; illegal for `GET`/`HEAD` |
+| `query` | map param-name (`[A-Za-z0-9_-]+`) → CEL over `input` | no | |
+| `body` | map identifier→CEL over `input` | no | JSON body; illegal for `GET`/`HEAD` |
 | `expect_status` | array of integer | no | default: any 2xx |
 
 Without `body`/`query`, the bound input object is sent as the JSON body
@@ -1110,7 +1150,11 @@ run_tests:
 The node-level `input:` bindings produce the object passed to the child as
 environment variables — binding keys are identifiers (§2.1) and are
 upper-snake-cased on the way into the environment, so `pattern:` above arrives as
-`PATTERN` — or on stdin for a scalar binding, per the §6.1 convention.
+`PATTERN` — or on stdin for a scalar binding, per the §6.1 convention. The
+in-block `env:` map writes into the same environment, so an `env:` key equal to
+the upper-snake-cased name of an input binding is a collision in which one of the
+two values would be silently discarded, and is a compile error naming both
+(Decision [D66](#d66-an-inline-nodes-input-never-competes-with-its-block-for-the-same-slot)).
 
 **Result binding.** An inline `exec:` node wraps a *process*, so its result is
 the process envelope, not a decoded payload
@@ -1145,6 +1189,21 @@ notify:
 | Key | Type | Required | Default |
 |---|---|---|---|
 | `output` | field map | no | `{ status: {type: integer}, body: {type: string} }` |
+
+An inline node's `query:`/`body:` CEL is *flow*-scoped — `input`, `state`,
+`execution` (§4.1) — unlike the same keys inside a `tool.*` binding, which see
+only the tool's own `input` (§6.1).
+
+**Request payload.** An inline `http:` node has no declared input schema of its
+own, so the node-level `input:` bindings (§8.0) build an ad-hoc object which
+§6.1's convention sends as the JSON body (body-bearing methods) or as query
+parameters (`GET`/`HEAD`) — but only when the in-block key that would carry it is
+absent. Declaring both is a compile error rather than a silently ignored key
+(Decision [D66](#d66-an-inline-nodes-input-never-competes-with-its-block-for-the-same-slot)):
+`input:` with `body:` on a body-bearing method, or `input:` with `query:` on
+`GET`/`HEAD`. The non-competing combinations stay legal — a `POST` may carry
+`query:` for its parameters and let `input:` become the body, and either method
+may drop `input:` and write the request out in full.
 
 **Result binding.** As with `exec:` (§8.2), an inline `http:` node's result is
 the response envelope. `status` (`{type: integer}`) and `body` (`{type: string}`,
@@ -1348,7 +1407,14 @@ approve:
 | `input` | field map (input surface) | yes | rendered for the human |
 | `output` | field map (result surface, §3.6) | yes | routable structured output; resume payloads are validated against it (PRD 5.11) |
 | `timeout` | duration | no | wall-clock wait budget |
-| `on_timeout` | flow-local node id, or `end` | required with `timeout` | route taken on expiry; same targets as `on_error.fallback` (§2.4, §9.2) |
+| `on_timeout` | flow-local node id, or `end` | with `timeout`, never without | route taken on expiry; same targets as `on_error.fallback` (§2.4, §9.2) |
+
+`timeout:` and `on_timeout:` are **jointly optional and jointly required**:
+declare both or neither. `timeout:` alone leaves the expiry with no route, and
+`on_timeout:` alone declares a route that can never be taken — the same silent
+no-op key that [D61](#d61-else-takes-the-literal-true) rejects for `else: false`.
+Either half alone is a compile error naming the missing one
+(Decision [D52](#d52-human-node-shape)).
 
 Node-level `timeout:` and `retry:` are ILLEGAL on a `human` node — a wait is not
 an activity timeout and re-prompting a human is not a retry
@@ -1685,6 +1751,7 @@ provider.local:
 | `api_key` | env-ref value | per kind | never a literal (§4.3) |
 | `base_url` | env-ref value | required for `openai_compatible` | |
 | `headers` | map name→string (interpolable) | no | extra request headers |
+| `description` | string | no | documentation only (D54) |
 | kind-specific keys | per plugin | per kind | validated against the plugin's published schema |
 
 v0 provider kinds and their kind-specific keys:
@@ -1872,7 +1939,7 @@ defaulted `session_key:`, exists implicitly for every flow (§13 preamble).
 
 | Key | Type | Required | Default | Notes |
 |---|---|---|---|---|
-| `path` | string starting `/` | no | `/triggers/<name>` | route of the generated app |
+| `path` | string starting `/`, no whitespace | no | `/triggers/<name>` | route of the generated app; router parameter syntax (`/reviews/:id`) passes through unexamined |
 | `method` | `POST` \| `PUT` \| `GET` | no | `POST` | |
 | `input` | map field→CEL over `payload` | no | — | |
 | `respond` | `sync` \| `async` | no | `async` | |
@@ -1964,9 +2031,9 @@ placements:
 
 storage_backends:
   defaults:
-    kv: { provider: redis, url: ${REDIS_URL} }
+    kv: { provider: redis, url: "${REDIS_URL}" }
   aliases:
-    docs_db: { provider: chroma, url: ${CHROMA_URL} }
+    docs_db: { provider: chroma, url: "${CHROMA_URL}" }
 
 event_sources:
   bug_reports:
@@ -1985,6 +2052,7 @@ the composition.
 |---|---|---|---|
 | `runtime` | `isolated` \| `colocated` | yes | own instance/container vs in-process |
 | `network` | `none` \| `egress` \| `all` | no (default `all`) | sandbox network policy (reserved) |
+| `description` | string | no | documentation only (D54) |
 
 `--target local` implies everything colocated in one process. `--target
 distributed` (post-v0) stitches boundaries with remote subgraphs (PRD 5.10).
@@ -2388,15 +2456,24 @@ and permits the rest. Everywhere else, unknown keys are errors. *PRD 5.9.*
 
 Value form (`^\$\{[A-Z_][A-Z0-9_]*\}$`) is mandatory for the credential and
 connection fields listed in §4.3; interpolation is allowed in URLs, headers, and
-exec env values; `$${` escapes. **Rationale**: PRD 5.9 forbids literals for
-secrets and keeps refs unresolved in the IR; interpolation is still needed for
-host-templated URLs, so the two forms are separated by field rather than banned
-outright. *PRD 5.8, 5.9.*
+exec env values; `$${` escapes, on every surface. Where refs are illegal
+(prompts, descriptions, schemas, CEL, model `id`) an unescaped `${NAME}` token is
+a compile error, not surviving literal text. **Rationale**: PRD 5.9 forbids
+literals for secrets and keeps refs unresolved in the IR; interpolation is still
+needed for host-templated URLs, so the two forms are separated by field rather
+than banned outright. Making the token an error where it cannot be substituted
+follows the same posture as
+[D61](#d61-else-takes-the-literal-true) — the reading the author intended is
+never silently discarded — and a uniform escape keeps a prompt that genuinely
+discusses `${…}` syntax writable. *PRD 5.8, 5.9, G3.*
 
 ### D42. Node outputs are readable only from edge guards and `map.over`
 
 Node configuration CEL sees `input`, `state`, `execution` (and item bindings
-inside a map). **Rationale**: PRD 5.3 scopes guards to the source node's output,
+inside a map; inside a `tool.*` implementation binding, which is a definition
+rather than node configuration, only the tool's own `input` —
+[D65](#d65-a-tool-implementation-binding-sees-only-the-tools-own-input)).
+**Rationale**: PRD 5.3 scopes guards to the source node's output,
 and PRD 5.10 requires every edge to be a potential network boundary — a node
 config reaching into an arbitrary other node's output would smuggle in an
 undeclared data dependency that placement could not honor. Data that must travel
@@ -2475,13 +2552,16 @@ runtime imposes. *PRD 5.4, 5.5.*
 ### D52. `human` node shape
 
 Schemas, `timeout`, and `on_timeout` live inside the `human:` block;
-`on_timeout` is required with `timeout`; node-level `timeout`/`retry` are
+`timeout` and `on_timeout` are jointly optional and jointly required — either
+one alone is an error; node-level `timeout`/`retry` are
 illegal; `on_timeout` accepts a flow-local node id or `end`, exactly as
 `on_error.fallback` does (D21). **Rationale**: PRD 5.5 gives the human node both
 schemas plus timeout and route; separating the human wait from an activity
 timeout prevents two keys named `timeout` meaning different things on one node.
 Two control-transfer positions with different target sets would be a trap with no
-rationale behind it. *PRD 5.5, 5.11.*
+rationale behind it. The pairing is symmetric because each half is inert without
+the other: a budget with nowhere to go, or a route nothing can reach — the
+[D61](#d61-else-takes-the-literal-true) no-op again. *PRD 5.5, 5.11.*
 
 ### D53. Flow outputs are name-based from state
 
@@ -2492,10 +2572,15 @@ data-edge feature under another name. *PRD 5.7.*
 
 ### D54. `description` is required only where it is machine-consumed
 
-Required on `tool.*` and on flows used as tools (LLM-facing); optional
-everywhere else. **Rationale**: PRD 5.5 makes the description part of the tool
+Required on `tool.*` and on flows used as tools (LLM-facing); optional but
+**always legal** everywhere else — every definition, node, trigger, and
+placement entry accepts a `description:` string, and the per-construct key
+tables list it as an ordinary optional key rather than an exception to the
+unknown-key rule of [D50](#d50-unknown-keys-are-errors-everywhere-except-plugin-config-objects).
+**Rationale**: PRD 5.5 makes the description part of the tool
 contract; forcing it on every definition would be documentation policy, not
-grammar. *PRD 5.5.*
+grammar. Making it universally *accepted* costs nothing and keeps the one key an
+author reaches for reflexively from being an error somewhere. *PRD 5.5.*
 
 ### D55. Definition order is irrelevant; IR order is canonical
 
@@ -2609,6 +2694,37 @@ and everything checked against it), while implicit manual invocation is a
 a CLI run carries — the session key — is what keeps the coherence check decidable
 rather than undefined. *PRD 5.11, 5.8.*
 
+### D65. A tool implementation binding sees only the tool's own `input`
+
+Inside `tool.<t>`'s `http:` binding, `query:`/`body:` CEL has exactly one root,
+`input`, bound to the tool's declared `input:` object; `state`, `execution`, and
+`<node>.output` are out of scope (§4.1, §6.1). **Rationale**: PRD 5.5 makes one
+definition serve two surfaces — an agent's tool list, where the *model* supplies
+the arguments and no graph context exists at all, and a `function` node, where
+the graph supplies them. A binding that could read `state` would be well-defined
+on only one of those surfaces, so the shared definition would stop being shared;
+scoping the binding to the declared parameters is what keeps the def/use split
+honest, and it makes the tool's inputs a complete account of what it can see.
+*PRD 5.5, 5.7.*
+
+### D66. An inline node's `input:` never competes with its block for the same slot
+
+On an inline `http:` node, node-level `input:` together with `body:` (body-bearing
+method) or with `query:` (`GET`/`HEAD`) is a compile error; wherever an input
+object becomes environment variables — an inline `exec:` node's bindings, a
+`tool.*` `exec:` binding's declared fields — an `env:` key colliding with the
+upper-snake-cased name of one of them is a compile error (§6.1, §8.2, §8.3).
+**Rationale**: §6.1 gives the bound input object
+a destination — the body, the query string, the environment — that an explicit
+in-block key also claims. Silently preferring one leaves the other as a key that
+changes nothing, the same silent no-op that
+[D61](#d61-else-takes-the-literal-true) rejects for `else: false` and that
+[D50](#d50-unknown-keys-are-errors-everywhere-except-plugin-config-objects)
+rejects for unknown keys. Erroring on the overlap costs nothing: the author
+either writes the request out in full or lets the bindings build it.
+Non-competing combinations (`query:` alongside `input:` on a `POST`) stay legal
+because there is no slot to fight over. *PRD 5.5, G3.*
+
 ---
 
 ## Appendix B — Editor integration
@@ -2649,16 +2765,39 @@ authority. The schema cannot see across files, so it does not check:
   a `map.over` path (§3.5 clause 2) it depends on resolving a path through other
   files, so only the validator can require it there.
 
-What the schema *does* enforce beyond plain shape, because `op:`, `type:`, and
-`route_by:` are literals in the same object: store-op parameter sets per `op`
-(§11.4), trigger keys per `type` (§13), and the map form rules (§8.6).
+What the schema *does* enforce beyond plain shape, because the deciding value is
+a literal in the same object: store-op parameter sets per `op` (§11.4), trigger
+keys per `type` (§13), the map form rules (§8.6), the direct-XOR-route split on
+model definitions (§12.2), the `human` timeout/route pairing (§8.7), the
+inline-`http` `input:`-versus-`body:`/`query:` rule (§8.3), duplicate edges
+(§7.2), and the absence of `${ENV}` tokens on the surfaces where §4.3 makes them
+illegal and a single string is the whole surface (`prompt:`, model `id:`).
+
+**Diagnostics.** Where a construct has variants, the schema branches on the
+literal that selects the variant — a node's kind key, a trigger's `type:`, a
+model's `route:` — with `if`/`then` rather than a bare `oneOf` over the whole
+variant list. A `oneOf` reports one error against the whole object ("is not valid
+under any of the schemas listed in the `oneOf` keyword"), which in an editor
+underlines the entire node and names nothing; branching reports the real error
+against the offending key. The conformance suite pins this: each negative fixture
+declares both the instance location and the schema keyword that must reject it
+(`crates/compose-core/tests/schema_conformance.rs`).
 
 A file that passes the schema and fails `validate` is normal and expected; a file
-that fails the schema always fails `validate`.
+that fails the schema always fails `validate`. Keeping that direction is why the
+schema stops short of guessing: `queue_url` on an event source is a plain
+interpolable string, because §4.3's secret-field list is closed and does not name
+it (§14.3), and a trigger `path:` is only required to start with `/` and carry no
+whitespace, because the router's own parameter syntax (`/reviews/:id`) is opaque
+to the grammar (§13.3).
 
 ---
 
 ## Appendix C — Construct reference card
+
+Shape sketch, not a document: `<x>` is a placeholder, `?` marks an optional key,
+`...` elides. It does not parse as YAML and is not meant to be copied — for
+copyable specs see [`examples/`](../examples).
 
 ```yaml
 # ---- spec file --------------------------------------------------------------
@@ -2698,7 +2837,7 @@ store.<name>:
   backend: <alias>
   agent_access: read|read_write
 
-provider.<name>: { kind: ..., api_key: ${ENV}, base_url: ${ENV}, ... }
+provider.<name>: { kind: ..., api_key: "${ENV}", base_url: "${ENV}", ... }
 model.<name>:    { provider: provider.<p>, id: <string>, settings: {...} }
 model.<name>:    { route: [model.<a>, model.<b>], route_on: [...] }
 
