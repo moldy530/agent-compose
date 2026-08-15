@@ -1,0 +1,15 @@
+# rule: `GET` and `HEAD` carry no request body (grammar 6.1)
+# code: conflicting-keys
+# message: `body` is not legal on a `GET` request
+# at: 14:5
+# help: `GET` and `HEAD` carry no request body; use `query:` instead
+tool.search:
+  description: Search the index.
+  input:
+    query: { type: string }
+  output: {}
+  http:
+    method: GET
+    url: "https://${SEARCH_HOST}/v1/search"
+    body:
+      q: "input.query"

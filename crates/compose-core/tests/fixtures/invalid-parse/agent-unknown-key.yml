@@ -1,0 +1,11 @@
+# rule: unknown keys are errors, with a suggestion for near misses (grammar 5, Decision D50)
+# code: unknown-key
+# message: unknown key `promt` in agent definition `agent.reviewer`
+# at: 9:3
+# help: did you mean `prompt`?
+# count: 2
+agent.reviewer:
+  model: model.smart
+  promt: Review the draft.
+  output:
+    verdict: { enum: [approve, revise] }

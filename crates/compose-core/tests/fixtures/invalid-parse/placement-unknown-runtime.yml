@@ -1,0 +1,10 @@
+# rule: a placement `runtime:` is `isolated` or `colocated` (grammar 14.1, Decision D47)
+# code: unknown-variant
+# message: `serverless` is not a valid `runtime`
+# at: 10:14
+# help: `runtime` takes one of `isolated`, `colocated`
+version: "0.1"
+
+placements:
+  agent.fixer:
+    runtime: serverless

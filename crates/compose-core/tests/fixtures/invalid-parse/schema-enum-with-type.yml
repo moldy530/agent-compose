@@ -1,0 +1,9 @@
+# rule: `enum` implies `type: string` (grammar 3.3, Decision D9)
+# code: conflicting-keys
+# message: `enum` implies `type: string`; writing `type:` alongside it is an error
+# at: 9:30
+agent.reviewer:
+  model: model.smart
+  prompt: Review the draft.
+  output:
+    verdict: { type: string, enum: [approve, revise] }

@@ -1,0 +1,86 @@
+---
+source: crates/compose-core/tests/parse_examples.rs
+expression: "parse_clean(\"examples/triage-fanout/stores/docs.yml\")"
+---
+Spec(
+    SpecFile {
+        source: "examples/triage-fanout/stores/docs.yml",
+        version: None,
+        imports: None,
+        defaults: None,
+        state: None,
+        triggers: None,
+        definitions: [
+            Definition {
+                address: store.docs @ 7:1..7:11,
+                body: Store(
+                    StoreDef {
+                        kind: Some(
+                            Vector @ 8:9..8:15,
+                        ),
+                        scope: Some(
+                            Global @ 9:10..9:16,
+                        ),
+                        value_schema: None,
+                        metadata_schema: Some(
+                            FieldMap {
+                                fields: [
+                                    Field {
+                                        name: "source" @ 15:5..15:11,
+                                        ty: TypeNode {
+                                            form: Scalar(
+                                                ScalarType {
+                                                    kind: String @ 15:21..15:27,
+                                                },
+                                            ),
+                                            description: None,
+                                            span: 15:13..15:29,
+                                        },
+                                    },
+                                    Field {
+                                        name: "updated_at" @ 16:5..16:15,
+                                        ty: TypeNode {
+                                            form: Scalar(
+                                                ScalarType {
+                                                    kind: String @ 16:25..16:31,
+                                                    format: DateTime @ 16:41..16:50,
+                                                },
+                                            ),
+                                            description: None,
+                                            span: 16:17..16:52,
+                                        },
+                                    },
+                                ],
+                                surface: Result,
+                                span: 15:5..17:3,
+                            },
+                        ),
+                        embed: Some(
+                            EmbedBlock {
+                                model: Some(
+                                    "text-embedding-3-small" @ 12:12..12:34,
+                                ),
+                                provider: None,
+                                dimensions: Some(
+                                    1536 @ 13:17..13:21,
+                                ),
+                                span: 12:5..14:3,
+                            },
+                        ),
+                        backend: Some(
+                            "docs_db" @ 17:12..17:19,
+                        ),
+                        description: Some(
+                            "Project documentation, chunked, for grounding triage decisions." @ 10:16..10:79,
+                        ),
+                        agent_access: Some(
+                            Read @ 18:17..18:21,
+                        ),
+                    },
+                ),
+                span: 7:1..7:11,
+            },
+        ],
+        span: 7:1..19:1,
+    },
+)

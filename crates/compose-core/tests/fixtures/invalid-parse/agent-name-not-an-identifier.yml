@@ -1,0 +1,10 @@
+# rule: definition names are lowercase snake_case identifiers (grammar 2.1)
+# code: invalid-identifier
+# message: `Reviewer` is not a valid name in `agent.*`
+# at: 6:1
+# help: identifiers are 1-64 characters of lowercase letters, digits, and `_`, starting with a letter
+agent.Reviewer:
+  model: model.smart
+  prompt: Review the draft.
+  output:
+    verdict: { enum: [approve, revise] }

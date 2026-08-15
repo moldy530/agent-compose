@@ -1,0 +1,6 @@
+# rule: mapping keys must be strings (grammar 1.1)
+# code: non-string-key
+# message: mapping keys must be strings, found an integer
+# at: 6:3
+state:
+  1: { type: string }

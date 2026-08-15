@@ -1,0 +1,8 @@
+# rule: an agent declares `model:` (grammar 5)
+# code: missing-key
+# message: missing required key `model` in agent definition `agent.reviewer`
+# at: 6:3
+agent.reviewer:
+  prompt: Review the draft.
+  output:
+    verdict: { enum: [approve, revise] }

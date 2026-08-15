@@ -1,0 +1,10 @@
+# rule: `default:` is illegal in a result schema (grammar 3.6)
+# code: invalid-value
+# message: `default` is not allowed in the schema of `verdict`: it is a result schema
+# at: 10:50
+# help: a defaulted model output would silently manufacture routing values (grammar 3.6)
+agent.reviewer:
+  model: model.smart
+  prompt: Review the draft.
+  output:
+    verdict: { enum: [approve, revise], default: approve }

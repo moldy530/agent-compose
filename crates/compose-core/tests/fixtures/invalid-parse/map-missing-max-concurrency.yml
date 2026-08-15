@@ -1,0 +1,15 @@
+# rule: fan-out bounding is mandatory: a map declares `max_concurrency` (grammar 8.6, Decision D28)
+# code: missing-key
+# message: missing required key `max_concurrency` in the `map` block of node `work`
+# at: 11:9
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    work:
+      map:
+        over: plan.output.tasks
+        node: agent.worker
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }

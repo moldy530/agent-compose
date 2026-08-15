@@ -1,0 +1,13 @@
+# rule: `else:` takes the literal `true` (grammar 7.2, Decision D61)
+# code: invalid-value
+# message: `else` takes the literal `true`
+# at: 13:37
+# help: an edge with neither `when` nor `else` is already unconditional, so any other value would change nothing
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    write: { agent: agent.researcher }
+  edges:
+    - { from: start, to: write }
+    - { from: write, to: end, else: false }

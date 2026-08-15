@@ -1,0 +1,7 @@
+# rule: the entrypoint declares `version:` (grammar 1.3, Decision D4)
+# code: missing-key
+# message: a file that declares `imports:` is the entrypoint and must declare `version:`
+# at: 6:1
+# help: write `version: "0.1"` — quoted, since an unquoted `0.1` is a YAML float
+imports:
+  - agents/reviewer.yml

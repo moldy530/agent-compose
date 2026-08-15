@@ -1,0 +1,11 @@
+# rule: event source kinds are a closed set (grammar 14.3, Decision D46)
+# code: unknown-variant
+# message: `kafka` is not a valid event source `kind`
+# at: 10:11
+# help: event source `kind` takes one of `redis_streams`, `sqs`, `nats`
+version: "0.1"
+
+event_sources:
+  bug_reports:
+    kind: kafka
+    url: ${KAFKA_URL}

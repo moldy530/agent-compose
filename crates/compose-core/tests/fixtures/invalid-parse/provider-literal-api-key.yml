@@ -1,0 +1,8 @@
+# rule: secret-bearing fields take the env-ref value form only (grammar 4.3, Decision D41)
+# code: invalid-env-ref
+# message: `api_key` takes an environment reference, found the literal `sk-ant-not-a-reference`
+# at: 8:12
+# help: the spec never contains credentials or connection strings: write `${NAME}`
+provider.anthropic:
+  kind: anthropic
+  api_key: sk-ant-not-a-reference

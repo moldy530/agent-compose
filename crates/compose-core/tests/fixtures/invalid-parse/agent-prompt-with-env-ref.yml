@@ -1,0 +1,10 @@
+# rule: environment references are illegal where nothing is interpolated (grammar 4.3, Decision D41)
+# code: unexpected-env-ref
+# message: `prompt` never interpolates environment references, but it contains `${REPO_ROOT}`
+# at: 8:11
+# help: write `$${REPO_ROOT}` for a literal `${REPO_ROOT}`
+agent.reviewer:
+  model: model.smart
+  prompt: Review the draft in ${REPO_ROOT}.
+  output:
+    verdict: { enum: [approve, revise] }

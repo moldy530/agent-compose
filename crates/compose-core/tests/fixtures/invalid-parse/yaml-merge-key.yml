@@ -1,0 +1,13 @@
+# rule: merge keys are a YAML 1.1 extension outside YAML 1.2 core (grammar 1.1)
+# code: merge-key
+# message: merge keys (`<<:`) are not supported; they are a YAML 1.1 extension outside YAML 1.2 core
+# at: 11:3
+# help: repeat the keys, or alias the whole value with `*anchor`
+provider.anthropic: &connection
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+
+provider.secondary:
+  <<: *connection
+  kind: anthropic
+  api_key: ${SECONDARY_API_KEY}

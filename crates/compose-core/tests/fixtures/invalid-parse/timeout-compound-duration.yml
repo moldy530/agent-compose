@@ -1,0 +1,15 @@
+# rule: durations are single-segment `<int><ms|s|m|h>` (grammar 4.4, Decision D22)
+# code: invalid-duration
+# message: `1m30s` is not a valid duration for `timeout`
+# at: 12:16
+# help: durations are a positive integer followed by `ms`, `s`, `m`, or `h`, e.g. `30s`; compound forms like `1m30s` are not supported
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    write:
+      agent: agent.researcher
+      timeout: 1m30s
+  edges:
+    - { from: start, to: write }
+    - { from: write, to: end }

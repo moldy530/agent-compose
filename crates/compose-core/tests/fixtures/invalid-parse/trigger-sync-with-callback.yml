@@ -1,0 +1,11 @@
+# rule: `callback` with `respond: sync` is an error (grammar 13.3)
+# code: conflicting-keys
+# message: `callback` is not legal on the `respond: sync` trigger `on_request`
+# at: 11:5
+# help: a synchronous response already returns the flow's outputs, so a completion webhook has nothing left to deliver
+triggers:
+  on_request:
+    type: http
+    flow: flow.review_loop
+    respond: sync
+    callback: "payload.body.callback_url"

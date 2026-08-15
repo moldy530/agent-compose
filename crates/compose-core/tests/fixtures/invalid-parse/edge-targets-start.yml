@@ -1,0 +1,13 @@
+# rule: nothing may target the `start` pseudo-node (grammar 2.4)
+# code: reserved-name
+# message: no edge may target `start`
+# at: 13:26
+# help: `start` is the flow's entry; one or more edges leave it and none reach it
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    write: { agent: agent.researcher }
+  edges:
+    - { from: start, to: write }
+    - { from: write, to: start }

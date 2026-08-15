@@ -1,0 +1,6 @@
+# rule: a state channel is a type node (grammar 10.1)
+# code: wrong-type
+# message: expected a mapping for state channel `draft`, found a string
+# at: 6:10
+state:
+  draft: string

@@ -1,0 +1,6 @@
+# rule: a file whose YAML does not parse is rejected before any spec-level processing (grammar 1.1)
+# code: yaml-syntax
+# message: invalid YAML: while parsing a flow mapping, did not find expected ',' or '}'
+# at: 7:1
+state:
+  draft: { type: string

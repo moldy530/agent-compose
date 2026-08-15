@@ -1,0 +1,11 @@
+# rule: a `manual` trigger carries no `input:` bindings (grammar 13.2, Decision D44)
+# code: invalid-value
+# message: `input` is not legal on the `manual` trigger `cli`
+# at: 10:5
+# help: CLI arguments are validated directly against the flow's input schema at run start, so a second binding layer would be two ways to supply the same values (grammar 13.2)
+triggers:
+  cli:
+    type: manual
+    flow: flow.review_loop
+    input:
+      goal: "payload.goal"

@@ -1,0 +1,12 @@
+# rule: an edge declares both `from:` and `to:` (grammar 7.2)
+# code: missing-key
+# message: missing required key `to` in an edge
+# at: 12:7
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    write: { agent: agent.researcher }
+  edges:
+    - { from: start, to: write }
+    - { from: write }

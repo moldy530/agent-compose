@@ -1,0 +1,208 @@
+---
+source: crates/compose-core/tests/parse_examples.rs
+expression: "parse_clean(\"examples/triage-fanout/agents/triage.yml\")"
+---
+Spec(
+    SpecFile {
+        source: "examples/triage-fanout/agents/triage.yml",
+        version: None,
+        imports: None,
+        defaults: None,
+        state: None,
+        triggers: None,
+        definitions: [
+            Definition {
+                address: agent.triage @ 5:1..5:13,
+                body: Agent(
+                    AgentDef {
+                        model: Some(
+                            model.smart @ 7:10..7:21,
+                        ),
+                        prompt: Some(
+                            "You triage incoming bug reports.\n\nEmit one finding per distinct defect. Tag a finding `auto_fixable` only when\nthe fix is mechanical and local to one file. Tag it `needs_human` when it\nrequires judgement, and `duplicate` when the report restates a finding you\nhave already emitted in this run.\n" @ 9:5..15:3,
+                        ),
+                        output: Some(
+                            FieldMap {
+                                fields: [
+                                    Field {
+                                        name: "findings" @ 25:5..25:13,
+                                        ty: TypeNode {
+                                            form: Array(
+                                                ArrayType {
+                                                    items: TypeNode {
+                                                        form: Union(
+                                                            UnionType {
+                                                                discriminator: "kind" @ 30:24..30:28,
+                                                                variants: [
+                                                                    UnionVariant {
+                                                                        tag: "auto_fixable" @ 32:11..32:23,
+                                                                        fields: FieldMap {
+                                                                            fields: [
+                                                                                Field {
+                                                                                    name: "file" @ 33:13..33:17,
+                                                                                    ty: TypeNode {
+                                                                                        form: Scalar(
+                                                                                            ScalarType {
+                                                                                                kind: String @ 33:27..33:33,
+                                                                                            },
+                                                                                        ),
+                                                                                        description: None,
+                                                                                        span: 33:19..33:35,
+                                                                                    },
+                                                                                },
+                                                                                Field {
+                                                                                    name: "patch_hint" @ 34:13..34:23,
+                                                                                    ty: TypeNode {
+                                                                                        form: Scalar(
+                                                                                            ScalarType {
+                                                                                                kind: String @ 34:33..34:39,
+                                                                                            },
+                                                                                        ),
+                                                                                        description: None,
+                                                                                        span: 34:25..34:41,
+                                                                                    },
+                                                                                },
+                                                                            ],
+                                                                            surface: Result,
+                                                                            span: 33:13..35:11,
+                                                                        },
+                                                                    },
+                                                                    UnionVariant {
+                                                                        tag: "needs_human" @ 35:11..35:22,
+                                                                        fields: FieldMap {
+                                                                            fields: [
+                                                                                Field {
+                                                                                    name: "summary" @ 36:13..36:20,
+                                                                                    ty: TypeNode {
+                                                                                        form: Scalar(
+                                                                                            ScalarType {
+                                                                                                kind: String @ 36:30..36:36,
+                                                                                            },
+                                                                                        ),
+                                                                                        description: None,
+                                                                                        span: 36:22..36:38,
+                                                                                    },
+                                                                                },
+                                                                                Field {
+                                                                                    name: "severity" @ 37:13..37:21,
+                                                                                    ty: TypeNode {
+                                                                                        form: Enum(
+                                                                                            EnumType {
+                                                                                                variants: [
+                                                                                                    "low" @ 37:32..37:35,
+                                                                                                    "high" @ 37:37..37:41,
+                                                                                                    "critical" @ 37:43..37:51,
+                                                                                                ],
+                                                                                                default: None,
+                                                                                            },
+                                                                                        ),
+                                                                                        description: None,
+                                                                                        span: 37:23..37:54,
+                                                                                    },
+                                                                                },
+                                                                            ],
+                                                                            surface: Result,
+                                                                            span: 36:13..38:11,
+                                                                        },
+                                                                    },
+                                                                    UnionVariant {
+                                                                        tag: "duplicate" @ 38:11..38:20,
+                                                                        fields: FieldMap {
+                                                                            fields: [
+                                                                                Field {
+                                                                                    name: "of" @ 39:13..39:15,
+                                                                                    ty: TypeNode {
+                                                                                        form: Scalar(
+                                                                                            ScalarType {
+                                                                                                kind: String @ 39:25..39:31,
+                                                                                            },
+                                                                                        ),
+                                                                                        description: None,
+                                                                                        span: 39:17..39:33,
+                                                                                    },
+                                                                                },
+                                                                            ],
+                                                                            surface: Result,
+                                                                            span: 39:13..40:1,
+                                                                        },
+                                                                    },
+                                                                ],
+                                                            },
+                                                        ),
+                                                        description: None,
+                                                        span: 30:9..40:1,
+                                                    },
+                                                    max_items: 50 @ 28:18..28:20,
+                                                },
+                                            ),
+                                            description: Some(
+                                                "Every distinct defect, tagged for routing." @ 26:20..26:62,
+                                            ),
+                                            span: 26:7..40:1,
+                                        },
+                                    },
+                                ],
+                                surface: Result,
+                                span: 25:5..40:1,
+                            },
+                        ),
+                        input: Some(
+                            FieldMap {
+                                fields: [
+                                    Field {
+                                        name: "report" @ 17:5..17:11,
+                                        ty: TypeNode {
+                                            form: Scalar(
+                                                ScalarType {
+                                                    kind: String @ 19:13..19:19,
+                                                },
+                                            ),
+                                            description: Some(
+                                                "The raw bug report." @ 18:20..18:39,
+                                            ),
+                                            span: 18:7..20:5,
+                                        },
+                                    },
+                                    Field {
+                                        name: "matches" @ 20:5..20:12,
+                                        ty: TypeNode {
+                                            form: Array(
+                                                ArrayType {
+                                                    items: TypeNode {
+                                                        form: Scalar(
+                                                            ScalarType {
+                                                                kind: String @ 23:22..23:28,
+                                                            },
+                                                        ),
+                                                        description: None,
+                                                        span: 23:14..23:30,
+                                                    },
+                                                },
+                                            ),
+                                            description: Some(
+                                                "Grep hits from the repository, for grounding." @ 21:20..21:65,
+                                            ),
+                                            span: 21:7..24:3,
+                                        },
+                                    },
+                                ],
+                                surface: Input,
+                                span: 17:5..24:3,
+                            },
+                        ),
+                        tools: [],
+                        stores: [
+                            store.docs @ 15:12..15:22,
+                        ],
+                        description: Some(
+                            "Classifies bug-report findings into routable variants." @ 6:16..6:70,
+                        ),
+                        max_tool_iterations: None,
+                    },
+                ),
+                span: 5:1..5:13,
+            },
+        ],
+        span: 5:1..40:1,
+    },
+)

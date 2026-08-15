@@ -1,0 +1,12 @@
+# rule: arrays in a result schema declare `max_items` (grammar 3.5, Decision D10)
+# code: missing-key
+# message: missing required key `max_items` in the schema of `findings`
+# at: 11:7
+# help: arrays in a result schema declare a bound, so model-produced cardinality is finite and every edge payload stays serializable (grammar 3.5)
+agent.reviewer:
+  model: model.smart
+  prompt: Review the draft.
+  output:
+    findings:
+      type: array
+      items: { type: string }

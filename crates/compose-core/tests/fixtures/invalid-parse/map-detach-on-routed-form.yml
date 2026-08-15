@@ -1,0 +1,20 @@
+# rule: `detach` is declared per route on a discriminator-routed map (grammar 8.6 rule 7, Decision D31)
+# code: conflicting-keys
+# message: `detach` is not legal on a discriminator-routed map
+# at: 15:9
+# help: the routes of a heterogeneous map are independently typed targets: declare `detach` on the routes that want it (grammar 8.6 rule 7)
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    work:
+      map:
+        over: plan.output.findings
+        route_by: kind
+        max_concurrency: 4
+        detach: true
+        routes:
+          auto_fixable: { node: agent.fixer }
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }

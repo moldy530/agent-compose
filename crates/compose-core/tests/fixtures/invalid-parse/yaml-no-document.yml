@@ -1,0 +1,5 @@
+# rule: a spec file declares one YAML document (grammar 1.1)
+# code: empty-document
+# message: the file declares no YAML document; a spec file is one document with a mapping at its root
+# at: 1:1
+# this file is nothing but comments

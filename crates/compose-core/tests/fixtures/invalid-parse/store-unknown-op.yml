@@ -1,0 +1,16 @@
+# rule: store ops come from a closed catalogue (grammar 11.4)
+# code: unknown-variant
+# message: `fetch` is not a valid store `op`
+# at: 12:11
+# help: store `op` takes one of `get`, `set`, `delete`, `list`, `search`, `upsert`, `put`
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    load:
+      store: store.memory
+      op: fetch
+      key: "execution.session_key"
+  edges:
+    - { from: start, to: load }
+    - { from: load, to: end }

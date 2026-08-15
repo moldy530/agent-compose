@@ -1,0 +1,11 @@
+# rule: any top-level key that is neither a section nor a definition is an error (grammar 1.5)
+# code: unknown-key
+# message: unknown top-level key `trigger`
+# at: 8:1
+# help: did you mean `triggers`?
+version: "0.1"
+
+trigger:
+  cli:
+    type: manual
+    flow: flow.review_loop

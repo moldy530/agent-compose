@@ -1,0 +1,15 @@
+# rule: a node carries no more than one kind key (grammar 7.1)
+# code: conflicting-keys
+# message: node `write` declares both `agent` and `function`; a node carries exactly one kind key
+# at: 12:7
+# help: the node kinds are `agent`, `exec`, `http`, `function`, `flow`, `map`, `human`, `store`
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    write:
+      agent: agent.researcher
+      function: tool.web_search
+  edges:
+    - { from: start, to: write }
+    - { from: write, to: end }

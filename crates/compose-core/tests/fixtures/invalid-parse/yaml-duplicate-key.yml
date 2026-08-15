@@ -1,0 +1,12 @@
+# rule: duplicate keys in one mapping are a parse error, never last-wins (grammar 1.1)
+# code: duplicate-key
+# message: duplicate key `provider.anthropic`
+# at: 10:1
+# help: keys are declared once; the second declaration never wins
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+
+provider.anthropic:
+  kind: anthropic
+  api_key: ${SECOND_API_KEY}

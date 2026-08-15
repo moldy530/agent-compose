@@ -1,0 +1,6 @@
+# rule: `version:` is a quoted string: an unquoted 0.1 is a YAML float (grammar 1.3)
+# code: wrong-type
+# message: expected a string for `version`, found a number
+# at: 6:10
+# help: the value must be quoted: an unquoted `0.1` is a YAML float
+version: 0.1

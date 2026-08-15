@@ -1,0 +1,5 @@
+﻿# rule: spec files are UTF-8 without a byte-order mark (grammar 1.1)
+# code: invalid-encoding
+# message: the file starts with a byte-order mark; spec files are UTF-8 without a BOM
+# at: 1:1
+version: "0.1"

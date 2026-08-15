@@ -1,0 +1,11 @@
+# rule: `value_schema` is illegal on a vector store (grammar 11.1)
+# code: conflicting-keys
+# message: `value_schema` is not legal on a `vector` store
+# at: 10:3
+store.docs:
+  kind: vector
+  scope: global
+  embed:
+    model: text-embedding-3-small
+  value_schema:
+    text: { type: string }

@@ -1,0 +1,14 @@
+# rule: two edges with the same `from`, `to`, and `when` are an error (grammar 7.2)
+# code: invalid-value
+# message: duplicate edge: the same `from`, `to`, and `when` are already declared
+# at: 14:7
+# help: a second identical edge adds no transition
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    write: { agent: agent.researcher }
+  edges:
+    - { from: start, to: write }
+    - { from: write, to: end }
+    - { from: write, to: end }

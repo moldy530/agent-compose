@@ -1,0 +1,6 @@
+# rule: YAML tags carry language-level type directives the spec never has (grammar 1.1)
+# code: yaml-tag
+# message: YAML tags are not supported; the spec carries no language-level type directives
+# at: 6:16
+# help: drop the tag: types come from the schema the value is declared against
+version: !!str "0.1"

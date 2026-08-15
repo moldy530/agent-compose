@@ -1,0 +1,112 @@
+---
+source: crates/compose-core/tests/parse_examples.rs
+expression: "parse_clean(\"examples/review-loop/models.yml\")"
+---
+Spec(
+    SpecFile {
+        source: "examples/review-loop/models.yml",
+        version: None,
+        imports: None,
+        defaults: None,
+        state: None,
+        triggers: None,
+        definitions: [
+            Definition {
+                address: model.smart @ 3:1..3:12,
+                body: Model(
+                    Direct(
+                        DirectModel {
+                            provider: Some(
+                                provider.anthropic @ 4:13..4:31,
+                            ),
+                            id: Some(
+                                "claude-sonnet-4-6" @ 5:7..5:24,
+                            ),
+                            settings: Some(
+                                Settings {
+                                    entries: [
+                                        LiteralEntry {
+                                            key: "max_tokens" @ 7:5..7:15,
+                                            value: Int(
+                                                8000,
+                                            ) @ 7:17..7:21,
+                                        },
+                                        LiteralEntry {
+                                            key: "thinking" @ 8:5..8:13,
+                                            value: Mapping(
+                                                [
+                                                    LiteralEntry {
+                                                        key: "budget_tokens" @ 9:7..9:20,
+                                                        value: Int(
+                                                            4000,
+                                                        ) @ 9:22..9:26,
+                                                    },
+                                                ],
+                                            ) @ 9:7..11:1,
+                                        },
+                                    ],
+                                    span: 7:5..11:1,
+                                },
+                            ),
+                            description: None,
+                        },
+                    ),
+                ),
+                span: 3:1..3:12,
+            },
+            Definition {
+                address: model.fast @ 11:1..11:11,
+                body: Model(
+                    Direct(
+                        DirectModel {
+                            provider: Some(
+                                provider.anthropic @ 12:13..12:31,
+                            ),
+                            id: Some(
+                                "claude-haiku-4-5" @ 13:7..13:23,
+                            ),
+                            settings: Some(
+                                Settings {
+                                    entries: [
+                                        LiteralEntry {
+                                            key: "temperature" @ 15:5..15:16,
+                                            value: Float(
+                                                0.2,
+                                            ) @ 15:18..15:21,
+                                        },
+                                    ],
+                                    span: 15:5..19:1,
+                                },
+                            ),
+                            description: None,
+                        },
+                    ),
+                ),
+                span: 11:1..11:11,
+            },
+            Definition {
+                address: model.default @ 19:1..19:14,
+                body: Model(
+                    Route(
+                        RouteModel {
+                            route: [
+                                model.smart @ 20:11..20:22,
+                                model.fast @ 20:24..20:34,
+                            ],
+                            route_on: Some(
+                                [
+                                    RateLimit @ 21:14..21:24,
+                                    Overloaded @ 21:26..21:36,
+                                    Timeout @ 21:38..21:45,
+                                ],
+                            ),
+                            description: None,
+                        },
+                    ),
+                ),
+                span: 19:1..19:14,
+            },
+        ],
+        span: 3:1..22:1,
+    },
+)

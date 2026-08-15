@@ -1,0 +1,11 @@
+# rule: nested objects are written out; a bare mapping is not a shorthand (grammar 3.4, Decision D6)
+# code: missing-key
+# message: the schema of `author` declares no type: a type node carries exactly one of `type`, `enum`, `discriminator`
+# at: 11:7
+# help: nested objects are written out with `type: object` and `properties:`; a bare mapping is not a shorthand for one
+agent.reviewer:
+  model: model.smart
+  prompt: Review the draft.
+  output:
+    author:
+      name: { type: string }

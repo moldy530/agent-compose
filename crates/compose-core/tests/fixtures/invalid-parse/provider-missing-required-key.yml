@@ -1,0 +1,6 @@
+# rule: each provider kind fixes its required keys (grammar 12.1, Decision D38)
+# code: missing-key
+# message: missing required key `api_key` in provider definition `provider.anthropic`: `anthropic` providers declare it
+# at: 6:3
+provider.anthropic:
+  kind: anthropic

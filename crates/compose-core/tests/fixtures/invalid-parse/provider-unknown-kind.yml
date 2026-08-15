@@ -1,0 +1,8 @@
+# rule: provider kinds are a closed v0 set (grammar 12.1, Decision D38)
+# code: unknown-variant
+# message: `ollama` is not a valid provider `kind`
+# at: 7:9
+# help: provider `kind` takes one of `anthropic`, `openai`, `openai_compatible`, `azure_openai`, `bedrock`, `vertex`
+provider.local:
+  kind: ollama
+  base_url: ${LOCAL_LLM_URL}

@@ -1,0 +1,10 @@
+# rule: `max_tool_iterations` is an integer in 1..50 (grammar 5, Decision D51)
+# code: value-out-of-range
+# message: `max_tool_iterations` must be between 1 and 50, found 500
+# at: 8:24
+agent.reviewer:
+  model: model.smart
+  prompt: Review the draft.
+  max_tool_iterations: 500
+  output:
+    verdict: { enum: [approve, revise] }

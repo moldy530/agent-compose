@@ -1,0 +1,6 @@
+# rule: the document root must be a mapping (grammar 1.1)
+# code: root-not-mapping
+# message: the document root must be a mapping of sections and definitions, found a sequence
+# at: 5:1
+- providers.yml
+- models.yml

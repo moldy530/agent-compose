@@ -1,0 +1,19 @@
+# rule: `timeout` and `on_timeout` are jointly required on a human node (grammar 8.7, Decision D52)
+# code: missing-key
+# message: missing required key `on_timeout` in the `human` block of node `approve`: `timeout` declares a wait budget with no route
+# at: 16:18
+# help: `timeout` and `on_timeout` are declared together or not at all
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    approve:
+      human:
+        input:
+          draft: { type: string }
+        output:
+          decision: { enum: [approve, reject] }
+        timeout: 24h
+  edges:
+    - { from: start, to: approve }
+    - { from: approve, to: end }

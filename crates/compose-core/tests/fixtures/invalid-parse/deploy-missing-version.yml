@@ -1,0 +1,8 @@
+# rule: every deploy file declares `version:` (grammar 1.3)
+# code: missing-key
+# message: a deploy file must declare `version:`
+# at: 6:1
+# help: write `version: "0.1"` — quoted, since an unquoted `0.1` is a YAML float
+placements:
+  agent.fixer:
+    runtime: isolated

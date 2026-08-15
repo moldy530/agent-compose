@@ -1,0 +1,10 @@
+# rule: a flow declares its result surface with `outputs:` (grammar 7, Decision D26)
+# code: missing-key
+# message: missing required key `outputs` in flow definition `flow.demo`
+# at: 6:3
+flow.demo:
+  nodes:
+    write: { agent: agent.researcher }
+  edges:
+    - { from: start, to: write }
+    - { from: write, to: end }

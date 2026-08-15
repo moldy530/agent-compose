@@ -1,0 +1,188 @@
+---
+source: crates/compose-core/tests/parse_examples.rs
+expression: "parse_clean(\"examples/review-loop/tools/web_search.yml\")"
+---
+Spec(
+    SpecFile {
+        source: "examples/review-loop/tools/web_search.yml",
+        version: None,
+        imports: None,
+        defaults: None,
+        state: None,
+        triggers: None,
+        definitions: [
+            Definition {
+                address: tool.web_search @ 4:1..4:16,
+                body: Tool(
+                    ToolDef {
+                        description: Some(
+                            "Search the public web and return ranked result snippets." @ 5:16..5:72,
+                        ),
+                        input: Some(
+                            FieldMap {
+                                fields: [
+                                    Field {
+                                        name: "query" @ 7:5..7:10,
+                                        ty: TypeNode {
+                                            form: Scalar(
+                                                ScalarType {
+                                                    kind: String @ 9:13..9:19,
+                                                    min_length: 1 @ 10:19..10:20,
+                                                },
+                                            ),
+                                            description: Some(
+                                                "The search query." @ 8:20..8:37,
+                                            ),
+                                            span: 8:7..11:5,
+                                        },
+                                    },
+                                    Field {
+                                        name: "max_results" @ 11:5..11:16,
+                                        ty: TypeNode {
+                                            form: Scalar(
+                                                ScalarType {
+                                                    kind: Integer @ 13:13..13:20,
+                                                    minimum: Int(
+                                                        1,
+                                                    ) @ 14:16..14:17,
+                                                    maximum: Int(
+                                                        10,
+                                                    ) @ 15:16..15:18,
+                                                    default: Int(
+                                                        5,
+                                                    ) @ 16:16..16:17,
+                                                },
+                                            ),
+                                            description: Some(
+                                                "How many results to return." @ 12:20..12:47,
+                                            ),
+                                            span: 12:7..17:3,
+                                        },
+                                    },
+                                ],
+                                surface: Input,
+                                span: 7:5..17:3,
+                            },
+                        ),
+                        output: Some(
+                            FieldMap {
+                                fields: [
+                                    Field {
+                                        name: "results" @ 18:5..18:12,
+                                        ty: TypeNode {
+                                            form: Array(
+                                                ArrayType {
+                                                    items: TypeNode {
+                                                        form: Object(
+                                                            ObjectType {
+                                                                properties: FieldMap {
+                                                                    fields: [
+                                                                        Field {
+                                                                            name: "title" @ 25:11..25:16,
+                                                                            ty: TypeNode {
+                                                                                form: Scalar(
+                                                                                    ScalarType {
+                                                                                        kind: String @ 25:26..25:32,
+                                                                                    },
+                                                                                ),
+                                                                                description: None,
+                                                                                span: 25:18..25:34,
+                                                                            },
+                                                                        },
+                                                                        Field {
+                                                                            name: "url" @ 26:11..26:14,
+                                                                            ty: TypeNode {
+                                                                                form: Scalar(
+                                                                                    ScalarType {
+                                                                                        kind: String @ 26:24..26:30,
+                                                                                        format: Uri @ 26:40..26:43,
+                                                                                    },
+                                                                                ),
+                                                                                description: None,
+                                                                                span: 26:16..26:45,
+                                                                            },
+                                                                        },
+                                                                        Field {
+                                                                            name: "snippet" @ 27:11..27:18,
+                                                                            ty: TypeNode {
+                                                                                form: Scalar(
+                                                                                    ScalarType {
+                                                                                        kind: String @ 27:28..27:34,
+                                                                                    },
+                                                                                ),
+                                                                                description: None,
+                                                                                span: 27:20..27:36,
+                                                                            },
+                                                                        },
+                                                                    ],
+                                                                    surface: Result,
+                                                                    span: 25:11..28:3,
+                                                                },
+                                                                optional: [],
+                                                                default: None,
+                                                            },
+                                                        ),
+                                                        description: None,
+                                                        span: 23:9..28:3,
+                                                    },
+                                                    max_items: 10 @ 21:18..21:20,
+                                                },
+                                            ),
+                                            description: Some(
+                                                "Ranked results, most relevant first." @ 19:20..19:56,
+                                            ),
+                                            span: 19:7..28:3,
+                                        },
+                                    },
+                                ],
+                                surface: Result,
+                                span: 18:5..28:3,
+                            },
+                        ),
+                        implementation: Some(
+                            Http(
+                                HttpBlock {
+                                    method: Some(
+                                        Get @ 29:13..29:16,
+                                    ),
+                                    url: Some(
+                                        interpolated("https://${SEARCH_HOST}/v1/search") @ 30:10..30:44,
+                                    ),
+                                    headers: [
+                                        InterpolatedEntry {
+                                            name: "authorization" @ 32:7..32:20,
+                                            value: interpolated("Bearer ${SEARCH_API_KEY}") @ 32:22..32:48,
+                                        },
+                                    ],
+                                    query: Some(
+                                        Bindings {
+                                            entries: [
+                                                Binding {
+                                                    name: "q" @ 34:7..34:8,
+                                                    value: cel("input.query") @ 34:10..34:23,
+                                                },
+                                                Binding {
+                                                    name: "n" @ 35:7..35:8,
+                                                    value: cel("input.max_results") @ 35:10..35:29,
+                                                },
+                                            ],
+                                            span: 34:7..36:5,
+                                        },
+                                    ),
+                                    body: None,
+                                    expect_status: [
+                                        200 @ 36:21..36:24,
+                                    ],
+                                    output: None,
+                                    span: 29:5..37:1,
+                                },
+                            ),
+                        ),
+                    },
+                ),
+                span: 4:1..4:16,
+            },
+        ],
+        span: 4:1..37:1,
+    },
+)

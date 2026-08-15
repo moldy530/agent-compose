@@ -1,0 +1,20 @@
+# rule: a map dispatches homogeneously or by discriminator, never both (grammar 8.6 rule 2)
+# code: conflicting-keys
+# message: the `map` block of node `work` declares both a `node:` target and discriminator routing
+# at: 14:9
+# help: a map dispatches one way or the other: `node:`, or `route_by:` with `routes:`
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    work:
+      map:
+        over: plan.output.findings
+        node: agent.worker
+        route_by: kind
+        routes:
+          auto_fixable: { node: agent.fixer }
+        max_concurrency: 4
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }

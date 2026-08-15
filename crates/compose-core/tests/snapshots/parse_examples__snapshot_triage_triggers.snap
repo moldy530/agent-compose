@@ -1,0 +1,157 @@
+---
+source: crates/compose-core/tests/parse_examples.rs
+expression: "parse_clean(\"examples/triage-fanout/triggers.yml\")"
+---
+Spec(
+    SpecFile {
+        source: "examples/triage-fanout/triggers.yml",
+        version: None,
+        imports: None,
+        defaults: None,
+        state: None,
+        triggers: Some(
+            TriggersSection {
+                triggers: [
+                    Trigger {
+                        name: "cli" @ 5:3..5:6,
+                        flow: Some(
+                            flow.triage @ 7:11..7:22,
+                        ),
+                        session_key: Some(
+                            cel("payload.session") @ 8:18..8:35,
+                        ),
+                        description: None,
+                        kind: Some(
+                            Manual,
+                        ),
+                        span: 6:5..10:3,
+                    },
+                    Trigger {
+                        name: "on_report" @ 10:3..10:12,
+                        flow: Some(
+                            flow.triage @ 12:11..12:22,
+                        ),
+                        session_key: Some(
+                            cel("payload.body.project") @ 18:18..18:40,
+                        ),
+                        description: None,
+                        kind: Some(
+                            Http(
+                                HttpTrigger {
+                                    path: Some(
+                                        "/reports" @ 13:11..13:19,
+                                    ),
+                                    method: Some(
+                                        Post @ 14:13..14:17,
+                                    ),
+                                    input: Some(
+                                        Bindings {
+                                            entries: [
+                                                Binding {
+                                                    name: "report" @ 16:7..16:13,
+                                                    value: cel("payload.body.report") @ 16:15..16:36,
+                                                },
+                                                Binding {
+                                                    name: "pattern" @ 17:7..17:14,
+                                                    value: cel("payload.body.pattern") @ 17:16..17:38,
+                                                },
+                                            ],
+                                            span: 16:7..18:5,
+                                        },
+                                    ),
+                                    respond: Some(
+                                        Async @ 19:14..19:19,
+                                    ),
+                                    timeout: None,
+                                    callback: Some(
+                                        cel("payload.body.callback_url") @ 20:15..20:42,
+                                    ),
+                                },
+                            ),
+                        ),
+                        span: 11:5..24:3,
+                    },
+                    Trigger {
+                        name: "nightly" @ 24:3..24:10,
+                        flow: Some(
+                            flow.triage @ 26:11..26:22,
+                        ),
+                        session_key: Some(
+                            cel("'nightly'") @ 32:18..32:29,
+                        ),
+                        description: None,
+                        kind: Some(
+                            Schedule(
+                                ScheduleTrigger {
+                                    cron: Some(
+                                        "0 3 * * *" @ 27:11..27:22,
+                                    ),
+                                    timezone: Some(
+                                        "UTC" @ 28:15..28:18,
+                                    ),
+                                    input: Some(
+                                        Bindings {
+                                            entries: [
+                                                Binding {
+                                                    name: "report" @ 30:7..30:13,
+                                                    value: cel("'nightly sweep'") @ 30:15..30:32,
+                                                },
+                                                Binding {
+                                                    name: "pattern" @ 31:7..31:14,
+                                                    value: cel("'TODO|FIXME'") @ 31:16..31:30,
+                                                },
+                                            ],
+                                            span: 30:7..32:5,
+                                        },
+                                    ),
+                                },
+                            ),
+                        ),
+                        span: 25:5..36:3,
+                    },
+                    Trigger {
+                        name: "ingest" @ 36:3..36:9,
+                        flow: Some(
+                            flow.triage @ 38:11..38:22,
+                        ),
+                        session_key: Some(
+                            cel("payload.body.project") @ 43:18..43:40,
+                        ),
+                        description: None,
+                        kind: Some(
+                            Event(
+                                EventTrigger {
+                                    source: Some(
+                                        "bug_reports" @ 39:13..39:24,
+                                    ),
+                                    input: Some(
+                                        Bindings {
+                                            entries: [
+                                                Binding {
+                                                    name: "report" @ 41:7..41:13,
+                                                    value: cel("payload.body.text") @ 41:15..41:34,
+                                                },
+                                                Binding {
+                                                    name: "pattern" @ 42:7..42:14,
+                                                    value: cel("payload.body.pattern") @ 42:16..42:38,
+                                                },
+                                            ],
+                                            span: 41:7..43:5,
+                                        },
+                                    ),
+                                    dedupe_key: Some(
+                                        cel("payload.id") @ 44:17..44:29,
+                                    ),
+                                },
+                            ),
+                        ),
+                        span: 37:5..45:1,
+                    },
+                ],
+                span: 5:3..45:1,
+            },
+        ),
+        definitions: [],
+        span: 1:1..45:1,
+    },
+)

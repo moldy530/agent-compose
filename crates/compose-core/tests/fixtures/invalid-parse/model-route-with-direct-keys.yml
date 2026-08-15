@@ -1,0 +1,8 @@
+# rule: a model definition is a direct binding or a route, never both (grammar 12.2, Decision D39)
+# code: conflicting-keys
+# message: `provider` is not legal on a model route
+# at: 8:3
+# help: a route is an ordered list of direct models; `provider`, `id`, and `settings` belong to its members (grammar 12.2)
+model.default:
+  route: [model.smart, model.fast]
+  provider: provider.anthropic

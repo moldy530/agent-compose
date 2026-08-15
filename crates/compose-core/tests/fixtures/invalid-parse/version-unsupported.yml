@@ -1,0 +1,6 @@
+# rule: `version:` must be one of the build's SUPPORTED_SPEC_VERSIONS (grammar 1.3, PRD 9.5)
+# code: unsupported-version
+# message: `9.9` is not a spec version this compiler supports
+# at: 6:10
+# help: this build supports `0.1`; run `agent-compose migrate` to update a spec written for another version
+version: "9.9"
