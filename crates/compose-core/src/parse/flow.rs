@@ -94,7 +94,7 @@ pub(crate) fn flow_def(fields: &mut Fields<'_>, subject: &str, cx: &mut Cx) -> F
         }
         if !incomplete && !items.is_empty() {
             check_start_is_guaranteed(&edges, &node.span, subject, cx);
-            check_else_edges_have_a_guarded_sibling(&edges, cx);
+            check_else_edges(&edges, cx);
         }
     }
 
@@ -117,11 +117,11 @@ pub(crate) fn flow_def(fields: &mut Fields<'_>, subject: &str, cx: &mut Cx) -> F
 /// having an outgoing edge, and the `on_error: skip` escape — relate an edge to
 /// a node, so they belong to the validator alongside reachability.
 ///
-/// The `else: true` spelling carries its own precondition, a `when:`-guarded
-/// sibling, which [`check_else_edges_have_a_guarded_sibling`] decides
-/// separately: this check reads exactly what grammar 7.6.3 rule 2 states, and a
-/// lone `else: true` leaving `start` is refused by the other rule rather than
-/// by a second reading of this one.
+/// The `else: true` spelling carries its own preconditions — a `when:`-guarded
+/// sibling, and being the node's only `else:` edge — which [`check_else_edges`]
+/// decides separately: this check reads exactly what grammar 7.6.3 rule 2
+/// states, and a lone `else: true` leaving `start` is refused by the other rules
+/// rather than by a second reading of this one.
 fn check_start_is_guaranteed(edges: &[Edge], span: &Span, subject: &str, cx: &mut Cx) {
     let leaves_start = |edge: &&Edge| {
         matches!(
@@ -160,31 +160,66 @@ fn check_start_is_guaranteed(edges: &[Edge], span: &Span, subject: &str, cx: &mu
     );
 }
 
-/// An edge carrying `else: true` must have a `when:`-guarded sibling leaving the
-/// same node (grammar 7.3, Decision D107).
+/// The two things grammar 7.3 rule 4 requires of an `else: true` edge: that its
+/// source declares **at most one** of them, and that it has a `when:`-guarded
+/// sibling leaving that same node (Decision D107).
 ///
-/// Grammar 7.3 rule 4 gives an `else:` edge exactly one behaviour — taken iff no
-/// guarded sibling was taken — so with no guarded sibling it fires on every
-/// pass, which is what an edge carrying neither keyword already is. The keyword
-/// then states nothing, while the author who wrote it to mean "only if the other
-/// edge did not fire" gets multicast to both targets: two concurrent branches, a
-/// reduced-channel requirement they did not expect, and possibly an unbalanced
-/// convergence downstream, none of it diagnosed. It is the inert key
-/// Decision D61 already refuses in its `else: false` spelling.
+/// Both read the same relation — two items of one `edges:` array sharing a
+/// `from` value — and they are decided in one pass because the second only asks
+/// its question of the edge the first leaves standing. A node with two `else:`
+/// edges keeps the first; the surplus ones are refused as surplus rather than
+/// also being asked, once each, whether they have a guarded sibling.
 ///
-/// Grammar Appendix B lists this among the rules the *published schema* cannot
-/// express — it relates two items of one `edges:` array through a shared `from`
-/// value. That is a statement about JSON Schema, not about this pass: the rule
-/// needs no resolution, so it is decided here, exactly as `optional:` entries
-/// naming declared properties are (grammar 3.4, Decision D89).
-fn check_else_edges_have_a_guarded_sibling(edges: &[Edge], cx: &mut Cx) {
-    for edge in edges {
-        let Some(else_span) = edge.else_edge.as_ref() else {
+/// **At most one `else:` edge per source.** Rule 4 gives a node one default
+/// edge. Two of them share the one suppression clause — neither is suppressed by
+/// the other, since suppression is keyed on *guarded* siblings — so both are
+/// taken on the same pass and the branch is multicast to both targets (rule 6):
+/// an unannounced fork, a reduced-channel requirement the author did not expect
+/// (grammar 10.2), and possibly an unbalanced convergence downstream. The
+/// duplicate rule of grammar 7.2 does not reach it, because two `else:` edges to
+/// different targets are not the same transition.
+///
+/// **A guarded sibling.** Rule 4 gives an `else:` edge exactly one behaviour —
+/// taken iff no guarded sibling was taken — so with no guarded sibling it fires
+/// on every pass, which is what an edge carrying neither keyword already is. The
+/// keyword then states nothing, while the author who wrote it to mean "only if
+/// the other edge did not fire" gets multicast to both targets. It is the inert
+/// key Decision D61 already refuses in its `else: false` spelling.
+///
+/// Grammar Appendix B lists the second among the rules the *published schema*
+/// cannot express — it relates two items of one `edges:` array through a shared
+/// `from` value — and the first is unlisted for the same reason: `uniqueItems`
+/// on `edges:` catches byte-identical edge objects, never two that agree on
+/// `from` and `else` alone. That is a statement about JSON Schema, not about
+/// this pass: neither rule needs resolution, so both are decided here, exactly
+/// as `optional:` entries naming declared properties are (grammar 3.4,
+/// Decision D89).
+fn check_else_edges(edges: &[Edge], cx: &mut Cx) {
+    for (index, edge) in edges.iter().enumerate() {
+        let (Some(else_span), Some(from)) = (edge.else_edge.as_ref(), edge.from.as_ref()) else {
             continue;
         };
-        let Some(from) = edge.from.as_ref() else {
+        let first_else = edges[..index].iter().find_map(|other| {
+            let span = other.else_edge.as_ref()?;
+            (other.from.as_ref().map(|source| &source.value) == Some(&from.value)).then_some(span)
+        });
+        if let Some(first) = first_else {
+            cx.push(
+                Diagnostic::error(
+                    DiagnosticCode::InvalidValue,
+                    else_span.clone(),
+                    format!(
+                        "another `else: true` edge already leaves `{}`",
+                        describe_source(&from.value)
+                    ),
+                )
+                .with_label(first.clone(), "the default edge is declared here")
+                .with_help(
+                    "a node has one default edge, taken when no guarded sibling was: two of them are both taken on the same pass, multicasting the branch to both targets rather than choosing between them — write the `when:` guard this one means, or route the default through one edge and fan out from its target (grammar 7.3 rule 4)",
+                ),
+            );
             continue;
-        };
+        }
         let has_guarded_sibling = edges.iter().any(|other| {
             other.when.is_some()
                 && other.from.as_ref().map(|other| &other.value) == Some(&from.value)
@@ -1343,6 +1378,60 @@ mod tests {
                 "    - { from: start, to: a }\n    - { from: a, to: b, when: 5 }\n    - { from: a, to: c, else: true }\n"
             )),
             ["wrong-type: expected a CEL expression for `when`, found an integer"]
+        );
+    }
+
+    /// Grammar 7.3 rule 4's two clauses are asked in order, and the second is
+    /// asked only of the `else:` edge the first leaves standing: a node with two
+    /// of them and no guarded sibling reports the surplus once and the missing
+    /// sibling once, rather than the missing sibling once per `else:` edge.
+    #[test]
+    fn a_surplus_else_edge_is_not_also_asked_for_a_guarded_sibling() {
+        assert_eq!(
+            diagnostics(&flow(
+                "    - { from: start, to: a }\n    - { from: a, to: b, else: true }\n    - { from: a, to: c, else: true }\n"
+            )),
+            [
+                "invalid-value: the `else: true` edge leaving `a` has no `when`-guarded sibling",
+                "invalid-value: another `else: true` edge already leaves `a`",
+            ]
+        );
+    }
+
+    /// Every `else:` edge past the first is surplus and says so against the
+    /// first, so the message counts nothing and stays true of the third.
+    #[test]
+    fn every_surplus_else_edge_is_reported_against_the_first() {
+        assert_eq!(
+            diagnostics(&flow(
+                "    - { from: start, to: a }\n    - { from: a, to: b, when: \"a.output.v == 'x'\" }\n    - { from: a, to: c, else: true }\n    - { from: a, to: end, else: true }\n    - { from: b, to: end }\n    - { from: c, to: end }\n"
+            )),
+            ["invalid-value: another `else: true` edge already leaves `a`"]
+        );
+        assert_eq!(
+            diagnostics(&flow(
+                "    - { from: start, to: a }\n    - { from: a, to: b, when: \"a.output.v == 'x'\" }\n    - { from: a, to: c, else: true }\n    - { from: a, to: end, else: true }\n    - { from: a, to: b, else: true }\n    - { from: b, to: end }\n    - { from: c, to: end }\n"
+            )),
+            [
+                "invalid-value: another `else: true` edge already leaves `a`",
+                "invalid-value: another `else: true` edge already leaves `a`",
+            ]
+        );
+    }
+
+    /// Rule 4 is stated per source node, so an `else:` edge leaving a different
+    /// node is not a second one: each keeps its own reading, and here neither
+    /// has a guarded sibling.
+    #[test]
+    fn else_edges_leaving_different_nodes_are_not_surplus() {
+        assert_eq!(
+            diagnostics(&flow(
+                "    - { from: start, to: a }\n    - { from: a, to: b, else: true }\n    - { from: b, to: c, else: true }\n    - { from: c, to: end }\n"
+            )),
+            [
+                "invalid-value: the `else: true` edge leaving `a` has no `when`-guarded sibling",
+                "invalid-value: the `else: true` edge leaving `b` has no `when`-guarded sibling",
+            ]
         );
     }
 

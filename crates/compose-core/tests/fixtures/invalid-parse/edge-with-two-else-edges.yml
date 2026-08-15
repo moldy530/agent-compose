@@ -1,0 +1,22 @@
+# rule: at most one `else: true` edge leaves any one source node (grammar 7.3 rule 4)
+# code: invalid-value
+# message: another `else: true` edge already leaves `review`
+# at: 21:43
+# help: a node has one default edge, taken when no guarded sibling was: two of them are both taken on the same pass, multicasting the branch to both targets rather than choosing between them — write the `when:` guard this one means, or route the default through one edge and fan out from its target (grammar 7.3 rule 4)
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    write:
+      agent: agent.researcher
+    review:
+      agent: agent.reviewer
+    escalate:
+      agent: agent.reviewer
+  edges:
+    - { from: start, to: write }
+    - { from: write, to: review }
+    - { from: review, to: write, when: "review.output.verdict == 'revise'" }
+    - { from: review, to: end, else: true }
+    - { from: review, to: escalate, else: true }
+    - { from: escalate, to: end }

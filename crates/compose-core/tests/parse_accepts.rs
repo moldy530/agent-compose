@@ -530,6 +530,35 @@ flow.demo:
     );
 }
 
+/// Grammar 7.3 rule 4 bounds `else:` edges **per source node**, so two of them
+/// in one flow are legal as long as no node declares two. Reading the rule over
+/// the whole `edges:` array instead would make the ordinary shape — every
+/// branching node with its own default — unwritable past the first one.
+#[test]
+fn one_else_edge_at_each_of_two_branching_nodes() {
+    accepts(
+        "two-else-edges.yml",
+        r#"
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    review:  { agent: agent.reviewer }
+    triage:  { agent: agent.triager }
+    publish: { agent: agent.publisher }
+    rework:  { agent: agent.reworker }
+  edges:
+    - { from: start, to: review }
+    - { from: review, to: publish, when: "review.output.verdict == 'approve'" }
+    - { from: review, to: triage, else: true }
+    - { from: triage, to: rework, when: "triage.output.verdict == 'revise'" }
+    - { from: triage, to: end, else: true }
+    - { from: publish, to: end }
+    - { from: rework, to: end }
+"#,
+    );
+}
+
 #[test]
 fn every_channel_form_with_its_reduce_policy() {
     accepts(

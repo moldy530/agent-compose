@@ -74,10 +74,15 @@
 //! * `optional:` entries naming declared properties (grammar 3.4, Decision
 //!   D89) — one type node's own two keys;
 //! * a `when:`-guarded sibling for every `else: true` edge (grammar 7.3,
-//!   Decision D107) — two items of one `edges:` array.
+//!   Decision D107) — two items of one `edges:` array;
+//! * at most one `else: true` edge per source node (grammar 7.3 rule 4) — the
+//!   same two items, related the same way. Appendix B does not list this one at
+//!   all: `uniqueItems` on `edges:` catches byte-identical edge objects, never
+//!   two that agree on `from` and `else` alone, so it would otherwise fall
+//!   between the schema, this pass, and PRD §7 M0's static-check list.
 //!
-//! Both are decided here. Being stricter than the schema is always safe: the
-//! invariant Appendix B closes with is one-directional, so a file the schema
+//! All three are decided here. Being stricter than the schema is always safe:
+//! the invariant Appendix B closes with is one-directional, so a file the schema
 //! rejects must fail `validate`, and never the reverse.
 //!
 //! Grammar 7.6.3's three no-dead-end rules then split on the same question.
