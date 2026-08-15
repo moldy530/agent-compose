@@ -162,10 +162,10 @@ fn imports(
                 Diagnostic::error(
                     DiagnosticCode::InvalidImportPath,
                     span,
-                    format!("`{written}` resolves outside the project root"),
+                    format!("`{written}` climbs out of the project root"),
                 )
                 .with_help(
-                    "a path may contain `..`, but every file of a composition sits inside the project root — the entrypoint's own directory — so an entry may not climb out of it (grammar 1.4)",
+                    "a path may contain `..`, but every file of a composition sits inside the project root — the entrypoint's own directory — so no part of an entry may climb out of it, not even one that climbs back in: whether `../<dir>/f.yml` came back would depend on what the checkout happens to be named, and a composition means the same thing on every host (grammar 1.4, PRD 5.12)",
                 ),
             );
             continue;
@@ -426,6 +426,15 @@ fn read(
 /// make the composition depend on the machine it is resolved on, which PRD 5.12
 /// forbids. The parser has already fixed the charset (grammar 1.4), so the only
 /// segments here are `.`, `..`, and portable names.
+///
+/// The root is a floor rather than a fence: a `..` at position 0 fails the path
+/// even when a later segment would climb back in. Deciding `../proj/f.yml`
+/// would mean comparing `proj` against the name of the directory the project
+/// was checked out into — so the same composition would resolve on one machine
+/// and not on another, which is the thing grammar 1.4's one-portable-spelling
+/// rule and PRD 5.12 both exist to prevent. It cannot even be asked uniformly:
+/// an entrypoint given as a bare `main.yml` has `""` for a root, and `""` has
+/// no name to compare against.
 fn normalize(path: &str) -> Option<String> {
     let mut segments: Vec<&str> = Vec::new();
     for segment in path.split('/') {
@@ -498,6 +507,15 @@ mod tests {
         assert_eq!(normalize("a/b/../../c.yml").as_deref(), Some("c.yml"));
         assert_eq!(normalize("../outside.yml"), None);
         assert_eq!(normalize("a/../../outside.yml"), None);
+    }
+
+    /// A path that climbs out and back in is refused too: whether it landed
+    /// inside would depend on the name of the directory the project was checked
+    /// out into, and a bare `main.yml` entrypoint has no such name at all.
+    #[test]
+    fn a_path_that_climbs_out_and_back_in_is_still_out() {
+        assert_eq!(normalize("../project/models.yml"), None);
+        assert_eq!(normalize("a/../../a/models.yml"), None);
     }
 
     #[test]

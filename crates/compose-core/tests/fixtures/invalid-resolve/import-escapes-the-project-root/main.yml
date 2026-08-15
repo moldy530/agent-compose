@@ -1,8 +1,8 @@
 # rule: an `imports:` entry resolves inside the project root (grammar 1.4)
 # code: invalid-import-path
-# message: `../outside.yml` resolves outside the project root
+# message: `../outside.yml` climbs out of the project root
 # at: main.yml:8:5
-# help: a path may contain `..`, but every file of a composition sits inside the project root — the entrypoint's own directory — so an entry may not climb out of it (grammar 1.4)
+# help: a path may contain `..`, but every file of a composition sits inside the project root — the entrypoint's own directory — so no part of an entry may climb out of it, not even one that climbs back in: whether `../<dir>/f.yml` came back would depend on what the checkout happens to be named, and a composition means the same thing on every host (grammar 1.4, PRD 5.12)
 version: "0.1"
 imports:
   - ../outside.yml
