@@ -103,15 +103,22 @@ fn validation_errors(validator: &Validator, instance: &Value) -> Vec<String> {
 /// ```yaml
 /// # rule: <the grammar rule the fixture violates>
 /// # at: <JSON Pointer where the violation must surface, or `<root>`>
+/// # via: <JSON Pointer to the schema keyword that must reject it>
 /// ```
 ///
-/// The pointer is what keeps the corpus honest: without it a fixture that
-/// starts failing for an unrelated reason still passes, and the rule it was
-/// written for silently stops being covered.
+/// The two pointers are what keep the corpus honest. `at` alone is too weak:
+/// it is satisfied by *any* error at that location, so a fixture that starts
+/// failing for an unrelated reason keeps the suite green while quietly ceasing
+/// to cover its rule. `via` pins the other half — the keyword doing the
+/// rejecting — so the pair identifies one specific rule firing on one specific
+/// value.
 struct FixtureHeader {
     rule: String,
     /// JSON Pointer into the instance; the empty string is the document root.
     at: String,
+    /// JSON Pointer into the schema, as `jsonschema` reports it: the location
+    /// of the keyword that produced the error.
+    via: String,
 }
 
 const ROOT_POINTER: &str = "<root>";
@@ -120,6 +127,7 @@ fn fixture_header(path: &Path) -> Option<FixtureHeader> {
     let text = fs::read_to_string(path).ok()?;
     let mut rule = None;
     let mut at = None;
+    let mut via = None;
     for line in text.lines().take_while(|line| line.starts_with('#')) {
         if let Some(value) = line.strip_prefix("# rule:") {
             rule.get_or_insert_with(|| value.trim().to_string());
@@ -128,10 +136,14 @@ fn fixture_header(path: &Path) -> Option<FixtureHeader> {
                 ROOT_POINTER => String::new(),
                 pointer => pointer.to_string(),
             });
+        } else if let Some(value) = line.strip_prefix("# via:") {
+            via.get_or_insert_with(|| value.trim().to_string());
         }
     }
-    match (rule, at) {
-        (Some(rule), Some(at)) if !rule.is_empty() => Some(FixtureHeader { rule, at }),
+    match (rule, at, via) {
+        (Some(rule), Some(at), Some(via)) if !rule.is_empty() && !via.is_empty() => {
+            Some(FixtureHeader { rule, at, via })
+        }
         _ => None,
     }
 }
@@ -295,8 +307,11 @@ fn every_invalid_fixture_is_rejected_by_the_published_schema() {
 
 /// Rejection alone is too weak: a fixture that starts failing somewhere else
 /// keeps the suite green while quietly ceasing to cover its rule. Each fixture
-/// therefore declares *where* the violation surfaces, and the schema must
-/// produce an error at exactly that location.
+/// therefore declares both halves of its violation — the instance location and
+/// the schema keyword that must reject it — and one single error has to match
+/// both. Matching only the location would let any unrelated failure at the same
+/// place stand in for the rule (a `oneOf` branch, say, that collapses every
+/// sub-error onto its own pointer).
 #[test]
 fn every_invalid_fixture_fails_at_its_declared_location() {
     let validator = compile_schema();
@@ -304,27 +319,47 @@ fn every_invalid_fixture_fails_at_its_declared_location() {
 
     let mut mislocated = Vec::new();
     for file in &files {
-        let header = fixture_header(file)
-            .unwrap_or_else(|| panic!("{} is missing its `# rule:`/`# at:` header", display(file)));
+        let header = fixture_header(file).unwrap_or_else(|| {
+            panic!(
+                "{} is missing its `# rule:`/`# at:`/`# via:` header",
+                display(file)
+            )
+        });
         let instance = read_yaml_as_json(file);
-        let locations: Vec<String> = validator
+        let reported: Vec<(String, String)> = validator
             .iter_errors(&instance)
-            .map(|error| error.instance_path().to_string())
+            .map(|error| {
+                (
+                    error.instance_path().to_string(),
+                    error.schema_path().to_string(),
+                )
+            })
             .collect();
-        if !locations.contains(&header.at) {
-            let expected = if header.at.is_empty() {
-                ROOT_POINTER.to_string()
+        let expected = (header.at.clone(), header.via.clone());
+        if !reported.contains(&expected) {
+            let shown = if header.at.is_empty() {
+                ROOT_POINTER
             } else {
-                header.at.clone()
+                &header.at
             };
             mislocated.push(format!(
-                "{} ({})\n  expected an error at {expected}, got: {}",
+                "{} ({})\n  expected an error at {shown} from {}, got: {}",
                 display(file),
                 header.rule,
-                if locations.is_empty() {
+                header.via,
+                if reported.is_empty() {
                     "<no errors at all>".to_string()
                 } else {
-                    locations.join(", ")
+                    reported
+                        .iter()
+                        .map(|(at, via)| {
+                            format!(
+                                "{} from {via}",
+                                if at.is_empty() { ROOT_POINTER } else { at }
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 }
             ));
         }
@@ -352,8 +387,9 @@ fn invalid_fixtures_declare_the_rule_they_violate() {
     }
     assert!(
         undeclared.is_empty(),
-        "every negative fixture must open with `# rule: <violated rule>` and \
-         `# at: <json pointer>` comments; missing or incomplete in:\n  {}",
+        "every negative fixture must open with `# rule: <violated rule>`, \
+         `# at: <instance pointer>` and `# via: <schema pointer>` comments; \
+         missing or incomplete in:\n  {}",
         undeclared.join("\n  ")
     );
     assert_eq!(
