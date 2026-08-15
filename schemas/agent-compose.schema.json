@@ -193,7 +193,7 @@
       "anyOf": [{ "$ref": "#/$defs/toolRef" }, { "$ref": "#/$defs/flowRef" }]
     },
     "mapTargetRef": {
-      "description": "A map dispatch target: agent., tool., or flow. Map instances are isolated per-item invocations of a component, not nodes of the enclosing flow (Grammar 8.6 / PRD 5.6).",
+      "description": "A map dispatch target: agent., tool., or flow. Map instances are isolated per-item invocations of a component, not nodes of the enclosing flow: they take no policy from `defaults:` (Decision D73) and each runs on a fresh conversation history that is discarded when it completes, never reading or appending to the enclosing flow's `messages` (grammar 8.6 rules 10 and 13, 10.4 / Decisions D29, D105). Grammar 8.6 / PRD 5.6.",
       "anyOf": [
         { "$ref": "#/$defs/agentRef" },
         { "$ref": "#/$defs/toolRef" },
@@ -1210,7 +1210,7 @@
         },
         "writes": { "description": "Write remap over the subflow's output fields.", "$ref": "#/$defs/writes" },
         "context": {
-          "description": "Conversation-history scoping: isolated (default) gives the subflow a fresh history; inherit shares the caller's (PRD 5.7).",
+          "description": "Conversation-history scoping: isolated (default) gives the subflow a fresh history; inherit shares the caller's (PRD 5.7). This key is a flow node's alone - a map dispatch is the other module boundary for history and its isolation is unconditional, so a map block accepts no `context:` (grammar 10.4, 8.6 rule 13 / Decisions D27, D105).",
           "enum": ["isolated", "inherit"]
         },
         "policy": { "description": "Instantiation-site policy override: the highest level of the resolution chain, propagated into nested instantiations.", "$ref": "#/$defs/policyBlock" },

@@ -1,0 +1,19 @@
+# rule: a map block takes no `context:` - a dispatch isolates conversation history unconditionally, and the sharing opt-in is a flow-node key (grammar 8.6 rule 13, 10.4 / D105)
+# at: /flow.work/nodes/fan/map
+# via: /$defs/mapNode/properties/map/additionalProperties
+flow.work:
+  outputs:
+    done: { type: boolean }
+  nodes:
+    plan:
+      agent: agent.planner
+    fan:
+      map:
+        over: plan.output.tasks
+        node: agent.worker
+        max_concurrency: 4
+        context: inherit
+  edges:
+    - { from: start, to: plan }
+    - { from: plan, to: fan }
+    - { from: fan, to: end }

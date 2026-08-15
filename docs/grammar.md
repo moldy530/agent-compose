@@ -1948,7 +1948,10 @@ sub:
 `context: inherit` shares the caller's conversation-history channel with the
 subflow; `isolated` (the default) gives the subflow a fresh one. Nothing else
 crosses a module boundary implicitly (PRD 5.7). `context:` is legal on `flow:`
-nodes only.
+nodes only — a `map` dispatch is a module boundary for history too, and an
+unconditional one: its instances always run on a fresh, discarded history and
+there is no key to say otherwise (§10.4, §8.6 rule 13,
+[D105](#d105-a-map-dispatch-isolates-conversation-history-per-instance)).
 
 **`policy:` and the node's own policy keys are different things**, and a `flow:`
 node MAY carry both:
@@ -2179,6 +2182,15 @@ A **route** object takes `node` (required) plus optional `max_concurrency`,
     [D75](#d75-map-dispatch-bindings-take-both-input-forms)). `tool.*` and
     `flow.*` targets always declare an input object, so only an agent target can
     be string-in.
+13. **History is per instance.** A dispatched instance runs on a fresh
+    conversation history that is discarded when it completes: it neither reads
+    nor appends to the enclosing flow instance's `messages` channel (§10.4).
+    A `map` block accepts no `context:` key — the opt-in that shares a caller's
+    history is a `flow:`-node key (§8.5) — so the isolation is not waivable at a
+    dispatch, which is what keeps concurrent instances from interleaving their
+    turns into one history (Decisions
+    [D105](#d105-a-map-dispatch-isolates-conversation-history-per-instance),
+    [D29](#d29-map-targets-are-component-references-not-flow-local-node-ids)).
 
 ### 8.7 `human`
 
@@ -2593,6 +2605,22 @@ agent nodes (PRD 5.7 tier 3). It MUST NOT be declared in `state:` and MUST NOT b
 named in `writes:`. It is **isolated across flow boundaries by default**; a
 `flow:` node opts into sharing the caller's history with `context: inherit`
 (§8.5).
+
+**A `map` dispatch is a module boundary for history, with no opt-in.** Every
+dispatched instance runs on a **fresh** history that is **discarded** when the
+instance completes: it never reads the enclosing flow instance's `messages` and
+its turns never append to it (Decision
+[D105](#d105-a-map-dispatch-isolates-conversation-history-per-instance)). The
+rule is the same for every dispatch form and every target — an `agent.*` instance
+is one call with an empty history, a `flow.*` instance starts as any isolated
+flow instance does, a `tool.*` has no history at all, and a routed map's routes
+are no different — so `max_concurrency: 5` can never interleave five
+conversations into one channel. `context:` is a `flow:`-node key (§8.5,
+[D27](#d27-context-inherit-is-a-flow-node-key-only-default-isolated)) and a `map`
+block does not accept it, so the sharing opt-in does not exist at a dispatch. It
+still exists *within* one: a `flow:` node inside a dispatched flow may declare
+`context: inherit` and share **that instance's** fresh history with the subflow
+it instantiates. Inheritance never reaches back across the dispatch.
 
 ---
 
@@ -3475,7 +3503,10 @@ would break the fan-out bounding guarantees. *PRD 5.1, 5.4.*
 
 **Rationale**: PRD 5.7 settles isolation by default with opt-in inheritance at
 the instantiation site; putting it on the definition would make a flow's
-reusability depend on its own declaration rather than its caller. *PRD 5.7.*
+reusability depend on its own declaration rather than its caller. A `map`
+dispatch is the other module boundary and takes no such key:
+[D105](#d105-a-map-dispatch-isolates-conversation-history-per-instance) makes its
+isolation unconditional. *PRD 5.7.*
 
 ### D28. `max_concurrency` is required on the map node; routes may only tighten it
 
@@ -3490,7 +3521,10 @@ one route declares one). *PRD 5.6.*
 example (`node: agent.worker`, `node: tool.review_queue`) and reflects that map
 instances are isolated per-item invocations, not nodes of the enclosing graph —
 which is also what makes them the natural unit for `runtime: isolated`.
-*PRD 5.6, 5.10.*
+[D105](#d105-a-map-dispatch-isolates-conversation-history-per-instance) draws the
+same conclusion for conversation history, and
+[D73](#d73-on_item_error-carries-its-retry-policy-inline) for policy: what a
+dispatched instance is *not* is a node of this flow. *PRD 5.6, 5.10.*
 
 ### D30. Union items require `route_by`; non-union items forbid it; `default:` is the catch-all
 
@@ -4760,6 +4794,32 @@ on the string a sink sees, in the spirit of
 fixed output names. Every component is reproduced by a replay, because the
 schedule is a pure function of the graph and the recorded outputs (§7.6.4), so
 the key is stable across a resume. *PRD 5.6, 5.8, 5.12.*
+
+### D105. A `map` dispatch isolates conversation history per instance
+
+Every instance a `map` dispatches runs on a fresh conversation history that is
+discarded when the instance completes; it neither reads nor appends to the
+enclosing flow instance's `messages` channel, and no key opts out — `context:`
+stays a `flow:`-node key (§10.4, §8.6 rule 13, §8.5).
+**Rationale**: §10.4 scoped history across `flow:`-node boundaries only, so what
+a `map`-dispatched *agent* sees was undefined — and the two readings differ in
+what the model is sent. Treating an instance as an agent node of the enclosing
+flow has five concurrent workers reading and appending to one `messages`,
+interleaving five conversations into a history none of them can make sense of and
+whose contents depend on completion order — the replay hazard PRD 5.6 names,
+reintroduced in the one channel §7.6.4's canonical write order does not govern.
+Isolation is the reading the rest of the document already implies:
+[D29](#d29-map-targets-are-component-references-not-flow-local-node-ids) makes an
+instance an isolated per-item invocation rather than a node of this flow, PRD 5.6
+runs instances "in isolated item-scoped contexts", and PRD 5.7 settles history as
+isolated across module boundaries with the opt-in placed at the *instantiation
+site* — a `map` block, which declares no `context:`, is exactly such a site. Not
+extending `context: inherit` to the map block is deliberate and is the same
+argument one level down: inheriting into N concurrent instances would either fork
+the channel N ways (so nothing is shared after all) or serialize the fan-out
+(so `max_concurrency` means nothing). A dispatched flow's own `flow:` nodes keep
+their `context:` key, sharing the instance's fresh history inward, which is all
+the continuation any single item can coherently want. *PRD 5.6, 5.7.*
 
 ---
 
