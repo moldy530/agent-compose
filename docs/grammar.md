@@ -1954,7 +1954,11 @@ nodes only.
 node MAY carry both:
 
 - `policy:` is level 1 of the resolution chain (§9.3) for **every node inside**
-  the instantiated subflow, propagated into nested instantiations. It never
+  the instantiated subflow, propagated into nested instantiations — except that a
+  `human` node inside takes no `timeout` and no `retry` from it, at this level or
+  any other (§9.3,
+  [D102](#d102-a-human-node-resolves-no-timeout-and-no-retry-at-any-level)); its
+  `on_error` resolves here like any node's. It never
   applies to the instantiating node itself. When two or more instantiation-site
   overrides reach the same node for the same policy field — flow A instantiates
   B with `policy: {timeout: 30s}` and a node inside B instantiates C with
@@ -2145,7 +2149,9 @@ A **route** object takes `node` (required) plus optional `max_concurrency`,
     - Nodes *inside* a dispatched `flow.*` are ordinary nodes and resolve
       `retry`/`timeout`/`on_error` through §9.3 with **level 1 absent** — a `map`
       has no `policy:` key, so a dispatched subflow's nodes see node →
-      `defaults:` → built-in.
+      `defaults:` → built-in. A `human` node among them is exempt from `timeout`
+      and `retry` at every remaining level, as it is anywhere else (§9.3,
+      [D102](#d102-a-human-node-resolves-no-timeout-and-no-retry-at-any-level)).
 11. **`over` reads a dominating node.** In `over: <node>.output.…`, `<node>` MUST
     **dominate** the map node: every path from the flow's `start` to the map node
     passes through `<node>`. Mere path-existence is not enough — a producer
@@ -2209,7 +2215,12 @@ Either half alone is a compile error naming the missing one
 
 Node-level `timeout:` and `retry:` are ILLEGAL on a `human` node — a wait is not
 an activity timeout and re-prompting a human is not a retry
-(Decision [D52](#d52-human-node-shape)). `on_error:` remains legal (it covers
+(Decision [D52](#d52-human-node-shape)). The exemption is the **whole chain's**,
+not this level's: a `human` node also resolves no `timeout` and no `retry` from a
+flow node's `policy:` (§9.3 level 1) or from `defaults:` (level 3), so a
+composition-wide budget can never cut a wait short (§9.3, Decision
+[D102](#d102-a-human-node-resolves-no-timeout-and-no-retry-at-any-level)).
+`on_error:` remains legal and resolves through all four levels (it covers
 delivery failures). A flow a `respond: sync` http trigger targets MUST NOT
 **reach** a `human` node, in the sense §7.7 fixes — which includes a `human` node
 inside a `map`-dispatched flow and inside a flow attached to an agent's `tools:`
@@ -2326,6 +2337,20 @@ precedence first (PRD 5.5's `flow override > node > defaults > fail`):
 3. **Defaults** — the composition's `defaults:` section.
 4. **Built-in** — no retry, no timeout, `on_error: fail`.
 
+**A `human` node resolves no `timeout` and no `retry`, at any level.** §8.7 makes
+those two keys illegal at level 2; levels 1 and 3 are skipped for them on a
+`human` node for the same reason, which is a property of the construct and not of
+the file the value was written in — a wait is not an activity timeout and
+re-prompting a human is not a retry (Decision
+[D102](#d102-a-human-node-resolves-no-timeout-and-no-retry-at-any-level)). A
+`human` node's wait semantics live exclusively in its `human:` block, where
+`timeout:` and `on_timeout:` are jointly optional and jointly required (§8.7), so
+`defaults: { timeout: 90s }` beside a node declaring `human: { timeout: 24h,
+on_timeout: escalate }` leaves that wait running for 24 hours; with no
+`human.timeout:` the wait is unbounded. `on_error` is **not** exempt and resolves
+through all four levels as on any other node: it covers delivery failures, which
+are ordinary node errors (§8.7).
+
 ```yaml
 # main.yml
 defaults:
@@ -2335,8 +2360,10 @@ defaults:
 ```
 
 `defaults:` accepts exactly `retry`, `timeout`, `on_error`, appears at most once
-per composition (§1.5), and applies to every node in every flow
-(Decision [D20](#d20-the-policy-resolution-chain-has-exactly-four-levels)).
+per composition (§1.5), and applies to every node in every flow — with the one
+exemption above, which withholds `timeout` and `retry` from `human` nodes
+(Decision [D20](#d20-the-policy-resolution-chain-has-exactly-four-levels),
+[D102](#d102-a-human-node-resolves-no-timeout-and-no-retry-at-any-level)).
 
 ---
 
@@ -3290,7 +3317,11 @@ an author one keyword, not an extra edge. Per-instance counting keeps
 
 Flow-node `policy:` override > node > `defaults:` > built-in `fail`; when a
 nesting chain sets one field at several instantiation sites, the outermost wins
-([D79](#d79-the-outermost-instantiation-site-policy-wins)).
+([D79](#d79-the-outermost-instantiation-site-policy-wins)). One node kind is
+partly outside the chain:
+[D102](#d102-a-human-node-resolves-no-timeout-and-no-retry-at-any-level) exempts
+a `human` node from `timeout` and `retry` at every level, leaving its `on_error`
+to resolve normally.
 **Rationale**: PRD 5.5 names exactly these four; the override is placed at the
 *instantiation site* so a caller can harden a reused module — the only reading
 under which "flow override" beating a node's own declaration makes sense. A
@@ -3594,7 +3625,10 @@ runtime imposes. *PRD 5.4, 5.5.*
 Schemas, `timeout`, and `on_timeout` live inside the `human:` block;
 `timeout` and `on_timeout` are jointly optional and jointly required — either
 one alone is an error; node-level `timeout`/`retry` are
-illegal; `on_timeout` accepts a flow-local node id or `end`, exactly as
+illegal (and
+[D102](#d102-a-human-node-resolves-no-timeout-and-no-retry-at-any-level) carries
+that exemption up the whole §9.3 chain); `on_timeout` accepts a flow-local node
+id or `end`, exactly as
 `on_error.fallback` does (D21). **Rationale**: PRD 5.5 gives the human node both
 schemas plus timeout and route; separating the human wait from an activity
 timeout prevents two keys named `timeout` meaning different things on one node.
@@ -4541,6 +4575,35 @@ writes have landed is exactly the runtime question. Admitting `has()` as the
 guarded-read spelling keeps the strict rule usable, and it is already in §4.1's
 supported CEL surface, so this adds no vocabulary either. *PRD 5.6, 5.7, G3.*
 
+### D102. A `human` node resolves no `timeout` and no `retry`, at any level
+
+The two fields are withheld from a `human` node at every level of §9.3's chain —
+a flow node's `policy:` (level 1), the node itself (level 2, where §8.7 already
+makes the keys illegal), and `defaults:` (level 3) — leaving the wait bounded
+only by the `human:` block's own `timeout:`/`on_timeout:` pair. `on_error`
+resolves normally through all four levels (§8.7, §9.3).
+**Rationale**: [D52](#d52-human-node-shape) makes the node-level keys illegal
+because a wait is not an activity timeout and re-prompting a human is not a
+retry, but §9.3 said `defaults:` "applies to every node in every flow" and §8.5
+said a `policy:` applies to "every node inside" — so the two fields a `human`
+node may not declare could still reach it from two other levels, and the
+document named no winner. The readings are not close: with
+`defaults: { timeout: 90s }` and a `human:` block declaring `timeout: 24h`, one
+implementation kills the wait after ninety seconds and the other waits a day,
+from one spec — and the first one breaks the shipped
+[`examples/triage-fanout`](../examples/triage-fanout), whose human step could
+then never be reached. D52's reason is a statement about the *construct*, not
+about which file the value was written in, so it has to hold wherever the value
+comes from; the alternative would also make a `human` node's behavior depend on
+whether some unrelated flow in the composition wanted a default timeout — the
+kind of action at a distance [D2](#d2-singleton-sections-are-declared-in-exactly-one-file)
+and PRD 5.7 reject elsewhere. Exempting `on_error` too was rejected for the
+opposite reason: a delivery failure *is* an ordinary node error, so the strategy
+covering it is ordinary policy, and §8.7 already keeps the key legal at the node.
+The cost is that a composition cannot bound its human waits from one place —
+which is what `human.timeout:` is for, one line at the node that owns the wait.
+*PRD 5.5, 5.11, G3.*
+
 ---
 
 ## Appendix B — Editor integration
@@ -4705,7 +4768,8 @@ model.<name>:    { route: [model.<a>, model.<b>], route_on: [...] }
                      input: <bindings>, writes: {...} }   # scalar input: stdin
 { http: { method, url, headers?, query?, body?, expect_status?, output? },
                      input: <field map>, writes: {...} }
-{ human: { input, output, timeout?, on_timeout? }, input: <field map>, writes: {...} }
+{ human: { input, output, timeout?, on_timeout? }, input: <field map>, writes: {...},
+                     on_error }             # no retry/timeout, at any level (D102)
 { store: store.<s>, op: <op>,     # params are exactly the op's row (11.4):
                      # get/delete: key | set: key,value | list: prefix?,limit
                      # search: query,top_k,filter? | upsert: key,value,metadata?

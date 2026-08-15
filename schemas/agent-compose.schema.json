@@ -1237,7 +1237,7 @@
         },
         "input": { "description": "Input bindings for the human-facing schema, field-map form only: `human.input` is a field map, so a bare scalar names no destination.", "$ref": "#/$defs/fieldInputBindings" },
         "writes": { "description": "Write remap.", "$ref": "#/$defs/writes" },
-        "on_error": { "description": "Delivery-failure strategy. Node-level `timeout`/`retry` are illegal on a human node: a wait is not an activity timeout.", "$ref": "#/$defs/onError" },
+        "on_error": { "description": "Delivery-failure strategy, resolved through all four levels of the policy chain like any node's. Node-level `timeout`/`retry` are illegal on a human node - a wait is not an activity timeout and re-prompting a human is not a retry - and the exemption is the whole chain's: a human node also takes no `timeout` and no `retry` from a flow node's `policy:` or from `defaults:`, so its wait is bounded only by `human.timeout:` (grammar 8.7, 9.3 / Decisions D52, D102).", "$ref": "#/$defs/onError" },
         "description": { "description": "Node documentation.", "type": "string" }
       },
       "additionalProperties": false
