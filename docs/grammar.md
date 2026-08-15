@@ -126,7 +126,13 @@ imports:
   (§1.1). No backslashes, no whitespace, no leading `/`. One portable spelling
   keeps a path identical in the IR, on a command line, and in a diagnostic on
   every host.
-- A path MAY contain `..` but MUST resolve inside the project root.
+- A path MAY contain `..`, but every prefix of the path MUST stay inside the
+  project root during resolution — the root is a fence, not a floor. A path
+  that climbs out and returns (`../<root-dir-name>/models.yml`) is refused
+  even though its final resolution lands inside the root: whether such a path
+  re-enters the same project depends on the checkout's parent directory
+  layout, which the spec cannot see. Write the in-root spelling instead
+  (`models.yml`).
 - Entries MUST be unique after path normalization, and MUST NOT name the
   entrypoint itself.
 - Imports are **not transitive**: an imported file that declares `imports:` is a
