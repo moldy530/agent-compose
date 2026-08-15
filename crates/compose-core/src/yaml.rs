@@ -15,7 +15,9 @@
 //! * no merge keys (`<<:`), a YAML 1.1 extension outside YAML 1.2 core;
 //! * no tags (`!!str`, `!custom`);
 //! * anchors and aliases are permitted and expanded here, before any
-//!   spec-level processing sees the tree.
+//!   spec-level processing sees the tree — up to a total expansion budget
+//!   (`MAX_NODES`), so a file built to multiply itself is a diagnostic rather
+//!   than an out-of-memory kill.
 //!
 //! Plain scalars resolve through the YAML 1.2 **core schema**: `true` is a
 //! boolean, `0.1` is a float, `~` is null, and anything quoted is a string.
@@ -185,6 +187,7 @@ pub fn load(source: &str, name: &SourceName, diagnostics: &mut Diagnostics) -> O
         end_of_file: source.len(),
         anchors: HashMap::new(),
         depth: 0,
+        nodes: 0,
         failed: false,
         diagnostics,
     };
@@ -198,15 +201,38 @@ pub fn load(source: &str, name: &SourceName, diagnostics: &mut Diagnostics) -> O
 /// the recursive loader's stack.
 const MAX_NESTING: usize = 100;
 
+/// How many nodes a document may expand to before the loader gives up.
+///
+/// `MAX_NESTING` bounds *depth*, which says nothing about total size: an alias
+/// expands to a copy of its anchor's whole value, so anchoring each level on
+/// the one below multiplies fan-out at every step and a few hundred bytes of
+/// input reach hundreds of millions of nodes. Anchors are legal (grammar 1.1,
+/// Decision D49) and expansion is therefore required, but `validate` reads
+/// untrusted spec files inside a millisecond budget (PRD 5.12), so the total is
+/// capped rather than the depth alone.
+///
+/// The bound is deliberately far above any hand-written file: the largest
+/// example in this repo is under a thousand nodes, and a 10,000-line spec would
+/// still sit an order of magnitude below it.
+const MAX_NODES: usize = 100_000;
+
 struct Loader<'src, 'dx> {
     parser: Parser<'src, saphyr_parser::StrInput<'src>>,
     source: SourceName,
     offsets: Vec<usize>,
     end_of_file: usize,
-    anchors: HashMap<usize, Node>,
+    anchors: HashMap<usize, Anchor>,
     depth: usize,
+    /// Nodes materialized so far, alias expansions counted at full size.
+    nodes: usize,
     failed: bool,
     diagnostics: &'dx mut Diagnostics,
+}
+
+/// An anchored value and the size of the tree an alias to it expands to.
+struct Anchor {
+    node: Node,
+    nodes: usize,
 }
 
 impl<'src> Loader<'src, '_> {
@@ -238,15 +264,22 @@ impl<'src> Loader<'src, '_> {
             }
         }
 
+        // A latched failure means the event stream was cut short — bad syntax,
+        // nesting past `MAX_NESTING`, an expansion past `MAX_NODES` — so
+        // whatever was built is a truncated prefix of the file. It has already
+        // been reported; walking it would bury that one diagnostic under
+        // spec-level complaints about the half of the file that never arrived.
+        if self.failed {
+            return None;
+        }
+
         match root {
             None => {
-                if !self.failed {
-                    self.diagnostics.error(
-                        DiagnosticCode::EmptyDocument,
-                        Span::file_start(self.source.clone()),
-                        "the file declares no YAML document; a spec file is one document with a mapping at its root",
-                    );
-                }
+                self.diagnostics.error(
+                    DiagnosticCode::EmptyDocument,
+                    Span::file_start(self.source.clone()),
+                    "the file declares no YAML document; a spec file is one document with a mapping at its root",
+                );
                 None
             }
             Some(node) if matches!(node.value, Yaml::Mapping(_)) => Some(node),
@@ -302,64 +335,113 @@ impl<'src> Loader<'src, '_> {
                 span,
             };
         }
+        let before = self.nodes;
         match event {
             Event::Scalar(text, style, anchor, tag) => {
                 if tag.is_some() {
                     self.reject_tag(span);
                 }
+                if !self.charge(1, span) {
+                    return self.empty(span);
+                }
                 let node = Node {
                     value: resolve_scalar(&text, style),
                     span: self.span(span),
                 };
-                self.record_anchor(anchor, &node);
+                self.record_anchor(anchor, &node, self.nodes - before);
                 node
             }
             Event::SequenceStart(anchor, tag) => {
                 if tag.is_some() {
                     self.reject_tag(span);
                 }
+                if !self.charge(1, span) {
+                    return self.empty(span);
+                }
                 let node = self.build_sequence(span);
-                self.record_anchor(anchor, &node);
+                self.record_anchor(anchor, &node, self.nodes - before);
                 node
             }
             Event::MappingStart(anchor, tag) => {
                 if tag.is_some() {
                     self.reject_tag(span);
                 }
+                if !self.charge(1, span) {
+                    return self.empty(span);
+                }
                 let node = self.build_mapping(span);
-                self.record_anchor(anchor, &node);
+                self.record_anchor(anchor, &node, self.nodes - before);
                 node
             }
-            Event::Alias(anchor) => match self.anchors.get(&anchor) {
-                // An alias expands to its anchor's value, re-anchored on the
-                // alias site so that a diagnostic about the expansion points at
-                // the `*name` the author wrote. Spans inside the expansion keep
-                // pointing at the anchor's definition, which is where that text
-                // actually lives.
-                Some(node) => Node {
-                    value: node.value.clone(),
-                    span: self.span(span),
-                },
-                None => {
-                    let span = self.span(span);
-                    self.diagnostics.error(
-                        DiagnosticCode::YamlSyntax,
-                        span.clone(),
-                        "invalid YAML: alias refers to an anchor that is not defined",
-                    );
-                    Node {
-                        value: Yaml::Null,
-                        span,
+            // An alias expands to its anchor's value, re-anchored on the alias
+            // site so that a diagnostic about the expansion points at the
+            // `*name` the author wrote. Spans inside the expansion keep pointing
+            // at the anchor's definition, which is where that text actually
+            // lives. The expansion is charged at the size of the tree it copies,
+            // which is what makes an anchor/alias bomb a diagnostic rather than
+            // an out-of-memory kill.
+            Event::Alias(anchor) => {
+                match self.anchors.get(&anchor).map(|anchored| anchored.nodes) {
+                    Some(cost) => {
+                        if !self.charge(cost, span) {
+                            return self.empty(span);
+                        }
+                        let value = self
+                            .anchors
+                            .get(&anchor)
+                            .map_or(Yaml::Null, |anchored| anchored.node.value.clone());
+                        Node {
+                            value,
+                            span: self.span(span),
+                        }
+                    }
+                    None => {
+                        let span = self.span(span);
+                        self.diagnostics.error(
+                            DiagnosticCode::YamlSyntax,
+                            span.clone(),
+                            "invalid YAML: alias refers to an anchor that is not defined",
+                        );
+                        Node {
+                            value: Yaml::Null,
+                            span,
+                        }
                     }
                 }
-            },
+            }
             // Structural events never reach `build`: the collection builders
             // consume their own terminators and `load_document` filters the
             // rest. Treat any straggler as an empty value rather than panicking.
-            _ => Node {
-                value: Yaml::Null,
-                span: self.span(span),
-            },
+            _ => self.empty(span),
+        }
+    }
+
+    /// Charge `count` nodes against the expansion budget, reporting and latching
+    /// the stream shut when it runs out.
+    fn charge(&mut self, count: usize, span: RawSpan) -> bool {
+        self.nodes = self.nodes.saturating_add(count);
+        if self.nodes <= MAX_NODES {
+            return true;
+        }
+        self.failed = true;
+        let span = self.span(span);
+        self.diagnostics.push(
+            Diagnostic::error(
+                DiagnosticCode::YamlSyntax,
+                span,
+                format!("invalid YAML: the document expands to more than {MAX_NODES} nodes"),
+            )
+            .with_help(
+                "an alias copies its anchor's whole value, so anchoring each level on the one below multiplies the document at every step; write the values out instead",
+            ),
+        );
+        false
+    }
+
+    fn empty(&self, span: RawSpan) -> Node {
+        Node {
+            value: Yaml::Null,
+            span: self.span(span),
         }
     }
 
@@ -469,9 +551,15 @@ impl<'src> Loader<'src, '_> {
         );
     }
 
-    fn record_anchor(&mut self, anchor: usize, node: &Node) {
+    fn record_anchor(&mut self, anchor: usize, node: &Node, nodes: usize) {
         if anchor != 0 {
-            self.anchors.insert(anchor, node.clone());
+            self.anchors.insert(
+                anchor,
+                Anchor {
+                    node: node.clone(),
+                    nodes,
+                },
+            );
         }
     }
 
@@ -725,6 +813,46 @@ mod tests {
         assert_eq!(mapping.len(), 2);
         assert_eq!(mapping.get("a").unwrap().value, Yaml::Int(1));
         assert_eq!(mapping.get("b").unwrap().value, Yaml::Int(3));
+    }
+
+    /// `level` levels of eight-way aliasing, each anchored on the one below.
+    fn alias_pyramid(levels: usize) -> String {
+        let mut source = String::from("l0: &l0 [x, x, x, x, x, x, x, x]\n");
+        for level in 1..=levels {
+            let alias = format!("*l{}", level - 1);
+            let row = [alias.as_str(); 8].join(", ");
+            source.push_str(&format!("l{level}: &l{level} [{row}]\n"));
+        }
+        source
+    }
+
+    #[test]
+    fn caps_the_total_expansion_of_aliases() {
+        // Each level copies the whole level below it, so this multiplies by
+        // eight per line: seven levels is 2.4M nodes and eight is 19M, from
+        // under 400 bytes of input. `MAX_NESTING` never fires — the document is
+        // two levels deep — so only the expansion budget stands between a
+        // hostile file and an out-of-memory kill.
+        let (node, diagnostics) = load_ok(&alias_pyramid(8));
+        assert!(
+            node.is_none(),
+            "a truncated tree is not handed to the parser"
+        );
+        assert_eq!(codes(&diagnostics), ["yaml-syntax"]);
+        assert!(
+            diagnostics[0].message.contains("expands to more than"),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn leaves_room_for_aliases_used_as_aliases() {
+        // Four levels is 42,797 nodes — far more repetition than a hand-written
+        // spec carries, and well inside the budget. The cap exists to stop
+        // multiplication, not to make anchors unusable (grammar 1.1, D49).
+        let (node, diagnostics) = load_ok(&alias_pyramid(4));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert!(node.is_some());
     }
 
     #[test]

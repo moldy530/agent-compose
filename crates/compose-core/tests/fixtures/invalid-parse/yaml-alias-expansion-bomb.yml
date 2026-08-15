@@ -1,0 +1,12 @@
+# rule: anchors are legal but their total expansion is bounded (grammar 1.1, Decision D49)
+# code: yaml-syntax
+# message: invalid YAML: the document expands to more than 100000 nodes
+# at: 12:17
+# help: an alias copies its anchor's whole value, so anchoring each level on the one below multiplies the document at every step; write the values out instead
+state:
+  l0: &l0 [x, x, x, x, x, x, x, x]
+  l1: &l1 [*l0, *l0, *l0, *l0, *l0, *l0, *l0, *l0]
+  l2: &l2 [*l1, *l1, *l1, *l1, *l1, *l1, *l1, *l1]
+  l3: &l3 [*l2, *l2, *l2, *l2, *l2, *l2, *l2, *l2]
+  l4: &l4 [*l3, *l3, *l3, *l3, *l3, *l3, *l3, *l3]
+  l5: &l5 [*l4, *l4, *l4, *l4, *l4, *l4, *l4, *l4]
