@@ -21,6 +21,12 @@
 //!   **string** — which is the shape mistake this surface most wants to catch in
 //!   the other direction too, on requests that send `arguments` as an object.
 //!
+//! A declared schema is checked before it is answered, because a schema the
+//! service refuses is a 400 a mock must not paper over: the **root** must be
+//! `type: "object"` and must not be an `anyOf` at any `strict`
+//! ([`check_root_schema`]), and `strict: true` closes every object all the way
+//! down ([`check_strict_schema`]).
+//!
 //! `WIRE-NOTES.md` records which of these could not be confirmed offline.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -31,7 +37,7 @@ use crate::control::{
     Failure, Outcome, Reply, ReplyBody, StructuredOutput, ValidationFailure, canonical, estimate,
     request_id,
 };
-use crate::strict::{Checker, Dialect, Kind, at};
+use crate::strict::{Checker, Dialect, Kind, at, listed};
 use crate::wire::{Answer, HARNESS_STATUS, INVALID, MISMATCH, Response, UNSCRIPTED};
 
 /// The top-level keys this surface accepts.
@@ -324,14 +330,12 @@ fn check_tools(checker: &mut Checker, body: &Map<String, Value>) -> Vec<String> 
             );
         }
         let parameters = checker.optional(&pointer, function, "parameters", Kind::Object);
-        if let Some(parameters) = parameters
-            && parameters.get("type").and_then(Value::as_str) != Some("object")
-        {
-            checker.fail(
-                &at(&pointer, "parameters.type"),
-                format!(
-                    "Invalid schema for function '{name}': schema must be a JSON Schema of 'type: \"object\"'."
-                ),
+        if let Some(parameters) = parameters {
+            check_root_schema(
+                checker,
+                &at(&pointer, "parameters"),
+                &format!("function '{name}'"),
+                parameters,
             );
         }
         let strict = checker
@@ -453,6 +457,19 @@ fn check_response_format(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let declared = Value::Object(declared);
+    // The root rules first, and whether or not `strict` was asked for: they are
+    // about what the model is asked to *produce*, not about how tightly the
+    // decoder is constrained. A `json_schema` response format asks for a JSON
+    // **object**, so a root that is not one — a bare `{"type": "string"}`, or the
+    // root `anyOf` `zod-to-json-schema` emits for a discriminated union — is a
+    // 400 on the live surface at any `strict`. PRD §7 M1 promises "state models
+    // (incl. tagged unions via Zod)", so that is a shape codegen can reach.
+    check_root_schema(
+        checker,
+        "response_format.json_schema.schema",
+        &format!("response_format '{name}'"),
+        &declared,
+    );
     if strict {
         check_strict_schema(
             checker,
@@ -466,6 +483,46 @@ fn check_response_format(
         schema: declared,
         strict,
     })
+}
+
+/// The rules OpenAI applies to the **root** of a schema it generates against,
+/// wherever that schema was declared.
+///
+/// Both places one can be declared — `response_format.json_schema.schema` and a
+/// function tool's `parameters` — are asking the model for a JSON **object**,
+/// and the service says so twice: the root must be `type: "object"`, and it must
+/// not be an `anyOf`. The second is not a footnote. `zod-to-json-schema` renders
+/// a `z.discriminatedUnion` as a bare root `anyOf`, and PRD §7 M1 promises
+/// "state models (incl. tagged unions via Zod)" — so a codegen path that puts a
+/// tagged union at an agent's output root, or unwraps a single-field output to
+/// its bare field schema, reaches this shape. A mock that walked past it would
+/// pass every acceptance run and 400 on the first live call, which is the one
+/// outcome this server exists to prevent.
+///
+/// Distinct from [`check_strict_schema`], which is about how tightly the decoder
+/// is constrained *below* the root and only applies when `strict: true` was
+/// asked for: these two hold at any `strict`.
+fn check_root_schema(checker: &mut Checker, pointer: &str, subject: &str, schema: &Value) {
+    if schema.get("type").and_then(Value::as_str) != Some("object") {
+        checker.fail(
+            &at(pointer, "type"),
+            format!(
+                "Invalid schema for {subject}: schema must be a JSON Schema of 'type: \"object\"'."
+            ),
+        );
+        // One complaint per root: a schema that is not an object has already
+        // been told the one thing that is wrong with it, and "and it is also an
+        // anyOf" would be a second sentence about the same mistake.
+        return;
+    }
+    if schema.get("anyOf").is_some() {
+        checker.fail(
+            &at(pointer, "anyOf"),
+            format!(
+                "Invalid schema for {subject}: 'anyOf' is not permitted at the root level of the schema."
+            ),
+        );
+    }
 }
 
 /// The rules `strict: true` adds to a schema, wherever it was asked for.
@@ -1010,10 +1067,10 @@ fn reply_answer(
         }
     };
 
-    let finish_reason = reply
-        .stop_reason
-        .clone()
-        .unwrap_or_else(|| finish.to_string());
+    let finish_reason = match checked_finish_reason(sequence, reply, finish) {
+        Ok(finish_reason) => finish_reason,
+        Err(refusal) => return refusal,
+    };
     let usage = reply.usage.map_or_else(
         || {
             let input = estimate(&canonical(request));
@@ -1040,13 +1097,84 @@ fn reply_answer(
             "usage": {
                 "prompt_tokens": usage.0,
                 "completion_tokens": usage.1,
-                "total_tokens": usage.0 + usage.1,
+                // Saturating, because `Usage`'s counts are public fields: the
+                // control plane bounds them at `MAX_TOKENS` on the way in, and a
+                // struct literal can still fill them with anything. A plain `+`
+                // would panic the connection task on a pair that overflows, and
+                // a panicked task is a *dropped connection* — PRD 5.9's timeout
+                // condition — so a harness bug would arrive at generated code
+                // wearing a failover condition. Same rule as `Store::take`'s
+                // saturating `times`.
+                "total_tokens": usage.0.saturating_add(usage.1),
             },
         }),
     )
     .header("x-request-id", request_id(sequence))
     .after(reply.delay)
     .answer()
+}
+
+/// The `finish_reason`s Chat Completions ends a choice with.
+///
+/// The legacy `function_call` is deliberately left out: it belongs to the
+/// deprecated `functions` request surface this server does not serve, so a
+/// choice carrying it would name a member no answer here has — the same reason
+/// the tool reasons below are held to the body.
+const FINISH_REASONS: &[&str] = &["stop", "length", "tool_calls", "content_filter"];
+
+/// Chat Completions' name for a turn the tool calls ended.
+const TOOL_CALLS: &str = "tool_calls";
+
+/// The reason this reply is served with: the one its body implies, or a scripted
+/// override Chat Completions could have sent *with that body*.
+///
+/// `finish_reason` is the field a compiled agent's tool loop branches on, so an
+/// override is held to the rule every other part of a `reply` is held to — it is
+/// what the API could have sent, and anything else is [`Outcome::raw`]. Two ways
+/// it can be something else, and both are the harness bug they look like:
+///
+/// * a value outside the closed set: `"banana"`, or the *other* surface's
+///   vocabulary (`"end_turn"`, `"tool_use"`) reached for out of habit;
+/// * a value that contradicts the body it accompanies. `tool_calls` names the
+///   calls that ended the turn — the sentence [`ReplyBody::Tools`] already
+///   refuses an empty call list with — and `stop` says the message itself ended
+///   it; neither is sayable about the other body.
+///
+/// `length` and `content_filter` stay legal over either body: truncation and
+/// filtering cut a tool call as readily as prose, and both are answers the
+/// service really sends.
+fn checked_finish_reason(sequence: u64, reply: &Reply, implied: &str) -> Result<String, Answer> {
+    let Some(scripted) = reply.stop_reason.as_deref() else {
+        return Ok(implied.to_string());
+    };
+    if !FINISH_REASONS.contains(&scripted) {
+        return Err(mismatch(
+            sequence,
+            &format!(
+                "`{scripted}` is not a `finish_reason` Chat Completions sends: it ends a choice \
+                 with one of {}. Script `raw` for a response generated code must reject",
+                listed(FINISH_REASONS)
+            ),
+        ));
+    }
+    if scripted == TOOL_CALLS && implied != TOOL_CALLS {
+        return Err(mismatch(
+            sequence,
+            "a `finish_reason` of `tool_calls` names the calls that ended the turn, and this \
+             reply carries none: Chat Completions never sends it beside a message with no \
+             `tool_calls`. Script a `tools` reply for a call, or `raw` for a response generated \
+             code must reject",
+        ));
+    }
+    if scripted == "stop" && implied == TOOL_CALLS {
+        return Err(mismatch(
+            sequence,
+            "a reply that carries tool calls is not ended by `finish_reason: \"stop\"`: Chat \
+             Completions names the calls that ended the turn. Script `text` for prose, or `raw` \
+             for a response generated code must reject",
+        ));
+    }
+    Ok(scripted.to_string())
 }
 
 /// How a request pinned the shape of its answer, if it pinned one.
@@ -1423,6 +1551,96 @@ mod tests {
             parse_direct(&tool(false)).failures.is_empty(),
             "an unstrict function tool takes the schema it is given"
         );
+    }
+
+    /// The **root** of a declared schema must be an object, and must not be an
+    /// `anyOf` — at both places a schema is declared, and whether or not
+    /// `strict` was asked for.
+    ///
+    /// The root `anyOf` is the case that matters: `zod-to-json-schema` renders a
+    /// `z.discriminatedUnion` as one, and PRD §7 M1 promises "state models
+    /// (incl. tagged unions via Zod)", so codegen can reach the shape. The
+    /// service 400s it; a mock that walked past it would pass every acceptance
+    /// run and fail on the first live call.
+    #[test]
+    fn a_declared_schemas_root_must_be_an_object_and_not_an_any_of() {
+        let format = |schema: Value| {
+            request(json!({
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": { "name": "review", "schema": schema },
+                },
+            }))
+        };
+        let tool = |schema: Value| {
+            request(json!({
+                "tools": [{
+                    "type": "function",
+                    "function": { "name": "extract", "parameters": schema },
+                }],
+            }))
+        };
+
+        // Not an object at all, in the three spellings codegen can produce it:
+        // a scalar root, a root that only lists `properties`, and the bare
+        // `anyOf` a tagged union renders as.
+        for schema in [
+            json!({ "type": "string" }),
+            json!({ "properties": { "verdict": { "type": "string" } } }),
+            json!({ "anyOf": [{ "type": "object" }, { "type": "object" }] }),
+        ] {
+            let failures = parse_direct(&format(schema.clone())).failures;
+            assert_eq!(failures.len(), 1, "{schema}: {failures:?}");
+            assert_eq!(
+                failures[0].pointer,
+                "response_format.json_schema.schema.type"
+            );
+            assert_eq!(
+                failures[0].message,
+                "Invalid schema for response_format 'review': schema must be a JSON Schema of 'type: \"object\"'."
+            );
+
+            let failures = parse_direct(&tool(schema.clone())).failures;
+            assert_eq!(failures.len(), 1, "{schema}: {failures:?}");
+            assert_eq!(failures[0].pointer, "tools.0.function.parameters.type");
+            assert_eq!(
+                failures[0].message,
+                "Invalid schema for function 'extract': schema must be a JSON Schema of 'type: \"object\"'."
+            );
+        }
+
+        // An object root that *also* branches is refused by the second rule,
+        // which is the one the first cannot reach.
+        let branching = json!({
+            "type": "object",
+            "anyOf": [{ "type": "object" }, { "type": "object" }],
+        });
+        let failures = parse_direct(&format(branching.clone())).failures;
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(
+            failures[0].pointer,
+            "response_format.json_schema.schema.anyOf"
+        );
+        assert_eq!(
+            failures[0].message,
+            "Invalid schema for response_format 'review': 'anyOf' is not permitted at the root level of the schema."
+        );
+        let failures = parse_direct(&tool(branching)).failures;
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].pointer, "tools.0.function.parameters.anyOf");
+
+        // Below the root, `anyOf` is ordinary — the rules are about what the
+        // model is asked to produce, not about branching as such.
+        let nested = json!({
+            "type": "object",
+            "properties": { "verdict": { "anyOf": [{ "type": "string" }, { "type": "null" }] } },
+        });
+        assert!(
+            parse_direct(&format(nested.clone())).failures.is_empty(),
+            "{:?}",
+            parse_direct(&format(nested.clone())).failures
+        );
+        assert!(parse_direct(&tool(nested)).failures.is_empty());
     }
 
     /// `tool_choice` without a tool surface is refused here too — the same
@@ -2288,6 +2506,99 @@ mod tests {
             response.body["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
             "lookup"
         );
+    }
+
+    /// A scripted `finish_reason` is held to the closed set and to the body it
+    /// accompanies.
+    ///
+    /// It is the field a compiled agent's tool loop branches on, so a script
+    /// that could name anything could stage a turn the service never ends that
+    /// way — and a codegen PR would watch its loop take the branch it wanted and
+    /// pass a criterion the real provider would never let it reach.
+    #[test]
+    fn a_scripted_finish_reason_must_be_one_the_service_sends() {
+        let plain = request(json!({}));
+        let with_tools = request(json!({
+            "tools": [{
+                "type": "function",
+                "function": { "name": "lookup", "parameters": { "type": "object" } },
+            }],
+        }));
+        let ended = |body: &Value, outcome: Outcome, reason: &str| {
+            let Outcome::Reply(reply) = outcome else {
+                panic!("a reply is a reply");
+            };
+            let scripted = Outcome::Reply(Reply {
+                stop_reason: Some(reason.to_string()),
+                ..reply
+            });
+            let Answer::Respond(response) = render(1, body, "gpt-4o-mini", None, &scripted) else {
+                panic!("an override answers");
+            };
+            response
+        };
+        let call = || Outcome::tool_calls(vec![ToolCall::new("lookup", json!({}))]);
+
+        // Outside the closed set: an invented value, and the *other* surface's
+        // vocabulary reached for out of habit.
+        for reason in ["banana", "end_turn", "tool_use", "function_call"] {
+            let response = ended(&plain, Outcome::text("just prose"), reason);
+            assert_eq!(response.status, HARNESS_STATUS, "{reason}");
+            assert_eq!(response.headers[HARNESS_HEADER], MISMATCH, "{reason}");
+            let message = response.body["error"]["message"].as_str().unwrap();
+            assert!(message.contains(reason), "{message}");
+        }
+
+        // In the set, but contradicting the body: `tool_calls` names calls a
+        // prose answer does not carry, and `stop` says a message ended a turn
+        // the calls ended.
+        let response = ended(&plain, Outcome::text("just prose"), "tool_calls");
+        assert_eq!(response.status, HARNESS_STATUS);
+        assert_eq!(response.headers[HARNESS_HEADER], MISMATCH);
+        let response = ended(&with_tools, call(), "stop");
+        assert_eq!(response.status, HARNESS_STATUS);
+        assert_eq!(response.headers[HARNESS_HEADER], MISMATCH);
+
+        // The positive half: truncation and filtering cut either body, and the
+        // reason a body implies is served when the script overrides nothing.
+        for (body, outcome) in [(&plain, Outcome::text("cut off")), (&with_tools, call())] {
+            for reason in ["length", "content_filter"] {
+                let response = ended(body, outcome.clone(), reason);
+                assert_eq!(response.status, 200, "{reason}");
+                assert_eq!(response.body["choices"][0]["finish_reason"], reason);
+            }
+        }
+        let Answer::Respond(response) =
+            render(1, &plain, "gpt-4o-mini", None, &Outcome::text("hi"))
+        else {
+            panic!("a reply is a response");
+        };
+        assert_eq!(response.body["choices"][0]["finish_reason"], "stop");
+    }
+
+    /// A `usage` no control-plane document could have staged — the counts are
+    /// public fields — is summed without overflowing, because a panic in a
+    /// render is a dropped connection and PRD 5.9 reads that as a provider
+    /// timeout.
+    #[test]
+    fn an_enormous_scripted_usage_cannot_overflow_the_total() {
+        let body = request(json!({}));
+        let Outcome::Reply(reply) = Outcome::text("counted") else {
+            panic!("a text outcome is a reply");
+        };
+        let outcome = Outcome::Reply(Reply {
+            usage: Some(crate::control::Usage {
+                input_tokens: u64::MAX,
+                output_tokens: 1,
+            }),
+            ..reply
+        });
+        let Answer::Respond(response) = render(1, &body, "gpt-4o-mini", None, &outcome) else {
+            panic!("a reply is a response");
+        };
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body["usage"]["prompt_tokens"], u64::MAX);
+        assert_eq!(response.body["usage"]["total_tokens"], u64::MAX);
     }
 
     /// Every answer carries `x-request-id`, errors included — the header the SDK

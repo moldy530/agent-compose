@@ -526,6 +526,66 @@ fn a_raw_outcomes_status_is_served_or_refused_by_name() {
     assert_eq!(served.json(), json!({ "nope": true }));
 }
 
+/// A scripted `usage` gets the same gate, for the same reason: token counts are
+/// arithmetic the server does — the Chat Completions surface serves their sum —
+/// and an addition that overflows panics the connection task, which reaches
+/// generated code as a **dropped connection** and PRD 5.9 classifies as a
+/// provider timeout. A harness bug must never arrive wearing a failover
+/// condition.
+#[test]
+fn a_token_count_outside_its_range_is_refused_by_name() {
+    let provider = MockProvider::start().expect("a port");
+    let client = provider.client();
+
+    for usage in [
+        json!({ "input_tokens": u64::MAX, "output_tokens": 1 }),
+        json!({ "input_tokens": 1, "output_tokens": 2_000_000_000_u64 }),
+    ] {
+        let refused = client
+            .post_json(
+                "/_mock/enqueue",
+                &json!({
+                    "model": MODEL,
+                    "outcome": { "reply": { "body": { "text": "hi" }, "usage": usage } },
+                }),
+            )
+            .expect("the control plane answers");
+        assert_eq!(
+            refused.status,
+            mock_provider::HARNESS_STATUS,
+            "{usage} was accepted: {}",
+            refused.text()
+        );
+        assert_eq!(
+            refused.header(mock_provider::HARNESS_HEADER),
+            Some("bad-control-request")
+        );
+        assert!(refused.text().contains("a token count is at most"));
+    }
+    assert!(
+        provider.snapshot().queues.is_empty(),
+        "a script that cannot be summed is never queued"
+    );
+
+    // The counts a run really reports are served exactly as written.
+    let staged = client
+        .post_json(
+            "/_mock/enqueue",
+            &json!({
+                "model": MODEL,
+                "outcome": { "reply": {
+                    "body": { "text": "counted" },
+                    "usage": { "input_tokens": 11, "output_tokens": 22 },
+                }},
+            }),
+        )
+        .expect("the control plane answers");
+    assert_eq!(staged.status, 200);
+    let served = call(&client, "one").json();
+    assert_eq!(served["usage"]["input_tokens"], 11);
+    assert_eq!(served["usage"]["output_tokens"], 22);
+}
+
 /// A `raw` outcome that writes the harness's *own* header is still a scripted
 /// answer, and is recorded as one.
 ///

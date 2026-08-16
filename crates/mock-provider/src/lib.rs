@@ -77,7 +77,9 @@
 //! `times` defaults to 1 and must be between 1 and a million; `match` defaults
 //! to "any request for this model", and an entry that narrows nothing shadows
 //! every narrowed entry behind it, so a queue whose entries answer *different*
-//! calls on one model id must narrow all of them.
+//! calls on one model id must narrow all of them. A reply's optional `usage` is
+//! bounded for the same reason `times` is — each count at most a billion,
+//! because the Chat Completions surface serves their sum.
 //!
 //! # What is *not* here
 //!

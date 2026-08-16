@@ -187,6 +187,68 @@ fn a_strict_schema_that_is_not_closed_is_refused() {
     );
 }
 
+/// A tagged union at the root of an output schema is a 400 too, and it is the
+/// shape codegen is most likely to send: `zod-to-json-schema` renders a
+/// `z.discriminatedUnion` as a bare root `anyOf`, and PRD §7 M1 promises "state
+/// models (incl. tagged unions via Zod)".
+///
+/// Structured Outputs requires the root of a schema to be an object and not an
+/// `anyOf` — the union has to be one level down, under a property. A mock that
+/// served this would let the tagged-union acceptance test pass on a request the
+/// service refuses.
+#[test]
+fn a_tagged_union_at_the_root_of_an_output_schema_is_refused() {
+    let provider = MockProvider::start().expect("a port");
+    provider.enqueue(Script::new(MODEL, Outcome::text("never served")));
+
+    let response = send(
+        &provider.client(),
+        "/v1/chat/completions",
+        &json!({
+            "model": MODEL,
+            "messages": [{ "role": "user", "content": "go" }],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "reviewer_output",
+                    "strict": true,
+                    "schema": {
+                        "anyOf": [
+                            {
+                                "type": "object",
+                                "properties": { "kind": { "const": "approve" } },
+                                "required": ["kind"],
+                                "additionalProperties": false,
+                            },
+                            {
+                                "type": "object",
+                                "properties": { "kind": { "const": "revise" } },
+                                "required": ["kind"],
+                                "additionalProperties": false,
+                            },
+                        ],
+                    },
+                },
+            },
+        }),
+    );
+    assert_eq!(response.status, 400);
+    assert_eq!(response.header(HARNESS_HEADER), Some(REFUSED_INVALID));
+    let body = response.json();
+    assert_eq!(
+        body["error"]["param"], "response_format.json_schema.schema.type",
+        "the refusal points at the root, where the author has to go"
+    );
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .expect("a message")
+            .contains("schema must be a JSON Schema of 'type: \"object\"'"),
+        "{body}"
+    );
+    assert_eq!(provider.snapshot().queues[MODEL], 1, "nothing was consumed");
+}
+
 /// An empty tool list is a 400, not an ignored key: it is what codegen emits for
 /// an agent with neither `tools:` nor `stores:` if it always writes `tools`.
 #[test]

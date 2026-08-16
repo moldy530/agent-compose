@@ -38,7 +38,7 @@ use crate::control::{
     Failure, Outcome, Reply, ReplyBody, StructuredOutput, ValidationFailure, canonical, estimate,
     request_id,
 };
-use crate::strict::{Checker, Dialect, Kind, at};
+use crate::strict::{Checker, Dialect, Kind, at, listed};
 use crate::wire::{Answer, HARNESS_STATUS, INVALID, MISMATCH, Response, UNSCRIPTED};
 
 /// The top-level keys the Messages API accepts.
@@ -906,10 +906,11 @@ fn reply_answer(
         .get("model")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let stop_reason = reply
-        .stop_reason
-        .clone()
-        .unwrap_or_else(|| implied.to_string());
+    let (stop_reason, stop_sequence) = match checked_stop_reason(sequence, request, reply, implied)
+    {
+        Ok(ended) => ended,
+        Err(refusal) => return refusal,
+    };
     let content = Value::Array(content);
     let (input_tokens, output_tokens) = reply.usage.map_or_else(
         || {
@@ -941,13 +942,113 @@ fn reply_answer(
             "model": model,
             "content": content,
             "stop_reason": stop_reason,
-            "stop_sequence": Value::Null,
+            "stop_sequence": stop_sequence,
             "usage": usage,
         }),
     )
     .header("request-id", request_id(sequence))
     .after(reply.delay)
     .answer()
+}
+
+/// The `stop_reason`s the Messages API ends a turn with.
+const STOP_REASONS: &[&str] = &[
+    "end_turn",
+    "max_tokens",
+    "stop_sequence",
+    "tool_use",
+    "pause_turn",
+    "refusal",
+];
+
+/// The Messages API's name for a turn a `tool_use` block ended.
+const TOOL_USE: &str = "tool_use";
+
+/// How the turn ended: the `stop_reason` this reply is served with, and the
+/// `stop_sequence` that goes with it.
+///
+/// The two travel together because the API sends them together — `stop_sequence`
+/// carries the sequence that ended the turn and is `null` in every other case,
+/// so a response that named one reason and the other's member would be a
+/// document no live call produces.
+///
+/// A scripted `stop_reason` overrides the one the body implies, and is held to
+/// the rule the rest of a `reply` is held to — it is what the API could have
+/// sent, and anything else is [`Outcome::raw`]. Three ways it can be something
+/// else:
+///
+/// * a value outside the closed set: `"banana"`, or Chat Completions'
+///   vocabulary (`"stop"`, `"tool_calls"`) reached for out of habit;
+/// * a value that contradicts the content it accompanies. `tool_use` names the
+///   block that ended the turn — the sentence [`ReplyBody::Tools`] already
+///   refuses an empty call list with — and `end_turn` says the model chose to
+///   stop talking; neither is sayable about the other content;
+/// * `stop_sequence` on a request that declared none. The API only matches
+///   sequences the request supplied, so there would be nothing to name, and a
+///   `stop_sequence: null` beside that reason is the same incoherence one field
+///   over. When the request *does* declare them, the first is the one named:
+///   the reply's text is scripted rather than generated, so there is no sequence
+///   to have matched, and a deterministic choice is what a golden transcript
+///   needs.
+///
+/// `max_tokens`, `pause_turn` and `refusal` stay legal over either content:
+/// truncation, a paused turn and a refusal each cut a tool call as readily as
+/// prose.
+fn checked_stop_reason(
+    sequence: u64,
+    request: &Value,
+    reply: &Reply,
+    implied: &str,
+) -> Result<(String, Value), Answer> {
+    let Some(scripted) = reply.stop_reason.as_deref() else {
+        return Ok((implied.to_string(), Value::Null));
+    };
+    if !STOP_REASONS.contains(&scripted) {
+        return Err(mismatch(
+            sequence,
+            &format!(
+                "`{scripted}` is not a `stop_reason` the Messages API sends: it ends a turn with \
+                 one of {}. Script `raw` for a response generated code must reject",
+                listed(STOP_REASONS)
+            ),
+        ));
+    }
+    if scripted == TOOL_USE && implied != TOOL_USE {
+        return Err(mismatch(
+            sequence,
+            "a `stop_reason` of `tool_use` names the block that ended the turn, and this reply \
+             carries none: the Messages API never sends it beside content with no `tool_use` \
+             block. Script a `tools` reply for a call, or `raw` for a response generated code \
+             must reject",
+        ));
+    }
+    if scripted == "end_turn" && implied == TOOL_USE {
+        return Err(mismatch(
+            sequence,
+            "a reply that carries a `tool_use` block is not ended by `stop_reason: \"end_turn\"`: \
+             the Messages API names the block that ended the turn. Script `text` for prose, or \
+             `raw` for a response generated code must reject",
+        ));
+    }
+    if scripted == "stop_sequence" {
+        let Some(matched) = request
+            .get("stop_sequences")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find_map(Value::as_str)
+        else {
+            return Err(mismatch(
+                sequence,
+                "a `stop_reason` of `stop_sequence` names the sequence that ended the turn, and \
+                 this request declares no `stop_sequences`: the Messages API only matches ones it \
+                 was given. Add them to the request, or script `raw` for a response generated \
+                 code must reject",
+            ));
+        };
+        return Ok((scripted.to_string(), Value::String(matched.to_string())));
+    }
+    Ok((scripted.to_string(), Value::Null))
 }
 
 /// How a request obliged the model to use a tool, if it did.
@@ -1774,10 +1875,7 @@ mod tests {
             panic!("a structured outcome is a reply");
         };
         let scripted = Outcome::Reply(Reply {
-            usage: Some(crate::control::Usage {
-                input_tokens: 11,
-                output_tokens: 22,
-            }),
+            usage: Some(crate::control::Usage::new(11, 22)),
             ..reply.clone()
         });
         let Answer::Respond(response) =
@@ -1980,6 +2078,94 @@ mod tests {
         };
         assert_eq!(response.status, 200);
         assert_eq!(response.body["content"][0]["name"], "lookup");
+    }
+
+    /// A scripted `stop_reason` is held to the closed set, to the content it
+    /// accompanies, and — for `stop_sequence` — to the request that could have
+    /// matched one.
+    ///
+    /// It is the field a compiled agent's tool loop branches on, so a script
+    /// that could name anything could stage a turn the API never ends that way,
+    /// and a codegen PR would watch its loop take the branch it wanted and pass
+    /// a criterion no live call would have let it reach.
+    #[test]
+    fn a_scripted_stop_reason_must_be_one_the_api_sends() {
+        let plain = messages(json!({ "messages": [{ "role": "user", "content": "hi" }] }));
+        let with_tools = messages(json!({
+            "messages": [{ "role": "user", "content": "hi" }],
+            "tools": [{ "name": "lookup", "input_schema": { "type": "object" } }],
+        }));
+        let ended = |request: &Value, outcome: Outcome, reason: &str| {
+            let Outcome::Reply(reply) = outcome else {
+                panic!("a reply is a reply");
+            };
+            let scripted = Outcome::Reply(Reply {
+                stop_reason: Some(reason.to_string()),
+                ..reply
+            });
+            let Answer::Respond(response) = render(1, request, None, &scripted) else {
+                panic!("an override answers");
+            };
+            response
+        };
+        let call = || Outcome::tool_calls(vec![crate::control::ToolCall::new("lookup", json!({}))]);
+
+        // Outside the closed set: an invented value, and Chat Completions'
+        // vocabulary reached for out of habit.
+        for reason in ["banana", "stop", "tool_calls", "length"] {
+            let response = ended(&plain, Outcome::text("just prose"), reason);
+            assert_eq!(response.status, HARNESS_STATUS, "{reason}");
+            assert_eq!(
+                response.headers[crate::control::HARNESS_HEADER],
+                MISMATCH,
+                "{reason}"
+            );
+            let message = response.body["error"]["message"].as_str().unwrap();
+            assert!(message.contains(reason), "{message}");
+        }
+
+        // In the set, but contradicting the content: `tool_use` names a block
+        // prose does not carry, and `end_turn` says the model stopped talking
+        // when a `tool_use` block ended the turn.
+        let response = ended(&plain, Outcome::text("just prose"), "tool_use");
+        assert_eq!(response.status, HARNESS_STATUS);
+        assert_eq!(response.headers[crate::control::HARNESS_HEADER], MISMATCH);
+        let response = ended(&with_tools, call(), "end_turn");
+        assert_eq!(response.status, HARNESS_STATUS);
+        assert_eq!(response.headers[crate::control::HARNESS_HEADER], MISMATCH);
+
+        // `stop_sequence` names the sequence that ended the turn, and the API
+        // only matches ones the request supplied — so it is refused without
+        // them, and served *with* the one it names when they are there.
+        let response = ended(&plain, Outcome::text("cut"), "stop_sequence");
+        assert_eq!(response.status, HARNESS_STATUS);
+        assert_eq!(response.headers[crate::control::HARNESS_HEADER], MISMATCH);
+        let mut stopped = plain.clone();
+        stopped["stop_sequences"] = json!(["<END>", "<HALT>"]);
+        assert!(
+            parse(&headers(), Some(&stopped)).failures.is_empty(),
+            "the request itself is legal"
+        );
+        let response = ended(&stopped, Outcome::text("cut"), "stop_sequence");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body["stop_reason"], "stop_sequence");
+        assert_eq!(response.body["stop_sequence"], "<END>");
+
+        // The positive half: truncation, a paused turn and a refusal each cut
+        // either content, and leave `stop_sequence` where it always was.
+        for (request, outcome) in [(&plain, Outcome::text("cut off")), (&with_tools, call())] {
+            for reason in ["max_tokens", "pause_turn", "refusal"] {
+                let response = ended(request, outcome.clone(), reason);
+                assert_eq!(response.status, 200, "{reason}");
+                assert_eq!(response.body["stop_reason"], reason);
+                assert!(response.body["stop_sequence"].is_null(), "{reason}");
+            }
+        }
+        let Answer::Respond(response) = render(1, &plain, None, &Outcome::text("hi")) else {
+            panic!("a reply is a response");
+        };
+        assert_eq!(response.body["stop_reason"], "end_turn");
+        assert!(response.body["stop_sequence"].is_null());
     }
 
     /// Every answer carries the request id, **errors included** — the header on

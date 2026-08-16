@@ -91,6 +91,19 @@ pub(crate) fn at(parent: &str, member: impl std::fmt::Display) -> String {
     }
 }
 
+/// A closed set of values, as a message names it: `'a', 'b', 'c'`.
+///
+/// One function because both dialects print a closed set the same way (see
+/// [`Checker::one_of`]) and the render side names them too, when it refuses a
+/// scripted stop reason no answer carries.
+pub(crate) fn listed(values: &[&str]) -> String {
+    values
+        .iter()
+        .map(|value| format!("'{value}'"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// A strict walk over one request body.
 pub(crate) struct Checker {
     dialect: Dialect,
@@ -342,11 +355,7 @@ impl Checker {
         if allowed.contains(&text) {
             return Some(text);
         }
-        let list = allowed
-            .iter()
-            .map(|value| format!("'{value}'"))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let list = listed(allowed);
         let message = match self.dialect {
             Dialect::Anthropic => {
                 format!("{pointer}: Input should be one of {list}")

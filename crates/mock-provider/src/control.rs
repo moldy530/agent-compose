@@ -96,7 +96,9 @@ pub const REFUSED_INVALID: &str = "invalid-request";
 /// [`HARNESS_HEADER`] on a request no scripted outcome answered.
 pub const REFUSED_UNSCRIPTED: &str = "unscripted-request";
 /// [`HARNESS_HEADER`] on a request whose scripted outcome could not be rendered
-/// into what the request asked for.
+/// into an answer the surface could have sent — either because it does not fit
+/// what the request asked for, or because the outcome contradicts itself (a
+/// stop reason no answer with that body carries).
 pub const REFUSED_MISMATCH: &str = "script-mismatch";
 /// [`HARNESS_HEADER`] on a scripted outcome that could not be put on the wire at
 /// all — a `raw` outcome carrying a header name or value HTTP cannot carry.
@@ -435,12 +437,20 @@ impl Outcome {
 pub struct Reply {
     /// What the model produced.
     pub body: ReplyBody,
-    /// Token counts. Defaults to a deterministic estimate over the rendered
-    /// request and response (see `usage`), which is what lets a test assert that
-    /// accounting reaches the trace at all without pinning a real tokenizer.
+    /// Token counts, each at most [`MAX_TOKENS`]. Defaults to a deterministic
+    /// estimate over the rendered request and response (see `usage`), which is
+    /// what lets a test assert that accounting reaches the trace at all without
+    /// pinning a real tokenizer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
     /// Overrides the stop reason the body implies.
+    ///
+    /// Held to what the answering surface could have sent: a value in that
+    /// surface's closed set, and one the body can carry — the tool reason names
+    /// calls a prose answer does not have, and the plain-end reason denies the
+    /// calls that ended the turn. A script that says otherwise is answered as
+    /// the harness bug it is rather than rendered, the same way an impossible
+    /// [`ReplyBody`] is. Anything else is [`Outcome::Raw`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,
     /// How long to wait before answering.
@@ -516,12 +526,71 @@ impl ToolCall {
     }
 }
 
+/// The largest token count a scripted [`Usage`] may report.
+///
+/// Bounded for the same reason `times` is: a token count is arithmetic the
+/// server does. The Chat Completions surface serves `total_tokens`, which is the
+/// **sum** of the two, so an unbounded pair is an addition that overflows — and
+/// an overflow in a render is a panicked connection task, which is a *dropped
+/// connection*, which PRD 5.9 classifies as a provider timeout. The bound also
+/// keeps both counts and their sum inside the integers JavaScript represents
+/// exactly (2^53 - 1): the client reading them is generated TypeScript, and a
+/// count it cannot round-trip is a count no test can assert on.
+///
+/// A billion is far above anything a real call reports — the widest context
+/// window in service is three orders of magnitude below it — so nothing a run
+/// needs is refused by it.
+pub(crate) const MAX_TOKENS: u64 = 1_000_000_000;
+
 /// Token counts, as both surfaces report them.
+///
+/// Each count is at most [`MAX_TOKENS`]; a control-plane document outside that
+/// range is refused by name rather than queued.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Usage {
+    #[serde(deserialize_with = "counted")]
     pub input_tokens: u64,
+    #[serde(deserialize_with = "counted")]
     pub output_tokens: u64,
+}
+
+impl Usage {
+    /// The counts a reply reports.
+    ///
+    /// # Panics
+    ///
+    /// If either count is above [`MAX_TOKENS`], which is the same bound the
+    /// control plane enforces. A test that asks for one has a bug in the script
+    /// rather than in the graph, and the panic names it where it was written
+    /// instead of serving a `usage` block no provider sends.
+    #[must_use]
+    pub fn new(input_tokens: u64, output_tokens: u64) -> Self {
+        for count in [input_tokens, output_tokens] {
+            assert!(
+                count <= MAX_TOKENS,
+                "a scripted token count is at most {MAX_TOKENS}, not {count}"
+            );
+        }
+        Self {
+            input_tokens,
+            output_tokens,
+        }
+    }
+}
+
+/// A token count, bounded — see [`Usage`].
+fn counted<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let count = u64::deserialize(deserializer)?;
+    if count > MAX_TOKENS {
+        return Err(serde::de::Error::custom(format!(
+            "a token count is at most {MAX_TOKENS}, not {count}"
+        )));
+    }
+    Ok(count)
 }
 
 /// How a provider refuses.
@@ -1394,6 +1463,53 @@ mod tests {
     #[should_panic(expected = "answers between 1 and 1000000 requests, not 0")]
     fn a_zero_times_is_refused_by_the_builder() {
         let _ = Script::new("fast", Outcome::text("hi")).times(0);
+    }
+
+    /// A scripted token count is bounded on the way in, for the same reason
+    /// `times` is: the counts are arithmetic the server does — Chat Completions
+    /// serves their **sum** as `total_tokens` — and an addition that overflows
+    /// panics the connection task, which a client reads as a dropped connection
+    /// and PRD 5.9 classifies as a provider timeout.
+    #[test]
+    fn a_token_count_outside_its_range_is_refused_by_the_control_plane() {
+        let script = |usage: Value| {
+            serde_json::from_value::<Script>(json!({
+                "model": "fast",
+                "outcome": { "reply": { "body": { "text": "hi" }, "usage": usage } },
+            }))
+        };
+
+        for refused in [
+            json!({ "input_tokens": MAX_TOKENS + 1, "output_tokens": 1 }),
+            json!({ "input_tokens": 1, "output_tokens": u64::MAX }),
+            json!({ "input_tokens": u64::MAX, "output_tokens": u64::MAX }),
+        ] {
+            let error = script(refused.clone())
+                .expect_err("a token count is bounded")
+                .to_string();
+            assert!(
+                error.contains("a token count is at most"),
+                "{refused}: {error}"
+            );
+        }
+
+        let counted = script(json!({ "input_tokens": MAX_TOKENS, "output_tokens": 0 }))
+            .expect("the largest pair a run could report");
+        let Outcome::Reply(reply) = counted.outcome else {
+            panic!("a reply is a reply");
+        };
+        assert_eq!(
+            reply.usage.expect("scripted counts").input_tokens,
+            MAX_TOKENS
+        );
+    }
+
+    /// The same bound at the Rust spelling, where a struct literal is the only
+    /// way past it.
+    #[test]
+    #[should_panic(expected = "a scripted token count is at most 1000000000")]
+    fn an_oversized_token_count_is_refused_by_the_builder() {
+        let _ = Usage::new(MAX_TOKENS + 1, 1);
     }
 
     /// A `raw` status HTTP cannot carry is refused at both spellings, for the

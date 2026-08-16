@@ -113,6 +113,10 @@ These are load-bearing and pinned by tests in `src/` and `tests/`:
   "tool_calls"` names the block that ended the turn, and neither API sends the
   name with nothing behind it. Prose is `text`; a shape generated code must
   reject is `raw`.
+* **A scripted stop reason is held to the same rule as the body it rides on.**
+  `stop_reason` / `finish_reason` is the one field a compiled agent's tool loop
+  branches on, so a `reply` may override it only with a value the surface really
+  sends *and* one the body can carry — see (16). Everything else, `raw`.
 * **A missing credential is a 401.** `x-api-key` on the Messages API,
   `Authorization: Bearer …` / `api-key` on Chat Completions — absent, the answer
   is 401 (`authentication_error` there, `code: "invalid_api_key"` here), not the
@@ -249,7 +253,13 @@ provider — no client is known to.
 
 Usage defaults to a four-characters-to-the-token estimate over the serialized
 request and response. It is not a tokenizer. A test that needs exact numbers
-scripts them (`usage` on a reply).
+scripts them (`usage` on a reply), and a scripted count is bounded at a billion
+— `control::MAX_TOKENS` — because the counts are arithmetic this server does
+(Chat Completions serves their **sum** as `total_tokens`), because an overflow
+in a render is a dropped connection and PRD 5.9 reads that as a provider
+timeout, and because the client reading them is generated TypeScript, which
+represents integers above 2^53 - 1 only approximately. The widest context window
+in service is three orders of magnitude below the bound.
 
 ### 11. The harness's own refusals use a status no provider sends and no SDK retries
 
@@ -316,6 +326,9 @@ Invalid schema for response_format 'reviewer_output': In context=(), 'additional
 Invalid schema for function 'lookup': In context=('properties', 'author'), 'required' is required to be supplied and to be an array including every key in properties. Missing 'name'.
 ```
 
+The **root** of a schema is held to two further rules, which apply whether or
+not `strict` was asked for — see (16).
+
 *What is certain*: the rules. They are the documented condition for structured
 outputs, and this is the most common 400 on the surface — a Zod-to-JSON-Schema
 path that drops either key passes a mock that does not check and fails on the
@@ -370,6 +383,67 @@ that sends one is what says which sentence and which address it uses.
 `src/openai.rs`'s namesake are where they live. A range that is too *narrow*
 would be worse than a wrong sentence, because it refuses a request that is
 correct; that is why the widest of the three kinds is the one enforced.
+
+### 16. OpenAI's root-schema rules
+
+Structured Outputs generates against a JSON **object**, so the root of a declared
+schema must be `type: "object"` and must not be an `anyOf`. Both places a schema
+is declared are held to it — `response_format.json_schema.schema` and a function
+tool's `parameters` — and at any `strict`, because the rules are about what the
+model is asked to produce rather than about how tightly the decoder is
+constrained. Below the root, `anyOf` is ordinary.
+
+```
+Invalid schema for response_format 'reviewer_output': schema must be a JSON Schema of 'type: "object"'.
+Invalid schema for function 'lookup': 'anyOf' is not permitted at the root level of the schema.
+```
+
+*What is certain*: the rules, and that codegen can reach the second one.
+`zod-to-json-schema` renders a `z.discriminatedUnion` as a bare root `anyOf`, and
+PRD §7 M1 promises "state models (incl. tagged unions via Zod)" — so a path that
+puts a tagged union at an agent's output root, or unwraps a single-field output
+to its bare field schema, produces exactly the request the service refuses. The
+union has to be one level down, under a property.
+*What is assumed*: the exact sentences. The first is the one this server already
+used for a function tool's `parameters`; the second is this server's own phrasing
+of the documented rule.
+*If wrong*: only a test asserting on the string breaks — `src/openai.rs`'s
+`a_declared_schemas_root_must_be_an_object_and_not_an_any_of` is where the
+strings live.
+
+### 17. The stop reasons each surface sends, and what they say about the body
+
+A `reply` may override the stop reason its body implies, and the override is held
+to the surface's closed set and to the body it accompanies — the same doctrine as
+every other part of a `reply`: it is what the API could have sent, and anything
+else is `raw`.
+
+| surface | closed set |
+|---|---|
+| Messages | `end_turn`, `max_tokens`, `stop_sequence`, `tool_use`, `pause_turn`, `refusal` |
+| Chat Completions | `stop`, `length`, `tool_calls`, `content_filter` |
+
+The coherence rules are three: `tool_use` / `tool_calls` requires content that
+carries a call (the sentence an empty `tools` reply is already refused with);
+`end_turn` / `stop` is refused *over* such content, because the calls are what
+ended that turn; and `stop_sequence` requires a request that declared
+`stop_sequences`, since the API only matches ones it was given — the first is
+then named in the response's `stop_sequence` member, which is `null` in every
+other case. `max_tokens` / `length`, `content_filter`, `pause_turn` and `refusal`
+cut either body and are legal over both.
+
+*What is certain*: that these are the fields a compiled agent's tool loop
+branches on, and that a mock which served an impossible pairing would let a
+codegen PR watch its loop take a branch and pass a criterion no live call could
+have produced.
+*What is assumed*: the closed sets themselves — a surface that adds a stop reason
+means adding a line, and until it exists the reason is refused as a
+`script-mismatch` (the same intended failure mode as the accepted-key lists
+below). Chat Completions' deprecated `function_call` is deliberately left out:
+this server does not serve the `functions` request surface, so a choice naming it
+would name a member no answer here has.
+*If wrong*: a test scripting the missing reason is refused loudly, with the set
+in the message; nothing is served that a provider would not.
 
 ---
 
