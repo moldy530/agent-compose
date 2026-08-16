@@ -776,6 +776,73 @@ flow.f:
     );
 }
 
+/// A property with a `default:` is optional **at its surface** — a binding need
+/// not supply it, and grammar 8.0's step 4 then does — so the value the
+/// declaration describes carries it either way and the channel stays readable
+/// by name (grammar 3.6, 8.0).
+///
+/// The half that a `default:` is *not* is grammar 3.4's `optional:`, which is
+/// what makes a property absent from a value at run time (Decision D110); the
+/// rejecting half of that is `check_invalid`'s
+/// `channel-does-not-satisfy-the-field-it-lands-in` and the reading below.
+#[test]
+fn a_defaulted_property_is_not_an_absent_one() {
+    accepts(
+        "defaulted-property",
+        r#"
+state:
+  author:
+    type: object
+    properties:
+      name: { type: string }
+      email: { type: string, default: "nobody@example.com" }
+  writer:
+    type: object
+    properties:
+      name: { type: string }
+      email: { type: string, default: "nobody@example.com" }
+  partial:
+    type: object
+    properties:
+      name: { type: string }
+      email: { type: string }
+    optional: [email]
+agent.a:
+  model: model.m
+  prompt: Do it.
+  input:
+    author:
+      type: object
+      properties:
+        name: { type: string }
+        email: { type: string }
+    other:
+      type: object
+      properties:
+        name: { type: string }
+        email: { type: string }
+    third:
+      type: object
+      properties:
+        name: { type: string }
+        email: { type: string, default: "nobody@example.com" }
+  output:
+    result: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.a
+      input:
+        other: "state.writer"
+        third: "state.partial"
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }
+"#,
+    );
+}
+
 /// Name-based wiring in both directions, with nothing between the two
 /// declarations (grammar 8.0 steps 2–3, 7.5, Decision D111).
 #[test]

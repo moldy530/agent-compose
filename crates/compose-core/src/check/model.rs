@@ -47,46 +47,12 @@ use crate::ir::schema::{
 };
 
 /// Why one type node does not satisfy another.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct Mismatch {
-    /// The path from the two nodes that were compared to the ones that
-    /// disagree: `.items`, `.author.email`. Empty at the top.
-    pub(crate) path: Vec<String>,
-    /// What the destination requires.
-    pub(crate) expected: String,
-    /// What the source offers.
-    pub(crate) found: String,
-}
-
-impl Mismatch {
-    fn at(mut self, segment: impl Into<String>) -> Self {
-        self.path.insert(0, segment.into());
-        self
-    }
-
-    fn new(expected: impl Into<String>, found: impl Into<String>) -> Self {
-        Self {
-            path: Vec::new(),
-            expected: expected.into(),
-            found: found.into(),
-        }
-    }
-
-    /// The sentence a diagnostic ends with: "expected …, found …" plus the
-    /// sub-path when the disagreement is nested.
-    pub(crate) fn describe(&self) -> String {
-        let expected = &self.expected;
-        let found = &self.found;
-        if self.path.is_empty() {
-            format!("expected {expected}, found {found}")
-        } else {
-            format!(
-                "expected {expected}, found {found} at `{}`",
-                self.path.join("")
-            )
-        }
-    }
-}
+///
+/// The same [`Mismatch`](crate::cel::ty::Mismatch) the expression-level
+/// relation reports: grammar 8.0 splits a wire into two typings, and an author
+/// meeting one of them should not have to learn a second vocabulary for the
+/// other.
+pub(crate) use crate::cel::ty::Mismatch;
 
 /// Whether every value `source` can hold is a legal value of `target`.
 pub(crate) fn satisfies(source: &TypeNode, target: &TypeNode) -> Result<(), Mismatch> {
@@ -307,7 +273,7 @@ fn objects(
             .iter()
             .find(|f| f.name.value == want.name.value)
         else {
-            if optional(want, target_optional) {
+            if unsupplied(want, target_optional) {
                 continue;
             }
             return Err(Mismatch::new(
@@ -315,7 +281,7 @@ fn objects(
                 "one that does not".to_string(),
             ));
         };
-        if !optional(want, target_optional) && optional(field, source_optional) {
+        if !unsupplied(want, target_optional) && absent(field, source_optional) {
             return Err(Mismatch::new(
                 format!("`{}` to be required", want.name.value),
                 "an optional property".to_string(),
@@ -483,8 +449,25 @@ fn bound(key: &str, target: Option<i64>, source: Option<i64>) -> Mismatch {
     )
 }
 
-fn optional(field: &Field, optional: &[Spanned<Ident>]) -> bool {
-    default_of(&field.ty).is_some() || optional.iter().any(|name| name.value == field.name.value)
+/// Whether a **value** of the object may legally omit this property: it is one
+/// its `optional:` names (grammar 3.4, Decision D110).
+///
+/// A `default:` is deliberately not this. Grammar 3.6 makes a defaulted
+/// property "implicitly optional **at its surface**" — a *binding* need not
+/// supply it, and grammar 8.0's step 4 then supplies the default — so the value
+/// the declaration describes carries the property either way. Reading the two
+/// as one concept is what would make a channel unreadable by name for the
+/// crime of declaring a convenience default on one of its properties.
+fn absent(field: &Field, optional: &[Spanned<Ident>]) -> bool {
+    optional.iter().any(|name| name.value == field.name.value)
+}
+
+/// Whether a value need not **supply** this property: it is `optional:`, or it
+/// declares a `default:` the surface fills in (grammar 3.4, 3.6, 8.0 step 4).
+///
+/// This is the destination's question, and the only one a `default:` answers.
+fn unsupplied(field: &Field, optional: &[Spanned<Ident>]) -> bool {
+    default_of(&field.ty).is_some() || absent(field, optional)
 }
 
 fn variants(variants: &[Spanned<String>]) -> String {
@@ -537,14 +520,20 @@ fn describe_form(form: &TypeForm) -> String {
 ///
 /// Only an object carries a name, and only because an unknown member has to
 /// say what it was looked for in: everything else is described by its own
-/// shape.
+/// shape. An array passes the name down to its `items:`, because the object a
+/// path reaches through an index is the one the reader named — `matches[0].id`
+/// looks its member up in an item of `matches`.
 pub(crate) fn type_of_named(node: &TypeNode, label: impl Into<String>) -> Type {
-    match type_of(node) {
-        Type::Object(shape) => Type::Object(Arc::new(ObjectShape {
+    match &node.form {
+        TypeForm::Object(object) => Type::Object(Arc::new(ObjectShape {
             origin: Origin::Declared(label.into()),
-            properties: shape.properties.clone(),
+            properties: properties(&object.properties, &object.optional),
         })),
-        other => other,
+        TypeForm::Array(array) => Type::list(type_of_named(
+            &array.items,
+            format!("an item of {}", label.into()),
+        )),
+        _ => type_of(node),
     }
 }
 
@@ -596,7 +585,8 @@ fn properties(map: &FieldMap, optional_names: &[Spanned<Ident>]) -> Vec<Property
             // member it does not have is reported against that name rather
             // than against an anonymous shape.
             ty: type_of_named(&field.ty, format!("`{}`", field.name.value)),
-            optional: optional(field, optional_names),
+            optional: absent(field, optional_names),
+            defaulted: default_of(&field.ty).is_some(),
         })
         .collect()
 }

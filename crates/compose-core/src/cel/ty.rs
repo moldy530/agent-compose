@@ -67,17 +67,31 @@ pub struct ObjectShape {
 }
 
 /// One member of an [`ObjectShape`].
+///
+/// The two flags are the two halves grammar 3 keeps apart, and conflating them
+/// is what makes a legal spec unwritable: `optional:` says a **value** may omit
+/// the property (grammar 3.4), while `default:` says a **binding** may omit it
+/// and the surface fills it in (grammar 3.6, 8.0 step 4). A property with a
+/// `default:` is therefore always present in the value its declaration
+/// describes, and only a destination reads the second flag.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Property {
     /// The member's name.
     pub name: String,
     /// Its type.
     pub ty: Type,
-    /// Whether a value may legally omit it (grammar 3.4, 11.4). Presence is a
-    /// runtime property either way — reading an absent value fails the
-    /// execution (Decision D110) — so this changes no static answer here; it is
-    /// carried because the schema-level relation needs it.
+    /// Whether a value may legally omit it: the property is listed in its
+    /// object's `optional:` (grammar 3.4, 11.4). Presence is a runtime property
+    /// either way — reading an absent value fails the execution (Decision
+    /// D110) — so this changes no static answer about the property itself; what
+    /// it decides is whether a source that may omit it can feed a destination
+    /// that may not.
     pub optional: bool,
+    /// Whether the destination supplies it when a value omits it: the property
+    /// declares a `default:` (grammar 3.6). Read on the destination side alone
+    /// — a source's `default:` is *in* the value it produces and says nothing
+    /// about absence.
+    pub defaulted: bool,
 }
 
 /// What an [`ObjectShape`] is, which is what decides how an unknown member is
@@ -105,6 +119,63 @@ pub enum Origin {
     Payload(&'static str),
 }
 
+/// Why one thing does not fit in another: where the two disagree, and what each
+/// side is there.
+///
+/// Both of the relations grammar 8.0 splits a wire into report through this —
+/// the expression one ([`Type::check_assignable`]) and the declaration one
+/// (`check::model::satisfies`) — so a mismatch reads the same wherever the
+/// author meets it, and a nested disagreement names its sub-path rather than
+/// reprinting the two shapes it is buried in.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Mismatch {
+    /// The path from the two things that were compared to the ones that
+    /// disagree: `.items`, `.author.email`. Empty at the top.
+    pub path: Vec<String>,
+    /// What the destination requires.
+    pub expected: String,
+    /// What the source offers.
+    pub found: String,
+}
+
+impl Mismatch {
+    /// A disagreement between the two things themselves.
+    #[must_use]
+    pub fn new(expected: impl Into<String>, found: impl Into<String>) -> Self {
+        Self {
+            path: Vec::new(),
+            expected: expected.into(),
+            found: found.into(),
+        }
+    }
+
+    /// The same disagreement, one level further out.
+    #[must_use]
+    pub fn at(mut self, segment: impl Into<String>) -> Self {
+        self.path.insert(0, segment.into());
+        self
+    }
+
+    /// The sub-path the two disagree at, empty at the top.
+    #[must_use]
+    pub fn path(&self) -> String {
+        self.path.join("")
+    }
+
+    /// The sentence a diagnostic ends with: "expected …, found …" plus the
+    /// sub-path when the disagreement is nested.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        let expected = &self.expected;
+        let found = &self.found;
+        if self.path.is_empty() {
+            format!("expected {expected}, found {found}")
+        } else {
+            format!("expected {expected}, found {found} at `{}`", self.path())
+        }
+    }
+}
+
 /// A discriminated union's shape (grammar 3.7).
 #[derive(Clone, Debug, PartialEq)]
 pub struct UnionShape {
@@ -127,7 +198,7 @@ impl ObjectShape {
     /// The member with this name, if the object declares one.
     #[must_use]
     pub fn property(&self, name: &str) -> Option<&Property> {
-        self.properties.iter().find(|p| p.name == name)
+        member(&self.properties, name)
     }
 
     /// Every member name, in declaration order.
@@ -200,56 +271,132 @@ impl Type {
     /// unmodelled expression from being reported as a mismatch.
     #[must_use]
     pub fn assignable_to(&self, target: &Self) -> bool {
+        self.check_assignable(target).is_ok()
+    }
+
+    /// [`assignable_to`](Self::assignable_to), with the disagreement named.
+    ///
+    /// Two objects are two nouns a diagnostic cannot tell apart — "expects this
+    /// object, found this object" is the whole of what the shapes themselves
+    /// can say — so the answer carries the sub-path the two differ at and what
+    /// each holds there, which is what error UX asks for (PRD G3) and what the
+    /// declaration-level relation already reports (`check::model::satisfies`).
+    ///
+    /// # Errors
+    ///
+    /// The [`Mismatch`] where the two disagree.
+    pub fn check_assignable(&self, target: &Self) -> Result<(), Mismatch> {
+        let refuse = || Mismatch::new(target.to_string(), self.to_string());
         match (self, target) {
-            (Self::Dyn, _) | (_, Self::Dyn) => true,
+            (Self::Dyn, _) | (_, Self::Dyn) => Ok(()),
             (Self::Bool, Self::Bool) | (Self::Bytes, Self::Bytes) | (Self::Null, Self::Null) => {
-                true
+                Ok(())
             }
             // CEL's integers land in a schema `number` as JSON's do; a `double`
             // never lands in an `integer`.
             (Self::Int | Self::Uint, Self::Int | Self::Uint | Self::Double)
-            | (Self::Double, Self::Double) => true,
+            | (Self::Double, Self::Double) => Ok(()),
             // A known string value is accepted by an `enum` that declares it.
             (Self::StringLiteral(value), Self::Enum(variants)) => {
-                variants.iter().any(|variant| variant.as_str() == &**value)
+                if variants.iter().any(|variant| variant.as_str() == &**value) {
+                    Ok(())
+                } else {
+                    Err(refuse())
+                }
             }
-            (Self::Enum(source), Self::Enum(target)) => {
-                source.iter().all(|variant| target.contains(variant))
+            (Self::Enum(source), Self::Enum(variants)) => {
+                if source.iter().all(|variant| variants.contains(variant)) {
+                    Ok(())
+                } else {
+                    Err(refuse())
+                }
             }
             // Every enum member is a string, so an enum lands in a string; the
             // reverse needs a value the expression does not promise.
             (Self::String | Self::StringLiteral(_) | Self::Enum(_), Self::String)
-            | (Self::StringLiteral(_), Self::StringLiteral(_)) => true,
-            (Self::List(source), Self::List(target)) => source.assignable_to(target),
-            (Self::Map(source), Self::Map(target)) => source.assignable_to(target),
+            | (Self::StringLiteral(_), Self::StringLiteral(_)) => Ok(()),
+            (Self::List(source), Self::List(items)) => source
+                .check_assignable(items)
+                .map_err(|mismatch| mismatch.at(".items")),
+            (Self::Map(source), Self::Map(values)) => source
+                .check_assignable(values)
+                .map_err(|mismatch| mismatch.at(".values")),
             // A map is what a decoded payload member is: its shape is unknown,
             // so an object destination can neither be proved nor refused.
-            (Self::Map(_), Self::Object(_)) | (Self::Object(_), Self::Map(_)) => true,
+            (Self::Map(_), Self::Object(_)) | (Self::Object(_), Self::Map(_)) => Ok(()),
             (Self::Object(source), Self::Object(target)) => {
-                target.properties.iter().all(|want| {
-                    source.property(&want.name).is_some_and(|have| {
-                        have.ty.assignable_to(&want.ty) && (want.optional || !have.optional)
-                    })
-                }) && source
-                    .properties
-                    .iter()
-                    .all(|have| target.property(&have.name).is_some())
+                members(&source.properties, &target.properties)
             }
-            (Self::Union(source), Self::Union(target)) => {
-                source.discriminator == target.discriminator
-                    && source.variants.iter().all(|variant| {
-                        target.variant(&variant.tag).is_some_and(|want| {
-                            variant.properties.iter().all(|have| {
-                                want.properties
-                                    .iter()
-                                    .any(|w| w.name == have.name && have.ty.assignable_to(&w.ty))
-                            }) && want.properties.len() == variant.properties.len()
-                        })
-                    })
-            }
-            _ => false,
+            (Self::Union(source), Self::Union(target)) => unions(source, target),
+            _ => Err(refuse()),
         }
     }
+}
+
+/// The member with this name, if the list carries one.
+fn member<'a>(properties: &'a [Property], name: &str) -> Option<&'a Property> {
+    properties.iter().find(|property| property.name == name)
+}
+
+/// Two closed member sets, member by member — an object against an object, or
+/// one union variant's payload against another's (grammar 3.4, 3.7, D8).
+fn members(source: &[Property], target: &[Property]) -> Result<(), Mismatch> {
+    if let Some(extra) = source
+        .iter()
+        .find(|have| member(target, &have.name).is_none())
+    {
+        // Objects are closed (Decision D8), so a value carrying a member the
+        // destination does not declare is not a legal value of it.
+        return Err(Mismatch::new(
+            format!(
+                "an object declaring only {}",
+                crate::parse::reader::list(target.iter().map(|want| want.name.as_str()))
+            ),
+            format!("one that also declares `{}`", extra.name),
+        ));
+    }
+    for want in target {
+        let Some(have) = member(source, &want.name) else {
+            return Err(Mismatch::new(
+                format!("an object declaring `{}`", want.name),
+                "one that does not",
+            ));
+        };
+        // A destination that supplies the property itself — `optional:`, or a
+        // `default:` it fills in — is the only one a source that may omit it
+        // can feed (grammar 3.4, 3.6).
+        if !want.optional && !want.defaulted && have.optional {
+            return Err(Mismatch::new(
+                format!("`{}` to be required", want.name),
+                "an optional property",
+            ));
+        }
+        have.ty
+            .check_assignable(&want.ty)
+            .map_err(|mismatch| mismatch.at(format!(".{}", want.name)))?;
+    }
+    Ok(())
+}
+
+/// Two discriminated unions, variant by variant (grammar 3.7).
+fn unions(source: &UnionShape, target: &UnionShape) -> Result<(), Mismatch> {
+    if source.discriminator != target.discriminator {
+        return Err(Mismatch::new(
+            format!("a `{}` union", target.discriminator),
+            format!("a `{}` union", source.discriminator),
+        ));
+    }
+    for variant in &source.variants {
+        let Some(want) = target.variant(&variant.tag) else {
+            return Err(Mismatch::new(
+                format!("a union of [{}]", target.tags().join(", ")),
+                format!("one that adds the variant `{}`", variant.tag),
+            ));
+        };
+        members(&variant.properties, &want.properties)
+            .map_err(|mismatch| mismatch.at(format!(".{}", variant.tag)))?;
+    }
+    Ok(())
 }
 
 impl Type {
@@ -353,6 +500,7 @@ mod tests {
             name: name.to_string(),
             ty,
             optional,
+            defaulted: false,
         };
         let target = Type::object(
             Origin::Declared("the target".into()),
@@ -385,6 +533,109 @@ mod tests {
         );
         assert!(!optional.assignable_to(&target));
         assert!(exact.assignable_to(&optional));
+        // …and a destination that supplies the property itself takes one that
+        // may omit it: a `default:` is filled in where a value stops short
+        // (grammar 3.6, 8.0 step 4).
+        let defaulted = Type::object(
+            Origin::Declared("defaulted".into()),
+            vec![Property {
+                name: "a".to_string(),
+                ty: Type::String,
+                optional: false,
+                defaulted: true,
+            }],
+        );
+        assert!(optional.assignable_to(&defaulted));
+    }
+
+    /// Two objects are two nouns a message cannot tell apart, so the answer
+    /// carries the sub-path they disagree at (PRD G3).
+    #[test]
+    fn a_refusal_names_the_member_the_two_disagree_at() {
+        let object = |label: &str, properties: Vec<Property>| {
+            Type::object(Origin::Declared(label.to_string()), properties)
+        };
+        let property = |name: &str, ty: Type| Property {
+            name: name.to_string(),
+            ty,
+            optional: false,
+            defaulted: false,
+        };
+        let target = object(
+            "the target",
+            vec![property(
+                "author",
+                object("`author`", vec![property("name", Type::String)]),
+            )],
+        );
+        let source = object(
+            "the source",
+            vec![property(
+                "author",
+                object("`author`", vec![property("name", Type::Int)]),
+            )],
+        );
+        let mismatch = source.check_assignable(&target).unwrap_err();
+        assert_eq!(
+            mismatch.describe(),
+            "expected a string, found an integer at `.author.name`"
+        );
+        // A member the destination does not declare, and one it declares and
+        // the source does not, are named rather than described as two objects.
+        let extra = object(
+            "the source",
+            vec![
+                property("author", object("`author`", Vec::new())),
+                property("editor", Type::String),
+            ],
+        );
+        assert_eq!(
+            extra.check_assignable(&target).unwrap_err().describe(),
+            "expected an object declaring only `author`, found one that also declares `editor`"
+        );
+        assert_eq!(
+            object("the source", Vec::new())
+                .check_assignable(&target)
+                .unwrap_err()
+                .describe(),
+            "expected an object declaring `author`, found one that does not"
+        );
+        // …and inside a list, at the item the two disagree at.
+        assert_eq!(
+            Type::list(source)
+                .check_assignable(&Type::list(target))
+                .unwrap_err()
+                .describe(),
+            "expected a string, found an integer at `.items.author.name`"
+        );
+    }
+
+    /// A union is compared variant by variant, and a payload that disagrees
+    /// names the variant it disagrees in (grammar 3.7).
+    #[test]
+    fn a_union_refusal_names_the_variant() {
+        let union = |ty: Type| {
+            Type::Union(Arc::new(UnionShape {
+                discriminator: "kind".to_string(),
+                variants: vec![UnionVariant {
+                    tag: "auto_fixable".to_string(),
+                    properties: vec![Property {
+                        name: "file".to_string(),
+                        ty,
+                        optional: false,
+                        defaulted: false,
+                    }],
+                }],
+            }))
+        };
+        assert!(union(Type::String).assignable_to(&union(Type::String)));
+        assert_eq!(
+            union(Type::Int)
+                .check_assignable(&union(Type::String))
+                .unwrap_err()
+                .describe(),
+            "expected a string, found an integer at `.auto_fixable.file`"
+        );
     }
 
     #[test]

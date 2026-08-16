@@ -268,8 +268,12 @@ impl<'a> Ctx<'a> {
                     ty: model::type_of(&channel.ty),
                     // A channel is a value the flow instance holds, not a
                     // property of an object: whether it is *set* is a runtime
-                    // question (Decision D78), never a declared one.
+                    // question (Decision D78), never a declared one, and a
+                    // channel `default:` is the initial value it holds rather
+                    // than something a reader of `state` supplies (grammar
+                    // 3.6, 10.1).
                     optional: false,
+                    defaulted: false,
                 })
                 .collect(),
         )

@@ -77,9 +77,9 @@ pub(crate) fn expect_field(
     subject: &str,
 ) {
     let want = model::type_of(field);
-    if analysis.ty.assignable_to(&want) {
+    let Err(mismatch) = analysis.ty.check_assignable(&want) else {
         return;
-    }
+    };
     let help = match (&analysis.ty, &want) {
         (Type::String, Type::Enum(_)) => Some(
             "an enum field takes one of its variants: bind it from an enum-typed source or write the variant as a literal"
@@ -91,11 +91,22 @@ pub(crate) fn expect_field(
         ),
         _ => None,
     };
+    // Where the two are objects, "expects this object, found this object" is
+    // the whole of what the two shapes can say for themselves, so the message
+    // is the member they disagree at instead (PRD G3).
+    let at = if mismatch.path.is_empty() {
+        String::new()
+    } else {
+        format!(" at `{}`", mismatch.path())
+    };
     ctx.push(
         Diagnostic::error(
             DiagnosticCode::TypeMismatch,
             expression.span.clone(),
-            format!("{subject} expects {want}, found {}", analysis.ty),
+            format!(
+                "{subject} expects {}, found {}{at}",
+                mismatch.expected, mismatch.found
+            ),
         )
         .with_label(field.span.clone(), "the destination is declared here")
         .with_optional_help(help),
@@ -126,24 +137,18 @@ fn flow_input(flow: &Flow, address: &str) -> Type {
 /// grammar 4.1 and Decision D115 make an absent index a runtime failure, not a
 /// static one.
 fn execution() -> Type {
+    let member = |name: &str, ty: Type| Property {
+        name: name.to_string(),
+        ty,
+        optional: false,
+        defaulted: false,
+    };
     Type::object(
         Origin::Execution,
         vec![
-            Property {
-                name: "id".to_string(),
-                ty: Type::String,
-                optional: false,
-            },
-            Property {
-                name: "session_key".to_string(),
-                ty: Type::String,
-                optional: false,
-            },
-            Property {
-                name: "item_index".to_string(),
-                ty: Type::Int,
-                optional: false,
-            },
+            member("id", Type::String),
+            member("session_key", Type::String),
+            member("item_index", Type::Int),
         ],
     )
 }
@@ -170,6 +175,7 @@ fn node_handle(ctx: &Ctx, node: &Node) -> Type {
             name: "output".to_string(),
             ty: model::object_of(&output, format!("`{id}`'s output")),
             optional: false,
+            defaulted: false,
         }]
     });
     Type::object(
@@ -240,6 +246,7 @@ pub(crate) fn trigger_scope(kind: &TriggerKind, surface: impl Into<String>) -> S
         name: name.to_string(),
         ty,
         optional: false,
+        defaulted: false,
     };
     let payload = match kind {
         // The CLI's `--session <key>` is the manual payload's one member
