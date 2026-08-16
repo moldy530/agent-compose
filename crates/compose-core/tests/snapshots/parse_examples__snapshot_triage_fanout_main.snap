@@ -26,7 +26,7 @@ Spec(
                     "triggers.yml" @ 29:5..29:17,
                 ],
                 dropped: 0,
-                span: 17:3..31:1,
+                span: 17:3..29:17,
             },
         ),
         defaults: Some(
@@ -51,7 +51,7 @@ Spec(
                 on_error: Some(
                     Fail @ 34:13..34:17,
                 ),
-            } @ 32:3..36:1,
+            } @ 32:3..34:17,
         ),
         state: Some(
             StateSection {
@@ -70,10 +70,10 @@ Spec(
                             description: Some(
                                 "The report after flow.enrich has normalized it." @ 38:18..38:65,
                             ),
-                            span: 38:5..42:3,
+                            span: 38:5..40:16,
                         },
                         reduce: None,
-                        span: 37:3..42:3,
+                        span: 37:3..40:16,
                     },
                     Channel {
                         name: "matches" @ 42:3..42:10,
@@ -94,10 +94,10 @@ Spec(
                             description: Some(
                                 "Raw grep hits handed to the triage agent." @ 43:18..43:59,
                             ),
-                            span: 43:5..53:3,
+                            span: 43:5..45:28,
                         },
                         reduce: None,
-                        span: 42:3..53:3,
+                        span: 42:3..45:28,
                     },
                     Channel {
                         name: "patches" @ 53:3..53:10,
@@ -119,12 +119,12 @@ Spec(
                             description: Some(
                                 "Patches produced by the fixer instances." @ 54:18..54:58,
                             ),
-                            span: 54:5..60:3,
+                            span: 54:5..58:19,
                         },
                         reduce: Some(
                             Append @ 58:13..58:19,
                         ),
-                        span: 53:3..60:3,
+                        span: 53:3..58:19,
                     },
                     Channel {
                         name: "summary" @ 60:3..60:10,
@@ -140,10 +140,10 @@ Spec(
                             description: Some(
                                 "Human-readable summary of the triage run." @ 61:18..61:59,
                             ),
-                            span: 61:5..65:3,
+                            span: 61:5..63:16,
                         },
                         reduce: None,
-                        span: 60:3..65:3,
+                        span: 60:3..63:16,
                     },
                     Channel {
                         name: "human_decision" @ 65:3..65:17,
@@ -164,17 +164,17 @@ Spec(
                             description: Some(
                                 "What the reviewer decided about the run as a whole." @ 66:18..66:69,
                             ),
-                            span: 66:5..69:1,
+                            span: 66:5..68:21,
                         },
                         reduce: None,
-                        span: 65:3..69:1,
+                        span: 65:3..68:21,
                     },
                 ],
-                span: 37:3..69:1,
+                span: 37:3..68:21,
             },
         ),
         triggers: None,
         definitions: [],
-        span: 14:1..69:1,
+        span: 14:1..68:21,
     },
 )

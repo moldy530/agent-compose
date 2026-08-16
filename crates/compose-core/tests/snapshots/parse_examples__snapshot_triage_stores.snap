@@ -52,7 +52,7 @@ Spec(
                                     },
                                 ],
                                 surface: Result,
-                                span: 21:5..23:3,
+                                span: 21:5..22:52,
                             },
                         ),
                         embed: Some(
@@ -66,7 +66,7 @@ Spec(
                                 dimensions: Some(
                                     1536 @ 19:17..19:21,
                                 ),
-                                span: 17:5..20:3,
+                                span: 17:5..19:21,
                             },
                         ),
                         backend: Some(
@@ -80,9 +80,9 @@ Spec(
                         ),
                     },
                 ),
-                span: 12:1..25:1,
+                span: 12:1..24:21,
             },
         ],
-        span: 12:1..25:1,
+        span: 12:1..24:21,
     },
 )

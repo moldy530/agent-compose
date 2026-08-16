@@ -197,11 +197,13 @@ error: `main.yml` is not valid (target `local`): 1 error
 /// channel breaks grammar 8.6 rule 5 as well, and a fixture there pins exactly
 /// one diagnostic per code.
 ///
-/// The `map` node is the file's last for a reason — which is also why the flow
-/// writes its `edges:` above its `nodes:`, key order in a mapping being free.
 /// The second diagnostic's own anchor *is* the `map:` block, grammar 8.6 rule 5
-/// being about the whole dispatch, so ending the block with the file keeps this
-/// golden about the label under test rather than about that end marker.
+/// being about the whole dispatch — and the underline stops at the last line the
+/// block actually declares, four lines drawn over four lines of `map:`. A
+/// collection's span ends at its own text rather than at the token that follows
+/// it (`yaml::Loader::collection_span`), which is what makes the two anchors
+/// comparable here: one names a node, the other draws a block, and neither
+/// reaches into anything it is not about.
 #[test]
 fn a_maps_write_is_labelled_on_the_node_that_makes_it() {
     let output = validate(&projects().join("one-concurrent-map-write"), &["main.yml"]);
@@ -231,7 +233,7 @@ error[unreduced-write]: the `map` of node `work` writes the unreduced channel `v
 45 | |         node: agent.worker
 46 | |         max_concurrency: 2
 47 | |         input: { text: \"item\" }
-   | |________________________________^
+   | |_______________________________^
    |
    = help: dispatched instances are concurrent writers, so the channel they write needs a declared `reduce:` policy — `append`, `merge`, or an explicit `last_wins` (grammar 8.6 rule 5, 10.2)
 

@@ -33,12 +33,12 @@ Spec(
                                             description: Some(
                                                 "What the finished draft must accomplish." @ 8:20..8:60,
                                             ),
-                                            span: 8:7..11:3,
+                                            span: 8:7..10:20,
                                         },
                                     },
                                 ],
                                 surface: Input,
-                                span: 7:5..11:3,
+                                span: 7:5..10:20,
                             },
                         ),
                         outputs: Some(
@@ -55,12 +55,12 @@ Spec(
                                             description: Some(
                                                 "The approved draft, read from the `draft` state channel." @ 13:20..13:76,
                                             ),
-                                            span: 13:7..16:3,
+                                            span: 13:7..14:19,
                                         },
                                     },
                                 ],
                                 surface: Result,
-                                span: 12:5..16:3,
+                                span: 12:5..14:19,
                             },
                         ),
                         nodes: [
@@ -82,7 +82,7 @@ Spec(
                                                     value: cel("state.feedback") @ 23:19..23:35,
                                                 },
                                             ],
-                                            span: 22:9..24:7,
+                                            span: 22:9..23:35,
                                         },
                                     ),
                                 ),
@@ -106,7 +106,7 @@ Spec(
                                     on_error: None,
                                 },
                                 description: None,
-                                span: 20:7..26:5,
+                                span: 20:7..24:37,
                             },
                             Node {
                                 id: "review" @ 26:5..26:11,
@@ -126,7 +126,7 @@ Spec(
                                                     value: cel("state.draft") @ 30:16..30:29,
                                                 },
                                             ],
-                                            span: 29:9..31:7,
+                                            span: 29:9..30:29,
                                         },
                                     ),
                                 ),
@@ -143,7 +143,7 @@ Spec(
                                     ),
                                 },
                                 description: None,
-                                span: 27:7..34:3,
+                                span: 27:7..32:34,
                             },
                         ],
                         edges: [
@@ -195,7 +195,7 @@ Spec(
                                 max_iterations: Some(
                                     3 @ 43:23..43:24,
                                 ),
-                                span: 40:7..51:5,
+                                span: 40:7..43:24,
                             },
                             Edge {
                                 from: Some(
@@ -211,14 +211,14 @@ Spec(
                                     53:13..53:17,
                                 ),
                                 max_iterations: None,
-                                span: 51:7..54:1,
+                                span: 51:7..53:17,
                             },
                         ],
                     },
                 ),
-                span: 4:1..54:1,
+                span: 4:1..53:17,
             },
         ],
-        span: 4:1..54:1,
+        span: 4:1..53:17,
     },
 )

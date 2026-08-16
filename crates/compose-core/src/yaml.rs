@@ -204,6 +204,7 @@ pub fn load(source: &str, name: &SourceName, diagnostics: &mut Diagnostics) -> O
 
     let mut loader = Loader {
         parser: Parser::new_from_str(source),
+        text: source,
         source: name.clone(),
         offsets: char_offsets(source),
         end_of_file: source.len(),
@@ -240,6 +241,9 @@ const MAX_NODES: usize = 100_000;
 
 struct Loader<'src, 'dx> {
     parser: Parser<'src, saphyr_parser::StrInput<'src>>,
+    /// The file being loaded. A collection's span is read back off it to find
+    /// where the collection's own text stops ([`Loader::collection_span`]).
+    text: &'src str,
     source: SourceName,
     offsets: Vec<usize>,
     end_of_file: usize,
@@ -470,18 +474,21 @@ impl<'src> Loader<'src, '_> {
     fn build_sequence(&mut self, start: RawSpan) -> Node {
         self.depth += 1;
         let mut items = Vec::new();
+        let mut content = None;
         let mut end = start;
         while let Some((event, span)) = self.next() {
             if matches!(event, Event::SequenceEnd) {
                 end = span;
                 break;
             }
-            items.push(self.build(event, span));
+            let item = self.build(event, span);
+            reach(&mut content, &item.span);
+            items.push(item);
         }
         self.depth -= 1;
         Node {
             value: Yaml::Sequence(items),
-            span: self.joined_span(start, end),
+            span: self.collection_span(start, end, content),
         }
     }
 
@@ -498,6 +505,7 @@ impl<'src> Loader<'src, '_> {
         // is not the millisecond budget the cap is there to protect
         // (PRD 5.12).
         let mut seen: HashMap<String, usize> = HashMap::new();
+        let mut content = None;
         let mut end = start;
         loop {
             let Some((event, span)) = self.next() else {
@@ -509,6 +517,7 @@ impl<'src> Loader<'src, '_> {
             }
 
             let key_node = self.build(event, span);
+            reach(&mut content, &key_node.span);
             let key = match key_node.value {
                 Yaml::String(text) => Spanned::new(text, key_node.span),
                 other => {
@@ -520,7 +529,7 @@ impl<'src> Loader<'src, '_> {
                             other.description()
                         ),
                     );
-                    self.skip_value();
+                    self.skip_value(&mut content);
                     mapping.dropped += 1;
                     continue;
                 }
@@ -535,7 +544,7 @@ impl<'src> Loader<'src, '_> {
                     )
                     .with_help("repeat the keys, or alias the whole value with `*anchor`"),
                 );
-                self.skip_value();
+                self.skip_value(&mut content);
                 mapping.dropped += 1;
                 continue;
             }
@@ -544,6 +553,7 @@ impl<'src> Loader<'src, '_> {
                 Some((event, span)) => self.build(event, span),
                 None => break,
             };
+            reach(&mut content, &value.span);
 
             if let Some(existing) = seen.get(&key.value).map(|index| &mapping.entries[*index]) {
                 let first = existing.key.span.clone();
@@ -565,14 +575,17 @@ impl<'src> Loader<'src, '_> {
         self.depth -= 1;
         Node {
             value: Yaml::Mapping(mapping),
-            span: self.joined_span(start, end),
+            span: self.collection_span(start, end, content),
         }
     }
 
-    /// Consume and discard the value of an entry whose key was rejected.
-    fn skip_value(&mut self) {
+    /// Consume and discard the value of an entry whose key was rejected. Its
+    /// text is still the enclosing mapping's own, so where it reaches to counts
+    /// towards that mapping's span even though the value itself is dropped.
+    fn skip_value(&mut self, content: &mut Option<(usize, Position)>) {
         if let Some((event, span)) = self.next() {
-            let _ = self.build(event, span);
+            let value = self.build(event, span);
+            reach(content, &value.span);
         }
     }
 
@@ -630,16 +643,93 @@ impl<'src> Loader<'src, '_> {
         Span::new(self.source.clone(), byte..byte, position, position)
     }
 
-    /// The region running from the start of one event to the end of another.
-    fn joined_span(&self, start: RawSpan, end: RawSpan) -> Span {
+    /// The region a collection occupies: from its start event to the end of its
+    /// own last piece of text.
+    ///
+    /// Not to its **end event**, which is where the *next* token begins. A block
+    /// collection has no closing delimiter, so YAML ends it at whatever comes
+    /// after — the following sibling's key, several lines down and past any
+    /// comment between the two — and a span drawn to there underlines a
+    /// declaration the diagnostic has nothing to say about, which is a
+    /// diagnostic pointing at the wrong line (PRD G3). A flow collection ends at
+    /// its `}` or `]` but its end event still runs on to the next token, so a
+    /// trailing comment lands inside the span the same way.
+    ///
+    /// So the span ends at the furthest point the collection's children reach,
+    /// extended over whatever separates that from the end event as long as it is
+    /// whitespace or a comment. The extension is what keeps the `}` or `]` a
+    /// flow collection closes with — the one piece of a collection's own text
+    /// that lies past its last child — and a collection holding nothing at all
+    /// (`{}`, `[]`) reaches from its opening delimiter by the same rule.
+    fn collection_span(
+        &self,
+        start: RawSpan,
+        end: RawSpan,
+        content: Option<(usize, Position)>,
+    ) -> Span {
         let start_byte = self.byte_of(start.start.index());
-        let end_byte = self.byte_of(end.end.index()).max(start_byte);
+        let (floor, at) = match content {
+            Some((byte, at)) if byte >= start_byte => (byte, at),
+            _ => (
+                self.byte_of(start.end.index()).max(start_byte),
+                Self::position(start.end),
+            ),
+        };
+        let limit = self.byte_of(end.end.index()).max(floor);
+        let (end_byte, end_position) = self.past_trivia(floor, at, limit);
         Span::new(
             self.source.clone(),
             start_byte..end_byte,
             Self::position(start.start),
-            Self::position(end.end),
+            end_position,
         )
+    }
+
+    /// Where the last thing in `from..limit` that is neither whitespace nor a
+    /// comment ends, as a byte offset and the position just past it — `from`
+    /// itself where the whole region is one or the other.
+    ///
+    /// The region is what lies between a collection's own content and the token
+    /// that ends it, so a comment here is always a *trailing* comment: `#`
+    /// begins one exactly where YAML says it does, after whitespace or at the
+    /// start of a line, and a `#` inside a quoted scalar is inside a child's
+    /// span and below `from`. The scan costs the region once per enclosing
+    /// collection, and `MAX_NESTING` bounds how many of those there can be.
+    fn past_trivia(&self, from: usize, at: Position, limit: usize) -> (usize, Position) {
+        let Some(text) = self.text.get(from..limit) else {
+            return (from, at);
+        };
+        let (mut byte, mut position) = (from, at);
+        let (mut cursor, mut seen) = (from, at);
+        let mut previous: Option<char> = None;
+        let mut commented = false;
+        for character in text.chars() {
+            let next = if character == '\n' {
+                Position::new(seen.line.saturating_add(1), 1)
+            } else {
+                Position::new(seen.line, seen.column.saturating_add(1))
+            };
+            cursor += character.len_utf8();
+            if character == '\n' {
+                commented = false;
+            } else if commented || (character == '#' && previous.is_some_and(char::is_whitespace)) {
+                commented = true;
+            } else if !character.is_whitespace() {
+                byte = cursor;
+                position = next;
+            }
+            previous = Some(character);
+            seen = next;
+        }
+        (byte, position)
+    }
+}
+
+/// Carry the furthest point a collection's children reach, as the byte just past
+/// one and the position just past it.
+fn reach(content: &mut Option<(usize, Position)>, span: &Span) {
+    if content.is_none_or(|(byte, _)| span.bytes.end > byte) {
+        *content = Some((span.bytes.end, span.end));
     }
 }
 
@@ -856,6 +946,79 @@ mod tests {
         assert_eq!(entry.key.span.start, Position::new(1, 1));
         assert_eq!(entry.value.span.bytes, 6..12);
         assert_eq!(entry.value.span.start, Position::new(1, 6));
+    }
+
+    /// A block collection has no closing delimiter, so YAML ends it where the
+    /// next token begins — the following sibling's key, past any comment
+    /// between the two. A span drawn to *there* underlines a declaration the
+    /// diagnostic naming it has nothing to say about, so a collection's span
+    /// stops at its own last value instead (PRD G3).
+    #[test]
+    fn a_block_collection_ends_at_its_own_last_value() {
+        let source = "a:\n  b: 1\n  c: 2\n\n# a comment about d\nd: 3\n";
+        let (node, diagnostics) = load_ok(source);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let root = node.unwrap();
+        let block = root.as_mapping().unwrap().get("a").unwrap();
+        assert_eq!(&source[block.span.bytes.clone()], "b: 1\n  c: 2");
+        assert_eq!(block.span.start, Position::new(2, 3));
+        assert_eq!(block.span.end, Position::new(3, 7));
+
+        // The root runs to its own last value the same way, dropping the
+        // trailing newline the file ends with.
+        assert_eq!(root.span.end, Position::new(6, 5));
+        assert_eq!(&source[root.span.bytes.clone()], source.trim_end());
+
+        // A sequence is the same shape.
+        let source = "a:\n  - one\n  - two\nb: 3\n";
+        let (node, _) = load_ok(source);
+        let items = node
+            .unwrap()
+            .as_mapping()
+            .unwrap()
+            .get("a")
+            .unwrap()
+            .span
+            .clone();
+        assert_eq!(&source[items.bytes.clone()], "- one\n  - two");
+        assert_eq!(items.end, Position::new(3, 8));
+    }
+
+    /// A flow collection *does* close itself, and its `}` or `]` is the one
+    /// piece of its text past its last child — so the span keeps that and stops
+    /// there, whatever trailing comment the end event runs on to.
+    #[test]
+    fn a_flow_collection_keeps_its_delimiter_and_drops_a_trailing_comment() {
+        let source = "a: { b: [1, 2] }   # trailing\nc: 3\n";
+        let (node, diagnostics) = load_ok(source);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let root = node.unwrap();
+        let mapping = root.as_mapping().unwrap().get("a").unwrap();
+        assert_eq!(&source[mapping.span.bytes.clone()], "{ b: [1, 2] }");
+        assert_eq!(mapping.span.end, Position::new(1, 17));
+        let sequence = mapping.as_mapping().unwrap().get("b").unwrap();
+        assert_eq!(&source[sequence.span.bytes.clone()], "[1, 2]");
+
+        // A collection that holds nothing reaches from its opening delimiter.
+        let source = "a: {}\nb: []\n";
+        let (node, _) = load_ok(source);
+        let root = node.unwrap();
+        let root = root.as_mapping().unwrap();
+        assert_eq!(&source[root.get("a").unwrap().span.bytes.clone()], "{}");
+        assert_eq!(&source[root.get("b").unwrap().span.bytes.clone()], "[]");
+    }
+
+    /// An entry the loader drops still leaves its text inside the mapping that
+    /// declared it: the span reaches over a duplicate rather than stopping at
+    /// the last entry that survived.
+    #[test]
+    fn a_dropped_entry_still_counts_towards_the_mapping_it_was_written_in() {
+        let source = "a:\n  b: 1\n  b: 2\nc: 3\n";
+        let (node, diagnostics) = load_ok(source);
+        assert_eq!(codes(&diagnostics), ["duplicate-key"]);
+        let root = node.unwrap();
+        let block = root.as_mapping().unwrap().get("a").unwrap();
+        assert_eq!(&source[block.span.bytes.clone()], "b: 1\n  b: 2");
     }
 
     #[test]

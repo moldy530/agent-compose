@@ -20,7 +20,7 @@ Spec(
                     "triggers.yml" @ 17:5..17:17,
                 ],
                 dropped: 0,
-                span: 11:3..20:1,
+                span: 11:3..17:17,
             },
         ),
         defaults: Some(
@@ -32,7 +32,7 @@ Spec(
                 on_error: Some(
                     Fail @ 22:13..22:17,
                 ),
-            } @ 21:3..27:1,
+            } @ 21:3..22:17,
         ),
         state: Some(
             StateSection {
@@ -51,10 +51,10 @@ Spec(
                             description: Some(
                                 "The current draft, rewritten on every pass." @ 29:18..29:61,
                             ),
-                            span: 29:5..32:3,
+                            span: 29:5..31:16,
                         },
                         reduce: None,
-                        span: 28:3..32:3,
+                        span: 28:3..31:16,
                     },
                     Channel {
                         name: "feedback" @ 32:3..32:11,
@@ -70,17 +70,17 @@ Spec(
                             description: Some(
                                 "The reviewer's most recent feedback, fed back into the writer." @ 33:18..33:80,
                             ),
-                            span: 33:5..36:1,
+                            span: 33:5..35:16,
                         },
                         reduce: None,
-                        span: 32:3..36:1,
+                        span: 32:3..35:16,
                     },
                 ],
-                span: 28:3..36:1,
+                span: 28:3..35:16,
             },
         ),
         triggers: None,
         definitions: [],
-        span: 8:1..36:1,
+        span: 8:1..35:16,
     },
 )

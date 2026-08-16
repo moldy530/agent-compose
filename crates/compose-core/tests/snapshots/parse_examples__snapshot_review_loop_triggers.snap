@@ -22,7 +22,7 @@ Spec(
                         kind: Some(
                             Manual,
                         ),
-                        span: 10:5..13:3,
+                        span: 10:5..11:27,
                     },
                     Trigger {
                         name: "on_request" @ 13:3..13:13,
@@ -50,7 +50,7 @@ Spec(
                                                     value: cel("payload.body.goal") @ 19:13..19:32,
                                                 },
                                             ],
-                                            span: 19:7..20:5,
+                                            span: 19:7..19:32,
                                         },
                                     ),
                                     respond: Some(
@@ -63,13 +63,13 @@ Spec(
                                 },
                             ),
                         ),
-                        span: 14:5..23:1,
+                        span: 14:5..22:42,
                     },
                 ],
-                span: 9:3..23:1,
+                span: 9:3..22:42,
             },
         ),
         definitions: [],
-        span: 3:1..23:1,
+        span: 3:1..22:42,
     },
 )
