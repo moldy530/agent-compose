@@ -34,6 +34,29 @@
 //! composition is identical to one that talks to a real provider (PRD 5.9: env
 //! refs survive unresolved into the IR), which is the point — the harness tests
 //! the graph that would ship.
+//!
+//! # How many model calls an agent node makes
+//!
+//! A pending test scripts answers *before* the run, so it has to know how many
+//! calls the node will make and what each one pins. One rule fixes both, and it
+//! is forced rather than chosen: **structured output is asked for by pinning the
+//! output tool by name** (PRD 5.2, `WIRE-NOTES.md` (1)), and a pinned tool choice
+//! is a promise that the pinned tool is what gets called. So:
+//!
+//! * an agent with **no tools and no stores** makes **one** call — its output
+//!   schema offered as the single tool, pinned — and `Outcome::structured` is
+//!   what answers it, rendered under whichever name codegen chose;
+//! * an agent **with** tools or attached stores runs its loop first, on calls
+//!   that offer those tools and pin **nothing** (a pinned choice would make the
+//!   loop unreachable), and the pinned output call is what ends it. Its first
+//!   recorded call is therefore a loop call, answered with `Outcome::text` or
+//!   `Outcome::tool_calls`, and `Outcome::structured` answers the last one.
+//!
+//! The mock enforces exactly this: a `structured` reply to a request that pinned
+//! nothing, a `text` reply to one that pinned a tool, and a tool call beside the
+//! pinned one are each refused as a `script-mismatch` rather than answered. A
+//! test that scripts the wrong number of calls fails loudly instead of passing
+//! against a transcript no provider could produce.
 
 // A test target is a crate root, so its submodules resolve against `tests/`
 // rather than against a directory named after the file. The path keeps the
@@ -516,8 +539,15 @@ fn a_tagged_union_output_is_narrowed_per_variant_and_a_bad_tag_is_rejected() {
     );
 }
 
-/// An agent node sends its literal prompt, its bound input, its tool surface, and
-/// its output schema — and writes the structured output it gets back.
+/// An agent node sends its literal prompt, its bound input, and its output
+/// schema — and writes the structured output it gets back.
+///
+/// `agent.reviewer` carries no `tools:`, so this is the single-call shape the
+/// module header's *How many model calls an agent node makes* fixes: the output
+/// schema offered as a tool and pinned. What an agent's own `tools:` list looks
+/// like on the wire belongs to the tool-loop test — a request cannot pin the
+/// output tool and leave another one callable, so no single test can assert
+/// both.
 #[test]
 #[ignore = "M1: codegen must emit agent node fns"]
 fn an_agent_node_sends_its_prompt_input_and_output_schema() {
@@ -553,19 +583,19 @@ fn an_agent_node_sends_its_prompt_input_and_output_schema() {
         turn.contains("ship it") && turn.contains("a draft"),
         "{turn}"
     );
-    assert!(
-        call.tools.contains(&"lookup".to_string()),
-        "the agent's `tools:` list reaches the provider: {:?}",
-        call.tools
-    );
-    let schema = call
+    let structured = call
         .structured_output
         .as_ref()
-        .expect("an agent always asks for structured output (PRD 5.2)")
-        .schema()
-        .clone();
+        .expect("an agent always asks for structured output (PRD 5.2)");
     assert_eq!(
-        schema["properties"]["verdict"]["enum"],
+        call.tools,
+        [structured.name()],
+        "a tool-less agent offers exactly one tool: the one carrying its output \
+         schema, which `tool_choice` then pins ({:?})",
+        call.tools
+    );
+    assert_eq!(
+        structured.schema()["properties"]["verdict"]["enum"],
         json!(["approve", "revise"])
     );
     assert_eq!(run.outputs()["verdict"], "revise");
@@ -649,12 +679,18 @@ fn an_agent_node_sends_its_prompt_input_and_output_schema_on_chat_completions() 
 }
 
 /// The intra-agent tool loop runs the tool, feeds the result back, and stops at
-/// `max_tool_iterations` rather than looping forever (D51).
+/// `max_tool_iterations` rather than looping forever.
+///
+/// `max_tool_iterations` is **Decision D51 and PRD §10's second open question**:
+/// the grammar accepts the key (M0), and whether the PRD keeps it is not settled.
+/// What this test decides either way is that the loop is bounded — declining D51
+/// makes the bound a runtime default rather than a declared one, and rewrites
+/// this test's fixture and its first assertion, not its subject.
 #[test]
 #[ignore = "M1: codegen must emit the agent tool loop"]
 fn an_agent_node_bounds_its_tool_loop_at_max_tool_iterations() {
     let provider = MockProvider::start().expect("a loopback port");
-    // `agent.reviewer` declares `max_tool_iterations: 2`, so a model that only
+    // `agent.researcher` declares `max_tool_iterations: 2`, so a model that only
     // ever asks for the tool must be stopped after the second call.
     provider.enqueue(
         Script::new(
@@ -666,8 +702,8 @@ fn an_agent_node_bounds_its_tool_loop_at_max_tool_iterations() {
 
     let run = harness::run(
         "agent-anthropic",
-        "flow.review",
-        &[("goal", "ship it"), ("draft", "a draft")],
+        "flow.research",
+        &[("goal", "ship it")],
         &provider,
     );
     let failure = run.failed();
@@ -682,6 +718,16 @@ fn an_agent_node_bounds_its_tool_loop_at_max_tool_iterations() {
         "two calls, not eight: the loop is bounded by the agent's own declaration"
     );
     assert!(recorded.iter().all(RecordedRequest::is_valid));
+    assert!(
+        recorded[0].tools.contains(&"lookup".to_string()),
+        "the agent's `tools:` list reaches the provider: {:?}",
+        recorded[0].tools
+    );
+    assert_eq!(
+        recorded[0].structured_output, None,
+        "a loop call pins no tool — a pinned one is a promise that the *pinned* \
+         tool is called, which would make the loop unreachable"
+    );
     let second = recorded[1].body()["messages"].clone();
     assert_eq!(
         second[2]["content"][0]["type"], "tool_result",
@@ -1073,10 +1119,17 @@ fn a_node_timeout_fires_and_its_error_policy_takes_over() {
 #[ignore = "M1: codegen must emit store-op nodes over the SQLite/local-disk backends"]
 fn a_store_op_node_reads_and_writes_the_local_backend() {
     let provider = MockProvider::start().expect("a loopback port");
-    provider.enqueue(Script::new(
-        SONNET,
-        Outcome::structured(json!({ "answer": "an answer" })),
-    ));
+    // `agent.grounded` has stores attached, so its tools open a loop: the first
+    // call offers them and pins nothing, and the pinned output call is what ends
+    // it (see *How many model calls an agent node makes*). The model here
+    // searches nothing and answers.
+    provider.enqueue_all([
+        Script::new(SONNET, Outcome::text("I have what I need.")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "answer": "an answer" })),
+        ),
+    ]);
 
     let run = harness::run(
         "stores",
@@ -1104,7 +1157,7 @@ fn a_store_op_node_reads_and_writes_the_local_backend() {
 
     // `load` ran before the agent and found nothing — the store is
     // execution-scoped, so every run starts empty. What the agent saw is that
-    // read's answer.
+    // read's answer, in the first call it made.
     let call = &provider.requests()[0];
     let turn = call.body()["messages"][0]["content"]
         .as_str()
@@ -1117,14 +1170,21 @@ fn a_store_op_node_reads_and_writes_the_local_backend() {
 
 /// An attached store synthesizes its LLM-facing tools into the model request
 /// (grammar 11.5).
+///
+/// Read off the **first** call, which is a loop call: attached store tools are
+/// tools, so they open the same loop an agent's `tools:` list does, and the
+/// pinned output call that ends it is a different request.
 #[test]
 #[ignore = "M1: codegen must synthesize store tools"]
 fn an_attached_store_synthesizes_its_tool_surface_in_the_model_request() {
     let provider = MockProvider::start().expect("a loopback port");
-    provider.enqueue(Script::new(
-        SONNET,
-        Outcome::structured(json!({ "answer": "an answer" })),
-    ));
+    provider.enqueue_all([
+        Script::new(SONNET, Outcome::text("I have what I need.")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "answer": "an answer" })),
+        ),
+    ]);
 
     harness::run(
         "stores",
@@ -1149,16 +1209,26 @@ fn an_attached_store_synthesizes_its_tool_surface_in_the_model_request() {
     );
 }
 
-/// `agent_access: read` withholds the write tool — the least-privilege knob D37
-/// adds, and the one M1 must honour when it synthesizes the surface.
+/// `agent_access: read` withholds the write tool — the least-privilege knob
+/// Decision D37 adds to a store attachment.
+///
+/// D37 is **PRD §10's first open question**: the grammar accepts the key (M0),
+/// and whether the PRD keeps it is not settled, so this test is written against
+/// the fixture as it stands rather than against a ratification. If §10.1 is
+/// declined, the key leaves the `stores` fixture and this test goes with it;
+/// what survives either way is the criterion the inventory names, which is that
+/// an attached store synthesizes a tool surface at all.
 #[test]
 #[ignore = "M1: codegen must synthesize store tools"]
 fn agent_access_read_withholds_the_write_tool() {
     let provider = MockProvider::start().expect("a loopback port");
-    provider.enqueue(Script::new(
-        SONNET,
-        Outcome::structured(json!({ "answer": "an answer" })),
-    ));
+    provider.enqueue_all([
+        Script::new(SONNET, Outcome::text("I have what I need.")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "answer": "an answer" })),
+        ),
+    ]);
 
     harness::run(
         "stores",
@@ -1172,6 +1242,11 @@ fn agent_access_read_withholds_the_write_tool() {
     assert!(
         !call.tools.contains(&"docs_upsert".to_string()),
         "`store.docs` is `agent_access: read`, so the write tool is not on offer: {:?}",
+        call.tools
+    );
+    assert!(
+        call.tools.contains(&"docs_search".to_string()),
+        "…while the read tool it does grant is: {:?}",
         call.tools
     );
 }

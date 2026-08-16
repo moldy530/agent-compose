@@ -13,7 +13,9 @@
 # `store.docs` is `read`, so the synthesized surface is `docs_search` and NOT
 # `docs_upsert`, while `store.prefs` takes the `read_write` default and
 # synthesizes `prefs_get` **and** `prefs_set`. The tool list of the recorded
-# request is exactly that claim, checkable.
+# request is exactly that claim, checkable. The key itself is Decision D37 and
+# still PRD §10's first open question — the grammar accepts it (M0), and if the
+# PRD declines it this fixture drops the line and keeps everything else.
 #
 # `embed.provider` is an `openai_compatible` connection because embeddings are
 # served by a provider that publishes the capability (grammar 11.2), and it is a
