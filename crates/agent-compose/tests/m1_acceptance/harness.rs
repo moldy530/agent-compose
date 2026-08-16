@@ -293,27 +293,44 @@ pub fn run_with(
     for (field, value) in inputs {
         command.arg("--input").arg(format!("{field}={value}"));
     }
-    // The environment is cleared so that a fixture's env refs are supplied by
-    // this call and by nothing else: the presence check of PRD 5.9 is only
-    // testable if a variable left out is really absent, and a developer machine
-    // that happens to export `ANTHROPIC_API_KEY` must not change what a run does.
+    seal(&mut command, environment);
+    let output = command.output().expect("the command runs");
+    Run { output }
+}
+
+/// The variables that survive [`seal`], because they are the machine and not
+/// the composition: a generated project runs under `node` and an `exec` node
+/// runs a command, so both need `PATH`, and `node`/`npm` read `HOME` for their
+/// caches.
+pub const MACHINE: &[&str] = &["PATH", "HOME"];
+
+/// Give `command` the environment this call names, and nothing else.
+///
+/// Every helper that starts a process which **resolves env refs** goes through
+/// here — `run_with` and [`serve`] — because both of the reasons are about that
+/// resolution rather than about which command does it:
+///
+/// * the presence check of PRD 5.9 is only testable if a variable left out is
+///   really absent;
+/// * a developer machine that happens to export `ANTHROPIC_API_KEY`, or a
+///   fixture that grows a ref this harness does not supply, must not make a run
+///   behave one way locally and another in CI.
+///
+/// `validate` and `build` are left alone: env refs survive *unresolved* into the
+/// IR and into generated code (PRD 5.9), so a compile-time command reads none of
+/// them, and clearing the environment around a build that may yet shell out to
+/// the Node toolchain would buy nothing for it.
+pub fn seal(command: &mut Command, environment: &[(String, String)]) {
     command.env_clear();
-    // Two survive, because they are the machine and not the composition: a
-    // generated project runs under `node` and an `exec` node runs a command, so
-    // both need `PATH`, and `node`/`npm` read `HOME` for their caches.
-    for passed_through in ["PATH", "HOME"] {
+    for passed_through in MACHINE {
         if let Ok(value) = std::env::var(passed_through) {
             command.env(passed_through, value);
         }
     }
+    command.env("NO_COLOR", "1");
     for (name, value) in environment {
         command.env(name, value);
     }
-    let output = command
-        .env("NO_COLOR", "1")
-        .output()
-        .expect("the command runs");
-    Run { output }
 }
 
 /// A served project, killed when the test ends.
@@ -334,6 +351,10 @@ impl Drop for Served {
 ///
 /// Waits for the app to announce its address on stdout, the way
 /// `mock-provider` does: a harness that slept instead would be a flaky test.
+///
+/// The environment is [`seal`]ed exactly as a `run`'s is: a served app resolves
+/// the same env refs at process start, so the two halves of the harness have to
+/// agree on what a fixture's refs may resolve from.
 pub fn serve(name: &str, provider: &MockProvider) -> Served {
     let mut command = agent_compose();
     command
@@ -342,9 +363,7 @@ pub fn serve(name: &str, provider: &MockProvider) -> Served {
         .args(["--port", "0"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    for (variable, value) in environment(provider) {
-        command.env(variable, value);
-    }
+    seal(&mut command, &environment(provider));
     let mut child = command.spawn().expect("the command runs");
     let stdout = child.stdout.take().expect("stdout is piped");
     let mut line = String::new();

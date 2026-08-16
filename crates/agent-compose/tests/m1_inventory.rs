@@ -268,6 +268,10 @@ const HARNESS: &[Criterion] = &[Criterion {
     tests: &[
         ("the_acceptance_fixtures_validate_clean", Status::Live),
         (
+            "a_generated_process_is_handed_a_sealed_environment",
+            Status::Live,
+        ),
+        (
             "the_harness_serves_both_provider_surfaces_without_api_keys",
             Status::Live,
         ),

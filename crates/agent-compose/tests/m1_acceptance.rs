@@ -54,7 +54,9 @@
 //!
 //! The mock enforces exactly this: a `structured` reply to a request that pinned
 //! nothing, a `text` reply to one that pinned a tool, and a tool call beside the
-//! pinned one are each refused as a `script-mismatch` rather than answered. A
+//! pinned one are each refused as a `script-mismatch` rather than answered — as
+//! is a scripted stop reason the surface does not send or the reply's own body
+//! cannot carry, which is the field a tool loop branches on (WIRE-NOTES (17)). A
 //! test that scripts the wrong number of calls fails loudly instead of passing
 //! against a transcript no provider could produce — and the refusal is recorded
 //! as one, so `snapshot().is_drained()` is false for a run that hit it even
@@ -68,7 +70,9 @@
 #[path = "m1_acceptance/harness.rs"]
 mod harness;
 
+use std::collections::BTreeSet;
 use std::path::Path;
+use std::process::Command;
 use std::time::Duration;
 
 use mock_provider::{
@@ -108,6 +112,53 @@ fn the_acceptance_fixtures_validate_clean() {
             "unexpected verdict for `{name}`: {stderr}"
         );
     }
+}
+
+/// A generated process is handed the environment the harness names, and nothing
+/// else — whether it was started by `run` or by `serve`.
+///
+/// Both commands start a process that resolves a fixture's env refs at process
+/// **start** (PRD 5.9), so both need the same sealed environment, and for the
+/// same two reasons: the presence check is only testable if a variable left out
+/// is really absent, and a developer machine that exports one a fixture
+/// references must not make a run behave one way there and another in CI. The
+/// two halves are asserted to agree here rather than read as agreeing, because
+/// they once did not.
+#[test]
+fn a_generated_process_is_handed_a_sealed_environment() {
+    // Cargo exports this into every test binary it runs, which makes it a
+    // variable that really is in the ambient environment on every machine this
+    // test runs on — the shape of the problem, without setting one.
+    const AMBIENT: &str = "CARGO_PKG_NAME";
+    assert!(
+        std::env::var(AMBIENT).is_ok(),
+        "cargo exports `{AMBIENT}` into its test binaries"
+    );
+
+    let mut command = Command::new("env");
+    harness::seal(
+        &mut command,
+        &[(harness::API_KEY.to_string(), "supplied".to_string())],
+    );
+    let printed = command.output().expect("`env` prints an environment");
+    let printed = String::from_utf8_lossy(&printed.stdout);
+    let carried: BTreeSet<&str> = printed
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(name, _)| name)
+        .collect();
+
+    let mut named: BTreeSet<&str> = ["NO_COLOR", harness::API_KEY].into_iter().collect();
+    named.extend(
+        harness::MACHINE
+            .iter()
+            .copied()
+            .filter(|name| std::env::var_os(name).is_some()),
+    );
+    assert_eq!(
+        carried, named,
+        "a sealed environment carries what the harness named and nothing else"
+    );
 }
 
 /// Both provider surfaces answer, with no API key anywhere and nothing but
