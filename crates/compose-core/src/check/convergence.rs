@@ -43,10 +43,28 @@
 //! set of paths ([`branches`]).
 //!
 //! `end` is exempt: it is not a node, it retires branches instead of running,
-//! and branches legitimately reach it at different depths (grammar 7.6.3). One
-//! diagnostic is reported per co-takeable pair, at the *nearest* convergence it
-//! unbalances: every node downstream of that one inherits the same skew, and a
-//! page of diagnostics for one mistake is not a diagnostic (PRD G3).
+//! and branches legitimately reach it at different depths (grammar 7.6.3).
+//!
+//! **One diagnostic per convergence of one fork, not per pair that unbalances
+//! it.** A pair is read at the *nearest* convergence it unbalances, because
+//! every node downstream of that one inherits the same skew. That bounds the
+//! report *within* a pair and not across the pairs of one fork, and a fork whose
+//! arms reach one node at differing depths unbalances it once per pair: an
+//! ordinary ten-way parallel fan is 33 error blocks, twenty arms 133, a hundred
+//! and twenty 4,800 — every one of them the same sentence about the same node at
+//! the same span, differing only in which two of the arms it underlines. What
+//! the diagnostic is *about* is the convergence and the fork it names, so that
+//! is what it is reported per, drawn through the two edges that come first in
+//! declaration order — the same policy the concurrent-write rule below states
+//! for its own quadratic, and the same reason (PRD G3). Two forks that unbalance
+//! one node stay two diagnostics: they are two mistakes and two edits, and the
+//! sentence names the fork.
+//!
+//! The rule itself is untouched by that. Co-takeability and `dist` are stated
+//! over pairs and stay stated over pairs (Decision D99): every pair is still
+//! compared, because a pair a later one repeats is still what proves the skew,
+//! and a shape reported through one pair is reported at all only because some
+//! pair unbalances it. What the count bounds is the report.
 //!
 //! # Concurrent writes
 //!
@@ -359,6 +377,11 @@ fn branches(graph: &Graph<'_>, pair: &Pair) -> Option<(usize, usize)> {
 fn balanced<'a>(ctx: &mut Ctx<'a>, cx: &FlowCx<'a>, graph: &Graph<'a>, pairs: &[Pair]) {
     let mut distances: BTreeMap<usize, Vec<Delivery>> = BTreeMap::new();
     let mut skew: BTreeMap<(usize, usize), Skew> = BTreeMap::new();
+    // One diagnostic per convergence of one fork rather than per pair that
+    // unbalances it: a fork of `w` arms landing on one node at differing depths
+    // holds up to w(w-1)/2 of those pairs and one mistake, and the sentence they
+    // all carry is the same one (see this module's header).
+    let mut reported: BTreeSet<(Vertex, usize)> = BTreeSet::new();
     for pair in pairs {
         let (left, right) = pair.edges;
         let Some((near, far)) = branches(graph, pair) else {
@@ -384,6 +407,13 @@ fn balanced<'a>(ctx: &mut Ctx<'a>, cx: &FlowCx<'a>, graph: &Graph<'a>, pairs: &[
         let Some((node, one, other)) = found else {
             continue;
         };
+        // The pairs of one fork are enumerated in edge declaration order
+        // ([`pairs`]), so the first to reach a convergence is the one the report
+        // draws through — a choice that does not move when an unrelated arm is
+        // added elsewhere on the fork.
+        if !reported.insert((pair.source, node)) {
+            continue;
+        }
         ctx.push(
             Diagnostic::error(
                 DiagnosticCode::UnbalancedConvergence,
@@ -849,8 +879,8 @@ mod tests {
         }
     }
 
-    /// One diagnostic per pair, at the nearest convergence it unbalances: every
-    /// node downstream inherits the same skew, and a page of diagnostics for one
+    /// A pair is read at the nearest convergence it unbalances: every node
+    /// downstream inherits the same skew, and a page of diagnostics for one
     /// mistake is not a diagnostic (PRD G3). "Nearest" is the shallower of the
     /// two arrivals, and a tie on it keeps the earlier node.
     #[test]

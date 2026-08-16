@@ -11,17 +11,19 @@
 //!   documents, and not something `--format json` can report;
 //! * **out-degree** — a per-*pair* analysis of a fork is quadratic in the number
 //!   of edges before it computes anything, so anything it recomputes per pair
-//!   multiplies out. Four shapes are needed, because a fork has four costs: one
+//!   multiplies out. Five shapes are needed, because a fork has five costs: one
 //!   fan of disjoint branches, where the pairs share no answers and what matters
 //!   is that nothing is *walked* per pair; one of overlapping branches, where
 //!   the pairs share almost every answer and what matters is that nothing is
-//!   *compared* or *crossed* per pair; one whose branches are **illegal** —
-//!   every one of them writing the same unreduced channel — where what matters is
-//!   that the report is one diagnostic and not one per pair; and one whose edges
-//!   are **guarded**, which is the only shape that enters grammar 7.6.1's rule 2
-//!   at all and where what matters is that no guard is *read* per pair. The
-//!   clean ones among them time the analysis with its diagnostic path switched
-//!   off, and a report quadratic in the out-degree is invisible to them;
+//!   *compared* or *crossed* per pair; **two** whose branches are illegal — one
+//!   where every branch writes the same unreduced channel, one whose arms reach
+//!   a convergence at differing depths — because each of the two rules stated
+//!   over pairs prints its own quadratic and what matters in both is that the
+//!   report is one diagnostic and not one per pair; and one whose edges are
+//!   **guarded**, which is the only shape that enters grammar 7.6.1's rule 2 at
+//!   all and where what matters is that no guard is *read* per pair. The clean
+//!   ones among them time the analysis with its diagnostic path switched off,
+//!   and a report quadratic in the out-degree is invisible to them;
 //! * **path count** — a branch's step distances (grammar 7.6.2) are a property
 //!   of its paths, of which a graph of *n* nodes has exponentially many and a
 //!   node may be reached at *n* distinct depths. Neither fork shape above shows
@@ -590,5 +592,92 @@ fn a_fan_racing_one_channel_is_one_diagnostic() {
     assert!(
         fastest < budget,
         "checking a 120-branch racing fan took {fastest:?}, and the budget is {budget:?}"
+    );
+}
+
+/// `width` arms off one `hub`, alternately landing on `j` and on `q`, each arm
+/// one, two, or three nodes long — and, beside the whole of it, a small `alt`
+/// subtree in which **two** forks reach one node `k` at two depths.
+///
+/// Nothing about the shape is exotic: an arm of a parallel fan carrying one more
+/// step than its neighbour reaches the convergence one step later (grammar
+/// 7.6.2), and every pair of arms that disagree says so. Four things make the
+/// expected count exactly four, and each pins one half of what the report is
+/// keyed by:
+///
+/// * the arms landing on `j` are three lengths in equal parts, so 1,200 of the
+///   pairs inside that half are unbalanced, and one node is at the wrong depth;
+/// * the arms landing on `q` are a second 1,200 — the same mistake at a second
+///   convergence of the **same** fork, which a report keyed on the fork alone
+///   would swallow. The two halves share no node, so no pair crossing them
+///   converges anywhere and neither half is the other's business;
+/// * `alt` forks to `p0` and to `q0`, which reach `k` at two and at three steps;
+/// * `p0` forks again, to `k` and to `r0`, which reach it at one and at two —
+///   the **same** convergence unbalanced by a second fork, two edits and two
+///   diagnostics, which a report keyed on the convergence alone would swallow.
+///
+/// The `alt` subtree meets `hub`'s nowhere, so the two counts do not interfere.
+/// `agent.b`'s output field is named after no channel, so no node of the shape
+/// writes one and grammar 10.2's rule short-circuits over an empty writer set:
+/// what is on the clock, and in the count, is this rule alone.
+fn unbalanced_fork_project(dir: &Path, width: usize) {
+    let mut nodes = String::new();
+    let mut edges = String::from(
+        "    - { from: start, to: hub }\n    - { from: start, to: alt }\n    - { from: j, to: end }\n    - { from: q, to: end }\n    - { from: alt, to: p0 }\n    - { from: alt, to: q0 }\n    - { from: q0, to: q1 }\n    - { from: q1, to: k }\n    - { from: p0, to: k }\n    - { from: p0, to: r0 }\n    - { from: r0, to: k }\n    - { from: k, to: end }\n",
+    );
+    let node = |nodes: &mut String, name: &str| {
+        nodes.push_str(&format!(
+            "    {name}: {{ agent: agent.b, input: \"'x'\" }}\n"
+        ));
+    };
+    for name in ["hub", "j", "q", "alt", "k", "p0", "q0", "q1", "r0"] {
+        node(&mut nodes, name);
+    }
+    for arm in 0..width {
+        let convergence = if arm % 2 == 0 { "j" } else { "q" };
+        let mut previous = "hub".to_string();
+        for step in 0..(arm / 2) % 3 + 1 {
+            let name = format!("a{arm}_{step}");
+            node(&mut nodes, &name);
+            edges.push_str(&format!("    - {{ from: {previous}, to: {name} }}\n"));
+            previous = name;
+        }
+        edges.push_str(&format!(
+            "    - {{ from: {previous}, to: {convergence} }}\n"
+        ));
+    }
+    fs::write(
+        dir.join("main.yml"),
+        format!(
+            "version: \"0.1\"\n{BACKEND}agent.b:\n  model: model.m\n  prompt: Do it.\n  output:\n    outcome: {{ enum: [approve, revise] }}\nflow.f:\n  outputs: {{}}\n  nodes:\n{nodes}  edges:\n{edges}"
+        ),
+    )
+    .expect("can write the entrypoint");
+}
+
+/// A fan whose arms converge at **differing depths**, which is where anything
+/// the *other* rule stated over pairs reports per pair shows.
+///
+/// 120 arms are 7,140 co-takeable pairs, 2,400 of them unbalanced — and four
+/// mistakes: a node at the wrong depth on each of `hub`'s two convergences, and
+/// two forks putting `k` at two depths. A diagnostic per pair made that a
+/// 2,402-error report, on a shape where an ordinary ten-way parallel fan is
+/// already 33 error blocks and twenty arms 133, every one of them the same
+/// sentence at the same span about the same node and differing only in which two
+/// arms it underlines (PRD G3). Neither the disjoint fan nor the layered rank
+/// above can see it — both are balanced by construction and cross the same
+/// quadratic with nothing to say about it — and the racing fan sees only the
+/// sibling rule's half. The count is the assertion here, and it is an assertion
+/// both ways round: four, because a bound collapsed any harder would hide a
+/// second convergence of one fork, or a second fork unbalancing one convergence.
+#[test]
+fn an_unbalanced_fan_is_one_diagnostic_per_convergence() {
+    let dir = scratch("unbalanced");
+    unbalanced_fork_project(&dir, 120);
+    let budget = Duration::from_secs(6);
+    let fastest = fastest_check(&artifact(&dir), "120-arm fan of unbalanced arms", 4);
+    assert!(
+        fastest < budget,
+        "checking a 120-arm unbalanced fan took {fastest:?}, and the budget is {budget:?}"
     );
 }
