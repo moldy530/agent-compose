@@ -1,0 +1,50 @@
+# rule: a `human.on_timeout:` route is on its node's branch and races the sibling branch (grammar 7.6.1, 7.8, 8.7, 10.2)
+# code: unreduced-write
+# message: nodes `right` and `escalate` of `flow.f` run concurrently and both write the unreduced channel `note`
+# at: main.yml:43:5
+# label: main.yml:42:5 the other write is here
+# label: main.yml:27:3 the channel is declared here
+# help: two edges of one fork that are not provably exclusive can both fire, so the branches they start are concurrent: the channel they both write needs a declared `reduce:` policy — `append`, `merge`, or an explicit `last_wins` (grammar 7.6.1, 10.2, Decision D32)
+#
+# The second of the two control-transfer positions (grammar 2.4), and the same
+# reading as `a-fallback-target-races-the-other-branch`: `escalate` is scheduled
+# by `wait`'s timeout route rather than by an edge, on `wait`'s branch, while
+# `right`'s branch runs on. Both positions are one relation, so a check that read
+# only edges would miss both.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.n:
+  model: model.m
+  prompt: Note.
+  output:
+    note: { type: string }
+state:
+  note: { type: string, default: "" }
+flow.f:
+  outputs: {}
+  nodes:
+    fork: { agent: agent.n, input: "'w'" }
+    wait:
+      human:
+        input:
+          summary: { type: string }
+        output:
+          decision: { enum: [approve, reject] }
+        timeout: 24h
+        on_timeout: escalate
+      input:
+        summary: "'s'"
+    right: { agent: agent.n, input: "'y'" }
+    escalate: { agent: agent.n, input: "'z'" }
+  edges:
+    - { from: start, to: fork }
+    - { from: fork, to: wait }
+    - { from: fork, to: right }
+    - { from: wait, to: end }
+    - { from: right, to: end }
+    - { from: escalate, to: end }
