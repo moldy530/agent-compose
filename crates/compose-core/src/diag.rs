@@ -400,6 +400,63 @@ pub enum DiagnosticCode {
 }
 
 impl DiagnosticCode {
+    /// Every code, in declaration order.
+    ///
+    /// The list is what the tests that must be exhaustive over the enum read,
+    /// so it is pinned to the enum rather than kept in step by hand: each entry
+    /// is asserted to sit at its own variant's position
+    /// (`codes_are_kebab_case_and_unique`), which fails on an entry that is
+    /// missing, duplicated, or out of order. A code appended after the last
+    /// variant below belongs at the end of this list too.
+    pub const ALL: &'static [Self] = &[
+        Self::IoError,
+        Self::InvalidEncoding,
+        Self::YamlSyntax,
+        Self::EmptyDocument,
+        Self::MultipleDocuments,
+        Self::RootNotMapping,
+        Self::NonStringKey,
+        Self::DuplicateKey,
+        Self::MergeKey,
+        Self::YamlTag,
+        Self::MisplacedSection,
+        Self::UnsupportedVersion,
+        Self::InvalidImportPath,
+        Self::UnknownKey,
+        Self::MissingKey,
+        Self::WrongType,
+        Self::InvalidValue,
+        Self::ValueOutOfRange,
+        Self::UnknownVariant,
+        Self::ConflictingKeys,
+        Self::InvalidIdentifier,
+        Self::InvalidReference,
+        Self::InvalidDuration,
+        Self::InvalidPathExpression,
+        Self::InvalidEnvRef,
+        Self::UnexpectedEnvRef,
+        Self::ReservedName,
+        Self::DuplicateDefinition,
+        Self::DuplicateSection,
+        Self::UndefinedReference,
+        Self::VersionMismatch,
+        Self::InvalidExpression,
+        Self::UnknownRoot,
+        Self::UnknownField,
+        Self::TypeMismatch,
+        Self::UndefinedChannel,
+        Self::UnreducedWrite,
+        Self::ConflictingWrites,
+        Self::MissingBinding,
+        Self::UnboundedFanOut,
+        Self::NonExhaustive,
+        Self::DetachedWrite,
+        Self::UnkeyedMapWrite,
+        Self::ToolNameCollision,
+        Self::MissingSessionKey,
+        Self::MissingCapability,
+    ];
+
     /// The stable kebab-case spelling of this code.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -654,56 +711,18 @@ mod tests {
         )
     }
 
+    /// The uniqueness rule is only worth as much as the list it runs over, so
+    /// the list is checked against the enum first: every entry of
+    /// [`DiagnosticCode::ALL`] must sit at its own variant's position, which an
+    /// entry that is missing, duplicated, or out of order fails.
     #[test]
     fn codes_are_kebab_case_and_unique() {
-        let codes = [
-            DiagnosticCode::IoError,
-            DiagnosticCode::InvalidEncoding,
-            DiagnosticCode::YamlSyntax,
-            DiagnosticCode::EmptyDocument,
-            DiagnosticCode::MultipleDocuments,
-            DiagnosticCode::RootNotMapping,
-            DiagnosticCode::NonStringKey,
-            DiagnosticCode::DuplicateKey,
-            DiagnosticCode::MergeKey,
-            DiagnosticCode::YamlTag,
-            DiagnosticCode::MisplacedSection,
-            DiagnosticCode::UnsupportedVersion,
-            DiagnosticCode::InvalidImportPath,
-            DiagnosticCode::UnknownKey,
-            DiagnosticCode::MissingKey,
-            DiagnosticCode::WrongType,
-            DiagnosticCode::InvalidValue,
-            DiagnosticCode::ValueOutOfRange,
-            DiagnosticCode::UnknownVariant,
-            DiagnosticCode::ConflictingKeys,
-            DiagnosticCode::InvalidIdentifier,
-            DiagnosticCode::InvalidReference,
-            DiagnosticCode::InvalidDuration,
-            DiagnosticCode::InvalidPathExpression,
-            DiagnosticCode::InvalidEnvRef,
-            DiagnosticCode::UnexpectedEnvRef,
-            DiagnosticCode::ReservedName,
-            DiagnosticCode::DuplicateDefinition,
-            DiagnosticCode::DuplicateSection,
-            DiagnosticCode::UndefinedReference,
-            DiagnosticCode::VersionMismatch,
-            DiagnosticCode::InvalidExpression,
-            DiagnosticCode::UnknownRoot,
-            DiagnosticCode::UnknownField,
-            DiagnosticCode::TypeMismatch,
-            DiagnosticCode::UndefinedChannel,
-            DiagnosticCode::UnreducedWrite,
-            DiagnosticCode::ConflictingWrites,
-            DiagnosticCode::MissingBinding,
-            DiagnosticCode::UnboundedFanOut,
-            DiagnosticCode::NonExhaustive,
-            DiagnosticCode::UnkeyedMapWrite,
-            DiagnosticCode::MissingSessionKey,
-            DiagnosticCode::MissingCapability,
-        ];
         let mut seen = std::collections::BTreeSet::new();
-        for code in codes {
+        for (position, code) in DiagnosticCode::ALL.iter().enumerate() {
+            assert_eq!(
+                *code as usize, position,
+                "`{code}` is not the {position}th variant: `DiagnosticCode::ALL` is not the enum"
+            );
             let text = code.as_str();
             assert!(
                 text.chars()
@@ -712,6 +731,11 @@ mod tests {
             );
             assert!(seen.insert(text), "{text} is used by two variants");
         }
+        assert_eq!(
+            DiagnosticCode::ALL.len(),
+            DiagnosticCode::MissingCapability as usize + 1,
+            "`DiagnosticCode::ALL` stops short of the last declared variant"
+        );
     }
 
     #[test]
