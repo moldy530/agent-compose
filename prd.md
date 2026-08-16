@@ -1,6 +1,6 @@
 # agent-compose — Product Requirements Document
 
-**Status:** Draft v0.8
+**Status:** Draft v0.9
 **Author:** moldy
 **Last updated:** 2026-08-14
 
@@ -36,7 +36,7 @@ Prior art validates the declarative direction but leaves gaps:
 ## 3. Goals
 
 - **G1.** A YAML DSL expressing agent graphs: agent defs, tool defs, deterministic nodes, edges (including cycles), shared state, and structured I/O.
-- **G2.** A compiler pipeline: multi-file YAML → resolved, validated flat IR → deterministic LangGraph (Python) codegen.
+- **G2.** A compiler pipeline, shipped as a single Rust binary: multi-file YAML → resolved, validated flat IR → deterministic LangGraph (TypeScript) codegen.
 - **G3.** Validation as a first-class product: reference checking, schema compatibility across edges, routing exhaustiveness, cycle-termination proofs — all pre-runtime, with LSP-quality error messages.
 - **G4.** Deterministic routing over model-produced values ("the LLM decides the value; the interpreter decides the transition").
 - **G5.** Forward-compatible grammar for cloud/distributed placement (parsed from day one, executed later).
@@ -46,7 +46,7 @@ Prior art validates the declarative direction but leaves gaps:
 - Building a bespoke runtime. LangGraph is the execution engine; we emit code, we do not interpret.
 - Graph structure optimization/learning (GPTSwarm/AFlow-style). The DSL may later become a *target* for generated graphs, but v0 is hand/agent-authored.
 - Visual editor.
-- Multi-language codegen targets (TS backend is a candidate for v2; Python first).
+- Multi-language codegen targets (a Python backend is a candidate for v2; TypeScript first).
 - Executing the `placements` section (reserved keywords only in v0).
 
 ## 5. Core Design Decisions (settled in research phase)
@@ -63,7 +63,7 @@ Prior art validates the declarative direction but leaves gaps:
 
 - **Every agent must declare an output schema** (JSON Schema). This is load-bearing for routing (5.3) and for distribution (5.7: every edge is serializable).
 - Input schemas optional; default is string-in for entrypoint agents (duckflux's "string by default, schema opt-in").
-- Codegen emits Pydantic models + `with_structured_output`.
+- Codegen emits Zod schemas + `withStructuredOutput`.
 
 ### 5.3 Routing — runtime always routes; the question is who produced the value
 
@@ -88,9 +88,9 @@ Loops are prominent (evaluator-optimizer, ReAct, plan-revise); DAG-only loses. D
 
 | Node type | Semantics | Codegen |
 |---|---|---|
-| `agent` | LLM call with structured output | node fn + Pydantic + structured output |
-| `exec` | shell command (map input → env vars; string input → stdin) | subprocess wrapper |
-| `http` | HTTP request | httpx wrapper |
+| `agent` | LLM call with structured output | node fn + Zod schema + structured output |
+| `exec` | shell command (map input → env vars; string input → stdin) | child-process wrapper |
+| `http` | HTTP request | fetch wrapper |
 | `function` | host-registered function by name (escape hatch; breaks spec portability — documented) | registry lookup |
 | `flow` | subgraph instantiation | LangGraph subgraph |
 | `map` | fan-out over an agent-produced collection, homogeneous or discriminator-routed (see 5.6) | LangGraph `Send` API |
@@ -105,7 +105,7 @@ The spec never contains executable code (Agent Spec's security posture). Code lo
 2. **First-class control constructs** in YAML: guarded edges, bounded loops, `map` fan-out, `when` guards.
 3. **Escape hatches**: `exec`, `http`, `function` — implementation outside the spec, referenced by identifier.
 
-CEL implementation choice (v0): embed `cel-python` in generated routers rather than transpiling CEL→Python. Semantic fidelity between `validate` and runtime beats zero-dep purity; transpilation is a later optimization.
+CEL implementation choice (v0): the compiler parses and type-checks expressions with the Rust CEL implementation (`cel` crate); generated routers embed a JS CEL evaluator rather than transpiling CEL→TS. Two interpreters means a semantic-drift risk between `validate` and runtime — mitigated by a shared conformance fixture corpus run against both in CI. Transpilation is a later optimization.
 
 ### 5.6 Fan-out — agent-controlled cardinality, deterministic dispatch
 
@@ -153,7 +153,7 @@ Rules and guarantees:
 
 - **Bounding is mandatory** (mirrors the SCC cycle rule): `max_items` on the source array schema (enforced at structured-output validation — the model cannot return more) plus `max_concurrency` at execution. An unbounded fan-out is a compile error.
 - **Exhaustiveness per variant**: every discriminator variant must have a route or an explicit `default:` — compile error otherwise. The agent structurally cannot produce an unroutable item.
-- **Schema narrowing**: each route's target node is validated against its variant's payload shape only (discriminated-union narrowing; Pydantic tagged unions in codegen), not a lowest-common-denominator item type.
+- **Schema narrowing**: each route's target node is validated against its variant's payload shape only (discriminated-union narrowing; Zod discriminated unions in codegen), not a lowest-common-denominator item type.
 - **Join via reducers**: instances run in isolated item-scoped contexts; writes to shared state must target channels with a declared `reduce` policy (`append`, `merge`, `last_wins`). Writing to a non-reduced channel from inside a `map` is a compile error. The downstream edge is the barrier: it fires when all instances complete, per `on_item_error` policy.
 - **Deterministic ordering**: completion order is nondeterministic, so appended results are automatically index-tagged and reordered by source-item index before the join. Unordered reduces would silently break replay.
 - **Sink routes and `detach`**: routes may target non-compute sinks (queues, webhooks, ticketing — this is how agent graphs talk to non-agent infrastructure). Default join semantics wait on *all* routes, including sinks (a failed enqueue is a surfaced failure). Per-route `detach: true` opts into fire-and-forget; detached routes cannot write to reduced state (compile error). **Replay interaction (settled)**: the design is idempotency-key delivery — an `idempotency_key` derived from `execution_id + node + item_index` is passed to the sink automatically, and sinks are documented to dedupe on it. The v0 implementation restricts: `detach` + checkpointing enabled is a validation error pointing at the roadmap (outbox-pattern delivery is not v0 work).
@@ -164,7 +164,7 @@ Rules and guarantees:
 ### 5.7 State — three tiers
 
 1. **Node-scoped I/O**: typed inputs/outputs per node.
-2. **Shared graph state**: a `state:` section generates the LangGraph `State` schema (TypedDict/Pydantic) with per-channel reducers. Default wiring is name-based (outputs write channels of the same name — Agent Spec's optional-data-edge insight). Subgraphs receive parent state only through explicit bindings (PayPal's `passVariables` discipline).
+2. **Shared graph state**: a `state:` section generates the LangGraph state schema (`Annotation` channels, Zod-typed) with per-channel reducers. Default wiring is name-based (outputs write channels of the same name — Agent Spec's optional-data-edge insight). Subgraphs receive parent state only through explicit bindings (PayPal's `passVariables` discipline).
 3. **Conversation history**: an implicit append channel available to agent nodes. **Scoping (settled): isolated by default across subgraph boundaries** — a flow's behavior must not depend on the caller's conversation, or reusability and the flow-as-tool equivalence break. Opt-in `context: inherit` on the flow-node instantiation for genuine continuation cases. Nothing crosses a module boundary implicitly.
 
 **Data-edge syntax (settled): deferred.** Full explicit data edges are not in v0. Instead, a per-node `writes:` remapping (`writes: { summary: reviewer_summary }`) covers the two real failure modes of name-based wiring — channel collisions between nodes and renames across subgraph boundaries — at a fraction of the grammar cost. Full data edges remain an additive later feature if demand appears.
@@ -260,7 +260,7 @@ model.default:
 - **Providers are logical-layer, not per-target**: unlike storage backends, providers rarely differ structurally per environment (same Anthropic everywhere; keys/URLs vary via env refs). The alias mechanism exists to extend if a real case appears; not pre-built.
 
 **Secrets** (extends the credentials rule of 5.8):
-- Config takes `${ENV_VAR}` references only, never literals. **Env refs survive into the IR unresolved** — resolution happens at process start in generated code, never at compile — so the flat IR stays committable/diffable and generated Python never contains a key.
+- Config takes `${ENV_VAR}` references only, never literals. **Env refs survive into the IR unresolved** — resolution happens at process start in generated code, never at compile — so the flat IR stays committable/diffable and generated code never contains a key.
 - `validate` checks ref syntax; `build`/`serve`/`run` check presence and fail fast naming the missing variable.
 - **Least-privilege distribution**: under `--target distributed` (5.10), an isolated node's deployment receives only the env vars its resolved providers/backends reference — computable statically from the IR, since every secret is a named ref. Blast-radius containment for keys falls out of the design.
 
@@ -277,7 +277,7 @@ placements:
     runtime: colocated
 ```
 
-- `--target local`: one Python process.
+- `--target local`: one Node.js process.
 - `--target distributed` (post-v0): N deployable LangGraph apps, boundaries stitched with `RemoteGraph`.
 - Already-guaranteed properties make this nearly free: structured I/O on every node ⇒ every edge is serializable ⇒ any edge can become a network boundary without semantic change; shared checkpointer ⇒ one durable execution history across instances.
 - Isolation is also a **security** feature (per-agent sandboxing, credentials, blast-radius containment for tool-wielding agents) — a declarative story no current framework has.
@@ -318,14 +318,15 @@ Rules and semantics:
 - **Resume is an invocation.** With `human` nodes (5.5), an interrupted execution must be able to receive the human's response. The generated invocation surface therefore has two verbs — `start(flow, inputs)` and `resume(execution_id, payload)` — and the `http` trigger exposes both. Resume payloads are validated against the interrupting `human` node's output schema. This unifies triggers with the HITL story rather than bolting on a separate callback mechanism.
 - **`event` backends (settled)**: the grammar is backend-agnostic — a trigger declares a logical `source:`; an `event_sources:` config section binds logical names to infrastructure (Redis Streams, SQS, NATS, …), mirroring `placements`' logical-vs-infra separation. Backends implement a minimal consumer contract (subscribe → payload stream + ack/nack) via a plugin interface. Delivery is at-least-once with inbound dedupe on message id — symmetric with the outbound `detach` idempotency-key design (5.6). M3 ships the interface plus one blessed reference backend (Redis Streams); further backends are plugins.
 - **`respond: sync` (settled)**: sync is a compile-time-constrained mode. A flow exposed via `respond: sync` must be **statically interrupt-free** — no `human` node reachable from its entry, no wait-style constructs — enforced by graph reachability analysis (same static machinery as SCC and exhaustiveness). Sync triggers require a `timeout:` (default 60s); on expiry the response **upgrades to async** (HTTP 202 + execution id + status URL) while the execution continues durably — nothing cancelled, no work lost. Node retries consume the timeout budget with no special casing.
-- **Codegen**: `manual` → the `run` CLI; `http` → a generated FastAPI app wrapping the compiled graph (start / resume / status routes), reusing the same generated Pydantic models for payload validation. Auth on `http` triggers is deliberately out of scope for v0 (deploy behind your own gateway); a declarative auth story belongs with `placements` in M3.
+- **Codegen**: `manual` → the `run` CLI; `http` → a generated Fastify app wrapping the compiled graph (start / resume / status routes), reusing the same generated Zod schemas for payload validation. Auth on `http` triggers is deliberately out of scope for v0 (deploy behind your own gateway); a declarative auth story belongs with `placements` in M3.
 
 ### 5.12 Compiler contract
 
 - **Generated code is a build artifact, never hand-edited.** The DSL is the single source of truth.
 - **Deterministic codegen**: same DSL → byte-identical output (stable ordering), so regeneration diffs are meaningful.
 - **Eject path**: for graphs that outgrow the DSL, copy generated code out and own it (CRA model).
-- **Pinned backend versions**: each compiler release targets a pinned LangGraph version; upgrades are explicit and versioned, like Terraform providers. DSL semantics must never drift silently with upstream API churn.
+- **Pinned backend versions**: each compiler release targets a pinned LangGraph (JS) version; upgrades are explicit and versioned, like Terraform providers. DSL semantics must never drift silently with upstream API churn.
+- **Toolchain split (settled)**: the compiler/CLI is a single static Rust binary — parse, resolve, validate, and codegen carry no language-runtime dependency, which keeps `validate` in the millisecond budget and makes the toolchain installable anywhere a coding agent runs. Node.js is required only to execute generated output.
 
 ## 6. Example (illustrative sketch, not final grammar)
 
@@ -381,8 +382,9 @@ Validator guarantees for this file: all refs resolve and are correctly typed; `v
 - `agent-compose validate` with precise, actionable error messages. Error UX is a feature, not polish — it is the coding-agent feedback loop.
 
 **M1 — Codegen (single process)**
-- IR → deterministic LangGraph Python: state models (incl. tagged unions), node fns, routers with embedded CEL, bounded cycles, homogeneous + discriminator-routed `map`→`Send` with index-tagged reducers, subgraphs, retry/timeout policy, store-op nodes + synthesized store tools with SQLite/local-disk backends, model routing with trace-recorded failover, env-ref presence checks at process start.
-- `agent-compose build`, `agent-compose run` (manual trigger), `agent-compose serve` (generated FastAPI app for http triggers: start/resume/status), golden-file codegen tests.
+- IR → deterministic LangGraph TypeScript: state models (incl. tagged unions via Zod), node fns, routers with embedded CEL, bounded cycles, homogeneous + discriminator-routed `map`→`Send` with index-tagged reducers, subgraphs, retry/timeout policy, store-op nodes + synthesized store tools with SQLite/local-disk backends, model routing with trace-recorded failover, env-ref presence checks at process start.
+- `agent-compose build`, `agent-compose run` (manual trigger), `agent-compose serve` (generated Fastify app for http triggers: start/resume/status), golden-file codegen tests.
+- Mock provider server + e2e harness: compiled graphs execute end-to-end in CI with scripted model responses, no API keys.
 
 **M2 — Ergonomics**
 - `agent-compose plan` (topology + validation diff between two specs).
@@ -401,9 +403,10 @@ Validator guarantees for this file: all refs resolve and are correctly typed; `v
 | Risk | Mitigation |
 |---|---|
 | LangGraph API churn breaks codegen | Pin backend version per release; explicit versioned upgrades; golden-file tests per pinned version |
+| LangGraph JS lags LangGraph Python on needed primitives (`Send`, `interrupt`, `RemoteGraph`) | Primitive-parity audit as part of each pinned-backend upgrade; required primitives exercised by the e2e harness |
 | DSL expressiveness ceiling → users bypass it | `function` escape hatch + `eject`; treat repeated ejects as grammar feedback |
 | Hand-edited generated code forks source of truth | Generated-file headers, `build --check` in CI, docs discipline |
-| CEL↔Python semantic drift | Embed cel-python (no transpilation) in v0 |
+| CEL semantic drift between Rust validator and JS runtime | Shared conformance corpus run against both interpreters in CI; both implementations pinned per compiler release |
 | Scope creep toward bespoke runtime | Hard non-goal; LangGraph owns execution |
 
 ## 9. Resolved Questions (log)
@@ -420,6 +423,8 @@ Formerly open, now settled — rationale lives in the referenced sections:
 8. **`respond: sync` semantics** → compile-time interrupt-free requirement + mandatory timeout with async upgrade (202 + execution id) (5.11).
 9. **Store backend binding** → alias-only: stores name abstract slots; per-target deploy files define them; no inline provider config, no address-keyed overrides (5.8).
 10. **LLM providers & models** → `provider.*` (connection) / `model.*` (behavior) split; schema-validated provider settings; ordered failover routes on infrastructure conditions only; no inline overrides on agents; env-ref-only secrets surviving unresolved into the IR (5.9).
+11. **Codegen target** → LangGraph TypeScript first; a Python backend is a possible v2 target (§4, 5.12).
+12. **Compiler implementation** → Rust single-binary CLI (parse/resolve/validate/codegen); CEL via the Rust `cel` crate at validate time and a JS evaluator at runtime, kept in lockstep by a shared conformance corpus (5.5, 5.12).
 
 ## 10. Open Questions
 
