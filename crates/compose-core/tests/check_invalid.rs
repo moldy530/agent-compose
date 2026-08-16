@@ -41,12 +41,17 @@ use compose_core::{Diagnostic, resolve_with_target};
 
 /// Every code the validator raises. The corpus must exercise all of them.
 ///
-/// Two codes the validator *can* raise are deliberately absent, and both are
+/// Two rules the validator implements are deliberately unpinned, and both are
 /// the same case: no v0 provider kind lacks structured output or tool use, so
 /// neither the agent-model capability rule nor route capability equivalence can
 /// fire on a composition this grammar admits (see `check::providers`). They are
-/// unit-tested against the table instead, and the third rule reading it —
-/// `embed.provider` — is pinned here.
+/// unit-tested against the table instead —
+/// `every_v0_kind_serves_structured_output` and
+/// `every_v0_kind_publishes_the_same_inference_capabilities`, which `Evidence`
+/// in `tests/m0_inventory.rs` reads as the second rule's evidence in place of a
+/// fixture — and the third rule reading that table, `embed.provider`, is pinned
+/// here. Their shared code, `missing-capability`, is therefore covered below by
+/// that third rule alone.
 const CHECK_CODES: &[&str] = &[
     "invalid-expression",
     "unknown-root",
