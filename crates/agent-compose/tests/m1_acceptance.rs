@@ -329,11 +329,13 @@ fn a_request_no_codegen_should_send_is_refused_and_recorded() {
 }
 
 /// An unscripted model call is refused loudly, naming the model — never answered
-/// with a default.
+/// with a default, and never retried past.
 ///
 /// Determinism is the reason: a default answer is how an acceptance test starts
-/// passing for a reason nobody chose. The status is one no failover condition
-/// claims, so a compiled route cannot quietly retry past a missing script.
+/// passing for a reason nobody chose. The status has to survive two mechanisms
+/// that would otherwise hide it — PRD 5.9's failover, and the client SDKs' own
+/// default retry set — because a refusal that is retried twice arrives as three
+/// transcript entries and a failure whose shape does not match its cause.
 #[test]
 fn an_unscripted_model_call_fails_the_run_loudly() {
     let provider = MockProvider::start().expect("a loopback port");
@@ -353,9 +355,13 @@ fn an_unscripted_model_call_fails_the_run_loudly() {
         .expect("a message")
         .to_string();
     assert!(message.contains(SONNET), "{message}");
-    assert_ne!(
-        refused.status, 429,
-        "a refusal must not read as a rate limit"
+    // 408, 409, 429 and 5xx are what `@anthropic-ai/sdk` and `openai` retry by
+    // default, and 429/5xx are what PRD 5.9 fails over on. A harness refusal
+    // must be none of them.
+    let status = refused.status;
+    assert!(
+        !matches!(status, 408 | 409 | 429) && !(500..600).contains(&status),
+        "a harness refusal must be neither a failover condition nor an SDK retry: {status}"
     );
     assert_eq!(provider.snapshot().unscripted, 1);
 }
@@ -549,6 +555,83 @@ fn an_agent_node_sends_its_prompt_input_and_output_schema() {
     assert_eq!(run.outputs()["verdict"], "revise");
 }
 
+/// The same agent node, compiled against the other HTTP surface: prompt, bound
+/// input, declared settings, and a structured output asked for in Chat
+/// Completions' own idiom.
+///
+/// The twin exists because half the provider surface would otherwise never run a
+/// compiled graph. `agent-openai` differs from `agent-anthropic` only in
+/// `kind: openai_compatible` — which is PRD 5.9's whole claim about the
+/// provider/model split — so a graph that works on one and not the other is a
+/// codegen bug that no Messages-API test can see, and three of grammar 12.1's
+/// six kinds reach this surface.
+#[test]
+#[ignore = "M1: codegen must emit agent node fns"]
+fn an_agent_node_sends_its_prompt_input_and_output_schema_on_chat_completions() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        LOCAL,
+        Outcome::structured(json!({ "verdict": "revise", "feedback": "tighten it" })),
+    ));
+
+    let run = harness::run(
+        "agent-openai",
+        "flow.review",
+        &[("goal", "ship it"), ("draft", "a draft")],
+        &provider,
+    );
+    run.succeeded();
+
+    let recorded = provider.requests();
+    assert_eq!(recorded.len(), 1);
+    let call = &recorded[0];
+    assert!(call.is_valid(), "{:?}", call.failures());
+    assert_eq!(
+        call.surface,
+        Surface::OpenAi,
+        "an `openai_compatible` provider speaks Chat Completions"
+    );
+    assert_eq!(call.model, LOCAL);
+    assert_eq!(
+        call.body()["messages"][0]["role"],
+        "system",
+        "the agent's prompt is the system turn on this surface too"
+    );
+    assert_eq!(
+        call.body()["messages"][0]["content"],
+        "You are a meticulous technical reviewer.\n\nApprove only when the draft fully satisfies the goal. Otherwise ask for a\nrevision and list every required change.\n",
+    );
+    let turn = call.body()["messages"][1]["content"]
+        .as_str()
+        .expect("the bound input is serialized into the user turn (grammar 5.3)")
+        .to_string();
+    assert!(
+        turn.contains("ship it") && turn.contains("a draft"),
+        "{turn}"
+    );
+    assert_eq!(
+        call.body()["temperature"],
+        0.2,
+        "the model's declared `settings:` reach the wire (grammar 12.2)"
+    );
+
+    // Either idiom is a correct compilation of PRD 5.2 here — `response_format`
+    // or a forced function — so what is asserted is that one of them was used
+    // and that it carried the agent's own output schema.
+    let schema = call
+        .structured_output
+        .as_ref()
+        .expect("an agent always asks for structured output (PRD 5.2)")
+        .schema()
+        .clone();
+    assert_eq!(
+        schema["properties"]["verdict"]["enum"],
+        json!(["approve", "revise"])
+    );
+    assert_eq!(run.outputs()["verdict"], "revise");
+    assert!(provider.snapshot().is_drained());
+}
+
 /// The intra-agent tool loop runs the tool, feeds the result back, and stops at
 /// `max_tool_iterations` rather than looping forever (D51).
 #[test]
@@ -737,14 +820,22 @@ process.stdout.write(JSON.stringify(divergences));
 fn a_bounded_cycle_leaves_through_its_escape_edge_when_the_budget_is_spent() {
     let provider = MockProvider::start().expect("a loopback port");
     // A model that never approves: only `max_iterations: 3` can end this run.
+    //
+    // Both nodes bind `model.smart`, so both draw from one queue and each entry
+    // has to say which of the two calls it answers — an entry that narrows
+    // nothing accepts everything and would shadow the one behind it. The
+    // discriminator is each agent's own prompt, which reaches the request as the
+    // system turn verbatim (D13).
     provider.enqueue_all([
-        Script::new(SONNET, Outcome::structured(json!({ "draft": "a draft" }))).times(4),
+        Script::new(SONNET, Outcome::structured(json!({ "draft": "a draft" })))
+            .times(4)
+            .matching("a research writer"),
         Script::new(
             SONNET,
             Outcome::structured(json!({ "verdict": "revise", "feedback": "again" })),
         )
         .times(4)
-        .matching("a draft"),
+        .matching("meticulous technical reviewer"),
     ]);
 
     let run = harness::run(

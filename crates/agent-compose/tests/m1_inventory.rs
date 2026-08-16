@@ -92,6 +92,13 @@ const CODEGEN: &[Criterion] = &[
                 "an_agent_node_sends_its_prompt_input_and_output_schema",
                 Status::Pending("M1: codegen must emit agent node fns"),
             ),
+            // The same criterion on the other HTTP surface. Three of grammar
+            // 12.1's six provider kinds reach Chat Completions, so a node fn
+            // that only works on Messages is half a node fn.
+            (
+                "an_agent_node_sends_its_prompt_input_and_output_schema_on_chat_completions",
+                Status::Pending("M1: codegen must emit agent node fns"),
+            ),
             (
                 "an_agent_node_bounds_its_tool_loop_at_max_tool_iterations",
                 Status::Pending("M1: codegen must emit the agent tool loop"),
