@@ -25,6 +25,16 @@
     "result": 1
   },
   {
+    "name": "map-index-by-an-integer-key",
+    "expression": "{1: 'a', 2: 'b'}[2]",
+    "result": "b"
+  },
+  {
+    "name": "map-index-by-a-boolean-key",
+    "expression": "{true: 'yes', false: 'no'}[false]",
+    "result": "no"
+  },
+  {
     "name": "size-of-a-map",
     "expression": "size({'a': 1, 'b': 2})",
     "result": 2

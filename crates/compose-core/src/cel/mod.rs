@@ -221,6 +221,11 @@ const AUTHORED_SURFACE: &[&str] = &[
     "map",
 ];
 
+/// The comprehension macros of that surface. They are the names that arrive at
+/// [`Walk::call`] only when the parser did *not* expand them, so a call wearing
+/// one is a form rather than a function to refuse.
+const COMPREHENSIONS: &[&str] = &["all", "exists", "exists_one", "filter", "map"];
+
 /// The parser's name for `container[key]`, which [`Walk::expr`] reads itself.
 const INDEX: &str = "_[_]";
 
@@ -580,15 +585,28 @@ impl Walk<'_> {
             Expr::Map(entries) => {
                 let mut values = Type::Dyn;
                 let mut first = true;
+                let mut keyed_by_strings = true;
                 for entry in &entries.entries {
                     if let ::cel::common::ast::EntryExpr::MapEntry(entry) = &entry.expr {
-                        self.value(&entry.key);
+                        keyed_by_strings &= self.value(&entry.key).is_stringy();
                         let ty = self.value(&entry.value);
                         values = if first { ty } else { join(&values, &ty) };
                         first = false;
                     }
                 }
-                (Type::Map(Arc::new(values)), None)
+                // `Type::Map` is *the string-keyed map* of this lattice, which
+                // is what the rules stated over it read it as. CEL also keys a
+                // map by an int, a uint, or a bool, and a literal that does is
+                // a value the walk carries no type for rather than a map whose
+                // keys the string rule would then refuse — the expression is
+                // legal CEL, and no declaration in this grammar produces one
+                // for anything to be checked against.
+                let ty = if keyed_by_strings {
+                    Type::Map(Arc::new(values))
+                } else {
+                    Type::Dyn
+                };
+                (ty, None)
             }
             Expr::Struct(structure) => {
                 self.problem(
@@ -862,13 +880,26 @@ impl Walk<'_> {
                 }
                 Type::Bool
             }
+            // A comprehension the parser recognized is a `Comprehension` node
+            // and never reaches here, so a macro name that does is one the
+            // author spelled in a form it does not expand — a wrong arity, or
+            // CEL's two-variable form. Saying the macro is unsupported would
+            // contradict grammar 4.1's own list of it.
+            other if COMPREHENSIONS.contains(&other) => {
+                self.problem(
+                    Problem::new(
+                        DiagnosticCode::InvalidExpression,
+                        format!(
+                            "`{other}` is not written here in a form this expression surface supports"
+                        ),
+                    )
+                    .with_help(
+                        "a comprehension macro takes a list and one binding — `state.items.all(item, item != '')`; every other spelling of it, the two-variable form included, is outside the supported surface (grammar 4.1)",
+                    ),
+                );
+                Type::Dyn
+            }
             other => {
-                for argument in &call.args {
-                    self.value(argument);
-                }
-                if let Some(target) = &call.target {
-                    self.value(target);
-                }
                 self.problem(
                     Problem::new(
                         DiagnosticCode::InvalidExpression,
@@ -1353,6 +1384,24 @@ mod tests {
         assert!(problem.message.contains("constructs a message"));
     }
 
+    /// `Type::Map` is the string-keyed map this lattice describes, and CEL also
+    /// keys a map by an int, a uint, or a bool. A literal that does is legal
+    /// CEL, so the walk carries no type for it rather than calling it a map and
+    /// then refusing its own keys — while a map that *is* string-keyed keeps
+    /// the rule that goes with it.
+    #[test]
+    fn a_map_literal_is_typed_only_where_its_keys_are_strings() {
+        assert_eq!(ok("{1: 'a'}[1] == 'a'").ty, Type::Bool);
+        assert_eq!(ok("{true: 'a'}[true] == 'a'").ty, Type::Bool);
+        assert_eq!(ok("{'a': 1}['a']").ty, Type::Int);
+        let problem = problem("{'a': 1}[1] == 1");
+        assert_eq!(problem.code, DiagnosticCode::TypeMismatch);
+        assert_eq!(
+            problem.message,
+            "expected a string as a map key, found an integer"
+        );
+    }
+
     #[test]
     fn an_expression_that_does_not_parse_is_reported_once() {
         let problem = problem("state.draft +");
@@ -1387,6 +1436,37 @@ mod tests {
         ok("state.patches.all(p, p.startsWith('x'))");
         let problem = problem("p.startsWith('x')");
         assert_eq!(problem.code, DiagnosticCode::UnknownRoot);
+    }
+
+    /// One mistake reads as one diagnostic (PRD G3). A call this surface
+    /// refuses is refused at the call: its arguments were written to be read by
+    /// it, so walking into them would report a comprehension's own bindings as
+    /// unknown roots — one follow-up per binding, each contradicting the
+    /// diagnostic above it.
+    #[test]
+    fn a_refused_call_is_one_diagnostic_and_not_one_per_argument() {
+        // The two-variable comprehension form, which the pinned parser does not
+        // expand: `i` and `v` are bindings the macro would introduce.
+        let refused = problem("state.patches.all(i, v, v.startsWith('a'))");
+        assert_eq!(refused.code, DiagnosticCode::InvalidExpression);
+        assert_eq!(
+            refused.message,
+            "`all` is not written here in a form this expression surface supports"
+        );
+        // A macro at the wrong arity is the same mistake, and `all` stays a
+        // macro grammar 4.1 lists either way.
+        assert_eq!(
+            problem("state.patches.all(p)").message,
+            "`all` is not written here in a form this expression surface supports"
+        );
+        // A name the surface really does not have keeps its own message, and
+        // an argument that would not resolve on its own does not add a second.
+        let unsupported = problem("string(nope.at.all)");
+        assert_eq!(unsupported.code, DiagnosticCode::InvalidExpression);
+        assert_eq!(
+            unsupported.message,
+            "`string` is not a function this expression surface supports"
+        );
     }
 
     /// `has()` answers a question about a member; it does not read it.
