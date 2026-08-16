@@ -2,11 +2,17 @@
 #
 # `agent-compose serve` emits a Fastify app for the `http` triggers of a project,
 # exposing **start**, **resume**, and **status** (PRD 5.11, grammar 13.3). This
-# project has all three surfaces to exercise: an `http` trigger whose `input:`
+# project has all three surfaces to exercise: `http` triggers whose `input:`
 # bindings are CEL over the request payload, an interrupting `human` node whose
-# output schema is what a resume payload is validated against, and an `async`
-# response, so a start returns an execution id and the status route is how a
+# output schema is what a resume payload is validated against, and `async`
+# responses, so a start returns an execution id and the status route is how a
 # caller learns the rest.
+#
+# Two triggers, over two flows, because the verbs do not all become testable at
+# once: `flow.assisted` interrupts and is what `resume` is for, while
+# `flow.direct` has no `human` node in it, so start and status can be decided
+# without the `human` node runtime (which PRD §9's resolved question 4 schedules
+# for M2). They share the agent, the model and the state channels.
 #
 # The `escalate` node is reached only through the `human` node's `on_timeout:`
 # control transfer — one of the two positions node reachability counts besides
@@ -40,6 +46,20 @@ triggers:
     respond: async
     callback: "payload.body.callback_url"
 
+  # Start and status over a flow with no interrupt in it: this trigger's
+  # execution runs to completion on its own, so the execution id it answers with
+  # and the terminal report the status route gives are observable with `serve`
+  # alone. `on_request`'s execution stops at the human and needs a resume, which
+  # is why the two are exercised apart.
+  on_direct_request:
+    type: http
+    flow: flow.direct
+    path: /direct-answers
+    method: POST
+    input:
+      question: "payload.body.question"
+    respond: async
+
 provider.mock:
   kind: anthropic
   api_key: ${MOCK_API_KEY}
@@ -63,6 +83,28 @@ agent.answerer:
     answer:
       type: string
       min_length: 1
+
+# No `human` node anywhere in it, so an execution started through
+# `on_direct_request` reaches `end` by itself: the start route's execution id and
+# the status route's terminal report are observable with `agent-compose serve`
+# alone.
+flow.direct:
+  description: Answer a question with nobody to sign it off.
+  inputs:
+    question:
+      type: string
+      min_length: 1
+  outputs:
+    answer:
+      type: string
+  nodes:
+    ask:
+      agent: agent.answerer
+      input:
+        question: "input.question"
+  edges:
+    - { from: start, to: ask }
+    - { from: ask, to: end }
 
 flow.assisted:
   description: Answer a question and have a human sign the answer off.

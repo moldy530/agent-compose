@@ -223,15 +223,30 @@ const COMMANDS: &[Criterion] = &[
             Status::Pending("M1: `agent-compose run` must exist"),
         )],
     },
+    // Two tests, because the criterion's three verbs do not unlock together.
+    // PRD §7 M1 puts `serve` — start, resume and status — in this milestone,
+    // while PRD §9's resolved question 4 says the `human` node runtime "may land
+    // M2". Only `resume` needs that runtime: an interrupt is what there is to
+    // resume from. So start/status is decided over the `http-trigger` fixture's
+    // interrupt-free flow and is `serve`'s to unlock, and resume is decided over
+    // its `human` flow and names the runtime it waits on. Keeping them in one
+    // test would have forced the `serve` PR either to ship an M2-scheduled
+    // feature or to edit this inventory — the drift it exists to prevent.
     Criterion {
         bullet: Bullet::Commands,
         phrase: "`agent-compose serve` (generated Fastify app for http triggers: start/resume/status)",
-        tests: &[(
-            "serve_exposes_start_resume_and_status_for_an_http_trigger",
-            Status::Pending(
-                "M1: `agent-compose serve` must exist, and the `human` node runtime with it",
+        tests: &[
+            (
+                "serve_exposes_start_and_status_for_an_http_trigger",
+                Status::Pending("M1: `agent-compose serve` must exist"),
             ),
-        )],
+            (
+                "serve_resumes_an_interrupted_execution_against_the_human_nodes_schema",
+                Status::Pending(
+                    "M1: `agent-compose serve` must exist, and the `human` node runtime with it",
+                ),
+            ),
+        ],
     },
     Criterion {
         bullet: Bullet::Commands,

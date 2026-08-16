@@ -56,7 +56,9 @@
 //! nothing, a `text` reply to one that pinned a tool, and a tool call beside the
 //! pinned one are each refused as a `script-mismatch` rather than answered. A
 //! test that scripts the wrong number of calls fails loudly instead of passing
-//! against a transcript no provider could produce.
+//! against a transcript no provider could produce — and the refusal is recorded
+//! as one, so `snapshot().is_drained()` is false for a run that hit it even
+//! though the 422 went to the generated process rather than to the test.
 
 // A test target is a crate root, so its submodules resolve against `tests/`
 // rather than against a directory named after the file. The path keeps the
@@ -1445,10 +1447,65 @@ fn run_executes_a_manual_trigger_and_prints_the_flow_outputs() {
     assert!(failure.contains("goal"), "{failure}");
 }
 
-/// `agent-compose serve` exposes start, resume, and status for an `http` trigger.
+/// `agent-compose serve` exposes start and status for an `http` trigger.
+///
+/// Two of the criterion's three verbs, over the fixture's interrupt-free flow
+/// (`flow.direct`): a start that answers with an execution id and a status route
+/// that reports the run's terminal state and outputs. Split from the resume half
+/// below because this half is decidable with `serve` alone — the criterion is
+/// PRD §7 M1's, while the `human` node runtime the other half needs is scheduled
+/// for M2 (PRD §9, resolved question 4).
+#[test]
+#[ignore = "M1: `agent-compose serve` must exist"]
+fn serve_exposes_start_and_status_for_an_http_trigger() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "answer": "an answer" })),
+    ));
+
+    let served = harness::serve("http-trigger", &provider);
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+
+    // Start: `respond: async` answers with an execution id immediately.
+    let started = app
+        .post_json("/direct-answers", &json!({ "question": "what is it?" }))
+        .expect("the trigger's route answers");
+    assert_eq!(started.status, 202);
+    let execution = started.json()["execution_id"]
+        .as_str()
+        .expect("an execution id")
+        .to_string();
+
+    // Status: nothing interrupts this flow, so it reaches its outputs on its own
+    // and the status route is how the caller reads them.
+    let finished = harness::settled(&app, &execution);
+    assert_eq!(finished["status"], "completed");
+    assert_eq!(finished["outputs"]["answer"], "an answer");
+
+    // The mirror of the resume rule below — a resume payload is validated
+    // against the `human` node's output schema (PRD 5.11), and a start payload
+    // against the flow's declared `inputs:`. `question` is `min_length: 1`, so
+    // an empty one is a 400 at the route and no execution at all.
+    let refused = app
+        .post_json("/direct-answers", &json!({ "question": "" }))
+        .expect("the trigger's route answers");
+    assert_eq!(
+        refused.status, 400,
+        "an empty question is not the flow's declared input"
+    );
+
+    assert!(provider.snapshot().is_drained(), "the run used its script");
+}
+
+/// The third verb: `resume` against the interrupting `human` node's schema.
+///
+/// Kept apart from start/status because it cannot be decided without the `human`
+/// node runtime, which PRD §9's resolved question 4 puts in M2 — so this is the
+/// one row of the M1 inventory whose blocker is not `serve` itself.
 #[test]
 #[ignore = "M1: `agent-compose serve` must exist, and the `human` node runtime with it"]
-fn serve_exposes_start_resume_and_status_for_an_http_trigger() {
+fn serve_resumes_an_interrupted_execution_against_the_human_nodes_schema() {
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue(Script::new(
         SONNET,
@@ -1469,10 +1526,7 @@ fn serve_exposes_start_resume_and_status_for_an_http_trigger() {
         .to_string();
 
     // Status: the execution is interrupted at the `human` node.
-    let status = app
-        .get(&format!("/executions/{execution}"))
-        .expect("the status route answers")
-        .json();
+    let status = harness::settled(&app, &execution);
     assert_eq!(status["status"], "interrupted");
 
     // Resume: the payload is validated against the `human` node's output schema.
@@ -1495,10 +1549,7 @@ fn serve_exposes_start_resume_and_status_for_an_http_trigger() {
         .expect("the resume route answers");
     assert!(resumed.status == 200 || resumed.status == 202);
 
-    let finished = app
-        .get(&format!("/executions/{execution}"))
-        .expect("the status route answers")
-        .json();
+    let finished = harness::settled(&app, &execution);
     assert_eq!(finished["status"], "completed");
     assert_eq!(finished["outputs"]["answer"], "an answer");
     assert_eq!(finished["outputs"]["decision"], "approve");

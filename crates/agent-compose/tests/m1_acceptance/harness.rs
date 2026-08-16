@@ -53,8 +53,9 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
 
-use mock_provider::MockProvider;
+use mock_provider::{Client, MockProvider};
 use serde_json::Value;
 
 /// Every acceptance fixture project, by directory name.
@@ -357,4 +358,37 @@ pub fn serve(name: &str, provider: &MockProvider) -> Served {
         .unwrap_or_else(|| panic!("the readiness line names no base url: {announced}"))
         .to_string();
     Served { child, base_url }
+}
+
+/// The states a status report can be asserted about: an execution has either
+/// finished, or stopped at an interrupt waiting for a resume.
+const SETTLED: &[&str] = &["completed", "interrupted", "failed"];
+
+/// The status route's report for `execution`, once it has stopped moving.
+///
+/// An `async` trigger answers with an execution id *before* the flow has run
+/// (grammar 13.3), so the state a status assertion is about arrives some time
+/// after the start route did. Polling is what makes such an assertion about the
+/// graph rather than about scheduling luck — and a report that stays unsettled
+/// is answered with the whole last body, so a run that ends somewhere the test
+/// did not expect says where instead of timing out silently.
+pub fn settled(app: &Client, execution: &str) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let last: Value = app
+            .get(&format!("/executions/{execution}"))
+            .expect("the status route answers")
+            .json();
+        if last["status"]
+            .as_str()
+            .is_some_and(|status| SETTLED.contains(&status))
+        {
+            return last;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "execution `{execution}` never reached one of {SETTLED:?}: {last}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
