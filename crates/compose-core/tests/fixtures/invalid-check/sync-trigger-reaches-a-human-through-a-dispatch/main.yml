@@ -1,7 +1,7 @@
 # rule: interrupt-freedom crosses a `map` dispatch (grammar 7.7 clause 2, 13.3)
 # code: sync-trigger-interrupt
 # message: the trigger `on_request` responds synchronously, and `flow.outer` reaches the `human` node `approve` of `flow.inner`
-# at: main.yml:26:5
+# at: main.yml:25:3
 # label: main.yml:34:5 the `human` node is declared here
 # help: a flow exposed with `respond: sync` must be statically interrupt-free: it must reach no `human` node through its own nodes, its `flow:` nodes, its maps' dispatch targets, or the `flow.*` tools of any agent it reaches — declare `respond: async` and take the result through `callback:` instead (grammar 13.3, 7.7, PRD 5.11)
 version: "0.1"

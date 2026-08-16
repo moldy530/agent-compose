@@ -1,8 +1,8 @@
 # rule: concurrent branches writing one channel need a reduce policy (grammar 7.6.1, 10.2)
 # code: unreduced-write
 # message: nodes `left` and `right` of `flow.f` run concurrently and both write the unreduced channel `note`
-# at: main.yml:32:12
-# label: main.yml:31:11 the other write is here
+# at: main.yml:32:5
+# label: main.yml:31:5 the other write is here
 # label: main.yml:21:3 the channel is declared here
 # help: two edges of one fork that are not provably exclusive can both fire, so the branches they start are concurrent: the channel they both write needs a declared `reduce:` policy — `append`, `merge`, or an explicit `last_wins` (grammar 7.6.1, 10.2, Decision D32)
 version: "0.1"

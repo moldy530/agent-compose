@@ -1,7 +1,7 @@
 # rule: a node's effective write map is injective (grammar 8.0, Decision D93)
 # code: conflicting-writes
 # message: `result` and `summary` of node `n` both write the channel `summary`
-# at: main.yml:28:7
+# at: main.yml:27:5
 # label: main.yml:30:25 the other write is here
 # help: a node's effective write map — remapped fields and same-named channels together — must be injective, because two writes to one channel from one writer have no order between them (grammar 7.6.4, Decision D93); remap one of them in `flow.f`
 version: "0.1"

@@ -509,7 +509,11 @@ fn races<'a>(
 fn written<'a>(ctx: &Ctx<'a>, node: &'a Node) -> Vec<Written<'a>> {
     let NodeKind::Map { map } = &node.kind else {
         return ctx.node_output(node).map_or_else(Vec::new, |output| {
-            channels::effective(ctx, &output, node.writes.as_ref(), &node.span)
+            // The node's id, not its block: the same anchor
+            // [`channels::node_writes`] reports its own diagnostics at, for the
+            // same reason — a block mapping ends where the next node's key
+            // begins.
+            channels::effective(ctx, &output, node.writes.as_ref(), &node.id.span)
         });
     };
     let sites: Vec<(

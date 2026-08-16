@@ -180,10 +180,14 @@ fn interrupt_freedom(ctx: &mut Ctx) {
         let Some(((holder, node), at)) = reached.humans.iter().next() else {
             continue;
         };
+        // The trigger's *name*, not its block: a block mapping ends where the
+        // next top-level key begins, so anchoring on the whole entry would
+        // underline the definition after it and say nothing about the trigger
+        // (PRD G3). The name is what the message already reads.
         ctx.push(
             Diagnostic::error(
                 DiagnosticCode::SyncTriggerInterrupt,
-                trigger.span.clone(),
+                trigger.name.span.clone(),
                 format!(
                     "the trigger `{}` responds synchronously, and `{flow}` reaches the `human` node `{node}` of `{holder}`",
                     trigger.name.value
