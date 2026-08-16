@@ -1,0 +1,47 @@
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+model.m:
+  provider: provider.p
+  id: some-model
+state:
+  tasks:
+    type: array
+    max_items: 4
+    items: { type: string }
+  verdict: { type: string, default: "" }
+agent.planner:
+  model: model.m
+  prompt: Plan the work.
+  output:
+    memo: { type: string }
+agent.reviewer:
+  model: model.m
+  prompt: Review the plan.
+  output:
+    verdict: { type: string }
+agent.worker:
+  model: model.m
+  prompt: Do one task.
+  input:
+    text: { type: string }
+  output:
+    verdict: { type: string }
+flow.fanout:
+  outputs: {}
+  edges:
+    - { from: start, to: plan }
+    - { from: plan, to: review }
+    - { from: plan, to: work }
+    - { from: review, to: end }
+    - { from: work, to: end }
+  nodes:
+    plan: { agent: agent.planner, input: "'the goal'" }
+    review: { agent: agent.reviewer, input: "'the plan'" }
+    work:
+      map:
+        over: "state.tasks"
+        node: agent.worker
+        max_concurrency: 2
+        input: { text: "item" }

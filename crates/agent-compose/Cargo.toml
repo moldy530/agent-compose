@@ -9,3 +9,23 @@ repository.workspace = true
 [dependencies]
 compose-core = { workspace = true }
 clap = { workspace = true }
+# The snippet renderer behind `validate`'s human output. Chosen over
+# `codespan-reporting` on three counts: its dependency footprint is one crate
+# (`unicode-width`), which keeps the single static binary of PRD 5.12 small; it
+# renders to a `String` rather than to a `WriteColor` stream, so the exact bytes
+# a report produces are testable without a terminal abstraction; and it
+# annotates byte ranges over a plain `&str`, which is what a `Span` already
+# carries — there is no file database to keep in step with the compiler's own.
+# It is also the renderer rustc's diagnostics use, which is the bar PRD G3 sets.
+annotate-snippets = "0.12"
+# `--format json`. `Diagnostic` is `Serialize` in `compose-core`, so all this
+# writes is the enclosing object.
+serde_json = "1"
+
+[dev-dependencies]
+# The CLI integration tests. Chosen over `trycmd` because one harness has to pin
+# three different things about a run — the exact bytes on each stream, the exit
+# code, and how long it took (`perf_smoke`) — and only a programmatic harness
+# expresses the third. `Command::cargo_bin` also builds and locates the binary
+# under test, which is what makes the tests runnable with a bare `cargo test`.
+assert_cmd = "2"

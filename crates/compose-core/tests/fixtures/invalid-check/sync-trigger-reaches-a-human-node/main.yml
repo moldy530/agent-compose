@@ -1,0 +1,34 @@
+# rule: a `respond: sync` flow is statically interrupt-free (grammar 13.3)
+# code: sync-trigger-interrupt
+# message: the trigger `on_request` responds synchronously, and `flow.f` reaches the `human` node `approve` of `flow.f`
+# at: main.yml:20:3
+# label: main.yml:27:5 the `human` node is declared here
+# help: a flow exposed with `respond: sync` must be statically interrupt-free: it must reach no `human` node through its own nodes, its `flow:` nodes, its maps' dispatch targets, or the `flow.*` tools of any agent it reaches — declare `respond: async` and take the result through `callback:` instead (grammar 13.3, 7.7, PRD 5.11)
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.a:
+  model: model.m
+  prompt: Do it.
+  output:
+    verdict: { enum: [approve, revise, escalate] }
+triggers:
+  on_request:
+    type: http
+    flow: flow.f
+    respond: sync
+flow.f:
+  outputs: {}
+  nodes:
+    approve:
+      human:
+        input: {}
+        output:
+          decision: { enum: [approve, reject] }
+  edges:
+    - { from: start, to: approve }
+    - { from: approve, to: end }

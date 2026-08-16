@@ -1,0 +1,32 @@
+# rule: a node declaring `on_error: skip` keeps one guaranteed edge (grammar 7.6.3 rule 3)
+# code: dead-end
+# message: node `n` of `flow.f` declares `on_error: skip`, and every edge leaving it is guarded
+# at: main.yml:24:5
+# label: main.yml:27:17 the strategy is declared here
+# help: a skipped node produces no output, so every guard that reads that output evaluates false and some pass takes no edge at all: give the node one edge that is unconditional or carries `else: true` (grammar 7.6.3 rule 3, Decision D97)
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.a:
+  model: model.m
+  prompt: Do it.
+  output:
+    verdict: { enum: [approve, revise, escalate] }
+state:
+  feedback: { type: string, default: "" }
+flow.f:
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.a
+      input: "'x'"
+      on_error: skip
+    done: { agent: agent.a, input: "'y'" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: done, when: "size(state.feedback) > 0" }
+    - { from: done, to: end }

@@ -1,7 +1,7 @@
 # rule: an `append` write supplies one element (grammar 10.2, Decision D58)
 # code: type-mismatch
 # message: `patches` of node `n` cannot be written to `patches`: an `append` write supplies one element: expected a string, found an array of strings
-# at: main.yml:33:7
+# at: main.yml:32:5
 # label: main.yml:15:3 the channel is declared here
 # help: appending several values in one write is deliberately not expressible: fan out with a `map` so each element is its own write, or declare the channel `last_wins` and set it whole (grammar 10.2, Decision D58)
 version: "0.1"

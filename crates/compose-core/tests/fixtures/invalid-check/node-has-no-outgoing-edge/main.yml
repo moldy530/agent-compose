@@ -1,0 +1,25 @@
+# rule: every node has at least one outgoing edge (grammar 7.6.3 rule 1)
+# code: dead-end
+# message: node `sink` of `flow.f` has no outgoing edge
+# at: main.yml:22:5
+# help: a branch retires only at `end`, so a node with no exit swallows it instead of reaching quiescence: `- { from: <node>, to: end }` is the one-line way to say "this branch is done here" (grammar 7.6.3 rule 1, Decision D71)
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.a:
+  model: model.m
+  prompt: Do it.
+  output:
+    verdict: { enum: [approve, revise, escalate] }
+flow.f:
+  outputs: {}
+  nodes:
+    n: { agent: agent.a, input: "'x'" }
+    sink: { agent: agent.a, input: "'y'" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: sink }

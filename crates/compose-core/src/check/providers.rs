@@ -421,19 +421,43 @@ fn providers_of(ctx: &Ctx, model: &Address) -> Vec<(String, ProviderKind)> {
 mod tests {
     use super::*;
 
+    /// Every kind v0 admits, so the two tests below read the whole table.
+    const V0: &[ProviderKind] = &[
+        ProviderKind::Anthropic,
+        ProviderKind::OpenAi,
+        ProviderKind::OpenAiCompatible,
+        ProviderKind::AzureOpenAi,
+        ProviderKind::Bedrock,
+        ProviderKind::Vertex,
+    ];
+
     #[test]
     fn every_v0_kind_serves_structured_output() {
-        for kind in [
-            ProviderKind::Anthropic,
-            ProviderKind::OpenAi,
-            ProviderKind::OpenAiCompatible,
-            ProviderKind::AzureOpenAi,
-            ProviderKind::Bedrock,
-            ProviderKind::Vertex,
-        ] {
+        for kind in V0 {
             assert!(
-                capabilities(kind).structured_output,
+                capabilities(*kind).structured_output,
                 "{} must serve structured output for agents to be bindable to it",
+                kind.as_str()
+            );
+        }
+    }
+
+    /// Why [`equivalence`] has nothing to reject on a v0 composition, stated
+    /// over the table rather than left as a remark: every kind publishes the
+    /// same pair of inference capabilities, so every route is equivalent by
+    /// construction and no legal spec can reach that diagnostic. It is the
+    /// evidence `tests/m0_inventory.rs` carries for that rule in place of a
+    /// negative fixture, and the day a kind arrives that lacks one of the two,
+    /// this test fails and the fixture becomes writable (grammar 12.2).
+    #[test]
+    fn every_v0_kind_publishes_the_same_inference_capabilities() {
+        let baseline = inference(capabilities(ProviderKind::Anthropic));
+        assert_eq!(baseline, (true, true));
+        for kind in V0 {
+            assert_eq!(
+                inference(capabilities(*kind)),
+                baseline,
+                "{} differs, so a route mixing it with another kind is now rejectable",
                 kind.as_str()
             );
         }

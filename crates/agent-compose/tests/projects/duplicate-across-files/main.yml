@@ -1,0 +1,14 @@
+# A two-file project defining one address twice, so the rendered report carries
+# a snippet from each file. Pinned by `cli.rs`.
+version: "0.1"
+
+imports:
+  - models.yml
+
+provider.p:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+
+model.m:
+  provider: provider.p
+  id: some-model

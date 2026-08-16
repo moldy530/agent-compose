@@ -1,0 +1,59 @@
+# rule: two nodes of a cycle that reach each other are in a loop, not in an order (grammar 7.6.1, 10.2)
+# code: unreduced-write
+# message: nodes `u` and `v` of `flow.f` run concurrently and both write the unreduced channel `note`
+# at: main.yml:48:5
+# label: main.yml:47:5 the other write is here
+# label: main.yml:40:3 the channel is declared here
+# help: two edges of one fork that are not provably exclusive can both fire, so the branches they start are concurrent: the channel they both write needs a declared `reduce:` policy — `append`, `merge`, or an explicit `last_wins` (grammar 7.6.1, 10.2, Decision D32)
+#
+# The same cycle as `a-fork-inside-a-bounded-cycle-races`, one node deeper, so
+# that the racing pair is *not* the pair of nodes the fork itself schedules: `p`
+# and `q` are the entries and write nothing, while `u` and `v` sit a step below
+# them and both write `note`. They run in one step on every pass all the same.
+#
+# What decides it is that they reach each other — `u -> j -> fork -> q -> v` and
+# `v -> j -> fork -> p -> u` — which is a loop rather than an order: neither
+# runs after the other, both are re-entered on every pass, and their arrivals
+# interleave. Reading "neither is reachable from the other" (7.6.1) as a plain
+# one-way test drops every pair inside a cycle, which is where grammar 7.6.2 has
+# already stood down (`dist` is not computed across a cycle) — so the pair would
+# fall between the two rules and ship a two-writers-per-step unreduced channel,
+# the shape 7.6.4 says is impossible by construction.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.a:
+  model: model.m
+  prompt: Do it.
+  output:
+    verdict: { enum: [approve, revise] }
+agent.n:
+  model: model.m
+  prompt: Note.
+  output:
+    note: { type: string }
+state:
+  note: { type: string, default: "" }
+flow.f:
+  outputs: {}
+  nodes:
+    fork: { agent: agent.a, input: "'w'" }
+    p: { agent: agent.a, input: "'p'" }
+    q: { agent: agent.a, input: "'q'" }
+    u: { agent: agent.n, input: "'u'" }
+    v: { agent: agent.n, input: "'v'" }
+    j: { agent: agent.a, input: "'j'" }
+  edges:
+    - { from: start, to: fork }
+    - { from: fork, to: p }
+    - { from: fork, to: q }
+    - { from: p, to: u }
+    - { from: q, to: v }
+    - { from: u, to: j }
+    - { from: v, to: j }
+    - { from: j, to: fork, when: "j.output.verdict == 'revise'", max_iterations: 3 }
+    - { from: j, to: end, else: true }

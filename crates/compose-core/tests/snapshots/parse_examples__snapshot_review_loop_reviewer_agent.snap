@@ -39,7 +39,7 @@ Spec(
                                             description: Some(
                                                 "approve ends the loop; revise sends the draft back to the writer." @ 24:20..24:85,
                                             ),
-                                            span: 24:7..26:5,
+                                            span: 24:7..25:30,
                                         },
                                     },
                                     Field {
@@ -53,12 +53,12 @@ Spec(
                                             description: Some(
                                                 "Required changes, empty when approving." @ 27:20..27:59,
                                             ),
-                                            span: 27:7..29:1,
+                                            span: 27:7..28:19,
                                         },
                                     },
                                 ],
                                 surface: Result,
-                                span: 23:5..29:1,
+                                span: 23:5..28:19,
                             },
                         ),
                         input: Some(
@@ -75,7 +75,7 @@ Spec(
                                             description: Some(
                                                 "What the draft must accomplish." @ 17:20..17:51,
                                             ),
-                                            span: 17:7..19:5,
+                                            span: 17:7..18:19,
                                         },
                                     },
                                     Field {
@@ -89,12 +89,12 @@ Spec(
                                             description: Some(
                                                 "The draft under review." @ 20:20..20:43,
                                             ),
-                                            span: 20:7..22:3,
+                                            span: 20:7..21:19,
                                         },
                                     },
                                 ],
                                 surface: Input,
-                                span: 16:5..22:3,
+                                span: 16:5..21:19,
                             },
                         ),
                         tools: [
@@ -109,9 +109,9 @@ Spec(
                         ),
                     },
                 ),
-                span: 4:1..29:1,
+                span: 4:1..28:19,
             },
         ],
-        span: 4:1..29:1,
+        span: 4:1..28:19,
     },
 )

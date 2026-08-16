@@ -1,0 +1,58 @@
+# rule: a fan inside a bounded cycle is still a fork, and its branches still race (grammar 7.6.1, 7.6.2, 10.2)
+# code: unreduced-write
+# message: nodes `x` and `y` of `flow.f` run concurrently and both write the unreduced channel `note`
+# at: main.yml:49:5
+# label: main.yml:48:5 the other write is here
+# label: main.yml:43:3 the channel is declared here
+# help: two edges of one fork that are not provably exclusive can both fire, so the branches they start are concurrent: the channel they both write needs a declared `reduce:` policy — `append`, `merge`, or an explicit `last_wins` (grammar 7.6.1, 10.2, Decision D32)
+#
+# The PRD's flagship shape with a fan in it: a bounded review loop whose body
+# forks. `fork`'s two edges are unconditional, so `x` and `y` run in one step on
+# every pass and both write `note`.
+#
+# The back edge `j -> fork` is what makes this its own case. It puts `x` and `y`
+# in one strongly connected component, so each is reachable from the other —
+# through the fork, on the next pass — and a rule that reads "neither is
+# reachable from the other" over the whole relation drops the pair. Grammar
+# 7.6.2's balanced check is silent here too, and correctly so: `dist` is not
+# computed where a cycle lies on the way, and the runtime rule governs instead.
+# 10.2 has no runtime rule to fall back on — an unreduced channel is a
+# compile-time promise of one writer per step (7.6.4) — so two nodes that reach
+# *each other* read as concurrent rather than as sequential.
+#
+# Replacing the back edge with `- { from: j, to: end }` reports the same race on
+# the same two nodes, which is what says the cycle is not what excuses it.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.a:
+  model: model.m
+  prompt: Do it.
+  output:
+    verdict: { enum: [approve, revise] }
+agent.n:
+  model: model.m
+  prompt: Note.
+  output:
+    note: { type: string }
+state:
+  note: { type: string, default: "" }
+flow.f:
+  outputs: {}
+  nodes:
+    fork: { agent: agent.a, input: "'w'" }
+    x: { agent: agent.n, input: "'x'" }
+    y: { agent: agent.n, input: "'y'" }
+    j: { agent: agent.a, input: "'j'" }
+  edges:
+    - { from: start, to: fork }
+    - { from: fork, to: x }
+    - { from: fork, to: y }
+    - { from: x, to: j }
+    - { from: y, to: j }
+    - { from: j, to: fork, when: "j.output.verdict == 'revise'", max_iterations: 3 }
+    - { from: j, to: end, else: true }

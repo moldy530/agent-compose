@@ -1,0 +1,40 @@
+# rule: concurrent branches writing one channel need a reduce policy (grammar 7.6.1, 10.2)
+# code: unreduced-write
+# message: nodes `left` and `right` of `flow.f` run concurrently and both write the unreduced channel `note`
+# at: main.yml:32:5
+# label: main.yml:31:5 the other write is here
+# label: main.yml:21:3 the channel is declared here
+# help: two edges of one fork that are not provably exclusive can both fire, so the branches they start are concurrent: the channel they both write needs a declared `reduce:` policy — `append`, `merge`, or an explicit `last_wins` (grammar 7.6.1, 10.2, Decision D32)
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.a:
+  model: model.m
+  prompt: Do it.
+  output:
+    verdict: { enum: [approve, revise, escalate] }
+state:
+  note: { type: string, default: "" }
+agent.n:
+  model: model.m
+  prompt: Note.
+  output:
+    note: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    plan: { agent: agent.n, input: "'w'" }
+    left: { agent: agent.n, input: "'x'" }
+    right: { agent: agent.n, input: "'y'" }
+    merge: { agent: agent.n, input: "'z'" }
+  edges:
+    - { from: start, to: plan }
+    - { from: plan, to: left }
+    - { from: plan, to: right }
+    - { from: left, to: merge }
+    - { from: right, to: merge }
+    - { from: merge, to: end }

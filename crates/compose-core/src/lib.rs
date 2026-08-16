@@ -17,17 +17,23 @@
 //!   (PRD 5.1);
 //! * [`cel`] — the expression front-end: one CEL string in, its type, what it
 //!   reads, and what is wrong with it (grammar 4.1);
-//! * [`check`] — the validator's data checks over that artifact: schema
-//!   compatibility, bindings and wiring, fan-out shapes, store ops, provider
-//!   settings and capabilities, trigger bindings.
+//! * [`check`] — the validator: schema compatibility, bindings and wiring,
+//!   fan-out shapes, store ops, provider settings and capabilities, trigger
+//!   bindings, and the graph analyses — routing exhaustiveness, cycle
+//!   termination, convergence, reachability, recursion, and interrupt-freedom.
 //!
 //! Everything the parser reports is decidable from a single file, and
 //! everything the resolver reports is decidable from names, files, and
-//! addresses. Everything [`check`] reports is decidable from the artifact's
-//! **schemas and expressions**; the static checks that need its *graphs* —
-//! exhaustiveness, cycle termination, convergence, reachability — are a later
-//! pass still. `docs/grammar.md` Appendix B is the normative account of the
-//! split.
+//! addresses. Everything [`check`] reports needs the whole artifact: its
+//! schemas and expressions, or its graphs. `docs/grammar.md` Appendix B is the
+//! normative account of the split, and
+//! `crates/compose-core/tests/m0_inventory.rs` is that account made executable
+//! — every static check PRD §7 M0 promises, mapped to the pass that decides it
+//! and the diagnostic codes it reports through.
+//!
+//! The CLI over all of it is the `agent-compose` crate: `agent-compose validate
+//! <path> [--target <name>] [--format human|json]`, which is the product's core
+//! loop (PRD §7 M0).
 
 pub mod ast;
 pub mod cel;

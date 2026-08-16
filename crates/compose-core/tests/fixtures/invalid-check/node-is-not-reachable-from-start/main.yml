@@ -1,0 +1,26 @@
+# rule: every node is reachable from its flow's `start` (grammar 7.8, Decision D95)
+# code: unreachable-node
+# message: node `orphan` of `flow.f` is not reachable from `start`
+# at: main.yml:22:5
+# help: reachability counts edges and the two control-transfer positions — `on_error: { fallback: … }` and `human.on_timeout:` — so a node none of them addresses is code no execution can reach: give it an inbound edge, name it as a fallback, or delete it (grammar 7.8, Decision D95)
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.a:
+  model: model.m
+  prompt: Do it.
+  output:
+    verdict: { enum: [approve, revise, escalate] }
+flow.f:
+  outputs: {}
+  nodes:
+    n: { agent: agent.a, input: "'x'" }
+    orphan: { agent: agent.a, input: "'y'" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }
+    - { from: orphan, to: end }

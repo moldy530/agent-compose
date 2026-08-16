@@ -1,15 +1,21 @@
-//! The validator's data checks: everything that is decided from the IR's
-//! **schemas and expressions**, as against its graphs.
+//! The validator: every static check `docs/grammar.md` and PRD §7 M0 define
+//! over a resolved composition.
 //!
 //! The pass reads one resolved [`Ir`] and reports through [`Diagnostic`]. It
 //! adds nothing to the artifact and changes nothing in it: an artifact exists
 //! only when resolution rejected nothing (see [`resolve`](crate::resolve)), and
 //! what this pass decides is whether the composition that produced it also
-//! *type-checks*.
+//! holds together.
 //!
-//! # What is here
+//! The rules fall into two families by the *evidence* they need, and the split
+//! is the one Appendix B draws. `crates/compose-core/tests/m0_inventory.rs`
+//! is the whole account in executable form: each check, its pass, and the codes
+//! it reports through.
 //!
-//! One submodule per rule family, each rule reporting a stable code
+//! # The data checks
+//!
+//! The first family is decided from the IR's **schemas and expressions**. One
+//! submodule per rule family, each rule reporting a stable code
 //! ([`DiagnosticCode`](crate::diag::DiagnosticCode)):
 //!
 //! | Module | Grammar | What it decides |
@@ -22,39 +28,61 @@
 //! | [`providers`] | 11.2, 12 | `settings:` against the provider kind's published schema, and the three capability checks |
 //! | [`triggers`] | 13 | a trigger's `input:` against its flow's declared inputs, and what its payload can supply |
 //!
-//! # What is not here
+//! # The graph checks
 //!
-//! **The graph analyses.** Routing exhaustiveness over edges (grammar 7.3.1),
-//! SCC termination (7.4), balanced convergence (7.6.2), `map.over` dominance
-//! (8.6 rule 11), node reachability (7.8), and the concurrent-writer half of
-//! the reduced-channel rule (10.2, which needs 7.6.1's co-takeability) all need
-//! the flow graph rather than a schema, and they are the next pass's. Where a
-//! rule splits across the two — `map.over` resolves a path *here* and proves
-//! dominance *there* — each half is stated where its evidence is.
+//! The second family reads the composition's **graphs** rather than its
+//! schemas. Every one of them needs a relation over a flow's nodes, or over the
+//! composition's definitions, that no key-and-value pair can supply:
+//!
+//! | Module | Grammar | What it decides |
+//! |---|---|---|
+//! | [`graph`] | 7.2, 7.4, 7.8 | the flow graph itself: adjacency, SCCs, reachability, dominance, and step distances. Answers questions; reports nothing |
+//! | [`guards`] | 7.3.1 | the closed guard-shape table, read for coverage and for disjointness. Answers questions; reports nothing |
+//! | [`routing`] | 7.3.1, 7.6.3 | routing exhaustiveness over enum output fields, and the two no-dead-end rules stated over a node |
+//! | [`cycles`] | 7.4 | every SCC is bounded, and every bounded edge has an escape |
+//! | [`convergence`] | 7.6.1, 7.6.2, 10.2 | forks and co-takeable pairs, balanced convergence, and the concurrent-branch half of the reduced-channel rule |
+//! | [`reachable`] | 7.8 | every node is reachable from its flow's `start` |
+//! | [`components`] | 7.5, 7.7, 13.3 | recursion, and a `respond: sync` trigger's flow reaching a `human` node |
+//! | [`fanout`] | 8.6 | `map.over` dominance, and `detach:` under a durably checkpointed target |
+//!
+//! Where a rule splits across the two families — `map.over` resolves a path in
+//! [`maps`] and proves dominance in [`fanout`] — each half is stated where its
+//! evidence is. The order the two families run in is not observable: every
+//! diagnostic carries a span and the whole report is sorted into source order at
+//! the end.
+//!
+//! # What is not here
 //!
 //! **Everything presence-shaped.** Reading a value that is legally absent fails
 //! the execution (Decision D110); no static rule anticipates it. See
 //! [`cel`](crate::cel) for the full account of what is deferred to run time.
 //!
-//! **One target-dependent rule.** `detach: true` under a durably checkpointed
-//! target (grammar 8.6 rule 7, Decision D59) is a rule about the *target*
-//! rather than about a schema; it belongs with the graph pass that also owns
-//! the `validate` command's target plumbing. The rest of rule 7 is here: what
-//! a detached dispatch may *write* is decided from the composition's channels
-//! alone ([`maps`]).
+//! **Everything the earlier passes own.** A rule decidable from one file is the
+//! parser's — the `start` edge of grammar 7.6.3 rule 2, an `else:` edge's
+//! guarded sibling (Decision D107), a duplicate edge — and a rule decidable from
+//! names and addresses is the resolver's. `docs/grammar.md` Appendix B is the
+//! normative account of the split.
 
 pub(crate) mod bindings;
 pub(crate) mod channels;
+pub(crate) mod components;
+pub(crate) mod convergence;
+pub(crate) mod cycles;
 pub(crate) mod expr;
+pub(crate) mod fanout;
+pub(crate) mod graph;
+pub(crate) mod guards;
 pub(crate) mod maps;
 pub(crate) mod model;
 pub(crate) mod providers;
 pub(crate) mod reach;
+pub(crate) mod reachable;
+pub(crate) mod routing;
 pub(crate) mod stores;
 pub(crate) mod triggers;
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ast::common::{Address, Ident, Namespace};
 use crate::cel::ty::{Origin, Property, Type};
@@ -65,7 +93,7 @@ use crate::ir::flow::{Flow, Node, NodeKind};
 use crate::ir::schema::FieldMap;
 use crate::ir::{Channel, Ir};
 
-/// Run every data check over one resolved composition.
+/// Run every static check over one resolved composition.
 ///
 /// Diagnostics come back in source order, so a report reads top to bottom
 /// whatever order the checks visited constructs in.
@@ -77,6 +105,7 @@ pub fn check(ir: &Ir) -> Vec<Diagnostic> {
     triggers::check(&mut ctx);
     stores::check_session_scope(&mut ctx);
     stores::check_map_writes(&mut ctx);
+    components::check(&mut ctx);
 
     let ir = ctx.ir;
     for (address, definition) in &ir.definitions {
@@ -86,6 +115,22 @@ pub fn check(ir: &Ir) -> Vec<Diagnostic> {
             DefinitionBody::Agent(agent) => bindings::agent_tools(&mut ctx, address, agent),
             _ => {}
         }
+    }
+
+    // The graph checks run after the data ones on purpose: the routing analyses
+    // read only the guards that type-checked, and which those are is what the
+    // pass above has just decided (see `Ctx::reject_guard`).
+    for (address, definition) in &ir.definitions {
+        let DefinitionBody::Flow(flow) = &definition.body else {
+            continue;
+        };
+        let cx = FlowCx { address, flow };
+        let graph = graph::Graph::new(flow);
+        reachable::check(&mut ctx, &cx, &graph);
+        routing::check(&mut ctx, &cx, &graph);
+        cycles::check(&mut ctx, &cx, &graph);
+        convergence::check(&mut ctx, &cx, &graph);
+        fanout::check(&mut ctx, &cx, &graph);
     }
 
     ctx.finish()
@@ -158,6 +203,9 @@ pub(crate) struct Ctx<'a> {
     pub(crate) ir: &'a Ir,
     diagnostics: Diagnostics,
     channels: BTreeMap<&'a str, &'a Channel>,
+    /// The edge guards the CEL front-end refused, by the position they were
+    /// written at — a file and a byte offset, which is one expression.
+    rejected: BTreeSet<(String, usize)>,
 }
 
 impl<'a> Ctx<'a> {
@@ -173,7 +221,22 @@ impl<'a> Ctx<'a> {
             ir,
             diagnostics: Diagnostics::new(),
             channels,
+            rejected: BTreeSet::new(),
         }
+    }
+
+    /// Record that an edge guard did not type-check, so the routing analyses
+    /// leave it alone (see [`routing`], [`convergence`]).
+    pub(crate) fn reject_guard(&mut self, at: &Span) {
+        self.rejected
+            .insert((at.source.as_str().to_string(), at.bytes.start));
+    }
+
+    /// Whether the guard written at this position type-checked.
+    pub(crate) fn guard_type_checked(&self, at: &Span) -> bool {
+        !self
+            .rejected
+            .contains(&(at.source.as_str().to_string(), at.bytes.start))
     }
 
     fn finish(mut self) -> Vec<Diagnostic> {

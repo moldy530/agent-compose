@@ -1,0 +1,31 @@
+# rule: flow-as-tool attachment carries reachability (grammar 7.7 clause 4, Decision D86)
+# code: recursive-flow
+# message: `flow.f` reaches itself
+# at: main.yml:21:11
+# help: a flow that reaches itself — through a `flow:` node, a `map` dispatch target, or the `flow.*` tools of an agent it reaches — has no termination proof analogous to grammar 7.4's SCC rule and would break the fan-out bounding guarantees: extract the shared part into a third flow, or break the cycle (grammar 7.5, 7.7, Decisions D26, D86)
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.a:
+  model: model.m
+  prompt: Do it.
+  output:
+    verdict: { enum: [approve, revise, escalate] }
+agent.helper:
+  model: model.m
+  prompt: Help.
+  tools: [flow.f]
+  output:
+    verdict: { enum: [approve, revise] }
+flow.f:
+  description: Answer a question, with help.
+  outputs: {}
+  nodes:
+    n: { agent: agent.helper, input: "'x'" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }

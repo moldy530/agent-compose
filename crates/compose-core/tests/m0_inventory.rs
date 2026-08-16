@@ -1,0 +1,487 @@
+//! The M0 completion inventory: every static check the PRD promises, mapped to
+//! the pass that decides it and the diagnostic codes that report it.
+//!
+//! PRD §7 M0 lists the static checks by name and calls `agent-compose validate`
+//! "the product's core loop". This file is that list, transcribed verbatim and
+//! made executable: each entry names the pass and the codes, and the tests below
+//! prove the codes exist, that each one really fires somewhere in the negative
+//! corpora, and — the direction that matters most — that **nothing the validator
+//! can report is missing from the inventory**. The last assertion reads the
+//! validator's own source for every `DiagnosticCode` it mentions, so a new check
+//! added without a line here fails this file rather than passing unnoticed.
+//!
+//! [`GRAMMAR`] is the companion list: the static rules `docs/grammar.md`
+//! Appendix B assigns to the validator that PRD §7 M0's sentence does not name
+//! individually. They are not extras — balanced convergence and the no-dead-end
+//! rules are what make PRD 5.3's and 5.4's promises hold at run time — but they
+//! come from the grammar rather than from the PRD's own enumeration, so they are
+//! listed apart to keep the transcription honest.
+//!
+//! One row carries [`Evidence::Unreachable`] instead of a fixture, and says so
+//! rather than borrowing another rule's: no composition v0 admits can trigger
+//! it, so the code it names is pinned by fixtures for *other* rules and a check
+//! that only asserted "the code is pinned somewhere" would report the row green
+//! on evidence about something else.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use compose_core::DiagnosticCode;
+
+/// One static check: what it is, where it is decided, what it reports, and what
+/// proves it fires.
+struct Check {
+    /// The rule, as PRD §7 M0 or `docs/grammar.md` names it.
+    rule: &'static str,
+    /// The module that decides it, as a path under `crates/compose-core/src/`.
+    pass: &'static str,
+    /// The diagnostic codes it reports through.
+    codes: &'static [&'static str],
+    /// What shows the rule really fires.
+    evidence: Evidence,
+}
+
+/// What a row offers as proof that the rule behind it is a check rather than an
+/// inventory entry.
+enum Evidence {
+    /// Some fixture in the negative corpora pins every code the row names, on
+    /// this rule. The ordinary case.
+    Fixture,
+    /// No composition this grammar admits can trigger the rule, so there is no
+    /// fixture to write and the codes it names are pinned by other rules'.
+    /// The named unit test, in one of the row's own passes, holds the premise
+    /// that makes it unreachable — when that premise stops being true the test
+    /// fails, and the fixture becomes writable.
+    Unreachable(&'static str),
+}
+
+/// PRD §7 M0's static-check list, in the order the PRD writes it.
+///
+/// The `rule` strings are the PRD's own phrases, so
+/// [`the_inventory_transcribes_the_prd_list`] can compare them against the
+/// sentence itself rather than against a paraphrase.
+const M0: &[Check] = &[
+    Check {
+        rule: "reference/type resolution",
+        pass: "resolve/references.rs",
+        codes: &["undefined-reference", "invalid-reference"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        rule: "schema compatibility across edges",
+        pass: "check/bindings.rs, check/channels.rs",
+        codes: &["type-mismatch", "unknown-field", "missing-binding"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        rule: "routing exhaustiveness (edges and map variants)",
+        pass: "check/routing.rs (edges), check/maps.rs (map variants)",
+        codes: &["non-exhaustive", "unknown-variant", "invalid-value"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        rule: "SCC cycle-termination",
+        pass: "check/cycles.rs",
+        codes: &["unbounded-cycle", "dead-end"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        rule: "fan-out bounding",
+        pass: "check/maps.rs (the array `over` resolves to), parse/flow.rs (`max_concurrency`)",
+        codes: &["unbounded-fan-out", "missing-key"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        rule: "reducer-channel write rules inside maps",
+        pass: "check/maps.rs",
+        codes: &["unreduced-write", "detached-write"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        rule: "trigger input-binding compatibility",
+        pass: "check/triggers.rs",
+        codes: &["type-mismatch", "unknown-field", "missing-binding"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        rule: "sync-trigger interrupt-free reachability",
+        pass: "check/components.rs, over check/reach.rs",
+        codes: &["sync-trigger-interrupt"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        rule: "store-op schema checks and map-write keying",
+        pass: "check/stores.rs",
+        codes: &[
+            "type-mismatch",
+            "unknown-field",
+            "missing-key",
+            "unkeyed-map-write",
+        ],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        rule: "session-scope/session-key coherence",
+        pass: "check/stores.rs, over check/reach.rs",
+        codes: &["missing-session-key"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        rule: "provider settings-schema and capability checks",
+        pass: "check/providers.rs",
+        codes: &[
+            "unknown-key",
+            "unknown-variant",
+            "value-out-of-range",
+            "type-mismatch",
+            "missing-capability",
+        ],
+        evidence: Evidence::Fixture,
+    },
+    // Every v0 provider kind publishes both inference capabilities
+    // (`check::providers`' table), so every route is capability-equivalent by
+    // construction and this rule cannot fire on a composition the grammar
+    // admits. `missing-capability` is pinned by the `embed.provider` rule, which
+    // is a different rule reading the same table — so this row states its own
+    // evidence rather than resting on that fixture.
+    Check {
+        rule: "route capability equivalence",
+        pass: "check/providers.rs",
+        codes: &["missing-capability"],
+        evidence: Evidence::Unreachable("every_v0_kind_publishes_the_same_inference_capabilities"),
+    },
+    Check {
+        rule: "env-ref syntax",
+        pass: "parse/lexical.rs",
+        codes: &["invalid-env-ref", "unexpected-env-ref"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        rule: "unreachable nodes",
+        pass: "check/reachable.rs",
+        codes: &["unreachable-node"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        rule: "undefined state channels",
+        pass: "check/channels.rs, cel/mod.rs",
+        codes: &["undefined-channel"],
+        evidence: Evidence::Fixture,
+    },
+];
+
+/// The validator-owned rules `docs/grammar.md` Appendix B names that PRD §7 M0's
+/// sentence does not enumerate individually.
+const GRAMMAR: &[Check] = &[
+    Check {
+        rule: "balanced convergence (7.6.2, D112)",
+        pass: "check/convergence.rs",
+        codes: &["unbalanced-convergence"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        rule: "no silent dead ends: every node exits, and a skip keeps an escape (7.6.3 rules 1 and 3, D71)",
+        pass: "check/routing.rs",
+        codes: &["dead-end"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        rule: "concurrent branches write a reduced channel (7.6.1, 10.2, D32)",
+        pass: "check/convergence.rs",
+        codes: &["unreduced-write"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        rule: "recursion: no flow reaches itself (7.5, D26, D86)",
+        pass: "check/components.rs, over check/reach.rs",
+        codes: &["recursive-flow"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        rule: "`map.over` reads a dominating node (8.6 rule 11, D76)",
+        pass: "check/fanout.rs",
+        codes: &["non-dominating-source"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        rule: "`detach: true` under a durably checkpointed target (8.6 rule 7, D59)",
+        pass: "check/fanout.rs",
+        codes: &["unsupported-detach"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        rule: "the effective write map is injective (8.0, D93)",
+        pass: "check/channels.rs",
+        codes: &["conflicting-writes"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        rule: "`flow:`-node and dispatch bindings are total (8.0, D68)",
+        pass: "check/bindings.rs, check/maps.rs",
+        codes: &["missing-binding"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        rule: "name-based wiring is type-checked in both directions (8.0, 7.5, D111)",
+        pass: "check/bindings.rs, check/channels.rs",
+        codes: &["type-mismatch", "undefined-channel"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        rule: "a synthesized store tool does not collide with an attached one (11.5)",
+        pass: "check/bindings.rs",
+        codes: &["tool-name-collision"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        rule: "a `method: GET` trigger does not read through `payload.body` (13.3, D117)",
+        pass: "check/triggers.rs",
+        codes: &["invalid-expression"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        rule: "every CEL surface: roots, paths, constructs, and result type (4.1)",
+        pass: "cel/mod.rs, over check/expr.rs",
+        codes: &[
+            "invalid-expression",
+            "unknown-root",
+            "unknown-field",
+            "type-mismatch",
+            "undefined-channel",
+        ],
+        evidence: Evidence::Fixture,
+    },
+];
+
+fn crate_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn rows() -> impl Iterator<Item = &'static Check> {
+    M0.iter().chain(GRAMMAR.iter())
+}
+
+/// Every code, by the variant name the source spells it with.
+fn by_variant() -> BTreeMap<String, &'static str> {
+    DiagnosticCode::ALL
+        .iter()
+        .map(|code| (format!("{code:?}"), code.as_str()))
+        .collect()
+}
+
+/// Every `DiagnosticCode::<Variant>` a source tree mentions.
+fn mentioned(directories: &[&str]) -> BTreeSet<String> {
+    let variants = by_variant();
+    let mut found = BTreeSet::new();
+    for directory in directories {
+        let mut queue = vec![crate_root().join(directory)];
+        while let Some(path) = queue.pop() {
+            let entries = fs::read_dir(&path).expect("the source directory exists");
+            for entry in entries {
+                let path = entry.expect("a readable directory entry").path();
+                if path.is_dir() {
+                    queue.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|extension| extension != "rs") {
+                    continue;
+                }
+                let source = fs::read_to_string(&path).expect("a readable source file");
+                for (at, _) in source.match_indices("DiagnosticCode::") {
+                    let name: String = source[at + "DiagnosticCode::".len()..]
+                        .chars()
+                        .take_while(char::is_ascii_alphanumeric)
+                        .collect();
+                    if let Some(code) = variants.get(&name) {
+                        found.insert((*code).to_string());
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Every code some negative fixture pins, across the three corpora.
+fn pinned() -> BTreeSet<String> {
+    let mut found = BTreeSet::new();
+    for corpus in ["invalid-parse", "invalid-resolve", "invalid-check"] {
+        let directory = crate_root().join("tests/fixtures").join(corpus);
+        for entry in fs::read_dir(&directory).expect("the fixture corpus exists") {
+            let path = entry.expect("a readable directory entry").path();
+            let main = if path.is_dir() {
+                path.join("main.yml")
+            } else {
+                path
+            };
+            let Ok(source) = fs::read_to_string(&main) else {
+                continue;
+            };
+            for line in source.lines() {
+                let Some(comment) = line.strip_prefix("# ") else {
+                    break;
+                };
+                if let Some(code) = comment.strip_prefix("code:") {
+                    found.insert(code.trim().to_string());
+                }
+            }
+        }
+    }
+    found
+}
+
+/// The PRD's own sentence, so the transcription cannot drift from it.
+#[test]
+fn the_inventory_transcribes_the_prd_list() {
+    let prd = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("the manifest directory has a grandparent")
+            .join("prd.md"),
+    )
+    .expect("the PRD is readable");
+    let sentence = prd
+        .lines()
+        .find(|line| line.trim_start().starts_with("- Static checks:"))
+        .expect("PRD §7 M0 lists the static checks");
+    for check in M0 {
+        assert!(
+            sentence.contains(check.rule),
+            "`{}` is not a phrase of PRD §7 M0's static-check list",
+            check.rule
+        );
+    }
+    let listed: Vec<&str> = sentence
+        .trim_start()
+        .trim_start_matches("- Static checks:")
+        .trim_end_matches('.')
+        .split(", ")
+        .map(str::trim)
+        .collect();
+    assert_eq!(
+        listed.len(),
+        M0.len(),
+        "PRD §7 M0 lists {} checks and the inventory has {}: {listed:?}",
+        listed.len(),
+        M0.len()
+    );
+}
+
+/// Every code the inventory names is a real one.
+#[test]
+fn every_named_code_exists() {
+    let known: BTreeSet<&str> = DiagnosticCode::ALL
+        .iter()
+        .map(|code| code.as_str())
+        .collect();
+    for check in rows() {
+        assert!(!check.codes.is_empty(), "`{}` names no code", check.rule);
+        for code in check.codes {
+            assert!(
+                known.contains(code),
+                "`{}` names `{code}`, which is not a `DiagnosticCode`",
+                check.rule
+            );
+        }
+    }
+}
+
+/// Every code the inventory names really fires: some fixture in the negative
+/// corpora pins it. A rule mapped to a code nothing can produce is an inventory
+/// entry, not a check.
+#[test]
+fn every_named_code_is_pinned_by_a_fixture() {
+    let pinned = pinned();
+    for check in rows() {
+        if matches!(check.evidence, Evidence::Unreachable(_)) {
+            continue;
+        }
+        for code in check.codes {
+            assert!(
+                pinned.contains(*code),
+                "`{}` reports `{code}`, which no negative fixture pins",
+                check.rule
+            );
+        }
+    }
+}
+
+/// A row that offers no fixture names a unit test that exists, in one of its own
+/// passes — the premise that makes its rule unreachable, held somewhere a change
+/// to the table would break it.
+///
+/// Without this, [`Evidence::Unreachable`] would be a way to exempt a row from
+/// evidence rather than a different kind of it: the marker has to cost something
+/// to carry.
+#[test]
+fn a_row_that_offers_no_fixture_names_a_unit_test_that_holds_its_premise() {
+    let mut unreachable = 0;
+    for check in rows() {
+        let Evidence::Unreachable(unit_test) = check.evidence else {
+            continue;
+        };
+        unreachable += 1;
+        let needle = format!("fn {unit_test}()");
+        let found = modules(check).into_iter().any(|module| {
+            fs::read_to_string(crate_root().join("src").join(module))
+                .expect("a readable source file")
+                .contains(&needle)
+        });
+        assert!(
+            found,
+            "`{}` rests on `{unit_test}`, which is not a test in `{}`",
+            check.rule, check.pass
+        );
+    }
+    assert_eq!(
+        unreachable, 1,
+        "a row that no composition can trigger is a claim worth counting; \
+         update this number and say why in the header when one is added or removed"
+    );
+}
+
+/// The direction that keeps the inventory honest: everything the validator — the
+/// checks and the CEL front-end they run — can report is accounted for here.
+#[test]
+fn the_inventory_accounts_for_every_code_the_validator_raises() {
+    let inventoried: BTreeSet<&str> = rows()
+        .flat_map(|check| check.codes.iter().copied())
+        .collect();
+    let raised = mentioned(&["src/check", "src/cel"]);
+    let missing: Vec<&String> = raised
+        .iter()
+        .filter(|code| !inventoried.contains(code.as_str()))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "the validator raises these codes and the M0 inventory does not account for them: {missing:?}"
+    );
+}
+
+/// The modules one row names, as paths under `crates/compose-core/src/`.
+fn modules(check: &'static Check) -> Vec<&'static str> {
+    check
+        .pass
+        .split(|character: char| character.is_whitespace() || character == ',')
+        .filter(|token| token.ends_with(".rs"))
+        .collect()
+}
+
+/// Each pass named is a module that exists, so a renamed file cannot leave the
+/// inventory pointing at nothing.
+#[test]
+fn every_named_pass_is_a_module() {
+    for check in rows() {
+        let modules = modules(check);
+        assert!(!modules.is_empty(), "`{}` names no pass", check.rule);
+        for module in modules {
+            assert!(
+                crate_root().join("src").join(module).is_file(),
+                "`{}` names the pass `{module}`, which is not a module",
+                check.rule
+            );
+        }
+    }
+}

@@ -1,0 +1,50 @@
+# rule: a channel raced by a whole fan of branches is reported once (grammar 10.2, PRD G3)
+# code: unreduced-write
+# message: nodes `a` and `b` of `flow.f` run concurrently and both write the unreduced channel `note`
+# at: main.yml:39:5
+# label: main.yml:38:5 the other write is here
+# label: main.yml:29:3 the channel is declared here
+# help: two edges of one fork that are not provably exclusive can both fire, so the branches they start are concurrent: the channel they both write needs a declared `reduce:` policy — `append`, `merge`, or an explicit `last_wins` (grammar 7.6.1, 10.2, Decision D32)
+#
+# Four branches of one fork, all writing `note` by name (grammar 8.0), are six
+# racing pairs and one mistake: the missing `reduce:` on the one declaration this
+# fixture's own `# label:` points at. Reporting the pairs would make this six
+# diagnostics — 190 at twenty branches, 7,140 at a hundred and twenty — for one
+# edit, and a page of diagnostics for one mistake is not a diagnostic (PRD G3).
+# The header's implicit `# count: 1` is the whole assertion, and the pair named is
+# the first two nodes in declaration order, so which one it is does not depend on
+# the order the analysis crossed the branches in.
+#
+# `start` is the fork: grammar 7.6's step 0 runs the nodes its taken edges target
+# and 7.3 rule 7 applies routing to it like any other vertex, so its four
+# unguarded edges are co-takeable in pairs and each starts a branch of its own.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+state:
+  note: { type: string, default: "" }
+agent.n:
+  model: model.m
+  prompt: Note.
+  output:
+    note: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    a: { agent: agent.n, input: "'a'" }
+    b: { agent: agent.n, input: "'b'" }
+    c: { agent: agent.n, input: "'c'" }
+    d: { agent: agent.n, input: "'d'" }
+  edges:
+    - { from: start, to: a }
+    - { from: start, to: b }
+    - { from: start, to: c }
+    - { from: start, to: d }
+    - { from: a, to: end }
+    - { from: b, to: end }
+    - { from: c, to: end }
+    - { from: d, to: end }

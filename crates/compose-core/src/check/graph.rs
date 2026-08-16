@@ -1,0 +1,637 @@
+//! One flow's graph, built once and read by every graph check.
+//!
+//! Grammar 7 states four *different* relations over a flow's nodes, and D95 is
+//! emphatic that they are four questions rather than one: the **edge** relation
+//! (grammar 7.2), which is what SCC termination (7.4), `dist` (7.6.2) and
+//! `map.over` dominance (8.6 rule 11) are all computed over; the
+//! **control-transfer** relation (7.8), which is the edge relation plus
+//! `on_error: { fallback: … }` and `human.on_timeout:`; grammar 7.7's
+//! **component** relation, which is about other definitions entirely and lives
+//! in [`reach`](super::reach); and grammar 7.6.1's **concurrency** relation,
+//! which [`convergence`](super::convergence) derives from the second of them.
+//!
+//! This module owns the first two. Nothing here reports a diagnostic — it
+//! answers questions, and the modules that ask them decide what is wrong.
+//!
+//! # Which relation "reachable" means
+//!
+//! Two of grammar 7.6's rules read a fork's branches, and they read them over
+//! *different* relations — deliberately, and the grammar says so in each place:
+//!
+//! * **7.6.2** (`dist`, balanced convergence) counts **edges** only, and says
+//!   why: a control transfer "fires *instead of* the node's outgoing edges …
+//!   never alongside them, so it can never add a second concurrent arrival at a
+//!   convergence". A fallback is not a step, so it is not a distance.
+//! * **7.6.1** (concurrency) says "reachable" with no qualifier, and the two
+//!   control-transfer positions are exactly where a node reached only by one of
+//!   them lives: 7.8 has them "schedule a node exactly as an edge does", 9.2 has
+//!   a fallback target "scheduled in the next step instead", and 7.6.3 has
+//!   concurrent branches "never cancelled". So when a node on one branch fails
+//!   over to its fallback, that fallback runs on that branch while the sibling
+//!   branch is still live: it is concurrent with the sibling's nodes, and the
+//!   `reduce:` rule of 10.2 is owed on any channel they both write.
+//!
+//! Reading 7.6.1 over edges alone would accept exactly the race D32 says a
+//! declared policy must replace, and it would do so for a shape one keyword away
+//! from one the check rejects. [`Graph::reachable_through`] and
+//! [`Graph::reaches`] therefore answer over the control-transfer relation, and
+//! [`Graph::distances`] over the edge relation.
+//!
+//! # Vertices
+//!
+//! A flow's vertices are its nodes plus the two pseudo-nodes (grammar 2.4).
+//! `start` and `end` are [`Vertex`] variants rather than node indexes because
+//! they are not nodes: nothing targets `start`, nothing leaves `end`, and
+//! neither can belong to a cycle or be a convergence. Every node id an edge
+//! names has been resolved against this flow already (see
+//! [`resolve`](crate::resolve)), so the lookup below cannot fail on a
+//! composition that reached this pass.
+//!
+//! # Cycles
+//!
+//! [`Graph::sccs`] is Tarjan's algorithm (PRD 5.4), written iteratively: the
+//! recursion depth of the textbook form is the node count, and a flow's node
+//! count is bounded by nothing this compiler controls.
+//!
+//! An SCC is a **cycle** when it has at least one edge — either two or more
+//! members, or one member with a self-edge (grammar 7.2: "Self-edges … form a
+//! one-node SCC, which must be bounded like any other cycle").
+
+use std::cell::OnceCell;
+use std::collections::{BTreeMap, VecDeque};
+
+use crate::ast::common::{ControlTarget, EdgeSource, EdgeTarget};
+use crate::ir::flow::{Edge, Flow, Node, NodeKind};
+
+/// What one branch delivers to one node: the fewest and the most steps a path
+/// admitted by grammar 7.6.2 takes to get there.
+///
+/// The rule asks whether *some* distance on one side differs from *some*
+/// distance on the other, and two non-empty sets fail that only when both are
+/// the same one-element set — so the least and the greatest of each decide it,
+/// and the intervening values are never read. Carrying the two instead of the
+/// set is what keeps a branch's answer proportional to the nodes it reaches
+/// rather than to the paths that reach them: a chain of `n` nodes whose every
+/// node also skips one ahead delivers to its far end at `n/2` distinct depths,
+/// and enumerating them costs a walk quadratic in the chain on top of the walk
+/// per branch (grammar 7.6.2, Decision D112).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Delivery {
+    /// The node reached.
+    pub(crate) node: usize,
+    /// The fewest steps a path admitted by grammar 7.6.2 reaches it in.
+    pub(crate) nearest: usize,
+    /// The most steps one does.
+    pub(crate) farthest: usize,
+}
+
+/// A vertex of one flow's graph (grammar 2.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum Vertex {
+    /// The `start` pseudo-node: the flow's entry, which nothing targets.
+    Start,
+    /// A node, by its index in declaration order.
+    Node(usize),
+    /// The `end` pseudo-node: where a branch retires.
+    End,
+}
+
+/// One flow's graph.
+pub(crate) struct Graph<'a> {
+    nodes: Vec<&'a Node>,
+    edges: &'a [Edge],
+    /// Per edge, the vertices it joins — `None` on the side naming a node this
+    /// flow does not declare, which the resolver has already refused.
+    endpoints: Vec<(Option<Vertex>, Option<Vertex>)>,
+    /// Edge indexes leaving `start`, in declaration order.
+    from_start: Vec<usize>,
+    /// Per node, the edge indexes leaving it, in declaration order.
+    from_node: Vec<Vec<usize>>,
+    /// Per node, the distinct node indexes an edge takes it to.
+    successors: Vec<Vec<usize>>,
+    /// The control-transfer relation (grammar 7.8): [`Graph::successors`] plus
+    /// `on_error: { fallback: … }` and `human.on_timeout:`. Two questions read
+    /// it — whether a node is addressable at all (7.8) and what a fork's branch
+    /// holds (7.6.1) — so it is built once with the id index that resolves it,
+    /// rather than rebuilt per question at a scan of the nodes per target.
+    transfers: Vec<Vec<usize>>,
+    /// Per node, the strongly connected component it belongs to.
+    component: Vec<usize>,
+    /// Per component, its members in ascending index order.
+    components: Vec<Vec<usize>>,
+    /// Per node, whether its component has at least one edge.
+    cyclic: Vec<bool>,
+    /// Per node, the nodes reachable from it over control transfers — the one
+    /// answer here that costs a walk per node, so it is computed on first use.
+    /// Only the concurrency relation asks for it (grammar 7.6.1), and a flow
+    /// with no fork never does.
+    reachable: OnceCell<Vec<Vec<bool>>>,
+    /// The nodes belonging to no cycle, in topological order — the order
+    /// [`Graph::distances`] relaxes in, shared by every branch it is asked
+    /// about. Computed on first use, for the same reason.
+    acyclic_order: OnceCell<Vec<usize>>,
+}
+
+impl<'a> Graph<'a> {
+    /// Build the graph of one flow.
+    pub(crate) fn new(flow: &'a Flow) -> Self {
+        let nodes: Vec<&'a Node> = flow.nodes.iter().collect();
+        let index: BTreeMap<&str, usize> = nodes
+            .iter()
+            .enumerate()
+            .map(|(at, node)| (node.id.value.as_str(), at))
+            .collect();
+        let count = nodes.len();
+
+        // An edge naming a node this flow does not declare has been refused by
+        // the resolver already, so it cannot reach this pass — but `endpoints`
+        // is indexed by edge, so such an edge keeps its slot rather than
+        // shifting every later one, and simply joins nothing.
+        let endpoints: Vec<(Option<Vertex>, Option<Vertex>)> = flow
+            .edges
+            .iter()
+            .map(|edge| {
+                let from = match &edge.from.value {
+                    EdgeSource::Start => Some(Vertex::Start),
+                    EdgeSource::Node(id) => index.get(id.as_str()).map(|at| Vertex::Node(*at)),
+                };
+                let to = match &edge.to.value {
+                    EdgeTarget::End => Some(Vertex::End),
+                    EdgeTarget::Node(id) => index.get(id.as_str()).map(|at| Vertex::Node(*at)),
+                };
+                (from, to)
+            })
+            .collect();
+
+        let mut from_start = Vec::new();
+        let mut from_node = vec![Vec::new(); count];
+        let mut successors: Vec<Vec<usize>> = vec![Vec::new(); count];
+        for (at, (from, to)) in endpoints.iter().enumerate() {
+            let (Some(from), Some(to)) = (from, to) else {
+                continue;
+            };
+            match from {
+                Vertex::Start => from_start.push(at),
+                Vertex::Node(node) => {
+                    from_node[*node].push(at);
+                    if let Vertex::Node(target) = to
+                        && !successors[*node].contains(target)
+                    {
+                        successors[*node].push(*target);
+                    }
+                }
+                Vertex::End => {}
+            }
+        }
+
+        // The edge relation plus the two control-transfer positions
+        // (grammar 7.8 clauses 2 and 3), resolved through the same id index the
+        // edges were.
+        let mut transfers = successors.clone();
+        for (at, node) in nodes.iter().enumerate() {
+            for target in control_targets(node) {
+                if let Some(to) = index.get(target)
+                    && !transfers[at].contains(to)
+                {
+                    transfers[at].push(*to);
+                }
+            }
+        }
+
+        let (component, components) = components(&successors);
+        let cyclic = components
+            .iter()
+            .map(|members| {
+                members.len() > 1
+                    || members
+                        .first()
+                        .is_some_and(|member| successors[*member].contains(member))
+            })
+            .collect::<Vec<bool>>();
+        let cyclic = component.iter().map(|at| cyclic[*at]).collect();
+
+        Self {
+            nodes,
+            edges: &flow.edges,
+            endpoints,
+            from_start,
+            from_node,
+            successors,
+            transfers,
+            component,
+            components,
+            cyclic,
+            reachable: OnceCell::new(),
+            acyclic_order: OnceCell::new(),
+        }
+    }
+
+    /// The flow's nodes, in declaration order.
+    pub(crate) fn nodes(&self) -> &[&'a Node] {
+        &self.nodes
+    }
+
+    /// The node at this index.
+    pub(crate) fn node(&self, at: usize) -> &'a Node {
+        self.nodes[at]
+    }
+
+    /// The node's flow-local id.
+    pub(crate) fn id(&self, at: usize) -> &'a str {
+        self.nodes[at].id.value.as_str()
+    }
+
+    /// The edge at this index.
+    pub(crate) fn edge(&self, at: usize) -> &'a Edge {
+        &self.edges[at]
+    }
+
+    /// Where the edge at this index goes. Every edge [`Graph::outgoing`] yields
+    /// has one.
+    pub(crate) fn target(&self, at: usize) -> Option<Vertex> {
+        self.endpoints[at].1
+    }
+
+    /// The nodes an edge leaving `start` reaches directly.
+    fn entries(&self) -> impl Iterator<Item = usize> + '_ {
+        self.from_start
+            .iter()
+            .filter_map(|edge| match self.endpoints[*edge].1 {
+                Some(Vertex::Node(at)) => Some(at),
+                _ => None,
+            })
+    }
+
+    /// The edges leaving a vertex, in declaration order — which is the order
+    /// grammar 7.3 evaluates them in.
+    pub(crate) fn outgoing(&self, vertex: Vertex) -> &[usize] {
+        match vertex {
+            Vertex::Start => &self.from_start,
+            Vertex::Node(at) => &self.from_node[at],
+            Vertex::End => &[],
+        }
+    }
+
+    /// Every vertex that has an outgoing edge and so may be a fork
+    /// (grammar 7.6.1): `start`, then the nodes in declaration order.
+    pub(crate) fn sources(&self) -> Vec<Vertex> {
+        std::iter::once(Vertex::Start)
+            .chain((0..self.nodes.len()).map(Vertex::Node))
+            .collect()
+    }
+
+    /// The strongly connected components, each a list of node indexes in
+    /// ascending order.
+    pub(crate) fn components(&self) -> &[Vec<usize>] {
+        &self.components
+    }
+
+    /// Whether two nodes belong to one strongly connected component.
+    pub(crate) fn same_component(&self, left: usize, right: usize) -> bool {
+        self.component[left] == self.component[right]
+    }
+
+    /// Whether this vertex is inside the component the node belongs to. `start`
+    /// and `end` never are, which is what makes an edge to `end` an edge that
+    /// *leaves* the SCC (grammar 7.4 clause 2(i)).
+    pub(crate) fn inside_component_of(&self, node: usize, vertex: Vertex) -> bool {
+        matches!(vertex, Vertex::Node(other) if self.same_component(node, other))
+    }
+
+    /// Whether the node belongs to a cycle — an SCC with at least one edge
+    /// (grammar 7.2, 7.4).
+    pub(crate) fn cyclic(&self, at: usize) -> bool {
+        self.cyclic[at]
+    }
+
+    /// Whether one node is reachable from another over control transfers — the
+    /// relation grammar 7.6.1 is read over (see this module's header). A node
+    /// reaches itself only through a cycle, which is what "neither is reachable
+    /// from the other" needs of it.
+    ///
+    /// A node reached from another by a fallback runs only where that other one
+    /// failed, and so runs *after* it rather than beside it: the same reading
+    /// that puts a fallback target on its predecessor's branch takes the pair
+    /// containing both of them out of the rule.
+    pub(crate) fn reaches(&self, from: usize, to: usize) -> bool {
+        self.reachable()[from][to]
+    }
+
+    fn reachable(&self) -> &Vec<Vec<bool>> {
+        self.reachable.get_or_init(|| {
+            (0..self.nodes.len())
+                .map(|node| {
+                    walk(
+                        self.nodes.len(),
+                        &self.transfers,
+                        self.transfers[node].iter().copied(),
+                    )
+                })
+                .collect()
+        })
+    }
+
+    /// The node an edge delivers a branch to — `None` where it retires the
+    /// branch at `end`, or names a node the resolver has already refused.
+    ///
+    /// Both fork rules read an edge only through this. What a branch holds
+    /// (grammar 7.6.1) and the depths it holds it at (grammar 7.6.2) are
+    /// properties of where the edge *lands*, so two sibling edges to one node ask
+    /// one question twice and the two answers below are keyed by the entry rather
+    /// than by the edge (see [`convergence`](super::convergence)).
+    pub(crate) fn entry(&self, edge: usize) -> Option<usize> {
+        match self.endpoints[edge].1 {
+            Some(Vertex::Node(at)) => Some(at),
+            _ => None,
+        }
+    }
+
+    /// The nodes reachable over **control transfers** from one entry, the entry
+    /// itself included — "reachable from a fork **through** this edge"
+    /// (grammar 7.6.1), read of the node the edge delivers to
+    /// ([`Graph::entry`]). A branch holds what it can schedule, and a fallback
+    /// target is scheduled on the branch of the node that failed over to it
+    /// (grammar 9.2, 7.8; see this module's header).
+    ///
+    /// The answer is the node indexes themselves, in ascending order, rather than
+    /// a mask over every node: its reader pairs one branch's answer with
+    /// another's (see [`convergence`](super::convergence)), and pairing two
+    /// *lists* costs what the branches hold instead of what the flow holds.
+    pub(crate) fn reachable_through(&self, entry: usize) -> Vec<usize> {
+        let reached = &self.reachable()[entry];
+        (0..self.nodes.len())
+            .filter(|at| *at == entry || reached[*at])
+            .collect()
+    }
+
+    /// Whether `dominator` dominates `node`: every path from `start` to `node`
+    /// over **edges** passes through it (grammar 8.6 rule 11, Decision D76).
+    ///
+    /// A node no edge path reaches is not asked about — a dominator relation
+    /// over an empty set of paths is vacuously true, and reporting a producer
+    /// that "does not dominate" a node nothing reaches would name the wrong
+    /// mistake. Grammar 7.8's reachability is where that node is answered for.
+    pub(crate) fn dominates(&self, dominator: usize, node: usize) -> bool {
+        if dominator == node {
+            return true;
+        }
+        if !walk(self.nodes.len(), &self.successors, self.entries())[node] {
+            return true;
+        }
+        let mut successors = self.successors.clone();
+        successors[dominator].clear();
+        let entries = self.entries().filter(|at| *at != dominator);
+        !walk(self.nodes.len(), &successors, entries)[node]
+    }
+
+    /// Every node reachable from `start` over the **control-transfer** relation:
+    /// edges, `on_error: { fallback: … }`, and `human.on_timeout:`
+    /// (grammar 7.8, Decision D95).
+    pub(crate) fn addressable(&self) -> Vec<bool> {
+        walk(self.nodes.len(), &self.transfers, self.entries())
+    }
+
+    /// The step distances from a fork to every node it delivers to, over the
+    /// paths that leave it by one edge — read of the node that edge delivers to
+    /// ([`Graph::entry`]) — and traverse no node belonging to a cycle
+    /// (grammar 7.6.2), as the nearest and farthest of each ([`Delivery`]).
+    ///
+    /// Excluding cycle nodes is what makes the answer meaningful *and* the walk
+    /// a single relaxation: a path that repeats a node passes through a cycle,
+    /// so the nodes left form a DAG, every admitted path visits each node at
+    /// most once, and one pass in topological order settles both extremes
+    /// together — every predecessor of a node is relaxed before the node is read
+    /// from. Where a cycle lies on the way, `dist` is not computed and the
+    /// runtime rule governs instead.
+    ///
+    /// Only the nodes this edge actually delivers to are listed, ascending — a
+    /// node absent from the list is one no admitted path reaches, which is the
+    /// empty set of distances said in the space a branch occupies rather than
+    /// the space the flow occupies, and the order is what lets a reader pair two
+    /// branches by walking them side by side.
+    pub(crate) fn distances(&self, entry: usize) -> Vec<Delivery> {
+        if self.cyclic(entry) {
+            return Vec::new();
+        }
+        let mut reached: Vec<Option<(usize, usize)>> = vec![None; self.nodes.len()];
+        reached[entry] = Some((1, 1));
+        for node in self.acyclic_order() {
+            let Some((nearest, farthest)) = reached[*node] else {
+                continue;
+            };
+            for next in &self.successors[*node] {
+                if self.cyclic(*next) {
+                    continue;
+                }
+                reached[*next] = Some(match reached[*next] {
+                    Some((near, far)) => (near.min(nearest + 1), far.max(farthest + 1)),
+                    None => (nearest + 1, farthest + 1),
+                });
+            }
+        }
+        reached
+            .into_iter()
+            .enumerate()
+            .filter_map(|(node, found)| {
+                found.map(|(nearest, farthest)| Delivery {
+                    node,
+                    nearest,
+                    farthest,
+                })
+            })
+            .collect()
+    }
+
+    /// The nodes belonging to no cycle, in topological order (Kahn's algorithm).
+    ///
+    /// Every cycle lies inside one strongly connected component and puts every
+    /// member of it on [`Graph::cyclic`], so the nodes left induce a DAG and the
+    /// order below covers all of them. It is a property of the flow rather than
+    /// of any one branch, so [`Graph::distances`] takes it once however many
+    /// branches it is asked about.
+    fn acyclic_order(&self) -> &[usize] {
+        self.acyclic_order.get_or_init(|| {
+            let count = self.nodes.len();
+            let mut incoming = vec![0usize; count];
+            for at in 0..count {
+                if self.cyclic(at) {
+                    continue;
+                }
+                for next in &self.successors[at] {
+                    if !self.cyclic(*next) {
+                        incoming[*next] += 1;
+                    }
+                }
+            }
+            let mut queue: VecDeque<usize> = (0..count)
+                .filter(|at| !self.cyclic(*at) && incoming[*at] == 0)
+                .collect();
+            let mut order = Vec::with_capacity(count);
+            while let Some(node) = queue.pop_front() {
+                order.push(node);
+                for next in &self.successors[node] {
+                    if self.cyclic(*next) {
+                        continue;
+                    }
+                    incoming[*next] -= 1;
+                    if incoming[*next] == 0 {
+                        queue.push_back(*next);
+                    }
+                }
+            }
+            order
+        })
+    }
+}
+
+/// The flow-local node ids one node transfers control to (grammar 7.8 clauses 2
+/// and 3). `end` is not a node and is never one of them.
+fn control_targets(node: &Node) -> Vec<&str> {
+    let mut targets = Vec::new();
+    if let Some(crate::ir::policy::OnError::Fallback { target, .. }) = &node.policy.on_error
+        && let ControlTarget::Node(id) = &target.value
+    {
+        targets.push(id.as_str());
+    }
+    if let NodeKind::Human { human } = &node.kind
+        && let Some(on_timeout) = &human.on_timeout
+        && let ControlTarget::Node(id) = &on_timeout.value
+    {
+        targets.push(id.as_str());
+    }
+    targets
+}
+
+/// Breadth-first reachability from a set of entry nodes.
+fn walk(
+    count: usize,
+    successors: &[Vec<usize>],
+    entries: impl Iterator<Item = usize>,
+) -> Vec<bool> {
+    let mut found = vec![false; count];
+    let mut queue = VecDeque::new();
+    for entry in entries {
+        if !found[entry] {
+            found[entry] = true;
+            queue.push_back(entry);
+        }
+    }
+    while let Some(node) = queue.pop_front() {
+        for next in &successors[node] {
+            if !found[*next] {
+                found[*next] = true;
+                queue.push_back(*next);
+            }
+        }
+    }
+    found
+}
+
+/// Tarjan's strongly-connected-components algorithm, iteratively (PRD 5.4).
+///
+/// Returns each node's component and the components themselves, every member
+/// list in ascending index order. The walk is over a bare adjacency list rather
+/// than over a [`Graph`], because the *invocation* graph of grammar 7.7 needs
+/// exactly this and for exactly the same reason: recursion is a cycle among
+/// flows the way an unbounded loop is a cycle among nodes
+/// ([`components`](super::components)).
+///
+/// It is iterative because the recursion depth of the textbook form is the
+/// vertex count, and neither a flow's node count nor a composition's flow count
+/// is bounded by anything this compiler controls.
+pub(crate) fn components(successors: &[Vec<usize>]) -> (Vec<usize>, Vec<Vec<usize>>) {
+    let count = successors.len();
+    let mut order: Vec<Option<usize>> = vec![None; count];
+    let mut low = vec![0usize; count];
+    let mut on_stack = vec![false; count];
+    let mut stack: Vec<usize> = Vec::new();
+    let mut component = vec![usize::MAX; count];
+    let mut components: Vec<Vec<usize>> = Vec::new();
+    let mut counter = 0usize;
+
+    for root in 0..count {
+        if order[root].is_some() {
+            continue;
+        }
+        order[root] = Some(counter);
+        low[root] = counter;
+        counter += 1;
+        stack.push(root);
+        on_stack[root] = true;
+        let mut work: Vec<(usize, usize)> = vec![(root, 0)];
+        while let Some((node, next)) = work.last().copied() {
+            if next < successors[node].len() {
+                work.last_mut().expect("the frame was just read").1 += 1;
+                let child = successors[node][next];
+                match order[child] {
+                    None => {
+                        order[child] = Some(counter);
+                        low[child] = counter;
+                        counter += 1;
+                        stack.push(child);
+                        on_stack[child] = true;
+                        work.push((child, 0));
+                    }
+                    Some(at) if on_stack[child] => low[node] = low[node].min(at),
+                    Some(_) => {}
+                }
+                continue;
+            }
+            work.pop();
+            if let Some((parent, _)) = work.last().copied() {
+                low[parent] = low[parent].min(low[node]);
+            }
+            if Some(low[node]) == order[node] {
+                let mut members = Vec::new();
+                while let Some(member) = stack.pop() {
+                    on_stack[member] = false;
+                    component[member] = components.len();
+                    members.push(member);
+                    if member == node {
+                        break;
+                    }
+                }
+                members.sort_unstable();
+                components.push(members);
+            }
+        }
+    }
+    (component, components)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A diamond, a self-loop, and a two-node cycle, as adjacency lists.
+    #[test]
+    fn tarjan_finds_every_component() {
+        // 0 -> 1 -> 2 -> 1, 0 -> 3 -> 3, 4 isolated.
+        let successors = vec![vec![1, 3], vec![2], vec![1], vec![3], vec![]];
+        let (component, components) = components(&successors);
+        assert_eq!(components.len(), 4);
+        assert_ne!(component[0], component[1]);
+        assert_eq!(component[1], component[2], "1 and 2 form one cycle");
+        assert_ne!(component[3], component[1]);
+        let cycle = &components[component[1]];
+        assert_eq!(cycle, &vec![1, 2], "members are sorted");
+    }
+
+    /// The walk has to survive a chain deeper than a recursive Tarjan's stack
+    /// would, which is the reason it is iterative.
+    #[test]
+    fn tarjan_survives_a_long_chain() {
+        let length = 50_000;
+        let successors: Vec<Vec<usize>> = (0..length)
+            .map(|at| {
+                if at + 1 < length {
+                    vec![at + 1]
+                } else {
+                    vec![]
+                }
+            })
+            .collect();
+        let (_, components) = components(&successors);
+        assert_eq!(components.len(), length);
+    }
+}

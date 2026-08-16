@@ -1,0 +1,32 @@
+# rule: an unrecognized guard term covers no variant (grammar 7.3.1's table, Decision D82)
+# code: non-exhaustive
+# message: node `review` of `flow.f` routes on `verdict` and leaves `revise`, `escalate` unrouted
+# at: main.yml:24:5
+# label: main.yml:18:14 the enum is declared here
+# help: cover every variant with guards the exhaustiveness table reads — `==`, `!=`, `in`, and their `&&`/`||`/`!` combinations — or give the node one outgoing edge that is unconditional or carries `else: true`; a term the table does not recognize proves nothing and covers no variant (grammar 7.3.1, Decision D82)
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.a:
+  model: model.m
+  prompt: Do it.
+  output:
+    verdict: { enum: [approve, revise, escalate] }
+state:
+  feedback: { type: string, default: "" }
+flow.f:
+  outputs: {}
+  nodes:
+    review: { agent: agent.a, input: "'x'" }
+    publish: { agent: agent.a, input: "'y'" }
+    rework: { agent: agent.a, input: "'z'" }
+  edges:
+    - { from: start, to: review }
+    - { from: review, to: publish, when: "review.output.verdict == 'approve'" }
+    - { from: review, to: rework, when: "size(state.feedback) > 0" }
+    - { from: publish, to: end }
+    - { from: rework, to: end }

@@ -1,6 +1,6 @@
-//! The negative corpus for the data checks: one minimal *resolvable* project
-//! per rule, pinned to its exact code, message, position, and — where the rule
-//! names two sites — its label.
+//! The negative corpus for the validator: one minimal *resolvable* project per
+//! rule, pinned to its exact code, message, position, and — where the rule names
+//! two sites — its label.
 //!
 //! Every fixture resolves cleanly and then fails exactly one check, which is
 //! what makes the corpus evidence about that check rather than about the
@@ -39,14 +39,19 @@ use std::path::{Path, PathBuf};
 
 use compose_core::{Diagnostic, resolve_with_target};
 
-/// Every code the data checks raise. The corpus must exercise all of them.
+/// Every code the validator raises. The corpus must exercise all of them.
 ///
-/// Two codes the validator *can* raise are deliberately absent, and both are
+/// Two rules the validator implements are deliberately unpinned, and both are
 /// the same case: no v0 provider kind lacks structured output or tool use, so
 /// neither the agent-model capability rule nor route capability equivalence can
 /// fire on a composition this grammar admits (see `check::providers`). They are
-/// unit-tested against the table instead, and the third rule reading it —
-/// `embed.provider` — is pinned here.
+/// unit-tested against the table instead —
+/// `every_v0_kind_serves_structured_output` and
+/// `every_v0_kind_publishes_the_same_inference_capabilities`, which `Evidence`
+/// in `tests/m0_inventory.rs` reads as the second rule's evidence in place of a
+/// fixture — and the third rule reading that table, `embed.provider`, is pinned
+/// here. Their shared code, `missing-capability`, is therefore covered below by
+/// that third rule alone.
 const CHECK_CODES: &[&str] = &[
     "invalid-expression",
     "unknown-root",
@@ -68,6 +73,14 @@ const CHECK_CODES: &[&str] = &[
     "unknown-variant",
     "value-out-of-range",
     "invalid-value",
+    "dead-end",
+    "unbounded-cycle",
+    "unbalanced-convergence",
+    "unreachable-node",
+    "recursive-flow",
+    "sync-trigger-interrupt",
+    "non-dominating-source",
+    "unsupported-detach",
 ];
 
 struct Anchor {
@@ -387,8 +400,8 @@ fn the_corpus_covers_every_diagnostic_the_checks_raise() {
 fn the_corpus_is_substantial() {
     let count = fixtures().len();
     assert!(
-        count >= 30,
-        "the negative corpus must cover at least 30 rules, found {count}"
+        count >= 80,
+        "the negative corpus must cover at least 80 rules, found {count}"
     );
 }
 

@@ -1,0 +1,36 @@
+# rule: a shortcut inside one branch is compared against the *other* edge of the pair (grammar 7.6.2)
+# code: unbalanced-convergence
+# message: node `c` of `flow.f` is reached from the fork `fork` at two different depths
+# at: main.yml:26:5
+# label: main.yml:30:7 this edge reaches it in 3 steps
+# label: main.yml:31:7 this one in 2 steps
+# help: a convergence reached in two different steps runs twice, once per arrival: route the short branch through the same depth, or make the two edges exclusive — `else: true` on one, or guards grammar 7.6.1 can prove disjoint (grammar 7.6.2, Decisions D69, D112)
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.a:
+  model: model.m
+  prompt: Do it.
+  output:
+    verdict: { enum: [approve, revise] }
+flow.f:
+  outputs: {}
+  nodes:
+    fork: { agent: agent.a, input: "'x'" }
+    a: { agent: agent.a, input: "'a'" }
+    b: { agent: agent.a, input: "'b'" }
+    c: { agent: agent.a, input: "'c'" }
+    d: { agent: agent.a, input: "'d'" }
+  edges:
+    - { from: start, to: fork }
+    - { from: fork, to: a }
+    - { from: fork, to: b }
+    - { from: a, to: c, when: "a.output.verdict == 'approve'" }
+    - { from: a, to: d, else: true }
+    - { from: d, to: c }
+    - { from: b, to: c }
+    - { from: c, to: end }

@@ -48,11 +48,15 @@ pub(crate) fn node_writes<'a>(ctx: &mut Ctx<'a>, cx: &FlowCx<'a>, node: &'a Node
         return;
     };
     let subject = format!("node `{}`", text(&node.id));
+    // A name-based write is written nowhere, so it is anchored on the node that
+    // makes it — at the node's *id* rather than its block, because a block
+    // mapping ends where the next node's key begins and underlining a sibling
+    // node names the wrong site (PRD G3).
     let written = write_map(
         ctx,
         &output,
         node.writes.as_ref(),
-        &node.span,
+        &node.id.span,
         &subject,
         cx.address,
     );

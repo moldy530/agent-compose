@@ -138,6 +138,7 @@ flow.f:
   edges:
     - { from: start, to: n, when: "size(input.goal) > 0" }
     - { from: start, to: n }
+    - { from: n, to: end }
 "#,
     );
 }
@@ -1202,6 +1203,464 @@ flow.f:
   edges:
     - { from: start, to: n }
     - { from: n, to: end }
+"#,
+    );
+}
+
+/// A **mixed-guard** node stays exhaustive: the sibling whose guard never
+/// mentions `verdict` contributes nothing to its coverage and does not exempt
+/// the node, and the `==`/`!=` pair covers the enum between them (grammar 7.3.1
+/// clause 2, Decision D82).
+#[test]
+fn a_mixed_guard_node_covered_by_an_inequality() {
+    accepts(
+        "mixed-guards",
+        r#"
+state:
+  feedback: { type: string, default: "" }
+agent.a:
+  model: model.m
+  prompt: Do it.
+  output:
+    verdict: { enum: [approve, revise, escalate] }
+flow.f:
+  outputs: {}
+  nodes:
+    review: { agent: agent.a, input: "'x'" }
+    publish: { agent: agent.a, input: "'y'" }
+    rework: { agent: agent.a, input: "'z'" }
+    notify: { agent: agent.a, input: "'w'" }
+  edges:
+    - { from: start, to: review }
+    - { from: review, to: publish, when: "review.output.verdict == 'approve'" }
+    - { from: review, to: rework, when: "review.output.verdict != 'approve'" }
+    - { from: review, to: notify, when: "size(state.feedback) > 0" }
+    - { from: publish, to: end }
+    - { from: rework, to: end }
+    - { from: notify, to: end }
+"#,
+    );
+}
+
+/// A cycle bounded by a CEL exit condition alone — a guarded back-edge beside an
+/// `else: true` escape, which is the spelling grammar 7.4 calls usual and which
+/// clause 2's earlier wording rejected (Decision D98).
+#[test]
+fn a_cycle_bounded_by_an_else_exit() {
+    accepts(
+        "else-exit-cycle",
+        r#"
+agent.a:
+  model: model.m
+  prompt: Do it.
+  output:
+    verdict: { enum: [approve, revise] }
+flow.f:
+  outputs: {}
+  nodes:
+    write: { agent: agent.a, input: "'x'" }
+    review: { agent: agent.a, input: "'y'" }
+  edges:
+    - { from: start, to: write }
+    - { from: write, to: review }
+    - { from: review, to: write, when: "review.output.verdict == 'revise'" }
+    - { from: review, to: end, else: true }
+"#,
+    );
+}
+
+/// A guarded shortcut **inside one concurrent branch** is not an unbalanced
+/// convergence: `c` is reached from the fork at depths 2 and 3 through one edge
+/// of the pair and at none through the other, and balance compares one distance
+/// from *each* edge rather than the union of one side (grammar 7.6.2,
+/// Decision D112). `a`'s own two out-edges are exclusive, so at most one of the
+/// two paths is taken on a pass and `c` never receives two deliveries.
+#[test]
+fn a_guarded_shortcut_inside_one_concurrent_branch() {
+    accepts(
+        "guarded-shortcut",
+        r#"
+agent.a:
+  model: model.m
+  prompt: Do it.
+  output:
+    verdict: { enum: [approve, revise] }
+flow.f:
+  outputs: {}
+  nodes:
+    fork: { agent: agent.a, input: "'x'" }
+    a: { agent: agent.a, input: "'a'" }
+    b: { agent: agent.a, input: "'b'" }
+    c: { agent: agent.a, input: "'c'" }
+    d: { agent: agent.a, input: "'d'" }
+  edges:
+    - { from: start, to: fork }
+    - { from: fork, to: a }
+    - { from: fork, to: b }
+    - { from: a, to: c, when: "a.output.verdict == 'approve'" }
+    - { from: a, to: d, else: true }
+    - { from: d, to: c }
+    - { from: c, to: end }
+    - { from: b, to: end }
+"#,
+    );
+}
+
+/// Two sibling edges that land on **one** node start one branch, not two.
+/// Grammar 7.6's P2 runs a node targeted by several edges taken in the same step
+/// exactly once, so `x` runs once and takes exactly one of *its* two exclusive
+/// out-edges: `d` receives one delivery per pass however the two `plan -> x`
+/// guards came out. The distances `{2, 3}` that reach `d` are one branch's own,
+/// and comparing them is the comparison inside one side Decision D112 refuses —
+/// here reached from the other end, since both sides of the pair are the *same*
+/// set of paths. Making the two `plan -> x` guards exclusive would silence a
+/// diagnostic while changing no runtime behaviour, which is how it reads as
+/// over-rejection rather than as strictness (grammar 7.6, 7.6.2, D99, D112).
+#[test]
+fn two_sibling_edges_that_deliver_to_one_node() {
+    accepts(
+        "same-target-pair",
+        r#"
+agent.a:
+  model: model.m
+  prompt: Do it.
+  output:
+    verdict: { enum: [approve, revise] }
+agent.planner:
+  model: model.m
+  prompt: Plan.
+  output:
+    need_draft: { type: boolean }
+    need_research: { type: boolean }
+flow.f:
+  outputs: {}
+  nodes:
+    plan: { agent: agent.planner, input: "'p'" }
+    x: { agent: agent.a, input: "'x'" }
+    m: { agent: agent.a, input: "'m'" }
+    d: { agent: agent.a, input: "'d'" }
+  edges:
+    - { from: start, to: plan }
+    - { from: plan, to: x, when: "plan.output.need_draft" }
+    - { from: plan, to: x, when: "plan.output.need_research" }
+    - { from: x, to: d, when: "x.output.verdict == 'approve'" }
+    - { from: x, to: m, when: "x.output.verdict == 'revise'" }
+    - { from: m, to: d }
+    - { from: d, to: end }
+"#,
+    );
+}
+
+/// The concurrent-write half of the same reading (grammar 7.6.1, 10.2). `p` and
+/// `q` sit behind the two *exclusive* out-edges of `x`, and `x` is the single
+/// node both `plan -> x` edges deliver to — so one pass runs one of them and
+/// they never race for `verdict`. Reading the pair as two branches makes every
+/// node of `x`'s branch concurrent with every other, and demands a `reduce:`
+/// policy on a channel nothing can race for; whether two nodes *inside* that
+/// branch are concurrent is its own fork's question, and `x`'s pair is exclusive.
+#[test]
+fn writers_behind_one_node_two_sibling_edges_share() {
+    accepts(
+        "same-target-writers",
+        r#"
+agent.a:
+  model: model.m
+  prompt: Do it.
+  output:
+    verdict: { enum: [approve, revise] }
+agent.planner:
+  model: model.m
+  prompt: Plan.
+  output:
+    need_draft: { type: boolean }
+    need_research: { type: boolean }
+state:
+  verdict:
+    description: the last verdict reached
+    enum: [approve, revise]
+flow.f:
+  outputs: {}
+  nodes:
+    plan: { agent: agent.planner, input: "'p'" }
+    x: { agent: agent.a, input: "'x'" }
+    p: { agent: agent.a, input: "'p'" }
+    q: { agent: agent.a, input: "'q'" }
+  edges:
+    - { from: start, to: plan }
+    - { from: plan, to: x, when: "plan.output.need_draft" }
+    - { from: plan, to: x, when: "plan.output.need_research" }
+    - { from: x, to: p, when: "x.output.verdict == 'approve'" }
+    - { from: x, to: q, when: "x.output.verdict == 'revise'" }
+    - { from: p, to: end }
+    - { from: q, to: end }
+"#,
+    );
+}
+
+/// A node no edge targets, reached only through `on_error: { fallback: … }`.
+/// Reachability counts the two control-transfer positions, so a dedicated
+/// error-handling node is live code rather than an unreachable one — and it
+/// still needs an outgoing edge of its own (grammar 7.8, 7.6.3 rule 1,
+/// Decision D95).
+#[test]
+fn a_node_reached_only_through_a_fallback() {
+    accepts(
+        "fallback-only-node",
+        r#"
+agent.a:
+  model: model.m
+  prompt: Do it.
+  output:
+    verdict: { enum: [approve, revise] }
+flow.f:
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.a
+      input: "'x'"
+      on_error: { fallback: cleanup }
+    cleanup: { agent: agent.a, input: "'y'" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }
+    - { from: cleanup, to: end }
+"#,
+    );
+}
+
+/// The accepting half of the same reading of grammar 7.6.1 that
+/// `tests/fixtures/invalid-check/a-fallback-target-races-the-other-branch`
+/// pins the rejecting half of: a branch holds what its control transfers can
+/// schedule, and "neither is reachable from the other" is read over that same
+/// relation.
+///
+/// `cleanup` is `merge`'s fallback, and `merge` is the convergence both branches
+/// of the fork at `plan` deliver to — so `cleanup` sits on *both* branches and
+/// gets crossed with `left`, which writes the same unreduced channel. It runs
+/// only where `merge` failed, and `merge` runs only after `left` completed, so
+/// the two are sequential and no `reduce:` policy is owed. Reading a branch over
+/// control transfers while reading "reachable from the other" over edges alone
+/// would demand one here — a fallback on a convergence being an ordinary shape,
+/// that is the over-rejection the pairing of the two readings avoids
+/// (grammar 7.6.1, 7.8, 9.2, 10.2, Decision D32).
+#[test]
+fn a_fallback_below_a_convergence_is_sequential_with_the_branches() {
+    accepts(
+        "fallback-below-a-convergence",
+        r#"
+agent.a:
+  model: model.m
+  prompt: Do it.
+  output:
+    verdict: { enum: [approve, revise] }
+agent.n:
+  model: model.m
+  prompt: Note.
+  output:
+    note: { type: string }
+state:
+  note: { type: string, default: "" }
+flow.f:
+  outputs: {}
+  nodes:
+    plan: { agent: agent.a, input: "'p'" }
+    left: { agent: agent.n, input: "'l'" }
+    right: { agent: agent.a, input: "'r'" }
+    merge:
+      agent: agent.a
+      input: "'m'"
+      on_error: { fallback: cleanup }
+    cleanup: { agent: agent.n, input: "'c'" }
+  edges:
+    - { from: start, to: plan }
+    - { from: plan, to: left }
+    - { from: plan, to: right }
+    - { from: left, to: merge }
+    - { from: right, to: merge }
+    - { from: merge, to: end }
+    - { from: cleanup, to: end }
+"#,
+    );
+}
+
+/// A bounded cycle whose two nodes both write one **unreduced** channel.
+///
+/// `review`'s two out-edges are a `when:` and an `else:`, which grammar 7.3
+/// rule 4 makes exclusive by construction, so the flow has no fork at all — no
+/// co-takeable pair, no concurrency, and two writers that simply alternate
+/// across steps. The concurrency relation is stated over the two edges of one
+/// co-takeable pair (grammar 7.6.1), and a rule that read "in one cycle" as
+/// "concurrent" on its own would make the PRD's flagship loop unwritable
+/// without a `reduce:` policy on every channel it touches. What a cycle does
+/// change is the reading of a pair that already exists, which is
+/// `tests/fixtures/invalid-check/writers-deep-in-a-cycle-reach-each-other`.
+#[test]
+fn a_bounded_loop_with_no_fork_races_nothing() {
+    accepts(
+        "loop-without-a-fork",
+        r#"
+agent.r:
+  model: model.m
+  prompt: Do it.
+  output:
+    note: { type: string }
+    verdict: { enum: [approve, revise] }
+state:
+  note: { type: string, default: "" }
+flow.f:
+  outputs: {}
+  nodes:
+    write: { agent: agent.r, input: "'w'" }
+    review: { agent: agent.r, input: "'r'" }
+  edges:
+    - { from: start, to: write }
+    - { from: write, to: review }
+    - { from: review, to: write, when: "review.output.verdict == 'revise'", max_iterations: 3 }
+    - { from: review, to: end, else: true }
+"#,
+    );
+}
+
+/// The accepting half of `a-fork-inside-a-bounded-cycle-races` and of
+/// `writers-deep-in-a-cycle-reach-each-other`: the very same fan inside the very
+/// same bounded loop, with the `reduce:` policy those two are missing.
+///
+/// A fan inside a review loop is an ordinary shape, and what makes it legal is
+/// the declared policy rather than anything about the cycle — so the rule has to
+/// stop asking the moment the policy is there (grammar 10.2, Decision D32).
+#[test]
+fn a_fan_inside_a_bounded_cycle_needs_only_the_policy() {
+    accepts(
+        "fan-inside-a-cycle",
+        r#"
+agent.a:
+  model: model.m
+  prompt: Do it.
+  output:
+    verdict: { enum: [approve, revise] }
+agent.n:
+  model: model.m
+  prompt: Note.
+  output:
+    note: { type: string }
+state:
+  note: { type: string, reduce: last_wins, default: "" }
+flow.f:
+  outputs: {}
+  nodes:
+    fork: { agent: agent.a, input: "'w'" }
+    x: { agent: agent.n, input: "'x'" }
+    y: { agent: agent.n, input: "'y'" }
+    j: { agent: agent.a, input: "'j'" }
+  edges:
+    - { from: start, to: fork }
+    - { from: fork, to: x }
+    - { from: fork, to: y }
+    - { from: x, to: j }
+    - { from: y, to: j }
+    - { from: j, to: fork, when: "j.output.verdict == 'revise'", max_iterations: 3 }
+    - { from: j, to: end, else: true }
+"#,
+    );
+}
+
+/// Grammar 7.4's escape rule reads over the source of **every** bounded edge,
+/// and outside a cycle only clause (b) is left to satisfy: a node alone in its
+/// component is left by every outgoing edge it has, so an `else: true` sibling
+/// discharges the rule on its own. The rejecting half is
+/// `tests/fixtures/invalid-check/bounded-edge-outside-every-cycle-has-no-escape`,
+/// where the same shape carries only guarded siblings and a fallback runs the
+/// source a second time (grammar 7.4, 9.2, Decisions D19, D90).
+#[test]
+fn a_bounded_edge_outside_every_cycle_escapes_through_an_else() {
+    accepts(
+        "acyclic-budget",
+        r#"
+agent.a:
+  model: model.m
+  prompt: Do it.
+  output:
+    verdict: { enum: [approve, revise] }
+flow.f:
+  outputs: {}
+  nodes:
+    a: { agent: agent.a, input: "'x'" }
+    b: { agent: agent.a, input: "'y'" }
+    c: { agent: agent.a, input: "'z'" }
+  edges:
+    - { from: start, to: a }
+    - { from: a, to: b, when: "a.output.verdict == 'approve'", max_iterations: 3 }
+    - { from: a, to: c, else: true }
+    - { from: b, to: end }
+    - { from: c, to: end }
+"#,
+    );
+}
+
+/// The rule is stated over the source node of the bounded edge and is checked
+/// there, whatever else bounds the SCC (grammar 7.4): `p` sits upstream of a
+/// loop it never joins, and its own `else: true` sibling is what discharges the
+/// rule — not the loop's `else:` exit, which belongs to `review`.
+#[test]
+fn a_bounded_edge_upstream_of_a_cycle_escapes_through_an_else() {
+    accepts(
+        "budget-above-a-cycle",
+        r#"
+agent.a:
+  model: model.m
+  prompt: Do it.
+  output:
+    verdict: { enum: [approve, revise] }
+flow.f:
+  outputs: {}
+  nodes:
+    p: { agent: agent.a, input: "'p'" }
+    q: { agent: agent.a, input: "'q'" }
+    write: { agent: agent.a, input: "'w'" }
+    review: { agent: agent.a, input: "'r'" }
+  edges:
+    - { from: start, to: p }
+    - { from: p, to: q, when: "p.output.verdict == 'approve'", max_iterations: 3 }
+    - { from: p, to: write, else: true }
+    - { from: q, to: end }
+    - { from: write, to: review }
+    - { from: review, to: write, when: "review.output.verdict == 'revise'" }
+    - { from: review, to: end, else: true }
+"#,
+    );
+}
+
+/// A node the loop routes to *does* carry the escape rule, and an `else: true`
+/// sibling discharges it: the pass that exhausts the budget takes that edge
+/// instead of dead-ending, which is the whole content of Decision D19. The
+/// rejecting half is the fixture named above (grammar 7.4, 7.3 rules 4 and 5).
+#[test]
+fn a_bounded_edge_below_a_cycle_escapes_through_an_else() {
+    accepts(
+        "budget-below-a-cycle",
+        r#"
+agent.a:
+  model: model.m
+  prompt: Do it.
+  output:
+    verdict: { enum: [approve, revise, escalate] }
+flow.f:
+  outputs: {}
+  nodes:
+    a: { agent: agent.a, input: "'a'" }
+    b: { agent: agent.a, input: "'b'" }
+    n: { agent: agent.a, input: "'n'" }
+    x: { agent: agent.a, input: "'x'" }
+    y: { agent: agent.a, input: "'y'" }
+  edges:
+    - { from: start, to: a }
+    - { from: a, to: b }
+    - { from: b, to: a, when: "b.output.verdict == 'revise'" }
+    - { from: b, to: n, when: "b.output.verdict in ['approve', 'revise', 'escalate']" }
+    - { from: n, to: x, when: "n.output.verdict == 'approve'", max_iterations: 3 }
+    - { from: n, to: y, else: true }
+    - { from: x, to: end }
+    - { from: y, to: end }
 "#,
     );
 }

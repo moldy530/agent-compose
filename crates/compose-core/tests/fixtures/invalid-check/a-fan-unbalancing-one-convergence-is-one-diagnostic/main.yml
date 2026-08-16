@@ -1,0 +1,57 @@
+# rule: a fan of arms reaching one convergence at differing depths is reported once (grammar 7.6.2, PRD G3)
+# code: unbalanced-convergence
+# message: node `merge` of `flow.f` is reached from the fork `hub` at two different depths
+# at: main.yml:38:5
+# label: main.yml:47:7 this edge reaches it in 2 steps
+# label: main.yml:48:7 this one in 3 steps
+# help: a convergence reached in two different steps runs twice, once per arrival: route the short branch through the same depth, or make the two edges exclusive — `else: true` on one, or guards grammar 7.6.1 can prove disjoint (grammar 7.6.2, Decisions D69, D112)
+#
+# Four arms of one fork, two of them one node long and two of them two, all
+# landing on `merge`: four of the fork's six co-takeable pairs reach it at
+# differing depths (grammar 7.6.2) and one node is at the wrong depth. Reporting
+# the pairs would make this four diagnostics — an evenly split fan of ten arms is
+# 25, twenty is 100, a hundred and twenty is 3,600 — every one of them the
+# sentence this fixture's own `# message:` pins, at the same span, about the same
+# node, differing only in which two arms it underlines. The header's implicit
+# `# count: 1` is the whole assertion, and the pair drawn is the first two
+# out-edges in declaration order, so which one it is does not depend on how many
+# arms follow them.
+#
+# The convergence is named per fork: `hub` is the only one here, because `start`
+# has a single out-edge and no arm forks again.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.a:
+  model: model.m
+  prompt: Do it.
+  output:
+    verdict: { enum: [approve, revise] }
+flow.f:
+  outputs: {}
+  nodes:
+    hub: { agent: agent.a, input: "'h'" }
+    merge: { agent: agent.a, input: "'m'" }
+    lint: { agent: agent.a, input: "'l'" }
+    draft: { agent: agent.a, input: "'d'" }
+    revise: { agent: agent.a, input: "'r'" }
+    scan: { agent: agent.a, input: "'s'" }
+    plan: { agent: agent.a, input: "'p'" }
+    refine: { agent: agent.a, input: "'f'" }
+  edges:
+    - { from: start, to: hub }
+    - { from: hub, to: lint }
+    - { from: hub, to: draft }
+    - { from: hub, to: scan }
+    - { from: hub, to: plan }
+    - { from: lint, to: merge }
+    - { from: draft, to: revise }
+    - { from: revise, to: merge }
+    - { from: scan, to: merge }
+    - { from: plan, to: refine }
+    - { from: refine, to: merge }
+    - { from: merge, to: end }

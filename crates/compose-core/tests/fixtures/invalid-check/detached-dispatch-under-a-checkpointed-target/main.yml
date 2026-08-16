@@ -1,0 +1,40 @@
+# rule: `detach: true` is a validation error under a durably checkpointed target (Decision D59)
+# code: unsupported-detach
+# message: `detach: true` is not supported under the target `staging`
+# at: main.yml:36:17
+# help: only `local` runs with an in-memory checkpointer; every other target is durably checkpointed, and v0 has no outbox-pattern delivery for a fire-and-forget dispatch under one — drop `detach:`, or validate against `local` (grammar 8.6 rule 7, 14, Decision D59)
+# target: staging
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.a:
+  model: model.m
+  prompt: Do it.
+  output:
+    verdict: { enum: [approve, revise, escalate] }
+state:
+  tasks:
+    type: array
+    max_items: 5
+    items: { type: string }
+agent.sink:
+  model: model.m
+  prompt: Record.
+  output:
+    receipt: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    fan:
+      map:
+        over: "state.tasks"
+        node: agent.sink
+        detach: true
+        max_concurrency: 2
+  edges:
+    - { from: start, to: fan }
+    - { from: fan, to: end }

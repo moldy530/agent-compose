@@ -1,0 +1,24 @@
+# rule: a flow that instantiates itself is recursion (grammar 7.5, Decision D26)
+# code: recursive-flow
+# message: `flow.f` reaches itself
+# at: main.yml:21:20
+# help: a flow that reaches itself — through a `flow:` node, a `map` dispatch target, or the `flow.*` tools of an agent it reaches — has no termination proof analogous to grammar 7.4's SCC rule and would break the fan-out bounding guarantees: extract the shared part into a third flow, or break the cycle (grammar 7.5, 7.7, Decisions D26, D86)
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.a:
+  model: model.m
+  prompt: Do it.
+  output:
+    verdict: { enum: [approve, revise, escalate] }
+flow.f:
+  outputs: {}
+  nodes:
+    inner: { flow: flow.f }
+  edges:
+    - { from: start, to: inner }
+    - { from: inner, to: end }
