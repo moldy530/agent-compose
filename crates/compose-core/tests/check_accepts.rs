@@ -637,6 +637,65 @@ flow.f:
     );
 }
 
+/// `execution.item_index` derives a key the way the unkeyed-write help says it
+/// does: from inside a string-valued expression. The index itself is an integer
+/// (grammar 4.1) and a `key` is a string (grammar 11.4), so a bare
+/// `key: "execution.item_index"` is a type error however item-derived it is —
+/// what satisfies both is an expression that *reads* the index and evaluates to
+/// a string.
+#[test]
+fn an_item_index_keyed_store_write_inside_a_fan_out() {
+    accepts(
+        "map-store-write-keyed-by-the-index",
+        r#"
+provider.local:
+  kind: openai_compatible
+  base_url: ${U}
+store.docs:
+  kind: vector
+  scope: global
+  embed:
+    model: text-embedding-3-small
+    provider: provider.local
+state:
+  tasks:
+    type: array
+    max_items: 5
+    items: { type: string }
+  topic: { type: string, default: "" }
+flow.ingest:
+  inputs:
+    doc_id: { type: string }
+    text: { type: string }
+  outputs: {}
+  nodes:
+    save:
+      store: store.docs
+      op: upsert
+      key: "state.tasks[execution.item_index]"
+      value: "input.text"
+  edges:
+    - { from: start, to: save }
+    - { from: save, to: end }
+flow.f:
+  outputs: {}
+  nodes:
+    work:
+      map:
+        over: "state.tasks"
+        as: task
+        node: flow.ingest
+        max_concurrency: 4
+        input:
+          doc_id: "state.topic"
+          text: "task"
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }
+"#,
+    );
+}
+
 /// A store node reached by no `map` is not subject to the keying rule at all,
 /// and its derived output is written by name like any other (grammar 11.4).
 #[test]
