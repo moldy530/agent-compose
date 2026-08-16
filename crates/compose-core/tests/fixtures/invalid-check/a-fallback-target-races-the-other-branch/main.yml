@@ -1,0 +1,50 @@
+# rule: a fallback target is on its predecessor's branch and races the sibling branch (grammar 7.6.1, 7.8, 9.2, 10.2)
+# code: unreduced-write
+# message: nodes `right` and `cleanup` of `flow.f` run concurrently and both write the unreduced channel `note`
+# at: main.yml:43:5
+# label: main.yml:42:5 the other write is here
+# label: main.yml:31:3 the channel is declared here
+# help: two edges of one fork that are not provably exclusive can both fire, so the branches they start are concurrent: the channel they both write needs a declared `reduce:` policy — `append`, `merge`, or an explicit `last_wins` (grammar 7.6.1, 10.2, Decision D32)
+#
+# `cleanup` is reached from `left` by a control transfer rather than by an edge,
+# and grammar 9.2 schedules it "in the next step instead" of `left`'s own edges —
+# on `left`'s branch, while `right`'s branch runs on, because concurrent branches
+# are never cancelled (grammar 7.6.3). Replacing `on_error: { fallback: cleanup }`
+# with `- { from: left, to: cleanup }` describes the same runtime race, so the two
+# spellings have to get the same verdict: grammar 7.6.1 says "reachable" with no
+# qualifier, and 7.8 has the two control-transfer positions scheduling a node
+# exactly as an edge does. `dist` is the rule that counts edges only (7.6.2), and
+# it is not this one.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.a:
+  model: model.m
+  prompt: Do it.
+  output:
+    verdict: { enum: [approve, revise, escalate] }
+state:
+  note: { type: string, default: "" }
+agent.n:
+  model: model.m
+  prompt: Note.
+  output:
+    note: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    fork: { agent: agent.a, input: "'w'" }
+    left: { agent: agent.a, input: "'x'", on_error: { fallback: cleanup } }
+    right: { agent: agent.n, input: "'y'" }
+    cleanup: { agent: agent.n, input: "'z'" }
+  edges:
+    - { from: start, to: fork }
+    - { from: fork, to: left }
+    - { from: fork, to: right }
+    - { from: left, to: end }
+    - { from: right, to: end }
+    - { from: cleanup, to: end }

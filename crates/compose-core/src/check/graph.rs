@@ -5,14 +5,37 @@
 //! (grammar 7.2), which is what SCC termination (7.4), `dist` (7.6.2) and
 //! `map.over` dominance (8.6 rule 11) are all computed over; the
 //! **control-transfer** relation (7.8), which is the edge relation plus
-//! `on_error: { fallback: … }` and `human.on_timeout:`, and answers only
-//! "is this node addressable at all"; grammar 7.7's **component** relation,
-//! which is about other definitions entirely and lives in [`reach`](super::reach);
-//! and grammar 7.6.1's **concurrency** relation, which is derived from the edge
-//! relation by [`convergence`](super::convergence).
+//! `on_error: { fallback: … }` and `human.on_timeout:`; grammar 7.7's
+//! **component** relation, which is about other definitions entirely and lives
+//! in [`reach`](super::reach); and grammar 7.6.1's **concurrency** relation,
+//! which [`convergence`](super::convergence) derives from the second of them.
 //!
 //! This module owns the first two. Nothing here reports a diagnostic — it
 //! answers questions, and the modules that ask them decide what is wrong.
+//!
+//! # Which relation "reachable" means
+//!
+//! Two of grammar 7.6's rules read a fork's branches, and they read them over
+//! *different* relations — deliberately, and the grammar says so in each place:
+//!
+//! * **7.6.2** (`dist`, balanced convergence) counts **edges** only, and says
+//!   why: a control transfer "fires *instead of* the node's outgoing edges …
+//!   never alongside them, so it can never add a second concurrent arrival at a
+//!   convergence". A fallback is not a step, so it is not a distance.
+//! * **7.6.1** (concurrency) says "reachable" with no qualifier, and the two
+//!   control-transfer positions are exactly where a node reached only by one of
+//!   them lives: 7.8 has them "schedule a node exactly as an edge does", 9.2 has
+//!   a fallback target "scheduled in the next step instead", and 7.6.3 has
+//!   concurrent branches "never cancelled". So when a node on one branch fails
+//!   over to its fallback, that fallback runs on that branch while the sibling
+//!   branch is still live: it is concurrent with the sibling's nodes, and the
+//!   `reduce:` rule of 10.2 is owed on any channel they both write.
+//!
+//! Reading 7.6.1 over edges alone would accept exactly the race D32 says a
+//! declared policy must replace, and it would do so for a shape one keyword away
+//! from one the check rejects. [`Graph::reachable_through`] and
+//! [`Graph::reaches`] therefore answer over the control-transfer relation, and
+//! [`Graph::distances`] over the edge relation.
 //!
 //! # Vertices
 //!
@@ -86,16 +109,22 @@ pub(crate) struct Graph<'a> {
     from_node: Vec<Vec<usize>>,
     /// Per node, the distinct node indexes an edge takes it to.
     successors: Vec<Vec<usize>>,
+    /// The control-transfer relation (grammar 7.8): [`Graph::successors`] plus
+    /// `on_error: { fallback: … }` and `human.on_timeout:`. Two questions read
+    /// it — whether a node is addressable at all (7.8) and what a fork's branch
+    /// holds (7.6.1) — so it is built once with the id index that resolves it,
+    /// rather than rebuilt per question at a scan of the nodes per target.
+    transfers: Vec<Vec<usize>>,
     /// Per node, the strongly connected component it belongs to.
     component: Vec<usize>,
     /// Per component, its members in ascending index order.
     components: Vec<Vec<usize>>,
     /// Per node, whether its component has at least one edge.
     cyclic: Vec<bool>,
-    /// Per node, the nodes reachable from it over edges — the one answer here
-    /// that costs a walk per node, so it is computed on first use. Only the
-    /// concurrency relation asks for it (grammar 7.6.1), and a flow with no fork
-    /// never does.
+    /// Per node, the nodes reachable from it over control transfers — the one
+    /// answer here that costs a walk per node, so it is computed on first use.
+    /// Only the concurrency relation asks for it (grammar 7.6.1), and a flow
+    /// with no fork never does.
     reachable: OnceCell<Vec<Vec<bool>>>,
     /// The nodes belonging to no cycle, in topological order — the order
     /// [`Graph::distances`] relaxes in, shared by every branch it is asked
@@ -155,6 +184,20 @@ impl<'a> Graph<'a> {
             }
         }
 
+        // The edge relation plus the two control-transfer positions
+        // (grammar 7.8 clauses 2 and 3), resolved through the same id index the
+        // edges were.
+        let mut transfers = successors.clone();
+        for (at, node) in nodes.iter().enumerate() {
+            for target in control_targets(node) {
+                if let Some(to) = index.get(target)
+                    && !transfers[at].contains(to)
+                {
+                    transfers[at].push(*to);
+                }
+            }
+        }
+
         let (component, components) = components(&successors);
         let cyclic = components
             .iter()
@@ -174,6 +217,7 @@ impl<'a> Graph<'a> {
             from_start,
             from_node,
             successors,
+            transfers,
             component,
             components,
             cyclic,
@@ -260,9 +304,15 @@ impl<'a> Graph<'a> {
         self.cyclic[at]
     }
 
-    /// Whether one node is reachable from another over edges. A node reaches
-    /// itself only through a cycle, which is what "neither is reachable from the
-    /// other" needs of it (grammar 7.6.1).
+    /// Whether one node is reachable from another over control transfers — the
+    /// relation grammar 7.6.1 is read over (see this module's header). A node
+    /// reaches itself only through a cycle, which is what "neither is reachable
+    /// from the other" needs of it.
+    ///
+    /// A node reached from another by a fallback runs only where that other one
+    /// failed, and so runs *after* it rather than beside it: the same reading
+    /// that puts a fallback target on its predecessor's branch takes the pair
+    /// containing both of them out of the rule.
     pub(crate) fn reaches(&self, from: usize, to: usize) -> bool {
         self.reachable()[from][to]
     }
@@ -273,8 +323,8 @@ impl<'a> Graph<'a> {
                 .map(|node| {
                     walk(
                         self.nodes.len(),
-                        &self.successors,
-                        self.successors[node].iter().copied(),
+                        &self.transfers,
+                        self.transfers[node].iter().copied(),
                     )
                 })
                 .collect()
@@ -296,9 +346,12 @@ impl<'a> Graph<'a> {
         }
     }
 
-    /// The nodes reachable over edges from one entry, the entry itself included
-    /// — "reachable from a fork **through** this edge" (grammar 7.6.1), read of
-    /// the node the edge delivers to ([`Graph::entry`]).
+    /// The nodes reachable over **control transfers** from one entry, the entry
+    /// itself included — "reachable from a fork **through** this edge"
+    /// (grammar 7.6.1), read of the node the edge delivers to
+    /// ([`Graph::entry`]). A branch holds what it can schedule, and a fallback
+    /// target is scheduled on the branch of the node that failed over to it
+    /// (grammar 9.2, 7.8; see this module's header).
     ///
     /// The answer is the node indexes themselves, in ascending order, rather than
     /// a mask over every node: its reader pairs one branch's answer with
@@ -335,26 +388,7 @@ impl<'a> Graph<'a> {
     /// edges, `on_error: { fallback: … }`, and `human.on_timeout:`
     /// (grammar 7.8, Decision D95).
     pub(crate) fn addressable(&self) -> Vec<bool> {
-        walk(self.nodes.len(), &self.transfers(), self.entries())
-    }
-
-    /// The control-transfer relation as an adjacency list: the edge relation plus
-    /// `on_error: { fallback: … }` and `human.on_timeout:` (grammar 7.8).
-    fn transfers(&self) -> Vec<Vec<usize>> {
-        let mut transfers: Vec<Vec<usize>> = self.successors.clone();
-        for (at, node) in self.nodes.iter().enumerate() {
-            for target in control_targets(node) {
-                if let Some(to) = self
-                    .nodes
-                    .iter()
-                    .position(|other| other.id.value.as_str() == target)
-                    && !transfers[at].contains(&to)
-                {
-                    transfers[at].push(to);
-                }
-            }
-        }
-        transfers
+        walk(self.nodes.len(), &self.transfers, self.entries())
     }
 
     /// The step distances from a fork to every node it delivers to, over the

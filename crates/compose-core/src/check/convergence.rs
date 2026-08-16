@@ -58,6 +58,20 @@
 //! the `map` half is [`maps`](super::maps)', and this is the concurrent-branch
 //! half.
 //!
+//! **What a branch holds is read over control transfers, not over edges.** The
+//! two rules on this page read a fork's branches over two different relations,
+//! because grammar 7.6 states them that way: `dist` above "counts **edges**
+//! only" and says why, while 7.6.1's "reachable" carries no qualifier and the
+//! two control-transfer positions "schedule a node exactly as an edge does"
+//! (grammar 7.8, 9.2). A node reached only by `on_error: { fallback: … }` or
+//! `human.on_timeout:` runs on the branch of the node that failed over to it,
+//! while the sibling branch runs on — concurrent branches are never cancelled
+//! (grammar 7.6.3) — so it races that sibling's writers exactly as an
+//! edge-reached node would. Both halves of the definition are read over the one
+//! relation ([`Graph::reachable_through`], [`Graph::reaches`]): the same
+//! transfer that puts a fallback target on its predecessor's branch is what
+//! makes the two of them sequential rather than concurrent.
+//!
 //! The analysis is deliberately conservative: a guard pair it cannot prove
 //! exclusive is co-takeable, so it may ask for a policy on a channel two
 //! branches could not really both write. Declaring the policy is the cost, and
@@ -421,8 +435,9 @@ fn concurrent<'a>(ctx: &mut Ctx<'a>, cx: &FlowCx<'a>, graph: &Graph<'a>, pairs: 
                         continue;
                     }
                     let (one, other) = writers.order(one, other);
-                    // Neither reachable from the other: a node downstream of both
-                    // branches runs after them, not beside them.
+                    // Neither reachable from the other: a node downstream of
+                    // both branches runs after them, not beside them — and so
+                    // does a node its predecessor only ever fails over to.
                     if graph.reaches(writers.node(one), writers.node(other))
                         || graph.reaches(writers.node(other), writers.node(one))
                     {
@@ -511,7 +526,7 @@ impl<'a> Writers<'a> {
     }
 }
 
-/// The writers reachable through one edge (grammar 7.6.1), both ways round.
+/// The writers one branch holds (grammar 7.6.1), both ways round.
 struct Branch {
     /// Their writer indexes, ascending.
     members: Vec<usize>,

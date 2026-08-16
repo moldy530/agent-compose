@@ -1428,6 +1428,61 @@ flow.f:
     );
 }
 
+/// The accepting half of the same reading of grammar 7.6.1 that
+/// `tests/fixtures/invalid-check/a-fallback-target-races-the-other-branch`
+/// pins the rejecting half of: a branch holds what its control transfers can
+/// schedule, and "neither is reachable from the other" is read over that same
+/// relation.
+///
+/// `cleanup` is `merge`'s fallback, and `merge` is the convergence both branches
+/// of the fork at `plan` deliver to — so `cleanup` sits on *both* branches and
+/// gets crossed with `left`, which writes the same unreduced channel. It runs
+/// only where `merge` failed, and `merge` runs only after `left` completed, so
+/// the two are sequential and no `reduce:` policy is owed. Reading a branch over
+/// control transfers while reading "reachable from the other" over edges alone
+/// would demand one here — a fallback on a convergence being an ordinary shape,
+/// that is the over-rejection the pairing of the two readings avoids
+/// (grammar 7.6.1, 7.8, 9.2, 10.2, Decision D32).
+#[test]
+fn a_fallback_below_a_convergence_is_sequential_with_the_branches() {
+    accepts(
+        "fallback-below-a-convergence",
+        r#"
+agent.a:
+  model: model.m
+  prompt: Do it.
+  output:
+    verdict: { enum: [approve, revise] }
+agent.n:
+  model: model.m
+  prompt: Note.
+  output:
+    note: { type: string }
+state:
+  note: { type: string, default: "" }
+flow.f:
+  outputs: {}
+  nodes:
+    plan: { agent: agent.a, input: "'p'" }
+    left: { agent: agent.n, input: "'l'" }
+    right: { agent: agent.a, input: "'r'" }
+    merge:
+      agent: agent.a
+      input: "'m'"
+      on_error: { fallback: cleanup }
+    cleanup: { agent: agent.n, input: "'c'" }
+  edges:
+    - { from: start, to: plan }
+    - { from: plan, to: left }
+    - { from: plan, to: right }
+    - { from: left, to: merge }
+    - { from: right, to: merge }
+    - { from: merge, to: end }
+    - { from: cleanup, to: end }
+"#,
+    );
+}
+
 /// Grammar 7.4's escape rule reads over the source of **every** bounded edge,
 /// and outside a cycle only clause (b) is left to satisfy: a node alone in its
 /// component is left by every outgoing edge it has, so an `else: true` sibling
