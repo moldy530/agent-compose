@@ -1405,7 +1405,6 @@ fn a_missing_env_ref_fails_at_process_start_naming_the_variable() {
 
 /// `agent-compose build` writes a TypeScript project for the selected target.
 #[test]
-#[ignore = "pending: `agent-compose build` must exist"]
 fn build_writes_a_typescript_project_for_the_target() {
     for name in harness::FIXTURES {
         let built = harness::build(name, "local");
@@ -1437,11 +1436,12 @@ fn build_writes_a_typescript_project_for_the_target() {
 ///
 /// This is the machine-checkable half of "golden-file codegen tests". The other
 /// half — goldens committed to the repository and reviewed in PRs like any other
-/// code (CLAUDE.md) — belongs to the codegen PR that has output to commit; what
-/// makes those goldens *mean* anything is the determinism asserted here, because
-/// a regeneration diff is only signal if identical input regenerates identically.
+/// code (CLAUDE.md) — lives in `compose-core`'s
+/// `tests/generated_project_goldens.rs`, where the emitted bytes for both worked
+/// examples are committed under `tests/goldens/`. What makes those goldens *mean*
+/// anything is the determinism asserted here, because a regeneration diff is only
+/// signal if identical input regenerates identically.
 #[test]
-#[ignore = "pending: `agent-compose build` must exist"]
 fn build_is_byte_identical_for_byte_identical_input() {
     for name in harness::FIXTURES {
         let first = harness::build(name, "local");
@@ -1608,8 +1608,24 @@ fn serve_resumes_an_interrupted_execution_against_the_human_nodes_schema() {
 
 /// Every generated project type-checks and constructs its graph under the pinned
 /// LangGraph version (CLAUDE.md, *Generated-code checks*).
+///
+/// Two things about this test changed when `build` landed, and both are
+/// interface assumptions the harness header says a codegen PR may fix here:
+///
+/// * the module is `src/graph.ts`, not `./graph.js`. The emitted project has **no
+///   build step** — Node has stripped types natively since 22.18, so the
+///   TypeScript in `src/` is what runs — and a `.js` at the root would have had
+///   to come from a `tsc` emit `--noEmit` never performs. See the generated
+///   `README.md`, which documents the layout.
+/// * the reason names what is actually missing. `build` exists, the pinned
+///   toolchain exists, and `compose-core`'s `tests/generated_code_gates.rs`
+///   already runs *this* pair of checks — `tsc --noEmit` and construction under
+///   the pinned LangGraph — over the committed golden corpus on every `cargo
+///   test`. What is left is the subject: `src/graph.ts` builds no topology yet,
+///   so "constructs its graph" is not a claim this milestone can make until the
+///   flows are assembled into it.
 #[test]
-#[ignore = "pending: `agent-compose build` must exist, and the pinned LangGraph toolchain with it"]
+#[ignore = "pending: codegen must assemble the flows into `src/graph.ts`"]
 fn every_generated_project_type_checks_and_constructs_its_graph() {
     for name in harness::FIXTURES {
         let built = harness::build(name, "local");
@@ -1641,7 +1657,11 @@ fn every_generated_project_type_checks_and_constructs_its_graph() {
         // model LangGraph refuses, or an edge to a node that is not registered,
         // is a runtime error at build time and a green `tsc` either way.
         let construct = std::process::Command::new("node")
-            .args(["--input-type=module", "-e", "await import('./graph.js');"])
+            .args([
+                "--input-type=module",
+                "-e",
+                "const graph = await import('./src/graph.ts'); graph.createBuilder().compile();",
+            ])
             .current_dir(built.root())
             .output()
             .expect("node runs");

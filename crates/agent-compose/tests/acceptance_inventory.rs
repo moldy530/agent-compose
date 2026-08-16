@@ -216,7 +216,7 @@ const COMMANDS: &[Criterion] = &[
         phrase: "`agent-compose build`",
         tests: &[(
             "build_writes_a_typescript_project_for_the_target",
-            Status::Pending("pending: `agent-compose build` must exist"),
+            Status::Live,
         )],
     },
     Criterion {
@@ -252,12 +252,18 @@ const COMMANDS: &[Criterion] = &[
             ),
         ],
     },
+    // The committed half of this criterion — "goldens are reviewed in PRs like
+    // any other code" — lives in `compose-core`'s
+    // `tests/generated_project_goldens.rs`, over `tests/goldens/`. The row points
+    // at the acceptance test because that is what this file maps, and because the
+    // determinism it asserts through the real command is what makes a committed
+    // golden mean anything.
     Criterion {
         bullet: Bullet::Commands,
         phrase: "golden-file codegen tests",
         tests: &[(
             "build_is_byte_identical_for_byte_identical_input",
-            Status::Pending("pending: `agent-compose build` must exist"),
+            Status::Live,
         )],
     },
 ];
@@ -316,11 +322,15 @@ const STRATEGY: &[Criterion] = &[
     Criterion {
         bullet: Bullet::Strategy,
         phrase: "every golden fixture must type-check (`tsc`) and construct its graph under the pinned LangGraph version",
+        // `build` and the pinned toolchain both landed, and `compose-core`'s
+        // `tests/generated_code_gates.rs` already runs this criterion's two
+        // checks — `tsc --noEmit` and construction under the pinned LangGraph —
+        // over the committed golden corpus on every `cargo test`. The row stays
+        // pending because its *subject* has not landed: `src/graph.ts` builds no
+        // topology yet, so "constructs its graph" is not yet a claim to make.
         tests: &[(
             "every_generated_project_type_checks_and_constructs_its_graph",
-            Status::Pending(
-                "pending: `agent-compose build` must exist, and the pinned LangGraph toolchain with it",
-            ),
+            Status::Pending("pending: codegen must assemble the flows into `src/graph.ts`"),
         )],
     },
     Criterion {
