@@ -1,0 +1,67 @@
+[package]
+name = "mock-provider"
+description = "Scripted stand-in for the LLM providers agent-compose talks to: the M1 acceptance harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The runtime the server runs on. `rt-multi-thread` because one server serves a
+# compiled graph's concurrent `map` instances, which are concurrent *client*
+# connections; `time` is the scripted delay, the one clock this server reads
+# (see `control::Delay`); `net` is the listener; `sync` is the shutdown signal;
+# `macros` is `select!` in the accept loop, which is how that signal is heard
+# between connections. Off: `fs`, `process`, `signal` — nothing here reads a
+# file, spawns a child, or installs a handler, and the binary builds its own
+# runtime rather than taking `#[tokio::main]`.
+tokio = { version = "1", features = [
+  "rt",
+  "rt-multi-thread",
+  "net",
+  "time",
+  "sync",
+  "macros",
+] }
+# HTTP/1.1, server and client. Chosen over `axum` deliberately, on the same
+# footprint-and-control grounds `agent-compose` chose `annotate-snippets` over
+# `codespan-reporting`:
+#
+#   * the routing surface is seven fixed routes and one path-parameterized
+#     Azure form, which is a `match` on (method, path) rather than a router;
+#   * strict validation (the crate's whole point) means no request may be
+#     deserialized by an extractor: a malformed body has to be *recorded* with a
+#     per-field verdict and answered in the provider's own error shape, so
+#     `axum`'s rejection machinery would be bypassed on every path that matters;
+#   * the harness needs a client as well as a server — the acceptance suite
+#     sends the requests a compiled graph will send — and `hyper` is one
+#     dependency for both halves where `axum` would add a second stack.
+#
+# `http1` only: no provider surface here is HTTP/2-specific, and every client is
+# on loopback.
+hyper = { version = "1", features = ["http1", "server", "client"] }
+# The `tokio`↔`hyper` I/O bridge (`TokioIo`) and nothing else; `hyper` 1.x
+# deliberately ships no runtime glue of its own.
+hyper-util = { version = "0.1", features = ["tokio"] }
+# `BodyExt::collect` on the request side and `Full<Bytes>` on the response side:
+# the two body adapters `hyper` 1.x leaves out of its core.
+http-body-util = "0.1"
+# `hyper`'s own byte buffer, already in the tree through it; named here because
+# this crate constructs response bodies with it directly.
+bytes = "1"
+# The control plane is a JSON API and every recorded request is a JSON document,
+# so the shapes are declared as types next to what reads them rather than in
+# hand-written readers that could drift. `deny_unknown_fields` on the
+# control-plane types is what makes a typo in a scripted outcome an error
+# instead of a silently ignored key — the same posture the grammar takes on
+# unknown keys (D50).
+serde = { version = "1", features = ["derive"] }
+# The JSON reader/writer. Already the workspace's (`compose-core` emits the IR
+# with it), and its `Map` is a `BTreeMap`, so every body this server renders has
+# sorted keys and is byte-identical for byte-identical input — determinism is a
+# requirement here, not a nicety.
+serde_json = "1"
+# The `mock-provider` binary's argument surface. The workspace already ships a
+# `clap` CLI (`agent-compose`), and a second hand-rolled parser would answer
+# `--help` and a bad flag differently from the first.
+clap = { workspace = true }

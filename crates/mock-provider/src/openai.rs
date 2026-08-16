@@ -1,0 +1,1234 @@
+//! The OpenAI Chat Completions surface: `POST /v1/chat/completions`, and the
+//! Azure routes that carry the same body.
+//!
+//! Three of grammar 12.1's six provider kinds reach this surface — `openai`,
+//! `openai_compatible` (ollama, vLLM, proxies), and `azure_openai` — because
+//! they differ in *connection*, which is exactly the layer PRD 5.9 split off
+//! from behavior. Azure differs on the wire only in route and auth header:
+//! `POST /openai/deployments/<deployment>/chat/completions?api-version=…` with
+//! an `api-key:` header, or the newer `POST /openai/v1/chat/completions`. The
+//! body is the same body, so it is checked by the same code.
+//!
+//! # Structured output, two ways
+//!
+//! Both are accepted because both are what the LangChain JS integration sends,
+//! depending on the `method` it is configured with:
+//!
+//! * `response_format: { type: "json_schema", json_schema: { name, schema } }`,
+//!   answered with the object serialized into the assistant message's content;
+//! * a forced function (`tool_choice: { type: "function", function: { name } }`),
+//!   answered with a tool call whose `arguments` is the object serialized as a
+//!   **string** — which is the shape mistake this surface most wants to catch in
+//!   the other direction too, on requests that send `arguments` as an object.
+//!
+//! `WIRE-NOTES.md` records which of these could not be confirmed offline.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use serde_json::{Map, Value, json};
+
+use crate::control::{
+    Failure, Outcome, Reply, ReplyBody, StructuredOutput, ValidationFailure, canonical, estimate,
+};
+use crate::strict::{Checker, Dialect, Kind, at};
+use crate::wire::{Answer, HARNESS_STATUS, INVALID, MISMATCH, Response, UNSCRIPTED};
+
+/// The top-level keys this surface accepts.
+const REQUEST_KEYS: &[&str] = &[
+    "model",
+    "messages",
+    "tools",
+    "tool_choice",
+    "response_format",
+    "max_tokens",
+    "max_completion_tokens",
+    "temperature",
+    "top_p",
+    "n",
+    "stop",
+    "seed",
+    "stream",
+    "stream_options",
+    "user",
+    "parallel_tool_calls",
+    "presence_penalty",
+    "frequency_penalty",
+    "logprobs",
+    "top_logprobs",
+    "logit_bias",
+    "reasoning_effort",
+    "metadata",
+    "store",
+    "service_tier",
+];
+
+/// The roles this surface accepts.
+const ROLES: &[&str] = &["system", "developer", "user", "assistant", "tool"];
+
+/// What the surface understood about a request.
+pub(crate) struct Parsed {
+    pub(crate) model: String,
+    pub(crate) failures: Vec<ValidationFailure>,
+    pub(crate) tools: Vec<String>,
+    pub(crate) structured_output: Option<StructuredOutput>,
+}
+
+/// How the request reached this surface, which is all Azure changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Route {
+    /// `POST /v1/chat/completions`, `Authorization: Bearer …`.
+    Direct,
+    /// An Azure route: `api-key:` (or a bearer token), and an `api-version`
+    /// query parameter the service requires.
+    Azure,
+}
+
+/// Read and check one request.
+pub(crate) fn parse(
+    route: Route,
+    headers: &BTreeMap<String, String>,
+    query: &str,
+    deployment: Option<&str>,
+    body: Option<&Value>,
+) -> Parsed {
+    let mut checker = Checker::new(Dialect::OpenAi);
+    check_headers(&mut checker, route, headers);
+    if route == Route::Azure
+        && !query
+            .split('&')
+            .any(|pair| pair.starts_with("api-version="))
+    {
+        checker.fail(
+            "query.api-version",
+            "Missing required parameter: 'api-version'.",
+        );
+    }
+
+    let Some(body) = body.and_then(Value::as_object) else {
+        checker.fail(
+            "",
+            "We could not parse the JSON body of your request. (HINT: This likely means you aren't using your HTTP library correctly.)",
+        );
+        return Parsed {
+            model: deployment.unwrap_or_default().to_string(),
+            failures: checker.into_failures(),
+            tools: Vec::new(),
+            structured_output: None,
+        };
+    };
+
+    checker.closed("", body, REQUEST_KEYS);
+
+    // On the Azure routes the deployment in the path is what selects the model,
+    // and the body's `model` is optional; everywhere else it is required.
+    let model = match (route, body.get("model")) {
+        (Route::Azure, None) => deployment.unwrap_or_default().to_string(),
+        _ => checker
+            .required_string("", body, "model")
+            .unwrap_or_default()
+            .to_string(),
+    };
+
+    let tools = check_tools(&mut checker, body);
+    let forced = check_tool_choice(&mut checker, body, &tools);
+    check_messages(&mut checker, body, &tools);
+    let response_format = check_response_format(&mut checker, body);
+    check_streaming(&mut checker, body);
+
+    let structured_output = response_format.or_else(|| {
+        let name = forced?;
+        let schema = function_schema(body, &name)?;
+        Some(StructuredOutput::ForcedFunction { name, schema })
+    });
+
+    Parsed {
+        model,
+        failures: checker.into_failures(),
+        tools,
+        structured_output,
+    }
+}
+
+fn check_headers(checker: &mut Checker, route: Route, headers: &BTreeMap<String, String>) {
+    let value = |name: &str| headers.get(name).filter(|value| !value.is_empty());
+    let bearer = value("authorization").is_some_and(|value| value.starts_with("Bearer "));
+    match route {
+        Route::Direct if !bearer => checker.fail(
+            "headers.authorization",
+            "You didn't provide an API key. You need to provide your API key in an Authorization header using Bearer auth (i.e. Authorization: Bearer YOUR_KEY).",
+        ),
+        Route::Azure if !bearer && value("api-key").is_none() => checker.fail(
+            "headers.api-key",
+            "Access denied due to missing subscription key. Make sure to include subscription key when making requests to an API.",
+        ),
+        _ => {}
+    }
+    let json = headers
+        .get("content-type")
+        .is_some_and(|value| value.starts_with("application/json"));
+    if !json {
+        checker.fail(
+            "headers.content-type",
+            "Invalid content type. Expected 'application/json'.",
+        );
+    }
+}
+
+/// The tool surface, in request order.
+fn check_tools(checker: &mut Checker, body: &Map<String, Value>) -> Vec<String> {
+    let mut names = Vec::new();
+    let Some(tools) = checker.optional("", body, "tools", Kind::Array) else {
+        return names;
+    };
+    let mut seen = BTreeSet::new();
+    for (index, tool) in tools.as_array().into_iter().flatten().enumerate() {
+        let pointer = at("tools", index);
+        let Some(tool) = checker
+            .typed(&pointer, tool, Kind::Object)
+            .and_then(Value::as_object)
+        else {
+            continue;
+        };
+        checker.closed(&pointer, tool, &["type", "function"]);
+        if let Some(kind) = checker.required(&pointer, tool, "type") {
+            checker.one_of(&at(&pointer, "type"), kind, &["function"]);
+        }
+        let Some(function) = checker.required_object(&pointer, tool, "function") else {
+            continue;
+        };
+        let pointer = at(&pointer, "function");
+        checker.closed(
+            &pointer,
+            function,
+            &["name", "description", "parameters", "strict"],
+        );
+        let Some(name) = checker.required_string(&pointer, function, "name") else {
+            continue;
+        };
+        let name = name.to_string();
+        if !well_formed(&name) {
+            checker.fail(
+                &at(&pointer, "name"),
+                format!(
+                    "Invalid 'tools[{index}].function.name': string does not match pattern. Expected a string that matches the pattern '^[a-zA-Z0-9_-]+$'."
+                ),
+            );
+        }
+        if !seen.insert(name.clone()) {
+            checker.fail(
+                &at(&pointer, "name"),
+                format!("Invalid 'tools': duplicate function name '{name}'."),
+            );
+        }
+        if let Some(parameters) = checker.optional(&pointer, function, "parameters", Kind::Object)
+            && parameters.get("type").and_then(Value::as_str) != Some("object")
+        {
+            checker.fail(
+                &at(&pointer, "parameters.type"),
+                format!(
+                    "Invalid schema for function '{name}': schema must be a JSON Schema of 'type: \"object\"'."
+                ),
+            );
+        }
+        names.push(name);
+    }
+    names
+}
+
+/// `tool_choice`, and the function it forces if it forces one.
+fn check_tool_choice(
+    checker: &mut Checker,
+    body: &Map<String, Value>,
+    tools: &[String],
+) -> Option<String> {
+    let choice = body.get("tool_choice")?;
+    match choice {
+        Value::String(_) => {
+            checker.one_of("tool_choice", choice, &["none", "auto", "required"]);
+            None
+        }
+        Value::Object(choice) => {
+            checker.closed("tool_choice", choice, &["type", "function"]);
+            if let Some(kind) = checker.required("tool_choice", choice, "type") {
+                checker.one_of("tool_choice.type", kind, &["function"]);
+            }
+            let function = checker.required_object("tool_choice", choice, "function")?;
+            checker.closed("tool_choice.function", function, &["name"]);
+            let name = checker
+                .required_string("tool_choice.function", function, "name")?
+                .to_string();
+            if !tools.contains(&name) {
+                checker.fail(
+                    "tool_choice.function.name",
+                    format!("Invalid value: '{name}'. Supported values are the names in 'tools'."),
+                );
+                return None;
+            }
+            Some(name)
+        }
+        other => {
+            checker.typed("tool_choice", other, Kind::Object);
+            None
+        }
+    }
+}
+
+/// The schema a named function declares.
+fn function_schema(body: &Map<String, Value>, name: &str) -> Option<Value> {
+    body.get("tools")?
+        .as_array()?
+        .iter()
+        .map(|tool| tool.get("function").unwrap_or(&Value::Null))
+        .find(|function| function.get("name").and_then(Value::as_str) == Some(name))?
+        .get("parameters")
+        .cloned()
+}
+
+/// `response_format`, and the structured output it asks for.
+fn check_response_format(
+    checker: &mut Checker,
+    body: &Map<String, Value>,
+) -> Option<StructuredOutput> {
+    let format = checker.optional("", body, "response_format", Kind::Object)?;
+    let format = format.as_object()?;
+    checker.closed("response_format", format, &["type", "json_schema"]);
+    let kind = checker.required("response_format", format, "type")?;
+    let kind = checker
+        .one_of(
+            "response_format.type",
+            kind,
+            &["text", "json_object", "json_schema"],
+        )?
+        .to_string();
+    if kind != "json_schema" {
+        if format.contains_key("json_schema") {
+            checker.fail(
+                "response_format.json_schema",
+                format!("Unrecognized request argument supplied: response_format.json_schema (with type '{kind}')"),
+            );
+        }
+        return None;
+    }
+    let schema = checker.required_object("response_format", format, "json_schema")?;
+    checker.closed(
+        "response_format.json_schema",
+        schema,
+        &["name", "schema", "strict", "description"],
+    );
+    let name = checker
+        .required_string("response_format.json_schema", schema, "name")?
+        .to_string();
+    let declared = checker
+        .required_object("response_format.json_schema", schema, "schema")
+        .cloned()?;
+    let strict = schema
+        .get("strict")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    Some(StructuredOutput::JsonSchema {
+        name,
+        schema: Value::Object(declared),
+        strict,
+    })
+}
+
+/// The message list, including the `tool` correlation rule.
+fn check_messages(checker: &mut Checker, body: &Map<String, Value>, tools: &[String]) {
+    let Some(messages) = checker.required_array("", body, "messages") else {
+        return;
+    };
+    if messages.is_empty() {
+        checker.fail(
+            "messages",
+            "Invalid 'messages': empty array. Expected an array with minimum length 1.",
+        );
+        return;
+    }
+
+    // The ids the most recent assistant turn is waiting on.
+    let mut awaiting: Vec<String> = Vec::new();
+
+    for (index, message) in messages.iter().enumerate() {
+        let pointer = at("messages", index);
+        let Some(message) = checker
+            .typed(&pointer, message, Kind::Object)
+            .and_then(Value::as_object)
+        else {
+            continue;
+        };
+        let Some(role) = checker.required(&pointer, message, "role") else {
+            continue;
+        };
+        let Some(role) = checker
+            .one_of(&at(&pointer, "role"), role, ROLES)
+            .map(str::to_string)
+        else {
+            continue;
+        };
+
+        // A turn that is not the answer to the pending tool calls means those
+        // calls were dropped — the tool loop losing a result.
+        if role != "tool" && !awaiting.is_empty() {
+            unanswered(checker, index, &awaiting);
+            awaiting.clear();
+        }
+
+        match role.as_str() {
+            "system" | "developer" | "user" => {
+                checker.closed(&pointer, message, &["role", "content", "name"]);
+                if let Some(content) = checker.required(&pointer, message, "content") {
+                    check_content(checker, &at(&pointer, "content"), content);
+                }
+            }
+            "assistant" => {
+                checker.closed(
+                    &pointer,
+                    message,
+                    &["role", "content", "name", "tool_calls", "refusal"],
+                );
+                let calls = check_tool_calls(checker, &pointer, message, tools);
+                let has_content = message
+                    .get("content")
+                    .is_some_and(|content| !content.is_null());
+                if has_content {
+                    check_content(checker, &at(&pointer, "content"), &message["content"]);
+                }
+                if !has_content && calls.is_empty() {
+                    checker.fail(
+                        &pointer,
+                        format!(
+                            "Invalid 'messages[{index}]': assistant message must carry 'content' or 'tool_calls'."
+                        ),
+                    );
+                }
+                awaiting = calls;
+            }
+            "tool" => {
+                checker.closed(&pointer, message, &["role", "content", "tool_call_id"]);
+                if let Some(content) = checker.required(&pointer, message, "content") {
+                    check_content(checker, &at(&pointer, "content"), content);
+                }
+                let Some(answers) = checker.required_string(&pointer, message, "tool_call_id")
+                else {
+                    continue;
+                };
+                let answers = answers.to_string();
+                if let Some(position) = awaiting.iter().position(|id| *id == answers) {
+                    awaiting.remove(position);
+                } else {
+                    checker.fail(
+                        &at(&pointer, "tool_call_id"),
+                        format!(
+                            "Invalid parameter: messages with role 'tool' must be a response to a preceding message with 'tool_calls'; '{answers}' answers no pending call."
+                        ),
+                    );
+                }
+            }
+            _ => unreachable!("`one_of` admitted only the roles above"),
+        }
+    }
+
+    if !awaiting.is_empty() {
+        unanswered(checker, messages.len(), &awaiting);
+    }
+}
+
+fn unanswered(checker: &mut Checker, message: usize, ids: &[String]) {
+    let list = ids
+        .iter()
+        .map(|id| format!("'{id}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    checker.fail(
+        &at("messages", message.saturating_sub(1)),
+        format!(
+            "An assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id'. The following tool_call_ids did not have response messages: {list}"
+        ),
+    );
+}
+
+/// An assistant turn's `tool_calls`, returning the ids it is waiting on.
+fn check_tool_calls(
+    checker: &mut Checker,
+    pointer: &str,
+    message: &Map<String, Value>,
+    tools: &[String],
+) -> Vec<String> {
+    let mut ids = Vec::new();
+    let Some(calls) = checker.optional(pointer, message, "tool_calls", Kind::Array) else {
+        return ids;
+    };
+    for (index, call) in calls.as_array().into_iter().flatten().enumerate() {
+        let pointer = at(&at(pointer, "tool_calls"), index);
+        let Some(call) = checker
+            .typed(&pointer, call, Kind::Object)
+            .and_then(Value::as_object)
+        else {
+            continue;
+        };
+        checker.closed(&pointer, call, &["id", "type", "function"]);
+        if let Some(kind) = checker.required(&pointer, call, "type") {
+            checker.one_of(&at(&pointer, "type"), kind, &["function"]);
+        }
+        if let Some(id) = checker.required_string(&pointer, call, "id") {
+            ids.push(id.to_string());
+        }
+        let Some(function) = checker.required_object(&pointer, call, "function") else {
+            continue;
+        };
+        let pointer = at(&pointer, "function");
+        checker.closed(&pointer, function, &["name", "arguments"]);
+        if let Some(name) = checker.required_string(&pointer, function, "name")
+            && !tools.is_empty()
+            && !tools.iter().any(|tool| tool == name)
+        {
+            checker.fail(
+                &at(&pointer, "name"),
+                format!("Invalid value: '{name}'. This message calls a function the request does not define."),
+            );
+        }
+        // The shape mistake this surface exists to catch: `arguments` travels as
+        // a JSON *string*, not as an object, and a client that sends the object
+        // is a client the real API refuses.
+        if let Some(arguments) = checker.required(&pointer, function, "arguments") {
+            let pointer = at(&pointer, "arguments");
+            if let Some(text) = checker
+                .typed(&pointer, arguments, Kind::String)
+                .and_then(Value::as_str)
+                && serde_json::from_str::<Value>(text).is_err()
+            {
+                checker.fail(
+                    &pointer,
+                    format!("Invalid '{pointer}': expected a JSON-encoded string."),
+                );
+            }
+        }
+    }
+    ids
+}
+
+/// Message content: a string, or a list of parts.
+fn check_content(checker: &mut Checker, pointer: &str, content: &Value) {
+    match content {
+        Value::String(_) => {}
+        Value::Array(parts) => {
+            if parts.is_empty() {
+                checker.fail(
+                    pointer,
+                    format!(
+                        "Invalid '{pointer}': empty array. Expected an array with minimum length 1."
+                    ),
+                );
+            }
+            for (index, part) in parts.iter().enumerate() {
+                let pointer = at(pointer, index);
+                let Some(part) = checker
+                    .typed(&pointer, part, Kind::Object)
+                    .and_then(Value::as_object)
+                else {
+                    continue;
+                };
+                let Some(kind) = checker.required(&pointer, part, "type") else {
+                    continue;
+                };
+                let Some(kind) = checker
+                    .one_of(
+                        &at(&pointer, "type"),
+                        kind,
+                        &["text", "image_url", "input_audio"],
+                    )
+                    .map(str::to_string)
+                else {
+                    continue;
+                };
+                if kind == "text" {
+                    checker.closed(&pointer, part, &["type", "text"]);
+                    checker.required_string(&pointer, part, "text");
+                }
+            }
+        }
+        other => {
+            checker.typed(pointer, other, Kind::String);
+        }
+    }
+}
+
+fn check_streaming(checker: &mut Checker, body: &Map<String, Value>) {
+    if body.get("stream") == Some(&Value::Bool(true)) {
+        checker.fail(
+            "stream",
+            "stream: the mock provider does not implement streaming responses (WIRE-NOTES.md); \
+             a compiled graph must invoke the model, not stream it.",
+        );
+    }
+}
+
+fn well_formed(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name.chars().all(|character| {
+            character.is_ascii_alphanumeric() || character == '_' || character == '-'
+        })
+}
+
+/// Render a served outcome into the Chat Completions wire shape.
+pub(crate) fn render(
+    sequence: u64,
+    request: &Value,
+    model: &str,
+    structured: Option<&StructuredOutput>,
+    outcome: &Outcome,
+) -> Answer {
+    match outcome {
+        Outcome::Failure(failure) => failure_answer(failure),
+        Outcome::Raw(raw) => {
+            let mut response = Response::new(raw.status, raw.body.clone()).after(raw.delay);
+            for (name, value) in &raw.headers {
+                response = response.header(name, value.clone());
+            }
+            response.answer()
+        }
+        Outcome::Reply(reply) => reply_answer(sequence, request, model, structured, reply),
+    }
+}
+
+fn reply_answer(
+    sequence: u64,
+    request: &Value,
+    model: &str,
+    structured: Option<&StructuredOutput>,
+    reply: &Reply,
+) -> Answer {
+    let offered: Vec<String> = request
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let (message, finish) = match &reply.body {
+        ReplyBody::Text(text) => (
+            json!({ "role": "assistant", "content": text, "refusal": Value::Null }),
+            "stop",
+        ),
+        ReplyBody::Structured(value) => match structured {
+            Some(StructuredOutput::JsonSchema { .. }) => (
+                json!({
+                    "role": "assistant",
+                    "content": canonical(value),
+                    "refusal": Value::Null,
+                }),
+                "stop",
+            ),
+            Some(StructuredOutput::ForcedFunction { name, .. }) => (
+                json!({
+                    "role": "assistant",
+                    "content": Value::Null,
+                    "tool_calls": [call_block(sequence, 0, name, value)],
+                    "refusal": Value::Null,
+                }),
+                "tool_calls",
+            ),
+            _ => {
+                return mismatch(
+                    "a `structured` reply needs a request that asks for structured output: this \
+                     one carries neither `response_format: {type: \"json_schema\"}` nor a forced \
+                     function",
+                );
+            }
+        },
+        ReplyBody::Tools {
+            calls: scripted,
+            text,
+        } => {
+            let mut calls = Vec::new();
+            for (index, call) in scripted.iter().enumerate() {
+                if !offered.contains(&call.name) {
+                    return mismatch(&format!(
+                        "the script calls the function `{}`, which this request does not offer",
+                        call.name
+                    ));
+                }
+                let mut block = call_block(sequence, index, &call.name, &call.input);
+                if let Some(id) = &call.id {
+                    block["id"] = json!(id);
+                }
+                calls.push(block);
+            }
+            (
+                json!({
+                    "role": "assistant",
+                    "content": text.clone().map_or(Value::Null, Value::String),
+                    "tool_calls": calls,
+                    "refusal": Value::Null,
+                }),
+                "tool_calls",
+            )
+        }
+    };
+
+    let finish_reason = reply
+        .stop_reason
+        .clone()
+        .unwrap_or_else(|| finish.to_string());
+    let usage = reply.usage.map_or_else(
+        || {
+            let input = estimate(&canonical(request));
+            let output = estimate(&canonical(&message));
+            (input, output)
+        },
+        |usage| (usage.input_tokens, usage.output_tokens),
+    );
+
+    Response::new(
+        200,
+        json!({
+            "id": format!("chatcmpl-mock-{sequence:08}"),
+            "object": "chat.completion",
+            "created": crate::control::CREATED,
+            "model": model,
+            "system_fingerprint": "fp_mock",
+            "choices": [{
+                "index": 0,
+                "message": message,
+                "logprobs": Value::Null,
+                "finish_reason": finish_reason,
+            }],
+            "usage": {
+                "prompt_tokens": usage.0,
+                "completion_tokens": usage.1,
+                "total_tokens": usage.0 + usage.1,
+            },
+        }),
+    )
+    .header("x-request-id", format!("req_mock_{sequence:08}"))
+    .after(reply.delay)
+    .answer()
+}
+
+fn call_block(sequence: u64, index: usize, name: &str, input: &Value) -> Value {
+    json!({
+        "id": format!("call_mock_{sequence:08}_{index}"),
+        "type": "function",
+        "function": { "name": name, "arguments": canonical(input) },
+    })
+}
+
+fn failure_answer(failure: &Failure) -> Answer {
+    match failure {
+        Failure::RateLimit {
+            retry_after_seconds,
+        } => {
+            let response = error(
+                429,
+                "requests",
+                Some("rate_limit_exceeded"),
+                "Rate limit reached for requests. Please try again later.",
+            );
+            match retry_after_seconds {
+                Some(seconds) => response.header("retry-after", seconds.to_string()),
+                None => response,
+            }
+            .answer()
+        }
+        Failure::Overloaded => error(
+            503,
+            "server_error",
+            None,
+            "The server is overloaded or not ready yet.",
+        )
+        .answer(),
+        Failure::ServerError => error(
+            500,
+            "server_error",
+            None,
+            "The server had an error while processing your request. Sorry about that!",
+        )
+        .answer(),
+        Failure::Timeout { delay } => Answer::Close(*delay),
+    }
+}
+
+/// The Chat Completions error envelope.
+fn error(status: u16, kind: &str, code: Option<&str>, message: &str) -> Response {
+    Response::new(
+        status,
+        json!({
+            "error": {
+                "message": message,
+                "type": kind,
+                "param": Value::Null,
+                "code": code.map_or(Value::Null, |code| json!(code)),
+            }
+        }),
+    )
+}
+
+/// The answer to a request that failed validation.
+pub(crate) fn rejected(failures: &[ValidationFailure]) -> Answer {
+    let message = failures
+        .iter()
+        .map(|failure| failure.message.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let param = failures.first().map(|failure| failure.pointer.clone());
+    let mut response = error(400, "invalid_request_error", None, &message).harness(INVALID);
+    if let Some(param) = param {
+        response.body["error"]["param"] = json!(param);
+    }
+    response.answer()
+}
+
+/// The answer to a request no scripted outcome answered.
+pub(crate) fn unscripted(model: &str, reason: &str) -> Answer {
+    error(
+        HARNESS_STATUS,
+        "invalid_request_error",
+        Some("mock_provider"),
+        &format!(
+            "mock provider: no scripted outcome for model `{model}` ({reason}). \
+             Enqueue one through POST /_mock/enqueue before the graph runs."
+        ),
+    )
+    .harness(UNSCRIPTED)
+    .answer()
+}
+
+/// The answer to a script that cannot be rendered into what the request asked
+/// for.
+fn mismatch(reason: &str) -> Answer {
+    error(
+        HARNESS_STATUS,
+        "invalid_request_error",
+        Some("mock_provider"),
+        &format!("mock provider: {reason}"),
+    )
+    .harness(MISMATCH)
+    .answer()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control::{HARNESS_HEADER, ToolCall};
+
+    fn headers() -> BTreeMap<String, String> {
+        [
+            ("authorization", "Bearer test-key"),
+            ("content-type", "application/json"),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect()
+    }
+
+    fn parse_direct(body: &Value) -> Parsed {
+        parse(Route::Direct, &headers(), "", None, Some(body))
+    }
+
+    fn check(body: &Value) -> Vec<String> {
+        parse_direct(body)
+            .failures
+            .into_iter()
+            .map(|failure| failure.pointer)
+            .collect()
+    }
+
+    fn request(extra: Value) -> Value {
+        let mut request = json!({
+            "model": "gpt-4o-mini",
+            "messages": [{ "role": "user", "content": "hi" }],
+        });
+        for (key, value) in extra.as_object().expect("an object") {
+            request[key] = value.clone();
+        }
+        request
+    }
+
+    /// The `response_format` shape of structured output, understood.
+    #[test]
+    fn a_json_schema_request_is_accepted_and_understood() {
+        let body = request(json!({
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "review",
+                    "strict": true,
+                    "schema": { "type": "object", "properties": { "verdict": { "type": "string" } } },
+                },
+            },
+        }));
+        let parsed = parse_direct(&body);
+        assert!(parsed.failures.is_empty(), "{:?}", parsed.failures);
+        let Some(StructuredOutput::JsonSchema { name, strict, .. }) = parsed.structured_output
+        else {
+            panic!("`response_format` is one of the two structured-output surfaces");
+        };
+        assert_eq!(name, "review");
+        assert!(strict);
+    }
+
+    /// The forced-function shape of structured output, understood.
+    #[test]
+    fn a_forced_function_request_is_accepted_and_understood() {
+        let body = request(json!({
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "extract",
+                    "parameters": { "type": "object", "properties": {} },
+                },
+            }],
+            "tool_choice": { "type": "function", "function": { "name": "extract" } },
+        }));
+        let parsed = parse_direct(&body);
+        assert!(parsed.failures.is_empty(), "{:?}", parsed.failures);
+        assert_eq!(parsed.tools, ["extract"]);
+        assert!(matches!(
+            parsed.structured_output,
+            Some(StructuredOutput::ForcedFunction { .. })
+        ));
+    }
+
+    /// The envelope and the auth header.
+    #[test]
+    fn the_required_envelope_is_required() {
+        assert_eq!(check(&json!({ "messages": [] })), ["model", "messages"]);
+
+        let mut anonymous = headers();
+        anonymous.remove("authorization");
+        let failures: Vec<String> = parse(
+            Route::Direct,
+            &anonymous,
+            "",
+            None,
+            Some(&request(json!({}))),
+        )
+        .failures
+        .into_iter()
+        .map(|failure| failure.pointer)
+        .collect();
+        assert_eq!(failures, ["headers.authorization"]);
+    }
+
+    /// An unknown argument is the API's own sentence, not a shrug.
+    #[test]
+    fn an_unknown_request_argument_is_refused() {
+        let parsed = parse_direct(&request(json!({ "temperatur": 0.5 })));
+        assert_eq!(parsed.failures.len(), 1);
+        assert_eq!(
+            parsed.failures[0].message,
+            "Unrecognized request argument supplied: temperatur"
+        );
+    }
+
+    /// A `tool` message answers a pending call, or it is not a valid message.
+    #[test]
+    fn a_tool_message_must_answer_a_pending_call() {
+        let stray = request(json!({
+            "messages": [
+                { "role": "user", "content": "go" },
+                { "role": "tool", "content": "result", "tool_call_id": "call_1" },
+            ],
+        }));
+        let failures = parse_direct(&stray).failures;
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].pointer, "messages.1.tool_call_id");
+        assert!(
+            failures[0]
+                .message
+                .contains("must be a response to a preceding message"),
+            "{}",
+            failures[0].message
+        );
+    }
+
+    /// Every pending call must be answered before the conversation moves on.
+    #[test]
+    fn a_dropped_tool_result_is_refused() {
+        let dropped = request(json!({
+            "tools": [{ "type": "function", "function": { "name": "web_search" } }],
+            "messages": [
+                { "role": "user", "content": "go" },
+                { "role": "assistant", "tool_calls": [
+                    { "id": "call_1", "type": "function", "function": { "name": "web_search", "arguments": "{}" } },
+                    { "id": "call_2", "type": "function", "function": { "name": "web_search", "arguments": "{}" } },
+                ]},
+                { "role": "tool", "content": "one", "tool_call_id": "call_1" },
+                { "role": "user", "content": "carry on" },
+            ],
+        }));
+        let failures = parse_direct(&dropped).failures;
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].message.contains("'call_2'"), "{failures:?}");
+    }
+
+    /// The whole loop, correct.
+    #[test]
+    fn a_well_formed_tool_loop_is_accepted() {
+        let body = request(json!({
+            "tools": [{ "type": "function", "function": { "name": "web_search", "parameters": { "type": "object" } } }],
+            "messages": [
+                { "role": "system", "content": "You search." },
+                { "role": "user", "content": "go" },
+                { "role": "assistant", "tool_calls": [
+                    { "id": "call_1", "type": "function", "function": { "name": "web_search", "arguments": "{\"query\":\"it\"}" } },
+                ]},
+                { "role": "tool", "content": "found", "tool_call_id": "call_1" },
+            ],
+        }));
+        let parsed = parse_direct(&body);
+        assert!(parsed.failures.is_empty(), "{:?}", parsed.failures);
+    }
+
+    /// `arguments` is a JSON string. An object there is the shape mistake a
+    /// generated tool loop makes, and a real request would be refused for it.
+    #[test]
+    fn tool_call_arguments_travel_as_a_json_string() {
+        let body = request(json!({
+            "tools": [{ "type": "function", "function": { "name": "web_search" } }],
+            "messages": [
+                { "role": "user", "content": "go" },
+                { "role": "assistant", "tool_calls": [
+                    { "id": "call_1", "type": "function", "function": { "name": "web_search", "arguments": { "query": "it" } } },
+                ]},
+                { "role": "tool", "content": "found", "tool_call_id": "call_1" },
+            ],
+        }));
+        let failures = parse_direct(&body).failures;
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(
+            failures[0].pointer,
+            "messages.1.tool_calls.0.function.arguments"
+        );
+
+        let malformed = request(json!({
+            "tools": [{ "type": "function", "function": { "name": "web_search" } }],
+            "messages": [
+                { "role": "user", "content": "go" },
+                { "role": "assistant", "tool_calls": [
+                    { "id": "call_1", "type": "function", "function": { "name": "web_search", "arguments": "{not json" } },
+                ]},
+                { "role": "tool", "content": "found", "tool_call_id": "call_1" },
+            ],
+        }));
+        let failures = parse_direct(&malformed).failures;
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].message.contains("JSON-encoded string"));
+    }
+
+    /// An assistant turn must say something: content, or calls.
+    #[test]
+    fn an_empty_assistant_turn_is_refused() {
+        let body = request(json!({
+            "messages": [
+                { "role": "user", "content": "go" },
+                { "role": "assistant" },
+            ],
+        }));
+        let failures = parse_direct(&body).failures;
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].pointer, "messages.1");
+    }
+
+    /// The Azure route: the deployment names the model when the body does not,
+    /// `api-key` authenticates, and `api-version` is required.
+    #[test]
+    fn the_azure_route_keys_on_its_deployment() {
+        let azure: BTreeMap<String, String> = [
+            ("api-key", "test-key"),
+            ("content-type", "application/json"),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect();
+        let body = json!({ "messages": [{ "role": "user", "content": "hi" }] });
+
+        let parsed = parse(
+            Route::Azure,
+            &azure,
+            "api-version=2024-10-21",
+            Some("smart-deployment"),
+            Some(&body),
+        );
+        assert!(parsed.failures.is_empty(), "{:?}", parsed.failures);
+        assert_eq!(parsed.model, "smart-deployment");
+
+        let parsed = parse(
+            Route::Azure,
+            &azure,
+            "",
+            Some("smart-deployment"),
+            Some(&body),
+        );
+        assert_eq!(
+            parsed
+                .failures
+                .iter()
+                .map(|failure| failure.pointer.as_str())
+                .collect::<Vec<_>>(),
+            ["query.api-version"]
+        );
+
+        // A body that names a model outranks the path, so one deployment can
+        // serve several scripted model ids.
+        let named =
+            json!({ "model": "gpt-4o-mini", "messages": [{ "role": "user", "content": "hi" }] });
+        let parsed = parse(
+            Route::Azure,
+            &azure,
+            "api-version=2024-10-21",
+            Some("smart-deployment"),
+            Some(&named),
+        );
+        assert_eq!(parsed.model, "gpt-4o-mini");
+    }
+
+    /// A `json_schema` structured reply is the object, serialized into content.
+    #[test]
+    fn a_structured_reply_renders_into_the_message_content() {
+        let body = request(json!({
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": { "name": "review", "schema": { "type": "object" } },
+            },
+        }));
+        let parsed = parse_direct(&body);
+        let outcome = Outcome::structured(json!({ "verdict": "approve" }));
+        let Answer::Respond(response) = render(
+            7,
+            &body,
+            &parsed.model,
+            parsed.structured_output.as_ref(),
+            &outcome,
+        ) else {
+            panic!("a reply is a response");
+        };
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body["id"], "chatcmpl-mock-00000007");
+        assert_eq!(response.body["created"], crate::control::CREATED);
+        assert_eq!(response.body["choices"][0]["finish_reason"], "stop");
+        assert_eq!(
+            response.body["choices"][0]["message"]["content"],
+            "{\"verdict\":\"approve\"}"
+        );
+        let usage = &response.body["usage"];
+        assert_eq!(
+            usage["total_tokens"].as_u64(),
+            Some(
+                usage["prompt_tokens"].as_u64().unwrap()
+                    + usage["completion_tokens"].as_u64().unwrap()
+            )
+        );
+    }
+
+    /// A forced-function structured reply is a tool call whose arguments are a
+    /// string — the same rule the request side enforces.
+    #[test]
+    fn a_forced_function_structured_reply_renders_as_a_tool_call() {
+        let body = request(json!({
+            "tools": [{ "type": "function", "function": { "name": "extract", "parameters": { "type": "object" } } }],
+            "tool_choice": { "type": "function", "function": { "name": "extract" } },
+        }));
+        let parsed = parse_direct(&body);
+        let Answer::Respond(response) = render(
+            1,
+            &body,
+            &parsed.model,
+            parsed.structured_output.as_ref(),
+            &Outcome::structured(json!({ "verdict": "revise" })),
+        ) else {
+            panic!("a reply is a response");
+        };
+        let call = &response.body["choices"][0]["message"]["tool_calls"][0];
+        assert_eq!(call["id"], "call_mock_00000001_0");
+        assert_eq!(call["function"]["name"], "extract");
+        assert_eq!(call["function"]["arguments"], "{\"verdict\":\"revise\"}");
+        assert_eq!(response.body["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    /// A structured reply with nothing asking for structure is a script bug.
+    #[test]
+    fn a_structured_reply_without_a_request_for_one_is_a_mismatch() {
+        let body = request(json!({}));
+        let Answer::Respond(response) = render(
+            1,
+            &body,
+            "gpt-4o-mini",
+            None,
+            &Outcome::structured(json!({ "a": 1 })),
+        ) else {
+            panic!("a mismatch is a response");
+        };
+        assert_eq!(response.status, HARNESS_STATUS);
+        assert_eq!(response.headers[HARNESS_HEADER], MISMATCH);
+    }
+
+    /// Tool calls the request never offered are refused for the same reason.
+    #[test]
+    fn a_call_to_an_unoffered_function_is_a_mismatch() {
+        let body = request(json!({
+            "tools": [{ "type": "function", "function": { "name": "web_search" } }],
+        }));
+        let Answer::Respond(response) = render(
+            1,
+            &body,
+            "gpt-4o-mini",
+            None,
+            &Outcome::tool_calls(vec![ToolCall::new("web_serch", json!({}))]),
+        ) else {
+            panic!("a mismatch is a response");
+        };
+        assert_eq!(response.headers[HARNESS_HEADER], MISMATCH);
+    }
+
+    /// The failure shapes generated code classifies on.
+    #[test]
+    fn the_failure_shapes_are_the_providers_own() {
+        let body = request(json!({}));
+        let served = |outcome: Outcome| match render(1, &body, "gpt-4o-mini", None, &outcome) {
+            Answer::Respond(response) => (response.status, response.body),
+            Answer::Close(_) => panic!("this outcome answers"),
+        };
+
+        let (status, error) = served(Outcome::rate_limit());
+        assert_eq!(status, 429);
+        assert_eq!(error["error"]["code"], "rate_limit_exceeded");
+
+        let (status, error) = served(Outcome::overloaded());
+        assert_eq!(status, 503, "OpenAI's overload status is 503, not 529");
+        assert_eq!(error["error"]["type"], "server_error");
+
+        assert_eq!(served(Outcome::server_error()).0, 500);
+
+        assert!(matches!(
+            render(
+                1,
+                &body,
+                "gpt-4o-mini",
+                None,
+                &Outcome::timeout(std::time::Duration::from_millis(1))
+            ),
+            Answer::Close(_)
+        ));
+    }
+
+    /// A rejection carries the first bad field in `param`, where a client looks.
+    #[test]
+    fn a_rejection_points_at_a_parameter() {
+        let Answer::Respond(response) = rejected(&[ValidationFailure::new(
+            "messages.0.role",
+            "Invalid value: 'wizard'.",
+        )]) else {
+            panic!("a rejection is a response");
+        };
+        assert_eq!(response.status, 400);
+        assert_eq!(response.body["error"]["param"], "messages.0.role");
+        assert_eq!(response.headers[HARNESS_HEADER], INVALID);
+    }
+}
