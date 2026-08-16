@@ -363,11 +363,43 @@ fn items(bullet: &str, lead_in: Option<&str>) -> Vec<String> {
         .collect()
 }
 
-/// One test in `tests/m1_acceptance.rs`: its name, and the `#[ignore]` reason it
+/// One test in `tests/m1_acceptance.rs`: its name, and the `#[ignore]` it
 /// carries if it carries one.
 struct Test {
     name: String,
-    ignore: Option<String>,
+    ignore: Option<Ignore>,
+}
+
+impl Test {
+    /// The reason its `#[ignore]` gives, if it carries one and it gives one.
+    fn reason(&self) -> Option<&str> {
+        match &self.ignore {
+            Some(Ignore::Because(reason)) => Some(reason),
+            Some(Ignore::Bare) | None => None,
+        }
+    }
+
+    /// How its attribute reads, for a failure message.
+    fn attribute(&self) -> String {
+        match &self.ignore {
+            Some(Ignore::Bare) => "#[ignore]".to_string(),
+            Some(Ignore::Because(reason)) => format!("#[ignore = \"{reason}\"]"),
+            None => "no `#[ignore]`".to_string(),
+        }
+    }
+}
+
+/// An `#[ignore]` attribute, in either of its two spellings.
+///
+/// A **bare** `#[ignore]` is kept apart from `#[ignore = "…"]` rather than read
+/// as "not ignored": both stop the test from running, so a parser that saw only
+/// the spelling with a reason would let a `Live` row pass while its test never
+/// ran — the one thing this file exists to make impossible. It fails both
+/// branches of [`a_pending_criterion_names_what_must_land_first`]: `Live`
+/// because the test is ignored, `Pending` because it names no feature.
+enum Ignore {
+    Bare,
+    Because(String),
 }
 
 /// Every `#[test]` in the acceptance suite, read from its source.
@@ -380,7 +412,12 @@ fn suite() -> Vec<Test> {
     let source =
         fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/m1_acceptance.rs"))
             .expect("the acceptance suite is readable");
+    parse(&source)
+}
 
+/// The parser [`suite`] reads with, over any source text — which is how the
+/// two `#[ignore]` spellings are themselves tested.
+fn parse(source: &str) -> Vec<Test> {
     let mut tests = Vec::new();
     let mut is_test = false;
     let mut ignore = None;
@@ -388,18 +425,17 @@ fn suite() -> Vec<Test> {
         let line = line.trim();
         if line == "#[test]" {
             is_test = true;
+        } else if line == "#[ignore]" {
+            ignore = Some(Ignore::Bare);
         } else if let Some(reason) = line
             .strip_prefix("#[ignore = \"")
             .and_then(|rest| rest.strip_suffix("\"]"))
         {
-            ignore = Some(reason.to_string());
+            ignore = Some(Ignore::Because(reason.to_string()));
         } else if let Some(rest) = line.strip_prefix("fn ") {
             if is_test {
                 let name = rest.split('(').next().expect("a function name").to_string();
-                tests.push(Test {
-                    name,
-                    ignore: ignore.clone(),
-                });
+                tests.push(Test { name, ignore });
             }
             is_test = false;
             ignore = None;
@@ -522,15 +558,16 @@ fn a_pending_criterion_names_what_must_land_first() {
             match status {
                 Status::Live => assert!(
                     test.ignore.is_none(),
-                    "`{name}` is inventoried as live but carries `#[ignore = \"{}\"]`",
-                    test.ignore.clone().unwrap_or_default()
+                    "`{name}` is inventoried as live but carries `{}`",
+                    test.attribute()
                 ),
                 Status::Pending(reason) => {
                     assert_eq!(
-                        test.ignore.as_deref(),
+                        test.reason(),
                         Some(*reason),
                         "`{name}` is inventoried as pending `{reason}`, and its \
-                         `#[ignore]` says otherwise"
+                         attribute says otherwise (`{}`)",
+                        test.attribute()
                     );
                     assert!(
                         reason.starts_with("M1: "),
@@ -540,6 +577,58 @@ fn a_pending_criterion_names_what_must_land_first() {
             }
         }
     }
+}
+
+/// The parser behind every assertion above reads **both** `#[ignore]`
+/// spellings.
+///
+/// The bare one is the hole worth closing by hand: `#[ignore]` with no reason
+/// stops a test from running exactly as the other spelling does, so a parser
+/// that missed it would report a `Live` row as met while its test never ran —
+/// and this file's whole job is making that impossible. It is neither
+/// not-ignored (so a `Live` row fails) nor a named reason (so a `Pending` row
+/// fails), which is what the last two cases assert.
+#[test]
+fn both_ignore_spellings_are_read_and_a_bare_one_claims_nothing() {
+    let parsed = parse(
+        r#"
+        #[test]
+        fn it_runs() {}
+
+        #[test]
+        #[ignore = "M1: something must land first"]
+        fn it_is_pending() {}
+
+        #[test]
+        #[ignore]
+        fn it_is_bare() {}
+
+        fn not_a_test() {}
+        "#,
+    );
+
+    let names: Vec<&str> = parsed.iter().map(|test| test.name.as_str()).collect();
+    assert_eq!(names, ["it_runs", "it_is_pending", "it_is_bare"]);
+
+    assert!(parsed[0].ignore.is_none());
+    assert_eq!(parsed[0].reason(), None);
+
+    assert_eq!(parsed[1].reason(), Some("M1: something must land first"));
+    assert_eq!(
+        parsed[1].attribute(),
+        "#[ignore = \"M1: something must land first\"]"
+    );
+
+    assert!(
+        parsed[2].ignore.is_some(),
+        "a bare `#[ignore]` is ignored, so a `Live` row naming it fails"
+    );
+    assert_eq!(
+        parsed[2].reason(),
+        None,
+        "…and it names no feature, so a `Pending` row naming it fails too"
+    );
+    assert_eq!(parsed[2].attribute(), "#[ignore]");
 }
 
 /// Every criterion is decided by a test, and every bullet contributes criteria —
