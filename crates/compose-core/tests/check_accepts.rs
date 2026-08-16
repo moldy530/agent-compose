@@ -1369,3 +1369,73 @@ flow.f:
 "#,
     );
 }
+
+/// The exemption above is *no cycle reaches this node*, not *this flow has no
+/// cycle*: a budget upstream of a loop is as inert as a budget in a flow with no
+/// loop at all, because the loop can never run its source a second time. The
+/// accompanying rejection is
+/// `tests/fixtures/invalid-check/bounded-edge-below-a-cycle-has-no-escape`,
+/// where the same budget sits *below* the loop (grammar 7.4, Decision D19).
+#[test]
+fn a_bounded_edge_upstream_of_a_cycle_needs_no_escape() {
+    accepts(
+        "budget-above-a-cycle",
+        r#"
+agent.a:
+  model: model.m
+  prompt: Do it.
+  output:
+    verdict: { enum: [approve, revise] }
+flow.f:
+  outputs: {}
+  nodes:
+    p: { agent: agent.a, input: "'p'" }
+    q: { agent: agent.a, input: "'q'" }
+    write: { agent: agent.a, input: "'w'" }
+    review: { agent: agent.a, input: "'r'" }
+  edges:
+    - { from: start, to: p }
+    - { from: p, to: q, when: "p.output.verdict == 'approve'", max_iterations: 3 }
+    - { from: p, to: write, when: "p.output.verdict != 'approve'" }
+    - { from: q, to: end }
+    - { from: write, to: review }
+    - { from: review, to: write, when: "review.output.verdict == 'revise'" }
+    - { from: review, to: end, else: true }
+"#,
+    );
+}
+
+/// A node the loop routes to *does* carry the escape rule, and an `else: true`
+/// sibling discharges it: the pass that exhausts the budget takes that edge
+/// instead of dead-ending, which is the whole content of Decision D19. The
+/// rejecting half is the fixture named above (grammar 7.4, 7.3 rules 4 and 5).
+#[test]
+fn a_bounded_edge_below_a_cycle_escapes_through_an_else() {
+    accepts(
+        "budget-below-a-cycle",
+        r#"
+agent.a:
+  model: model.m
+  prompt: Do it.
+  output:
+    verdict: { enum: [approve, revise, escalate] }
+flow.f:
+  outputs: {}
+  nodes:
+    a: { agent: agent.a, input: "'a'" }
+    b: { agent: agent.a, input: "'b'" }
+    n: { agent: agent.a, input: "'n'" }
+    x: { agent: agent.a, input: "'x'" }
+    y: { agent: agent.a, input: "'y'" }
+  edges:
+    - { from: start, to: a }
+    - { from: a, to: b }
+    - { from: b, to: a, when: "b.output.verdict == 'revise'" }
+    - { from: b, to: n, when: "b.output.verdict in ['approve', 'revise', 'escalate']" }
+    - { from: n, to: x, when: "n.output.verdict == 'approve'", max_iterations: 3 }
+    - { from: n, to: y, else: true }
+    - { from: x, to: end }
+    - { from: y, to: end }
+"#,
+    );
+}
