@@ -1306,6 +1306,97 @@ flow.f:
     );
 }
 
+/// Two sibling edges that land on **one** node start one branch, not two.
+/// Grammar 7.6's P2 runs a node targeted by several edges taken in the same step
+/// exactly once, so `x` runs once and takes exactly one of *its* two exclusive
+/// out-edges: `d` receives one delivery per pass however the two `plan -> x`
+/// guards came out. The distances `{2, 3}` that reach `d` are one branch's own,
+/// and comparing them is the comparison inside one side Decision D112 refuses —
+/// here reached from the other end, since both sides of the pair are the *same*
+/// set of paths. Making the two `plan -> x` guards exclusive would silence a
+/// diagnostic while changing no runtime behaviour, which is how it reads as
+/// over-rejection rather than as strictness (grammar 7.6, 7.6.2, D99, D112).
+#[test]
+fn two_sibling_edges_that_deliver_to_one_node() {
+    accepts(
+        "same-target-pair",
+        r#"
+agent.a:
+  model: model.m
+  prompt: Do it.
+  output:
+    verdict: { enum: [approve, revise] }
+agent.planner:
+  model: model.m
+  prompt: Plan.
+  output:
+    need_draft: { type: boolean }
+    need_research: { type: boolean }
+flow.f:
+  outputs: {}
+  nodes:
+    plan: { agent: agent.planner, input: "'p'" }
+    x: { agent: agent.a, input: "'x'" }
+    m: { agent: agent.a, input: "'m'" }
+    d: { agent: agent.a, input: "'d'" }
+  edges:
+    - { from: start, to: plan }
+    - { from: plan, to: x, when: "plan.output.need_draft" }
+    - { from: plan, to: x, when: "plan.output.need_research" }
+    - { from: x, to: d, when: "x.output.verdict == 'approve'" }
+    - { from: x, to: m, when: "x.output.verdict == 'revise'" }
+    - { from: m, to: d }
+    - { from: d, to: end }
+"#,
+    );
+}
+
+/// The concurrent-write half of the same reading (grammar 7.6.1, 10.2). `p` and
+/// `q` sit behind the two *exclusive* out-edges of `x`, and `x` is the single
+/// node both `plan -> x` edges deliver to — so one pass runs one of them and
+/// they never race for `verdict`. Reading the pair as two branches makes every
+/// node of `x`'s branch concurrent with every other, and demands a `reduce:`
+/// policy on a channel nothing can race for; whether two nodes *inside* that
+/// branch are concurrent is its own fork's question, and `x`'s pair is exclusive.
+#[test]
+fn writers_behind_one_node_two_sibling_edges_share() {
+    accepts(
+        "same-target-writers",
+        r#"
+agent.a:
+  model: model.m
+  prompt: Do it.
+  output:
+    verdict: { enum: [approve, revise] }
+agent.planner:
+  model: model.m
+  prompt: Plan.
+  output:
+    need_draft: { type: boolean }
+    need_research: { type: boolean }
+state:
+  verdict:
+    description: the last verdict reached
+    enum: [approve, revise]
+flow.f:
+  outputs: {}
+  nodes:
+    plan: { agent: agent.planner, input: "'p'" }
+    x: { agent: agent.a, input: "'x'" }
+    p: { agent: agent.a, input: "'p'" }
+    q: { agent: agent.a, input: "'q'" }
+  edges:
+    - { from: start, to: plan }
+    - { from: plan, to: x, when: "plan.output.need_draft" }
+    - { from: plan, to: x, when: "plan.output.need_research" }
+    - { from: x, to: p, when: "x.output.verdict == 'approve'" }
+    - { from: x, to: q, when: "x.output.verdict == 'revise'" }
+    - { from: p, to: end }
+    - { from: q, to: end }
+"#,
+    );
+}
+
 /// A node no edge targets, reached only through `on_error: { fallback: … }`.
 /// Reachability counts the two control-transfer positions, so a dedicated
 /// error-handling node is live code rather than an unreachable one — and it

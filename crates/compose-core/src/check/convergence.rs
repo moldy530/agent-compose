@@ -36,6 +36,12 @@
 //! inside one branch, which is runtime-safe, while naming a pair that cannot
 //! deliver the distances the diagnostic reports.
 //!
+//! A pair whose two edges land on **one** node is that same reading seen from
+//! the other end, and both rules skip it: grammar 7.6's P2 runs a node targeted
+//! by several edges taken in one step exactly once, so such a pair starts a
+//! single branch, and the two sides the rules would compare are the very same
+//! set of paths ([`branches`]).
+//!
 //! `end` is exempt: it is not a node, it retires branches instead of running,
 //! and branches legitimately reach it at different depths (grammar 7.6.3). One
 //! diagnostic is reported per co-takeable pair, at the *nearest* convergence it
@@ -221,6 +227,32 @@ fn exclusive(
     })
 }
 
+/// The two nodes a co-takeable pair starts a branch at, or `None` where it
+/// starts fewer than two.
+///
+/// Both rules read a pair only through this, and there are two ways a pair has
+/// no second branch for them to compare. An edge that retires its branch at
+/// `end` delivers to no node, and `end` is exempt from both rules anyway
+/// (grammar 7.6.2, 7.6.3). And two edges that land on the **same** node deliver
+/// one branch rather than two: grammar 7.6's P2 runs a node targeted by several
+/// edges taken in one step exactly once, so the pair schedules a single
+/// instance, which then leaves by one of *its* own out-edges.
+///
+/// Comparing that branch with itself is exactly the comparison inside one side
+/// that Decision D112 refuses, arrived at by a different route — the two
+/// distance sets are not merely overlapping but identical, so any node the
+/// branch reaches at two depths is reported as an unbalanced convergence, with
+/// a diagnostic naming two edges that share a target and claiming they arrive at
+/// different depths. The same skew read at the node where the branch really
+/// parts is the question grammar 7.6.2 puts there, and this check asks it of
+/// that node's own pair. Grammar 10.2's half over-rejects the same way: two
+/// nodes one branch reaches are concurrent only if something *inside* it forks,
+/// which is that fork's pair to answer for, not this one's.
+fn branches(graph: &Graph<'_>, pair: &Pair) -> Option<(usize, usize)> {
+    let (near, far) = (graph.entry(pair.edges.0)?, graph.entry(pair.edges.1)?);
+    (near != far).then_some((near, far))
+}
+
 /// Grammar 7.6.2: the two edges of a pair may not deliver to one node at two
 /// different depths.
 fn balanced<'a>(ctx: &mut Ctx<'a>, cx: &FlowCx<'a>, graph: &Graph<'a>, pairs: &[Pair]) {
@@ -228,9 +260,7 @@ fn balanced<'a>(ctx: &mut Ctx<'a>, cx: &FlowCx<'a>, graph: &Graph<'a>, pairs: &[
     let mut skew: BTreeMap<(usize, usize), Skew> = BTreeMap::new();
     for pair in pairs {
         let (left, right) = pair.edges;
-        // An edge that retires its branch at `end` delivers to no node, and
-        // `end` is exempt anyway (grammar 7.6.2).
-        let (Some(near), Some(far)) = (graph.entry(left), graph.entry(right)) else {
+        let Some((near, far)) = branches(graph, pair) else {
             continue;
         };
         for entry in [near, far] {
@@ -328,13 +358,13 @@ fn concurrent<'a>(ctx: &mut Ctx<'a>, cx: &FlowCx<'a>, graph: &Graph<'a>, pairs: 
     let Some(writers) = Writers::of(ctx, graph) else {
         return;
     };
-    let mut branches: BTreeMap<usize, Branch> = BTreeMap::new();
+    let mut held: BTreeMap<usize, Branch> = BTreeMap::new();
     let mut crossed: BTreeSet<(usize, usize)> = BTreeSet::new();
     // One bit per ordered pair of *writers*, so a pair is decided once for the
     // whole flow however many forks separate it.
     let mut examined = vec![0u64; writers.count() * writers.words()];
     for pair in pairs {
-        let (Some(near), Some(far)) = (graph.entry(pair.edges.0), graph.entry(pair.edges.1)) else {
+        let Some((near, far)) = branches(graph, pair) else {
             continue;
         };
         // What a branch holds depends on the pair only through the node it
@@ -343,11 +373,10 @@ fn concurrent<'a>(ctx: &mut Ctx<'a>, cx: &FlowCx<'a>, graph: &Graph<'a>, pairs: 
             continue;
         }
         for entry in [near, far] {
-            branches
-                .entry(entry)
+            held.entry(entry)
                 .or_insert_with(|| writers.branch(graph, entry));
         }
-        for one in &branches[&near].members {
+        for one in &held[&near].members {
             let one = *one;
             let row = one * writers.words();
             for word in 0..writers.words() {
@@ -355,7 +384,7 @@ fn concurrent<'a>(ctx: &mut Ctx<'a>, cx: &FlowCx<'a>, graph: &Graph<'a>, pairs: 
                 // with. Every bit left standing is a pair decided for the first
                 // and last time, so the scan costs a word per branch and the
                 // decisions cost what the answer holds.
-                let mut fresh = branches[&far].mask[word] & !examined[row + word];
+                let mut fresh = held[&far].mask[word] & !examined[row + word];
                 while fresh != 0 {
                     let other = word * 64 + fresh.trailing_zeros() as usize;
                     fresh &= fresh - 1;
