@@ -1,0 +1,28 @@
+# rule: the source of a `max_iterations` edge needs a guaranteed escape (grammar 7.4, Decision D19)
+# code: dead-end
+# message: the `max_iterations` edge from `review` to `write` in `flow.f` has no escape
+# at: main.yml:27:7
+# label: main.yml:23:5 the source node is here
+# help: an exhausted edge is not taken whatever its guard says, so the pass that spends the budget needs somewhere to go: give `review` an outgoing edge that leaves the cycle *and* is unconditional or carries `else: true` — a guarded escape is not enough (grammar 7.4, Decision D19)
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.a:
+  model: model.m
+  prompt: Do it.
+  output:
+    verdict: { enum: [approve, revise, escalate] }
+flow.f:
+  outputs: {}
+  nodes:
+    write: { agent: agent.a, input: "'x'" }
+    review: { agent: agent.a, input: "'y'" }
+  edges:
+    - { from: start, to: write }
+    - { from: write, to: review }
+    - { from: review, to: write, when: "review.output.verdict == 'revise'", max_iterations: 3 }
+    - { from: review, to: end, when: "review.output.verdict != 'revise'" }

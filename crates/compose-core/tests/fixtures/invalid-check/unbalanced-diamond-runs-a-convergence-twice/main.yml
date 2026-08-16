@@ -1,0 +1,37 @@
+# rule: two edges of a co-takeable pair reach a node at different depths (grammar 7.6.2)
+# code: unbalanced-convergence
+# message: node `merge` of `flow.f` is reached from the fork `plan` at two different depths
+# at: main.yml:31:5
+# label: main.yml:34:7 this edge reaches it in 1 step
+# label: main.yml:35:7 this one in 2 steps
+# help: a convergence reached in two different steps runs twice, once per arrival: route the short branch through the same depth, or make the two edges exclusive — `else: true` on one, or guards grammar 7.6.1 can prove disjoint (grammar 7.6.2, Decisions D69, D112)
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.a:
+  model: model.m
+  prompt: Do it.
+  output:
+    verdict: { enum: [approve, revise, escalate] }
+agent.planner:
+  model: model.m
+  prompt: Plan.
+  output:
+    trivial: { type: boolean }
+    need_draft: { type: boolean }
+flow.f:
+  outputs: {}
+  nodes:
+    plan: { agent: agent.planner, input: "'x'" }
+    draft: { agent: agent.a, input: "'y'" }
+    merge: { agent: agent.a, input: "'z'" }
+  edges:
+    - { from: start, to: plan }
+    - { from: plan, to: merge, when: "plan.output.trivial" }
+    - { from: plan, to: draft, when: "plan.output.need_draft" }
+    - { from: draft, to: merge }
+    - { from: merge, to: end }

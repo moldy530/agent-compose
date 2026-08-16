@@ -1,0 +1,55 @@
+# rule: interrupt-freedom crosses a `map` dispatch (grammar 7.7 clause 2, 13.3)
+# code: sync-trigger-interrupt
+# message: the trigger `on_request` responds synchronously, and `flow.outer` reaches the `human` node `approve` of `flow.inner`
+# at: main.yml:26:5
+# label: main.yml:34:5 the `human` node is declared here
+# help: a flow exposed with `respond: sync` must be statically interrupt-free: it must reach no `human` node through its own nodes, its `flow:` nodes, its maps' dispatch targets, or the `flow.*` tools of any agent it reaches — declare `respond: async` and take the result through `callback:` instead (grammar 13.3, 7.7, PRD 5.11)
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.a:
+  model: model.m
+  prompt: Do it.
+  output:
+    verdict: { enum: [approve, revise, escalate] }
+state:
+  tasks:
+    type: array
+    max_items: 5
+    items: { type: string }
+triggers:
+  on_request:
+    type: http
+    flow: flow.outer
+    respond: sync
+flow.inner:
+  inputs:
+    text: { type: string }
+  outputs: {}
+  nodes:
+    approve:
+      human:
+        input:
+          text: { type: string }
+        output:
+          decision: { enum: [approve, reject] }
+      input: { text: "input.text" }
+  edges:
+    - { from: start, to: approve }
+    - { from: approve, to: end }
+flow.outer:
+  outputs: {}
+  nodes:
+    fan:
+      map:
+        over: "state.tasks"
+        node: flow.inner
+        max_concurrency: 2
+        input: { text: "item" }
+  edges:
+    - { from: start, to: fan }
+    - { from: fan, to: end }

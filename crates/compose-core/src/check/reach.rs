@@ -3,12 +3,14 @@
 //! # Component reachability (grammar 7.7)
 //!
 //! A flow **reaches** the components its own nodes name, its maps' dispatch
-//! targets, the stores and tools of every agent it reaches, and everything the
-//! flows it reaches reach in turn. One relation serves three checks; the one
-//! that is this pass's is session coherence (grammar 11.3), so [`stores_of`]
-//! is stated over stores. The other two — sync-trigger interrupt-freedom and
-//! recursion — are the graph pass's, and are the reason this is a module rather
-//! than a private helper of `stores`.
+//! targets, the `human` nodes among them, the stores and tools of every agent it
+//! reaches, and everything the flows it reaches reach in turn. One relation
+//! serves three checks and each reads a different part of what [`reached`]
+//! returns: session coherence reads the stores ([`stores_of`], grammar 11.3),
+//! interrupt-freedom reads the `human` nodes (grammar 13.3), and recursion reads
+//! the flows — which it needs as *edges* with their invocation sites rather than
+//! as a set, so it walks [`calls`] instead (grammar 7.5). Stating the traversal
+//! once here is what keeps the three from drifting apart (Decision D86).
 //!
 //! # Dispatch sites (grammar 11.4, Decision D83)
 //!
@@ -37,10 +39,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ast::common::{Address, Namespace};
 use crate::cel::Scope;
-use crate::diag::Span;
+use crate::diag::{Span, Spanned};
 use crate::ir::Ir;
 use crate::ir::binding::NodeInput;
-use crate::ir::definition::DefinitionBody;
+use crate::ir::definition::{Agent, DefinitionBody};
 use crate::ir::flow::{Flow, MapDispatch, NodeKind};
 
 use super::Ctx;
@@ -53,20 +55,37 @@ pub(crate) fn flow_at<'a>(ir: &'a Ir, address: &str) -> Option<&'a Flow> {
     }
 }
 
-/// The store addresses a flow reaches (grammar 7.7).
-pub(crate) fn stores_of(ctx: &Ctx, flow: &str) -> BTreeSet<String> {
-    let mut found = BTreeSet::new();
+/// What one flow **reaches** (grammar 7.7).
+///
+/// Three checks quantify over this one relation and each reads a different part
+/// of it: session coherence reads [`stores`](Self::stores) (grammar 11.3),
+/// sync-trigger interrupt-freedom reads [`humans`](Self::humans) (grammar 13.3),
+/// and recursion reads the flows — which it needs with their invocation sites
+/// rather than as a set, so it walks [`calls`] instead (grammar 7.5).
+#[derive(Debug, Default)]
+pub(crate) struct Reached {
+    /// The `store.*` addresses.
+    pub(crate) stores: BTreeSet<String>,
+    /// The `human` nodes, by the flow that declares them and their flow-local
+    /// id, each with the id's span. A map rather than a list so the answer does
+    /// not depend on the order the walk happened to take.
+    pub(crate) humans: BTreeMap<(String, String), Span>,
+}
+
+/// Everything a flow reaches (grammar 7.7).
+pub(crate) fn reached(ctx: &Ctx, flow: &str) -> Reached {
+    let mut found = Reached::default();
     let mut seen = BTreeSet::new();
-    walk_stores(ctx, flow, &mut seen, &mut found);
+    walk(ctx, flow, &mut seen, &mut found);
     found
 }
 
-fn walk_stores(
-    ctx: &Ctx,
-    address: &str,
-    seen: &mut BTreeSet<String>,
-    found: &mut BTreeSet<String>,
-) {
+/// The store addresses a flow reaches (grammar 7.7, 11.3).
+pub(crate) fn stores_of(ctx: &Ctx, flow: &str) -> BTreeSet<String> {
+    reached(ctx, flow).stores
+}
+
+fn walk(ctx: &Ctx, address: &str, seen: &mut BTreeSet<String>, found: &mut Reached) {
     if !seen.insert(address.to_string()) {
         return;
     }
@@ -76,17 +95,27 @@ fn walk_stores(
     for node in &flow.nodes {
         match &node.kind {
             NodeKind::Store { store, .. } => {
-                found.insert(store.value.to_string());
+                found.stores.insert(store.value.to_string());
+            }
+            // Clause 1 names the `human` node itself, which is the one thing a
+            // flow reaches that is not a typed address.
+            NodeKind::Human { .. } => {
+                found.humans.insert(
+                    (address.to_string(), node.id.value.to_string()),
+                    node.id.span.clone(),
+                );
             }
             NodeKind::Agent { agent } => agent_reaches(ctx, &agent.value.to_string(), seen, found),
             NodeKind::Flow { flow, .. } => {
-                walk_stores(ctx, &flow.value.to_string(), seen, found);
+                walk(ctx, &flow.value.to_string(), seen, found);
             }
             NodeKind::Map { map } => {
                 for target in targets(&map.dispatch) {
-                    match target.namespace {
-                        Namespace::Agent => agent_reaches(ctx, &target.to_string(), seen, found),
-                        Namespace::Flow => walk_stores(ctx, &target.to_string(), seen, found),
+                    match target.value.namespace {
+                        Namespace::Agent => {
+                            agent_reaches(ctx, &target.value.to_string(), seen, found);
+                        }
+                        Namespace::Flow => walk(ctx, &target.value.to_string(), seen, found),
                         _ => {}
                     }
                 }
@@ -98,31 +127,88 @@ fn walk_stores(
 
 /// An agent reaches the stores it attaches and everything its `flow.*` tools
 /// reach — flow-as-tool attachment is a call (grammar 7.7 clauses 3, 4).
-fn agent_reaches(
-    ctx: &Ctx,
-    address: &str,
-    seen: &mut BTreeSet<String>,
-    found: &mut BTreeSet<String>,
-) {
-    let Some(agent) =
-        ctx.ir
-            .definitions
-            .get(address)
-            .and_then(|definition| match &definition.body {
-                crate::ir::definition::DefinitionBody::Agent(agent) => Some(agent),
-                _ => None,
-            })
-    else {
+fn agent_reaches(ctx: &Ctx, address: &str, seen: &mut BTreeSet<String>, found: &mut Reached) {
+    let Some(agent) = agent_at(ctx, address) else {
         return;
     };
     for store in &agent.stores {
-        found.insert(store.value.to_string());
+        found.stores.insert(store.value.to_string());
     }
     for tool in &agent.tools {
         if tool.value.namespace == Namespace::Flow {
-            walk_stores(ctx, &tool.value.to_string(), seen, found);
+            walk(ctx, &tool.value.to_string(), seen, found);
         }
     }
+}
+
+/// The agent definition at this address.
+fn agent_at<'a>(ctx: &Ctx<'a>, address: &str) -> Option<&'a Agent> {
+    match ctx.ir.definitions.get(address).map(|found| &found.body) {
+        Some(DefinitionBody::Agent(agent)) => Some(agent),
+        _ => None,
+    }
+}
+
+/// One flow invoking another, with the construct that invokes it (grammar 7.7).
+pub(crate) struct Call {
+    /// The `flow.*` address invoked.
+    pub(crate) target: String,
+    /// Where the invocation is written.
+    pub(crate) span: Span,
+    /// The verb a diagnostic uses for it.
+    pub(crate) verb: &'static str,
+}
+
+/// The flows one flow invokes **directly** (grammar 7.7 clauses 1, 2, and 4).
+///
+/// Transitivity — clause 5 — is the caller's, because recursion is a property of
+/// the whole invocation graph rather than of one walk from one flow: the same
+/// edges are read once and every cycle in them is found together
+/// ([`components`](super::components)).
+pub(crate) fn calls(ctx: &Ctx, address: &str) -> Vec<Call> {
+    let mut calls = Vec::new();
+    let Some(flow) = ctx.flow_named(address) else {
+        return calls;
+    };
+    let from_agent = |calls: &mut Vec<Call>, agent: &str| {
+        let Some(agent) = agent_at(ctx, agent) else {
+            return;
+        };
+        for tool in &agent.tools {
+            if tool.value.namespace == Namespace::Flow {
+                calls.push(Call {
+                    target: tool.value.to_string(),
+                    span: tool.span.clone(),
+                    verb: "attaches",
+                });
+            }
+        }
+    };
+    for node in &flow.nodes {
+        match &node.kind {
+            NodeKind::Flow { flow, .. } => calls.push(Call {
+                target: flow.value.to_string(),
+                span: flow.span.clone(),
+                verb: "instantiates",
+            }),
+            NodeKind::Agent { agent } => from_agent(&mut calls, &agent.value.to_string()),
+            NodeKind::Map { map } => {
+                for target in targets(&map.dispatch) {
+                    match target.value.namespace {
+                        Namespace::Flow => calls.push(Call {
+                            target: target.value.to_string(),
+                            span: target.span.clone(),
+                            verb: "dispatches",
+                        }),
+                        Namespace::Agent => from_agent(&mut calls, &target.value.to_string()),
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    calls
 }
 
 /// One dispatch a `map` block issues (grammar 8.6 rule 7).
@@ -161,12 +247,20 @@ pub(crate) fn dispatches(dispatch: &MapDispatch) -> Vec<Dispatch<'_>> {
     }
 }
 
-/// Every dispatch target of a `map` block, in declaration order.
-pub(crate) fn targets(dispatch: &MapDispatch) -> Vec<&Address> {
-    dispatches(dispatch)
-        .into_iter()
-        .map(|dispatch| dispatch.target)
-        .collect()
+/// Every dispatch target of a `map` block, in declaration order, with the span
+/// of the reference itself — which is what a diagnostic about the *invocation*
+/// points at, as against one about the dispatch's bindings.
+pub(crate) fn targets(dispatch: &MapDispatch) -> Vec<&Spanned<Address>> {
+    match dispatch {
+        MapDispatch::Homogeneous { node, .. } => vec![node],
+        MapDispatch::Routed {
+            routes, default, ..
+        } => routes
+            .iter()
+            .chain(default.iter().map(|route| &**route))
+            .map(|route| &route.node)
+            .collect(),
+    }
 }
 
 /// One flow instance running inside a fan-out.

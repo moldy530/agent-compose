@@ -1,0 +1,32 @@
+# rule: recursion through two flows is reported once, at the cycle (grammar 7.5)
+# code: recursive-flow
+# message: `flow.f` reaches itself through `flow.g`
+# at: main.yml:22:20
+# label: main.yml:29:19 `flow.g` instantiates `flow.f` here
+# help: a flow that reaches itself — through a `flow:` node, a `map` dispatch target, or the `flow.*` tools of an agent it reaches — has no termination proof analogous to grammar 7.4's SCC rule and would break the fan-out bounding guarantees: extract the shared part into a third flow, or break the cycle (grammar 7.5, 7.7, Decisions D26, D86)
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.a:
+  model: model.m
+  prompt: Do it.
+  output:
+    verdict: { enum: [approve, revise, escalate] }
+flow.f:
+  outputs: {}
+  nodes:
+    inner: { flow: flow.g }
+  edges:
+    - { from: start, to: inner }
+    - { from: inner, to: end }
+flow.g:
+  outputs: {}
+  nodes:
+    back: { flow: flow.f }
+  edges:
+    - { from: start, to: back }
+    - { from: back, to: end }

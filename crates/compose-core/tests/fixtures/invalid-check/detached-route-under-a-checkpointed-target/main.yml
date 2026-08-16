@@ -1,0 +1,70 @@
+# rule: a route's `detach: true` is checked per target like the map-level key (grammar 8.6 rule 7)
+# code: unsupported-detach
+# message: `detach: true` is not supported under the target `staging`
+# at: main.yml:65:21
+# help: only `local` runs with an in-memory checkpointer; every other target is durably checkpointed, and v0 has no outbox-pattern delivery for a fire-and-forget dispatch under one — drop `detach:`, or validate against `local` (grammar 8.6 rule 7, 14, Decision D59)
+# target: staging
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.a:
+  model: model.m
+  prompt: Do it.
+  output:
+    verdict: { enum: [approve, revise, escalate] }
+agent.triage:
+  model: model.m
+  prompt: Triage.
+  output:
+    findings:
+      type: array
+      max_items: 10
+      items:
+        discriminator: kind
+        variants:
+          auto_fixable:
+            file: { type: string }
+          duplicate:
+            of: { type: string }
+tool.fix:
+  description: Apply a mechanical fix.
+  input:
+    file: { type: string }
+  output:
+    patch: { type: string }
+  exec:
+    command: fix
+tool.record:
+  description: Record a duplicate finding.
+  input:
+    of: { type: string }
+  output:
+    accepted: { type: boolean }
+  exec:
+    command: record
+flow.f:
+  outputs: {}
+  nodes:
+    classify: { agent: agent.triage, input: "'x'" }
+    dispatch:
+      map:
+        over: "classify.output.findings"
+        as: finding
+        route_by: kind
+        max_concurrency: 4
+        routes:
+          auto_fixable:
+            node: tool.fix
+            input: { file: "finding.file" }
+          duplicate:
+            node: tool.record
+            detach: true
+            input: { of: "finding.of" }
+  edges:
+    - { from: start, to: classify }
+    - { from: classify, to: dispatch }
+    - { from: dispatch, to: end }

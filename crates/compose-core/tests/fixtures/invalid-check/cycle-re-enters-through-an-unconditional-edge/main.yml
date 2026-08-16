@@ -1,0 +1,27 @@
+# rule: an unconditional in-SCC edge is not a CEL exit condition (grammar 7.4 clause 2(ii))
+# code: unbounded-cycle
+# message: the cycle through `write`, `review` in `flow.f` carries no bounded edge
+# at: main.yml:21:5
+# help: every cycle must terminate: put `max_iterations:` on a `when:`-guarded edge inside it, or give one of its nodes a CEL exit condition — an edge that leaves the cycle, plus in-cycle edges that can all go untaken on one pass (grammar 7.4, Decisions D57, D98)
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.a:
+  model: model.m
+  prompt: Do it.
+  output:
+    verdict: { enum: [approve, revise, escalate] }
+flow.f:
+  outputs: {}
+  nodes:
+    write: { agent: agent.a, input: "'x'" }
+    review: { agent: agent.a, input: "'y'" }
+  edges:
+    - { from: start, to: write }
+    - { from: write, to: review }
+    - { from: review, to: write }
+    - { from: review, to: end, when: "review.output.verdict == 'approve'" }

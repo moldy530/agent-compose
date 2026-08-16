@@ -1,0 +1,47 @@
+# rule: `over` reads a node that dominates the map node (grammar 8.6 rule 11, Decision D76)
+# code: non-dominating-source
+# message: `over` of the `map` of node `work` in `flow.f` reads `plan`, which does not dominate it
+# at: main.yml:39:15
+# label: main.yml:36:5 the producer is declared here
+# help: every path from `start` to the map node must pass through the producer, or the array `over` reads may not exist when the map dispatches — a producer on a guarded sibling branch may not have run (grammar 8.6 rule 11, Decision D76)
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.a:
+  model: model.m
+  prompt: Do it.
+  output:
+    verdict: { enum: [approve, revise, escalate] }
+agent.planner:
+  model: model.m
+  prompt: Plan.
+  output:
+    tasks:
+      type: array
+      max_items: 5
+      items: { type: string }
+agent.worker:
+  model: model.m
+  prompt: Work.
+  output:
+    result: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    gate: { agent: agent.a, input: "'x'" }
+    plan: { agent: agent.planner, input: "'y'" }
+    work:
+      map:
+        over: "plan.output.tasks"
+        node: agent.worker
+        max_concurrency: 2
+  edges:
+    - { from: start, to: gate }
+    - { from: gate, to: plan, when: "gate.output.verdict == 'approve'" }
+    - { from: gate, to: work, else: true }
+    - { from: plan, to: work }
+    - { from: work, to: end }

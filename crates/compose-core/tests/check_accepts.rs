@@ -138,6 +138,7 @@ flow.f:
   edges:
     - { from: start, to: n, when: "size(input.goal) > 0" }
     - { from: start, to: n }
+    - { from: n, to: end }
 "#,
     );
 }
@@ -1202,6 +1203,136 @@ flow.f:
   edges:
     - { from: start, to: n }
     - { from: n, to: end }
+"#,
+    );
+}
+
+/// A **mixed-guard** node stays exhaustive: the sibling whose guard never
+/// mentions `verdict` contributes nothing to its coverage and does not exempt
+/// the node, and the `==`/`!=` pair covers the enum between them (grammar 7.3.1
+/// clause 2, Decision D82).
+#[test]
+fn a_mixed_guard_node_covered_by_an_inequality() {
+    accepts(
+        "mixed-guards",
+        r#"
+state:
+  feedback: { type: string, default: "" }
+agent.a:
+  model: model.m
+  prompt: Do it.
+  output:
+    verdict: { enum: [approve, revise, escalate] }
+flow.f:
+  outputs: {}
+  nodes:
+    review: { agent: agent.a, input: "'x'" }
+    publish: { agent: agent.a, input: "'y'" }
+    rework: { agent: agent.a, input: "'z'" }
+    notify: { agent: agent.a, input: "'w'" }
+  edges:
+    - { from: start, to: review }
+    - { from: review, to: publish, when: "review.output.verdict == 'approve'" }
+    - { from: review, to: rework, when: "review.output.verdict != 'approve'" }
+    - { from: review, to: notify, when: "size(state.feedback) > 0" }
+    - { from: publish, to: end }
+    - { from: rework, to: end }
+    - { from: notify, to: end }
+"#,
+    );
+}
+
+/// A cycle bounded by a CEL exit condition alone — a guarded back-edge beside an
+/// `else: true` escape, which is the spelling grammar 7.4 calls usual and which
+/// clause 2's earlier wording rejected (Decision D98).
+#[test]
+fn a_cycle_bounded_by_an_else_exit() {
+    accepts(
+        "else-exit-cycle",
+        r#"
+agent.a:
+  model: model.m
+  prompt: Do it.
+  output:
+    verdict: { enum: [approve, revise] }
+flow.f:
+  outputs: {}
+  nodes:
+    write: { agent: agent.a, input: "'x'" }
+    review: { agent: agent.a, input: "'y'" }
+  edges:
+    - { from: start, to: write }
+    - { from: write, to: review }
+    - { from: review, to: write, when: "review.output.verdict == 'revise'" }
+    - { from: review, to: end, else: true }
+"#,
+    );
+}
+
+/// A guarded shortcut **inside one concurrent branch** is not an unbalanced
+/// convergence: `c` is reached from the fork at depths 2 and 3 through one edge
+/// of the pair and at none through the other, and balance compares one distance
+/// from *each* edge rather than the union of one side (grammar 7.6.2,
+/// Decision D112). `a`'s own two out-edges are exclusive, so at most one of the
+/// two paths is taken on a pass and `c` never receives two deliveries.
+#[test]
+fn a_guarded_shortcut_inside_one_concurrent_branch() {
+    accepts(
+        "guarded-shortcut",
+        r#"
+agent.a:
+  model: model.m
+  prompt: Do it.
+  output:
+    verdict: { enum: [approve, revise] }
+flow.f:
+  outputs: {}
+  nodes:
+    fork: { agent: agent.a, input: "'x'" }
+    a: { agent: agent.a, input: "'a'" }
+    b: { agent: agent.a, input: "'b'" }
+    c: { agent: agent.a, input: "'c'" }
+    d: { agent: agent.a, input: "'d'" }
+  edges:
+    - { from: start, to: fork }
+    - { from: fork, to: a }
+    - { from: fork, to: b }
+    - { from: a, to: c, when: "a.output.verdict == 'approve'" }
+    - { from: a, to: d, else: true }
+    - { from: d, to: c }
+    - { from: c, to: end }
+    - { from: b, to: end }
+"#,
+    );
+}
+
+/// A node no edge targets, reached only through `on_error: { fallback: … }`.
+/// Reachability counts the two control-transfer positions, so a dedicated
+/// error-handling node is live code rather than an unreachable one — and it
+/// still needs an outgoing edge of its own (grammar 7.8, 7.6.3 rule 1,
+/// Decision D95).
+#[test]
+fn a_node_reached_only_through_a_fallback() {
+    accepts(
+        "fallback-only-node",
+        r#"
+agent.a:
+  model: model.m
+  prompt: Do it.
+  output:
+    verdict: { enum: [approve, revise] }
+flow.f:
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.a
+      input: "'x'"
+      on_error: { fallback: cleanup }
+    cleanup: { agent: agent.a, input: "'y'" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }
+    - { from: cleanup, to: end }
 "#,
     );
 }

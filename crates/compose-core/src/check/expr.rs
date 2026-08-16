@@ -203,6 +203,14 @@ pub(crate) fn edge_guard(ctx: &mut Ctx, cx: &FlowCx, edge: &Edge) {
     }
     let analysis = analyze(ctx, guard, &scope);
     expect(ctx, guard, &analysis, &Type::Bool, "an edge guard");
+    // A guard that did not type-check is not read again by the routing
+    // analyses: grammar 7.3.1's table reads an unrecognized term as `∅`, so a
+    // guard already reported as a mistake would come back a second time as a
+    // variant it fails to cover, or as a fork it fails to be exclusive with
+    // (see `routing`, `convergence`).
+    if !analysis.problems.is_empty() || !analysis.ty.assignable_to(&Type::Bool) {
+        ctx.reject_guard(&guard.span);
+    }
 }
 
 /// The scope of a `map.over` path: every node of the flow, plus `input` and
