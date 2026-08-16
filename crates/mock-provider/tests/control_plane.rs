@@ -79,6 +79,7 @@ fn a_run_is_staged_read_and_cleared_over_http() {
     assert_eq!(state["requests"], 3);
     assert_eq!(state["invalid"], 0);
     assert_eq!(state["unscripted"], 0);
+    assert_eq!(state["refused"], 0);
     assert_eq!(
         state["queues"],
         json!({}),
@@ -525,6 +526,50 @@ fn a_raw_outcomes_status_is_served_or_refused_by_name() {
     assert_eq!(served.json(), json!({ "nope": true }));
 }
 
+/// A `raw` outcome that writes the harness's *own* header is still a scripted
+/// answer, and is recorded as one.
+///
+/// The refusal a transcript records is read back off the answer, and a `raw`
+/// outcome's headers are the script's own, served verbatim (WIRE-NOTES §9). So
+/// the one shape that could be mistaken for a refusal is exempt: this stages a
+/// harness-looking response for generated code to reject, the queue entry was
+/// really served, and the run is clean.
+#[test]
+fn a_raw_outcome_wearing_the_harness_header_is_still_a_served_answer() {
+    let provider = MockProvider::start().expect("a port");
+    let client = provider.client();
+    client
+        .post_json(
+            "/_mock/enqueue",
+            &json!({
+                "model": MODEL,
+                "outcome": { "raw": {
+                    "status": mock_provider::HARNESS_STATUS,
+                    "body": { "mock_provider": "a shape generated code must reject" },
+                    // `HARNESS_HEADER` / `REFUSED_MISMATCH`, spelled out because
+                    // a JSON key cannot be a constant.
+                    "headers": { "x-mock-provider-error": "script-mismatch" },
+                }},
+            }),
+        )
+        .expect("the control plane answers");
+
+    let answered = call(&client, "one");
+    assert_eq!(answered.status, mock_provider::HARNESS_STATUS);
+    assert_eq!(
+        answered.header(mock_provider::HARNESS_HEADER),
+        Some(mock_provider::REFUSED_MISMATCH)
+    );
+    let recorded = provider.requests();
+    assert_eq!(recorded[0].served, "raw");
+    assert!(!recorded[0].was_refused());
+    assert!(
+        provider.snapshot().is_drained(),
+        "a `raw` outcome that was served is a clean run: {:?}",
+        provider.snapshot()
+    );
+}
+
 /// The second gate, end to end. A `raw` outcome assembled in Rust never passes
 /// through the control plane's check, so the *client* is what must not be hurt
 /// by one: it gets the harness's refusal rather than a connection that ends with
@@ -552,6 +597,16 @@ fn a_raw_outcome_built_in_rust_cannot_drop_the_connection() {
         "the refusal names the header: {}",
         answered.text()
     );
+    // The transcript says the same as the client saw. The queue entry is spent —
+    // the take happened before the answer was built — so a `served` reading
+    // `raw` would leave a test with a record of a response nobody received, and
+    // a drained snapshot for a run that got a 422.
+    let recorded = provider.requests();
+    assert_eq!(recorded[0].served, mock_provider::REFUSED_UNSENDABLE);
+    assert!(recorded[0].was_refused());
+    let snapshot = provider.snapshot();
+    assert_eq!(snapshot.refused, 1);
+    assert!(!snapshot.is_drained(), "{snapshot:?}");
 
     // …and the same for a status a struct literal wrote past the control plane:
     // the client gets the harness's refusal, not a 500 it would fail over on.
@@ -574,4 +629,9 @@ fn a_raw_outcome_built_in_rust_cannot_drop_the_connection() {
         "the refusal names the status: {}",
         answered.text()
     );
+    assert_eq!(
+        provider.requests()[0].served,
+        mock_provider::REFUSED_UNSENDABLE
+    );
+    assert_eq!(provider.snapshot().refused, 1);
 }

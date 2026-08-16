@@ -208,9 +208,20 @@ fn check_settings(checker: &mut Checker, body: &Map<String, Value>) {
 }
 
 /// `system` is a string or a list of text blocks, and nothing else.
+///
+/// The string is the same shorthand a message's `content` takes, so an empty one
+/// is the same empty text block and is refused at the same normalised address.
+/// Grammar 5.4 requires an agent's `prompt:` to be a non-empty string, so no
+/// correct composition can produce `system: ""` — it is a prompt that rendered
+/// to nothing, which is the codegen bug this rule is for.
 fn check_system(checker: &mut Checker, body: &Map<String, Value>) {
     match body.get("system") {
-        None | Some(Value::Null) | Some(Value::String(_)) => {}
+        None | Some(Value::Null) => {}
+        Some(Value::String(text)) => {
+            if text.is_empty() {
+                report_empty_text(checker, "system.0.text");
+            }
+        }
         Some(Value::Array(blocks)) => {
             for (index, block) in blocks.iter().enumerate() {
                 let pointer = at("system", index);
@@ -516,8 +527,18 @@ fn check_content(
         return blocks;
     };
     let content = match content {
-        // A string is shorthand for one text block, and always legal.
-        Value::String(_) => return blocks,
+        // A string is shorthand for one text block — the API normalises it into
+        // one and addresses its complaints at the *normalised* block, which is
+        // why the refusal below is reported at `content.0.text` and not at
+        // `content`. It is the spelling a compiled graph actually sends, so it
+        // is the spelling the empty-text rule has to reach: a bound input that
+        // rendered to nothing arrives here, not as an explicit empty block.
+        Value::String(text) => {
+            if text.is_empty() {
+                report_empty_text(checker, &at(pointer, "content.0.text"));
+            }
+            return blocks;
+        }
         Value::Array(blocks) => blocks,
         other => {
             checker.fail(
@@ -653,18 +674,31 @@ fn check_content(
 /// whose only symptom would otherwise be a model answering a blank turn.
 fn check_text(checker: &mut Checker, pointer: &str, block: &Map<String, Value>) {
     if checker.required_string(pointer, block, "text") == Some("") {
-        checker.fail(
-            &at(pointer, "text"),
-            format!(
-                "{}: text content blocks must be non-empty",
-                at(pointer, "text")
-            ),
-        );
+        report_empty_text(checker, &at(pointer, "text"));
     }
 }
 
-/// A `tool_result`'s content: a string, or a list of text blocks. Absent is
-/// legal and means an empty result.
+/// The API's complaint about a text block with nothing in it, at `pointer` — the
+/// address of the block's `text`.
+///
+/// One function because the same rule is reached three ways: an explicit block,
+/// a `tool_result` part, and the single block a string `content` normalises into
+/// (whose address is `content.0.text` on a message that never spelled a block).
+fn report_empty_text(checker: &mut Checker, pointer: &str) {
+    checker.fail(
+        pointer,
+        format!("{pointer}: text content blocks must be non-empty"),
+    );
+}
+
+/// A `tool_result`'s content: a string, or a list of text blocks.
+///
+/// The key is optional here, unlike a message's `content`, so "the tool returned
+/// nothing" is a thing this position can say: absent, the empty string and the
+/// empty list all say it, and all three are legal. What is not legal is a text
+/// **block** with nothing in it — that is a block claiming to carry text and
+/// carrying none, which is what a tool whose result binding rendered to nothing
+/// produces, and it is held to the rule every other text block obeys.
 fn check_tool_result_content(checker: &mut Checker, pointer: &str, block: &Map<String, Value>) {
     match block.get("content") {
         None | Some(Value::Null) | Some(Value::String(_)) => {}
@@ -677,8 +711,12 @@ fn check_tool_result_content(checker: &mut Checker, pointer: &str, block: &Map<S
                 else {
                     continue;
                 };
-                if let Some(kind) = checker.required(&pointer, part, "type") {
-                    checker.one_of(&at(&pointer, "type"), kind, &["text"]);
+                if let Some(kind) = checker.required(&pointer, part, "type")
+                    && checker
+                        .one_of(&at(&pointer, "type"), kind, &["text"])
+                        .is_some()
+                {
+                    check_text(checker, &pointer, part);
                 }
             }
         }
@@ -873,15 +911,26 @@ fn reply_answer(
         .clone()
         .unwrap_or_else(|| implied.to_string());
     let content = Value::Array(content);
-    let usage = reply.usage.map_or_else(
+    let (input_tokens, output_tokens) = reply.usage.map_or_else(
         || {
-            json!({
-                "input_tokens": estimate(&canonical(request)),
-                "output_tokens": estimate(&canonical(&content)),
-            })
+            (
+                estimate(&canonical(request)),
+                estimate(&canonical(&content)),
+            )
         },
-        |usage| json!({ "input_tokens": usage.input_tokens, "output_tokens": usage.output_tokens }),
+        |usage| (usage.input_tokens, usage.output_tokens),
     );
+    // The two cache counters are on **every** live Messages response, whether or
+    // not the request asked for caching, so WIRE-NOTES §9's rule applies to them
+    // as much as to `stop_sequence: null`: no client here reads them, and their
+    // absence is what a strict client library trips over. Zero, because nothing
+    // this server serves is cached.
+    let usage = json!({
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+    });
 
     Response::new(
         200,
@@ -1569,6 +1618,111 @@ mod tests {
         assert!(parse(&headers(), Some(&request)).failures.is_empty());
     }
 
+    /// The same rule reaches the spelling a compiled graph actually sends: a
+    /// **string** `content`, which the API normalises into one text block and
+    /// refuses when it is empty — at the normalised block's address, which is
+    /// why the pointer names a block the request never spelled.
+    ///
+    /// This is the shape the empty-text rule exists for. Every acceptance
+    /// fixture sends its user turn as a plain string, so a codegen bug that
+    /// bound an input to nothing arrives here and nowhere else.
+    #[test]
+    fn an_empty_string_content_is_refused_as_the_block_it_normalizes_into() {
+        let request = messages(json!({
+            "messages": [{ "role": "user", "content": "" }],
+        }));
+        let failures = parse(&headers(), Some(&request)).failures;
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].pointer, "messages.0.content.0.text");
+        assert_eq!(
+            failures[0].message,
+            "messages.0.content.0.text: text content blocks must be non-empty"
+        );
+
+        // `system` takes the same shorthand and answers the same way — an
+        // agent's `prompt:` is a non-empty string (grammar 5.4), so an empty
+        // system is a prompt that rendered to nothing.
+        let request = messages(json!({
+            "messages": [{ "role": "user", "content": "hi" }],
+            "system": "",
+        }));
+        let failures = parse(&headers(), Some(&request)).failures;
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].pointer, "system.0.text");
+
+        // …and both string spellings with something in them are the ordinary
+        // request, which must stay accepted: the rule is about emptiness, not
+        // about the shorthand.
+        let request = messages(json!({
+            "messages": [{ "role": "user", "content": "review it" }],
+            "system": "You are a meticulous technical reviewer.",
+        }));
+        assert!(parse(&headers(), Some(&request)).failures.is_empty());
+    }
+
+    /// A `tool_result`'s text parts obey the rule too. A tool whose result
+    /// binding rendered to nothing produces exactly this — a part with no `text`
+    /// at all, or an empty one — and it is a block the real API refuses.
+    #[test]
+    fn a_tool_result_part_is_held_to_the_empty_text_rule() {
+        let loop_request = |content: Value| {
+            messages(json!({
+                "messages": [
+                    { "role": "user", "content": "look it up" },
+                    { "role": "assistant", "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "lookup",
+                        "input": { "query": "a fact" },
+                    }] },
+                    { "role": "user", "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": content,
+                    }] },
+                ],
+                "tools": [{ "name": "lookup", "input_schema": { "type": "object" } }],
+            }))
+        };
+
+        let failures = parse(&headers(), Some(&loop_request(json!([{ "type": "text" }])))).failures;
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].pointer, "messages.2.content.0.content.0.text");
+        assert_eq!(
+            failures[0].message,
+            "messages.2.content.0.content.0.text: Field required"
+        );
+
+        let failures = parse(
+            &headers(),
+            Some(&loop_request(json!([{ "type": "text", "text": "" }]))),
+        )
+        .failures;
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].pointer, "messages.2.content.0.content.0.text");
+        assert!(
+            failures[0].message.contains("must be non-empty"),
+            "{}",
+            failures[0].message
+        );
+
+        // The shapes a real tool loop sends stay accepted: a filled text part,
+        // the string spelling, and an absent `content` — the last two are how a
+        // tool that returned nothing says so, which is legal on this surface.
+        for content in [
+            json!([{ "type": "text", "text": "the fact" }]),
+            json!("the fact"),
+            json!(""),
+        ] {
+            assert!(
+                parse(&headers(), Some(&loop_request(content.clone())))
+                    .failures
+                    .is_empty(),
+                "a `tool_result` content of {content} is legal"
+            );
+        }
+    }
+
     /// Streaming is out of scope and says so, rather than being answered wrong.
     #[test]
     fn streaming_is_refused_by_name() {
@@ -1607,6 +1761,39 @@ mod tests {
         assert_eq!(response.body["content"][0]["input"]["verdict"], "approve");
         assert_eq!(response.body["model"], "claude-sonnet-4-6");
         assert!(response.body["usage"]["input_tokens"].as_u64().unwrap() > 0);
+        // Every live response carries the two cache counters whether or not the
+        // request asked for caching, and WIRE-NOTES §9's rule is to send the
+        // always-present members a strict client might read.
+        assert_eq!(response.body["usage"]["cache_creation_input_tokens"], 0);
+        assert_eq!(response.body["usage"]["cache_read_input_tokens"], 0);
+
+        // A scripted `usage` overrides the estimate and leaves the counters
+        // where they are: a test pinning token accounting is not a test asking
+        // for a different response shape.
+        let Outcome::Reply(reply) = &outcome else {
+            panic!("a structured outcome is a reply");
+        };
+        let scripted = Outcome::Reply(Reply {
+            usage: Some(crate::control::Usage {
+                input_tokens: 11,
+                output_tokens: 22,
+            }),
+            ..reply.clone()
+        });
+        let Answer::Respond(response) =
+            render(3, &request, parsed.structured_output.as_ref(), &scripted)
+        else {
+            panic!("a reply is a response");
+        };
+        assert_eq!(
+            response.body["usage"],
+            json!({
+                "input_tokens": 11,
+                "output_tokens": 22,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+            })
+        );
     }
 
     /// A structured reply to a request that forced nothing is a *script* bug,

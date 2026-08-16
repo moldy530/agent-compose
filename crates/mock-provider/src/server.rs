@@ -22,9 +22,9 @@ use serde_json::{Value, json};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::control::{
-    Decision, Delay, HARNESS_HEADER, Incoming, Script, Store, Surface, canonical,
+    Decision, Delay, HARNESS_HEADER, Incoming, Outcome, Script, Store, Surface, canonical,
 };
-use crate::wire::{Answer, HARNESS_STATUS, Response as Wire, UNSENDABLE};
+use crate::wire::{Answer, HARNESS_STATUS, MISMATCH, Response as Wire, UNSENDABLE};
 use crate::{anthropic, openai};
 
 /// The largest request body this server will read.
@@ -301,7 +301,8 @@ fn provider(store: &Store, reached: Reached<'_>, arriving: Arriving<'_>) -> Answ
     match surface {
         Surface::Anthropic => match decision {
             Decision::Serve(outcome) => {
-                anthropic::render(sequence, &body, structured.as_ref(), &outcome)
+                let answer = anthropic::render(sequence, &body, structured.as_ref(), &outcome);
+                recorded(store, sequence, &outcome, answer)
             }
             Decision::Rejected(failures) => anthropic::rejected(sequence, &failures),
             Decision::Unscripted { model, reason } => {
@@ -310,12 +311,46 @@ fn provider(store: &Store, reached: Reached<'_>, arriving: Arriving<'_>) -> Answ
         },
         Surface::OpenAi | Surface::AzureOpenAi => match decision {
             Decision::Serve(outcome) => {
-                openai::render(sequence, &body, &model, structured.as_ref(), &outcome)
+                let answer = openai::render(sequence, &body, &model, structured.as_ref(), &outcome);
+                recorded(store, sequence, &outcome, answer)
             }
             Decision::Rejected(failures) => openai::rejected(sequence, &failures),
             Decision::Unscripted { model, reason } => openai::unscripted(sequence, &model, &reason),
         },
     }
+}
+
+/// Hand the answer on, correcting the transcript first if the outcome the store
+/// handed over never made it onto the wire.
+fn recorded(store: &Store, sequence: u64, outcome: &Outcome, answer: Answer) -> Answer {
+    if let Some(refusal) = refusal(outcome, &answer) {
+        store.refused(sequence, refusal);
+    }
+    answer
+}
+
+/// The refusal a rendered answer carries, for an outcome that had already been
+/// taken from its queue.
+///
+/// Both refusals here are decided *after* [`Store::serve`] has written the
+/// transcript entry — the surface refuses an outcome it cannot render into what
+/// the request asked for, and [`render`] refuses one that cannot be put on the
+/// wire — and both are read back off the answer rather than plumbed out of the
+/// surfaces, because in each case the refusal **is** the answer: it is the 422
+/// the client receives, header and all.
+///
+/// A `raw` outcome is exempt from the header half. Its headers are the script's
+/// own, verbatim, so a script that writes `x-mock-provider-error` is staging a
+/// response for generated code to reject — not a refusal by this server.
+fn refusal(outcome: &Outcome, answer: &Answer) -> Option<&'static str> {
+    let Answer::Respond(response) = answer else {
+        return None;
+    };
+    if sendable(response.status, &response.headers).is_err() {
+        return Some(UNSENDABLE);
+    }
+    let refused = response.headers.get(HARNESS_HEADER).map(String::as_str) == Some(MISMATCH);
+    (refused && !matches!(outcome, Outcome::Raw(_))).then_some(MISMATCH)
 }
 
 /// `POST /_mock/enqueue`: one scripted outcome, or a list of them.
@@ -384,10 +419,13 @@ fn read_headers(headers: &hyper::HeaderMap) -> BTreeMap<String, String> {
 ///   **500** — a failover condition *and* a status both SDKs retry twice.
 ///
 /// So each is checked here and answered as the harness bug it is, in the same
-/// voice as an unscripted call. The transcript still shows the outcome that was
-/// taken, exactly as it does for a `script-mismatch`. The control plane refuses
-/// both when the script is enqueued; this is the second gate, the one a struct
-/// literal filling the public fields still has to pass.
+/// voice as an unscripted call. The queue entry is spent either way — the take
+/// happened before the answer was built — but the transcript records the
+/// refusal rather than the outcome ([`refusal`] and [`Store::refused`]), so a
+/// test cannot read `reply.text` off a call that received a 422 and no reply.
+/// The control plane refuses both when the script is enqueued; this is the
+/// second gate, the one a struct literal filling the public fields still has to
+/// pass.
 fn render(answer: Answer) -> hyper::Response<Full<Bytes>> {
     let Answer::Respond(response) = answer else {
         unreachable!("a closed connection never renders");

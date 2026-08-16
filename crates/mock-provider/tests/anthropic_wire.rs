@@ -432,7 +432,21 @@ fn a_text_reply_to_a_forced_tool_is_refused_as_a_script_mismatch() {
         "the refusal names what the request pinned: {}",
         response.text()
     );
-    assert_eq!(provider.requests()[0].served, "reply.text");
+
+    // The transcript records what the client received, not what the queue handed
+    // over: no reply was sent, and a `served` reading `reply.text` would tell a
+    // test the opposite. The snapshot says the same thing — in an e2e run the 422
+    // goes to the generated process, so a drained snapshot here would leave the
+    // Rust side with a graph that failed for no visible reason.
+    let recorded = &provider.requests()[0];
+    assert_eq!(recorded.served, mock_provider::REFUSED_MISMATCH);
+    assert!(recorded.was_refused());
+    let snapshot = provider.snapshot();
+    assert_eq!(snapshot.refused, 1);
+    assert!(
+        !snapshot.is_drained(),
+        "a refused call is not a clean run: {snapshot:?}"
+    );
 }
 
 /// A scripted call to a tool the request *offered* but did not *pin* is refused
@@ -484,6 +498,17 @@ fn a_tool_call_beside_the_pinned_tool_is_refused_as_a_script_mismatch() {
     );
     assert_eq!(response.status, 200);
     assert_eq!(response.json()["content"][0]["name"], "lookup");
+
+    // Both halves in one transcript: the refused call records the refusal, the
+    // answered one records the reply it actually sent, and only the first is
+    // counted as refused.
+    let served: Vec<String> = provider
+        .requests()
+        .iter()
+        .map(|request| request.served.clone())
+        .collect();
+    assert_eq!(served, [mock_provider::REFUSED_MISMATCH, "reply.tools"]);
+    assert_eq!(provider.snapshot().refused, 1);
 }
 
 /// The escape hatch: a body served verbatim, for the responses generated code

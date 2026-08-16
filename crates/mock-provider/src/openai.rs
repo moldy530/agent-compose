@@ -644,7 +644,15 @@ fn check_messages(checker: &mut Checker, body: &Map<String, Value>, tools: &[Str
                 if has_content {
                     check_content(checker, &at(&pointer, "content"), &message["content"]);
                 }
-                if !has_content && calls.is_empty() {
+                // Presence of the *key*, not of usable ids: a `tool_calls` that
+                // is there but empty or malformed has already been complained
+                // about by name, and "carries neither" on top of it would be a
+                // second sentence about one mistake. What this catches is the
+                // turn that carries neither key at all.
+                let has_calls = message
+                    .get("tool_calls")
+                    .is_some_and(|calls| !calls.is_null());
+                if !has_content && !has_calls {
                     checker.fail(
                         &pointer,
                         format!(
@@ -711,6 +719,19 @@ fn check_tool_calls(
     let Some(calls) = checker.optional(pointer, message, "tool_calls", Kind::Array) else {
         return ids;
     };
+    // The same rule `tools: []` obeys, one message lower and for the same
+    // reason: the service refuses an empty array where it requires at least one
+    // item, and a client that always writes the key when it echoes assistant
+    // history sends exactly this on a turn that called nothing. Refused here, so
+    // the mistake is found in CI rather than on the first live call.
+    if calls.as_array().is_some_and(Vec::is_empty) {
+        let pointer = at(pointer, "tool_calls");
+        checker.fail(
+            &pointer,
+            format!("Invalid '{pointer}': empty array. Expected an array with minimum length 1."),
+        );
+        return ids;
+    }
     for (index, call) in calls.as_array().into_iter().flatten().enumerate() {
         let pointer = at(&at(pointer, "tool_calls"), index);
         let Some(call) = checker
@@ -1451,6 +1472,80 @@ mod tests {
 
         // Absent is the correct spelling for "no tools", and it is accepted.
         assert!(parse_direct(&request(json!({}))).failures.is_empty());
+    }
+
+    /// The same rule one message lower: an assistant turn's `tool_calls` is
+    /// refused when it is an empty array, which is what a client that always
+    /// writes the key sends for a turn that called nothing.
+    #[test]
+    fn an_empty_tool_calls_array_is_refused() {
+        let body = request(json!({
+            "messages": [
+                { "role": "user", "content": "hi" },
+                { "role": "assistant", "content": "ok", "tool_calls": [] },
+                { "role": "user", "content": "again" },
+            ],
+        }));
+        let failures = parse_direct(&body).failures;
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].pointer, "messages.1.tool_calls");
+        assert_eq!(
+            failures[0].message,
+            "Invalid 'messages.1.tool_calls': empty array. Expected an array with minimum length 1."
+        );
+
+        // …and it is the *empty array* that is refused, not the key: an
+        // assistant turn with content and no `tool_calls` at all is the ordinary
+        // echoed history, and a turn that really called a tool is accepted with
+        // its answer.
+        let body = request(json!({
+            "messages": [
+                { "role": "user", "content": "hi" },
+                { "role": "assistant", "content": "ok" },
+                { "role": "user", "content": "again" },
+            ],
+        }));
+        assert!(parse_direct(&body).failures.is_empty());
+
+        let body = request(json!({
+            "messages": [
+                { "role": "user", "content": "look it up" },
+                { "role": "assistant", "content": null, "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": { "name": "lookup", "arguments": "{\"query\":\"a fact\"}" },
+                }] },
+                { "role": "tool", "tool_call_id": "call_1", "content": "the fact" },
+            ],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "parameters": { "type": "object", "properties": {}, "additionalProperties": false },
+                },
+            }],
+        }));
+        assert!(
+            parse_direct(&body).failures.is_empty(),
+            "{:?}",
+            parse_direct(&body).failures
+        );
+
+        // The turn that carries neither key is still the missing-both mistake,
+        // reported once and in the service's own words.
+        let body = request(json!({
+            "messages": [
+                { "role": "user", "content": "hi" },
+                { "role": "assistant" },
+                { "role": "user", "content": "again" },
+            ],
+        }));
+        let failures = parse_direct(&body).failures;
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(
+            failures[0].message,
+            "Invalid 'messages[1]': assistant message must carry 'content' or 'tool_calls'."
+        );
     }
 
     /// `top_k` is accepted here because `openai_compatible` backends take it and

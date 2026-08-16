@@ -40,6 +40,14 @@
 //! **consumes no outcome**. A queue is a test's statement about the calls a graph
 //! makes; letting one malformed call eat the answer meant for the next one would
 //! turn a single codegen bug into a cascade of unrelated failures.
+//!
+//! The two refusals that arrive *after* that point — an outcome the surface
+//! cannot render into what the request asked for, and one that cannot be put on
+//! the wire — do consume theirs, because the take has already happened by the
+//! time the answer is built. What they must not do is look like an answer:
+//! [`Store::refused`] rewrites the record so `served` names the refusal, and
+//! [`Snapshot::refused`] counts it, so [`Snapshot::is_drained`] cannot call a
+//! refused run clean.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Mutex;
@@ -93,6 +101,18 @@ pub const REFUSED_MISMATCH: &str = "script-mismatch";
 /// [`HARNESS_HEADER`] on a scripted outcome that could not be put on the wire at
 /// all — a `raw` outcome carrying a header name or value HTTP cannot carry.
 pub const REFUSED_UNSENDABLE: &str = "unsendable-response";
+
+/// The two refusals that happen **after** an outcome has been taken from its
+/// queue, spelled as [`RecordedRequest::served`] records them.
+///
+/// They are the pair a transcript could most easily lie about: the queue take
+/// has already happened when the refusal is decided, so a `served` written from
+/// the taken outcome would say `reply.text` about a call that received a 422 and
+/// no reply. Counted apart from `invalid` and `unscripted` in [`Snapshot`] for
+/// the same reason those two are counted at all — [`Snapshot::is_drained`] is
+/// the suite's clean-run assertion, and a refusal it could not see would let a
+/// failed run report a clean one.
+const REFUSED_AFTER_TAKING: &[&str] = &[REFUSED_MISMATCH, REFUSED_UNSENDABLE];
 
 /// Which provider surface a request arrived on.
 ///
@@ -364,16 +384,34 @@ impl Outcome {
     /// The scheduling knob a fan-out test needs: with completion order forced,
     /// "appended results are reordered by source-item index" (PRD 5.6) becomes
     /// an assertion rather than a coin flip.
+    ///
+    /// # Panics
+    ///
+    /// If the outcome is a `rate_limit`, `overloaded` or `server_error`
+    /// failure. Those three are the shapes with nowhere to carry a wait: they
+    /// are rendered from the surface's own error envelope, and a scripted
+    /// document cannot express one on them either ([`Failure`] denies unknown
+    /// fields), so a builder that accepted one here would have to drop it. A
+    /// dropped delay is the worst of the three outcomes — the test staging "the
+    /// first route member rate-limits 300ms in" would get an instant 429 and
+    /// assert about an ordering that never happened — so it is refused where it
+    /// was written instead, the same way [`Outcome::raw`] refuses a status HTTP
+    /// cannot carry. A late refusal is scriptable two ways: `Outcome::timeout`
+    /// for no answer at all, and `Outcome::raw(429, body).after(delay)` for a
+    /// late one with a status generated code classifies (PRD 5.9).
     #[must_use]
     pub fn after(self, delay: Duration) -> Self {
         let delay = Delay::from(delay);
         match self {
             Self::Reply(reply) => Self::Reply(Reply { delay, ..reply }),
             Self::Raw(raw) => Self::Raw(RawOutcome { delay, ..raw }),
-            Self::Failure(failure) => Self::Failure(match failure {
-                Failure::Timeout { .. } => Failure::Timeout { delay },
-                other => other,
-            }),
+            Self::Failure(Failure::Timeout { .. }) => Self::Failure(Failure::Timeout { delay }),
+            Self::Failure(other) => panic!(
+                "`{}` has no wait to carry, so `after` would drop it: script \
+                 `Outcome::timeout(delay)` for a late non-answer, or \
+                 `Outcome::raw(status, body).after(delay)` for a late refusal",
+                other.served()
+            ),
         }
     }
 
@@ -786,7 +824,17 @@ pub struct RecordedRequest {
     pub tools: Vec<String>,
     /// How the request asked for structured output, if it did.
     pub structured_output: Option<StructuredOutput>,
-    /// What the server did about it.
+    /// What the server **answered** it with — not merely what the queue handed
+    /// over.
+    ///
+    /// `reply.text`, `reply.structured`, `reply.tools`, `failure.*` and `raw`
+    /// name a scripted outcome that was served. `rejected` and `unscripted` are
+    /// refusals that took nothing from the queue. `script-mismatch` and
+    /// `unsendable-response` are refusals that took an outcome and then could
+    /// not send it ([`REFUSED_MISMATCH`], [`REFUSED_UNSENDABLE`]): the queue
+    /// entry is gone — `/_mock/state` shows the depth it left — but no reply
+    /// reached the client, and recording the taken outcome here would tell a
+    /// test the opposite of what the client saw.
     pub served: String,
 }
 
@@ -814,6 +862,17 @@ impl RecordedRequest {
             .as_ref()
             .expect("the recorded request carries a JSON body")
     }
+
+    /// Whether the harness refused this call after taking its scripted
+    /// outcome — a `script-mismatch` or an `unsendable-response`.
+    ///
+    /// The client got a 422 and no reply, so a test reading the transcript to
+    /// find out what a run received asks this rather than reading [`Self::served`]
+    /// for a reply name that is not there.
+    #[must_use]
+    pub fn was_refused(&self) -> bool {
+        REFUSED_AFTER_TAKING.contains(&self.served.as_str())
+    }
 }
 
 /// A count of everything the store is holding.
@@ -828,6 +887,14 @@ pub struct Snapshot {
     pub invalid: usize,
     /// How many of them found no scripted outcome.
     pub unscripted: usize,
+    /// How many of them took an outcome and were refused anyway — a
+    /// `script-mismatch` or an `unsendable-response` (see
+    /// [`REFUSED_AFTER_TAKING`]).
+    ///
+    /// Disjoint from the two counts above: those refuse *before* the queue is
+    /// touched, this one after, which is why it needs a counter of its own for
+    /// [`Self::is_drained`] to mean what it says.
+    pub refused: usize,
 }
 
 impl Snapshot {
@@ -835,7 +902,7 @@ impl Snapshot {
     /// the shape a finished acceptance run should have.
     #[must_use]
     pub fn is_drained(&self) -> bool {
-        self.queues.is_empty() && self.invalid == 0 && self.unscripted == 0
+        self.queues.is_empty() && self.invalid == 0 && self.unscripted == 0 && self.refused == 0
     }
 }
 
@@ -949,6 +1016,11 @@ impl Store {
                 .iter()
                 .filter(|request| request.served == "unscripted")
                 .count(),
+            refused: state
+                .requests
+                .iter()
+                .filter(|request| request.was_refused())
+                .count(),
         }
     }
 
@@ -1007,6 +1079,36 @@ impl Store {
         });
 
         (decision, sequence)
+    }
+
+    /// Record that request `sequence` was refused *after* its outcome had been
+    /// taken, so the transcript says what the client actually received.
+    ///
+    /// Two refusals are decided downstream of [`Self::serve`] — the surface
+    /// finding that a taken outcome cannot answer this request
+    /// ([`REFUSED_MISMATCH`]), and the connection loop finding that the answer
+    /// cannot be put on the wire ([`REFUSED_UNSENDABLE`]) — because both need
+    /// the rendered answer, which the store never sees. Without this the
+    /// transcript would name the taken outcome as though it had been sent, and
+    /// [`Snapshot::is_drained`] would report a clean run: in an e2e run the 422
+    /// goes to the generated process, so the Rust side would be left with a
+    /// graph that failed for no visible reason.
+    ///
+    /// A no-op if the record is gone — a [`Self::reset`] between the answer and
+    /// this call — because a refusal that outlived its transcript is not worth
+    /// a panic in a harness.
+    pub(crate) fn refused(&self, sequence: u64, refusal: &str) {
+        debug_assert!(
+            REFUSED_AFTER_TAKING.contains(&refusal),
+            "`{refusal}` is not a refusal that happens after an outcome is taken"
+        );
+        let Ok(index) = usize::try_from(sequence.saturating_sub(1)) else {
+            return;
+        };
+        let mut state = self.lock();
+        if let Some(request) = state.requests.get_mut(index) {
+            request.served = refusal.to_string();
+        }
     }
 
     /// Take the first outcome in `model`'s queue that matches this body.
@@ -1472,9 +1574,47 @@ mod tests {
             panic!("a raw outcome stays raw");
         };
         assert_eq!(raw.delay.duration(), delay);
+    }
 
-        // A failure with no delay of its own is delivered at once: only a
-        // timeout has a wait to move.
-        assert!(Outcome::rate_limit().after(delay).served() == "failure.rate_limit");
+    /// …and a failure with nowhere to carry one says so where it was written.
+    ///
+    /// The three refusal shapes are rendered from the surface's error envelope
+    /// and have no delay field, so accepting the call would mean dropping the
+    /// wait: a test staging "the first route member rate-limits 300ms into a
+    /// fan-out" would get an instant 429 and assert about an ordering that never
+    /// happened. Refused the way a `raw` outcome's impossible status is.
+    #[test]
+    #[should_panic(expected = "`failure.rate_limit` has no wait to carry")]
+    fn a_delay_on_a_failure_that_cannot_carry_one_is_refused_by_the_builder() {
+        let _ = Outcome::rate_limit().after(Duration::from_millis(300));
+    }
+
+    /// The panic names what to script instead, because the two alternatives are
+    /// what make the refusal a redirection rather than a dead end.
+    #[test]
+    fn the_refusal_names_the_two_ways_to_stage_a_late_failure() {
+        let panicked = std::panic::catch_unwind(|| {
+            let _ = Outcome::overloaded().after(Duration::from_millis(1));
+        })
+        .expect_err("`after` refuses an overload");
+        let message = panicked
+            .downcast_ref::<String>()
+            .expect("the panic carries its message");
+        assert!(message.contains("failure.overloaded"), "{message}");
+        assert!(message.contains("Outcome::timeout(delay)"), "{message}");
+        assert!(
+            message.contains("Outcome::raw(status, body).after(delay)"),
+            "{message}"
+        );
+
+        // The other half of the promise: a late refusal really is scriptable
+        // that way, and the delay reaches the outcome that answers it.
+        let Outcome::Raw(raw) =
+            Outcome::raw(429, json!({ "error": "slow down" })).after(Duration::from_millis(300))
+        else {
+            panic!("a raw outcome stays raw");
+        };
+        assert_eq!(raw.status, 429);
+        assert_eq!(raw.delay.duration(), Duration::from_millis(300));
     }
 }

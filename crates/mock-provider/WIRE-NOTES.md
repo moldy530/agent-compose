@@ -93,6 +93,20 @@ These are load-bearing and pinned by tests in `src/` and `tests/`:
   half of grammar 12.2: the compiler range-checks a `settings:` block against the
   literal in the spec, and nothing else looks at what a template or a codegen bug
   actually serializes. The exact sentences are (15).
+* **A string is one text block, and the empty one is refused as such.** The
+  Messages API takes a string wherever it takes a list of text blocks —
+  `messages[].content`, `system` — as shorthand for a single block, and it
+  addresses its complaint at the **normalised** block: `content: ""` is refused
+  at `messages.0.content.0.text`, an address the request never spelled. That
+  matters because the string is the spelling a compiled graph sends: a prompt or
+  a bound input that rendered to nothing arrives as `""`, not as an explicit
+  empty block, so a rule that only reached the block form would miss every real
+  instance of the bug it was written for. The same rule reaches the text parts
+  of a `tool_result`. (An **absent** `tool_result` content, and the empty string
+  in that one position, stay legal: a tool that returned nothing says so that
+  way, and the API makes the key optional. `system: ""` is not that case —
+  grammar 5.4 requires a non-empty `prompt:`, so no correct composition
+  produces one.)
 * **`tool_choice: none` forbids one**, which is the same rule read backwards, so
   a `tools` reply scripted against it is refused the same way. So is a `tools`
   reply carrying **no calls**: `stop_reason: "tool_use"` / `finish_reason:
@@ -111,7 +125,10 @@ These are load-bearing and pinned by tests in `src/` and `tests/`:
 * **`tool_choice` requires `tools`**, on both surfaces, and **OpenAI refuses an
   empty `tools` array** (`Invalid 'tools': empty array. Expected an array with
   minimum length 1.`) — which is what a compiled graph sends for an agent with
-  neither `tools:` nor `stores:` if it always writes the key.
+  neither `tools:` nor `stores:` if it always writes the key. An assistant
+  message's **`tool_calls: []`** is the same mistake one message lower, sent by
+  a client that always writes the key when it echoes history, and it is refused
+  with the same sentence at `messages.N.tool_calls`.
 
 ---
 
@@ -209,8 +226,11 @@ call would be refused too.
 ### 9. Response fields no client reads are still worth sending
 
 `stop_sequence: null`, `system_fingerprint: "fp_mock"`, `logprobs: null`,
-`created`, `request-id` / `x-request-id` headers. They are cheap and their
-absence is the kind of thing a strict client library trips over.
+`created`, `request-id` / `x-request-id` headers, and the Messages surface's
+`usage.cache_creation_input_tokens` / `usage.cache_read_input_tokens` (both `0`,
+because nothing here is cached — they are on every live response whether or not
+the request asked for caching). They are cheap and their absence is the kind of
+thing a strict client library trips over.
 
 The argument applies to **errors as well as answers**, which is where it is
 easiest to forget: both APIs return a request id on every response, and it is
@@ -250,6 +270,16 @@ mechanisms had to be dodged, not one:
 The envelope's `type` is the surface's `invalid_request_error` rather than an
 invented one, because an unknown error type is what a client library least
 reliably parses.
+
+Every one of them is **recorded as a refusal**, which matters most for the two
+that happen after a scripted outcome has already been taken from its queue: a
+`script-mismatch`, and a `raw` outcome that cannot be put on the wire. The
+transcript's `served` names the refusal (`script-mismatch`,
+`unsendable-response`) rather than the outcome that was taken, and
+`/_mock/state` counts it under `refused`, so `is_drained()` is false for a run
+that was refused. In an e2e run the 422 goes to the generated process, so
+without that the Rust side would see a transcript claiming a reply was served,
+a clean snapshot, and a graph that failed for no visible reason.
 *Confirmed by*: the first live e2e — one refused call producing exactly one
 transcript entry.
 *If wrong* (some client retries 422s): the transcript still shows the refusal,
@@ -329,7 +359,12 @@ Invalid type for 'temperature': expected number, but got string instead.
 *What is assumed*: the exact sentences, and the ranges where the three kinds
 behind the Chat Completions route disagree — `temperature` is bounded at 2 there
 because that is the widest of them, and the list is a union for the same reason
-`top_k` is on it (see *Accepted-key lists*, below).
+`top_k` is on it (see *Accepted-key lists*, below). The empty-text sentence is
+also the one used for the **string** spelling of a `content` or a `system` (the
+Certain list, above): the refusal is not in doubt, but the Messages API is also
+known to word an empty turn as `messages: all messages must have non-empty
+content except for the optional final assistant message`, so the first live e2e
+that sends one is what says which sentence and which address it uses.
 *If wrong*: only a test asserting on the string breaks —
 `src/anthropic.rs`'s `the_sampling_knobs_are_checked_for_type_and_range` and
 `src/openai.rs`'s namesake are where they live. A range that is too *narrow*
