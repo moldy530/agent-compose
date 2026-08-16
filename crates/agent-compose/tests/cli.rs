@@ -11,7 +11,9 @@
 //! Every run sets `NO_COLOR` and reads the streams through a pipe, so nothing
 //! here depends on a terminal; `annotate-snippets`' decor is ASCII either way,
 //! which means the only difference a terminal makes is the colour these tests
-//! turn off.
+//! turn off. That colour is the one thing they therefore cannot see, so
+//! `report`'s own unit tests hold it: both verdicts styled or neither, and the
+//! styled render equal to the plain one once the escapes come back out.
 
 use std::path::{Path, PathBuf};
 use std::process::Output;
