@@ -16,6 +16,8 @@
 //! several fields at once, and one round trip that names all of them is worth
 //! more to whoever is reading the transcript than five that each name one.
 
+use std::ops::RangeInclusive;
+
 use serde_json::{Map, Value};
 
 use crate::control::ValidationFailure;
@@ -38,6 +40,8 @@ pub(crate) enum Kind {
     Array,
     String,
     Integer,
+    /// Any JSON number, integral or not — what a sampling knob takes.
+    Number,
     Boolean,
 }
 
@@ -49,6 +53,7 @@ impl Kind {
             Self::Array => "array",
             Self::String => "string",
             Self::Integer => "integer",
+            Self::Number => "number",
             Self::Boolean => "boolean",
         }
     }
@@ -64,6 +69,16 @@ fn found(value: &Value) -> &'static str {
         Value::String(_) => "string",
         Value::Array(_) => "array",
         Value::Object(_) => "object",
+    }
+}
+
+/// A bound as an error message spells it: `1` rather than `1.0`, because that
+/// is how both APIs print the integral ones.
+fn printed(value: f64) -> String {
+    if value.fract() == 0.0 {
+        format!("{value:.0}")
+    } else {
+        value.to_string()
     }
 }
 
@@ -141,6 +156,7 @@ impl Checker {
             Kind::Array => value.is_array(),
             Kind::String => value.is_string(),
             Kind::Integer => value.is_i64() || value.is_u64(),
+            Kind::Number => value.is_number(),
             Kind::Boolean => value.is_boolean(),
         };
         if matches {
@@ -206,6 +222,90 @@ impl Checker {
             None | Some(Value::Null) => None,
             Some(value) => self.typed(&at(parent, key), value, kind),
         }
+    }
+
+    /// An optional number, within the range the API bounds it to.
+    ///
+    /// The two halves belong together because a settings knob is wrong in two
+    /// ways and both are 400s: `temperature: "hot"` is a type the API refuses,
+    /// and `temperature: 5` is a value it refuses. A membership check that asked
+    /// neither question — which is what a key list alone does — accepts both,
+    /// and a compiled graph that stringifies its `settings:` block (grammar
+    /// 12.2 range-checks them at *compile* time, never on the wire) would pass
+    /// CI here and be refused on its first live call.
+    pub(crate) fn bounded_number(
+        &mut self,
+        parent: &str,
+        object: &Map<String, Value>,
+        key: &str,
+        bounds: RangeInclusive<f64>,
+    ) {
+        let Some(number) = self
+            .optional(parent, object, key, Kind::Number)
+            .and_then(Value::as_f64)
+        else {
+            return;
+        };
+        self.within(&at(parent, key), number, bounds);
+    }
+
+    /// An optional integer, within the range the API bounds it to.
+    pub(crate) fn bounded_integer(
+        &mut self,
+        parent: &str,
+        object: &Map<String, Value>,
+        key: &str,
+        bounds: RangeInclusive<i64>,
+    ) {
+        let Some(number) = self
+            .optional(parent, object, key, Kind::Integer)
+            .and_then(Value::as_i64)
+        else {
+            return;
+        };
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "the bounds these keys carry are small counts (1, 20, 50); \
+                      a magnitude where `f64` loses integer precision is far outside \
+                      any of them and would be reported as out of range either way"
+        )]
+        self.within(
+            &at(parent, key),
+            number as f64,
+            *bounds.start() as f64..=*bounds.end() as f64,
+        );
+    }
+
+    /// The complaint a value outside its range draws, in the surface's dialect.
+    fn within(&mut self, pointer: &str, number: f64, bounds: RangeInclusive<f64>) {
+        let (limit, over) = if number < *bounds.start() {
+            (*bounds.start(), false)
+        } else if number > *bounds.end() {
+            (*bounds.end(), true)
+        } else {
+            return;
+        };
+        let message = match (self.dialect, over) {
+            (Dialect::Anthropic, false) => format!(
+                "{pointer}: Input should be greater than or equal to {}",
+                printed(limit)
+            ),
+            (Dialect::Anthropic, true) => format!(
+                "{pointer}: Input should be less than or equal to {}",
+                printed(limit)
+            ),
+            (Dialect::OpenAi, false) => format!(
+                "{} is less than the minimum of {} - '{pointer}'",
+                printed(number),
+                printed(limit)
+            ),
+            (Dialect::OpenAi, true) => format!(
+                "{} is greater than the maximum of {} - '{pointer}'",
+                printed(number),
+                printed(limit)
+            ),
+        };
+        self.fail(pointer, message);
     }
 
     /// The closed key set of an object.
@@ -386,6 +486,99 @@ mod tests {
             checker.into_failures()[0].message,
             "Invalid value: 'wizard'. Supported values are: 'user', 'assistant'."
         );
+    }
+
+    /// A bounded key is wrong in two ways, and both are reported: a type the
+    /// API refuses and a value it refuses.
+    #[test]
+    fn a_bounded_key_is_checked_for_its_type_and_its_range() {
+        let mut checker = Checker::new(Dialect::Anthropic);
+        checker.bounded_number(
+            "",
+            &object(json!({ "temperature": "hot" })),
+            "temperature",
+            0.0..=1.0,
+        );
+        checker.bounded_number(
+            "",
+            &object(json!({ "temperature": 5 })),
+            "temperature",
+            0.0..=1.0,
+        );
+        checker.bounded_number("", &object(json!({ "top_p": -0.5 })), "top_p", 0.0..=1.0);
+        checker.bounded_integer(
+            "",
+            &object(json!({ "max_tokens": 0 })),
+            "max_tokens",
+            1..=i64::MAX,
+        );
+        let failures = checker.into_failures();
+        assert_eq!(
+            failures
+                .iter()
+                .map(|failure| failure.message.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "temperature: Input should be a valid number",
+                "temperature: Input should be less than or equal to 1",
+                "top_p: Input should be greater than or equal to 0",
+                "max_tokens: Input should be greater than or equal to 1",
+            ]
+        );
+
+        // The other dialect words the same two mistakes its own way.
+        let mut checker = Checker::new(Dialect::OpenAi);
+        checker.bounded_number(
+            "",
+            &object(json!({ "temperature": "hot" })),
+            "temperature",
+            0.0..=2.0,
+        );
+        checker.bounded_number(
+            "",
+            &object(json!({ "temperature": 2.5 })),
+            "temperature",
+            0.0..=2.0,
+        );
+        checker.bounded_integer("", &object(json!({ "n": 0 })), "n", 1..=128);
+        let failures = checker.into_failures();
+        assert_eq!(
+            failures
+                .iter()
+                .map(|failure| failure.message.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Invalid type for 'temperature': expected number, but got string instead.",
+                "2.5 is greater than the maximum of 2 - 'temperature'",
+                "0 is less than the minimum of 1 - 'n'",
+            ]
+        );
+    }
+
+    /// …and a value inside the range, at either edge, is accepted — including
+    /// the integral spelling of a fractional knob, which is what a `settings:`
+    /// block writes for `temperature: 1`.
+    #[test]
+    fn a_bounded_key_within_its_range_is_accepted() {
+        let mut checker = Checker::new(Dialect::Anthropic);
+        for value in [json!(0), json!(0.7), json!(1), json!(1.0)] {
+            checker.bounded_number(
+                "",
+                &object(json!({ "temperature": value })),
+                "temperature",
+                0.0..=1.0,
+            );
+        }
+        checker.bounded_integer("", &object(json!({ "top_k": 40 })), "top_k", 0..=i64::MAX);
+        // An absent key, and an explicitly null one, are both simply absent.
+        checker.bounded_number("", &object(json!({})), "temperature", 0.0..=1.0);
+        checker.bounded_number(
+            "",
+            &object(json!({ "temperature": null })),
+            "temperature",
+            0.0..=1.0,
+        );
+        assert!(checker.into_failures().is_empty());
     }
 
     /// A number that is not an integer is not an integer.

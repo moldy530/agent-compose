@@ -69,8 +69,10 @@ These are load-bearing and pinned by tests in `src/` and `tests/`:
   preceding assistant message.
 * **OpenAI's error envelope is `{"error":{"message","type","param","code"}}`**,
   and unknown request arguments are refused rather than ignored.
-* **Azure requires an `api-version` query parameter** and authenticates with an
-  `api-key` header (a bearer token is also accepted, for AAD).
+* **Azure's classic deployment route requires an `api-version` query
+  parameter**, and both Azure routes authenticate with an `api-key` header (a
+  bearer token is also accepted, for AAD). The newer `/openai/v1/...` route makes
+  `api-version` optional — see (7), where the route forms live.
 * **A pinned tool choice guarantees a call.** Anthropic's `tool_choice: {type:
   "tool", …}` and `{type: "any"}`, OpenAI's forced function and `tool_choice:
   "required"`, and OpenAI's `response_format: {type: "json_schema"}` each make
@@ -78,6 +80,19 @@ These are load-bearing and pinned by tests in `src/` and `tests/`:
   is refused as a `script-mismatch` for the same reason a `structured` reply to
   a request that pinned nothing is: the harness must not teach generated code
   that a provider answers in a way it cannot.
+* **A tool choice pinned by *name* guarantees a call to *that* tool.** The
+  stronger half of the same rule, and the one an agent with tools makes
+  reachable: `tool_choice: {type: "tool", name: X}` and a forced function both
+  offer the model no other move, so a `tools` reply naming a **sibling** tool the
+  request also offered — legal-looking, since the tool is on the surface — is
+  refused as a `script-mismatch` too. (`{type: "any"}` and `"required"` pin that
+  *some* tool is called and not which, so any offered tool is fair game there.)
+* **Both APIs check a known key's type and range, not just its name.**
+  `temperature: "hot"`, `top_p: 5`, `n: "2"` and `stream: "true"` are 400s, not
+  ignored settings, and so is an empty Anthropic text block. This is the runtime
+  half of grammar 12.2: the compiler range-checks a `settings:` block against the
+  literal in the spec, and nothing else looks at what a template or a codegen bug
+  actually serializes. The exact sentences are (15).
 * **`tool_choice: none` forbids one**, which is the same rule read backwards, so
   a `tools` reply scripted against it is refused the same way. So is a `tools`
   reply carrying **no calls**: `stop_reason: "tool_use"` / `finish_reason:
@@ -163,10 +178,16 @@ path, which it already has. The harness can script either.
 ### 7. The Azure route forms
 
 Classic: `POST /openai/deployments/<deployment>/chat/completions?api-version=…`,
-where the deployment names the model and the body's `model` is optional. Newer:
-`POST /openai/v1/chat/completions?api-version=preview`, where the body names the
-model. Both are served; when a body names a model it outranks the path, so one
-deployment can host several scripted model ids.
+where the deployment names the model, the body's `model` is optional, and
+`api-version` is **required**. Newer: `POST /openai/v1/chat/completions`, where
+the body names the model and `api-version` is **optional** — the v1 API needs it
+only to opt into preview features. Both are served; when a body names a model it
+outranks the path, so one deployment can host several scripted model ids.
+
+*This server*: enforces `api-version` on the classic route only. Refusing it on
+the v1 route would fail a fixture that is correct, which is the same class of bug
+as accepting a request the service refuses — so the two routes are told apart
+(`openai::Route::Azure` and `Route::AzureV1`) rather than merged.
 
 The classic route is therefore the **only** place a body without `model` is
 accepted: on `/openai/v1/...` there is no deployment to stand in for it, so an
@@ -190,6 +211,15 @@ call would be refused too.
 `stop_sequence: null`, `system_fingerprint: "fp_mock"`, `logprobs: null`,
 `created`, `request-id` / `x-request-id` headers. They are cheap and their
 absence is the kind of thing a strict client library trips over.
+
+The argument applies to **errors as well as answers**, which is where it is
+easiest to forget: both APIs return a request id on every response, and it is
+what an SDK's error object surfaces and what support tooling asks for. So every
+answer this server generates carries one derived from the call's arrival
+sequence — 200s, scripted failures, refused requests and harness refusals alike —
+and the Messages surface's error envelope carries the `request_id` member it has
+in addition to the header. The one exception is a `raw` outcome, which is served
+verbatim: a script that wants headers there writes them.
 *Note*: `created` is the **frozen** constant `1700000000` (see
 `control::CREATED`), because a golden transcript must not carry the wall clock.
 A client that rejects a stale timestamp would be a real difference from a live
@@ -203,8 +233,8 @@ scripts them (`usage` on a reply).
 
 ### 11. The harness's own refusals use a status no provider sends and no SDK retries
 
-An unscripted call, a script that cannot be rendered, a script whose `raw`
-headers cannot be put on the wire, and a control-plane document that will not
+An unscripted call, a script that cannot be rendered, a script whose `raw` status
+or headers cannot be put on the wire, and a control-plane document that will not
 parse all answer **422** with an `x-mock-provider-error` header, wrapped in the
 surface's own error envelope so a client library can still parse them. Two
 mechanisms had to be dodged, not one:
@@ -280,6 +310,31 @@ the forced name is not in a list that does not exist.
 are this server's own phrasing in each API's idiom.
 *If wrong*: nothing a compiled graph does — codegen has no reason to emit a bare
 `tool_choice` — so the cost of being wrong is a message, not a verdict.
+
+### 15. The sentences a bad `settings:` value is refused with
+
+*What is certain*: the rules. Both services check a known key's **type** and its
+**range**, and neither ignores a key it knows but cannot read — `temperature:
+"hot"`, `temperature: -3`, `top_p: 5`, `n: "2"`, `stream: "true"` and an empty
+Anthropic text block are all 400s. This server enforces them, in each dialect:
+
+```
+temperature: Input should be a valid number
+temperature: Input should be less than or equal to 1
+messages.0.content.0.text: text content blocks must be non-empty
+Invalid type for 'temperature': expected number, but got string instead.
+5 is greater than the maximum of 2 - 'temperature'
+```
+
+*What is assumed*: the exact sentences, and the ranges where the three kinds
+behind the Chat Completions route disagree — `temperature` is bounded at 2 there
+because that is the widest of them, and the list is a union for the same reason
+`top_k` is on it (see *Accepted-key lists*, below).
+*If wrong*: only a test asserting on the string breaks —
+`src/anthropic.rs`'s `the_sampling_knobs_are_checked_for_type_and_range` and
+`src/openai.rs`'s namesake are where they live. A range that is too *narrow*
+would be worse than a wrong sentence, because it refuses a request that is
+correct; that is why the widest of the three kinds is the one enforced.
 
 ---
 

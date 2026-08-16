@@ -473,6 +473,58 @@ fn a_raw_outcomes_headers_are_served_or_refused_by_name() {
     );
 }
 
+/// The other half of a `raw` outcome gets both gates too: a status HTTP cannot
+/// carry is refused when it is scripted, rather than queued to be answered as
+/// the 500 a failed `StatusCode` would fall back to — which PRD 5.9 fails over
+/// on and both SDKs retry twice.
+#[test]
+fn a_raw_outcomes_status_is_served_or_refused_by_name() {
+    let provider = MockProvider::start().expect("a port");
+    let client = provider.client();
+
+    for status in [0, 42, 1000] {
+        let refused = client
+            .post_json(
+                "/_mock/enqueue",
+                &json!({
+                    "model": MODEL,
+                    "outcome": { "raw": { "status": status, "body": { "nope": true } } },
+                }),
+            )
+            .expect("the control plane answers");
+        assert_eq!(
+            refused.status,
+            mock_provider::HARNESS_STATUS,
+            "status {status} was accepted: {}",
+            refused.text()
+        );
+        assert_eq!(
+            refused.header(mock_provider::HARNESS_HEADER),
+            Some("bad-control-request")
+        );
+    }
+    assert!(
+        provider.snapshot().queues.is_empty(),
+        "a script that cannot be sent is never queued"
+    );
+
+    // A status HTTP does carry is served exactly as written — including the odd
+    // ones a `raw` outcome exists to stage.
+    let staged = client
+        .post_json(
+            "/_mock/enqueue",
+            &json!({
+                "model": MODEL,
+                "outcome": { "raw": { "status": 418, "body": { "nope": true } } },
+            }),
+        )
+        .expect("the control plane answers");
+    assert_eq!(staged.status, 200);
+    let served = call(&client, "one");
+    assert_eq!(served.status, 418);
+    assert_eq!(served.json(), json!({ "nope": true }));
+}
+
 /// The second gate, end to end. A `raw` outcome assembled in Rust never passes
 /// through the control plane's check, so the *client* is what must not be hurt
 /// by one: it gets the harness's refusal rather than a connection that ends with
@@ -498,6 +550,28 @@ fn a_raw_outcome_built_in_rust_cannot_drop_the_connection() {
     assert!(
         answered.text().contains("bad header"),
         "the refusal names the header: {}",
+        answered.text()
+    );
+
+    // …and the same for a status a struct literal wrote past the control plane:
+    // the client gets the harness's refusal, not a 500 it would fail over on.
+    let provider = MockProvider::start().expect("a port");
+    let mut outcome = Outcome::raw(200, json!({ "ok": true }));
+    let Outcome::Raw(raw) = &mut outcome else {
+        panic!("`Outcome::raw` is a raw outcome");
+    };
+    raw.status = 42;
+    provider.enqueue(Script::new(MODEL, outcome));
+
+    let answered = call(&provider.client(), "one");
+    assert_eq!(answered.status, mock_provider::HARNESS_STATUS);
+    assert_eq!(
+        answered.header(mock_provider::HARNESS_HEADER),
+        Some(mock_provider::REFUSED_UNSENDABLE)
+    );
+    assert!(
+        answered.text().contains("42"),
+        "the refusal names the status: {}",
         answered.text()
     );
 }

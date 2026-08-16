@@ -93,8 +93,12 @@ fn a_scripted_structured_output_arrives_as_forced_tool_use() {
     assert!(provider.snapshot().is_drained(), "the script was consumed");
 }
 
-/// The tool surface a request carries is observable, which is how an
-/// `agent_access: read` store attachment is checked (grammar 11.5, PRD 9.13).
+/// The tool surface a request carries is observable, in request order.
+///
+/// This is what a test asserting about synthesized store tools reads (grammar
+/// 11.5) — including an `agent_access: read` narrowing, if the key survives:
+/// `agent_access` is PRD §10's first open question, so what is pinned here is
+/// the *observability*, which the acceptance suite needs either way.
 #[test]
 fn the_tool_surface_of_a_request_is_recorded_in_order() {
     let provider = MockProvider::start().expect("a port");
@@ -118,7 +122,8 @@ fn the_tool_surface_of_a_request_is_recorded_in_order() {
     assert_eq!(
         provider.requests()[0].tools,
         ["web_search", "docs_search", "reviewer_output"],
-        "a `docs_upsert` appearing here would be `agent_access: read` not being honoured"
+        "a `docs_upsert` appearing beside `docs_search` is what a read-only \
+         store attachment failing to narrow the surface would look like"
     );
 }
 
@@ -430,6 +435,57 @@ fn a_text_reply_to_a_forced_tool_is_refused_as_a_script_mismatch() {
     assert_eq!(provider.requests()[0].served, "reply.text");
 }
 
+/// A scripted call to a tool the request *offered* but did not *pin* is refused
+/// too — the shape between the two refusals above, and the one an agent fixture
+/// makes reachable: an agent with a `tools:` list and a pinned output tool
+/// offers both, and only one of them can be called.
+#[test]
+fn a_tool_call_beside_the_pinned_tool_is_refused_as_a_script_mismatch() {
+    let provider = MockProvider::start().expect("a port");
+    provider.enqueue(Script::new(
+        MODEL,
+        Outcome::tool_calls(vec![ToolCall::new("lookup", json!({ "query": "a fact" }))]),
+    ));
+
+    let tools = json!([
+        { "name": "lookup", "input_schema": { "type": "object" } },
+        { "name": "reviewer_output", "input_schema": { "type": "object" } },
+    ]);
+    let response = send(
+        &provider.client(),
+        &structured_request(tools.clone(), "reviewer_output"),
+    );
+    assert_eq!(response.status, HARNESS_STATUS);
+    assert_eq!(
+        response.header(HARNESS_HEADER),
+        Some(mock_provider::REFUSED_MISMATCH)
+    );
+    let message = response.json()["error"]["message"]
+        .as_str()
+        .expect("a message")
+        .to_string();
+    assert!(message.contains("lookup"), "{message}");
+    assert!(message.contains("reviewer_output"), "{message}");
+
+    // The same call against the same tool surface, with nothing pinned, is the
+    // tool loop's own first turn — and it is served.
+    provider.enqueue(Script::new(
+        MODEL,
+        Outcome::tool_calls(vec![ToolCall::new("lookup", json!({ "query": "a fact" }))]),
+    ));
+    let response = send(
+        &provider.client(),
+        &json!({
+            "model": MODEL,
+            "max_tokens": 1024,
+            "messages": [{ "role": "user", "content": "review it" }],
+            "tools": tools,
+        }),
+    );
+    assert_eq!(response.status, 200);
+    assert_eq!(response.json()["content"][0]["name"], "lookup");
+}
+
 /// The escape hatch: a body served verbatim, for the responses generated code
 /// must reject rather than parse.
 #[test]
@@ -453,6 +509,47 @@ fn a_raw_outcome_is_served_verbatim() {
         json!({ "type": "message", "content": [] }),
         "nothing is added to a raw body: no id, no usage, no stop_reason"
     );
+}
+
+/// Every answer a client receives carries a request id — the 200s and the
+/// errors alike, in the header and in the error envelope's own member.
+///
+/// The real Messages API answers every request with one, and it is what an SDK
+/// error object surfaces and what a transcript reader correlates by. Asserted
+/// over a socket because the header is the half a client actually reads.
+#[test]
+fn every_answer_carries_a_request_id_including_the_errors() {
+    let provider = MockProvider::start().expect("a port");
+    let client = provider.client();
+    let request = json!({
+        "model": MODEL,
+        "max_tokens": 1024,
+        "messages": [{ "role": "user", "content": "go" }],
+    });
+
+    // 1: a 200. 2: a scripted rate limit. 3: an unscripted call. 4: a malformed
+    // request. Each id is the call's own arrival sequence.
+    provider.enqueue_all([
+        Script::new(MODEL, Outcome::text("answered")),
+        Script::new(MODEL, Outcome::rate_limit()),
+    ]);
+    let answered = send(&client, &request);
+    assert_eq!(answered.status, 200);
+    assert_eq!(answered.header("request-id"), Some("req_mock_00000001"));
+
+    let limited = send(&client, &request);
+    assert_eq!(limited.status, 429);
+    assert_eq!(limited.header("request-id"), Some("req_mock_00000002"));
+    assert_eq!(limited.json()["request_id"], "req_mock_00000002");
+
+    let unscripted = send(&client, &request);
+    assert_eq!(unscripted.status, HARNESS_STATUS);
+    assert_eq!(unscripted.header("request-id"), Some("req_mock_00000003"));
+
+    let malformed = send(&client, &json!({ "model": MODEL }));
+    assert_eq!(malformed.status, 400);
+    assert_eq!(malformed.header("request-id"), Some("req_mock_00000004"));
+    assert_eq!(malformed.json()["request_id"], "req_mock_00000004");
 }
 
 /// The same script answered twice is the same bytes, which is what makes a

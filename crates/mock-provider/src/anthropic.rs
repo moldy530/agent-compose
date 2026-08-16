@@ -22,7 +22,10 @@
 //!   object schema, and `tools` present whenever a tool block appears anywhere
 //!   in the conversation;
 //! * the **required envelope** — `model`, `messages`, `max_tokens`, the
-//!   `x-api-key` and `anthropic-version` headers, and a JSON content type.
+//!   `x-api-key` and `anthropic-version` headers, and a JSON content type;
+//! * the **sampling knobs** — grammar 12.2's `settings:` vocabulary, checked for
+//!   type *and* range, because the compiler range-checks them and nothing else
+//!   watches what reaches the wire.
 //!
 //! Assumptions about the wire shape that could not be confirmed without a live
 //! call are listed in `WIRE-NOTES.md`, each with what would confirm it.
@@ -33,6 +36,7 @@ use serde_json::{Map, Value, json};
 
 use crate::control::{
     Failure, Outcome, Reply, ReplyBody, StructuredOutput, ValidationFailure, canonical, estimate,
+    request_id,
 };
 use crate::strict::{Checker, Dialect, Kind, at};
 use crate::wire::{Answer, HARNESS_STATUS, INVALID, MISMATCH, Response, UNSCRIPTED};
@@ -99,6 +103,7 @@ pub(crate) fn parse(headers: &BTreeMap<String, String>, body: Option<&Value>) ->
         checker.fail("model", "model: String should have at least 1 character");
     }
     check_max_tokens(&mut checker, body);
+    check_settings(&mut checker, body);
     check_system(&mut checker, body);
     let tools = check_tools(&mut checker, body);
     let forced = check_tool_choice(&mut checker, body, &tools);
@@ -172,6 +177,36 @@ fn check_max_tokens(checker: &mut Checker, body: &Map<String, Value>) {
     }
 }
 
+/// Everything else the envelope carries, by type and by range.
+///
+/// These are the keys a `settings:` block (grammar 12.2) puts on the wire, and
+/// the compiler is the only thing that has checked them so far: it bounds them
+/// at *compile* time against the literal in the spec, which says nothing about
+/// what a template or a codegen bug serializes at run time. A key list that only
+/// asked whether the name is known would accept `temperature: "hot"` and
+/// `top_p: 5` — both 400s on the real API, and both a graph that passes CI and
+/// fails on its first live call.
+///
+/// `stream` is the sharpest of them: checked as a boolean here so that the
+/// *string* `"true"` is refused as the type error it is, rather than slipping
+/// past [`check_streaming`]'s `true` comparison and being answered as a
+/// non-streaming call.
+fn check_settings(checker: &mut Checker, body: &Map<String, Value>) {
+    checker.bounded_number("", body, "temperature", 0.0..=1.0);
+    checker.bounded_number("", body, "top_p", 0.0..=1.0);
+    checker.bounded_integer("", body, "top_k", 0..=i64::MAX);
+    checker.optional("", body, "stream", Kind::Boolean);
+    checker.optional("", body, "metadata", Kind::Object);
+    checker.optional("", body, "thinking", Kind::Object);
+    checker.optional("", body, "service_tier", Kind::String);
+    let Some(stops) = checker.optional("", body, "stop_sequences", Kind::Array) else {
+        return;
+    };
+    for (index, stop) in stops.as_array().into_iter().flatten().enumerate() {
+        checker.typed(&at("stop_sequences", index), stop, Kind::String);
+    }
+}
+
 /// `system` is a string or a list of text blocks, and nothing else.
 fn check_system(checker: &mut Checker, body: &Map<String, Value>) {
     match body.get("system") {
@@ -189,7 +224,7 @@ fn check_system(checker: &mut Checker, body: &Map<String, Value>) {
                 if let Some(kind) = checker.required(&pointer, block, "type") {
                     checker.one_of(&at(&pointer, "type"), kind, &["text"]);
                 }
-                checker.required_string(&pointer, block, "text");
+                check_text(checker, &pointer, block);
             }
         }
         Some(other) => {
@@ -542,7 +577,7 @@ fn check_content(
                     block,
                     &["type", "text", "cache_control", "citations"],
                 );
-                checker.required_string(&pointer, block, "text");
+                check_text(checker, &pointer, block);
             }
             "thinking" => {
                 seen_other = true;
@@ -609,6 +644,23 @@ fn check_content(
     }
 
     blocks
+}
+
+/// One text block's `text`: required, and **not empty**.
+///
+/// The API refuses an empty one, and an empty text block is what a prompt or a
+/// bound input that rendered to nothing looks like on the wire — a codegen bug
+/// whose only symptom would otherwise be a model answering a blank turn.
+fn check_text(checker: &mut Checker, pointer: &str, block: &Map<String, Value>) {
+    if checker.required_string(pointer, block, "text") == Some("") {
+        checker.fail(
+            &at(pointer, "text"),
+            format!(
+                "{}: text content blocks must be non-empty",
+                at(pointer, "text")
+            ),
+        );
+    }
 }
 
 /// A `tool_result`'s content: a string, or a list of text blocks. Absent is
@@ -682,7 +734,7 @@ pub(crate) fn render(
     outcome: &Outcome,
 ) -> Answer {
     match outcome {
-        Outcome::Failure(failure) => failure_answer(failure),
+        Outcome::Failure(failure) => failure_answer(sequence, failure),
         Outcome::Raw(raw) => {
             let mut response = Response::new(raw.status, raw.body.clone()).after(raw.delay);
             for (name, value) in &raw.headers {
@@ -721,18 +773,22 @@ fn reply_answer(
             // structured-output parser against an answer the Messages API
             // cannot send, and passing.
             if let Some(pinned) = pinned_tool_use(request) {
-                return mismatch(&format!(
-                    "a `text` reply cannot answer a request carrying {pinned}: the Messages API \
-                     answers a pinned tool with a `tool_use` block, never with `end_turn` and no \
-                     call. Script `structured` for the object the agent should produce, or `raw` \
-                     for a response generated code must reject"
-                ));
+                return mismatch(
+                    sequence,
+                    &format!(
+                        "a `text` reply cannot answer a request carrying {pinned}: the \
+                         Messages API answers a pinned tool with a `tool_use` block, never with \
+                         `end_turn` and no call. Script `structured` for the object the agent \
+                         should produce, or `raw` for a response generated code must reject"
+                    ),
+                );
             }
             (vec![text_block(text)], "end_turn")
         }
         ReplyBody::Structured(value) => {
             let Some(StructuredOutput::ForcedTool { name, .. }) = structured else {
                 return mismatch(
+                    sequence,
                     "a `structured` reply needs a request that forces a tool: this one carries no \
                      `tool_choice: {type: \"tool\", name: …}`, so there is no schema to answer",
                 );
@@ -746,6 +802,7 @@ fn reply_answer(
             // rendered just because a script asked for one.
             if calls.is_empty() {
                 return mismatch(
+                    sequence,
                     "a `tools` reply with no calls is not an answer the Messages API can send: \
                      `stop_reason: \"tool_use\"` names the block that ended the turn, and there \
                      would be none. Script `text` for prose, or `raw` for a response generated \
@@ -753,22 +810,49 @@ fn reply_answer(
                 );
             }
             if let Some(forbidden) = forbidden_tool_use(request) {
-                return mismatch(&format!(
-                    "a `tools` reply cannot answer a request carrying {forbidden}: the Messages \
-                     API never calls a tool the request forbade. Script `text` for prose, or \
-                     `raw` for a response generated code must reject"
-                ));
+                return mismatch(
+                    sequence,
+                    &format!(
+                        "a `tools` reply cannot answer a request carrying {forbidden}: the \
+                         Messages API never calls a tool the request forbade. Script `text` for \
+                         prose, or `raw` for a response generated code must reject"
+                    ),
+                );
             }
+            let pinned = pinned_tool_name(request);
             let mut content = Vec::new();
             if let Some(text) = text {
                 content.push(text_block(text));
             }
             for call in calls {
                 if !offered.contains(&call.name) {
-                    return mismatch(&format!(
-                        "the script calls the tool `{}`, which this request does not offer",
-                        call.name
-                    ));
+                    return mismatch(
+                        sequence,
+                        &format!(
+                            "the script calls the tool `{}`, which this request does not offer",
+                            call.name
+                        ),
+                    );
+                }
+                // Offered is not enough when the request pinned one of them:
+                // `tool_choice: {type: "tool", name: X}` is a promise that X is
+                // what gets called, so a call to a *sibling* tool is as
+                // impossible an answer as prose is, and refusing it is the same
+                // rule as the two above rather than a new one.
+                if let Some(pinned) = &pinned
+                    && &call.name != pinned
+                {
+                    return mismatch(
+                        sequence,
+                        &format!(
+                            "the script calls the tool `{}`, but this request pins `tool_choice: \
+                         {{type: \"tool\", name: \"{pinned}\"}}`: the Messages API answers a \
+                         pinned tool with a call to *that* tool and no other. Script a call to \
+                         `{pinned}` — or `structured`, which is rendered under the pinned name — \
+                         or `raw` for a response generated code must reject",
+                            call.name
+                        ),
+                    );
                 }
                 let mut block = tool_use_block(sequence, content.len(), &call.name, &call.input);
                 if let Some(id) = &call.id {
@@ -812,7 +896,7 @@ fn reply_answer(
             "usage": usage,
         }),
     )
-    .header("request-id", format!("req_mock_{sequence:08}"))
+    .header("request-id", request_id(sequence))
     .after(reply.delay)
     .answer()
 }
@@ -836,6 +920,19 @@ fn pinned_tool_use(request: &Value) -> Option<String> {
         "any" => Some("`tool_choice: {type: \"any\"}`".to_string()),
         _ => None,
     }
+}
+
+/// The tool a request pinned **by name**, if it pinned one.
+///
+/// Narrower than [`pinned_tool_use`] on purpose: `any` guarantees *a* call and
+/// so rules out prose, while `{type: "tool", name: X}` additionally says which
+/// tool the call is to. Read here so a `tools` reply can be held to it.
+fn pinned_tool_name(request: &Value) -> Option<String> {
+    let choice = request.get("tool_choice")?.as_object()?;
+    (choice.get("type").and_then(Value::as_str)? == "tool")
+        .then(|| choice.get("name").and_then(Value::as_str))
+        .flatten()
+        .map(str::to_string)
 }
 
 /// How a request forbade tool use, if it forbade it.
@@ -863,12 +960,13 @@ fn tool_use_block(sequence: u64, index: usize, name: &str, input: &Value) -> Val
     })
 }
 
-fn failure_answer(failure: &Failure) -> Answer {
+fn failure_answer(sequence: u64, failure: &Failure) -> Answer {
     match failure {
         Failure::RateLimit {
             retry_after_seconds,
         } => {
             let response = error(
+                sequence,
                 429,
                 "rate_limit_error",
                 "Number of requests has exceeded your per-minute rate limit.",
@@ -879,8 +977,9 @@ fn failure_answer(failure: &Failure) -> Answer {
             }
             .answer()
         }
-        Failure::Overloaded => error(529, "overloaded_error", "Overloaded").answer(),
+        Failure::Overloaded => error(sequence, 529, "overloaded_error", "Overloaded").answer(),
         Failure::ServerError => error(
+            sequence,
             500,
             "api_error",
             "Internal server error. Please try again later.",
@@ -891,14 +990,24 @@ fn failure_answer(failure: &Failure) -> Answer {
 }
 
 /// The Messages API's error envelope.
-fn error(status: u16, kind: &str, message: &str) -> Response {
+///
+/// It carries the request id twice — as the `request-id` header and as the
+/// envelope's own `request_id` member — because the real API does, on **errors
+/// as well as answers**: it is the identifier an SDK's error object surfaces and
+/// the one a transcript reader correlates by (WIRE-NOTES §9). An error path that
+/// dropped it would be the one place this server answered less than the provider
+/// does.
+fn error(sequence: u64, status: u16, kind: &str, message: &str) -> Response {
+    let id = request_id(sequence);
     Response::new(
         status,
         json!({
             "type": "error",
             "error": { "type": kind, "message": message },
+            "request_id": id.clone(),
         }),
     )
+    .header("request-id", id)
 }
 
 /// The answer to a request that failed validation.
@@ -908,14 +1017,16 @@ fn error(status: u16, kind: &str, message: &str) -> Response {
 /// authentication is settled before the body is looked at, so the answer names
 /// the credential and nothing else. Every other failure is the 400 the API sends
 /// for a body it could not accept.
-pub(crate) fn rejected(failures: &[ValidationFailure]) -> Answer {
+pub(crate) fn rejected(sequence: u64, failures: &[ValidationFailure]) -> Answer {
     let (status, kind, reported) = classify(failures);
     let message = reported
         .iter()
         .map(|failure| failure.message.as_str())
         .collect::<Vec<_>>()
         .join("; ");
-    error(status, kind, &message).harness(INVALID).answer()
+    error(sequence, status, kind, &message)
+        .harness(INVALID)
+        .answer()
 }
 
 /// The status, error type, and the failures a refusal reports — see
@@ -933,8 +1044,9 @@ fn classify(failures: &[ValidationFailure]) -> (u16, &'static str, Vec<&Validati
 }
 
 /// The answer to a request no scripted outcome answered.
-pub(crate) fn unscripted(model: &str, reason: &str) -> Answer {
+pub(crate) fn unscripted(sequence: u64, model: &str, reason: &str) -> Answer {
     error(
+        sequence,
         HARNESS_STATUS,
         "invalid_request_error",
         &format!(
@@ -948,8 +1060,9 @@ pub(crate) fn unscripted(model: &str, reason: &str) -> Answer {
 
 /// The answer to a script that cannot be rendered into what the request asked
 /// for. A test bug, and loud about being one.
-fn mismatch(reason: &str) -> Answer {
+fn mismatch(sequence: u64, reason: &str) -> Answer {
     error(
+        sequence,
         HARNESS_STATUS,
         "invalid_request_error",
         &format!("mock provider: {reason}"),
@@ -1072,7 +1185,7 @@ mod tests {
                 .iter()
                 .all(|failure| !failure.authentication)
         );
-        let Answer::Respond(response) = rejected(&parsed.failures) else {
+        let Answer::Respond(response) = rejected(1, &parsed.failures) else {
             panic!("a rejection is a response");
         };
         assert_eq!(response.status, 400);
@@ -1085,7 +1198,7 @@ mod tests {
         let parsed = parse(&anonymous, Some(&request));
         assert_eq!(parsed.failures[0].pointer, "headers.x-api-key");
         assert!(parsed.failures[0].authentication);
-        let Answer::Respond(response) = rejected(&parsed.failures) else {
+        let Answer::Respond(response) = rejected(1, &parsed.failures) else {
             panic!("a rejection is a response");
         };
         assert_eq!(response.status, 401);
@@ -1330,6 +1443,132 @@ mod tests {
         );
     }
 
+    /// The sampling knobs are checked for **type and range**, not just for
+    /// having a name the API knows: `temperature: "hot"` and `top_p: 5` are
+    /// both 400s, and both are what a `settings:` block (grammar 12.2) looks
+    /// like when codegen stringifies it or interpolates the wrong value.
+    #[test]
+    fn the_sampling_knobs_are_checked_for_type_and_range() {
+        let complaints = |extra: Value| {
+            let request = messages(json!({ "messages": [{ "role": "user", "content": "hi" }] }));
+            let mut request = request;
+            for (key, value) in extra.as_object().expect("an object") {
+                request[key] = value.clone();
+            }
+            parse(&headers(), Some(&request))
+                .failures
+                .into_iter()
+                .map(|failure| (failure.pointer, failure.message))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            complaints(json!({ "temperature": "hot" })),
+            [(
+                "temperature".to_string(),
+                "temperature: Input should be a valid number".to_string()
+            )]
+        );
+        assert_eq!(
+            complaints(json!({ "top_p": 5 })),
+            [(
+                "top_p".to_string(),
+                "top_p: Input should be less than or equal to 1".to_string()
+            )]
+        );
+        assert_eq!(
+            complaints(json!({ "temperature": -3 })),
+            [(
+                "temperature".to_string(),
+                "temperature: Input should be greater than or equal to 0".to_string()
+            )]
+        );
+        assert_eq!(
+            complaints(json!({ "top_k": 1.5 }))
+                .into_iter()
+                .map(|(pointer, _)| pointer)
+                .collect::<Vec<_>>(),
+            ["top_k"]
+        );
+        assert_eq!(
+            complaints(json!({ "stop_sequences": ["ok", 7] }))
+                .into_iter()
+                .map(|(pointer, _)| pointer)
+                .collect::<Vec<_>>(),
+            ["stop_sequences.1"]
+        );
+        for wrong in [
+            json!({ "metadata": "u1" }),
+            json!({ "thinking": true }),
+            json!({ "service_tier": 1 }),
+        ] {
+            assert_eq!(complaints(wrong.clone()).len(), 1, "{wrong}");
+        }
+
+        // The positive half: every knob at a legal value passes, including the
+        // integral spelling of a fractional one.
+        assert_eq!(
+            complaints(json!({
+                "temperature": 1,
+                "top_p": 0.95,
+                "top_k": 40,
+                "stop_sequences": ["STOP"],
+                "stream": false,
+                "metadata": { "user_id": "u1" },
+                "thinking": { "type": "enabled", "budget_tokens": 1024 },
+                "service_tier": "auto",
+            })),
+            []
+        );
+    }
+
+    /// `stream: "true"` is the string, not the flag — a type error, and the one
+    /// that would otherwise walk straight past the streaming refusal below,
+    /// which compares against the boolean `true`.
+    #[test]
+    fn a_stringly_typed_stream_flag_is_refused_as_a_type_error() {
+        let request = messages(json!({
+            "messages": [{ "role": "user", "content": "hi" }],
+            "stream": "true",
+        }));
+        let failures = parse(&headers(), Some(&request)).failures;
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].pointer, "stream");
+        assert_eq!(
+            failures[0].message,
+            "stream: Input should be a valid boolean"
+        );
+    }
+
+    /// An empty text block is refused: it is what a prompt or a bound input that
+    /// rendered to nothing looks like on the wire.
+    #[test]
+    fn an_empty_text_block_is_refused() {
+        let request = messages(json!({
+            "messages": [{ "role": "user", "content": [{ "type": "text", "text": "" }] }],
+            "system": [{ "type": "text", "text": "" }],
+        }));
+        let failures = parse(&headers(), Some(&request)).failures;
+        assert_eq!(
+            failures
+                .iter()
+                .map(|failure| failure.pointer.as_str())
+                .collect::<Vec<_>>(),
+            ["system.0.text", "messages.0.content.0.text"]
+        );
+        assert!(
+            failures[0].message.contains("must be non-empty"),
+            "{}",
+            failures[0].message
+        );
+
+        // A block with something in it is the ordinary case, and it passes.
+        let request = messages(json!({
+            "messages": [{ "role": "user", "content": [{ "type": "text", "text": "hi" }] }],
+        }));
+        assert!(parse(&headers(), Some(&request)).failures.is_empty());
+    }
+
     /// Streaming is out of scope and says so, rather than being answered wrong.
     #[test]
     fn streaming_is_refused_by_name() {
@@ -1503,6 +1742,98 @@ mod tests {
         assert_eq!(response.body["stop_reason"], "tool_use");
     }
 
+    /// A scripted call to a tool the request offered but did **not** pin is a
+    /// script bug too: a pinned `tool_choice` promises a call to *that* tool, so
+    /// a call to a sibling is a shape the Messages API cannot send — the hole
+    /// between "the tool is on offer" and "the tool is the one that was forced".
+    #[test]
+    fn a_tool_call_beside_the_pinned_one_is_a_script_mismatch() {
+        let request = messages(json!({
+            "messages": [{ "role": "user", "content": "hi" }],
+            "tools": [
+                { "name": "lookup", "input_schema": { "type": "object" } },
+                { "name": "reviewer_output", "input_schema": { "type": "object" } },
+            ],
+            "tool_choice": { "type": "tool", "name": "reviewer_output" },
+        }));
+        let parsed = parse(&headers(), Some(&request));
+        assert!(parsed.failures.is_empty(), "{:?}", parsed.failures);
+
+        let outcome = Outcome::tool_calls(vec![crate::control::ToolCall::new("lookup", json!({}))]);
+        let Answer::Respond(response) =
+            render(1, &request, parsed.structured_output.as_ref(), &outcome)
+        else {
+            panic!("a mismatch is a response");
+        };
+        assert_eq!(response.status, HARNESS_STATUS);
+        assert_eq!(response.headers[crate::control::HARNESS_HEADER], MISMATCH);
+        let message = response.body["error"]["message"].as_str().unwrap();
+        assert!(message.contains("lookup"), "{message}");
+        assert!(message.contains("reviewer_output"), "{message}");
+
+        // The positive half, twice over: a call to the tool that *was* pinned is
+        // the answer the API sends, and with nothing pinned either tool is fair
+        // game — the rule narrows exactly one shape and nothing else.
+        let pinned = Outcome::tool_calls(vec![crate::control::ToolCall::new(
+            "reviewer_output",
+            json!({ "verdict": "approve" }),
+        )]);
+        let Answer::Respond(response) =
+            render(1, &request, parsed.structured_output.as_ref(), &pinned)
+        else {
+            panic!("a reply is a response");
+        };
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body["content"][0]["name"], "reviewer_output");
+
+        let mut unpinned = request.clone();
+        unpinned["tool_choice"] = json!({ "type": "auto" });
+        let Answer::Respond(response) = render(1, &unpinned, None, &outcome) else {
+            panic!("a reply is a response");
+        };
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body["content"][0]["name"], "lookup");
+    }
+
+    /// Every answer carries the request id, **errors included** — the header on
+    /// each, and the `request_id` member the error envelope has.
+    #[test]
+    fn every_answer_carries_its_request_id() {
+        let request = messages(json!({ "messages": [{ "role": "user", "content": "hi" }] }));
+        let carried = |answer: Answer| match answer {
+            Answer::Respond(response) => (
+                response.headers.get("request-id").cloned(),
+                response.body.get("request_id").cloned(),
+            ),
+            Answer::Close(_) => panic!("this outcome answers"),
+        };
+
+        // A 200, for the contrast: it has carried the header all along.
+        assert_eq!(
+            carried(render(3, &request, None, &Outcome::text("ok"))).0,
+            Some("req_mock_00000003".to_string())
+        );
+
+        for answer in [
+            render(3, &request, None, &Outcome::rate_limit()),
+            render(3, &request, None, &Outcome::server_error()),
+            render(3, &request, None, &Outcome::structured(json!({ "a": 1 }))),
+            rejected(
+                3,
+                &[ValidationFailure::new("model", "model: Field required")],
+            ),
+            unscripted(3, "model.fast", "the queue is empty"),
+        ] {
+            assert_eq!(
+                carried(answer),
+                (
+                    Some("req_mock_00000003".to_string()),
+                    Some(json!("req_mock_00000003"))
+                )
+            );
+        }
+    }
+
     /// Each failure shape carries the status and body the SDK classifies on.
     #[test]
     fn the_failure_shapes_are_the_providers_own() {
@@ -1543,7 +1874,7 @@ mod tests {
             ValidationFailure::new("model", "model: Field required"),
             ValidationFailure::new("max_tokens", "max_tokens: Field required"),
         ];
-        let Answer::Respond(response) = rejected(&failures) else {
+        let Answer::Respond(response) = rejected(4, &failures) else {
             panic!("a rejection is a response");
         };
         assert_eq!(response.status, 400);
@@ -1559,7 +1890,7 @@ mod tests {
     /// status no failover condition claims.
     #[test]
     fn an_unscripted_answer_names_the_model() {
-        let Answer::Respond(response) = unscripted("model.fast", "the queue is empty") else {
+        let Answer::Respond(response) = unscripted(9, "model.fast", "the queue is empty") else {
             panic!("a refusal is a response");
         };
         assert_eq!(response.status, HARNESS_STATUS);

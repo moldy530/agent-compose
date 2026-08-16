@@ -397,9 +397,15 @@ fn the_newer_azure_route_still_requires_a_model_in_the_body() {
     );
 }
 
-/// Azure without `api-version` is a refusal, because the service refuses it.
+/// Azure's **classic** route without `api-version` is a refusal, because the
+/// service refuses it there — and the newer v1 route without one is served,
+/// because the service serves it (WIRE-NOTES §7).
+///
+/// The positive half is why the two routes are told apart at all: refusing a
+/// request the service accepts would fail a fixture that is correct, which is
+/// the same class of bug as accepting one the service refuses.
 #[test]
-fn an_azure_request_without_an_api_version_is_refused() {
+fn an_api_version_is_required_on_the_classic_azure_route_only() {
     let provider = MockProvider::start().expect("a port");
     let response = provider
         .client()
@@ -411,6 +417,62 @@ fn an_azure_request_without_an_api_version_is_refused() {
         .expect("the route answers");
     assert_eq!(response.status, 400);
     assert_eq!(response.json()["error"]["param"], "query.api-version");
+
+    provider.enqueue(Script::new(MODEL, Outcome::text("served without one")));
+    let response = provider
+        .client()
+        .send(
+            Request::post("/openai/v1/chat/completions")
+                .azure_auth()
+                .json(&json!({
+                    "model": MODEL,
+                    "messages": [{ "role": "user", "content": "go" }],
+                })),
+        )
+        .expect("the v1 route answers");
+    assert_eq!(response.status, 200);
+    assert_eq!(
+        response.json()["choices"][0]["message"]["content"],
+        "served without one"
+    );
+    assert_eq!(provider.requests()[1].query, "");
+}
+
+/// A transcript spells the surface the way grammar 12.1 spells the provider
+/// kinds that reach it, which is what a harness filters on.
+#[test]
+fn the_transcript_spells_each_surface_the_way_the_grammar_does() {
+    let provider = MockProvider::start().expect("a port");
+    let client = provider.client();
+    provider.enqueue_all([
+        Script::new(MODEL, Outcome::text("direct")),
+        Script::new("smart-deployment", Outcome::text("azure")),
+    ]);
+
+    send(
+        &client,
+        "/v1/chat/completions",
+        &json!({ "model": MODEL, "messages": [{ "role": "user", "content": "go" }] }),
+    );
+    client
+        .send(
+            Request::post(
+                "/openai/deployments/smart-deployment/chat/completions?api-version=2024-10-21",
+            )
+            .azure_auth()
+            .json(&json!({ "messages": [{ "role": "user", "content": "go" }] })),
+        )
+        .expect("the classic Azure route answers");
+
+    let transcript = client
+        .get("/_mock/requests")
+        .expect("the control plane answers")
+        .json();
+    assert_eq!(
+        transcript["requests"][0]["surface"], "openai",
+        "a harness filtering on the grammar's own kind spelling must match"
+    );
+    assert_eq!(transcript["requests"][1]["surface"], "azure_openai");
 }
 
 /// A call with no credentials is refused: the harness needs no API *keys*, but

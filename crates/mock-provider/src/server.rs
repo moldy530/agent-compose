@@ -145,16 +145,35 @@ fn route(
         bytes,
     };
     match (method.as_str(), path) {
-        ("POST", "/v1/messages") => provider(store, Surface::Anthropic, None, arriving),
-        ("POST", "/v1/chat/completions") => provider(store, Surface::OpenAi, None, arriving),
+        ("POST", "/v1/messages") => provider(store, Reached::Anthropic, arriving),
+        ("POST", "/v1/chat/completions") => provider(
+            store,
+            Reached::ChatCompletions {
+                route: openai::Route::Direct,
+                deployment: None,
+            },
+            arriving,
+        ),
         // Azure, both spellings: the deployment sits in the path on the classic
-        // route and is absent from the newer `/openai/v1` one.
-        ("POST", "/openai/v1/chat/completions") => {
-            provider(store, Surface::AzureOpenAi, None, arriving)
-        }
-        ("POST", _) if deployment(path).is_some() => {
-            provider(store, Surface::AzureOpenAi, deployment(path), arriving)
-        }
+        // route and is absent from the newer `/openai/v1` one, which also drops
+        // the `api-version` requirement (WIRE-NOTES §7) — which is why the two
+        // are told apart here rather than merged into one Azure route.
+        ("POST", "/openai/v1/chat/completions") => provider(
+            store,
+            Reached::ChatCompletions {
+                route: openai::Route::AzureV1,
+                deployment: None,
+            },
+            arriving,
+        ),
+        ("POST", _) if deployment(path).is_some() => provider(
+            store,
+            Reached::ChatCompletions {
+                route: openai::Route::Azure,
+                deployment: deployment(path),
+            },
+            arriving,
+        ),
         ("POST", "/_mock/enqueue") => enqueue(store, bytes),
         ("POST", "/_mock/reset") => {
             let discarded = store.reset();
@@ -197,13 +216,41 @@ struct Arriving<'a> {
     bytes: &'a [u8],
 }
 
+/// Which surface a route matched, and what that surface needs to know about how
+/// it was reached.
+///
+/// The route is carried rather than re-derived: Chat Completions is reached at
+/// three routes that differ in auth header, in whether the path names the model,
+/// and in whether `api-version` is required, and a `provider` that re-read the
+/// path to work out which would be asserting what the routing table already
+/// matched on.
+enum Reached<'a> {
+    /// The Messages API.
+    Anthropic,
+    /// Chat Completions, at one of its three routes.
+    ChatCompletions {
+        route: openai::Route,
+        /// The Azure deployment in the path, on the one route that has one.
+        deployment: Option<&'a str>,
+    },
+}
+
+impl Reached<'_> {
+    /// Which surface a transcript records this call on.
+    fn surface(&self) -> Surface {
+        match self {
+            Self::Anthropic => Surface::Anthropic,
+            Self::ChatCompletions {
+                route: openai::Route::Direct,
+                ..
+            } => Surface::OpenAi,
+            Self::ChatCompletions { .. } => Surface::AzureOpenAi,
+        }
+    }
+}
+
 /// Check, record, and answer one model call.
-fn provider(
-    store: &Store,
-    surface: Surface,
-    deployment: Option<&str>,
-    arriving: Arriving<'_>,
-) -> Answer {
+fn provider(store: &Store, reached: Reached<'_>, arriving: Arriving<'_>) -> Answer {
     let Arriving {
         method,
         path,
@@ -213,9 +260,10 @@ fn provider(
     } = arriving;
     let body_text = String::from_utf8_lossy(bytes).into_owned();
     let body: Option<Value> = serde_json::from_slice(bytes).ok();
+    let surface = reached.surface();
 
-    let (model, failures, tools, structured): (String, _, _, _) = match surface {
-        Surface::Anthropic => {
+    let (model, failures, tools, structured): (String, _, _, _) = match reached {
+        Reached::Anthropic => {
             let parsed = anthropic::parse(&headers, body.as_ref());
             (
                 parsed.model,
@@ -224,12 +272,7 @@ fn provider(
                 parsed.structured_output,
             )
         }
-        Surface::OpenAi | Surface::AzureOpenAi => {
-            let route = if surface == Surface::AzureOpenAi {
-                openai::Route::Azure
-            } else {
-                openai::Route::Direct
-            };
+        Reached::ChatCompletions { route, deployment } => {
             let parsed = openai::parse(route, &headers, query, deployment, body.as_ref());
             (
                 parsed.model,
@@ -260,15 +303,17 @@ fn provider(
             Decision::Serve(outcome) => {
                 anthropic::render(sequence, &body, structured.as_ref(), &outcome)
             }
-            Decision::Rejected(failures) => anthropic::rejected(&failures),
-            Decision::Unscripted { model, reason } => anthropic::unscripted(&model, &reason),
+            Decision::Rejected(failures) => anthropic::rejected(sequence, &failures),
+            Decision::Unscripted { model, reason } => {
+                anthropic::unscripted(sequence, &model, &reason)
+            }
         },
         Surface::OpenAi | Surface::AzureOpenAi => match decision {
             Decision::Serve(outcome) => {
                 openai::render(sequence, &body, &model, structured.as_ref(), &outcome)
             }
-            Decision::Rejected(failures) => openai::rejected(&failures),
-            Decision::Unscripted { model, reason } => openai::unscripted(&model, &reason),
+            Decision::Rejected(failures) => openai::rejected(sequence, &failures),
+            Decision::Unscripted { model, reason } => openai::unscripted(sequence, &model, &reason),
         },
     }
 }
@@ -328,23 +373,32 @@ fn read_headers(headers: &hyper::HeaderMap) -> BTreeMap<String, String> {
 /// Turn an answer into bytes.
 ///
 /// Total, deliberately. The one part of a response this server does not write
-/// itself is the header map of a scripted `raw` outcome, and a test can write a
-/// header there that HTTP cannot carry (see [`crate::wire::header`]). Building
-/// that response fails, and a failure here would close the connection without an
-/// answer — which PRD 5.9 classifies as a provider **timeout**. So the headers
-/// are parsed first and an unsendable one is answered as the harness bug it is,
-/// in the same voice as an unscripted call. The transcript still shows the
-/// outcome that was taken, exactly as it does for a `script-mismatch`.
+/// itself is a scripted `raw` outcome's **status and header map**, and a test
+/// can write either one so that HTTP cannot carry it (see
+/// [`crate::wire::header`]). Both would otherwise fail quietly and in the worst
+/// possible direction:
+///
+/// * a header hyper cannot build ends the connection with no answer, which PRD
+///   5.9 classifies as a provider **timeout**;
+/// * a status outside 100..=999 has no `StatusCode`, and the obvious fallback is
+///   **500** — a failover condition *and* a status both SDKs retry twice.
+///
+/// So each is checked here and answered as the harness bug it is, in the same
+/// voice as an unscripted call. The transcript still shows the outcome that was
+/// taken, exactly as it does for a `script-mismatch`. The control plane refuses
+/// both when the script is enqueued; this is the second gate, the one a struct
+/// literal filling the public fields still has to pass.
 fn render(answer: Answer) -> hyper::Response<Full<Bytes>> {
     let Answer::Respond(response) = answer else {
         unreachable!("a closed connection never renders");
     };
-    match sendable(&response.headers) {
-        Ok(headers) => assemble(response.status, headers, &response.body),
+    match sendable(response.status, &response.headers) {
+        Ok((status, headers)) => assemble(status, headers, &response.body),
         Err(reason) => assemble(
-            HARNESS_STATUS,
-            // `from_static` cannot fail on these two: both are this crate's own
-            // constants, lowercase and printable ASCII.
+            // `from_u16` cannot fail on this crate's own refusal status, and
+            // `from_static` cannot fail on the two constants below: both are
+            // lowercase, printable ASCII.
+            StatusCode::from_u16(HARNESS_STATUS).expect("422 is a status"),
             vec![(
                 HeaderName::from_static(HARNESS_HEADER),
                 HeaderValue::from_static(UNSENDABLE),
@@ -356,22 +410,29 @@ fn render(answer: Answer) -> hyper::Response<Full<Bytes>> {
     }
 }
 
-/// A response's headers, parsed — or the first one that cannot be sent.
-fn sendable(headers: &BTreeMap<String, String>) -> Result<Vec<(HeaderName, HeaderValue)>, String> {
-    headers
+/// A response's status and headers, parsed — or the first part of it that
+/// cannot be sent.
+fn sendable(
+    status: u16,
+    headers: &BTreeMap<String, String>,
+) -> Result<(StatusCode, Vec<(HeaderName, HeaderValue)>), String> {
+    let status = StatusCode::from_u16(status)
+        .map_err(|_| format!("`{status}` is not a status HTTP can carry (100..=999)"))?;
+    let headers = headers
         .iter()
         .map(|(name, value)| crate::wire::header(name, value))
-        .collect()
+        .collect::<Result<_, _>>()?;
+    Ok((status, headers))
 }
 
 /// Status, headers, and body into the response that goes on the wire.
 fn assemble(
-    status: u16,
+    status: StatusCode,
     headers: Vec<(HeaderName, HeaderValue)>,
     body: &Value,
 ) -> hyper::Response<Full<Bytes>> {
     let mut built = hyper::Response::new(Full::new(Bytes::from(canonical(body))));
-    *built.status_mut() = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    *built.status_mut() = status;
     let map = built.headers_mut();
     map.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     // After `content-type`, so a script that means to override it can.
@@ -673,6 +734,31 @@ mod tests {
         assert_eq!(rendered.headers()[CONTENT_TYPE], "application/json");
     }
 
+    /// The same gate on the other half of a `raw` outcome: a status HTTP cannot
+    /// carry is answered as the harness bug it is, rather than falling back to
+    /// **500** — which PRD 5.9 fails over on and both SDKs retry twice, so a
+    /// typo'd status would stage a provider failure the script never asked for.
+    #[test]
+    fn a_status_that_cannot_be_sent_is_refused_rather_than_answered_as_a_server_error() {
+        for status in [0, 42, 99, 1000] {
+            let rendered = render(Wire::new(status, json!({ "nope": true })).answer());
+            assert_eq!(
+                rendered.status().as_u16(),
+                HARNESS_STATUS,
+                "`{status}` is not a status HTTP can carry"
+            );
+            assert_eq!(rendered.headers()[HARNESS_HEADER], UNSENDABLE);
+        }
+
+        // …and every status it *can* carry is still served untouched, including
+        // the ones a `raw` outcome exists to stage.
+        for status in [100, 200, 402, 418, 500, 599, 999] {
+            let rendered = render(Wire::new(status, json!({ "nope": true })).answer());
+            assert_eq!(rendered.status().as_u16(), status);
+            assert!(rendered.headers().get(HARNESS_HEADER).is_none());
+        }
+    }
+
     /// The same check, at the control plane: a script carrying a header that
     /// cannot be sent is refused by name instead of queued.
     #[test]
@@ -707,6 +793,28 @@ mod tests {
         };
         assert_eq!(response.status, 200);
         assert_eq!(store.snapshot().queues["a"], 1);
+    }
+
+    /// And a script whose **status** cannot be sent is refused by name too,
+    /// rather than queued to be answered as a 500 later.
+    #[test]
+    fn a_script_whose_status_cannot_be_sent_is_refused_by_name() {
+        let store = Store::new();
+        let script = json!({ "model": "a", "outcome": { "raw": { "status": 42, "body": {} } } });
+        let Answer::Respond(response) = enqueue(&store, canonical(&script).as_bytes()) else {
+            panic!("enqueue answers");
+        };
+        assert_eq!(response.status, HARNESS_STATUS);
+        assert_eq!(response.headers[HARNESS_HEADER], "bad-control-request");
+        assert!(
+            response.body["mock_provider"]
+                .as_str()
+                .unwrap()
+                .contains("42"),
+            "{:?}",
+            response.body
+        );
+        assert!(store.snapshot().is_drained(), "nothing was queued");
     }
 
     /// Repeated headers arrive joined, and every name is lowercase, so a

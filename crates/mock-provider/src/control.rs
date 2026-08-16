@@ -102,15 +102,22 @@ pub const REFUSED_UNSENDABLE: &str = "unsendable-response";
 /// auth header rather than by body. `bedrock` and `vertex` are reached through
 /// cloud SDKs and have no HTTP surface this server can stand in for — they are
 /// out of scope for v0, and `WIRE-NOTES.md` says so.
+/// A surface is spelled the way grammar 12.1 spells the provider kinds that
+/// reach it — `openai`, not `open_ai` — because the reader of a transcript is a
+/// harness written against the DSL, and a `snake_case` derive would have split
+/// the names into a second vocabulary nobody writes. [`Surface::as_str`] is the
+/// same spelling for a Rust caller, and a test pins the two together.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
 pub enum Surface {
     /// `POST /v1/messages`.
+    #[serde(rename = "anthropic")]
     Anthropic,
     /// `POST /v1/chat/completions`.
+    #[serde(rename = "openai")]
     OpenAi,
     /// `POST /openai/deployments/<deployment>/chat/completions` and the newer
     /// `POST /openai/v1/chat/completions`.
+    #[serde(rename = "azure_openai")]
     AzureOpenAi,
 }
 
@@ -330,8 +337,20 @@ impl Outcome {
     }
 
     /// A verbatim body at a chosen status.
+    ///
+    /// # Panics
+    ///
+    /// If `status` is not one HTTP can carry (it must be in 100..=999), which
+    /// is the same range the control plane enforces — see [`RawOutcome::status`].
+    /// A test that writes one has a bug in the script rather than in the graph,
+    /// and the panic names it where it was written instead of serving something
+    /// else entirely.
     #[must_use]
     pub fn raw(status: u16, body: Value) -> Self {
+        assert!(
+            sendable_status(status),
+            "a `raw` outcome's status must be one HTTP can carry (100..=999), not {status}"
+        );
         Self::Raw(RawOutcome {
             status,
             body,
@@ -508,6 +527,18 @@ impl Failure {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawOutcome {
+    /// The status to answer with, which must be one HTTP can carry
+    /// (100..=999).
+    ///
+    /// Checked on the way in for the same reason the headers are: a status
+    /// outside the range cannot be put on the wire, and the fallback for one
+    /// that cannot is **500** — a PRD 5.9 failover condition and a status both
+    /// SDKs retry. A typo'd `42` would therefore stage "the provider had an
+    /// error" while the script said "a response generated code must reject",
+    /// and the run would report a different failure than the one it has. Refused
+    /// by name here, and again on the way out (`server::render`), because this
+    /// is a public field a struct literal can fill.
+    #[serde(deserialize_with = "carried")]
     pub status: u16,
     pub body: Value,
     /// Extra response headers, on top of `content-type`.
@@ -537,6 +568,39 @@ where
         crate::wire::header(name, value).map_err(serde::de::Error::custom)?;
     }
     Ok(headers)
+}
+
+/// A status, refused unless HTTP can carry it — see [`RawOutcome::status`].
+fn carried<'de, D>(deserializer: D) -> Result<u16, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let status = u16::deserialize(deserializer)?;
+    if !sendable_status(status) {
+        return Err(serde::de::Error::custom(format!(
+            "`{status}` is not a status HTTP can carry (100..=999)"
+        )));
+    }
+    Ok(status)
+}
+
+/// Whether HTTP can carry this status code at all.
+///
+/// The one place the range is stated, so the builder, the control plane and the
+/// connection loop cannot drift apart about it.
+#[must_use]
+pub(crate) fn sendable_status(status: u16) -> bool {
+    (100..=999).contains(&status)
+}
+
+/// The id every answer carries back, derived from the request's own arrival
+/// sequence — `req_mock_00000003` is the third request's.
+///
+/// One function because both surfaces send it and both send it on **errors as
+/// well as answers**, which is what the real APIs do: it is the identifier an
+/// SDK's error object surfaces and the one a transcript reader correlates by.
+pub(crate) fn request_id(sequence: u64) -> String {
+    format!("req_mock_{sequence:08}")
 }
 
 /// A scripted wait, in milliseconds.
@@ -1228,6 +1292,63 @@ mod tests {
     #[should_panic(expected = "answers between 1 and 1000000 requests, not 0")]
     fn a_zero_times_is_refused_by_the_builder() {
         let _ = Script::new("fast", Outcome::text("hi")).times(0);
+    }
+
+    /// A `raw` status HTTP cannot carry is refused at both spellings, for the
+    /// same reason `times` is: the fallback for a status that cannot be built is
+    /// **500**, which PRD 5.9 fails over on and both SDKs retry — so a typo
+    /// would stage a provider failure the script never asked for, and the run
+    /// would report a failure whose shape does not match its cause.
+    #[test]
+    fn a_raw_status_outside_what_http_carries_is_refused_by_the_control_plane() {
+        for status in [0, 42, 99, 1000, 65_535] {
+            let refused = serde_json::from_value::<Script>(json!({
+                "model": "fast",
+                "outcome": { "raw": { "status": status, "body": {} } },
+            }))
+            .expect_err("a status HTTP cannot carry is not a script");
+            assert!(
+                refused.to_string().contains("HTTP can carry"),
+                "{status}: {refused}"
+            );
+        }
+
+        // The ones it can carry are queued exactly as before.
+        for status in [200, 402, 429, 503] {
+            serde_json::from_value::<Script>(json!({
+                "model": "fast",
+                "outcome": { "raw": { "status": status, "body": {} } },
+            }))
+            .unwrap_or_else(|error| panic!("{status} is sendable: {error}"));
+        }
+    }
+
+    /// The same bound at the Rust spelling, where a struct literal is the only
+    /// way past it.
+    #[test]
+    #[should_panic(expected = "must be one HTTP can carry (100..=999), not 42")]
+    fn a_raw_status_outside_what_http_carries_is_refused_by_the_builder() {
+        let _ = Outcome::raw(42, json!({}));
+    }
+
+    /// A surface is spelled on the wire the way grammar 12.1 spells the kinds
+    /// that reach it, and [`Surface::as_str`] says the same thing — the two
+    /// pinned together because a harness filtering `surface === "openai"` reads
+    /// one of them and a Rust caller reads the other.
+    #[test]
+    fn a_surface_is_spelled_the_same_way_everywhere() {
+        for (surface, spelling) in [
+            (Surface::Anthropic, "anthropic"),
+            (Surface::OpenAi, "openai"),
+            (Surface::AzureOpenAi, "azure_openai"),
+        ] {
+            assert_eq!(surface.as_str(), spelling);
+            assert_eq!(
+                serde_json::to_value(surface).expect("a surface serializes"),
+                json!(spelling),
+                "the control plane and `as_str` must not drift apart"
+            );
+        }
     }
 
     /// Two queues of enormous entries add up to a number, not to a panic — and

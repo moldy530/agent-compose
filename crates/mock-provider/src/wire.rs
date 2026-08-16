@@ -29,6 +29,10 @@ pub(crate) enum Answer {
 /// A JSON response, before it becomes bytes.
 #[derive(Clone, Debug)]
 pub(crate) struct Response {
+    /// The status, still a `u16` because a scripted `raw` outcome writes it and
+    /// a test can write one HTTP cannot carry. Turned into a `StatusCode` by
+    /// `server::render`, which refuses an impossible one the same way and for
+    /// the same reason [`header`] below refuses an unsendable header.
     pub(crate) status: u16,
     pub(crate) headers: BTreeMap<String, String>,
     pub(crate) body: Value,
