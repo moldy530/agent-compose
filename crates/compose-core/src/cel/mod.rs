@@ -18,7 +18,9 @@
 //! `exists`, `exists_one`, `filter`, `map`) and `has()` at parse time, exactly
 //! as the specification says a conforming implementation must, so the walk
 //! below sees `Comprehension` and `Select { test: true }` nodes rather than
-//! calls.
+//! calls. A macro spelled in a form it does not expand — a wrong arity, CEL's
+//! two-variable comprehension — arrives as a plain call instead, and is refused
+//! as the *form* it is rather than as a function the surface lacks.
 //!
 //! # What is checked here, and what is not
 //!

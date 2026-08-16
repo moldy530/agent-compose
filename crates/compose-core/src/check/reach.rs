@@ -278,10 +278,17 @@ fn walk_detached<'a>(
     for node in &flow.nodes {
         let reached: Vec<String> = match &node.kind {
             NodeKind::Flow { flow, .. } => vec![flow.value.to_string()],
-            NodeKind::Map { map } => targets(&map.dispatch)
+            // A dispatch that detached itself is the seed of its own walk, and
+            // what it reaches is reported against *it* — the nearer of the two
+            // `detach: true`s the author would go and read. Following it from
+            // out here would record the same instance a second time and say
+            // one write twice.
+            NodeKind::Map { map } => dispatches(&map.dispatch)
                 .into_iter()
-                .filter(|target| target.namespace == Namespace::Flow)
-                .map(Address::to_string)
+                .filter(|dispatch| {
+                    !dispatch.is_detached() && dispatch.target.namespace == Namespace::Flow
+                })
+                .map(|dispatch| dispatch.target.to_string())
                 .collect(),
             _ => Vec::new(),
         };
