@@ -66,20 +66,23 @@ enum Status {
 /// PRD §7 M1's first bullet, decomposed into the ten items its own sentence
 /// lists, in order.
 const CODEGEN: &[Criterion] = &[
+    // The emission half of this criterion has landed: `build` writes the state
+    // model and the Zod discriminated unions, and `compose-core`'s golden corpus
+    // and generated-code gates check both against the pinned toolchain on every
+    // `cargo test`. Both rows stay pending because both tests are about a
+    // *running* graph, which is what these reasons now name.
     Criterion {
         bullet: Bullet::Codegen,
         phrase: "state models (incl. tagged unions via Zod)",
         tests: &[
             (
                 "state_channels_carry_their_declared_types_and_defaults",
-                Status::Pending(
-                    "pending: `agent-compose build` must emit the state model, and `run` must execute it",
-                ),
+                Status::Pending("pending: `agent-compose run` must execute the emitted graph"),
             ),
             (
                 "a_tagged_union_output_is_narrowed_per_variant_and_a_bad_tag_is_rejected",
                 Status::Pending(
-                    "pending: codegen must emit Zod discriminated unions for tagged-union outputs",
+                    "pending: an agent node fn must parse its answer with the emitted union schema",
                 ),
             ),
         ],

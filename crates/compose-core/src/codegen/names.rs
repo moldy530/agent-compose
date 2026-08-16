@@ -309,6 +309,37 @@ mod tests {
         assert_eq!(names.ty("state.a_1"), "StateA1_2");
     }
 
+    /// A schema may not take a name one of the emitted modules already declares:
+    /// `src/index.ts` re-exports every module, so two of them exporting one name
+    /// is a duplicate export and a project that does not compile.
+    #[test]
+    fn a_schema_never_takes_a_name_a_module_already_declares() {
+        // `state.channels` camel-cases to `stateChannels`, which is free; the
+        // reserved ones are the bare module-level names, and the composition
+        // below reaches one of them through a store called `unique_items`.
+        let names = Names::of(&ir_of(
+            "version: \"0.1\"\nstate:\n  channels: { type: string }\n",
+        ));
+        assert_eq!(names.value("state.channels"), "stateChannels");
+
+        let mut names = Names {
+            assigned: BTreeMap::new(),
+            taken: BTreeMap::new(),
+        };
+        for reserved in RESERVED {
+            names.taken.insert((*reserved).to_string(), ());
+            names.taken.insert(capitalize(reserved), ());
+        }
+        names.assign("unique.items");
+        assert_eq!(
+            names.value("unique.items"),
+            "uniqueItems_2",
+            "`uniqueItems` is the emitted `unique_items` helper"
+        );
+        names.assign("read.environment");
+        assert_eq!(names.value("read.environment"), "readEnvironment_2");
+    }
+
     /// The same composition assigns the same names however its channels are
     /// ordered on the page, because the IR sorts them before the emitter sees
     /// them.

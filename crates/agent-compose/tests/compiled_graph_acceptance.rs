@@ -521,8 +521,14 @@ fn a_scripted_delay_makes_completion_order_differ_from_item_order() {
 /// `none yet` are the defaults. `round` and `notes` are written by nothing, so
 /// the only thing that can produce them is the declaration: an `integer`
 /// default, and an `append` channel's identity element (grammar 10.1).
+///
+/// `build` now emits that state model, and `compose-core`'s
+/// `tests/generated_code_gates.rs` constructs it under the pinned LangGraph on
+/// every `cargo test`. What this test adds is the half only a run can show — that
+/// the declared defaults are what a flow *returns* — so its reason names the
+/// command it waits on rather than the emission that has landed.
 #[test]
-#[ignore = "pending: `agent-compose build` must emit the state model, and `run` must execute it"]
+#[ignore = "pending: `agent-compose run` must execute the emitted graph"]
 fn state_channels_carry_their_declared_types_and_defaults() {
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue(Script::new(
@@ -558,8 +564,15 @@ fn state_channels_carry_their_declared_types_and_defaults() {
 
 /// A tagged-union output is narrowed per variant, and a response carrying a tag
 /// the schema does not declare is rejected before any edge is evaluated.
+///
+/// The `z.discriminatedUnion` this needs is emitted, and `compose-core`'s
+/// `tests/generated_code_gates.rs` runs a corpus through it that includes this
+/// very refusal — a tag the union does not declare, rejected by both the emitted
+/// Zod and the JSON Schema the same lowering produces. What is left is the node
+/// function that parses a model's answer with it, which is what makes the
+/// refusal a *run* failure naming the tag.
 #[test]
-#[ignore = "pending: codegen must emit Zod discriminated unions for tagged-union outputs"]
+#[ignore = "pending: an agent node fn must parse its answer with the emitted union schema"]
 fn a_tagged_union_output_is_narrowed_per_variant_and_a_bad_tag_is_rejected() {
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue_all([
