@@ -3606,15 +3606,12 @@ must remain consistent with.
 
 Two entries are different in kind and are labelled **PRD-extending**:
 [D37](#d37-agent_access-narrows-the-synthesized-store-tool-surface) and
-[D51](#d51-agents-carry-max_tool_iterations-default-8) each add a key answering a
-question the PRD does not ask. They are consistent with the sections they cite
-and neither contradicts a settled position, but they are *new design surface*,
-not shape decisions — so under CLAUDE.md's PRD discipline each must land in the
-PRD's Open Questions and be resolved there before the affected area (store tool
-synthesis; the agent tool loop) is implemented. If either is declined, dropping
-it from this document costs one key and one default; nothing else in the grammar
-depends on them. No other entry in this appendix introduces a construct the PRD
-does not already imply.
+[D51](#d51-agents-carry-max_tool_iterations-default-8) each added a key answering
+a question the PRD did not ask. Both went through CLAUDE.md's PRD discipline as
+Open Questions and both were **ratified** into the PRD's Resolved Questions log
+(PRD §9.13 and §9.14), so they now stand on the same footing as every other
+entry. No other entry in this appendix introduces a construct the PRD does not
+already imply.
 
 ### D1. Imports are entrypoint-only and non-transitive
 
@@ -3979,11 +3976,9 @@ is [D116](#d116-embedprovider-is-required-and-no-backend-serves-embeddings)'s.
 Default `read_write`, narrowable to `read`. **Rationale**: PRD 5.8 synthesizes
 `get`/`set` pairs, so `read_write` is the settled default; a declarative way to
 withhold writes costs one enum and serves the same least-privilege posture as
-placement isolation. **Status**: the PRD asks no least-privilege question about
-store attachment, and this key changes which tools codegen synthesizes, so it is
-new design surface rather than a shape choice — it needs PRD ratification before
-M1 synthesizes those tools. Declining it removes one optional key and the `read`
-column of §11.5. *PRD 5.8, 5.10.*
+placement isolation. **Status**: ratified — PRD §9.13 accepts the key and its
+default; 5.8 now records the least-privilege attachment rule. *PRD 5.8, 5.10,
+§9.13.*
 
 ### D38. Provider kinds are a closed v0 set with per-kind required keys
 
@@ -4119,11 +4114,9 @@ event-source configs) are exactly the objects whose schemas live in plugins.
 
 **Rationale**: PRD 5.4 bounds graph cycles statically; the intra-agent tool loop
 is the one remaining unbounded loop in a compiled graph, and a declarative bound
-keeps termination reasoning complete. **Status**: PRD 5.4 is about *graph*
-cycles and says nothing about the tool loop, so both the bound and its default
-are new design surface and need PRD ratification before M1 emits the loop.
-Declining it removes one optional key; the loop then relies on whatever bound the
-runtime imposes. *PRD 5.4, 5.5.*
+keeps termination reasoning complete. **Status**: ratified — PRD §9.14 accepts
+the bound and its default of 8; the 5.5 node taxonomy now names it. *PRD 5.4,
+5.5, §9.14.*
 
 ### D52. `human` node shape
 
