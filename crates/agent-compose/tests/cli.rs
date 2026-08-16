@@ -183,6 +183,65 @@ error: `main.yml` is not valid (target `local`): 1 error
     assert_eq!(code(&output), 1);
 }
 
+/// The other shape a graph check takes: a `map` node as one of the two sites.
+///
+/// A `map` node has no output of its own, so what it writes is what its
+/// dispatched instances write — and a write made by *name* has no site of its
+/// own to point at, which is where an anchor goes wrong. The block a `map:` key
+/// opens ends where the next node's key begins, so anchoring the label there
+/// draws "the other write is here" across a node the diagnostic has nothing to
+/// say about; the node's `id` is the anchor, and it is the name the message
+/// itself reads. Only the rendered report shows the difference, which is why it
+/// is pinned here rather than in `compose-core`'s corpus — and that corpus
+/// cannot host this case anyway: a `map` that races a node on an unreduced
+/// channel breaks grammar 8.6 rule 5 as well, and a fixture there pins exactly
+/// one diagnostic per code.
+///
+/// The `map` node is the file's last for a reason — which is also why the flow
+/// writes its `edges:` above its `nodes:`, key order in a mapping being free.
+/// The second diagnostic's own anchor *is* the `map:` block, grammar 8.6 rule 5
+/// being about the whole dispatch, so ending the block with the file keeps this
+/// golden about the label under test rather than about that end marker.
+#[test]
+fn a_maps_write_is_labelled_on_the_node_that_makes_it() {
+    let output = validate(&projects().join("one-concurrent-map-write"), &["main.yml"]);
+    assert_eq!(
+        stderr(&output),
+        "\
+error[unreduced-write]: nodes `review` and `work` of `flow.fanout` run concurrently and both write the unreduced channel `verdict`
+  --> main.yml:42:5
+   |
+13 |   verdict: { type: string, default: \"\" }
+   |   -------------------------------------- the channel is declared here
+...
+41 |     review: { agent: agent.reviewer, input: \"'the plan'\" }
+   |     ------ the other write is here
+42 |     work:
+   |     ^^^^
+   |
+   = help: two edges of one fork that are not provably exclusive can both fire, so the branches they start are concurrent: the channel they both write needs a declared `reduce:` policy — `append`, `merge`, or an explicit `last_wins` (grammar 7.6.1, 10.2, Decision D32)
+
+error[unreduced-write]: the `map` of node `work` writes the unreduced channel `verdict`
+  --> main.yml:44:9
+   |
+13 |     verdict: { type: string, default: \"\" }
+   |     -------------------------------------- the channel is declared here
+...
+44 | /         over: \"state.tasks\"
+45 | |         node: agent.worker
+46 | |         max_concurrency: 2
+47 | |         input: { text: \"item\" }
+   | |________________________________^
+   |
+   = help: dispatched instances are concurrent writers, so the channel they write needs a declared `reduce:` policy — `append`, `merge`, or an explicit `last_wins` (grammar 8.6 rule 5, 10.2)
+
+error: `main.yml` is not valid (target `local`): 2 errors
+"
+    );
+    assert_eq!(stdout(&output), "");
+    assert_eq!(code(&output), 1);
+}
+
 /// The same two sites, reported from *outside* the project: every path in the
 /// human report is the one the reader would have to type from where they ran the
 /// command, entrypoint and imported file alike. A span names its file relative

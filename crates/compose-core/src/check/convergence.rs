@@ -104,7 +104,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ::cel::Program;
 
-use crate::diag::{Diagnostic, DiagnosticCode, Span};
+use crate::diag::{Diagnostic, DiagnosticCode};
 use crate::ir::flow::{MapDispatch, Node, NodeKind};
 use crate::ir::schema::TypeForm;
 
@@ -563,36 +563,40 @@ fn races<'a>(
 /// node, which has no output of its own — the effective write map of each
 /// dispatch it issues (grammar 8.0, 8.6 rule 9).
 fn written<'a>(ctx: &Ctx<'a>, node: &'a Node) -> Vec<Written<'a>> {
+    // The node's id, not its block: the same anchor [`channels::node_writes`]
+    // reports its own diagnostics at, for the same reason — a block mapping ends
+    // where the next node's key begins, so a name-based write anchored on the
+    // block draws this rule's "the other write is here" label across the
+    // *following* node's declaration, which is not a party to the diagnostic
+    // (PRD G3). A `map` node's `map:` block and each of its route blocks end the
+    // same way and take the same anchor: the message compares two node names, so
+    // both of its annotations land on one.
+    let at = &node.id.span;
     let NodeKind::Map { map } = &node.kind else {
         return ctx.node_output(node).map_or_else(Vec::new, |output| {
-            // The node's id, not its block: the same anchor
-            // [`channels::node_writes`] reports its own diagnostics at, for the
-            // same reason — a block mapping ends where the next node's key
-            // begins.
-            channels::effective(ctx, &output, node.writes.as_ref(), &node.id.span)
+            channels::effective(ctx, &output, node.writes.as_ref(), at)
         });
     };
     let sites: Vec<(
         &crate::ast::common::Address,
         Option<&crate::ir::binding::Writes>,
-        &Span,
     )> = match &map.dispatch {
         MapDispatch::Homogeneous {
             node: target,
             writes,
             ..
-        } => vec![(&target.value, writes.as_ref(), &map.span)],
+        } => vec![(&target.value, writes.as_ref())],
         MapDispatch::Routed {
             routes, default, ..
         } => routes
             .iter()
             .chain(default.iter().map(|route| &**route))
-            .map(|route| (&route.node.value, route.writes.as_ref(), &route.span))
+            .map(|route| (&route.node.value, route.writes.as_ref()))
             .collect(),
     };
     sites
         .into_iter()
-        .filter_map(|(target, writes, at)| {
+        .filter_map(|(target, writes)| {
             let output = ctx.target_output(target)?;
             Some(channels::effective(ctx, output, writes, at))
         })
