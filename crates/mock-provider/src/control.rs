@@ -306,6 +306,12 @@ impl Outcome {
     /// Structured output: rendered through whichever mechanism the request asked
     /// for (a forced tool on the Anthropic surface, `response_format` or a
     /// forced function on the OpenAI one).
+    ///
+    /// A Chat Completions request may carry **both** of its mechanisms, and the
+    /// pinned call wins: `response_format` shapes the content, and a tool pin
+    /// decides whether the turn has content at all. A pin that names no function
+    /// — `tool_choice: "required"` — leaves this reply nothing to make the call
+    /// under and is refused as a `script-mismatch`; script `tools` there.
     #[must_use]
     pub fn structured(value: Value) -> Self {
         Self::Reply(Reply::new(ReplyBody::Structured(value)))

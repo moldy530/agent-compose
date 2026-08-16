@@ -601,7 +601,23 @@ fn walk_strict_schema(
             context.pop();
         }
     }
-    for (key, group) in [("$defs", object.get("$defs"))] {
+    // Both spellings of the definitions bucket, because a schema this server is
+    // asked to close arrives in either. `$defs` is JSON Schema 2020-12's, and
+    // what OpenAI's own examples use; `definitions` is draft-07's — and, the
+    // load-bearing half, `zod-to-json-schema`'s **default** `definitionPath`, so
+    // it is where a Zod model's reused or recursive sub-schemas actually land
+    // unless codegen overrides the option. Walking only `$defs` would accept the
+    // unclosed object under the likelier of the two spellings, which is the 400
+    // this check exists to catch (WIRE-NOTES §13).
+    //
+    // Walking every entry in the bucket, rather than following `$ref` to the
+    // ones a schema reaches, is deliberate: an object that would be refused when
+    // referenced is refused when merely declared, and a `$ref` walk would have
+    // to resolve pointers and guard cycles to reach the same objects.
+    for (key, group) in [
+        ("$defs", object.get("$defs")),
+        ("definitions", object.get("definitions")),
+    ] {
         for (name, subschema) in group.and_then(Value::as_object).into_iter().flatten() {
             context.push(key.to_string());
             context.push(name.clone());
@@ -964,8 +980,8 @@ fn reply_answer(
                 "stop",
             )
         }
-        ReplyBody::Structured(value) => match structured {
-            Some(StructuredOutput::JsonSchema { .. }) => (
+        ReplyBody::Structured(value) => match structured_destination(request, structured) {
+            Ok(Destination::Content) => (
                 json!({
                     "role": "assistant",
                     "content": canonical(value),
@@ -973,23 +989,16 @@ fn reply_answer(
                 }),
                 "stop",
             ),
-            Some(StructuredOutput::ForcedFunction { name, .. }) => (
+            Ok(Destination::Call(name)) => (
                 json!({
                     "role": "assistant",
                     "content": Value::Null,
-                    "tool_calls": [call_block(sequence, 0, name, value)],
+                    "tool_calls": [call_block(sequence, 0, &name, value)],
                     "refusal": Value::Null,
                 }),
-                "tool_calls",
+                TOOL_CALLS,
             ),
-            _ => {
-                return mismatch(
-                    sequence,
-                    "a `structured` reply needs a request that asks for structured output: this \
-                     one carries neither `response_format: {type: \"json_schema\"}` nor a forced \
-                     function",
-                );
-            }
+            Err(reason) => return mismatch(sequence, &reason),
         },
         ReplyBody::Tools {
             calls: scripted,
@@ -1175,6 +1184,90 @@ fn checked_finish_reason(sequence: u64, reply: &Reply, implied: &str) -> Result<
         ));
     }
     Ok(scripted.to_string())
+}
+
+/// Where a `structured` reply's object goes.
+enum Destination {
+    /// Serialized into `message.content`, ending the turn with `stop`.
+    Content,
+    /// Rendered as the `arguments` of a call to this function, ending the turn
+    /// with `tool_calls`.
+    Call(String),
+}
+
+/// Where this request's answer has to put a scripted object — or why it cannot
+/// take one.
+///
+/// This surface has **two** mechanisms for asking for an object (WIRE-NOTES §3),
+/// and a request may carry both: `response_format: {type: "json_schema"}` shapes
+/// the *content*, while a pinned `tool_choice` decides whether the turn has any
+/// content at all. They do not compose the way [`Parsed::structured_output`]
+/// suggests — that field is `response_format`-first, because it records how the
+/// request *asked*, and reading the answer off it would render a request
+/// carrying both as content with `finish_reason: "stop"` and no `tool_calls`.
+/// That is a document Chat Completions can never send against a tool pin, and
+/// the exact one [`pinned_answer_shape`] and WIRE-NOTES' "a pinned tool choice
+/// guarantees a call" declare impossible: a codegen path that emitted both
+/// mechanisms would watch its tool loop take the prose branch, pass, and get
+/// `tool_calls` on the first live call.
+///
+/// So the pin is read off the **request** first, exactly as `pinned_answer_shape`
+/// is, and `structured` is consulted only once the request pins no call.
+fn structured_destination(
+    request: &Value,
+    structured: Option<&StructuredOutput>,
+) -> Result<Destination, String> {
+    if let Some(name) = pinned_function_name(request) {
+        // A forced function is answered with a call to *that* function, whatever
+        // else the request also asked for. The object is the call's `arguments`,
+        // so the function has to declare the shape it takes: one that declares
+        // no `parameters` takes none, and there is nowhere to render the object.
+        // (That is also the only way a forced function reaches here with a
+        // `structured_output` of `None`, which is why the sentence names the
+        // missing `parameters` rather than a missing `tool_choice` the request
+        // plainly carries.)
+        return if request
+            .as_object()
+            .and_then(|body| function_schema(body, &name))
+            .is_some()
+        {
+            Ok(Destination::Call(name))
+        } else {
+            Err(format!(
+                "a `structured` reply cannot answer this request: it pins `tool_choice: {{type: \
+                 \"function\", function: {{name: \"{name}\"}}}}`, and `{name}` declares no \
+                 `parameters` — there is no schema to render the object into. Give the function \
+                 the agent's output schema, or script `tools` for a call with the arguments it \
+                 takes"
+            ))
+        };
+    }
+    // `"required"` guarantees *a* call and so rules out content, but names no
+    // function to render the object under. The script has to say which — the
+    // same rule the Messages surface keeps for `tool_choice: {type: "any"}` with
+    // several tools on offer.
+    if request.get("tool_choice").and_then(Value::as_str) == Some("required") {
+        return Err(
+            "a `structured` reply cannot answer a request carrying `tool_choice: \"required\"`: \
+             Chat Completions answers that with a call, and this reply names no function to make \
+             it under. Script `tools` for a call to one of the functions the request offers, or \
+             force one by name with `tool_choice: {type: \"function\", function: {name: …}}`"
+                .to_string(),
+        );
+    }
+    match structured {
+        // `response_format` shapes the content, and with no tool pin over it the
+        // content is where the object goes.
+        Some(StructuredOutput::JsonSchema { .. }) => Ok(Destination::Content),
+        // A `ForcedFunction` is precisely a request the first branch answered,
+        // so it does not reach here; the remaining requests asked for no object
+        // at all.
+        _ => Err(
+            "a `structured` reply needs a request that asks for structured output: this one \
+                  carries neither `response_format: {type: \"json_schema\"}` nor a forced function"
+                .to_string(),
+        ),
+    }
 }
 
 /// How a request pinned the shape of its answer, if it pinned one.
@@ -1514,6 +1607,105 @@ mod tests {
             "{:?}",
             parse_direct(&lenient).failures
         );
+    }
+
+    /// The strict walk reaches every place a subschema hides, and that includes
+    /// **both** spellings of the definitions bucket.
+    ///
+    /// `$defs` is JSON Schema 2020-12's and what OpenAI's own examples use;
+    /// `definitions` is draft-07's and `zod-to-json-schema`'s **default**
+    /// `definitionPath`, so it is where a Zod model's reused or recursive
+    /// sub-schemas land unless codegen overrides the option. A walk that only
+    /// knew `$defs` would accept an unclosed object under the likelier of the
+    /// two spellings and 400 on the first live call, which is the outcome this
+    /// check exists to move into CI (WIRE-NOTES §13).
+    #[test]
+    fn the_strict_walk_reaches_both_spellings_of_the_definitions_bucket() {
+        let strict = |schema: Value| {
+            request(json!({
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": { "name": "review", "strict": true, "schema": schema },
+                },
+            }))
+        };
+        let unclosed = json!({ "type": "object", "properties": { "z": { "type": "string" } } });
+
+        for key in ["$defs", "definitions"] {
+            let mut schema = json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["a"],
+                "properties": { "a": { "$ref": format!("#/{key}/X") } },
+            });
+            schema[key] = json!({ "X": unclosed.clone() });
+            let failures = parse_direct(&strict(schema)).failures;
+            let messages: Vec<&str> = failures
+                .iter()
+                .map(|failure| failure.message.as_str())
+                .collect();
+            assert_eq!(
+                messages,
+                [
+                    format!(
+                        "Invalid schema for response_format 'review': In context=('{key}', 'X'), 'additionalProperties' is required to be supplied and to be false."
+                    ),
+                    format!(
+                        "Invalid schema for response_format 'review': In context=('{key}', 'X'), 'required' is required to be supplied and to be an array including every key in properties. Missing 'z'."
+                    ),
+                ]
+            );
+
+            // The closed spelling of the same bucket is served: the rule is
+            // about the objects, not about where they were declared.
+            let mut closed = json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["a"],
+                "properties": { "a": { "$ref": format!("#/{key}/X") } },
+            });
+            closed[key] = json!({
+                "X": {
+                    "type": "object",
+                    "properties": { "z": { "type": "string" } },
+                    "required": ["z"],
+                    "additionalProperties": false,
+                },
+            });
+            let failures = parse_direct(&strict(closed)).failures;
+            assert!(failures.is_empty(), "{failures:?}");
+        }
+
+        // The other two places, addressed by the path walked to reach them: a
+        // list's `items`, and a branch of an `anyOf` below the root.
+        for (schema, context) in [
+            (
+                json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["rows"],
+                    "properties": { "rows": { "type": "array", "items": unclosed.clone() } },
+                }),
+                "('properties', 'rows', 'items')",
+            ),
+            (
+                json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["choice"],
+                    "properties": { "choice": { "anyOf": [unclosed.clone()] } },
+                }),
+                "('properties', 'choice', 'anyOf', '0')",
+            ),
+        ] {
+            let failures = parse_direct(&strict(schema)).failures;
+            assert!(
+                failures.iter().any(|failure| failure
+                    .message
+                    .contains(&format!("In context={context}, 'additionalProperties'"))),
+                "{failures:?}"
+            );
+        }
     }
 
     /// The same rules on a `strict: true` function tool, which is the other
@@ -2277,6 +2469,134 @@ mod tests {
         assert_eq!(call["function"]["name"], "extract");
         assert_eq!(call["function"]["arguments"], "{\"verdict\":\"revise\"}");
         assert_eq!(response.body["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    /// A request may carry **both** of this surface's structured-output
+    /// mechanisms, and they do not compose the way the recorded
+    /// `structured_output` suggests: a pinned tool choice decides whether the
+    /// turn carries content at all, so it outranks `response_format`. Answering
+    /// one of these in the content, with `finish_reason: "stop"` and no
+    /// `tool_calls`, would be a document Chat Completions cannot send — and the
+    /// one a codegen path that emitted both mechanisms (WIRE-NOTES §3) would
+    /// watch its tool loop take the prose branch on, pass, and then meet a call
+    /// on the first live request.
+    #[test]
+    fn a_tool_pin_outranks_a_response_format_on_a_request_carrying_both() {
+        let json_schema = json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "review",
+                "schema": { "type": "object", "properties": { "verdict": { "type": "string" } } },
+            },
+        });
+        let tools = json!([{
+            "type": "function",
+            "function": { "name": "extract", "parameters": { "type": "object" } },
+        }]);
+
+        // Forced by name: the object is *that* call's arguments, and the content
+        // the `response_format` would have shaped is never produced.
+        let body = request(json!({
+            "response_format": json_schema.clone(),
+            "tools": tools.clone(),
+            "tool_choice": { "type": "function", "function": { "name": "extract" } },
+        }));
+        let parsed = parse_direct(&body);
+        assert!(parsed.failures.is_empty(), "{:?}", parsed.failures);
+        // The transcript still records how the request *asked*, which was both
+        // ways; only the answer follows the pin.
+        assert!(matches!(
+            parsed.structured_output,
+            Some(StructuredOutput::JsonSchema { .. })
+        ));
+        let Answer::Respond(response) = render(
+            1,
+            &body,
+            &parsed.model,
+            parsed.structured_output.as_ref(),
+            &Outcome::structured(json!({ "verdict": "revise" })),
+        ) else {
+            panic!("a reply is a response");
+        };
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body["choices"][0]["finish_reason"], TOOL_CALLS);
+        let call = &response.body["choices"][0]["message"]["tool_calls"][0];
+        assert_eq!(call["function"]["name"], "extract");
+        assert_eq!(call["function"]["arguments"], "{\"verdict\":\"revise\"}");
+        assert_eq!(
+            response.body["choices"][0]["message"]["content"],
+            Value::Null
+        );
+
+        // `"required"` pins a call without naming the function to make it under,
+        // so neither the content nor a call is an answer this script can be
+        // rendered into — with or without a `response_format` beside it.
+        for extra in [
+            json!({ "response_format": json_schema, "tools": tools.clone(), "tool_choice": "required" }),
+            json!({ "tools": tools, "tool_choice": "required" }),
+        ] {
+            let body = request(extra);
+            let parsed = parse_direct(&body);
+            assert!(parsed.failures.is_empty(), "{:?}", parsed.failures);
+            let Answer::Respond(response) = render(
+                1,
+                &body,
+                &parsed.model,
+                parsed.structured_output.as_ref(),
+                &Outcome::structured(json!({ "verdict": "revise" })),
+            ) else {
+                panic!("a mismatch is a response");
+            };
+            assert_eq!(response.status, HARNESS_STATUS, "{body}");
+            assert_eq!(response.headers[HARNESS_HEADER], MISMATCH);
+            let message = response.body["error"]["message"]
+                .as_str()
+                .expect("a message");
+            assert!(
+                message.contains("`tool_choice: \"required\"`"),
+                "the refusal names the pin it could not answer: {message}"
+            );
+        }
+    }
+
+    /// A forced function that declares no `parameters` takes none, so a
+    /// scripted object has nowhere to go — the verdict the `_` arm used to
+    /// reach by way of a `structured_output` of `None`. The refusal has to say
+    /// *that*, rather than report a `tool_choice` the request plainly carries as
+    /// absent: in a crate where the wording is the product, a sentence that
+    /// sends the reader looking for a pin that is right there is a wrong answer.
+    #[test]
+    fn a_structured_reply_to_a_parameterless_forced_function_names_the_missing_parameters() {
+        let body = request(json!({
+            "tools": [{ "type": "function", "function": { "name": "extract" } }],
+            "tool_choice": { "type": "function", "function": { "name": "extract" } },
+        }));
+        let parsed = parse_direct(&body);
+        assert!(parsed.failures.is_empty(), "{:?}", parsed.failures);
+        assert!(parsed.structured_output.is_none());
+        let Answer::Respond(response) = render(
+            1,
+            &body,
+            &parsed.model,
+            parsed.structured_output.as_ref(),
+            &Outcome::structured(json!({ "a": 1 })),
+        ) else {
+            panic!("a mismatch is a response");
+        };
+        assert_eq!(response.status, HARNESS_STATUS);
+        assert_eq!(response.headers[HARNESS_HEADER], MISMATCH);
+        let message = response.body["error"]["message"]
+            .as_str()
+            .expect("a message");
+        assert!(
+            message.contains("`extract` declares no `parameters`"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("carries neither"),
+            "the request carries a forced function, and the refusal must not say otherwise: \
+             {message}"
+        );
     }
 
     /// A structured reply with nothing asking for structure is a script bug.

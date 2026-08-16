@@ -80,6 +80,18 @@ These are load-bearing and pinned by tests in `src/` and `tests/`:
   is refused as a `script-mismatch` for the same reason a `structured` reply to
   a request that pinned nothing is: the harness must not teach generated code
   that a provider answers in a way it cannot.
+* **A pinned tool choice outranks a `response_format`.** The consequence of the
+  rule above on a Chat Completions request that carries *both* mechanisms:
+  `response_format` shapes the content, and a pinned `tool_choice` decides
+  whether the turn has content at all, so the answer is the call and
+  `finish_reason: "tool_calls"`. A `structured` reply is therefore rendered as
+  the pinned call's `arguments`, never into the content — answering one of these
+  with `stop` and no `tool_calls` would hand a codegen path that emitted both
+  mechanisms (3) a prose branch to pass on and a tool call on its first live
+  request. `tool_choice: "required"` pins a call without naming the function to
+  make it under, so a `structured` reply to one is refused as a
+  `script-mismatch`: the script has to name the function, with `tools` or by
+  forcing one.
 * **A tool choice pinned by *name* guarantees a call to *that* tool.** The
   stronger half of the same rule, and the one an agent with tools makes
   reachable: `tool_choice: {type: "tool", name: X}` and a forced function both
@@ -166,7 +178,13 @@ Function calling (a forced function) and `response_format: {type: "json_schema",
 json_schema: {name, schema, strict}}`, selected by a `method` option.
 *This server*: accepts both, and renders `Outcome::structured(v)` the way the
 request asked — serialized into `message.content` for `json_schema`, or as a
-tool call whose `arguments` is the serialized object for a forced function.
+tool call whose `arguments` is the serialized object for a forced function. A
+request that carries **both** is answered by the tool pin (the Certain list,
+above), because a codegen path confusing the two is a live risk and the harness
+must not be the thing that hides it. A forced function that declares no
+`parameters` takes no arguments, so a `structured` reply to one is refused as a
+`script-mismatch` naming the missing `parameters` — the function has to carry
+the agent's output schema for there to be an object to answer with.
 *If wrong*: as (1), a `script-mismatch`.
 
 ### 4. `anthropic-version` is required and `2023-06-01` is what clients send
@@ -333,14 +351,26 @@ not `strict` was asked for — see (16).
 outputs, and this is the most common 400 on the surface — a Zod-to-JSON-Schema
 path that drops either key passes a mock that does not check and fails on the
 first live call.
+
+The recursion follows `properties`, `items`, `anyOf`, and **both** spellings of
+the definitions bucket — `$defs`, which is JSON Schema 2020-12's and what
+OpenAI's examples show, and `definitions`, which is draft-07's and
+`zod-to-json-schema`'s **default** `definitionPath`. The second is the one a Zod
+model with a reused or recursive sub-schema actually lands on, so a walk that
+knew only `$defs` would accept the unclosed object under the likelier spelling
+and 400 on the first live call — the outcome this check exists to prevent. Every
+entry in the bucket is walked rather than only the ones a `$ref` reaches: an
+object refused when referenced is refused when merely declared, and a `$ref` walk
+would have to resolve pointers and guard cycles to arrive at the same objects.
+
 *What is assumed*: the exact sentences, and the `context=` path spelling (a
-Python tuple of the schema keys walked through). The recursion follows
-`properties`, `items`, `$defs` and `anyOf`, and reports one missing-`required`
-complaint per object, naming the first property left out — the service reports
+Python tuple of the schema keys walked through). One missing-`required` complaint
+is reported per object, naming the first property left out — the service reports
 one at a time.
 *If wrong*: only a test asserting on the string breaks;
 `src/openai.rs`'s `a_strict_schema_must_close_every_object_and_require_every_property`
-is where the strings live.
+and `the_strict_walk_reaches_both_spellings_of_the_definitions_bucket` are where
+the strings live.
 
 ### 14. `tool_choice` without `tools` is refused on both surfaces
 

@@ -122,6 +122,66 @@ fn a_forced_function_structured_output_arrives_as_a_tool_call() {
     assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
 }
 
+/// A request may carry **both** mechanisms, and the pinned call is what answers
+/// it: the turn ends with `finish_reason: "tool_calls"` and a null content, so
+/// the `response_format` shapes nothing.
+///
+/// This is the pairing a codegen path that confused the two would send —
+/// WIRE-NOTES §3 records that LangChain JS selects between them with a `method`
+/// option — and a mock that answered it in the content would hand that path a
+/// `stop` branch to pass on, then meet a tool call on the first live request.
+#[test]
+fn a_request_carrying_both_structured_output_mechanisms_is_answered_with_the_pinned_call() {
+    let provider = MockProvider::start().expect("a port");
+    provider.enqueue(Script::new(
+        MODEL,
+        Outcome::structured(json!({ "verdict": "approve" })),
+    ));
+
+    let mut body = json_schema_request();
+    body["tools"] = json!([{
+        "type": "function",
+        "function": {
+            "name": "reviewer_output",
+            "parameters": { "type": "object", "properties": {} },
+        },
+    }]);
+    body["tool_choice"] = json!({ "type": "function", "function": { "name": "reviewer_output" } });
+
+    let response = send(&provider.client(), "/v1/chat/completions", &body);
+    assert_eq!(response.status, 200);
+    let answered = response.json();
+    assert_eq!(answered["choices"][0]["finish_reason"], "tool_calls");
+    assert_eq!(answered["choices"][0]["message"]["content"], Value::Null);
+    let call = &answered["choices"][0]["message"]["tool_calls"][0];
+    assert_eq!(call["function"]["name"], "reviewer_output");
+    assert_eq!(call["function"]["arguments"], "{\"verdict\":\"approve\"}");
+
+    // `"required"` pins a call too, but names no function to make it under, so
+    // the script has to say which one — and is told so rather than served
+    // content the service could not have sent.
+    provider.reset();
+    provider.enqueue(Script::new(
+        MODEL,
+        Outcome::structured(json!({ "verdict": "approve" })),
+    ));
+    body["tool_choice"] = json!("required");
+    let response = send(&provider.client(), "/v1/chat/completions", &body);
+    assert_eq!(response.status, HARNESS_STATUS);
+    assert_eq!(
+        response.header(HARNESS_HEADER),
+        Some(mock_provider::REFUSED_MISMATCH)
+    );
+    assert!(
+        response.json()["error"]["message"]
+            .as_str()
+            .expect("a message")
+            .contains("`tool_choice: \"required\"`"),
+        "{}",
+        response.json()
+    );
+}
+
 /// `strict: true` closes the schema, and a schema that is not closed is a 400 —
 /// the most common one on this surface, and the one a Zod-to-JSON-Schema path
 /// produces when it drops `additionalProperties` or an entry in `required`.
@@ -185,6 +245,66 @@ fn a_strict_schema_that_is_not_closed_is_refused() {
         .status,
         200
     );
+}
+
+/// The same 400, under the definitions bucket `zod-to-json-schema` actually
+/// writes.
+///
+/// Its `definitionPath` option defaults to `definitions`, not `$defs`, so any
+/// Zod model with a reused or recursive sub-schema puts its objects there — and
+/// an unclosed one has to be caught in the bucket the tool uses, not only in the
+/// spelling OpenAI's examples show. This is the same rule as
+/// `a_strict_schema_that_is_not_closed_is_refused`, one indirection down, and
+/// the reason it is a separate test is that a walk can pass that one and miss
+/// this one.
+#[test]
+fn a_strict_schema_left_open_under_definitions_is_refused() {
+    let provider = MockProvider::start().expect("a port");
+
+    for bucket in ["$defs", "definitions"] {
+        provider.reset();
+        provider.enqueue(Script::new(MODEL, Outcome::text("never served")));
+        let mut schema = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["author"],
+            "properties": { "author": { "$ref": format!("#/{bucket}/Author") } },
+        });
+        schema[bucket] = json!({
+            "Author": { "type": "object", "properties": { "name": { "type": "string" } } },
+        });
+
+        let response = send(
+            &provider.client(),
+            "/v1/chat/completions",
+            &json!({
+                "model": MODEL,
+                "messages": [{ "role": "user", "content": "go" }],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "reviewer_output",
+                        "strict": true,
+                        "schema": schema,
+                    },
+                },
+            }),
+        );
+        assert_eq!(response.status, 400, "{bucket}");
+        assert_eq!(response.header(HARNESS_HEADER), Some(REFUSED_INVALID));
+        let message = response.json()["error"]["message"]
+            .as_str()
+            .expect("a message")
+            .to_string();
+        assert!(
+            message.contains(&format!(
+                "In context=('{bucket}', 'Author'), 'additionalProperties' is required to be \
+                 supplied and to be false."
+            )),
+            "{message}"
+        );
+        assert_eq!(provider.snapshot().queues[MODEL], 1, "nothing was consumed");
+    }
 }
 
 /// A tagged union at the root of an output schema is a 400 too, and it is the
