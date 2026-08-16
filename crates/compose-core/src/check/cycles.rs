@@ -35,9 +35,23 @@
 //! pass that spends the budget with no viable route — an infinite loop converted
 //! into a runtime dead end, which is the failure Decision D19's rule removes.
 //!
-//! An edge leaving `start` is exempt: `start` belongs to no component, so every
-//! edge leaving it leaves "its" SCC, and grammar 7.6.3 rule 2 — which the parser
-//! owns — already requires one of them to be unconditional or `else: true`.
+//! Two sources are exempt, and both for the same reason: a budget that cannot
+//! run out withdraws no guarantee.
+//!
+//! * An edge leaving **`start`**. `start` belongs to no component, so every edge
+//!   leaving it leaves "its" SCC, and grammar 7.6.3 rule 2 — which the parser
+//!   owns — already requires one of them to be unconditional or `else: true`.
+//! * A node **in no cycle**. `max_iterations` counts traversals of one edge
+//!   within one flow instance (grammar 7.4), and a node no cycle reaches
+//!   executes once per instance, so a budget of at least one — which the range
+//!   1..=1000 guarantees — is never spent and the edge is never untakeable.
+//!   Grammar 7.4's escape bullet reads over "each `max_iterations`-carrying
+//!   edge" while grammar 7.2's own gloss of the key says the source "then also
+//!   needs an unconditional or `else:` edge **leaving the cycle**", which
+//!   presupposes one; refusing the acyclic shape would reject a composition that
+//!   is runtime-safe, and that is the one direction Decisions D99 and D112 say a
+//!   conservative static check must not go. The budget there is inert rather
+//!   than dangerous, and no rule in this grammar refuses it.
 
 use crate::diag::{Diagnostic, DiagnosticCode};
 use crate::ir::flow::Edge;
@@ -72,6 +86,10 @@ pub(crate) fn check<'a>(ctx: &mut Ctx<'a>, cx: &FlowCx<'a>, graph: &Graph<'a>) {
     }
 
     for at in 0..graph.nodes().len() {
+        // A node in no cycle runs once, so its budget is never spent (above).
+        if !graph.cyclic(at) {
+            continue;
+        }
         for edge in graph.outgoing(Vertex::Node(at)) {
             if graph.edge(*edge).max_iterations.is_none() || escapes(graph, at) {
                 continue;

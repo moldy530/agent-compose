@@ -1336,3 +1336,36 @@ flow.f:
 "#,
     );
 }
+
+/// A `max_iterations` on an edge **no cycle reaches** needs no escape. The
+/// budget counts traversals of that edge within one flow instance (grammar 7.4)
+/// and an acyclic node executes once, so a bound of at least one is never spent
+/// and the edge is never untakeable — there is no pass for an escape to catch.
+/// Grammar 7.4's escape bullet reads over every bounded edge while grammar 7.2's
+/// gloss of the key says "leaving the cycle", and refusing this shape would
+/// reject a runtime-safe composition (Decisions D19, D90, D99).
+#[test]
+fn a_bounded_edge_outside_every_cycle_needs_no_escape() {
+    accepts(
+        "acyclic-budget",
+        r#"
+agent.a:
+  model: model.m
+  prompt: Do it.
+  output:
+    verdict: { enum: [approve, revise] }
+flow.f:
+  outputs: {}
+  nodes:
+    a: { agent: agent.a, input: "'x'" }
+    b: { agent: agent.a, input: "'y'" }
+    c: { agent: agent.a, input: "'z'" }
+  edges:
+    - { from: start, to: a }
+    - { from: a, to: b, when: "a.output.verdict == 'approve'", max_iterations: 3 }
+    - { from: a, to: c, when: "a.output.verdict != 'approve'" }
+    - { from: b, to: end }
+    - { from: c, to: end }
+"#,
+    );
+}

@@ -1,15 +1,21 @@
-//! The validator's data checks: everything that is decided from the IR's
-//! **schemas and expressions**, as against its graphs.
+//! The validator: every static check `docs/grammar.md` and PRD §7 M0 define
+//! over a resolved composition.
 //!
 //! The pass reads one resolved [`Ir`] and reports through [`Diagnostic`]. It
 //! adds nothing to the artifact and changes nothing in it: an artifact exists
 //! only when resolution rejected nothing (see [`resolve`](crate::resolve)), and
 //! what this pass decides is whether the composition that produced it also
-//! *type-checks*.
+//! holds together.
 //!
-//! # What is here
+//! The rules fall into two families by the *evidence* they need, and the split
+//! is the one Appendix B draws. `crates/compose-core/tests/m0_inventory.rs`
+//! is the whole account in executable form: each check, its pass, and the codes
+//! it reports through.
 //!
-//! One submodule per rule family, each rule reporting a stable code
+//! # The data checks
+//!
+//! The first family is decided from the IR's **schemas and expressions**. One
+//! submodule per rule family, each rule reporting a stable code
 //! ([`DiagnosticCode`](crate::diag::DiagnosticCode)):
 //!
 //! | Module | Grammar | What it decides |
