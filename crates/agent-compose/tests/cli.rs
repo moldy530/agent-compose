@@ -14,9 +14,15 @@
 //! turn off. That colour is the one thing they therefore cannot see, so
 //! `report`'s own unit tests hold it: both verdicts styled or neither, and the
 //! styled render equal to the plain one once the escapes come back out.
+//!
+//! One scenario reads its stream *and stops* rather than draining it, because
+//! `| head` and `| less` are how this command is used and a closed pipe is the
+//! one way a run ends outside the exit-code table (see `main.rs`).
 
+use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Output;
+use std::process::{Output, Stdio};
 use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
@@ -401,6 +407,94 @@ fn a_usage_error_exits_two() {
         .output()
         .expect("the command runs");
     assert_eq!(code(&output), 2, "a missing path is a usage error");
+}
+
+/// A project whose report is far larger than a pipe can hold: `definitions`
+/// agent definitions, each with one misspelled key, for one `unknown-key`
+/// diagnostic apiece.
+///
+/// The size is the point. A pipe holds 64 KiB on Linux, and a command whose
+/// whole report fits inside it never writes into a closed one — so a report that
+/// does not outgrow the buffer cannot show the failure below, whatever the
+/// reader does. 400 definitions are ~190 KB of JSON and ~180 KB of rendered
+/// snippets, both several times the buffer.
+fn noisy_project(dir: &Path, definitions: usize) {
+    let mut text = String::from(
+        "version: \"0.1\"\nprovider.p:\n  kind: anthropic\n  api_key: ${K}\nmodel.m:\n  provider: provider.p\n  id: some-model\n",
+    );
+    for at in 0..definitions {
+        text.push_str(&format!(
+            "agent.a{at}:\n  model: model.m\n  prompt: Do it.\n  descriptio: Reviews a draft.\n"
+        ));
+    }
+    fs::write(dir.join("main.yml"), text).expect("can write the entrypoint");
+}
+
+/// Run `validate`, read one byte of the stream the report goes to, close it, and
+/// wait for the command to exit: the shape of `agent-compose validate … | head`.
+///
+/// The other stream is captured whole, so what the run has to say about the
+/// closed one is still readable. The report outgrows the pipe's buffer, so the
+/// command is certainly still writing when the read end goes.
+fn report_into_a_closed_pipe(dir: &Path, format: &str) -> Output {
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_agent-compose"))
+        .current_dir(dir)
+        .env("NO_COLOR", "1")
+        .args(["validate", "main.yml", "--format", format])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the command runs");
+    let mut reading: Box<dyn Read> = if format == "json" {
+        Box::new(child.stdout.take().expect("stdout is a pipe"))
+    } else {
+        Box::new(child.stderr.take().expect("stderr is a pipe"))
+    };
+    let mut first = [0u8; 1];
+    reading
+        .read_exact(&mut first)
+        .expect("the report starts before the reader leaves");
+    drop(reading);
+    child.wait_with_output().expect("the command exits")
+}
+
+/// A reader that stops reading is not a failure of the command.
+///
+/// `| head -1`, or `| less` and then `q`: the pipe closes while the report is
+/// still being written, and the write that follows fails. Answering that by
+/// panicking exits `101` — a code `main.rs`'s table gives no meaning, and one no
+/// consumer of `validate` can act on — and prints a Rust backtrace on the stream
+/// `--format json` promises to leave empty. The verdict is what the run means,
+/// and it survives the reader leaving: both formats exit `1` here, and the JSON
+/// run still says nothing at all on stderr.
+///
+/// This is reachable only through a report bigger than the pipe's buffer, which
+/// is why the project is generated: a composition grows into this failure
+/// without anything about it changing.
+#[test]
+fn a_reader_that_stops_reading_still_gets_the_verdict() {
+    let dir =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("closed-pipe-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("can create a scratch directory");
+    noisy_project(&dir, 400);
+
+    let output = report_into_a_closed_pipe(&dir, "json");
+    assert_eq!(
+        code(&output),
+        1,
+        "a closed pipe exits on the verdict, not on a panic; stderr was:\n{}",
+        stderr(&output)
+    );
+    assert_eq!(
+        stderr(&output),
+        "",
+        "`--format json` says nothing on stderr, a closed stdout included"
+    );
+
+    let output = report_into_a_closed_pipe(&dir, "human");
+    assert_eq!(code(&output), 1, "the human report, read and abandoned");
+    assert_eq!(stdout(&output), "", "the human format writes no stdout");
 }
 
 /// A guard against the graph analyses going quadratic in a way nobody notices:

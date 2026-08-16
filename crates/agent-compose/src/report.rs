@@ -14,7 +14,10 @@
 //!
 //! The split is what makes `--format json` pipeable without interleaving, and it
 //! means a caller never has to strip a progress line out of a document it is
-//! about to parse.
+//! about to parse. Both promises are about the whole run, a reader that stops
+//! reading included: writing either report is what [`crate::write()`] is for,
+//! because a panic over a closed pipe would land a backtrace on the stream this
+//! one promises to leave empty.
 //!
 //! # The snippet renderer
 //!
