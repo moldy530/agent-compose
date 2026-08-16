@@ -34,6 +34,18 @@
 //! rule 5 and rule 7 — are decided at the site, in [`maps`](super::maps).
 //! A store write is the one effect that *is* shared across instances, which is
 //! why derivation, and only derivation, is traced inward from here.
+//!
+//! # Both traversals carry their own stack
+//!
+//! [`walk`] and [`push_frame`] descend through nested compositions, and a
+//! composition's flow count is bounded by nothing this compiler controls — the
+//! same reason [`Graph::sccs`](super::graph) is written iteratively. Written with
+//! the call stack instead, a composition nested deeply enough aborts the process
+//! on a stack overflow: no diagnostic, no report, and an exit code no consumer of
+//! `validate` has a meaning for. Both therefore keep their pending work on the
+//! heap. [`push_frame`]'s stack carries an explicit `Leave` marker, because its
+//! recursion had an *after* — the path set a frame is removed from once its
+//! nested flows are done with it.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -85,49 +97,59 @@ pub(crate) fn stores_of(ctx: &Ctx, flow: &str) -> BTreeSet<String> {
     reached(ctx, flow).stores
 }
 
+/// The traversal itself: a worklist of flow addresses, each visited once.
+///
+/// What it collects is order-independent — a set of stores and a map of `human`
+/// nodes — so the order the pending addresses come off the list is not
+/// observable, and `seen` is read on the way *out* of the list rather than on the
+/// way in: an address may be queued twice and is walked once.
 fn walk(ctx: &Ctx, address: &str, seen: &mut BTreeSet<String>, found: &mut Reached) {
-    if !seen.insert(address.to_string()) {
-        return;
-    }
-    let Some(flow) = ctx.flow_named(address) else {
-        return;
-    };
-    for node in &flow.nodes {
-        match &node.kind {
-            NodeKind::Store { store, .. } => {
-                found.stores.insert(store.value.to_string());
-            }
-            // Clause 1 names the `human` node itself, which is the one thing a
-            // flow reaches that is not a typed address.
-            NodeKind::Human { .. } => {
-                found.humans.insert(
-                    (address.to_string(), node.id.value.to_string()),
-                    node.id.span.clone(),
-                );
-            }
-            NodeKind::Agent { agent } => agent_reaches(ctx, &agent.value.to_string(), seen, found),
-            NodeKind::Flow { flow, .. } => {
-                walk(ctx, &flow.value.to_string(), seen, found);
-            }
-            NodeKind::Map { map } => {
-                for target in targets(&map.dispatch) {
-                    match target.value.namespace {
-                        Namespace::Agent => {
-                            agent_reaches(ctx, &target.value.to_string(), seen, found);
+    let mut pending: Vec<String> = vec![address.to_string()];
+    while let Some(address) = pending.pop() {
+        if !seen.insert(address.clone()) {
+            continue;
+        }
+        let Some(flow) = ctx.flow_named(&address) else {
+            continue;
+        };
+        for node in &flow.nodes {
+            match &node.kind {
+                NodeKind::Store { store, .. } => {
+                    found.stores.insert(store.value.to_string());
+                }
+                // Clause 1 names the `human` node itself, which is the one thing
+                // a flow reaches that is not a typed address.
+                NodeKind::Human { .. } => {
+                    found.humans.insert(
+                        (address.clone(), node.id.value.to_string()),
+                        node.id.span.clone(),
+                    );
+                }
+                NodeKind::Agent { agent } => {
+                    agent_reaches(ctx, &agent.value.to_string(), &mut pending, found);
+                }
+                NodeKind::Flow { flow, .. } => pending.push(flow.value.to_string()),
+                NodeKind::Map { map } => {
+                    for target in targets(&map.dispatch) {
+                        match target.value.namespace {
+                            Namespace::Agent => {
+                                agent_reaches(ctx, &target.value.to_string(), &mut pending, found);
+                            }
+                            Namespace::Flow => pending.push(target.value.to_string()),
+                            _ => {}
                         }
-                        Namespace::Flow => walk(ctx, &target.value.to_string(), seen, found),
-                        _ => {}
                     }
                 }
+                _ => {}
             }
-            _ => {}
         }
     }
 }
 
 /// An agent reaches the stores it attaches and everything its `flow.*` tools
-/// reach — flow-as-tool attachment is a call (grammar 7.7 clauses 3, 4).
-fn agent_reaches(ctx: &Ctx, address: &str, seen: &mut BTreeSet<String>, found: &mut Reached) {
+/// reach — flow-as-tool attachment is a call (grammar 7.7 clauses 3, 4). The
+/// flows go on the caller's worklist rather than down a second stack.
+fn agent_reaches(ctx: &Ctx, address: &str, pending: &mut Vec<String>, found: &mut Reached) {
     let Some(agent) = agent_at(ctx, address) else {
         return;
     };
@@ -136,7 +158,7 @@ fn agent_reaches(ctx: &Ctx, address: &str, seen: &mut BTreeSet<String>, found: &
     }
     for tool in &agent.tools {
         if tool.value.namespace == Namespace::Flow {
-            walk(ctx, &tool.value.to_string(), seen, found);
+            pending.push(tool.value.to_string());
         }
     }
 }
@@ -335,6 +357,15 @@ pub(crate) fn frames<'a>(ctx: &Ctx<'a>) -> Vec<Frame<'a>> {
     frames
 }
 
+/// One item of [`push_frame`]'s worklist: a frame to record, or a frame whose
+/// nested flows are done with and whose address leaves the path.
+enum Step<'a> {
+    /// Record this frame and queue the `flow:` nodes inside it.
+    Enter(Frame<'a>),
+    /// Every frame below this address has been recorded; drop it from the path.
+    Leave(String),
+}
+
 /// Record a frame and follow the `flow:` nodes inside it, carrying derivation
 /// inward through their bindings (Decision D83).
 ///
@@ -343,74 +374,87 @@ pub(crate) fn frames<'a>(ctx: &Ctx<'a>) -> Vec<Frame<'a>> {
 /// twice, and every rule stated over frames would otherwise report one mistake
 /// once per repetition. The dedup reads the derivation itself and not
 /// [`Frame::bound_at`], which only says where the same answer was written.
+///
+/// The worklist is a stack and each frame's nested flows go onto it in reverse,
+/// so the order frames are recorded in is the depth-first, declaration-order one
+/// a recursive walk would produce — which is what makes *which* repetition the
+/// dedup keeps a property of the composition rather than of this loop.
 fn push_frame<'a>(
     ctx: &Ctx<'a>,
     frames: &mut Vec<Frame<'a>>,
     path: &mut BTreeSet<String>,
     frame: Frame<'a>,
 ) {
-    if frames.iter().any(|recorded| {
-        recorded.address == frame.address
-            && recorded.dispatcher == frame.dispatcher
-            && recorded.derived == frame.derived
-    }) {
-        return;
-    }
-    // A flow that reaches itself is refused by the graph pass's recursion
-    // check; guarding the path here keeps this traversal finite meanwhile.
-    let address = frame.address.clone();
-    if !path.insert(address.clone()) {
-        return;
-    }
-    let flow = frame.flow;
-    let derived = frame.derived.clone();
-    let dispatcher = frame.dispatcher.clone();
-    let span = frame.span.clone();
-    frames.push(frame);
-    for node in &flow.nodes {
-        let NodeKind::Flow { flow: target, .. } = &node.kind else {
-            continue;
-        };
-        let address = target.value.to_string();
-        let Some(nested) = ctx.flow_named(&address) else {
-            continue;
-        };
-        let mut inner = BTreeMap::new();
-        let mut bound_at = BTreeMap::new();
-        if let Some(inputs) = &nested.inputs {
-            for field in &inputs.fields {
-                let name = field.name.value.to_string();
-                let binding = match &node.input {
-                    Some(NodeInput::Fields { bindings }) => bindings
-                        .entries
-                        .iter()
-                        .find(|binding| binding.name.value == name),
-                    _ => None,
-                };
-                let value = binding.is_some_and(|binding| {
-                    is_item_derived(binding.value.value.as_str(), None, &derived)
-                });
-                if let Some(binding) = binding {
-                    bound_at.insert(name.clone(), binding.value.span.clone());
-                }
-                inner.insert(name, value);
+    let mut pending = vec![Step::Enter(frame)];
+    while let Some(step) = pending.pop() {
+        let frame = match step {
+            Step::Enter(frame) => frame,
+            Step::Leave(address) => {
+                path.remove(&address);
+                continue;
             }
+        };
+        if frames.iter().any(|recorded| {
+            recorded.address == frame.address
+                && recorded.dispatcher == frame.dispatcher
+                && recorded.derived == frame.derived
+        }) {
+            continue;
         }
-        push_frame(
-            ctx,
-            frames,
-            path,
-            Frame {
+        // A flow that reaches itself is refused by the graph pass's recursion
+        // check; guarding the path here keeps this traversal finite meanwhile.
+        let address = frame.address.clone();
+        if !path.insert(address.clone()) {
+            continue;
+        }
+        let flow = frame.flow;
+        let derived = frame.derived.clone();
+        let dispatcher = frame.dispatcher.clone();
+        let span = frame.span.clone();
+        frames.push(frame);
+        pending.push(Step::Leave(address));
+        let mut nested_frames = Vec::new();
+        for node in &flow.nodes {
+            let NodeKind::Flow { flow: target, .. } = &node.kind else {
+                continue;
+            };
+            let address = target.value.to_string();
+            let Some(nested) = ctx.flow_named(&address) else {
+                continue;
+            };
+            let mut inner = BTreeMap::new();
+            let mut bound_at = BTreeMap::new();
+            if let Some(inputs) = &nested.inputs {
+                for field in &inputs.fields {
+                    let name = field.name.value.to_string();
+                    let binding = match &node.input {
+                        Some(NodeInput::Fields { bindings }) => bindings
+                            .entries
+                            .iter()
+                            .find(|binding| binding.name.value == name),
+                        _ => None,
+                    };
+                    let value = binding.is_some_and(|binding| {
+                        is_item_derived(binding.value.value.as_str(), None, &derived)
+                    });
+                    if let Some(binding) = binding {
+                        bound_at.insert(name.clone(), binding.value.span.clone());
+                    }
+                    inner.insert(name, value);
+                }
+            }
+            nested_frames.push(Step::Enter(Frame {
                 address,
                 flow: nested,
                 derived: inner,
                 bound_at,
                 dispatcher: dispatcher.clone(),
                 span: span.clone(),
-            },
-        );
+            }));
+        }
+        nested_frames.reverse();
+        pending.extend(nested_frames);
     }
-    path.remove(&address);
 }
 
 /// Which input fields of a dispatched flow are item-derived at one site, and
