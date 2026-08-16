@@ -11,15 +11,20 @@
 //!   documents, and not something `--format json` can report;
 //! * **out-degree** — a per-*pair* analysis of a fork is quadratic in the number
 //!   of edges before it computes anything, so anything it recomputes per pair
-//!   multiplies out;
+//!   multiplies out. Two shapes are needed, because a fork has two costs: one
+//!   fan of disjoint branches, where the pairs share no answers and what matters
+//!   is that nothing is *walked* per pair, and one of overlapping branches, where
+//!   the pairs share almost every answer and what matters is that nothing is
+//!   *compared* or *crossed* per pair;
 //! * **size** — the usual one, and the one the two worked projects already
 //!   guard through `crates/agent-compose/tests/cli.rs`.
 //!
 //! Every case here is written so that a regression shows up as a failure rather
 //! than as a slow test: the depth case runs on a thread whose stack is far too
-//! small to recurse through, and the fork case times the check pass alone — the
-//! project is resolved off the clock — against a budget orders of magnitude
-//! above what it costs.
+//! small to recurse through, and the fork cases time the check pass alone — the
+//! project is resolved off the clock — against a budget several times what they
+//! cost and a fraction of what the shape costs a per-pair analysis. Each fork
+//! case names both numbers, so a budget can be re-fitted from what it is for.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -27,7 +32,16 @@ use std::time::{Duration, Instant};
 
 use compose_core::resolve;
 
-/// The provider and model every case needs, and a lister to fan out over.
+/// The provider and model every case needs, a lister to fan out over, and the
+/// one state channel that makes every `agent.a` node a **writer**.
+///
+/// The channel is what puts the concurrent-write half of `check/convergence.rs`
+/// on the clock at all: that rule is answered over the nodes that write a
+/// channel, `verdict` is where `agent.a`'s output field lands name-based
+/// (grammar 8.0), and a project declaring no `state:` at all leaves every node
+/// writing nothing — so the rule's inner loop never runs and a fork of any width
+/// costs nothing to check. `reduce: last_wins` is what keeps the shapes below
+/// *legal* while every one of their branches writes it (grammar 10.2, D32).
 const BACKEND: &str = r#"provider.p:
   kind: anthropic
   api_key: ${K}
@@ -47,6 +61,12 @@ agent.lister:
       type: array
       max_items: 10
       items: { type: string }
+state:
+  verdict:
+    description: the verdict the last node to write reached
+    enum: [approve, revise]
+    reduce: last_wins
+    default: approve
 "#;
 
 /// A scratch directory of this test's own, cleaned out before use.
@@ -178,43 +198,129 @@ fn wide_fork_project(dir: &Path, width: usize) {
     .expect("can write the entrypoint");
 }
 
-/// A fork wide enough that anything recomputed per *pair* shows.
-///
-/// 240 branches are 28,680 co-takeable pairs over 1,441 nodes. What the two
-/// rules read of an edge — its step distances (grammar 7.6.2) and what it
-/// reaches (grammar 7.6.1) — is a property of the edge, so 480 walks answer for
-/// every pair; taking them per pair instead made this shape cubic in the
-/// out-degree and cost seconds, against a command whose budget is milliseconds
-/// (PRD 5.12). Resolution is off the clock deliberately: this is a bound on the
-/// graph analyses, not on the parser.
-#[test]
-fn a_wide_fork_is_checked_in_proportion_to_its_pairs() {
-    let dir = scratch("wide");
-    wide_fork_project(&dir, 240);
-    let resolution = resolve(dir.join("main.yml"));
-    assert!(
-        resolution.diagnostics.is_empty(),
-        "the generated project resolves cleanly, got {} diagnostic(s)",
-        resolution.diagnostics.len()
-    );
-    let ir = resolution
-        .ir
-        .expect("a clean resolution produces an artifact");
+/// `layers` ranks of `wide` nodes, every node of one rank edging to every node of
+/// the next. Every source is a fork whose branches **overlap** — each of its
+/// out-edges reaches almost the whole graph below it — which is the half a fan of
+/// disjoint chains does not reach: convergences at every depth for grammar
+/// 7.6.2's distance comparison, and a cross product of writers per pair for
+/// grammar 10.2's.
+fn layered_project(dir: &Path, layers: usize, wide: usize) {
+    let mut nodes = String::new();
+    let mut edges = String::new();
+    for rank in 0..layers {
+        for at in 0..wide {
+            nodes.push_str(&format!(
+                "    n{rank}_{at}: {{ agent: agent.a, input: \"'x'\" }}\n"
+            ));
+        }
+    }
+    for at in 0..wide {
+        edges.push_str(&format!("    - {{ from: start, to: n0_{at} }}\n"));
+        edges.push_str(&format!(
+            "    - {{ from: n{}_{at}, to: end }}\n",
+            layers - 1
+        ));
+    }
+    for rank in 0..layers - 1 {
+        for from in 0..wide {
+            for to in 0..wide {
+                edges.push_str(&format!(
+                    "    - {{ from: n{rank}_{from}, to: n{}_{to} }}\n",
+                    rank + 1
+                ));
+            }
+        }
+    }
+    fs::write(
+        dir.join("main.yml"),
+        format!(
+            "version: \"0.1\"\n{BACKEND}flow.f:\n  outputs: {{}}\n  nodes:\n{nodes}  edges:\n{edges}"
+        ),
+    )
+    .expect("can write the entrypoint");
+}
 
-    // The minimum of three runs, so a scheduling hiccup cannot fail the test.
-    let budget = Duration::from_secs(4);
+/// The minimum of three checks of one artifact, so a scheduling hiccup cannot
+/// fail a test about an algorithm. Resolution is off the clock deliberately:
+/// these are bounds on the graph analyses, not on the parser.
+fn fastest_check(ir: &compose_core::Ir, what: &str) -> Duration {
     let fastest = (0..3)
         .map(|_| {
             let started = Instant::now();
-            let diagnostics = compose_core::check(&ir);
-            assert!(diagnostics.is_empty(), "the wide fork checks cleanly");
+            let diagnostics = compose_core::check(ir);
+            assert!(
+                diagnostics.is_empty(),
+                "{what} checks cleanly, got {} diagnostic(s): {:?}",
+                diagnostics.len(),
+                diagnostics.first().map(|d| d.message.clone())
+            );
             started.elapsed()
         })
         .min()
         .expect("three runs");
-    println!("240-branch fork: {fastest:?}");
+    println!("{what}: {fastest:?}");
+    fastest
+}
+
+/// The artifact of a project that must resolve cleanly first.
+fn artifact(dir: &Path) -> compose_core::Ir {
+    let resolution = resolve(dir.join("main.yml"));
+    assert!(
+        resolution.diagnostics.is_empty(),
+        "the generated project resolves cleanly, got {} diagnostic(s): {:?}",
+        resolution.diagnostics.len(),
+        resolution.diagnostics.first().map(|d| d.message.clone())
+    );
+    resolution
+        .ir
+        .expect("a clean resolution produces an artifact")
+}
+
+/// A fork wide enough that anything **walked** per pair shows.
+///
+/// 240 branches are 28,680 co-takeable pairs over 1,441 nodes, every one of them
+/// a writer of the `verdict` channel. What the two rules read of an edge — its
+/// step distances (grammar 7.6.2) and what it reaches (grammar 7.6.1) — is a
+/// property of the node it delivers to, and every branch here leaves the hub for
+/// a chain of its own, so no two pairs share an answer and 240 walks are the
+/// fewest that can serve 28,680 pairs. Walking per pair instead made this shape
+/// cubic in the out-degree and cost tens of seconds, against a command whose
+/// budget is milliseconds (PRD 5.12).
+#[test]
+fn a_wide_fork_is_checked_in_proportion_to_its_pairs() {
+    let dir = scratch("wide");
+    wide_fork_project(&dir, 240);
+    let budget = Duration::from_secs(6);
+    let fastest = fastest_check(&artifact(&dir), "240-branch fork");
     assert!(
         fastest < budget,
         "checking a 240-branch fork took {fastest:?}, and the budget is {budget:?}"
+    );
+}
+
+/// Overlapping branches, which is where anything **compared** per pair shows.
+///
+/// 5 ranks of 50 are 250 nodes and 10,100 edges, and each of the 201 forks —
+/// `start` included — carries 1,225 co-takeable pairs, for 246,225 in all. The
+/// two branches of any of them hold *almost the same nodes*, so a pair costs the
+/// whole graph below it rather than a chain of six: the previous fan guards the
+/// walks, and this one guards what is done with them. Both rules answer from the
+/// two nodes a pair delivers to, of which there are 6,125 distinct combinations
+/// here rather than 246,225 — comparing the two distance maps per pair instead
+/// takes this shape from 1.4 s to 12.6 s, and crossing the two branches' writers
+/// per pair from 1.4 s to minutes, on a composition with nothing wrong with it.
+///
+/// The `state:` channel of `BACKEND` is load-bearing: without a channel for
+/// `agent.a`'s output field to land in, no node writes anything and grammar
+/// 10.2's rule short-circuits before it looks at a single pair.
+#[test]
+fn overlapping_branches_are_checked_in_proportion_to_their_writers() {
+    let dir = scratch("layered");
+    layered_project(&dir, 5, 50);
+    let budget = Duration::from_secs(6);
+    let fastest = fastest_check(&artifact(&dir), "5x50 layered fan-out");
+    assert!(
+        fastest < budget,
+        "checking a 5-by-50 layered fan-out took {fastest:?}, and the budget is {budget:?}"
     );
 }

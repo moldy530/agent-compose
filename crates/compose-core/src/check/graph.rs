@@ -254,18 +254,30 @@ impl<'a> Graph<'a> {
         })
     }
 
-    /// The nodes reachable over edges from the target of one edge, the edge
-    /// itself included — "reachable from a fork **through** this edge"
-    /// (grammar 7.6.1).
+    /// The node an edge delivers a branch to — `None` where it retires the
+    /// branch at `end`, or names a node the resolver has already refused.
+    ///
+    /// Both fork rules read an edge only through this. What a branch holds
+    /// (grammar 7.6.1) and the depths it holds it at (grammar 7.6.2) are
+    /// properties of where the edge *lands*, so two sibling edges to one node ask
+    /// one question twice and the two answers below are keyed by the entry rather
+    /// than by the edge (see [`convergence`](super::convergence)).
+    pub(crate) fn entry(&self, edge: usize) -> Option<usize> {
+        match self.endpoints[edge].1 {
+            Some(Vertex::Node(at)) => Some(at),
+            _ => None,
+        }
+    }
+
+    /// The nodes reachable over edges from one entry, the entry itself included
+    /// — "reachable from a fork **through** this edge" (grammar 7.6.1), read of
+    /// the node the edge delivers to ([`Graph::entry`]).
     ///
     /// The answer is the node indexes themselves, in ascending order, rather than
-    /// a mask over every node: its reader pairs one edge's answer with another's
-    /// (see [`convergence`](super::convergence)), and pairing two *lists* costs
-    /// what the branches hold instead of what the flow holds.
-    pub(crate) fn reachable_through(&self, edge: usize) -> Vec<usize> {
-        let Some(Vertex::Node(entry)) = self.endpoints[edge].1 else {
-            return Vec::new();
-        };
+    /// a mask over every node: its reader pairs one branch's answer with
+    /// another's (see [`convergence`](super::convergence)), and pairing two
+    /// *lists* costs what the branches hold instead of what the flow holds.
+    pub(crate) fn reachable_through(&self, entry: usize) -> Vec<usize> {
         let reached = &self.reachable()[entry];
         (0..self.nodes.len())
             .filter(|at| *at == entry || reached[*at])
@@ -319,7 +331,8 @@ impl<'a> Graph<'a> {
     }
 
     /// The step distances from a fork to every node it delivers to, over the
-    /// paths that leave it by one edge and traverse no node belonging to a cycle
+    /// paths that leave it by one edge — read of the node that edge delivers to
+    /// ([`Graph::entry`]) — and traverse no node belonging to a cycle
     /// (grammar 7.6.2).
     ///
     /// Excluding cycle nodes is what makes the walk finite *and* the answer
@@ -331,28 +344,31 @@ impl<'a> Graph<'a> {
     /// Only the nodes this edge actually delivers to are keyed — a node absent
     /// from the map is one no admitted path reaches, which is the empty set of
     /// distances said in the space a branch occupies rather than the space the
-    /// flow occupies.
-    pub(crate) fn distances(&self, edge: usize) -> BTreeMap<usize, BTreeSet<usize>> {
-        let mut distances: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
-        let Some(Vertex::Node(entry)) = self.endpoints[edge].1 else {
-            return distances;
-        };
+    /// flow occupies. The walk itself keeps its running answer positionally,
+    /// because it touches one entry per edge traversed and the flow's edge count
+    /// is the one thing here that is not bounded by its node count.
+    pub(crate) fn distances(&self, entry: usize) -> BTreeMap<usize, BTreeSet<usize>> {
         if self.cyclic(entry) {
-            return distances;
+            return BTreeMap::new();
         }
+        let mut reached: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); self.nodes.len()];
         let mut queue = VecDeque::from([(entry, 1usize)]);
-        distances.entry(entry).or_default().insert(1);
+        reached[entry].insert(1);
         while let Some((node, distance)) = queue.pop_front() {
             for next in &self.successors[node] {
                 if self.cyclic(*next) {
                     continue;
                 }
-                if distances.entry(*next).or_default().insert(distance + 1) {
+                if reached[*next].insert(distance + 1) {
                     queue.push_back((*next, distance + 1));
                 }
             }
         }
-        distances
+        reached
+            .into_iter()
+            .enumerate()
+            .filter(|(_, distances)| !distances.is_empty())
+            .collect()
     }
 }
 
