@@ -221,9 +221,47 @@ const AUTHORED_SURFACE: &[&str] = &[
     "map",
 ];
 
+/// How deeply an expression may nest brackets before the front-end refuses to
+/// parse it at all.
+///
+/// The pinned parser is recursive descent over the CEL grammar, so every
+/// nested group costs a full pass down the precedence chain — and the chain is
+/// deep enough that nesting exhausts a thread's stack long before anything
+/// else about the expression matters. Measured against `cel` 0.14.3 in a debug
+/// build on the 2 MiB stack a test thread gets, `Program::compile` survives 10
+/// nested brackets and aborts the *process* at 11; the shipped binary has more
+/// room, but a limit that only holds on the roomiest stack is not a limit.
+///
+/// Eight is what is left after that margin, and it is far past anything the
+/// grammar's own surface produces: the deepest expression in the example
+/// corpus nests two. This is the compiler's bound rather than one grammar 4.1
+/// states — hence a diagnostic that says so, rather than a rule an author is
+/// expected to have read.
+const MAX_NESTING: usize = 8;
+
 /// Parse and check one expression against the roots its surface exposes.
 #[must_use]
 pub fn analyze(source: &str, scope: &Scope) -> Analysis {
+    let nesting = nesting(source);
+    if nesting > MAX_NESTING {
+        return Analysis {
+            ty: Type::Dyn,
+            reads: Vec::new(),
+            problems: vec![
+                Problem::new(
+                    DiagnosticCode::InvalidExpression,
+                    format!(
+                        "`{source}` nests brackets {nesting} deep, and this compiler reads at most {MAX_NESTING}"
+                    ),
+                )
+                .with_help(format!(
+                    "the bound is the compiler's, not the grammar's: parsing is recursive, so a deeply nested expression is refused with a message rather than exhausting the stack — split {} into shallower parts",
+                    scope.surface
+                )),
+            ],
+        };
+    }
+
     let program = match Program::compile(source) {
         Ok(program) => program,
         Err(errors) => {
@@ -261,6 +299,41 @@ pub fn analyze(source: &str, scope: &Scope) -> Analysis {
         reads: walk.reads,
         problems: walk.problems,
     }
+}
+
+/// The deepest nesting of `(`, `[` and `{` the source reaches.
+///
+/// String literals are skipped, so a `matches('\\(')` pattern is not read as a
+/// group; the three bracket kinds share one counter, because the parser
+/// re-enters the same expression rule for each of them and a mixture nests
+/// exactly as deeply as it looks.
+fn nesting(source: &str) -> usize {
+    let mut depth = 0usize;
+    let mut deepest = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for character in source.chars() {
+        if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+        match character {
+            '\'' | '"' => quote = Some(character),
+            '(' | '[' | '{' => {
+                depth += 1;
+                deepest = deepest.max(depth);
+            }
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    deepest
 }
 
 /// A path under construction: a root and the members selected from it so far.
@@ -1184,5 +1257,46 @@ mod tests {
         let analysis = analyze("input.doc_id", &Scope::default());
         assert_eq!(analysis.reads.len(), 1);
         assert_eq!(analysis.reads[0].spelling(), "input.doc_id");
+    }
+
+    /// Nesting is counted over the three bracket kinds together, and never
+    /// inside a string: a regex with parentheses in it nests no deeper than the
+    /// call that carries it.
+    #[test]
+    fn nesting_counts_groups_and_not_string_contents() {
+        assert_eq!(nesting("state.draft == 'x'"), 0);
+        assert_eq!(nesting("size(state.patches) > 0"), 1);
+        assert_eq!(nesting("state.patches.exists(p, size(p[0]) > 1)"), 3);
+        assert_eq!(nesting("state.draft.matches('^\\\\((a|b)\\\\)$')"), 1);
+        assert_eq!(nesting("[[{'a': 1}]]"), 3);
+    }
+
+    /// The bound is a guard on the parser's recursion, so it is decided before
+    /// the parser sees the expression — an expression past it comes back as a
+    /// diagnostic, where without the guard the process would abort with no
+    /// message at all.
+    #[test]
+    fn nesting_past_the_bound_is_a_diagnostic_rather_than_a_crash() {
+        let deep = format!(
+            "{}state.draft{} == 'x'",
+            "(".repeat(MAX_NESTING + 1),
+            ")".repeat(MAX_NESTING + 1)
+        );
+        let problem = problem(&deep);
+        assert_eq!(problem.code, DiagnosticCode::InvalidExpression);
+        assert!(
+            problem
+                .message
+                .ends_with("nests brackets 9 deep, and this compiler reads at most 8"),
+            "{}",
+            problem.message
+        );
+        // …and the depth the bound admits still parses and still types.
+        let deepest = format!(
+            "{}state.draft{} == 'x'",
+            "(".repeat(MAX_NESTING),
+            ")".repeat(MAX_NESTING)
+        );
+        assert_eq!(ok(&deepest).ty, Type::Bool);
     }
 }
