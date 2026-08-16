@@ -1,0 +1,47 @@
+# rule: a synthesized store tool may not collide with an attached tool name (grammar 11.5)
+# code: tool-name-collision
+# message: `agent.a` attaches `store.prefs`, whose synthesized `prefs_get` tool collides with the attached `tool.prefs_get`
+# at: main.yml:36:12
+# label: main.yml:35:11 the colliding tool is attached here
+# help: a `kv` store with `agent_access: read` synthesizes `prefs_get` (grammar 11.5): rename the store, rename the tool, or drop one of the two attachments
+#
+# Neither half of the rule is decidable in one file: the synthesized names come
+# from the store's kind and `agent_access:`, and the name they collide with is
+# in the agent's own `tools:` list.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+store.prefs:
+  kind: kv
+  scope: global
+  agent_access: read
+  value_schema:
+    theme: { type: string }
+tool.prefs_get:
+  description: Read a preference the long way round.
+  input:
+    key: { type: string }
+  output:
+    value: { type: string }
+  exec:
+    command: prefs-get
+agent.a:
+  model: model.m
+  prompt: Decide.
+  tools: [tool.prefs_get]
+  stores: [store.prefs]
+  output:
+    verdict: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.a
+      input: "'x'"
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }

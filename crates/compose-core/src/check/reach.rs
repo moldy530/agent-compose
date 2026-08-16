@@ -29,7 +29,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ast::common::Namespace;
 use crate::cel::Scope;
-use crate::diag::Span;
+use crate::diag::{Span, Spanned};
 use crate::ir::binding::NodeInput;
 use crate::ir::flow::{Flow, MapDispatch, MapRoute, NodeKind};
 
@@ -134,6 +134,10 @@ pub(crate) struct Frame<'a> {
     pub(crate) dispatcher: String,
     /// The dispatching map node's span.
     pub(crate) span: Span,
+    /// `detach: true` on the dispatch that opened this site, and where it was
+    /// written. Carried inward: a `flow:` node inside a detached instance is
+    /// dispatched no less fire-and-forget than its caller (grammar 8.6 rule 7).
+    pub(crate) detached: Option<Spanned<bool>>,
 }
 
 /// Every flow instance any `map` in the composition dispatches, directly or
@@ -153,20 +157,35 @@ pub(crate) fn frames<'a>(ctx: &Ctx<'a>) -> Vec<Frame<'a>> {
                 .item_binding
                 .as_ref()
                 .map_or("item", |binding| binding.value.as_str());
-            let routes: Vec<(&crate::ast::common::Address, Option<&NodeInput>)> =
-                match &map.dispatch {
-                    MapDispatch::Homogeneous { node, input, .. } => {
-                        vec![(&node.value, input.as_ref())]
-                    }
-                    MapDispatch::Routed {
-                        routes, default, ..
-                    } => routes
-                        .iter()
-                        .chain(default.iter().map(|route| &**route))
-                        .map(|route: &MapRoute| (&route.node.value, route.input.as_ref()))
-                        .collect(),
-                };
-            for (target, input) in routes {
+            type Dispatch<'a> = (
+                &'a crate::ast::common::Address,
+                Option<&'a NodeInput>,
+                Option<&'a Spanned<bool>>,
+            );
+            let routes: Vec<Dispatch<'_>> = match &map.dispatch {
+                MapDispatch::Homogeneous {
+                    node,
+                    input,
+                    detach,
+                    ..
+                } => {
+                    vec![(&node.value, input.as_ref(), detach.as_ref())]
+                }
+                MapDispatch::Routed {
+                    routes, default, ..
+                } => routes
+                    .iter()
+                    .chain(default.iter().map(|route| &**route))
+                    .map(|route: &MapRoute| {
+                        (
+                            &route.node.value,
+                            route.input.as_ref(),
+                            route.detach.as_ref(),
+                        )
+                    })
+                    .collect(),
+            };
+            for (target, input, detach) in routes {
                 if target.namespace != Namespace::Flow {
                     continue;
                 }
@@ -186,6 +205,7 @@ pub(crate) fn frames<'a>(ctx: &Ctx<'a>) -> Vec<Frame<'a>> {
                         derived,
                         dispatcher: dispatcher.clone(),
                         span: node.span.clone(),
+                        detached: detach.filter(|detach| detach.value).cloned(),
                     },
                 );
             }
@@ -198,9 +218,11 @@ pub(crate) fn frames<'a>(ctx: &Ctx<'a>) -> Vec<Frame<'a>> {
 /// inward through their bindings (Decision D83).
 ///
 /// A frame that repeats one already recorded — the same flow, dispatched by the
-/// same map with the same derivation — is dropped: it is the same *site* said
-/// twice, and every rule stated over frames would otherwise report one mistake
-/// once per repetition.
+/// same map with the same derivation and the same detachment — is dropped: it
+/// is the same *site* said twice, and every rule stated over frames would
+/// otherwise report one mistake once per repetition. Two routes of one map that
+/// differ in `detach:` are two sites, not one, because the rules stated over a
+/// frame read that key.
 fn push_frame<'a>(
     ctx: &Ctx<'a>,
     frames: &mut Vec<Frame<'a>>,
@@ -211,6 +233,7 @@ fn push_frame<'a>(
         recorded.address == frame.address
             && recorded.dispatcher == frame.dispatcher
             && recorded.derived == frame.derived
+            && recorded.detached.is_some() == frame.detached.is_some()
     }) {
         return;
     }
@@ -224,6 +247,7 @@ fn push_frame<'a>(
     let derived = frame.derived.clone();
     let dispatcher = frame.dispatcher.clone();
     let span = frame.span.clone();
+    let detached = frame.detached.clone();
     frames.push(frame);
     for node in &flow.nodes {
         let NodeKind::Flow { flow: target, .. } = &node.kind else {
@@ -260,6 +284,7 @@ fn push_frame<'a>(
                 derived: inner,
                 dispatcher: dispatcher.clone(),
                 span: span.clone(),
+                detached: detached.clone(),
             },
         );
     }

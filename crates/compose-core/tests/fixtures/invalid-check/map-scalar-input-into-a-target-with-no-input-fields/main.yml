@@ -1,0 +1,47 @@
+# rule: a dispatch's scalar `input:` binds a string-in agent only (grammar 8.6 rule 12, Decision D75)
+# code: type-mismatch
+# message: the `map` of node `fan` binds one unnamed value, but `flow.sink` is not a string-in agent
+# at: main.yml:44:16
+# help: `flow.sink` declares no input fields: the scalar form binds a string-in agent's single unnamed input, and every other target takes the field-map form (grammar 8.6 rule 12, Decision D75)
+#
+# The target here declares *no* input fields at all, which is why the message
+# does not claim it declares named ones: what the author needs is what the
+# target's contract actually is.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+state:
+  tasks:
+    type: array
+    max_items: 9
+    items: { type: string }
+agent.a:
+  model: model.m
+  prompt: Do it.
+  output:
+    verdict: { type: string }
+flow.sink:
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.a
+      input: "'x'"
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }
+flow.f:
+  outputs: {}
+  nodes:
+    fan:
+      map:
+        over: "state.tasks"
+        node: flow.sink
+        max_concurrency: 2
+        input: "item"
+  edges:
+    - { from: start, to: fan }
+    - { from: fan, to: end }

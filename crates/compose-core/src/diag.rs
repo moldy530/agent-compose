@@ -380,11 +380,16 @@ pub enum DiagnosticCode {
     UnboundedFanOut,
     /// A variant of the item union has neither a route nor a `default:`.
     NonExhaustive,
+    /// A detached dispatch writes state (Decisions D31, D94).
+    DetachedWrite,
 
     // --- stores (grammar 11) ----------------------------------------------
     /// A `vector`/`blob` write inside a fan-out has a key that is not
     /// item-derived (Decision D67).
     UnkeyedMapWrite,
+    /// A tool an attached store synthesizes has the name of a tool the same
+    /// agent attaches (grammar 11.5).
+    ToolNameCollision,
     /// A trigger whose flow reaches a `session`-scoped store declares no
     /// `session_key:`.
     MissingSessionKey,
@@ -440,7 +445,9 @@ impl DiagnosticCode {
             Self::MissingBinding => "missing-binding",
             Self::UnboundedFanOut => "unbounded-fan-out",
             Self::NonExhaustive => "non-exhaustive",
+            Self::DetachedWrite => "detached-write",
             Self::UnkeyedMapWrite => "unkeyed-map-write",
+            Self::ToolNameCollision => "tool-name-collision",
             Self::MissingSessionKey => "missing-session-key",
             Self::MissingCapability => "missing-capability",
         }

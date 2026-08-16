@@ -21,11 +21,12 @@
 //! D14, D75).
 
 use crate::ast::common::Namespace;
+use crate::ast::definition::{AgentAccess, StoreKind};
 use crate::cel::Scope;
 use crate::cel::ty::Type;
 use crate::diag::{Diagnostic, DiagnosticCode, Span, Spanned};
 use crate::ir::binding::{Bindings, Http, NodeInput};
-use crate::ir::definition::{Agent, Tool};
+use crate::ir::definition::{Agent, Store, Tool};
 use crate::ir::flow::{Node, NodeKind};
 use crate::ir::schema::{Field, FieldMap};
 
@@ -321,11 +322,13 @@ pub(crate) fn inline_http<'a>(ctx: &mut Ctx<'a>, cx: &FlowCx<'a>, node: &'a Node
     }
 }
 
-/// A `flow.*` in an agent's `tools:` is a tool, and a tool's `description:` is
-/// the model's selection signal (grammar 5.4, 7.5, Decisions D26, D54).
+/// What an agent's two attachment lists produce together (grammar 5.4, 11.5).
 ///
-/// The rule is the validator's because both halves are never in one file: the
-/// attachment is the agent's, the `description:` is the flow's.
+/// Both rules here are the validator's because neither's two halves are ever in
+/// one file: a `flow.*` used as a tool needs the `description:` the *flow*
+/// declares, and a store's synthesized tool names are decided by the *store*'s
+/// kind and `agent_access:` while the name they may not collide with is in the
+/// agent's own `tools:` list.
 pub(crate) fn agent_tools(ctx: &mut Ctx, address: &str, agent: &Agent) {
     for tool in &agent.tools {
         if tool.value.namespace != Namespace::Flow {
@@ -356,6 +359,74 @@ pub(crate) fn agent_tools(ctx: &mut Ctx, address: &str, agent: &Agent) {
                 "a flow used as an agent tool takes a tool's contract: its `inputs`/`outputs` become the parameter and result schemas, and the description is what the model selects on (grammar 5.4, 7.5)",
             ),
         );
+    }
+    store_tool_collisions(ctx, address, agent);
+}
+
+/// An attached store synthesizes LLM-facing tools, and one of those names
+/// colliding with an attached `tool.*`/`flow.*` is a compile error
+/// (grammar 11.5).
+///
+/// An attached tool's name is its address's local name — the only name it has
+/// on the model's side — so `tool.prefs_get` and the `prefs_get` a `kv`
+/// `store.prefs` synthesizes are two tools with one name.
+fn store_tool_collisions(ctx: &mut Ctx, address: &str, agent: &Agent) {
+    if agent.tools.is_empty() || agent.stores.is_empty() {
+        return;
+    }
+    for attached in &agent.stores {
+        let Some(store) = ctx.store(&attached.value) else {
+            continue;
+        };
+        let local = attached.value.name.as_str();
+        for suffix in synthesized_tools(store) {
+            let synthesized = format!("{local}_{suffix}");
+            let Some(tool) = agent
+                .tools
+                .iter()
+                .find(|tool| tool.value.name.as_str() == synthesized)
+            else {
+                continue;
+            };
+            ctx.push(
+                Diagnostic::error(
+                    DiagnosticCode::ToolNameCollision,
+                    attached.span.clone(),
+                    format!(
+                        "`{address}` attaches `{}`, whose synthesized `{synthesized}` tool collides with the attached `{}`",
+                        attached.value, tool.value
+                    ),
+                )
+                .with_label(tool.span.clone(), "the colliding tool is attached here")
+                .with_help(format!(
+                    "a `{}` store with `agent_access: {}` synthesizes {} (grammar 11.5): rename the store, rename the tool, or drop one of the two attachments",
+                    store.kind.as_str(),
+                    store
+                        .agent_access
+                        .unwrap_or(AgentAccess::ReadWrite)
+                        .as_str(),
+                    crate::parse::reader::list(
+                        synthesized_tools(store)
+                            .iter()
+                            .map(|suffix| format!("{local}_{suffix}"))
+                    )
+                )),
+            );
+        }
+    }
+}
+
+/// The tool-name suffixes an attached store synthesizes, in the order grammar
+/// 11.5's table lists them.
+fn synthesized_tools(store: &Store) -> &'static [&'static str] {
+    let read_only = store.agent_access == Some(AgentAccess::Read);
+    match (store.kind, read_only) {
+        (StoreKind::Kv, true) => &["get"],
+        (StoreKind::Kv, false) => &["get", "set"],
+        (StoreKind::Vector, true) => &["search"],
+        (StoreKind::Vector, false) => &["search", "upsert"],
+        (StoreKind::Blob, true) => &["get", "list"],
+        (StoreKind::Blob, false) => &["get", "list", "put"],
     }
 }
 

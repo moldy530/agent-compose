@@ -48,7 +48,7 @@ pub(crate) fn map_node<'a>(ctx: &mut Ctx<'a>, cx: &FlowCx<'a>, node: &'a Node, m
             node: target,
             input,
             writes,
-            ..
+            detach,
         } => {
             if let TypeForm::Union(union) = &item.form {
                 ctx.push(
@@ -74,6 +74,7 @@ pub(crate) fn map_node<'a>(ctx: &mut Ctx<'a>, cx: &FlowCx<'a>, node: &'a Node, m
                 &target.value,
                 input.as_ref(),
                 writes.as_ref(),
+                detach.as_ref(),
                 &map.span,
             );
         }
@@ -191,6 +192,7 @@ fn routed<'a>(
             &route.node.value,
             route.input.as_ref(),
             route.writes.as_ref(),
+            route.detach.as_ref(),
             &route.span,
         );
     }
@@ -237,6 +239,7 @@ fn routed<'a>(
             &default.node.value,
             default.input.as_ref(),
             default.writes.as_ref(),
+            default.detach.as_ref(),
             &default.span,
         );
     } else if !unrouted.is_empty() {
@@ -274,6 +277,7 @@ fn dispatch<'a>(
     target: &Address,
     input: Option<&NodeInput>,
     writes: Option<&Writes>,
+    detach: Option<&Spanned<bool>>,
     at: &Span,
 ) {
     let contract = ctx.target_input(target);
@@ -290,16 +294,26 @@ fn dispatch<'a>(
                 &format!("the scalar `input:` of {subject}"),
             );
         }
-        (Some(NodeInput::Scalar { value }), _) => {
+        (Some(NodeInput::Scalar { value }), contract) => {
+            // What the target *does* declare is the half of this the author
+            // needs, and "named input fields" is false of a target that
+            // declares none — a `flow.*` with no `inputs:`, a no-argument tool.
+            let contract_note = match contract.declared() {
+                Some(fields) if !fields.is_empty() => format!(
+                    "`{target}` declares {}",
+                    crate::parse::reader::list(super::field_names(fields))
+                ),
+                _ => format!("`{target}` declares no input fields"),
+            };
             ctx.push(
                 Diagnostic::error(
                     DiagnosticCode::TypeMismatch,
                     value.span.clone(),
-                    format!("{subject} binds one unnamed value, but `{target}` declares named input fields"),
+                    format!("{subject} binds one unnamed value, but `{target}` is not a string-in agent"),
                 )
-                .with_help(
-                    "the scalar form binds a string-in agent's single unnamed input; a target with a declared input object takes the field-map form (grammar 8.6 rule 12, Decision D75)",
-                ),
+                .with_help(format!(
+                    "{contract_note}: the scalar form binds a string-in agent's single unnamed input, and every other target takes the field-map form (grammar 8.6 rule 12, Decision D75)"
+                )),
             );
         }
         (Some(NodeInput::Fields { bindings }), InputContract::StringIn) => {
@@ -343,11 +357,53 @@ fn dispatch<'a>(
     }
 
     // Anything a dispatched instance writes to shared state must target a
-    // reduced channel (grammar 8.6 rule 5).
+    // reduced channel (grammar 8.6 rule 5) — and a **detached** dispatch must
+    // write no state at all (rule 7).
     if let Some(output) = ctx.target_output(target) {
         let written = channels::write_map(ctx, output, writes, at, subject, cx.address);
-        channels::check_types(ctx, output, &written, subject, true);
+        match detach.filter(|detach| detach.value) {
+            Some(detach) => {
+                for write in &written {
+                    detached_write(
+                        ctx,
+                        detach,
+                        &write.at,
+                        write.channel,
+                        format!(
+                            "{subject} is detached, and `{}` of `{target}` writes the channel `{}`",
+                            write.field,
+                            text(&write.channel.name)
+                        ),
+                    );
+                }
+            }
+            None => channels::check_types(ctx, output, &written, subject, true),
+        }
     }
+}
+
+/// One write a detached dispatch makes (grammar 8.6 rule 7, Decisions D31,
+/// D94).
+///
+/// The parser refuses the `writes:` half of the rule where it is written
+/// (`detach: true` beside a remap is a `conflicting-keys` error); what only the
+/// composition shows is the *name-based* half — an output field that lands in a
+/// channel of the same name, with no remap to refuse.
+fn detached_write(
+    ctx: &mut Ctx,
+    detach: &Spanned<bool>,
+    at: &Span,
+    channel: &crate::ir::Channel,
+    message: String,
+) {
+    ctx.push(
+        Diagnostic::error(DiagnosticCode::DetachedWrite, at.clone(), message)
+            .with_label(detach.span.clone(), "the dispatch is detached here")
+            .with_label(channel.span.clone(), "the channel is declared here")
+            .with_help(
+                "a detached dispatch is resolved at dispatch: the join is over the moment it is issued and its outcome is never observed, so what it wrote would land — or not — after everything that reads it (grammar 8.6 rule 7, Decisions D31, D94); drop `detach: true`, or send the result out through the target itself",
+            ),
+    );
 }
 
 /// With no `input:`, the whole item is the instance's input, which then has to
@@ -432,11 +488,15 @@ fn common_fields(variants: &[&crate::ir::schema::UnionVariant], span: &Span) -> 
         return model::field_map(Vec::new(), span);
     };
     for field in &first.fields.fields {
+        // Two variants declare one field *identically* when they declare the
+        // same type, not when they declare it in the same place: comparing the
+        // type nodes with `==` would reach the spans they carry and no two
+        // variants would ever share anything (see `model::identical`).
         let shared = rest.iter().all(|variant| {
             variant
                 .fields
                 .field(field.name.value.as_str())
-                .is_some_and(|other| other.ty == field.ty)
+                .is_some_and(|other| model::identical(&other.ty, &field.ty))
         });
         if shared {
             fields.push(field.clone());
@@ -593,7 +653,7 @@ fn resolve(
 
 /// Everything a dispatched flow instance writes has to target a reduced
 /// channel, however deep inside the instance the writer is (grammar 8.6
-/// rule 5).
+/// rule 5) — and a **detached** instance may write nothing at all (rule 7).
 pub(crate) fn check_dispatched_writes(ctx: &mut Ctx) {
     for frame in reach::frames(ctx) {
         for node in &frame.flow.nodes {
@@ -604,6 +664,22 @@ pub(crate) fn check_dispatched_writes(ctx: &mut Ctx) {
             // the node is checked as part of its own flow.
             let written = channels::effective(ctx, &output, node.writes.as_ref(), &node.span);
             for write in &written {
+                if let Some(detach) = &frame.detached {
+                    detached_write(
+                        ctx,
+                        detach,
+                        &node.span,
+                        write.channel,
+                        format!(
+                            "{} detaches `{}`, whose node `{}` writes the channel `{}`",
+                            frame.dispatcher,
+                            frame.address,
+                            text(&node.id),
+                            text(&write.channel.name)
+                        ),
+                    );
+                    continue;
+                }
                 if write.channel.reduce.is_none() {
                     ctx.push(
                         Diagnostic::error(

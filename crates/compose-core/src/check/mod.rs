@@ -15,9 +15,9 @@
 //! | Module | Grammar | What it decides |
 //! |---|---|---|
 //! | [`expr`] | 4.1 | every CEL expression, at the surface it was written on: roots, paths, constructs, result type |
-//! | [`bindings`] | 8.0 | node input bindings against the target's declared input, name-based reads, `writes:` remaps and the injectivity of the effective write map |
+//! | [`bindings`] | 8.0, 5.4, 11.5 | node input bindings against the target's declared input, name-based reads, `writes:` remaps and the injectivity of the effective write map, and what an agent's two attachment lists produce together |
 //! | [`channels`] | 7.5, 10 | write typing against the reduce policy, undefined channels, and a flow's `outputs:` against the channels it materializes from |
-//! | [`maps`] | 8.6 | `over` resolution and bounding, route narrowing and exhaustiveness, per-item bindings and the two `input:` forms |
+//! | [`maps`] | 8.6 | `over` resolution and bounding, route narrowing and exhaustiveness, per-item bindings and the two `input:` forms, what a dispatch — detached or not — may write |
 //! | [`stores`] | 11 | store-op parameters and values against the op's row and the store's schemas, map-write keying, session-scope coherence |
 //! | [`providers`] | 11.2, 12 | `settings:` against the provider kind's published schema, and the three capability checks |
 //! | [`triggers`] | 13 | a trigger's `input:` against its flow's declared inputs, and what its payload can supply |
@@ -36,10 +36,12 @@
 //! the execution (Decision D110); no static rule anticipates it. See
 //! [`cel`](crate::cel) for the full account of what is deferred to run time.
 //!
-//! **Two target-dependent rules.** `detach: true` under a durably checkpointed
+//! **One target-dependent rule.** `detach: true` under a durably checkpointed
 //! target (grammar 8.6 rule 7, Decision D59) is a rule about the *target*
 //! rather than about a schema; it belongs with the graph pass that also owns
-//! the `validate` command's target plumbing.
+//! the `validate` command's target plumbing. The rest of rule 7 is here: what
+//! a detached dispatch may *write* is decided from the composition's channels
+//! alone ([`maps`]).
 
 pub(crate) mod bindings;
 pub(crate) mod channels;

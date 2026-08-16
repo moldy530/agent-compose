@@ -162,6 +162,120 @@ pub(crate) fn field_maps_satisfy(source: &FieldMap, target: &FieldMap) -> Result
     objects(source, &[], target, &[])
 }
 
+/// Whether two declarations are the **same type**: the same form, the same
+/// constraints, the same members — wherever each was written.
+///
+/// [`TypeNode`] derives `PartialEq`, and every node carries the [`Span`] it was
+/// written at (as does every `default:` literal inside one), so `==` answers
+/// "is this the same *declaration*" and never "are these the same *type*": two
+/// fields spelled identically in two places are never equal under it. The rule
+/// that asks the second question is the narrowing a `default:` route gets — the
+/// discriminator plus the fields **every** unrouted variant declares (grammar
+/// 8.6 rule 4, Decision D30) — where the two declarations are two variants of
+/// one union and so are never one source region.
+///
+/// The relation is deliberately strict: declaration order counts, because it is
+/// the order a structured-output schema carries the members in (grammar 3.8),
+/// and every constraint counts, because two fields that admit different values
+/// are two fields whatever they are named.
+pub(crate) fn identical(left: &TypeNode, right: &TypeNode) -> bool {
+    match (&left.form, &right.form) {
+        (TypeForm::Scalar(left), TypeForm::Scalar(right)) => {
+            left.kind == right.kind
+                && left.min_length == right.min_length
+                && left.max_length == right.max_length
+                && left.pattern == right.pattern
+                && left.format == right.format
+                && left.minimum == right.minimum
+                && left.maximum == right.maximum
+                && left.exclusive_minimum == right.exclusive_minimum
+                && left.exclusive_maximum == right.exclusive_maximum
+                && left.multiple_of == right.multiple_of
+                && same_default(left.default.as_ref(), right.default.as_ref())
+        }
+        (TypeForm::Enum(left), TypeForm::Enum(right)) => {
+            same_values(&left.variants, &right.variants)
+                && same_default(left.default.as_ref(), right.default.as_ref())
+        }
+        (TypeForm::Object(left), TypeForm::Object(right)) => {
+            same_field_maps(&left.properties, &right.properties)
+                && same_values(&left.optional, &right.optional)
+                && same_default(left.default.as_ref(), right.default.as_ref())
+        }
+        (TypeForm::Array(left), TypeForm::Array(right)) => {
+            left.max_items == right.max_items
+                && left.min_items == right.min_items
+                && left.unique_items == right.unique_items
+                && identical(&left.items, &right.items)
+                && same_default(left.default.as_ref(), right.default.as_ref())
+        }
+        (TypeForm::Union(left), TypeForm::Union(right)) => {
+            left.discriminator.value == right.discriminator.value
+                && left.variants.len() == right.variants.len()
+                && left
+                    .variants
+                    .iter()
+                    .zip(&right.variants)
+                    .all(|(left, right)| {
+                        left.tag.value == right.tag.value
+                            && same_field_maps(&left.fields, &right.fields)
+                    })
+        }
+        _ => false,
+    }
+}
+
+fn same_field_maps(left: &FieldMap, right: &FieldMap) -> bool {
+    left.fields.len() == right.fields.len()
+        && left.fields.iter().zip(&right.fields).all(|(left, right)| {
+            left.name.value == right.name.value && identical(&left.ty, &right.ty)
+        })
+}
+
+/// Two spanned values, compared by what was written rather than by where.
+fn same_values<T: PartialEq>(left: &[Spanned<T>], right: &[Spanned<T>]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| left.value == right.value)
+}
+
+fn same_default(left: Option<&Spanned<Literal>>, right: Option<&Spanned<Literal>>) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => same_literal(&left.value, &right.value),
+        _ => false,
+    }
+}
+
+/// A literal's own `PartialEq` reaches the spans its sequence entries and
+/// mapping keys carry, so it needs the same span-free reading.
+fn same_literal(left: &Literal, right: &Literal) -> bool {
+    match (left, right) {
+        (Literal::Null, Literal::Null) => true,
+        (Literal::Bool(left), Literal::Bool(right)) => left == right,
+        (Literal::Int(left), Literal::Int(right)) => left == right,
+        (Literal::Float(left), Literal::Float(right)) => left == right,
+        (Literal::String(left), Literal::String(right)) => left == right,
+        (Literal::Sequence(left), Literal::Sequence(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(left, right)| same_literal(&left.value, &right.value))
+        }
+        (Literal::Mapping(left), Literal::Mapping(right)) => {
+            left.len() == right.len()
+                && left.iter().zip(right).all(|(left, right)| {
+                    left.key.value == right.key.value
+                        && same_literal(&left.value.value, &right.value.value)
+                })
+        }
+        _ => false,
+    }
+}
+
 fn objects(
     source: &FieldMap,
     source_optional: &[Spanned<Ident>],
@@ -776,6 +890,81 @@ mod tests {
             mismatch.describe(),
             "expected a string, found an integer at `.author.name`"
         );
+    }
+
+    /// The relation the `default:` narrowing needs: two spellings of one type,
+    /// written in two places, are the same type — which `==` cannot say,
+    /// because every node carries the span it was written at.
+    #[test]
+    fn identity_is_about_the_type_and_not_about_the_declaration() {
+        let here = span();
+        let there = Span::new(
+            SourceName::new("other.yml"),
+            40..41,
+            Position::new(9, 3),
+            Position::new(9, 4),
+        );
+        let left = object_node(
+            vec![("summary", scalar_node(ScalarKind::String, &here))],
+            &here,
+        );
+        let right = object_node(
+            vec![("summary", scalar_node(ScalarKind::String, &there))],
+            &there,
+        );
+        assert_ne!(left, right, "the two declarations are two source regions");
+        assert!(identical(&left, &right));
+        // …and identity still reads every constraint, every name, and the
+        // order they were declared in.
+        assert!(!identical(&string_with(Some(1)), &string_with(None)));
+        assert!(!identical(
+            &object_node(vec![("a", string_with(None))], &here),
+            &object_node(vec![("b", string_with(None))], &here)
+        ));
+        assert!(!identical(
+            &object_node(
+                vec![("a", string_with(None)), ("b", string_with(None))],
+                &here
+            ),
+            &object_node(
+                vec![("b", string_with(None)), ("a", string_with(None))],
+                &here
+            )
+        ));
+        assert!(!identical(
+            &array_node(scalar_node(ScalarKind::String, &here), Some(5), &here),
+            &array_node(scalar_node(ScalarKind::String, &here), Some(6), &here)
+        ));
+        assert!(!identical(
+            &scalar_node(ScalarKind::Integer, &here),
+            &scalar_node(ScalarKind::Number, &here)
+        ));
+    }
+
+    /// A `default:` is part of what a declaration says, and its literal carries
+    /// spans of its own — so it needs the same span-free reading.
+    #[test]
+    fn identity_reads_a_default_by_its_value() {
+        let here = span();
+        let there = Span::new(
+            SourceName::new("other.yml"),
+            40..41,
+            Position::new(9, 3),
+            Position::new(9, 4),
+        );
+        let with = |value: &str, at: &Span| {
+            let mut node = scalar_node(ScalarKind::String, at);
+            if let TypeForm::Scalar(scalar) = &mut node.form {
+                scalar.default = Some(Spanned::new(Literal::String(value.to_string()), at.clone()));
+            }
+            node
+        };
+        assert!(identical(&with("x", &here), &with("x", &there)));
+        assert!(!identical(&with("x", &here), &with("y", &here)));
+        assert!(!identical(
+            &with("x", &here),
+            &scalar_node(ScalarKind::String, &here)
+        ));
     }
 
     #[test]

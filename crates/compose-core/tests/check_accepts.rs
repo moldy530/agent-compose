@@ -310,6 +310,179 @@ flow.f:
     );
 }
 
+/// With **two** variants unrouted, the `default:` route still sees every field
+/// they both declare — the case where "the fields every unrouted variant
+/// declares" is a real intersection rather than one variant's whole payload
+/// (grammar 8.6 rule 4, Decision D30).
+///
+/// The two declarations of `summary` are two source regions, so nothing here
+/// works unless the narrowing compares the *types* rather than the
+/// declarations. `finding.of`, which only one of the two declares, is the
+/// rejecting half and is pinned by
+/// `invalid-check/map-default-route-selects-an-unshared-field`.
+#[test]
+fn a_default_route_narrowed_to_two_unrouted_variants() {
+    accepts(
+        "default-route-intersection",
+        r#"
+agent.triage:
+  model: model.m
+  prompt: Triage.
+  input:
+    text: { type: string }
+  output:
+    findings:
+      type: array
+      max_items: 10
+      items:
+        discriminator: kind
+        variants:
+          auto_fixable:
+            file: { type: string }
+          needs_human:
+            summary: { type: string }
+            severity: { enum: [low, high] }
+          duplicate:
+            summary: { type: string }
+            of: { type: string }
+agent.fixer:
+  model: model.m
+  prompt: Fix.
+  input:
+    file: { type: string }
+  output:
+    patch: { type: string }
+agent.reviewer:
+  model: model.m
+  prompt: Review.
+  input:
+    kind: { type: string }
+    summary: { type: string }
+  output:
+    verdict: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    classify:
+      agent: agent.triage
+      input: { text: "'x'" }
+    dispatch:
+      map:
+        over: "classify.output.findings"
+        as: finding
+        route_by: kind
+        max_concurrency: 4
+        routes:
+          auto_fixable:
+            node: agent.fixer
+            input: { file: "finding.file" }
+        default:
+          node: agent.reviewer
+          input:
+            kind: "finding.kind"
+            summary: "finding.summary"
+  edges:
+    - { from: start, to: classify }
+    - { from: classify, to: dispatch }
+    - { from: dispatch, to: end }
+"#,
+    );
+}
+
+/// A detached dispatch is legal — it is writing state that is not (grammar 8.6
+/// rule 7, Decisions D31, D94). The sink's result field shares no name with any
+/// channel, so nothing it produces lands in shared state and the fire-and-forget
+/// dispatch stands.
+#[test]
+fn a_detached_dispatch_that_writes_no_state() {
+    accepts(
+        "detached-dispatch",
+        r#"
+state:
+  tasks:
+    type: array
+    max_items: 5
+    items: { type: string }
+  note:
+    type: array
+    max_items: 5
+    items: { type: string }
+    reduce: append
+agent.sink:
+  model: model.m
+  prompt: Record.
+  input:
+    text: { type: string }
+  output:
+    receipt: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    fan:
+      map:
+        over: "state.tasks"
+        node: agent.sink
+        detach: true
+        max_concurrency: 2
+        input: { text: "item" }
+  edges:
+    - { from: start, to: fan }
+    - { from: fan, to: end }
+"#,
+    );
+}
+
+/// An agent may attach both a store and tools; what grammar 11.5 refuses is a
+/// synthesized name that collides with an attached one, and none of these do —
+/// including `prefs_search`, which a `kv` store does not synthesize, and
+/// `prefs_set`, which `agent_access: read` does not.
+#[test]
+fn attached_store_tools_that_do_not_collide() {
+    accepts(
+        "store-tool-names",
+        r#"
+store.prefs:
+  kind: kv
+  scope: global
+  agent_access: read
+  value_schema:
+    theme: { type: string }
+tool.prefs_search:
+  description: Search the preference catalogue.
+  input:
+    query: { type: string }
+  output:
+    hits: { type: string }
+  exec:
+    command: prefs-search
+tool.prefs_set:
+  description: Set a preference out of band.
+  input:
+    key: { type: string }
+  output:
+    ok: { type: boolean }
+  exec:
+    command: prefs-set
+agent.a:
+  model: model.m
+  prompt: Decide.
+  tools: [tool.prefs_search, tool.prefs_set]
+  stores: [store.prefs]
+  output:
+    verdict: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.a
+      input: "'x'"
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }
+"#,
+    );
+}
+
 /// The two legal forms of a store write inside a fan-out: an item-derived key,
 /// and a keyed `kv` write whose key is constant across instances (grammar 11.4,
 /// Decisions D67, D83).
