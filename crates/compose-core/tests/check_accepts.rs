@@ -238,6 +238,58 @@ flow.f:
     );
 }
 
+/// The third per-item binding form: the empty one. A target that declares no
+/// input fields — a flow with no `inputs:`, a no-argument tool — takes no part
+/// of the item, and `input: {}` is how a dispatch says so. The whole-item
+/// default does not fit such a target, and `input: {}` is what the diagnostic
+/// that refuses it names (grammar 8.6 rule 12, 3.9).
+#[test]
+fn an_empty_per_item_binding_dispatches_a_target_with_no_inputs() {
+    accepts(
+        "per-item-empty-binding",
+        r#"
+state:
+  tasks:
+    type: array
+    max_items: 5
+    items: { type: string }
+tool.ping:
+  description: Ping the endpoint once.
+  input: {}
+  output: {}
+  exec:
+    command: ping
+flow.sink:
+  outputs: {}
+  nodes:
+    p:
+      function: tool.ping
+  edges:
+    - { from: start, to: p }
+    - { from: p, to: end }
+flow.f:
+  outputs: {}
+  nodes:
+    fan:
+      map:
+        over: "state.tasks"
+        node: flow.sink
+        max_concurrency: 2
+        input: {}
+    direct:
+      map:
+        over: "state.tasks"
+        node: tool.ping
+        max_concurrency: 2
+        input: {}
+  edges:
+    - { from: start, to: fan }
+    - { from: fan, to: direct }
+    - { from: direct, to: end }
+"#,
+    );
+}
+
 /// A routed map's `default:` sees the discriminator and the fields every
 /// unrouted variant declares (grammar 8.6 rule 4, Decision D30).
 #[test]

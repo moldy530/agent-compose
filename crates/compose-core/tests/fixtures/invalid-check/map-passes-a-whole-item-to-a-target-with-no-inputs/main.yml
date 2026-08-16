@@ -1,0 +1,51 @@
+# rule: a target that declares no input fields is one the whole item does not fit either (grammar 8.6 rule 12, 3.9)
+# code: type-mismatch
+# message: the `map` of node `d` passes the whole item to `flow.sink`, which cannot accept it: expected an object, found a string
+# at: main.yml:46:9
+# label: main.yml:26:12 the item type is declared here
+# help: `flow.sink` declares no input fields, so the only per-item binding that fits it is the empty one: write `input: {}` to dispatch it without passing the item (grammar 8.6 rule 12)
+#
+# `flow.sink` declares no `inputs:`, which grammar 3.9 makes the same parameter
+# surface as `inputs: {}` and as a no-argument tool's `input: {}` — a closed
+# object with no properties. A string item is not schema-compatible with one, so
+# the whole-item default does not fit it however the emptiness is spelled; what
+# fits is the empty binding, `input: {}`, which is what the help names. There is
+# no `inputs:` to label here, so the diagnostic carries the item's declaration
+# alone.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+state:
+  items:
+    type: array
+    max_items: 4
+    items: { type: string }
+tool.ping:
+  description: Ping something.
+  input: {}
+  output: {}
+  exec:
+    command: ping
+flow.sink:
+  outputs: {}
+  nodes:
+    p:
+      function: tool.ping
+  edges:
+    - { from: start, to: p }
+    - { from: p, to: end }
+flow.f:
+  outputs: {}
+  nodes:
+    d:
+      map:
+        over: "state.items"
+        node: flow.sink
+        max_concurrency: 2
+  edges:
+    - { from: start, to: d }
+    - { from: d, to: end }

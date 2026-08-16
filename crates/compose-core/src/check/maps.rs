@@ -443,34 +443,70 @@ fn whole_item(
             }
         }
         InputContract::Fields(fields) => {
-            let object = model::node(
-                TypeForm::Object(crate::ir::schema::ObjectType {
-                    properties: fields.clone(),
-                    optional: Vec::new(),
-                    default: None,
-                }),
-                &fields.span,
-            );
-            if let Err(mismatch) = satisfies(item, &object) {
-                ctx.push(
-                    Diagnostic::error(
-                        DiagnosticCode::TypeMismatch,
-                        at.clone(),
-                        format!(
-                            "{subject} passes the whole item to `{target}`, which cannot accept it: {}",
-                            mismatch.describe()
-                        ),
-                    )
-                    .with_label(fields.span.clone(), "the target's input is declared here")
-                    .with_label(item.span.clone(), "the item type is declared here")
-                    .with_help(
-                        "bind the target's fields from the item with `input: { <field>: \"item.<field>\" }`, or leave `input:` out only where the whole item is schema-compatible with the declared object (grammar 8.6 rule 12)",
-                    ),
-                );
-            }
+            declared_object(ctx, subject, item, target, fields, Some(&fields.span), at);
         }
-        InputContract::Empty | InputContract::AdHoc | InputContract::Unknown => {}
+        // A flow with no `inputs:` has the parameter surface `inputs: {}`
+        // declares — a closed object with no properties (grammar 3.9) — so the
+        // whole item meets the same contract here as it does at a no-argument
+        // tool. The two spellings would otherwise disagree about one dispatch,
+        // and the one that says nothing about its inputs would be the one that
+        // accepts anything. There is simply no declaration to point at.
+        InputContract::Empty => {
+            let none = model::field_map(Vec::new(), at);
+            declared_object(ctx, subject, item, target, &none, None, at);
+        }
+        InputContract::AdHoc | InputContract::Unknown => {}
     }
+}
+
+/// The whole item against a target's declared input object (grammar 8.6
+/// rule 12). `declared_at` is where that object was written, for the targets
+/// that wrote one.
+fn declared_object(
+    ctx: &mut Ctx,
+    subject: &str,
+    item: &TypeNode,
+    target: &Address,
+    fields: &FieldMap,
+    declared_at: Option<&Span>,
+    at: &Span,
+) {
+    let object = model::node(
+        TypeForm::Object(crate::ir::schema::ObjectType {
+            properties: fields.clone(),
+            optional: Vec::new(),
+            default: None,
+        }),
+        declared_at.unwrap_or(at),
+    );
+    let Err(mismatch) = satisfies(item, &object) else {
+        return;
+    };
+    let mut diagnostic = Diagnostic::error(
+        DiagnosticCode::TypeMismatch,
+        at.clone(),
+        format!(
+            "{subject} passes the whole item to `{target}`, which cannot accept it: {}",
+            mismatch.describe()
+        ),
+    );
+    if let Some(declared_at) = declared_at {
+        diagnostic =
+            diagnostic.with_label(declared_at.clone(), "the target's input is declared here");
+    }
+    ctx.push(
+        diagnostic
+            .with_label(item.span.clone(), "the item type is declared here")
+            .with_help(if fields.fields.is_empty() {
+                // "Bind the target's fields" is advice a target with none
+                // cannot take: what fits it is a dispatch that passes nothing.
+                format!(
+                    "`{target}` declares no input fields, so the only per-item binding that fits it is the empty one: write `input: {{}}` to dispatch it without passing the item (grammar 8.6 rule 12)"
+                )
+            } else {
+                "bind the target's fields from the item with `input: { <field>: \"item.<field>\" }`, or leave `input:` out only where the whole item is schema-compatible with the declared object (grammar 8.6 rule 12)".to_string()
+            }),
+    );
 }
 
 /// The item type a route sees: the discriminator, narrowed to the tags that
