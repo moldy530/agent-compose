@@ -54,12 +54,6 @@ use serde::{Serialize, Serializer};
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct SourceName(Arc<str>);
 
-impl Serialize for SourceName {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.0)
-    }
-}
-
 impl SourceName {
     /// Intern a source name.
     pub fn new(name: impl AsRef<str>) -> Self {
