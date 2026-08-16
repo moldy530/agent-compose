@@ -86,6 +86,109 @@ pub(crate) fn json(diagnostics: &[Diagnostic]) -> Result<String, serde_json::Err
     Ok(text)
 }
 
+/// `build`'s JSON report: `{"diagnostics": [ … ], "drift": [ … ]}`.
+///
+/// One shape for every outcome, the way [`json`] is: a clean build writes two
+/// empty arrays rather than nothing, and a `--check` that found drift writes the
+/// same two keys with the second populated. A consumer parses one document and
+/// branches on its contents instead of on which command produced it.
+pub(crate) fn build_json(
+    diagnostics: &[Diagnostic],
+    drift: &[crate::build::Drift],
+) -> Result<String, serde_json::Error> {
+    let mut report = serde_json::Map::new();
+    report.insert(
+        "diagnostics".to_string(),
+        serde_json::to_value(diagnostics)?,
+    );
+    report.insert(
+        "drift".to_string(),
+        serde_json::Value::Array(
+            drift
+                .iter()
+                .map(|entry| {
+                    let mut object = serde_json::Map::new();
+                    object.insert(
+                        "path".to_string(),
+                        serde_json::Value::String(entry.path.clone()),
+                    );
+                    object.insert(
+                        "state".to_string(),
+                        serde_json::Value::String(entry.state.as_str().to_string()),
+                    );
+                    serde_json::Value::Object(object)
+                })
+                .collect(),
+        ),
+    );
+    let mut text = serde_json::to_string_pretty(&serde_json::Value::Object(report))?;
+    text.push('\n');
+    Ok(text)
+}
+
+/// `build`'s one-line verdict, plus a line per drifted file.
+///
+/// The drift lines come first and each names one file and how it disagrees, so a
+/// CI log says what to regenerate rather than only that something did.
+pub(crate) fn build_verdict(
+    entrypoint: &Path,
+    target: &str,
+    out: &Path,
+    diagnostics: &[Diagnostic],
+    drift: &[crate::build::Drift],
+    wrote: Option<usize>,
+    color: bool,
+) -> String {
+    let renderer = if color {
+        Renderer::styled()
+    } else {
+        Renderer::plain()
+    }
+    .decor_style(DecorStyle::Ascii);
+
+    // An invalid composition is reported as `validate` reports it: the emission
+    // never happened, and the reason is the diagnostics above this line.
+    if !diagnostics.is_empty() {
+        return verdict(entrypoint, target, diagnostics, color);
+    }
+
+    let out = out.display();
+    let (level, title) = match (drift.is_empty(), wrote) {
+        (true, Some(count)) => (
+            Level::NOTE.no_name(),
+            format!(
+                "wrote {} to `{out}` (target `{target}`)",
+                plural(count, "file")
+            ),
+        ),
+        (true, None) => (
+            Level::NOTE.no_name(),
+            format!("`{out}` is up to date (target `{target}`)"),
+        ),
+        (false, _) => (
+            Level::ERROR,
+            format!(
+                "`{out}` does not match `{}` (target `{target}`): {}",
+                entrypoint.display(),
+                plural(drift.len(), "file")
+            ),
+        ),
+    };
+
+    let mut report = String::new();
+    for entry in drift {
+        report.push_str(&format!("{entry}\n"));
+    }
+    report.push_str(&format!(
+        "{}\n",
+        renderer.render(&[Group::with_title(level.primary_title(title.as_str()))])
+    ));
+    if !drift.is_empty() {
+        report.push_str("help: run `agent-compose build` to regenerate\n");
+    }
+    report
+}
+
 /// The human report, as one string ready for stderr.
 ///
 /// `root` is the project root every span's file name is relative to — the

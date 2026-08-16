@@ -1,23 +1,34 @@
 //! `agent-compose` — the compiler's command line.
 //!
-//! One command exists in M0, and it is the product's core loop (PRD §7 M0):
+//! Two commands exist. The first is the product's core loop (PRD §7 M0):
 //!
 //! ```text
 //! agent-compose validate <path> [--target <name>] [--format human|json]
 //! ```
 //!
 //! It parses the entrypoint, follows its `imports:`, resolves every name, and
-//! runs every static check the grammar defines, then reports. The work is all
+//! runs every static check the grammar defines, then reports. The second is
+//! codegen (PRD §7 M1):
+//!
+//! ```text
+//! agent-compose build <path> [--target <name>] [--out <dir>] [--check]
+//!                            [--format human|json]
+//! ```
+//!
+//! It runs `validate` first and emits **only** on a clean report — generated
+//! code is a build artifact of a valid composition, and emitting from a broken
+//! one would produce a project whose failures are the spec's, reported by `tsc`
+//! instead of by the compiler that has spans to point at. The work is all
 //! `compose-core`'s; what lives here is the surface — argument parsing, the
-//! choice of report format, and the exit code.
+//! choice of report format, writing the files, and the exit code.
 //!
 //! # Exit codes
 //!
 //! | code | meaning |
 //! |---|---|
 //! | `0` | clean: nothing was reported |
-//! | `1` | diagnostics were reported |
-//! | `2` | the command could not run: bad usage, or an unreadable entrypoint |
+//! | `1` | diagnostics were reported, or `build --check` found drift |
+//! | `2` | the command could not run: bad usage, an unreadable entrypoint, or an output directory that could not be written |
 //!
 //! The split between `1` and `2` is the difference between *the composition is
 //! wrong* and *there was no composition to look at*. A missing `imports:` entry
@@ -25,6 +36,10 @@
 //! an entrypoint that is not a readable file is the command's own precondition
 //! and exits `2` with a plain message, because there is no span to point at.
 //! Argument errors are clap's, which exits `2` for them already.
+//!
+//! `build --check` uses the same three codes for the same three meanings: `1` is
+//! "the answer is no" — the composition is invalid, or the directory no longer
+//! matches it — which is what a CI step branches on (PRD §8).
 //!
 //! # A reader that stops reading
 //!
@@ -52,6 +67,7 @@
 //! `source:`, and `detach: true` (grammar 14, Decisions D59, D87). Omitting it
 //! resolves the built-in `local` target, which requires no deploy file at all.
 
+mod build;
 mod report;
 
 use std::io::{self, Write};
@@ -59,7 +75,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use compose_core::{DEFAULT_TARGET, Diagnostics, resolve_with_target};
+use compose_core::{DEFAULT_TARGET, Diagnostics, Ir, resolve_with_target};
 
 /// Nothing was reported.
 const CLEAN: u8 = 0;
@@ -88,6 +104,23 @@ enum Command {
         #[arg(long, value_enum, default_value_t = Format::Human)]
         format: Format,
     },
+    /// Compile a spec to a TypeScript project (validates first; emits only when clean)
+    Build {
+        /// Path to the spec entrypoint (conventionally `main.yml`)
+        path: PathBuf,
+        /// Deploy target to resolve and emit for
+        #[arg(long, value_name = "NAME", default_value = DEFAULT_TARGET)]
+        target: String,
+        /// Where to write the generated project [default: <project>/build/<target>]
+        #[arg(long, value_name = "DIR")]
+        out: Option<PathBuf>,
+        /// Write nothing; report whether the directory already matches the spec
+        #[arg(long)]
+        check: bool,
+        /// How to report what was found
+        #[arg(long, value_enum, default_value_t = Format::Human)]
+        format: Format,
+    },
 }
 
 /// How a report is written.
@@ -107,18 +140,27 @@ fn main() -> ExitCode {
             target,
             format,
         } => validate(&path, &target, format),
+        Command::Build {
+            path,
+            target,
+            out,
+            check,
+            format,
+        } => {
+            let out = out.unwrap_or_else(|| build::default_out(&path, &target));
+            build_project(&path, &target, &out, check, format)
+        }
     }
 }
 
-fn validate(entrypoint: &Path, target: &str, format: Format) -> ExitCode {
-    if let Err(reason) = usable(entrypoint) {
-        return fail(&reason);
-    }
-
+/// Everything both commands do before they differ: resolve, check, and hand back
+/// the report alongside the artifact.
+///
+/// The checks read the artifact, and a composition that was rejected has none:
+/// half an artifact would send them chasing failures resolution has already named
+/// (see `compose_core::resolve`).
+fn analyse(entrypoint: &Path, target: &str) -> (Vec<compose_core::Diagnostic>, Option<Ir>) {
     let resolution = resolve_with_target(entrypoint, target);
-    // The checks read the artifact, and a composition that was rejected has
-    // none: half an artifact would send them chasing failures resolution has
-    // already named (see `compose_core::resolve`).
     let mut report = Diagnostics::new();
     report.extend(resolution.diagnostics);
     if let Some(ir) = &resolution.ir {
@@ -127,8 +169,15 @@ fn validate(entrypoint: &Path, target: &str, format: Format) -> ExitCode {
     // Both passes sort their own output; the concatenation needs sorting once
     // more so the whole report reads in one source order.
     report.sort();
-    let diagnostics = report.into_vec();
+    (report.into_vec(), resolution.ir)
+}
 
+fn validate(entrypoint: &Path, target: &str, format: Format) -> ExitCode {
+    if let Err(reason) = usable(entrypoint) {
+        return fail(&reason);
+    }
+
+    let (diagnostics, _) = analyse(entrypoint, target);
     let verdict = if diagnostics.is_empty() {
         CLEAN
     } else {
@@ -157,6 +206,86 @@ fn validate(entrypoint: &Path, target: &str, format: Format) -> ExitCode {
         // The reader closed the pipe: it has as much of the report as it asked
         // for, and the verdict is still the answer to the question the exit code
         // asks (see the module header).
+        Err(error) if departed(&error) => ExitCode::from(verdict),
+        Err(error) => fail(&format!("cannot write the report: {error}")),
+    }
+}
+
+/// `agent-compose build`, and `build --check`.
+///
+/// Validation comes first and **any** diagnostic refuses the emission — a
+/// warning included. Generated code is a build artifact of a valid composition
+/// (PRD 5.12), and a project emitted from one the compiler had something to say
+/// about would report that thing again, later, as a `tsc` error with no span.
+fn build_project(
+    entrypoint: &Path,
+    target: &str,
+    out: &Path,
+    checking: bool,
+    format: Format,
+) -> ExitCode {
+    if let Err(reason) = usable(entrypoint) {
+        return fail(&reason);
+    }
+
+    let (diagnostics, ir) = analyse(entrypoint, target);
+    let project = match (&ir, diagnostics.is_empty()) {
+        (Some(ir), true) => Some(compose_core::emit(ir)),
+        _ => None,
+    };
+
+    let drift = match (&project, checking) {
+        (Some(project), true) => match build::check(project, out) {
+            Ok(drift) => drift,
+            Err(error) => {
+                return fail(&format!("cannot read `{}`: {error}", out.display()));
+            }
+        },
+        _ => Vec::new(),
+    };
+    let wrote = match (&project, checking) {
+        (Some(project), false) => match build::write(project, out) {
+            Ok(written) => Some(written),
+            Err(error) => {
+                return fail(&format!("cannot write `{}`: {error}", out.display()));
+            }
+        },
+        _ => None,
+    };
+
+    let verdict = if diagnostics.is_empty() && drift.is_empty() {
+        CLEAN
+    } else {
+        REPORTED
+    };
+    let written = match format {
+        Format::Json => match report::build_json(&diagnostics, &drift) {
+            Ok(text) => write(&mut io::stdout().lock(), &text),
+            Err(error) => return fail(&format!("cannot write the report as JSON: {error}")),
+        },
+        Format::Human => {
+            let color = report::color_enabled();
+            let root = entrypoint.parent().unwrap_or_else(|| Path::new(""));
+            let mut stream = io::stderr().lock();
+            write(&mut stream, &report::human(root, &diagnostics, color)).and_then(|()| {
+                write(
+                    &mut stream,
+                    &report::build_verdict(
+                        entrypoint,
+                        target,
+                        out,
+                        &diagnostics,
+                        &drift,
+                        wrote,
+                        color,
+                    ),
+                )
+            })
+        }
+    };
+
+    match written {
+        Ok(()) => ExitCode::from(verdict),
         Err(error) if departed(&error) => ExitCode::from(verdict),
         Err(error) => fail(&format!("cannot write the report: {error}")),
     }
