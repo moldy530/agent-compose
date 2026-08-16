@@ -19,6 +19,15 @@
 # names no base URL, so a graph built from it talks to Anthropic.
 version: "0.1"
 
+# Four channels, and the two halves of "state channels carry their declared
+# types, defaults, and reduce policies" are deliberately kept apart. `verdict`
+# and `feedback` are *written* by the agent, and every value the acceptance suite
+# scripts for them differs from the default declared here — so an assertion on
+# them can only pass if the write happened. `round` and `notes` are written by
+# nothing, so what a run returns for them is the declaration itself: an integer
+# default, and an `append` channel's identity element (grammar 10.1). Without
+# that split, a build that ignored `default:` entirely would be indistinguishable
+# from one that honoured it.
 state:
   verdict:
     description: The reviewer's verdict, written by name from its output.
@@ -27,7 +36,18 @@ state:
   feedback:
     description: The reviewer's feedback, written by name from its output.
     type: string
-    default: ""
+    default: none yet
+  round:
+    description: Which review round this is. Nothing here writes it.
+    type: integer
+    default: 1
+  notes:
+    description: Side notes, appended. Nothing here writes it either.
+    type: array
+    max_items: 8
+    items:
+      type: string
+    reduce: append
 
 provider.mock:
   kind: anthropic
@@ -94,6 +114,13 @@ flow.review:
       enum: [approve, revise]
     feedback:
       type: string
+    round:
+      type: integer
+    notes:
+      type: array
+      max_items: 8
+      items:
+        type: string
   nodes:
     review:
       agent: agent.reviewer

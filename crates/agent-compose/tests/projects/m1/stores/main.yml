@@ -2,7 +2,7 @@
 #
 # One definition, two usage surfaces:
 #
-#   * **store-op nodes** — `load` and `remember` below: deterministic,
+#   * **store-op nodes** — `load`, `remember` and `reread` below: deterministic,
 #     graph-invoked, schema-checked against `value_schema`, and under
 #     `--target local` backed by SQLite/local disk with no infrastructure at all;
 #   * **agent-attached** — `store.docs` and `store.prefs` on `agent.grounded`:
@@ -21,11 +21,30 @@
 # `local` target substitutes local storage for every store unconditionally).
 version: "0.1"
 
+# The flow reads the store, writes it, and reads it **again**, and the second
+# read is what makes the write observable: `store.prefs` is `scope: execution`,
+# so a later run starts empty and nothing outside this execution can see what
+# `remember` did. Both channels the re-read fills declare a default no write ever
+# produces — `false`, and a `theme`/`verbosity` pair `remember` does not write —
+# so an `op: set` that did nothing at all could not pass.
 state:
   prefs_found:
-    description: Whether the preferences store had anything for this key.
+    description: Whether the preferences store had anything for this key, before the write.
     type: boolean
     default: false
+  prefs_found_after:
+    description: Whether the second read found what `remember` wrote.
+    type: boolean
+    default: false
+  recorded_prefs:
+    description: What the second read got back, for comparison against what was written.
+    type: object
+    properties:
+      theme:
+        type: string
+      verbosity:
+        enum: [low, high]
+    default: { theme: nothing was written, verbosity: high }
   answer:
     type: string
     default: ""
@@ -92,6 +111,15 @@ flow.answer:
   outputs:
     answer:
       type: string
+    prefs_found_after:
+      type: boolean
+    recorded_prefs:
+      type: object
+      properties:
+        theme:
+          type: string
+        verbosity:
+          enum: [low, high]
   nodes:
     load:
       store: store.prefs
@@ -114,8 +142,17 @@ flow.answer:
         theme: "'default'"
         verbosity: "'low'"
 
+    reread:
+      store: store.prefs
+      op: get
+      key: "'preferences'"
+      writes:
+        found: prefs_found_after
+        value: recorded_prefs
+
   edges:
     - { from: start, to: load }
     - { from: load, to: ask }
     - { from: ask, to: remember }
-    - { from: remember, to: end }
+    - { from: remember, to: reread }
+    - { from: reread, to: end }

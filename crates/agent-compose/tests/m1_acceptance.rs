@@ -437,13 +437,21 @@ fn a_scripted_delay_makes_completion_order_differ_from_item_order() {
 
 /// State channels carry their declared types, defaults, and reduce policies into
 /// the running graph.
+///
+/// The fixture's four channels split into two halves on purpose, because a test
+/// whose every expected value is also the scripted value cannot tell a default
+/// from a write. `verdict` and `feedback` are written by the agent, and the
+/// script below gives both a value the declaration does *not* — `approve` and
+/// `none yet` are the defaults. `round` and `notes` are written by nothing, so
+/// the only thing that can produce them is the declaration: an `integer`
+/// default, and an `append` channel's identity element (grammar 10.1).
 #[test]
 #[ignore = "M1: `agent-compose build` must emit the state model, and `run` must execute it"]
 fn state_channels_carry_their_declared_types_and_defaults() {
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue(Script::new(
         SONNET,
-        Outcome::structured(json!({ "verdict": "approve", "feedback": "" })),
+        Outcome::structured(json!({ "verdict": "revise", "feedback": "tighten it" })),
     ));
 
     let run = harness::run(
@@ -454,14 +462,22 @@ fn state_channels_carry_their_declared_types_and_defaults() {
     );
     run.succeeded();
 
-    // `verdict` and `feedback` are declared channels, written by name from the
-    // agent's output (grammar 8.0, 10.3), and read back as the flow's outputs.
+    // Written by name from the agent's output (grammar 8.0, 10.3), and read back
+    // as the flow's outputs — neither value could have come from the default.
     let outputs = run.outputs();
-    assert_eq!(outputs["verdict"], "approve");
+    assert_eq!(outputs["verdict"], "revise", "the default is `approve`");
     assert_eq!(
-        outputs["feedback"], "",
-        "an empty string is the channel's declared default and a legal value"
+        outputs["feedback"], "tighten it",
+        "the default is `none yet`"
     );
+
+    // Nothing writes these two, so they are the declaration itself. `round` is
+    // the typed default — the integer `1`, not the string `\"1\"` — and a build
+    // that never applied defaults would fail materialization instead (D78).
+    assert_eq!(outputs["round"], json!(1));
+    // `notes` declares `reduce: append` and no default, so it starts at the
+    // policy's identity element rather than unset (grammar 10.1).
+    assert_eq!(outputs["notes"], json!([]));
 }
 
 /// A tagged-union output is narrowed per variant, and a response carrying a tag
@@ -1046,6 +1062,13 @@ fn a_node_timeout_fires_and_its_error_policy_takes_over() {
 
 /// A store-op node reads and writes the local backend, with no infrastructure
 /// (PRD 5.8's zero-infra guarantee under `--target local`).
+///
+/// The **write** is what needs care to observe. `store.prefs` is
+/// `scope: execution`, so nothing after this run can see what `remember` did,
+/// and an `op: set` that silently did nothing would be invisible to any
+/// assertion made outside the execution. So the fixture reads the key back
+/// inside the same flow (`reread`) and materializes both halves of that read as
+/// flow outputs — the miss before the write and the hit after it.
 #[test]
 #[ignore = "M1: codegen must emit store-op nodes over the SQLite/local-disk backends"]
 fn a_store_op_node_reads_and_writes_the_local_backend() {
@@ -1062,11 +1085,26 @@ fn a_store_op_node_reads_and_writes_the_local_backend() {
         &provider,
     );
     run.succeeded();
-    assert_eq!(run.outputs()["answer"], "an answer");
+    let outputs = run.outputs();
+    assert_eq!(outputs["answer"], "an answer");
+
+    // The round trip: `load` missed, `remember` wrote, `reread` found it. Both
+    // channels declare a default the write never produces (`false`, and a
+    // `theme` of `nothing was written`), so a stubbed `set` cannot pass this.
+    assert_eq!(
+        outputs["prefs_found_after"],
+        json!(true),
+        "the second `get` found what `set` wrote; its channel's default is `false`"
+    );
+    assert_eq!(outputs["recorded_prefs"]["theme"], "default");
+    assert_eq!(
+        outputs["recorded_prefs"]["verbosity"], "low",
+        "the value read back is the one `remember` wrote, field for field"
+    );
 
     // `load` ran before the agent and found nothing — the store is
-    // execution-scoped, so every run starts empty — and `remember` wrote after
-    // it. What the agent saw is the read's answer.
+    // execution-scoped, so every run starts empty. What the agent saw is that
+    // read's answer.
     let call = &provider.requests()[0];
     let turn = call.body()["messages"][0]["content"]
         .as_str()
