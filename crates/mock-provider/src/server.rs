@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::Incoming as IncomingBody;
 use hyper::service::service_fn;
 use hyper::{Method, Request, StatusCode};
@@ -28,7 +28,11 @@ use crate::{anthropic, openai};
 ///
 /// A prompt is text and a tool surface is schemas; nothing a compiled graph
 /// sends is close to this. The cap is here so a client that mis-frames a body
-/// fails as a request rather than as memory.
+/// fails as a request rather than as memory — which is why it is applied by
+/// [`Limited`] *while* the body streams in rather than to the length of an
+/// already-buffered one: a cap checked after the fact bounds nothing, and a
+/// client advertising two gigabytes would have had them allocated before the
+/// check could refuse it.
 const MAX_BODY: usize = 8 * 1024 * 1024;
 
 /// Serve until `shutdown` resolves.
@@ -89,20 +93,23 @@ async fn handle(
     let query = parts.uri.query().unwrap_or_default().to_string();
     let headers = read_headers(&parts.headers);
 
-    let bytes = match body.collect().await {
+    let bytes = match Limited::new(body, MAX_BODY).collect().await {
         Ok(collected) => collected.to_bytes(),
+        Err(error) if error.downcast_ref::<LengthLimitError>().is_some() => {
+            return Ok(render(
+                Wire::new(
+                    StatusCode::PAYLOAD_TOO_LARGE.as_u16(),
+                    json!({ "mock_provider": format!("request body exceeds {MAX_BODY} bytes") }),
+                )
+                .harness("oversized-request")
+                .answer(),
+            ));
+        }
+        // Any other read error is a connection that ended mid-body. There is
+        // nothing to record but the fact that nothing arrived, and the surfaces
+        // already answer an empty body with "could not parse".
         Err(_) => Bytes::new(),
     };
-    if bytes.len() > MAX_BODY {
-        return Ok(render(
-            Wire::new(
-                StatusCode::PAYLOAD_TOO_LARGE.as_u16(),
-                json!({ "mock_provider": format!("request body exceeds {MAX_BODY} bytes") }),
-            )
-            .harness("oversized-request")
-            .answer(),
-        ));
-    }
 
     let answer = route(&store, &method, &path, &query, headers, &bytes);
     let delay: Delay = match &answer {

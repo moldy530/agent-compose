@@ -254,6 +254,103 @@ fn a_malformed_script_is_refused_with_its_own_error() {
     assert!(provider.snapshot().is_drained(), "nothing was queued");
 }
 
+/// A matcher is scriptable over HTTP, in the spelling a TypeScript harness will
+/// write: `"match": {"body_contains": …}`.
+///
+/// `Match` is the field the Rust tests lean on hardest — every fan-out and
+/// every shared-model queue narrows with it — so the control-plane half has to
+/// be exercised too, or a harness written against `/_mock/enqueue` would be the
+/// first to discover the spelling.
+#[test]
+fn a_matcher_is_scriptable_over_http() {
+    let provider = MockProvider::start().expect("a port");
+    let client = provider.client();
+
+    let staged = client
+        .post_json(
+            "/_mock/enqueue",
+            &json!([
+                {
+                    "model": MODEL,
+                    "outcome": { "reply": { "body": { "text": "for-beta" } } },
+                    "match": { "body_contains": "beta" },
+                },
+                {
+                    "model": MODEL,
+                    "outcome": { "reply": { "body": { "text": "for-alpha" } } },
+                    "match": { "body_contains": "alpha" },
+                },
+            ]),
+        )
+        .expect("the control plane accepts narrowed scripts");
+    assert_eq!(staged.status, 200);
+
+    // The second entry answers first, because narrowing beats arrival order —
+    // which is the property a concurrent fan-out depends on.
+    assert_eq!(text(&call(&client, "alpha")), "for-alpha");
+    assert_eq!(text(&call(&client, "beta")), "for-beta");
+    assert!(provider.snapshot().is_drained());
+
+    // A request no entry accepts is refused rather than answered by the nearest
+    // one, and a matcher spelled wrong is refused on the way in.
+    let refused = client
+        .post_json(
+            "/_mock/enqueue",
+            &json!({
+                "model": MODEL,
+                "outcome": { "reply": { "body": { "text": "hi" } } },
+                "match": { "body_contian": "alpha" },
+            }),
+        )
+        .expect("the control plane answers");
+    assert_eq!(refused.status, mock_provider::HARNESS_STATUS);
+    assert!(
+        refused.json()["mock_provider"]
+            .as_str()
+            .expect("a reason")
+            .contains("body_contian"),
+        "{}",
+        refused.text()
+    );
+}
+
+/// A body past the server's cap is refused as a request, and the refusal is the
+/// harness's own — a mis-framed body must not become the harness's memory
+/// problem, which is the only failure mode a test suite cannot diagnose from a
+/// transcript.
+#[test]
+fn an_oversized_body_is_refused_rather_than_buffered() {
+    let provider = MockProvider::start().expect("a port");
+    provider.enqueue(Script::new(MODEL, Outcome::text("never served")));
+
+    // Just past the 8 MiB cap: enough to trip it, small enough that the tail the
+    // server stops reading fits in the socket's own buffers.
+    let oversized = vec![b'x'; 8 * 1024 * 1024 + 1024];
+    let refused = provider
+        .client()
+        .send(
+            Request::post("/v1/messages")
+                .anthropic_auth()
+                .bytes(oversized),
+        )
+        .expect("the server answers rather than reading on");
+
+    assert_eq!(refused.status, 413);
+    assert_eq!(
+        refused.header(mock_provider::HARNESS_HEADER),
+        Some("oversized-request")
+    );
+    assert!(
+        provider.requests().is_empty(),
+        "a body the server refused to read is not a model call"
+    );
+    assert_eq!(
+        provider.snapshot().queues[MODEL],
+        1,
+        "and it consumed nothing"
+    );
+}
+
 /// Every scripted shape survives the JSON round trip the HTTP control plane puts
 /// it through, so a TypeScript harness can stage what a Rust test can.
 #[test]

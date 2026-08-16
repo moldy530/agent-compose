@@ -28,6 +28,12 @@
 //!   fan-out test would be scripting against arrival order, which is exactly the
 //!   nondeterminism the harness is supposed to remove.
 //!
+//!   The corollary is worth stating, because it is how a queue is written
+//!   wrong: [`Match::Any`] accepts everything, so an **unnarrowed entry shadows
+//!   every narrowed entry behind it** for as long as its `times` last. A queue
+//!   whose entries answer *different* calls on one model id must narrow all of
+//!   them, not just the ones that look ambiguous.
+//!
 //! # Validation comes first
 //!
 //! A request that fails validation is answered with the provider's own error and
@@ -59,12 +65,20 @@ pub const HARNESS_HEADER: &str = "x-mock-provider-error";
 
 /// The status every harness refusal carries.
 ///
-/// Deliberately not a provider status. PRD 5.9 routes on *infrastructure*
-/// conditions — 429, 5xx, no answer — so a harness refusal dressed as one of
-/// those would be silently failed over instead of failing the test that has a
-/// bug in it. 409 belongs to no failover condition, and [`HARNESS_HEADER`] names
-/// which refusal it is.
-pub const HARNESS_STATUS: u16 = 409;
+/// Deliberately not a provider status, and deliberately not a *retried* one.
+/// Two different mechanisms would otherwise swallow a harness refusal:
+///
+/// * PRD 5.9 routes on *infrastructure* conditions — 429, 5xx, no answer — so a
+///   refusal dressed as one of those would be silently failed over instead of
+///   failing the test that has a bug in it;
+/// * both official client SDKs (`@anthropic-ai/sdk` and `openai`) retry
+///   **408, 409, 429 and 5xx** by default, twice, so a refusal at 409 would be
+///   sent three times before the run saw it — three transcript entries, three
+///   `unscripted` counts, and a failure whose shape does not match its cause.
+///
+/// 422 is outside both sets: no failover condition claims it and neither SDK
+/// retries it. [`HARNESS_HEADER`] names which refusal it is.
+pub const HARNESS_STATUS: u16 = 422;
 
 /// [`HARNESS_HEADER`] on a request the harness refused because it was malformed.
 pub const REFUSED_INVALID: &str = "invalid-request";
@@ -106,6 +120,16 @@ impl Surface {
     }
 }
 
+/// The most requests one scripted outcome may answer.
+///
+/// A bound rather than `u32::MAX` because `times` is arithmetic the server does
+/// on every call and sums across a queue: an unbounded count is a queue depth
+/// that overflows the snapshot, and a snapshot is what `/_mock/state` and
+/// [`Store::reset`] both render. Well above anything a run needs — the longest
+/// scripted loop in the acceptance suite is eight — and low enough that a whole
+/// queue of them still fits in the sum.
+pub(crate) const MAX_TIMES: u32 = 1_000_000;
+
 /// One scripted outcome, and the requests it is willing to answer.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -116,15 +140,34 @@ pub struct Script {
     /// What the provider does when this outcome is served.
     pub outcome: Outcome,
     /// How many requests this outcome answers before it leaves the queue.
-    #[serde(default = "once")]
+    ///
+    /// At least 1 and at most a million; a control-plane document outside that
+    /// range is refused by name rather than queued. Zero is not "never answers"
+    /// but a queue entry that cannot be reached, and a count near `u32::MAX` is
+    /// a number no run could consume and every snapshot would have to add up.
+    #[serde(default = "once", deserialize_with = "repetitions")]
     pub times: u32,
     /// Which requests it is willing to answer.
-    #[serde(default, rename = "match")]
+    #[serde(default, rename = "match", skip_serializing_if = "Match::is_any")]
     pub matcher: Match,
 }
 
 fn once() -> u32 {
     1
+}
+
+/// `times`, bounded — see [`Script::times`].
+fn repetitions<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let times = u32::deserialize(deserializer)?;
+    if !(1..=MAX_TIMES).contains(&times) {
+        return Err(serde::de::Error::custom(format!(
+            "`times` must be between 1 and {MAX_TIMES}, not {times}"
+        )));
+    }
+    Ok(times)
 }
 
 impl Script {
@@ -140,8 +183,19 @@ impl Script {
     }
 
     /// Answer this many requests rather than one.
+    ///
+    /// # Panics
+    ///
+    /// If `times` is zero or above a million, which is the same range the
+    /// control plane enforces. A test that asks for either has a bug in the
+    /// script rather than in the graph, and the panic names it where it was
+    /// written instead of failing later as a queue that answers nothing.
     #[must_use]
     pub fn times(mut self, times: u32) -> Self {
+        assert!(
+            (1..=MAX_TIMES).contains(&times),
+            "a scripted outcome answers between 1 and {MAX_TIMES} requests, not {times}"
+        );
         self.times = times;
         self
     }
@@ -149,9 +203,7 @@ impl Script {
     /// Answer only requests whose body contains `needle`.
     #[must_use]
     pub fn matching(mut self, needle: impl Into<String>) -> Self {
-        self.matcher = Match::BodyContains {
-            body_contains: needle.into(),
-        };
+        self.matcher = Match::BodyContains(needle.into());
         self
     }
 }
@@ -163,6 +215,12 @@ impl Script {
 /// language in a project that already has one (CEL, PRD 5.5), and the only
 /// question a fan-out test needs to ask — "the call carrying *this* item" — is
 /// answered by the item's own text appearing in the user turn.
+///
+/// A newtype variant rather than a struct one so the control-plane spelling is
+/// `"match": {"body_contains": "a draft"}` — the shape a TypeScript harness
+/// writes by hand — instead of repeating the key inside itself. [`Match::Any`]
+/// is the default and is omitted on the way out, so a scripted document only
+/// mentions `match` when it narrows.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Match {
@@ -170,7 +228,7 @@ pub enum Match {
     #[default]
     Any,
     /// Only requests whose canonically serialized body contains this substring.
-    BodyContains { body_contains: String },
+    BodyContains(String),
 }
 
 impl Match {
@@ -178,8 +236,13 @@ impl Match {
     fn accepts(&self, body: &str) -> bool {
         match self {
             Self::Any => true,
-            Self::BodyContains { body_contains } => body.contains(body_contains.as_str()),
+            Self::BodyContains(needle) => body.contains(needle.as_str()),
         }
+    }
+
+    /// Whether this narrows nothing.
+    fn is_any(&self) -> bool {
+        matches!(self, Self::Any)
     }
 }
 
@@ -736,7 +799,15 @@ impl Store {
                 .iter()
                 .filter(|(_, queue)| !queue.is_empty())
                 .map(|(model, queue)| {
-                    (model.clone(), queue.iter().map(|script| script.times).sum())
+                    // Saturating, not `sum`: a snapshot is taken on the way out
+                    // of `enqueue`, on every `/_mock/state`, and — before
+                    // anything is cleared — inside `reset`. An overflow here
+                    // would panic all three, and the one that can recover the
+                    // store last, so the count is capped rather than trusted.
+                    let depth = queue
+                        .iter()
+                        .fold(0u32, |depth, script| depth.saturating_add(script.times));
+                    (model.clone(), depth)
                 })
                 .collect(),
             requests: state.requests.len(),
@@ -835,7 +906,13 @@ impl Store {
         };
         let script = &mut queue[at];
         let outcome = script.outcome.clone();
-        script.times -= 1;
+        // Saturating, because `times` is a public field: the builder and the
+        // control plane both refuse a zero, but a struct literal can still write
+        // one, and a `u32` that wrapped here would panic the connection task —
+        // which a client reads as a dropped connection and PRD 5.9 classifies as
+        // a *timeout*. A harness bug must never arrive wearing a failover
+        // condition.
+        script.times = script.times.saturating_sub(1);
         if script.times == 0 {
             queue.remove(at);
         }
@@ -966,6 +1043,38 @@ mod tests {
         );
     }
 
+    /// The corollary, pinned: an unnarrowed entry accepts everything, so it
+    /// shadows every narrowed entry behind it. A queue written this way answers
+    /// the *wrong* call rather than refusing, which is why it is stated in the
+    /// module header and asserted here.
+    #[test]
+    fn an_unnarrowed_entry_shadows_the_narrowed_ones_behind_it() {
+        let store = store_with(vec![
+            Script::new("fast", Outcome::text("for-anything")).times(2),
+            Script::new("fast", Outcome::text("for-beta")).matching("beta"),
+        ]);
+
+        let served = |body: &str| match take(&store, "fast", body) {
+            Decision::Serve(Outcome::Reply(Reply {
+                body: ReplyBody::Text(text),
+                ..
+            })) => text,
+            other => panic!("expected a text reply, got {other:?}"),
+        };
+
+        assert_eq!(
+            served("{\"m\":\"beta\"}"),
+            "for-anything",
+            "the entry that narrows nothing is in front, so it answers a request written for the one behind it"
+        );
+        assert_eq!(served("{\"m\":\"beta\"}"), "for-anything");
+        assert_eq!(
+            served("{\"m\":\"beta\"}"),
+            "for-beta",
+            "only once the shadowing entry is spent does the narrowed one serve"
+        );
+    }
+
     /// An unmatched request does not consume the entries it did not match.
     #[test]
     fn an_unmatched_request_leaves_the_queue_alone() {
@@ -1018,6 +1127,115 @@ mod tests {
             "a drained model leaves the snapshot"
         );
         assert!(!snapshot.is_drained(), "`fast` still holds three");
+    }
+
+    /// A `times` outside the range a run could consume is refused on the way
+    /// in, at both spellings — because `times` is arithmetic the server does on
+    /// every call and sums across a queue, and neither is checked at the point
+    /// it happens.
+    #[test]
+    fn a_times_outside_its_range_is_refused_by_the_control_plane() {
+        let script = |times: Value| {
+            serde_json::from_value::<Script>(json!({
+                "model": "fast",
+                "outcome": { "reply": { "body": { "text": "hi" } } },
+                "times": times,
+            }))
+        };
+
+        for refused in [json!(0), json!(MAX_TIMES + 1), json!(u32::MAX)] {
+            let error = script(refused.clone())
+                .expect_err("`times` is bounded")
+                .to_string();
+            assert!(error.contains("`times` must be between 1 and"), "{error}");
+        }
+        assert_eq!(script(json!(1)).expect("one is the smallest").times, 1);
+        assert_eq!(
+            script(json!(MAX_TIMES))
+                .expect("a million is the largest")
+                .times,
+            MAX_TIMES
+        );
+    }
+
+    /// The same bound, at the Rust spelling: a script written with a `times` no
+    /// run could consume says so where it was written.
+    #[test]
+    #[should_panic(expected = "answers between 1 and 1000000 requests, not 0")]
+    fn a_zero_times_is_refused_by_the_builder() {
+        let _ = Script::new("fast", Outcome::text("hi")).times(0);
+    }
+
+    /// Two queues of enormous entries add up to a number, not to a panic — and
+    /// the snapshot is what `reset` computes *before* it can clear anything, so
+    /// a panic here would leave the store unrecoverable.
+    #[test]
+    fn an_enormous_queue_depth_saturates_rather_than_overflowing() {
+        let mut state = State::default();
+        let queue = state.queues.entry("wide".to_string()).or_default();
+        for _ in 0..3 {
+            queue.push_back(Script {
+                model: "wide".to_string(),
+                outcome: Outcome::text("hi"),
+                times: u32::MAX,
+                matcher: Match::Any,
+            });
+        }
+        assert_eq!(Store::snapshot_of(&state).queues["wide"], u32::MAX);
+    }
+
+    /// A `times: 0` that reached the queue anyway — the field is public — serves
+    /// once and leaves, rather than wrapping a `u32` and panicking the
+    /// connection task into something a client reads as a provider timeout.
+    #[test]
+    fn a_zero_times_entry_cannot_underflow_the_take() {
+        let store = Store::new();
+        store.enqueue(Script {
+            model: "fast".to_string(),
+            outcome: Outcome::text("once"),
+            times: 0,
+            matcher: Match::Any,
+        });
+        assert!(matches!(take(&store, "fast", "{}"), Decision::Serve(_)));
+        assert!(matches!(
+            take(&store, "fast", "{}"),
+            Decision::Unscripted { .. }
+        ));
+    }
+
+    /// The control-plane spelling of a matcher, both ways: a narrowed script
+    /// reads `"match": {"body_contains": …}`, and one that narrows nothing does
+    /// not mention `match` at all.
+    #[test]
+    fn a_matcher_round_trips_through_the_control_plane() {
+        let narrowed: Script = serde_json::from_value(json!({
+            "model": "fast",
+            "outcome": { "reply": { "body": { "text": "hi" } } },
+            "match": { "body_contains": "a draft" },
+        }))
+        .expect("the control-plane spelling of a matcher");
+        assert!(narrowed.matcher.accepts("{\"draft\":\"a draft\"}"));
+        assert!(!narrowed.matcher.accepts("{\"draft\":\"another\"}"));
+
+        assert_eq!(
+            serde_json::to_value(&narrowed).expect("a script serializes")["match"],
+            json!({ "body_contains": "a draft" }),
+            "what a harness reads back is what it wrote"
+        );
+        let plain = Script::new("fast", Outcome::text("hi"));
+        assert!(
+            serde_json::to_value(&plain).expect("a script serializes")["match"].is_null(),
+            "an entry that narrows nothing does not mention `match`"
+        );
+
+        let error = serde_json::from_value::<Script>(json!({
+            "model": "fast",
+            "outcome": { "reply": { "body": { "text": "hi" } } },
+            "match": { "body_contian": "a draft" },
+        }))
+        .expect_err("a typo in the matcher is not a matcher")
+        .to_string();
+        assert!(error.contains("body_contian"), "{error}");
     }
 
     /// A control-plane document rejects a key it does not know, so a typo in a

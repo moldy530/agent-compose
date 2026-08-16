@@ -62,6 +62,23 @@
 //! | `GET /_mock/state` | queue depths and counts |
 //! | `POST /_mock/reset` | discard both, answering with what was discarded |
 //!
+//! A scripted outcome is the JSON spelling of [`Script`], and the two optional
+//! keys are the ones a shared model queue needs:
+//!
+//! ```json
+//! {
+//!   "model": "claude-sonnet-4-6",
+//!   "times": 4,
+//!   "match": { "body_contains": "a research writer" },
+//!   "outcome": { "reply": { "body": { "structured": { "draft": "a draft" } } } }
+//! }
+//! ```
+//!
+//! `times` defaults to 1 and must be between 1 and a million; `match` defaults
+//! to "any request for this model", and an entry that narrows nothing shadows
+//! every narrowed entry behind it, so a queue whose entries answer *different*
+//! calls on one model id must narrow all of them.
+//!
 //! # What is *not* here
 //!
 //! Streaming, embeddings, the Files/Batch APIs, and the Bedrock and Vertex SDK
