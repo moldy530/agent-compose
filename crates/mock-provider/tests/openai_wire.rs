@@ -122,6 +122,89 @@ fn a_forced_function_structured_output_arrives_as_a_tool_call() {
     assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
 }
 
+/// `strict: true` closes the schema, and a schema that is not closed is a 400 —
+/// the most common one on this surface, and the one a Zod-to-JSON-Schema path
+/// produces when it drops `additionalProperties` or an entry in `required`.
+///
+/// This is the check that keeps PRD 5.2 honest here: without it a compiled graph
+/// passes every acceptance run and fails on its first live call, which is the
+/// exact failure the mock exists to move into CI.
+#[test]
+fn a_strict_schema_that_is_not_closed_is_refused() {
+    let provider = MockProvider::start().expect("a port");
+    provider.enqueue(Script::new(MODEL, Outcome::text("never served")));
+
+    let response = send(
+        &provider.client(),
+        "/v1/chat/completions",
+        &json!({
+            "model": MODEL,
+            "messages": [{ "role": "user", "content": "go" }],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "reviewer_output",
+                    "strict": true,
+                    "schema": {
+                        "type": "object",
+                        "properties": { "verdict": { "type": "string" } },
+                    },
+                },
+            },
+        }),
+    );
+    assert_eq!(response.status, 400);
+    assert_eq!(response.header(HARNESS_HEADER), Some(REFUSED_INVALID));
+    let body = response.json();
+    assert_eq!(
+        body["error"]["param"], "response_format.json_schema.schema",
+        "the refusal points at the schema, where the author has to go"
+    );
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .expect("a message")
+            .contains("'additionalProperties' is required to be supplied and to be false"),
+        "{body}"
+    );
+    assert_eq!(provider.snapshot().queues[MODEL], 1, "nothing was consumed");
+
+    // The closed spelling of the same schema is the one every fixture writes,
+    // and it is served — the strictness is about the schema, not about `strict`.
+    provider.reset();
+    provider.enqueue(Script::new(
+        MODEL,
+        Outcome::structured(json!({ "verdict": "approve" })),
+    ));
+    assert_eq!(
+        send(
+            &provider.client(),
+            "/v1/chat/completions",
+            &json_schema_request()
+        )
+        .status,
+        200
+    );
+}
+
+/// An empty tool list is a 400, not an ignored key: it is what codegen emits for
+/// an agent with neither `tools:` nor `stores:` if it always writes `tools`.
+#[test]
+fn an_empty_tools_array_is_refused() {
+    let provider = MockProvider::start().expect("a port");
+    let response = send(
+        &provider.client(),
+        "/v1/chat/completions",
+        &json!({
+            "model": MODEL,
+            "messages": [{ "role": "user", "content": "go" }],
+            "tools": [],
+        }),
+    );
+    assert_eq!(response.status, 400);
+    assert_eq!(response.json()["error"]["param"], "tools");
+}
+
 /// The whole tool loop on this surface, including the `tool` message that
 /// answers a call by id.
 #[test]

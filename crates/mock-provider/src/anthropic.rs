@@ -282,6 +282,19 @@ fn check_tool_choice(
         .one_of("tool_choice.type", kind, &["auto", "any", "tool", "none"])?
         .to_string();
 
+    // The mirror of the rule tool *blocks* obey: a request that says how the
+    // model must use its tools has to have some. Reported here and answered
+    // early, so a `{type: "tool", name: X}` with no tool surface is one
+    // complaint about the missing surface rather than two about X not being in
+    // it.
+    if !body.contains_key("tools") {
+        checker.fail(
+            "tools",
+            "tool_choice: Requests which specify `tool_choice` must also define tools.",
+        );
+        return None;
+    }
+
     let named = match choice.get("name") {
         Some(name) if kind == "tool" => checker
             .typed("tool_choice.name", name, Kind::String)
@@ -697,7 +710,23 @@ fn reply_answer(
         .unwrap_or_default();
 
     let (content, implied) = match &reply.body {
-        ReplyBody::Text(text) => (vec![text_block(text)], "end_turn"),
+        ReplyBody::Text(text) => {
+            // A request that pins tool use cannot be answered with prose. This
+            // is the inverse of the `structured`-without-a-forced-tool refusal
+            // below, and it exists for the same reason: a codegen PR that
+            // scripted `Outcome::text` for an agent node would be testing its
+            // structured-output parser against an answer the Messages API
+            // cannot send, and passing.
+            if let Some(pinned) = pinned_tool_use(request) {
+                return mismatch(&format!(
+                    "a `text` reply cannot answer a request carrying {pinned}: the Messages API \
+                     answers a pinned tool with a `tool_use` block, never with `end_turn` and no \
+                     call. Script `structured` for the object the agent should produce, or `raw` \
+                     for a response generated code must reject"
+                ));
+            }
+            (vec![text_block(text)], "end_turn")
+        }
         ReplyBody::Structured(value) => {
             let Some(StructuredOutput::ForcedTool { name, .. }) = structured else {
                 return mismatch(
@@ -764,6 +793,27 @@ fn reply_answer(
     .header("request-id", format!("req_mock_{sequence:08}"))
     .after(reply.delay)
     .answer()
+}
+
+/// How a request obliged the model to use a tool, if it did.
+///
+/// `auto` and `none` leave prose on the table; `tool` and `any` do not — both
+/// guarantee the answer carries a `tool_use` block. Read off the request rather
+/// than off the parsed [`StructuredOutput`] because the two differ: `any` over
+/// several tools pins no *schema* (so there is nothing to render a `structured`
+/// reply into) while still pinning that a tool is called.
+fn pinned_tool_use(request: &Value) -> Option<String> {
+    let choice = request.get("tool_choice")?.as_object()?;
+    match choice.get("type").and_then(Value::as_str)? {
+        "tool" => {
+            let name = choice.get("name").and_then(Value::as_str).unwrap_or("…");
+            Some(format!(
+                "`tool_choice: {{type: \"tool\", name: \"{name}\"}}`"
+            ))
+        }
+        "any" => Some("`tool_choice: {type: \"any\"}`".to_string()),
+        _ => None,
+    }
 }
 
 fn text_block(text: &str) -> Value {
@@ -1143,6 +1193,45 @@ mod tests {
         assert!(parsed.structured_output.is_none());
     }
 
+    /// `tool_choice` says how the model must use tools, so a request that
+    /// carries one without a tool surface is refused — once, naming the missing
+    /// surface rather than the name that is not in it.
+    #[test]
+    fn a_tool_choice_without_tools_is_refused() {
+        for choice in [
+            json!({ "type": "auto" }),
+            json!({ "type": "any" }),
+            json!({ "type": "none" }),
+            json!({ "type": "tool", "name": "extract" }),
+        ] {
+            let request = messages(json!({
+                "messages": [{ "role": "user", "content": "hi" }],
+                "tool_choice": choice.clone(),
+            }));
+            let parsed = parse(&headers(), Some(&request));
+            assert_eq!(parsed.failures.len(), 1, "{choice}: {:?}", parsed.failures);
+            assert_eq!(parsed.failures[0].pointer, "tools");
+            assert!(
+                parsed.failures[0]
+                    .message
+                    .contains("must also define tools"),
+                "{}",
+                parsed.failures[0].message
+            );
+            assert!(parsed.structured_output.is_none());
+        }
+
+        // The positive half: the same `tool_choice` over a tool surface is the
+        // request every agent node sends.
+        let request = messages(json!({
+            "messages": [{ "role": "user", "content": "hi" }],
+            "tools": [{ "name": "extract", "input_schema": { "type": "object" } }],
+            "tool_choice": { "type": "auto" },
+        }));
+        let parsed = parse(&headers(), Some(&request));
+        assert!(parsed.failures.is_empty(), "{:?}", parsed.failures);
+    }
+
     /// `tool_choice: any` with one tool on offer forces that tool, which is the
     /// other shape a structured-output request takes.
     #[test]
@@ -1214,6 +1303,54 @@ mod tests {
         };
         assert_eq!(response.status, HARNESS_STATUS);
         assert_eq!(response.headers[crate::control::HARNESS_HEADER], MISMATCH);
+    }
+
+    /// The inverse refusal: a `text` reply to a request that pinned tool use is
+    /// an answer the Messages API cannot send, so it is a script bug too — and
+    /// a codegen PR that scripted one would be testing its structured-output
+    /// parser against an input no provider will ever produce.
+    #[test]
+    fn a_text_reply_to_a_pinned_tool_use_is_a_script_mismatch() {
+        let pinned = |choice: Value| {
+            messages(json!({
+                "messages": [{ "role": "user", "content": "hi" }],
+                "tools": [{ "name": "extract", "input_schema": { "type": "object" } }],
+                "tool_choice": choice,
+            }))
+        };
+
+        for choice in [
+            json!({ "type": "tool", "name": "extract" }),
+            json!({ "type": "any" }),
+        ] {
+            let request = pinned(choice.clone());
+            let parsed = parse(&headers(), Some(&request));
+            assert!(parsed.failures.is_empty(), "{:?}", parsed.failures);
+            let Answer::Respond(response) = render(
+                1,
+                &request,
+                parsed.structured_output.as_ref(),
+                &Outcome::text("I am not going to call the tool"),
+            ) else {
+                panic!("a mismatch is a response");
+            };
+            assert_eq!(response.status, HARNESS_STATUS, "{choice}");
+            assert_eq!(response.headers[crate::control::HARNESS_HEADER], MISMATCH);
+        }
+
+        // The positive half: `auto` and `none` leave prose on the table, and a
+        // request that pins nothing at all is answered as it always was.
+        for choice in [json!({ "type": "auto" }), json!({ "type": "none" })] {
+            let request = pinned(choice.clone());
+            let Answer::Respond(response) =
+                render(1, &request, None, &Outcome::text("just talking"))
+            else {
+                panic!("a reply is a response");
+            };
+            assert_eq!(response.status, 200, "{choice}");
+            assert_eq!(response.body["content"][0]["text"], "just talking");
+            assert_eq!(response.body["stop_reason"], "end_turn");
+        }
     }
 
     /// A scripted tool call the request never offered is the same kind of bug.

@@ -324,6 +324,38 @@ fn an_unscripted_call_names_the_model_and_the_empty_queue() {
     assert_eq!(provider.snapshot().unscripted, 1);
 }
 
+/// A scripted `text` answer to a request that forced a tool is refused as a
+/// harness bug, in the harness's own status — because the Messages API cannot
+/// answer that way, and a codegen PR that tested its structured-output parser
+/// against such an answer would be testing against an input no provider sends.
+#[test]
+fn a_text_reply_to_a_forced_tool_is_refused_as_a_script_mismatch() {
+    let provider = MockProvider::start().expect("a port");
+    provider.enqueue(Script::new(
+        MODEL,
+        Outcome::text("I am not going to call the tool"),
+    ));
+
+    let response = send(
+        &provider.client(),
+        &structured_request(output_schema_tool(), "reviewer_output"),
+    );
+    assert_eq!(response.status, HARNESS_STATUS);
+    assert_eq!(
+        response.header(HARNESS_HEADER),
+        Some(mock_provider::REFUSED_MISMATCH)
+    );
+    assert!(
+        response.json()["error"]["message"]
+            .as_str()
+            .expect("a message")
+            .contains("tool_choice"),
+        "the refusal names what the request pinned: {}",
+        response.text()
+    );
+    assert_eq!(provider.requests()[0].served, "reply.text");
+}
+
 /// The escape hatch: a body served verbatim, for the responses generated code
 /// must reject rather than parse.
 #[test]

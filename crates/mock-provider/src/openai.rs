@@ -34,6 +34,13 @@ use crate::strict::{Checker, Dialect, Kind, at};
 use crate::wire::{Answer, HARNESS_STATUS, INVALID, MISMATCH, Response, UNSCRIPTED};
 
 /// The top-level keys this surface accepts.
+///
+/// `top_k` is on the list even though `api.openai.com` refuses it: this route
+/// serves all three of grammar 12.1's Chat-Completions kinds, and
+/// `openai_compatible` (vLLM, ollama) accepts `top_k` — which is also why
+/// grammar 12.2 lists it in the typed `settings:` vocabulary. The mock cannot
+/// tell the kinds apart from one route, and refusing a key one of them accepts
+/// would fail a fixture that is correct. `WIRE-NOTES.md` records the choice.
 const REQUEST_KEYS: &[&str] = &[
     "model",
     "messages",
@@ -44,6 +51,7 @@ const REQUEST_KEYS: &[&str] = &[
     "max_completion_tokens",
     "temperature",
     "top_p",
+    "top_k",
     "n",
     "stop",
     "seed",
@@ -185,6 +193,16 @@ fn check_tools(checker: &mut Checker, body: &Map<String, Value>) -> Vec<String> 
     let Some(tools) = checker.optional("", body, "tools", Kind::Array) else {
         return names;
     };
+    // An empty list is refused, not ignored: `tools: []` is what codegen emits
+    // for an agent with no `tools:` and no `stores:` if it always writes the
+    // key, and the service answers that with a 400.
+    if tools.as_array().is_some_and(Vec::is_empty) {
+        checker.fail(
+            "tools",
+            "Invalid 'tools': empty array. Expected an array with minimum length 1.",
+        );
+        return names;
+    }
     let mut seen = BTreeSet::new();
     for (index, tool) in tools.as_array().into_iter().flatten().enumerate() {
         let pointer = at("tools", index);
@@ -225,7 +243,8 @@ fn check_tools(checker: &mut Checker, body: &Map<String, Value>) -> Vec<String> 
                 format!("Invalid 'tools': duplicate function name '{name}'."),
             );
         }
-        if let Some(parameters) = checker.optional(&pointer, function, "parameters", Kind::Object)
+        let parameters = checker.optional(&pointer, function, "parameters", Kind::Object);
+        if let Some(parameters) = parameters
             && parameters.get("type").and_then(Value::as_str) != Some("object")
         {
             checker.fail(
@@ -233,6 +252,18 @@ fn check_tools(checker: &mut Checker, body: &Map<String, Value>) -> Vec<String> 
                 format!(
                     "Invalid schema for function '{name}': schema must be a JSON Schema of 'type: \"object\"'."
                 ),
+            );
+        }
+        let strict = checker
+            .optional(&pointer, function, "strict", Kind::Boolean)
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if let (true, Some(parameters)) = (strict, parameters) {
+            check_strict_schema(
+                checker,
+                &at(&pointer, "parameters"),
+                &format!("function '{name}'"),
+                parameters,
             );
         }
         names.push(name);
@@ -247,6 +278,17 @@ fn check_tool_choice(
     tools: &[String],
 ) -> Option<String> {
     let choice = body.get("tool_choice")?;
+    // The same rule the Messages surface keeps: `tool_choice` says how the model
+    // must use its tools, so a request that carries one without a tool surface
+    // is refused — once, at the missing surface, rather than at a name that
+    // could not have been in it.
+    if !body.contains_key("tools") {
+        checker.fail(
+            "tool_choice",
+            "Invalid value: 'tool_choice' may only be specified when 'tools' are provided.",
+        );
+        return None;
+    }
     match choice {
         Value::String(_) => {
             checker.one_of("tool_choice", choice, &["none", "auto", "required"]);
@@ -330,11 +372,132 @@ fn check_response_format(
         .get("strict")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let declared = Value::Object(declared);
+    if strict {
+        check_strict_schema(
+            checker,
+            "response_format.json_schema.schema",
+            &format!("response_format '{name}'"),
+            &declared,
+        );
+    }
     Some(StructuredOutput::JsonSchema {
         name,
-        schema: Value::Object(declared),
+        schema: declared,
         strict,
     })
+}
+
+/// The rules `strict: true` adds to a schema, wherever it was asked for.
+///
+/// `strict` is not a hint. The service compiles the schema into a constrained
+/// decoder, and it can only do that over a **closed** shape: every object must
+/// carry `additionalProperties: false` and list every one of its properties in
+/// `required`. A schema that does not is a 400 — the most common one on this
+/// surface — so a Zod-to-JSON-Schema path that drops either key must fail here
+/// rather than on the first live call, which is the whole reason this server
+/// validates at all.
+///
+/// The complaint is the service's own, `context=` and all: it addresses the
+/// offending object by its path *inside the schema*, which is the only address
+/// that means anything once the schema nests.
+fn check_strict_schema(checker: &mut Checker, pointer: &str, subject: &str, schema: &Value) {
+    walk_strict_schema(checker, pointer, subject, &mut Vec::new(), schema);
+}
+
+fn walk_strict_schema(
+    checker: &mut Checker,
+    pointer: &str,
+    subject: &str,
+    context: &mut Vec<String>,
+    schema: &Value,
+) {
+    let Some(object) = schema.as_object() else {
+        return;
+    };
+    let properties = object.get("properties").and_then(Value::as_object);
+    if object.get("type").and_then(Value::as_str) == Some("object") {
+        let printed = printed_context(context);
+        if object.get("additionalProperties") != Some(&Value::Bool(false)) {
+            checker.fail(
+                pointer,
+                format!(
+                    "Invalid schema for {subject}: In context={printed}, 'additionalProperties' is required to be supplied and to be false."
+                ),
+            );
+        }
+        let required: BTreeSet<&str> = object
+            .get("required")
+            .and_then(Value::as_array)
+            .map(|listed| listed.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        // One complaint per object, naming the first property left out — the
+        // way the service reports it, and enough to send whoever reads it to
+        // the object that is wrong.
+        if let Some(missing) = properties
+            .into_iter()
+            .flatten()
+            .map(|(name, _)| name)
+            .find(|name| !required.contains(name.as_str()))
+        {
+            checker.fail(
+                pointer,
+                format!(
+                    "Invalid schema for {subject}: In context={printed}, 'required' is required to be supplied and to be an array including every key in properties. Missing '{missing}'."
+                ),
+            );
+        }
+    }
+
+    // Every place a subschema can hide. The rules apply to all of them, because
+    // the decoder has to be constrained all the way down.
+    for (name, subschema) in properties.into_iter().flatten() {
+        context.push("properties".to_string());
+        context.push(name.clone());
+        walk_strict_schema(checker, pointer, subject, context, subschema);
+        context.truncate(context.len() - 2);
+    }
+    for (key, subschema) in [("items", object.get("items"))] {
+        if let Some(subschema) = subschema {
+            context.push(key.to_string());
+            walk_strict_schema(checker, pointer, subject, context, subschema);
+            context.pop();
+        }
+    }
+    for (key, group) in [("$defs", object.get("$defs"))] {
+        for (name, subschema) in group.and_then(Value::as_object).into_iter().flatten() {
+            context.push(key.to_string());
+            context.push(name.clone());
+            walk_strict_schema(checker, pointer, subject, context, subschema);
+            context.truncate(context.len() - 2);
+        }
+    }
+    for (index, subschema) in object
+        .get("anyOf")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        context.push("anyOf".to_string());
+        context.push(index.to_string());
+        walk_strict_schema(checker, pointer, subject, context, subschema);
+        context.truncate(context.len() - 2);
+    }
+}
+
+/// A schema path as the service prints it: a Python tuple, `()` at the root.
+fn printed_context(context: &[String]) -> String {
+    let members = context
+        .iter()
+        .map(|member| format!("'{member}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    match context.len() {
+        0 => "()".to_string(),
+        1 => format!("({members},)"),
+        _ => format!("({members})"),
+    }
 }
 
 /// The message list, including the `tool` correlation rule.
@@ -622,10 +785,24 @@ fn reply_answer(
         .unwrap_or_default();
 
     let (message, finish) = match &reply.body {
-        ReplyBody::Text(text) => (
-            json!({ "role": "assistant", "content": text, "refusal": Value::Null }),
-            "stop",
-        ),
+        ReplyBody::Text(text) => {
+            // The inverse of the `structured`-without-a-request-for-one refusal
+            // below: a request that pinned the *shape* of the answer cannot be
+            // answered with free prose, so a script that says otherwise is a
+            // harness bug and is answered as one.
+            if let Some(pinned) = pinned_answer_shape(request) {
+                return mismatch(&format!(
+                    "a `text` reply cannot answer a request carrying {pinned}: Chat Completions \
+                     answers that with parseable JSON or a tool call, never with free prose. \
+                     Script `structured` for the object the agent should produce, or `raw` for a \
+                     response generated code must reject"
+                ));
+            }
+            (
+                json!({ "role": "assistant", "content": text, "refusal": Value::Null }),
+                "stop",
+            )
+        }
         ReplyBody::Structured(value) => match structured {
             Some(StructuredOutput::JsonSchema { .. }) => (
                 json!({
@@ -719,6 +896,40 @@ fn reply_answer(
     .header("x-request-id", format!("req_mock_{sequence:08}"))
     .after(reply.delay)
     .answer()
+}
+
+/// How a request pinned the shape of its answer, if it pinned one.
+///
+/// `json_schema` guarantees parseable JSON in the content; `tool_choice:
+/// "required"` and a forced function guarantee a tool call. `auto`, `none` and
+/// `response_format: {type: "text"}` guarantee nothing, and leave prose legal.
+/// Read off the request rather than off the parsed [`StructuredOutput`], which
+/// is `None` for a forced function that declares no `parameters` — still a
+/// pinned answer, just not a pinned schema.
+fn pinned_answer_shape(request: &Value) -> Option<String> {
+    if request
+        .pointer("/response_format/type")
+        .and_then(Value::as_str)
+        == Some("json_schema")
+    {
+        return Some("`response_format: {type: \"json_schema\"}`".to_string());
+    }
+    match request.get("tool_choice")? {
+        Value::String(pinned) if pinned == "required" => {
+            Some("`tool_choice: \"required\"`".to_string())
+        }
+        Value::Object(choice) => {
+            let name = choice
+                .get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or("…");
+            Some(format!(
+                "`tool_choice: {{type: \"function\", function: {{name: \"{name}\"}}}}`"
+            ))
+        }
+        _ => None,
+    }
 }
 
 fn call_block(sequence: u64, index: usize, name: &str, input: &Value) -> Value {
@@ -869,7 +1080,12 @@ mod tests {
                 "json_schema": {
                     "name": "review",
                     "strict": true,
-                    "schema": { "type": "object", "properties": { "verdict": { "type": "string" } } },
+                    "schema": {
+                        "type": "object",
+                        "properties": { "verdict": { "type": "string" } },
+                        "required": ["verdict"],
+                        "additionalProperties": false,
+                    },
                 },
             },
         }));
@@ -881,6 +1097,176 @@ mod tests {
         };
         assert_eq!(name, "review");
         assert!(strict);
+    }
+
+    /// `strict: true` closes the schema, and a schema that is not closed is the
+    /// most common 400 on this surface. A mock that accepted it would let a
+    /// Zod-to-JSON-Schema path pass every CI run and fail on the first live
+    /// call, which is precisely what this server exists to prevent.
+    #[test]
+    fn a_strict_schema_must_close_every_object_and_require_every_property() {
+        let strict = |schema: Value| {
+            request(json!({
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": { "name": "review", "strict": true, "schema": schema },
+                },
+            }))
+        };
+
+        let open = parse_direct(&strict(json!({
+            "type": "object",
+            "properties": { "verdict": { "type": "string" } },
+        })))
+        .failures;
+        assert_eq!(
+            open.iter()
+                .map(|failure| failure.message.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Invalid schema for response_format 'review': In context=(), 'additionalProperties' is required to be supplied and to be false.",
+                "Invalid schema for response_format 'review': In context=(), 'required' is required to be supplied and to be an array including every key in properties. Missing 'verdict'.",
+            ]
+        );
+        assert_eq!(open[0].pointer, "response_format.json_schema.schema");
+
+        // The rules go all the way down, and the complaint addresses the object
+        // inside the schema rather than the schema.
+        let nested = parse_direct(&strict(json!({
+            "type": "object",
+            "properties": {
+                "author": {
+                    "type": "object",
+                    "properties": { "name": { "type": "string" } },
+                    "required": ["name"],
+                },
+            },
+            "required": ["author"],
+            "additionalProperties": false,
+        })))
+        .failures;
+        assert_eq!(nested.len(), 1, "{nested:?}");
+        assert!(
+            nested[0]
+                .message
+                .contains("In context=('properties', 'author'), 'additionalProperties'"),
+            "{}",
+            nested[0].message
+        );
+
+        // `strict: false` — and an absent `strict` — ask for none of this.
+        let lenient = request(json!({
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "review",
+                    "schema": { "type": "object", "properties": { "verdict": { "type": "string" } } },
+                },
+            },
+        }));
+        assert!(
+            parse_direct(&lenient).failures.is_empty(),
+            "{:?}",
+            parse_direct(&lenient).failures
+        );
+    }
+
+    /// The same rules on a `strict: true` function tool, which is the other
+    /// place this surface accepts the flag.
+    #[test]
+    fn a_strict_function_tool_is_held_to_the_same_schema_rules() {
+        let tool = |strict: bool| {
+            request(json!({
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "extract",
+                        "strict": strict,
+                        "parameters": {
+                            "type": "object",
+                            "properties": { "verdict": { "type": "string" } },
+                        },
+                    },
+                }],
+            }))
+        };
+
+        let failures = parse_direct(&tool(true)).failures;
+        assert_eq!(failures.len(), 2, "{failures:?}");
+        assert_eq!(failures[0].pointer, "tools.0.function.parameters");
+        assert!(
+            failures[0]
+                .message
+                .starts_with("Invalid schema for function 'extract': In context=(),"),
+            "{}",
+            failures[0].message
+        );
+
+        assert!(
+            parse_direct(&tool(false)).failures.is_empty(),
+            "an unstrict function tool takes the schema it is given"
+        );
+    }
+
+    /// `tool_choice` without a tool surface is refused here too — the same
+    /// mirror rule the Messages surface keeps, in this dialect.
+    #[test]
+    fn a_tool_choice_without_tools_is_refused() {
+        for choice in [
+            json!("auto"),
+            json!("required"),
+            json!("none"),
+            json!({ "type": "function", "function": { "name": "extract" } }),
+        ] {
+            let body = request(json!({ "tool_choice": choice.clone() }));
+            let failures = parse_direct(&body).failures;
+            assert_eq!(failures.len(), 1, "{choice}: {failures:?}");
+            assert_eq!(failures[0].pointer, "tool_choice");
+            assert!(
+                failures[0].message.contains("when 'tools' are provided"),
+                "{}",
+                failures[0].message
+            );
+        }
+
+        // The positive half: over a tool surface, every one of those is legal.
+        let body = request(json!({
+            "tools": [{
+                "type": "function",
+                "function": { "name": "extract", "parameters": { "type": "object" } },
+            }],
+            "tool_choice": "auto",
+        }));
+        assert!(parse_direct(&body).failures.is_empty());
+    }
+
+    /// An empty tool list is refused, not ignored: it is what codegen emits for
+    /// a tool-less agent if it always writes the key, and the service answers a
+    /// 400.
+    #[test]
+    fn an_empty_tools_array_is_refused() {
+        let failures = parse_direct(&request(json!({ "tools": [] }))).failures;
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].pointer, "tools");
+        assert_eq!(
+            failures[0].message,
+            "Invalid 'tools': empty array. Expected an array with minimum length 1."
+        );
+
+        // Absent is the correct spelling for "no tools", and it is accepted.
+        assert!(parse_direct(&request(json!({}))).failures.is_empty());
+    }
+
+    /// `top_k` is accepted here because `openai_compatible` backends take it and
+    /// grammar 12.2 lists it in the `settings:` vocabulary — one route serves
+    /// three provider kinds and cannot tell them apart.
+    #[test]
+    fn top_k_is_accepted_for_the_openai_compatible_backends() {
+        assert!(
+            parse_direct(&request(json!({ "top_k": 40 })))
+                .failures
+                .is_empty()
+        );
     }
 
     /// The forced-function shape of structured output, understood.
@@ -1201,6 +1587,85 @@ mod tests {
         };
         assert_eq!(response.status, HARNESS_STATUS);
         assert_eq!(response.headers[HARNESS_HEADER], MISMATCH);
+    }
+
+    /// And the inverse: prose cannot answer a request that pinned the shape of
+    /// its answer, on either of this surface's two mechanisms.
+    #[test]
+    fn a_text_reply_to_a_pinned_answer_shape_is_a_mismatch() {
+        let pinned = [
+            request(json!({
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "review",
+                        "schema": { "type": "object" },
+                    },
+                },
+            })),
+            request(json!({
+                "tools": [{
+                    "type": "function",
+                    "function": { "name": "extract", "parameters": { "type": "object" } },
+                }],
+                "tool_choice": { "type": "function", "function": { "name": "extract" } },
+            })),
+            request(json!({
+                "tools": [{
+                    "type": "function",
+                    "function": { "name": "extract", "parameters": { "type": "object" } },
+                }],
+                "tool_choice": "required",
+            })),
+        ];
+        for body in &pinned {
+            let parsed = parse_direct(body);
+            assert!(parsed.failures.is_empty(), "{:?}", parsed.failures);
+            let Answer::Respond(response) = render(
+                1,
+                body,
+                &parsed.model,
+                parsed.structured_output.as_ref(),
+                &Outcome::text("not json at all"),
+            ) else {
+                panic!("a mismatch is a response");
+            };
+            assert_eq!(response.status, HARNESS_STATUS, "{body}");
+            assert_eq!(response.headers[HARNESS_HEADER], MISMATCH);
+        }
+
+        // The positive half: `auto`, `text`, and a request that pins nothing all
+        // leave prose legal.
+        let free = [
+            request(json!({})),
+            request(json!({ "response_format": { "type": "text" } })),
+            request(json!({
+                "tools": [{
+                    "type": "function",
+                    "function": { "name": "extract", "parameters": { "type": "object" } },
+                }],
+                "tool_choice": "auto",
+            })),
+        ];
+        for body in &free {
+            let parsed = parse_direct(body);
+            assert!(parsed.failures.is_empty(), "{:?}", parsed.failures);
+            let Answer::Respond(response) = render(
+                1,
+                body,
+                &parsed.model,
+                parsed.structured_output.as_ref(),
+                &Outcome::text("just talking"),
+            ) else {
+                panic!("a reply is a response");
+            };
+            assert_eq!(response.status, 200, "{body}");
+            assert_eq!(
+                response.body["choices"][0]["message"]["content"],
+                "just talking"
+            );
+            assert_eq!(response.body["choices"][0]["finish_reason"], "stop");
+        }
     }
 
     /// Tool calls the request never offered are refused for the same reason.
