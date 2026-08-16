@@ -1,0 +1,3 @@
+model.m:
+  provider: provider.p
+  id: another-model

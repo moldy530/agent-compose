@@ -1,0 +1,18 @@
+# A single-file project whose only mistake is a misspelled key, so the rendered
+# report is exactly one snippet with a suggestion. Pinned by `cli.rs`.
+version: "0.1"
+
+provider.p:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+
+model.m:
+  provider: provider.p
+  id: some-model
+
+agent.reviewer:
+  model: model.m
+  prompt: Review the draft.
+  descriptio: Reviews a draft.
+  output:
+    verdict: { enum: [approve, revise] }
