@@ -35,39 +35,43 @@
 //! pass that spends the budget with no viable route — an infinite loop converted
 //! into a runtime dead end, which is the failure Decision D19's rule removes.
 //!
-//! Two sources are exempt, and both for the same reason: a budget that cannot
-//! run out withdraws no guarantee.
+//! Grammar 7.4 and Decision D19 both state the rule over the source node of
+//! **each** `max_iterations`-carrying edge, with no exemption, and this reads it
+//! that way. Outside a cycle clause (a) costs nothing — a node alone in its
+//! component with no self-edge is left by every outgoing edge it has — so what
+//! still bites there is clause (b), the guarantee.
 //!
-//! * An edge leaving **`start`**. `start` belongs to no component, so every edge
-//!   leaving it leaves "its" SCC, and grammar 7.6.3 rule 2 — which the parser
-//!   owns — already requires one of them to be unconditional or `else: true`.
-//! * A node **no cycle reaches**. `max_iterations` counts traversals of one edge
-//!   within one flow instance (grammar 7.4), and a node no cycle reaches
-//!   executes once per instance, so a budget of at least one — which the range
-//!   1..=1000 guarantees — is never spent and the edge is never untakeable.
-//!   Grammar 7.4's escape bullet reads over "each `max_iterations`-carrying
-//!   edge" while grammar 7.2's own gloss of the key says the source "then also
-//!   needs an unconditional or `else:` edge **leaving the cycle**", which
-//!   presupposes one; refusing the shape no loop can reach would reject a
-//!   composition that is runtime-safe, and that is the one direction Decisions
-//!   D99 and D112 say a conservative static check must not go. The budget there
-//!   is inert rather than dangerous, and no rule in this grammar refuses it.
+//! One source is exempt, and only because it cannot spend a budget: an edge
+//! leaving **`start`**. `start` is not a node and its outgoing edges are
+//! evaluated exactly once, at grammar 7.6's step 0, so a bound of at least one —
+//! which the range 1..=1000 guarantees — is never reached. Grammar 7.6.3 rule 2
+//! independently requires one edge leaving `start` to be unconditional or
+//! `else: true`, and the parser owns that rule, so the only shape this exemption
+//! passes over is already refused there and reporting it again would be one
+//! mistake said twice (PRD G3).
 //!
-//!   It is *reaches* and not *is a member of*, because what spends a budget is a
-//!   node running twice rather than a node looping: a node the loop routes to
-//!   runs once per pass (grammar 7.6: the union of the targets of the edges taken
-//!   at step k is step k+1), so its budget can be spent while the flow is still
-//!   running and the pass that spends it dead-ends on grammar 7.3 rule 7 — the
-//!   very failure this rule exists to remove. Only a node standing outside every
-//!   loop's reach ([`Graph::reached_by_cycle`]) is exempt.
+//! # A node outside every cycle is *not* exempt
 //!
-//!   Reachability is also where the exemption stops. A finer gate is arguable —
-//!   a node whose every incoming edge is *exclusive* with every in-SCC edge
-//!   (grammar 7.6.1) still runs once, however deep in the loop's reach it sits —
-//!   but grammar 7.4 states its escape bullet over "each `max_iterations`-carrying
-//!   edge" with no exemption at all. Every line of this one is therefore a
-//!   relaxation of what the grammar says, and a relaxation is kept no wider than
-//!   the argument that carries it.
+//! An earlier reading let a budget through whenever no cycle *reached* its
+//! source, on the premise that such a node executes once per flow instance and
+//! so never spends a bound of at least one. The premise is false, and a flow with
+//! no SCC anywhere disproves it: grammar 9.2 says `on_error: { fallback: n }`
+//! leaves the failing node's own edges unevaluated and schedules `n` "in the next
+//! step" instead, and grammar 8.7's `human.on_timeout:` schedules the same way.
+//! A node that is both an edge target and a control-transfer target therefore
+//! runs twice with nothing looping. Grammar 7.6.2 says so outright where it keeps
+//! control transfers out of `dist`: "where an error path does deliver to a
+//! convergence at some other depth, the runtime rule above governs" — and the
+//! runtime rule there is that the node is scheduled again and runs twice.
+//!
+//! The second pass spends a budget of 1, the exhausted edge stops being taken
+//! (grammar 7.3 rule 5), and a source whose remaining out-edges are all guarded
+//! dead-ends on grammar 7.3 rule 7 — the exact failure D19's rule exists to
+//! remove. Grammar 7.2's gloss of the key ("an unconditional or `else:` edge
+//! leaving the cycle") presupposes a cycle rather than exempting the shapes
+//! without one, and a static check that reads a presupposition as an exemption
+//! stops being conservative in the direction Decisions D99 and D112 care about:
+//! it accepts a composition that really can dead-end.
 
 use crate::diag::{Diagnostic, DiagnosticCode};
 use crate::ir::flow::Edge;
@@ -101,17 +105,11 @@ pub(crate) fn check<'a>(ctx: &mut Ctx<'a>, cx: &FlowCx<'a>, graph: &Graph<'a>) {
         );
     }
 
-    // A node no cycle reaches runs once, so its budget is never spent (above).
-    // The mask costs one walk, so it is taken only where a budget exists to ask
-    // about — which is no flow at all in most compositions.
-    let mut looping: Option<Vec<bool>> = None;
+    // Every budget a node can spend, which is every budget a node carries: only
+    // `start` is exempt, and `start` is not a node (above).
     for at in 0..graph.nodes().len() {
         for edge in graph.outgoing(Vertex::Node(at)) {
-            if graph.edge(*edge).max_iterations.is_none() {
-                continue;
-            }
-            let looping = looping.get_or_insert_with(|| graph.reached_by_cycle());
-            if !looping[at] || escapes(graph, at) {
+            if graph.edge(*edge).max_iterations.is_none() || escapes(graph, at) {
                 continue;
             }
             ctx.push(
@@ -186,9 +184,9 @@ fn escapes(graph: &Graph<'_>, node: usize) -> bool {
 }
 
 /// The edit that discharges the escape rule, which reads differently either side
-/// of the cycle: a looping node has to *leave* its SCC, while a node the loop
-/// merely routes to belongs to no SCC with an edge, so every outgoing edge of it
-/// already leaves one and only the guarantee is missing.
+/// of the cycle: a looping node has to *leave* its SCC, while a node outside
+/// every cycle is alone in its component, so every outgoing edge of it already
+/// leaves one and only the guarantee is missing.
 fn help(graph: &Graph<'_>, node: usize) -> String {
     let id = graph.id(node);
     if graph.cyclic(node) {
@@ -197,7 +195,7 @@ fn help(graph: &Graph<'_>, node: usize) -> String {
         );
     }
     format!(
-        "an exhausted edge is not taken whatever its guard says, and a cycle upstream runs `{id}` once per pass, so the budget is spent with the flow still going: give `{id}` an outgoing edge that is unconditional or carries `else: true` — a guarded escape is not enough (grammar 7.4, Decision D19)"
+        "an exhausted edge is not taken whatever its guard says, and a node outside every cycle can still run twice — a loop upstream routes to it once per pass, and `on_error: {{ fallback: … }}` or `human.on_timeout:` schedules it again — so the budget can be spent with the flow still going: give `{id}` an outgoing edge that is unconditional or carries `else: true` — a guarded escape is not enough (grammar 7.4, 9.2, Decision D19)"
     )
 }
 

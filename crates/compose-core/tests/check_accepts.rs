@@ -1337,15 +1337,15 @@ flow.f:
     );
 }
 
-/// A `max_iterations` on an edge **no cycle reaches** needs no escape. The
-/// budget counts traversals of that edge within one flow instance (grammar 7.4)
-/// and an acyclic node executes once, so a bound of at least one is never spent
-/// and the edge is never untakeable — there is no pass for an escape to catch.
-/// Grammar 7.4's escape bullet reads over every bounded edge while grammar 7.2's
-/// gloss of the key says "leaving the cycle", and refusing this shape would
-/// reject a runtime-safe composition (Decisions D19, D90, D99).
+/// Grammar 7.4's escape rule reads over the source of **every** bounded edge,
+/// and outside a cycle only clause (b) is left to satisfy: a node alone in its
+/// component is left by every outgoing edge it has, so an `else: true` sibling
+/// discharges the rule on its own. The rejecting half is
+/// `tests/fixtures/invalid-check/bounded-edge-outside-every-cycle-has-no-escape`,
+/// where the same shape carries only guarded siblings and a fallback runs the
+/// source a second time (grammar 7.4, 9.2, Decisions D19, D90).
 #[test]
-fn a_bounded_edge_outside_every_cycle_needs_no_escape() {
+fn a_bounded_edge_outside_every_cycle_escapes_through_an_else() {
     accepts(
         "acyclic-budget",
         r#"
@@ -1363,21 +1363,19 @@ flow.f:
   edges:
     - { from: start, to: a }
     - { from: a, to: b, when: "a.output.verdict == 'approve'", max_iterations: 3 }
-    - { from: a, to: c, when: "a.output.verdict != 'approve'" }
+    - { from: a, to: c, else: true }
     - { from: b, to: end }
     - { from: c, to: end }
 "#,
     );
 }
 
-/// The exemption above is *no cycle reaches this node*, not *this flow has no
-/// cycle*: a budget upstream of a loop is as inert as a budget in a flow with no
-/// loop at all, because the loop can never run its source a second time. The
-/// accompanying rejection is
-/// `tests/fixtures/invalid-check/bounded-edge-below-a-cycle-has-no-escape`,
-/// where the same budget sits *below* the loop (grammar 7.4, Decision D19).
+/// The rule is stated over the source node of the bounded edge and is checked
+/// there, whatever else bounds the SCC (grammar 7.4): `p` sits upstream of a
+/// loop it never joins, and its own `else: true` sibling is what discharges the
+/// rule — not the loop's `else:` exit, which belongs to `review`.
 #[test]
-fn a_bounded_edge_upstream_of_a_cycle_needs_no_escape() {
+fn a_bounded_edge_upstream_of_a_cycle_escapes_through_an_else() {
     accepts(
         "budget-above-a-cycle",
         r#"
@@ -1396,7 +1394,7 @@ flow.f:
   edges:
     - { from: start, to: p }
     - { from: p, to: q, when: "p.output.verdict == 'approve'", max_iterations: 3 }
-    - { from: p, to: write, when: "p.output.verdict != 'approve'" }
+    - { from: p, to: write, else: true }
     - { from: q, to: end }
     - { from: write, to: review }
     - { from: review, to: write, when: "review.output.verdict == 'revise'" }

@@ -299,24 +299,6 @@ impl<'a> Graph<'a> {
         walk(self.nodes.len(), &self.transfers(), self.entries())
     }
 
-    /// Every node a cycle can run, the cycle's own members included — the nodes
-    /// that execute **once per pass** rather than once per flow instance.
-    ///
-    /// The seeds are the members of every SCC with an edge, because that is what
-    /// a cycle is (grammar 7.2, 7.4) and the **edge** relation is what SCCs are
-    /// computed over (Decision D95). What is walked *from* them is the wider
-    /// **control-transfer** relation: a node a looping node falls back to, or
-    /// times out into, runs once per pass exactly as an edge target does, and the
-    /// question here is how many times a node can run rather than how it was
-    /// addressed.
-    pub(crate) fn reached_by_cycle(&self) -> Vec<bool> {
-        walk(
-            self.nodes.len(),
-            &self.transfers(),
-            (0..self.nodes.len()).filter(|at| self.cyclic(*at)),
-        )
-    }
-
     /// The control-transfer relation as an adjacency list: the edge relation plus
     /// `on_error: { fallback: … }` and `human.on_timeout:` (grammar 7.8).
     fn transfers(&self) -> Vec<Vec<usize>> {

@@ -3,7 +3,7 @@
 # message: the `max_iterations` edge from `n` to `x` in `flow.f` has no escape
 # at: main.yml:39:7
 # label: main.yml:31:5 the source node is here
-# help: an exhausted edge is not taken whatever its guard says, and a cycle upstream runs `n` once per pass, so the budget is spent with the flow still going: give `n` an outgoing edge that is unconditional or carries `else: true` — a guarded escape is not enough (grammar 7.4, Decision D19)
+# help: an exhausted edge is not taken whatever its guard says, and a node outside every cycle can still run twice — a loop upstream routes to it once per pass, and `on_error: { fallback: … }` or `human.on_timeout:` schedules it again — so the budget can be spent with the flow still going: give `n` an outgoing edge that is unconditional or carries `else: true` — a guarded escape is not enough (grammar 7.4, 9.2, Decision D19)
 #
 # `n` belongs to no cycle, but the loop through `a` and `b` reaches it: the edge
 # `b -> n` is co-takeable with the back-edge `b -> a` (grammar 7.6.1), so `n`
