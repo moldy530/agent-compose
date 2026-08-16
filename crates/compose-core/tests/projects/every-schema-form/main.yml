@@ -1,0 +1,178 @@
+# A codegen shape fixture: every form of grammar 3, every reduce policy of
+# grammar 10.2, and every `format:` of grammar 3.3, in one composition.
+#
+# `examples/` is the worked reference and is written to be *read*; this file is
+# written to be *emitted*. Between them the two examples reach maybe half of the
+# schema language, so a golden built only from them would leave `z.hostname()`,
+# `z.iso.duration()`, a `merge` channel's `Partial<…>`, a `unique_items` refine
+# and an empty field map unchecked against the real Zod — every one of which is a
+# spelling this compiler could get wrong in a way only a type-checker or a parse
+# would notice.
+#
+# It is deliberately the smallest graph that carries all of it: one flow, one
+# agent, one store, one tool. What is being covered here is the schema language,
+# not the topology.
+version: "0.1"
+
+state:
+  # Unreduced, no default: LangGraph's `LastValue`, unset until written (D78).
+  draft: { type: string }
+  # Unreduced with a default, which needs an initial value and so a reducer.
+  round: { type: integer, default: 1, minimum: 0, multiple_of: 1 }
+  # The three declared policies.
+  notes:
+    description: One element per write, in canonical write order.
+    type: array
+    max_items: 32
+    items: { type: string }
+    reduce: append
+  totals:
+    description: Partial until every property has been supplied (D101).
+    type: object
+    properties:
+      fixed: { type: integer }
+      skipped: { type: integer }
+    reduce: merge
+  latest: { type: string, reduce: last_wins, default: "" }
+  # A merge channel with a default is total from step 0.
+  seen:
+    type: object
+    properties:
+      count: { type: integer, minimum: 0 }
+    reduce: merge
+    default: { count: 0 }
+
+  # Every `format:` of grammar 3.3, on an input surface so a `default:` is legal
+  # beside one where it is interesting.
+  at:        { type: string, format: date-time }
+  on_day:    { type: string, format: date }
+  at_time:   { type: string, format: time }
+  lasting:   { type: string, format: duration }
+  who:       { type: string, format: email }
+  where:     { type: string, format: uri }
+  which:     { type: string, format: uuid }
+  host:      { type: string, format: hostname }
+  v4:        { type: string, format: ipv4 }
+  v6:        { type: string, format: ipv6 }
+
+  # The rest of the constraint vocabulary.
+  slug:      { type: string, pattern: "^[a-z][a-z0-9-]*$", min_length: 1, max_length: 64 }
+  ratio:     { type: number, exclusive_minimum: 0, exclusive_maximum: 1 }
+  step:      { type: number, minimum: -1.5, maximum: 1.5, multiple_of: 0.5 }
+  urgent:    { type: boolean, default: false }
+  mood:      { enum: [calm, brisk], default: calm }
+  tags:
+    type: array
+    min_items: 1
+    max_items: 8
+    unique_items: true
+    items: { type: string }
+  author:
+    type: object
+    properties:
+      name:  { type: string }
+      email: { type: string, format: email }
+      home:  { type: string, format: uri }
+    optional: [email, home]
+  # A union as a property type rather than as an array's `items:`, which is the
+  # other legal position (grammar 3.7).
+  origin:
+    type: object
+    properties:
+      source:
+        discriminator: kind
+        variants:
+          upload: { filename: { type: string } }
+          crawl:  { url: { type: string, format: uri }, depth: { type: integer, minimum: 0 } }
+
+provider.p:
+  kind: openai_compatible
+  api_key: ${SHAPES_KEY}
+  base_url: ${SHAPES_URL}
+
+model.m:
+  provider: provider.p
+  id: a-model
+
+# An empty input and an empty output: both legal on a tool, and both a closed
+# object with no properties (grammar 3.1, 3.9).
+tool.ping:
+  description: Has an effect and no arguments.
+  input: {}
+  output: {}
+  exec:
+    command: "true"
+
+store.notes:
+  kind: kv
+  scope: execution
+  description: What has been noted.
+  value_schema:
+    body:   { type: string }
+    weight: { type: number, minimum: 0 }
+
+store.docs:
+  kind: vector
+  scope: global
+  description: Documents to ground against.
+  embed:
+    model: text-embedding-3-small
+    provider: provider.p
+    dimensions: 8
+  metadata_schema:
+    source:     { type: string }
+    updated_at: { type: string, format: date-time }
+
+agent.shaper:
+  description: Produces one of everything.
+  model: model.m
+  prompt: Produce a shape.
+  input:
+    goal: { type: string, description: What to shape. }
+  output:
+    draft: { type: string, min_length: 1 }
+    findings:
+      description: A union inside a bounded array, the fan-out shape.
+      type: array
+      max_items: 16
+      items:
+        discriminator: kind
+        variants:
+          auto_fixable:
+            file:       { type: string }
+            confidence: { type: number, minimum: 0, maximum: 1 }
+          needs_human:
+            summary:  { type: string }
+            severity: { enum: [low, high, critical] }
+    author:
+      type: object
+      properties:
+        name:  { type: string }
+        email: { type: string, format: email }
+      optional: [email]
+
+flow.shape:
+  description: One pass over the shaper.
+  inputs:
+    goal: { type: string, min_length: 1 }
+  outputs:
+    draft: { type: string }
+    notes:
+      type: array
+      max_items: 32
+      items: { type: string }
+  nodes:
+    shape:
+      agent: agent.shaper
+      input:
+        goal: "input.goal"
+    ask:
+      human:
+        input:
+          draft: { type: string }
+        output:
+          decision: { enum: [approve, reject] }
+  edges:
+    - { from: start, to: shape }
+    - { from: shape, to: ask }
+    - { from: ask, to: end }

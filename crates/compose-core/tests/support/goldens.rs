@@ -22,13 +22,27 @@ pub struct Golden {
     pub target: &'static str,
 }
 
-/// The corpus: the two worked examples, and one of them under both targets.
+/// The corpus: the two worked examples, one of them under both targets, and a
+/// shape fixture.
 ///
 /// `examples/triage-fanout` appears twice because only the deploy layer forks per
 /// target (PRD 5.8's per-target invariant), and the environment references a
 /// project needs are the visible consequence — `staging` binds two storage
 /// backends whose `${ENV}` references `local` never sees.
+///
+/// `every-schema-form` is not an example and is not written to be read as one.
+/// Between them the two worked projects reach about half of grammar 3's
+/// vocabulary; the fixture reaches the rest — every `format:`, every reduce
+/// policy, `unique_items`, `pattern`, the exclusive numeric bounds, an empty
+/// field map, and a union in the property position rather than as an array's
+/// `items:`. Each of those is a spelling this compiler could get wrong in a way
+/// only `tsc` or a real parse would notice.
 pub const GOLDENS: &[Golden] = &[
+    Golden {
+        directory: "every-schema-form",
+        project: "crates/compose-core/tests/projects/every-schema-form",
+        target: "local",
+    },
     Golden {
         directory: "review-loop",
         project: "examples/review-loop",

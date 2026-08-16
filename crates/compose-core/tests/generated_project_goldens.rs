@@ -34,6 +34,21 @@ fn updating() -> bool {
     std::env::var_os("UPDATE_GOLDENS").is_some_and(|value| !value.is_empty())
 }
 
+/// Whether a test that *reads* the committed corpus should run.
+///
+/// Under `UPDATE_GOLDENS` one test is rewriting those directories while the
+/// others would be reading them, on cargo's parallel threads: every read is a
+/// race against a `remove_dir_all`. Regeneration is a maintenance action rather
+/// than a test run, so the readers stand down and the very next `cargo test`
+/// — the one whose diff is the point — runs all of them.
+fn regenerating() -> bool {
+    if updating() {
+        eprintln!("note: UPDATE_GOLDENS is set; this test reads the corpus and is standing down");
+        return true;
+    }
+    false
+}
+
 /// The committed project is what the compiler emits, byte for byte.
 #[test]
 fn every_example_emits_the_committed_project() {
@@ -112,6 +127,9 @@ fn emitting_the_same_composition_twice_answers_the_same_bytes() {
 /// Every golden carries the marker that says it is not source (PRD §8).
 #[test]
 fn every_golden_file_says_it_is_generated() {
+    if regenerating() {
+        return;
+    }
     for golden in GOLDENS {
         let root = goldens_root().join(golden.directory);
         assert!(root.is_dir(), "`{}` is not committed", golden.directory);
@@ -157,6 +175,9 @@ fn the_corpus_covers_more_than_one_target() {
 /// from the table rather than from the directory.
 #[test]
 fn no_golden_directory_is_an_orphan() {
+    if regenerating() {
+        return;
+    }
     let known: BTreeSet<&str> = GOLDENS.iter().map(|golden| golden.directory).collect();
     let mut found: Vec<String> = Vec::new();
     for entry in fs::read_dir(goldens_root()).expect("the golden corpus exists") {

@@ -75,5 +75,175 @@
       { "why": "below the bound", "valid": false, "document": { "last_report": "r", "patch_count": -1 } },
       { "why": "a boolean is not an integer", "valid": false, "document": { "last_report": "r", "patch_count": true } }
     ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "state.at_time",
+    "about": "`format: time` — RFC 3339 `full-time`, which requires an offset",
+    "documents": [
+      { "why": "`Z` is an offset", "valid": true, "document": "09:30:00Z" },
+      { "why": "so is `+02:00`", "valid": true, "document": "09:30:00+02:00" },
+      { "why": "fractional seconds are allowed", "valid": true, "document": "09:30:00.250Z" },
+      { "why": "no offset is not a full-time", "valid": false, "document": "09:30:00" },
+      { "why": "the hour is out of range", "valid": false, "document": "25:30:00Z" },
+      { "why": "not a time at all", "valid": false, "document": "half past nine" }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "state.on_day",
+    "about": "`format: date`",
+    "documents": [
+      { "why": "a calendar date", "valid": true, "document": "2026-08-16" },
+      { "why": "month 13 does not exist", "valid": false, "document": "2026-13-01" },
+      { "why": "a date-time is not a date", "valid": false, "document": "2026-08-16T09:30:00Z" }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "state.lasting",
+    "about": "`format: duration` — an ISO 8601 duration",
+    "documents": [
+      { "why": "a day and two hours", "valid": true, "document": "P1DT2H" },
+      { "why": "seconds alone", "valid": true, "document": "PT30S" },
+      { "why": "English is not ISO 8601", "valid": false, "document": "1 day" },
+      { "why": "the designator is required", "valid": false, "document": "1DT2H" }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "state.who",
+    "about": "`format: email`",
+    "documents": [
+      { "why": "an ordinary address", "valid": true, "document": "someone@example.test" },
+      { "why": "no domain", "valid": false, "document": "someone@" },
+      { "why": "no at sign", "valid": false, "document": "someone" }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "state.where",
+    "about": "`format: uri`",
+    "documents": [
+      { "why": "an absolute https URL", "valid": true, "document": "https://example.test/a?b=c" },
+      { "why": "another scheme", "valid": true, "document": "mailto:someone@example.test" },
+      { "why": "a bare host is not a URI", "valid": false, "document": "example.test" },
+      { "why": "not a URI at all", "valid": false, "document": "not a uri" }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "state.which",
+    "about": "`format: uuid`",
+    "documents": [
+      { "why": "a version 4 UUID", "valid": true, "document": "3f2504e0-4f89-41d3-9a0c-0305e82c3301" },
+      { "why": "a hyphen out of place", "valid": false, "document": "3f2504e04f8941d39a0c0305e82c3301" },
+      { "why": "not a UUID", "valid": false, "document": "nope" }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "state.host",
+    "about": "`format: hostname`",
+    "documents": [
+      { "why": "a dotted hostname", "valid": true, "document": "api.example.test" },
+      { "why": "a single label", "valid": true, "document": "localhost" },
+      { "why": "a space is not a hostname", "valid": false, "document": "not a host" },
+      { "why": "a label may not start with a hyphen", "valid": false, "document": "-bad.example.test" }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "state.v4",
+    "about": "`format: ipv4`",
+    "documents": [
+      { "why": "a documentation address", "valid": true, "document": "192.0.2.1" },
+      { "why": "an octet out of range", "valid": false, "document": "192.0.2.256" },
+      { "why": "three octets is not an address", "valid": false, "document": "192.0.2" }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "state.v6",
+    "about": "`format: ipv6`",
+    "documents": [
+      { "why": "a documentation address", "valid": true, "document": "2001:db8::1" },
+      { "why": "two elisions", "valid": false, "document": "2001::db8::1" },
+      { "why": "an IPv4 address is not an IPv6 one", "valid": false, "document": "192.0.2.1" }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "state.slug",
+    "about": "`pattern` (RE2, Decision D12) beside the length bounds",
+    "documents": [
+      { "why": "lowercase with a hyphen", "valid": true, "document": "a-slug-2" },
+      { "why": "uppercase is not in the class", "valid": false, "document": "A-Slug" },
+      { "why": "it may not start with a digit", "valid": false, "document": "2slug" },
+      { "why": "`max_length: 64`", "valid": false, "document": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "state.tags",
+    "about": "`min_items`, `max_items` and `unique_items` on one array (grammar 3.5)",
+    "documents": [
+      { "why": "distinct elements within the bounds", "valid": true, "document": ["a", "b"] },
+      { "why": "`min_items: 1` refuses the empty array", "valid": false, "document": [] },
+      { "why": "`unique_items: true` refuses a repeat", "valid": false, "document": ["a", "a"] },
+      { "why": "`max_items: 8` refuses nine", "valid": false, "document": ["a", "b", "c", "d", "e", "f", "g", "h", "i"] }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "state.ratio",
+    "about": "the exclusive numeric bounds (grammar 3.3)",
+    "documents": [
+      { "why": "strictly between", "valid": true, "document": 0.5 },
+      { "why": "the lower bound is exclusive", "valid": false, "document": 0 },
+      { "why": "the upper bound is exclusive", "valid": false, "document": 1 }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "state.step",
+    "about": "`multiple_of` on a fractional step (grammar 3.3)",
+    "documents": [
+      { "why": "a multiple of the step", "valid": true, "document": 1.5 },
+      { "why": "zero is a multiple of everything", "valid": true, "document": 0 },
+      { "why": "not a multiple", "valid": false, "document": 0.3 },
+      { "why": "outside the range", "valid": false, "document": 2 }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "state.origin",
+    "about": "a discriminated union in the property position rather than as `items:` (grammar 3.7)",
+    "documents": [
+      { "why": "one variant", "valid": true, "document": { "source": { "kind": "upload", "filename": "a.txt" } } },
+      { "why": "the other, with its own constraints", "valid": true, "document": { "source": { "kind": "crawl", "url": "https://example.test/a", "depth": 0 } } },
+      { "why": "a tag the union does not declare", "valid": false, "document": { "source": { "kind": "paste", "text": "x" } } },
+      { "why": "a variant's own constraint still applies", "valid": false, "document": { "source": { "kind": "crawl", "url": "not a uri", "depth": 0 } } }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "state.author",
+    "about": "`optional:` on a nested object (Decision D7)",
+    "documents": [
+      { "why": "only the required property", "valid": true, "document": { "name": "someone" } },
+      { "why": "an optional one supplied", "valid": true, "document": { "name": "someone", "email": "someone@example.test" } },
+      { "why": "the required one missing", "valid": false, "document": { "email": "someone@example.test" } },
+      { "why": "an optional property is still type-checked when present", "valid": false, "document": { "name": "someone", "email": "not an email" } }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "tool.ping.input",
+    "about": "an empty field map: a closed object with no properties (grammar 3.1)",
+    "documents": [
+      { "why": "nothing at all", "valid": true, "document": {} },
+      { "why": "closed means closed", "valid": false, "document": { "anything": 1 } }
+    ]
   }
 ]
