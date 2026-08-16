@@ -1,0 +1,32 @@
+# A module instantiated by flow.triage. Its inputs/outputs surface is the only
+# thing that crosses the boundary: a subgraph receives parent state exclusively
+# through explicit bindings (PRD 5.7).
+flow.enrich:
+  description: Normalize a raw bug report through the triage service.
+  inputs:
+    report: { type: string }
+  outputs:
+    report_normalized: { type: string }
+  nodes:
+    fetch:
+      http:
+        method: POST
+        url: "https://${TRIAGE_HOST}/v1/normalize"
+        headers:
+          authorization: "Bearer ${TRIAGE_TOKEN}"
+        body:
+          report: "input.report"
+        expect_status: [200]
+        # `report_normalized` is not an envelope name (`status`/`body` are), so
+        # it is DECODED from the JSON response body — always, whatever its type
+        # and however few fields there are. §6.1's single-string-property
+        # exception is a `tool.*`-surface rule and does not reach inline nodes,
+        # which name raw text with the `body` envelope field instead
+        # (grammar 8.3 / D91).
+        output:
+          report_normalized: { type: string }
+      timeout: 15s
+      retry: { max: 2, backoff: 1s, multiplier: 3.0, max_backoff: 20s }
+  edges:
+    - { from: start, to: fetch }
+    - { from: fetch, to: end }

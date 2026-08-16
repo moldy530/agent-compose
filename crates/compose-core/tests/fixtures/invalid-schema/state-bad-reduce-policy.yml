@@ -1,0 +1,8 @@
+# rule: reduce policies are exactly append | merge | last_wins (grammar 10.2 / PRD 5.6)
+# at: /state/results
+# via: /$defs/stateChannel/oneOf
+state:
+  results:
+    type: array
+    items: { type: string }
+    reduce: concat

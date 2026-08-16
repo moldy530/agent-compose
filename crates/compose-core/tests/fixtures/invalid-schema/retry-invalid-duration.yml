@@ -1,0 +1,8 @@
+# rule: durations are a single <positive integer><ms|s|m|h> segment (grammar 4.4)
+# at: /defaults/retry/backoff
+# via: /$defs/duration/pattern
+defaults:
+  timeout: 1m30s
+  retry:
+    max: 2
+    backoff: 5 seconds

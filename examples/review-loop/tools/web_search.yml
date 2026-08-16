@@ -1,0 +1,36 @@
+# One definition, two usage surfaces (PRD 5.5): attached to an agent's `tools:`
+# it is LLM-discovered; used as a `function` node it is graph-invoked with
+# checked arguments. The description is the LLM's selection signal.
+tool.web_search:
+  description: Search the public web and return ranked result snippets.
+  input:
+    query:
+      description: The search query.
+      type: string
+      min_length: 1
+    max_results:
+      description: How many results to return.
+      type: integer
+      minimum: 1
+      maximum: 10
+      default: 5
+  output:
+    results:
+      description: Ranked results, most relevant first.
+      type: array
+      max_items: 10
+      items:
+        type: object
+        properties:
+          title: { type: string }
+          url: { type: string, format: uri }
+          snippet: { type: string }
+  http:
+    method: GET
+    url: "https://${SEARCH_HOST}/v1/search"
+    headers:
+      authorization: "Bearer ${SEARCH_API_KEY}"
+    query:
+      q: "input.query"
+      n: "input.max_results"
+    expect_status: [200]

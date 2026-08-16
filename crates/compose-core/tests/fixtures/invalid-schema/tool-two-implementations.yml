@@ -1,0 +1,14 @@
+# rule: a tool definition binds exactly one implementation (exec | http | function) (grammar 6.1 / PRD 5.5)
+# at: /tool.web_search
+# via: /$defs/toolDef/oneOf
+tool.web_search:
+  description: Search the public web.
+  input:
+    query: { type: string }
+  output:
+    body: { type: string }
+  exec:
+    command: search-cli
+  http:
+    method: GET
+    url: "https://${SEARCH_HOST}/v1/search"

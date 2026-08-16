@@ -1,0 +1,19 @@
+# Dispatched once per `auto_fixable` finding. Its input is validated against
+# that variant's payload only — discriminated-union narrowing, not a
+# lowest-common-denominator item type (PRD 5.6).
+agent.fixer:
+  description: Produces a patch for one mechanically fixable finding.
+  model: model.fast
+  prompt: |
+    You write minimal unified diffs. Fix exactly the described defect in the
+    named file and change nothing else.
+  input:
+    file: { type: string }
+    patch_hint: { type: string }
+  output:
+    patch:
+      description: A unified diff.
+      type: string
+    explanation:
+      description: One sentence describing the change.
+      type: string

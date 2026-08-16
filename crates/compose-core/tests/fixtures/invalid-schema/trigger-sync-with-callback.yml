@@ -1,0 +1,11 @@
+# rule: `callback:` is async-only — a synchronous response already returns the outputs (grammar 13.3)
+# at: /triggers/on_request
+# via: /$defs/httpTrigger/allOf/0/then/not
+triggers:
+  on_request:
+    type: http
+    flow: flow.review_loop
+    path: /review
+    respond: sync
+    timeout: 30s
+    callback: "payload.body.callback_url"

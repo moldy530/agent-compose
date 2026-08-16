@@ -1,0 +1,17 @@
+# rule: `expect_exit:`/`expect_status:` members are distinct - membership is a set test, so a repeated member is inert (grammar 6.1 / D100)
+# at: /flow.notify/nodes/ping/http/expect_status
+# via: /$defs/expectStatus/uniqueItems
+flow.notify:
+  outputs: {}
+  nodes:
+    ping:
+      http:
+        method: POST
+        url: "https://${HOOKS_HOST}/notify"
+        # `200` twice accepts exactly what `[200]` accepts.
+        expect_status: [200, 200]
+        output:
+          status: { type: integer }
+  edges:
+    - { from: start, to: ping }
+    - { from: ping, to: end }

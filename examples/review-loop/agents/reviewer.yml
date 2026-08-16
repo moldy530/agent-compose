@@ -1,0 +1,28 @@
+# The `verdict` enum is the routing surface: the LLM decides the value, the
+# compiled router decides the transition (PRD 5.3). Exhaustiveness checking
+# proves both variants are routed in flow.review_loop.
+agent.reviewer:
+  description: Reviews a draft against the goal and returns a routable verdict.
+  model: model.smart
+  prompt: |
+    You are a meticulous technical reviewer.
+
+    Approve only when the draft fully satisfies the goal, is internally
+    consistent, and contains no unsupported claims. Otherwise ask for a
+    revision and list every required change explicitly.
+  tools: [tool.web_search]
+  max_tool_iterations: 4
+  input:
+    goal:
+      description: What the draft must accomplish.
+      type: string
+    draft:
+      description: The draft under review.
+      type: string
+  output:
+    verdict:
+      description: approve ends the loop; revise sends the draft back to the writer.
+      enum: [approve, revise]
+    feedback:
+      description: Required changes, empty when approving.
+      type: string

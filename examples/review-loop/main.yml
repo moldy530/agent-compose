@@ -1,0 +1,35 @@
+# examples/review-loop — the PRD section 6 sketch, written in the final grammar.
+#
+# Exercises: agent defs with structured output, a bounded cycle (write <-> review),
+# exhaustive verdict routing, a tool def, provider/model defs with a fallback
+# route, and manual + http triggers.
+#
+# Entrypoint: the only file that may declare `imports:` (grammar 1.4).
+version: "0.1"
+
+imports:
+  - providers.yml
+  - models.yml
+  - agents/researcher.yml
+  - agents/reviewer.yml
+  - tools/web_search.yml
+  - flows/review_loop.yml
+  - triggers.yml
+
+# Project-wide node policy: level 3 of the resolution chain (grammar 9.3).
+defaults:
+  timeout: 120s
+  on_error: fail
+
+# Shared graph state. `verdict` is deliberately NOT a channel: it stays
+# node-scoped and is read by the edge guards as review.output.verdict
+# (grammar 8.0, 10.3).
+state:
+  draft:
+    description: The current draft, rewritten on every pass.
+    type: string
+    default: ""
+  feedback:
+    description: The reviewer's most recent feedback, fed back into the writer.
+    type: string
+    default: ""

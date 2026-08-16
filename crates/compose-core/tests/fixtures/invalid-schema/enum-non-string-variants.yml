@@ -1,0 +1,8 @@
+# rule: enum variants MUST be strings - routing exhaustiveness is defined over string variants (grammar 3.3 / PRD 5.3)
+# at: /agent.rater/output/level
+# via: /$defs/outputTypeNode/oneOf
+agent.rater:
+  model: model.smart
+  prompt: Rate the draft.
+  output:
+    level: { enum: [1, 2, 3] }

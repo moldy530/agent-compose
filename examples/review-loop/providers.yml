@@ -1,0 +1,5 @@
+# Connection layer (PRD 5.9). Credentials are ${ENV} references, never literals;
+# they survive unresolved into the IR and are checked for presence at build time.
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}

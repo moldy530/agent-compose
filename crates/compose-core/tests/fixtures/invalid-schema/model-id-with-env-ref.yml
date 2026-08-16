@@ -1,0 +1,6 @@
+# rule: env refs are illegal in a model `id:` - the id is part of the composition's identity, not of its environment (grammar 4.3 / PRD 5.9)
+# at: /model.smart/id
+# via: /$defs/noEnvRefString/not
+model.smart:
+  provider: provider.anthropic
+  id: ${MODEL_ID}

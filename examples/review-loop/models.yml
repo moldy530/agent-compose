@@ -1,0 +1,21 @@
+# Behavior layer (PRD 5.9). Agents reference model.* only: swapping the project
+# from hosted to local inference is a one-line edit in providers.yml.
+model.smart:
+  provider: provider.anthropic
+  id: claude-sonnet-4-6
+  settings:
+    max_tokens: 8000
+    thinking:
+      budget_tokens: 4000
+
+model.fast:
+  provider: provider.anthropic
+  id: claude-haiku-4-5
+  settings:
+    temperature: 0.2
+
+# Ordered failover on infrastructure conditions only. Route members must be
+# capability-equivalent so failover cannot break structured output.
+model.default:
+  route: [model.smart, model.fast]
+  route_on: [rate_limit, overloaded, timeout]

@@ -1,0 +1,14 @@
+# rule: `expect_status:` is a non-empty list of 100..599 - an empty one accepts no response at all, making every call an error (grammar 6.1 / D80)
+# at: /tool.notify/http/expect_status
+# via: /$defs/expectStatus/minItems
+tool.notify:
+  description: Post a notification to the hooks service.
+  input:
+    message: { type: string }
+  output: {}
+  http:
+    method: POST
+    url: "https://${HOOKS_HOST}/notify"
+    body:
+      message: "input.message"
+    expect_status: []

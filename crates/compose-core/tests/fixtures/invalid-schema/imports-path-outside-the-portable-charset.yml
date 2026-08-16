@@ -1,0 +1,6 @@
+# rule: an import path is `/`-separated segments of [A-Za-z0-9_][A-Za-z0-9_.-]* (or `.`/`..`) - no whitespace, no backslashes (grammar 1.4 / D80)
+# at: /imports/0
+# via: /properties/imports/items/pattern
+version: "0.1"
+imports:
+  - "my dir/providers.yml"

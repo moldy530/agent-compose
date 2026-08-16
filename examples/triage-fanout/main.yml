@@ -1,0 +1,68 @@
+# examples/triage-fanout — bug triage with heterogeneous fan-out.
+#
+# Exercises: discriminator-routed `map` with per-variant narrowing, per-item
+# retry, and a `default:` catch-all sink, an `exec`-backed tool used as a
+# `function` node, kv and vector stores (both consumption surfaces), a `human`
+# node, reduced state channels, a pair of concurrent branches converging at
+# equal depth (grammar 7.6), a node reachable only through an `on_error:`
+# fallback (grammar 7.8), and the reserved grammar (schedule + event triggers,
+# placements, event_sources).
+#
+# The project is written to validate under `--target local` AND under the
+# `--target staging` it ships in deploy/ — which is why no route is detached
+# (grammar 8.6 rule 7, tools/dead_letter.yml).
+version: "0.1"
+
+imports:
+  - providers.yml
+  - models.yml
+  - agents/triage.yml
+  - agents/fixer.yml
+  - agents/summarizer.yml
+  - tools/repo_grep.yml
+  - tools/review_queue.yml
+  - tools/dead_letter.yml
+  - stores/docs.yml
+  - stores/triage_memory.yml
+  - flows/enrich.yml
+  - flows/triage.yml
+  - triggers.yml
+
+defaults:
+  timeout: 90s
+  retry: { max: 1, backoff: 2s }
+  on_error: fail
+
+state:
+  report_normalized:
+    description: The report after flow.enrich has normalized it.
+    type: string
+    default: ""
+
+  matches:
+    description: Raw grep hits handed to the triage agent.
+    type: array
+    items: { type: string }
+
+  # Written from inside a `map`, so it MUST declare a reduce policy (PRD 5.6).
+  # Each dispatched instance contributes ONE element — `agent.fixer.output.patch`
+  # is a string and `items:` here is a string (grammar 10.2) — and appended
+  # values are index-tagged and reordered by source-item index before the join,
+  # which is what keeps replay deterministic. Contrast `matches` above: an
+  # unreduced channel takes the whole array in one write.
+  patches:
+    description: Patches produced by the fixer instances.
+    type: array
+    max_items: 200
+    items: { type: string }
+    reduce: append
+
+  summary:
+    description: Human-readable summary of the triage run.
+    type: string
+    default: ""
+
+  human_decision:
+    description: What the reviewer decided about the run as a whole.
+    enum: [approve, reject]
+    default: approve

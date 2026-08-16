@@ -1,0 +1,22 @@
+# The entrypoints of a project are exactly the flows its DECLARED triggers point
+# at (PRD 5.11). There is no `entrypoint:` key.
+triggers:
+  # Declaring this one is optional: `agent-compose run flow.review_loop` works
+  # for every flow whether or not a manual trigger names it (grammar 13, D64).
+  # Written out here for clarity. A manual trigger declares no `input:` — CLI
+  # arguments are validated against the flow's input schema at run start
+  # (grammar 13.2).
+  cli:
+    type: manual
+    flow: flow.review_loop
+
+  on_request:
+    type: http
+    flow: flow.review_loop
+    path: /review
+    method: POST
+    input:
+      goal: "payload.body.goal"
+    session_key: "payload.headers['x-session-id']"
+    respond: async
+    callback: "payload.body.callback_url"

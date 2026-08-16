@@ -1,0 +1,24 @@
+# Target of the map's `default:` route — a sink: it writes no reduced state, so
+# whether the join waits on it is purely a `detach:` decision at the route.
+#
+# The route keeps `detach: false` on purpose. `detach` is a target-dependent
+# restriction in v0 (grammar 8.6 rule 7 / 14, PRD 5.6): legal under
+# `--target local`, which is not durably checkpointed, and a validation error
+# under every other target until the outbox-pattern delivery lands. This project
+# ships `deploy/staging.yml`, so it is written to validate under BOTH
+# `--target local` and `--target staging`.
+tool.dead_letter:
+  description: Record an unroutable finding for later inspection.
+  input:
+    kind: { type: string }
+    payload: { type: string }
+  output:
+    accepted: { type: boolean }
+  http:
+    method: POST
+    url: "https://${QUEUE_HOST}/v1/dead-letter"
+    headers:
+      authorization: "Bearer ${QUEUE_TOKEN}"
+    body:
+      kind: "input.kind"
+      payload: "input.payload"

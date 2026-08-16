@@ -1,0 +1,17 @@
+# rule: a human node with `timeout:` MUST declare the `on_timeout:` route (grammar 8.7 / PRD 5.5)
+# at: /flow.approval/nodes/approve/human
+# via: /$defs/humanNode/properties/human/dependentRequired
+flow.approval:
+  outputs:
+    decision: { type: string }
+  nodes:
+    approve:
+      human:
+        input:
+          draft: { type: string }
+        output:
+          decision: { enum: [approve, reject] }
+        timeout: 24h
+  edges:
+    - { from: start, to: approve }
+    - { from: approve, to: end }

@@ -1,0 +1,19 @@
+# rule: node-level `timeout:`/`retry:` are illegal on a human node - a wait is not an activity timeout, and the exemption holds at every level of the policy chain (grammar 8.7, 9.3 / D52, D102)
+# at: /flow.approval/nodes/approve
+# via: /$defs/humanNode/additionalProperties
+flow.approval:
+  outputs:
+    decision: { type: string }
+  nodes:
+    approve:
+      human:
+        input:
+          draft: { type: string }
+        output:
+          decision: { enum: [approve, reject] }
+        timeout: 24h
+        on_timeout: end
+      timeout: 90s
+  edges:
+    - { from: start, to: approve }
+    - { from: approve, to: end }

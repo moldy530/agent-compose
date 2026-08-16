@@ -1,0 +1,18 @@
+# rule: `map.over` is a path expression, not arbitrary CEL - the array schema must be statically resolvable (grammar 4.2 / PRD 5.6)
+# at: /flow.work/nodes/fan/map/over
+# via: /$defs/pathExpression/pattern
+flow.work:
+  outputs:
+    done: { type: boolean }
+  nodes:
+    plan:
+      agent: agent.planner
+    fan:
+      map:
+        over: "plan.output.tasks.filter(t, t.ready)"
+        node: agent.worker
+        max_concurrency: 4
+  edges:
+    - { from: start, to: plan }
+    - { from: plan, to: fan }
+    - { from: fan, to: end }

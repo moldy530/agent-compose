@@ -1,0 +1,15 @@
+# rule: an inline `http:` node builds its request from named fields, so a scalar `input:` names no destination and is illegal (grammar 8.0, 8.3 / D88)
+# at: /flow.notify/nodes/ping/input
+# via: /$defs/fieldInputBindings/type
+flow.notify:
+  outputs:
+    done: { type: boolean }
+  nodes:
+    ping:
+      http:
+        method: POST
+        url: "https://${HOOKS_HOST}/notify"
+      input: "state.draft"
+  edges:
+    - { from: start, to: ping }
+    - { from: ping, to: end }

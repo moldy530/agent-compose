@@ -1,0 +1,10 @@
+# rule: scalar constraints are type-appropriate - `pattern` and `format` are string-only, `minimum` is numeric-only (grammar 3.3)
+# at: /agent.rater/output/count
+# via: /$defs/outputTypeNode/oneOf
+agent.rater:
+  model: model.smart
+  prompt: Rate the draft.
+  output:
+    count:
+      type: integer
+      pattern: "^[0-9]+$"

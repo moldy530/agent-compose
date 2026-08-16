@@ -1,0 +1,36 @@
+# Selected by `--target staging`; never imported. Only this layer forks per
+# environment: agents/, flows/, stores/, and tools/ are env-invariant
+# (PRD 5.8 per-target invariant).
+version: "0.1"
+
+# RESERVED (PRD 5.10): parsed and validated in v0, executed in M3. Map instances
+# are the natural unit for `runtime: isolated` — one worker per sandbox, with no
+# change to the logical definition.
+placements:
+  agent.fixer:
+    runtime: isolated
+    network: egress
+  flow.triage:
+    runtime: colocated
+
+storage_backends:
+  defaults:
+    kv:
+      provider: redis
+      url: ${REDIS_URL}
+  aliases:
+    # store.docs declares `backend: docs_db`; this is where that abstract slot
+    # becomes physical. Swapping staging to pgvector is a one-line edit here.
+    docs_db:
+      provider: chroma
+      url: ${CHROMA_URL}
+      index: project-docs
+
+# RESERVED (PRD 5.11): binds the logical `source: bug_reports` of the `ingest`
+# trigger to infrastructure. Delivery is at-least-once with inbound dedupe.
+event_sources:
+  bug_reports:
+    kind: redis_streams
+    url: ${REDIS_URL}
+    stream: bug-reports
+    consumer_group: agent-compose

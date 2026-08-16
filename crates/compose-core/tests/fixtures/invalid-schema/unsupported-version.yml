@@ -1,0 +1,6 @@
+# rule: `version:` MUST be one of the compiler build's SUPPORTED_SPEC_VERSIONS - old syntax is never silently reinterpreted (grammar 1.3 / PRD 9.5)
+# at: /version
+# via: /properties/version/enum
+version: "9.9"
+imports:
+  - agents/reviewer.yml

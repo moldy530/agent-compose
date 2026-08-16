@@ -1,0 +1,14 @@
+# rule: a tool definition MUST carry an LLM-facing description - it is the selection signal (grammar 6 / PRD 5.5)
+# at: /tool.web_search
+# via: /$defs/toolDef/required
+tool.web_search:
+  input:
+    query: { type: string }
+  output:
+    results:
+      type: array
+      max_items: 10
+      items: { type: string }
+  http:
+    method: GET
+    url: "https://${SEARCH_HOST}/v1/search"

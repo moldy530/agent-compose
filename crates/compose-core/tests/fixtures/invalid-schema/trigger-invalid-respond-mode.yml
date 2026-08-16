@@ -1,0 +1,8 @@
+# rule: an http trigger responds `sync` or `async` (grammar 13.3 / PRD 5.11)
+# at: /triggers/on_request/respond
+# via: /$defs/httpTrigger/properties/respond/enum
+triggers:
+  on_request:
+    type: http
+    flow: flow.review_loop
+    respond: maybe

@@ -1,0 +1,13 @@
+# rule: `else:` takes the literal `true`; an unguarded edge is already unconditional, so `else: false` would mean nothing (grammar 7.2, 7.3)
+# at: /flow.simple/edges/1/else
+# via: /$defs/edge/properties/else/const
+flow.simple:
+  outputs:
+    draft: { type: string }
+  nodes:
+    write:
+      agent: agent.researcher
+      input: "input.goal"
+  edges:
+    - { from: start, to: write }
+    - { from: write, to: end, else: false }

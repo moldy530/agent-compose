@@ -1,0 +1,6 @@
+# rule: `route:` members must be distinct - a repeated member fails over to the model that just failed (grammar 12.2 / D80)
+# at: /model.default/route
+# via: /$defs/modelRouteForm/properties/route/uniqueItems
+model.default:
+  route: [model.smart, model.smart]
+  route_on: [rate_limit, overloaded]

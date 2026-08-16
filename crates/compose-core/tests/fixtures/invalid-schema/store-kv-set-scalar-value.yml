@@ -1,0 +1,15 @@
+# rule: a `kv set` writes a value_schema-shaped object, so `value:` is a field map of CEL expressions, never a bare expression (grammar 11.4)
+# at: /flow.work/nodes/save/value
+# via: /$defs/storeNode/allOf/7/then/properties/value/type
+flow.work:
+  outputs:
+    done: { type: boolean }
+  nodes:
+    save:
+      store: store.prefs
+      op: set
+      key: "execution.session_key"
+      value: "input.theme"
+  edges:
+    - { from: start, to: save }
+    - { from: save, to: end }

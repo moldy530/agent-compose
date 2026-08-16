@@ -1,0 +1,24 @@
+# The built-in target, selected by `--target local` or by naming no target at
+# all. `local` runs in one process with an in-memory checkpointer and substitutes
+# SQLite/local disk for EVERY store unconditionally — PRD 5.8's zero-infra
+# guarantee (grammar 14 / D87). Three consequences are visible here:
+#
+#   * `storage_backends:` would be a compile error in this file. Under `local` no
+#     alias and no per-kind default is ever consulted, so a backend block could
+#     only be an inert key — contrast deploy/staging.yml, where `store.docs`'s
+#     `backend: docs_db` becomes chroma.
+#   * the two target-dependent binding checks are satisfied vacuously: `docs_db`
+#     needs no alias definition here, and the `ingest` trigger's
+#     `source: bug_reports` needs no `event_sources:` entry, because `local` runs
+#     no consumer process. That is what lets this project validate and run with
+#     no infrastructure installed while still shipping a staging target.
+#   * the file is OPTIONAL — deleting it changes nothing but the placements
+#     below, which are reserved no-ops in v0 anyway.
+version: "0.1"
+
+placements:
+  agent.fixer:
+    runtime: colocated
+    description: Isolated under staging; in-process locally, where there is one process.
+  flow.triage:
+    runtime: colocated

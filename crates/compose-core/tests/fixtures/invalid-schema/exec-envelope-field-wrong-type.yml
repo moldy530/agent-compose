@@ -1,0 +1,15 @@
+# rule: an inline exec node's envelope fields are synthesized from the process and have fixed types — `exit_code` is an integer (grammar 8.2)
+# at: /flow.work/nodes/run/exec/output/exit_code/type
+# via: /$defs/execEnvelopeFields/properties/exit_code/properties/type/const
+flow.work:
+  outputs:
+    done: { type: boolean }
+  nodes:
+    run:
+      exec:
+        command: run-checks
+        output:
+          exit_code: { type: string }
+  edges:
+    - { from: start, to: run }
+    - { from: run, to: end }

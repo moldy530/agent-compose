@@ -1,0 +1,7 @@
+# rule: an agent definition MUST bind a model (grammar 5 / PRD 5.9)
+# at: /agent.reviewer
+# via: /$defs/agentDef/required
+agent.reviewer:
+  prompt: Review the draft and return a verdict.
+  output:
+    verdict: { enum: [approve, revise] }

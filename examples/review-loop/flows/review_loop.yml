@@ -1,0 +1,53 @@
+# A flow is a module: its inputs/outputs surface is interchangeable with a
+# tool's, so this flow could also be attached to an agent's `tools:` list
+# (PRD 5.1). `description:` is present for exactly that reason.
+flow.review_loop:
+  description: Draft a document and revise it until the reviewer approves.
+  inputs:
+    goal:
+      description: What the finished draft must accomplish.
+      type: string
+      min_length: 1
+  outputs:
+    draft:
+      description: The approved draft, read from the `draft` state channel.
+      type: string
+
+  nodes:
+    # `input:` bindings are CEL over input/state/execution (grammar 8.0).
+    # `input.goal` is the flow input; `state.feedback` is a declared channel.
+    write:
+      agent: agent.researcher
+      input:
+        goal: "input.goal"
+        feedback: "state.feedback"
+      retry: { max: 2, backoff: 5s }
+
+    review:
+      agent: agent.reviewer
+      input:
+        goal: "input.goal"
+        draft: "state.draft"
+      timeout: 90s
+      on_error: { fallback: end }
+
+  edges:
+    - { from: start, to: write }
+    - { from: write, to: review }
+
+    # Back-edge closing the write <-> review cycle. `max_iterations` is the
+    # termination guard the SCC check requires (PRD 5.4).
+    - from: review
+      to: write
+      when: "review.output.verdict == 'revise'"
+      max_iterations: 3
+
+    # The escape edge the bounded cycle requires (grammar 7.4): it leaves the SCC
+    # and is an `else:`, so it is guaranteed to fire when no guarded sibling was
+    # taken — on `approve`, and equally on the pass where `revise` comes back but
+    # the back-edge's budget is spent. A guarded escape would leave that pass
+    # with no viable route. It is also what makes the `verdict` enum exhaustively
+    # routed (grammar 7.3.1).
+    - from: review
+      to: end
+      else: true

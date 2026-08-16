@@ -1,0 +1,21 @@
+# rule: an inline exec/http node's `output` is a result schema too, so arrays inside it MUST declare max_items (grammar 3.5 / D96)
+# at: /flow.build/nodes/list_targets/exec/output/names
+# via: /$defs/outputTypeNode/oneOf
+flow.build:
+  outputs:
+    names:
+      type: array
+      max_items: 50
+      items: { type: string }
+  nodes:
+    list_targets:
+      exec:
+        command: list-targets
+        output:
+          # No `max_items:` — legal on an input surface, a compile error here.
+          names:
+            type: array
+            items: { type: string }
+  edges:
+    - { from: start, to: list_targets }
+    - { from: list_targets, to: end }

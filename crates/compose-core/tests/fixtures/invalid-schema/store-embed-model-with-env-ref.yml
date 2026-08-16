@@ -1,0 +1,9 @@
+# rule: env refs are illegal in `embed.model` - an embedding model id is part of the composition's identity, exactly as a model `id:` is (grammar 4.3 class 3 / Decision D92)
+# at: /store.docs/embed/model
+# via: /$defs/noEnvRefString/not
+store.docs:
+  kind: vector
+  scope: global
+  embed:
+    model: ${EMBED_MODEL}
+    provider: provider.openai

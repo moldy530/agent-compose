@@ -1,0 +1,25 @@
+# rule: a discriminator-routed map declares `writes:` per route; a map-level one would name output fields only some route targets declare (grammar 8.6 rule 7 / D85)
+# at: /flow.work/nodes/fan/map/writes
+# via: /$defs/mapNode/properties/map/allOf/1/then/properties/writes
+flow.work:
+  outputs:
+    done: { type: boolean }
+  nodes:
+    plan:
+      agent: agent.planner
+    fan:
+      map:
+        over: plan.output.findings
+        route_by: kind
+        max_concurrency: 4
+        writes:
+          patch: patches
+        routes:
+          auto_fixable:
+            node: agent.fixer
+          needs_human:
+            node: tool.review_queue
+  edges:
+    - { from: start, to: plan }
+    - { from: plan, to: fan }
+    - { from: fan, to: end }

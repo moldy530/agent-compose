@@ -1,0 +1,18 @@
+# rule: a control-transfer target is a flow-local node id or `end`, never `start` — re-entering a flow from a timeout has no defined input (grammar 2.4)
+# at: /flow.approval/nodes/approve/human/on_timeout
+# via: /$defs/controlTarget/allOf/1/not
+flow.approval:
+  outputs:
+    decision: { enum: [approve, reject] }
+  nodes:
+    approve:
+      human:
+        input:
+          draft: { type: string }
+        output:
+          decision: { enum: [approve, reject] }
+        timeout: 24h
+        on_timeout: start
+  edges:
+    - { from: start, to: approve }
+    - { from: approve, to: end }

@@ -428,7 +428,10 @@ Formerly open, now settled — rationale lives in the referenced sections:
 
 ## 10. Open Questions
 
-_None. New questions raised during grammar/spec work land here and must be resolved (moved to §9) before implementation of the affected area begins._
+_New questions raised during grammar/spec work land here and must be resolved (moved to §9) before implementation of the affected area begins._
+
+1. **`agent_access` on store attachment** (raised by grammar spec, Decision D37): should an agent's `stores:` entry support narrowing the synthesized tool surface to read-only (`agent_access: read`, default `read_write`)? Extends 5.8 with a least-privilege knob the PRD doesn't ask for; changes which tools codegen synthesizes. Must be resolved before M1 implements store-tool synthesis. Declining costs one optional key.
+2. **`max_tool_iterations` on agents** (raised by grammar spec, Decision D51): should agents declare a bound on the intra-agent tool-call loop (default 8)? 5.4 bounds graph cycles only; the tool loop is the one remaining unbounded loop in a compiled graph. Must be resolved before M1 emits the agent tool loop. Declining costs one optional key and defers to runtime defaults.
 
 ## 11. References
 

@@ -1,0 +1,1999 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/moldy530/agent-compose/main/schemas/agent-compose.schema.json",
+  "title": "agent-compose spec file",
+  "description": "Structural schema for a single agent-compose YAML file (spec file or deploy/<target>.yml). Per-file shape only: cross-file reference resolution, exhaustiveness, cycle termination, and every other static check listed in docs/grammar.md Appendix B belong to `agent-compose validate`. Grammar: docs/grammar.md.",
+  "type": "object",
+  "properties": {
+    "version": {
+      "description": "Spec version. Required in the entrypoint (main.yml) and in every deploy/<target>.yml; optional in imported files, where it must match the entrypoint. Must be one of the compiler build's SUPPORTED_SPEC_VERSIONS. Grammar 1.3.",
+      "enum": ["0.1"]
+    },
+    "imports": {
+      "description": "Explicit list of spec files composing this project, relative to the entrypoint's directory. No directory scanning, no globs, no transitive imports: only the entrypoint may declare this key. Grammar 1.4 / PRD 5.1.",
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "description": "Relative path to a spec file: `/`-separated segments, each `.`, `..`, or a name matching [A-Za-z0-9_][A-Za-z0-9_.-]*, ending in .yml or .yaml. No leading /, no backslashes, no whitespace - one portable spelling keeps a path identical in the IR, on a command line, and in a diagnostic on every host. Grammar 1.4.",
+        "type": "string",
+        "pattern": "^(([A-Za-z0-9_][A-Za-z0-9_.-]*|\\.\\.?)/)*[A-Za-z0-9_][A-Za-z0-9_.-]*\\.(yml|yaml)$"
+      }
+    },
+    "defaults": {
+      "description": "Project-wide node policy defaults: the third level of the retry/timeout/on_error resolution chain (flow override > node > defaults > built-in fail). At most one `defaults:` section per composition. Grammar 9.3 / PRD 5.5.",
+      "$ref": "#/$defs/policyBlock"
+    },
+    "state": {
+      "description": "Shared graph state: one entry per channel, each a type node plus the channel-only keys `reduce` and `default`. At most one `state:` section per composition. Grammar 10 / PRD 5.7.",
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/channelName" },
+      "additionalProperties": { "$ref": "#/$defs/stateChannel" }
+    },
+    "triggers": {
+      "description": "What causes an execution to exist. The entrypoints of a project are exactly the flows its triggers point at. At most one `triggers:` section per composition. Grammar 13 / PRD 5.11.",
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/identifier" },
+      "additionalProperties": { "$ref": "#/$defs/trigger" }
+    },
+    "placements": {
+      "description": "DEPLOY FILE ONLY. Placement annotations per component address. Parsed and validated in v0, executed in M3. Grammar 14.1 / PRD 5.10.",
+      "type": "object",
+      "propertyNames": {
+        "description": "An agent., tool., or flow. address defined in the composition.",
+        "type": "string",
+        "pattern": "^(agent|tool|flow)\\.[a-z][a-z0-9_]{0,63}$"
+      },
+      "additionalProperties": { "$ref": "#/$defs/placement" }
+    },
+    "storage_backends": {
+      "description": "DEPLOY FILE ONLY. Physical backing for stores: per-kind defaults plus named aliases that `store.<s>.backend` refers to. Resolution: explicit alias -> per-kind defaults -> target built-in. Grammar 14.2 / PRD 5.8.",
+      "type": "object",
+      "properties": {
+        "defaults": {
+          "description": "Per-store-kind fallback backend, used by stores that declare no `backend:` alias.",
+          "type": "object",
+          "properties": {
+            "kv": { "$ref": "#/$defs/kvBackend" },
+            "vector": { "$ref": "#/$defs/vectorBackend" },
+            "blob": { "$ref": "#/$defs/blobBackend" }
+          },
+          "additionalProperties": false
+        },
+        "aliases": {
+          "description": "Named abstract slots. A store's `backend: <alias>` resolves here for this target; an alias referenced but undefined in the active target is a compile error.",
+          "type": "object",
+          "propertyNames": { "$ref": "#/$defs/identifier" },
+          "additionalProperties": { "$ref": "#/$defs/anyBackend" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "event_sources": {
+      "description": "DEPLOY FILE ONLY. Binds the logical `source:` names used by event triggers to infrastructure. RESERVED: parsed and validated in v0, executed in M3. Grammar 14.3 / PRD 5.11.",
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/identifier" },
+      "additionalProperties": { "$ref": "#/$defs/eventSource" }
+    }
+  },
+  "patternProperties": {
+    "^agent\\.[a-z][a-z0-9_]{0,63}$": { "$ref": "#/$defs/agentDef" },
+    "^tool\\.[a-z][a-z0-9_]{0,63}$": { "$ref": "#/$defs/toolDef" },
+    "^flow\\.[a-z][a-z0-9_]{0,63}$": { "$ref": "#/$defs/flowDef" },
+    "^store\\.[a-z][a-z0-9_]{0,63}$": { "$ref": "#/$defs/storeDef" },
+    "^provider\\.[a-z][a-z0-9_]{0,63}$": { "$ref": "#/$defs/providerDef" },
+    "^model\\.[a-z][a-z0-9_]{0,63}$": { "$ref": "#/$defs/modelDef" }
+  },
+  "additionalProperties": false,
+  "dependentRequired": {
+    "imports": ["version"],
+    "placements": ["version"],
+    "storage_backends": ["version"],
+    "event_sources": ["version"]
+  },
+  "dependentSchemas": {
+    "imports": { "$ref": "#/$defs/notADeployFile" },
+    "state": { "$ref": "#/$defs/notADeployFile" },
+    "triggers": { "$ref": "#/$defs/notADeployFile" },
+    "defaults": { "$ref": "#/$defs/notADeployFile" },
+    "placements": { "$ref": "#/$defs/deployFileOnly" },
+    "storage_backends": { "$ref": "#/$defs/deployFileOnly" },
+    "event_sources": { "$ref": "#/$defs/deployFileOnly" }
+  },
+
+  "$defs": {
+    "notADeployFile": {
+      "description": "A spec file must not carry deploy-layer sections: only the deploy layer forks per target (PRD 5.8).",
+      "not": {
+        "anyOf": [
+          { "required": ["placements"] },
+          { "required": ["storage_backends"] },
+          { "required": ["event_sources"] }
+        ]
+      }
+    },
+    "deployFileOnly": {
+      "description": "A deploy file carries only version + placements/storage_backends/event_sources: no definitions, imports, state, triggers, or defaults (PRD 5.8 per-target invariant).",
+      "not": {
+        "anyOf": [
+          { "required": ["imports"] },
+          { "required": ["state"] },
+          { "required": ["triggers"] },
+          { "required": ["defaults"] }
+        ]
+      },
+      "patternProperties": {
+        "^(agent|tool|flow|store|provider|model)\\.": false
+      }
+    },
+
+    "identifier": {
+      "description": "lowercase snake_case, 1-64 characters: [a-z][a-z0-9_]*. Used for definition names, node ids, channels, fields, variant tags, trigger names, and aliases. Grammar 2.1.",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]{0,63}$"
+    },
+    "reservedRootName": {
+      "description": "The seven identifiers with a fixed meaning inside an expression. Five are CEL roots (input, state, execution, payload, and item, a map's default per-item binding); `messages` is the implicit conversation-history channel; and `output` is the selector half of `<node>.output`, on the list to keep that token to one meaning rather than because it is a root - no surface exposes a bare `output`. None of them may name a state channel or a flow-local node id: a node named `input` would make `input.output.x` ambiguous with the flow input object. Grammar 2.5 / Decisions D33, D74.",
+      "enum": ["input", "state", "execution", "item", "messages", "output", "payload"]
+    },
+    "channelName": {
+      "description": "A state channel name: an identifier that is not one of the seven reserved names - the five CEL roots, the implicit conversation-history channel `messages`, and the node-output selector `output`. Grammar 2.5.",
+      "allOf": [
+        { "$ref": "#/$defs/identifier" },
+        { "not": { "$ref": "#/$defs/reservedRootName" } }
+      ]
+    },
+    "nodeId": {
+      "description": "A flow-local node id: an identifier other than the pseudo-nodes `start` and `end` and other than one of the seven reserved names of grammar 2.5. A node id is the root of `<node>.output`, which is why `output` is reserved here too: `output.output.verdict` spells the node and the selector with one word. Grammar 2.4, 2.5.",
+      "allOf": [
+        { "$ref": "#/$defs/identifier" },
+        { "not": { "enum": ["start", "end"] } },
+        { "not": { "$ref": "#/$defs/reservedRootName" } }
+      ]
+    },
+    "controlTarget": {
+      "description": "A control-transfer target: a flow-local node id, or the pseudo-node `end` (retire this branch; the instance finishes at quiescence). Never `start`. Used by `on_error.fallback` and `human.on_timeout`, which accept exactly the same targets. Grammar 2.4, 7.6.3, 9.2.",
+      "allOf": [
+        { "$ref": "#/$defs/identifier" },
+        { "not": { "const": "start" } },
+        { "not": { "$ref": "#/$defs/reservedRootName" } }
+      ]
+    },
+    "agentRef": {
+      "description": "A reference to an agent definition, e.g. agent.reviewer.",
+      "type": "string",
+      "pattern": "^agent\\.[a-z][a-z0-9_]{0,63}$"
+    },
+    "toolRef": {
+      "description": "A reference to a tool definition, e.g. tool.web_search.",
+      "type": "string",
+      "pattern": "^tool\\.[a-z][a-z0-9_]{0,63}$"
+    },
+    "flowRef": {
+      "description": "A reference to a flow definition, e.g. flow.review_loop.",
+      "type": "string",
+      "pattern": "^flow\\.[a-z][a-z0-9_]{0,63}$"
+    },
+    "storeRef": {
+      "description": "A reference to a store definition, e.g. store.docs.",
+      "type": "string",
+      "pattern": "^store\\.[a-z][a-z0-9_]{0,63}$"
+    },
+    "providerRef": {
+      "description": "A reference to a provider definition, e.g. provider.anthropic.",
+      "type": "string",
+      "pattern": "^provider\\.[a-z][a-z0-9_]{0,63}$"
+    },
+    "modelRef": {
+      "description": "A reference to a model definition, e.g. model.smart. Agents bind models, never providers or inline settings (PRD 5.9).",
+      "type": "string",
+      "pattern": "^model\\.[a-z][a-z0-9_]{0,63}$"
+    },
+    "toolOrFlowRef": {
+      "description": "An LLM-facing tool: a tool. definition, or a flow. definition used as a tool (flow-as-tool equivalence, PRD 5.1).",
+      "anyOf": [{ "$ref": "#/$defs/toolRef" }, { "$ref": "#/$defs/flowRef" }]
+    },
+    "mapTargetRef": {
+      "description": "A map dispatch target: agent., tool., or flow. Map instances are isolated per-item invocations of a component, not nodes of the enclosing flow: they take no policy from `defaults:` (Decision D73) and each runs on a fresh conversation history that is discarded when it completes, never reading or appending to the enclosing flow's `messages` (grammar 8.6 rules 10 and 13, 10.4 / Decisions D29, D105). Grammar 8.6 / PRD 5.6.",
+      "anyOf": [
+        { "$ref": "#/$defs/agentRef" },
+        { "$ref": "#/$defs/toolRef" },
+        { "$ref": "#/$defs/flowRef" }
+      ]
+    },
+
+    "cel": {
+      "description": "A CEL expression. Roots in scope depend on the surface (Grammar 4.1): edge guards see the source node's output plus input/state/execution; node bindings see input/state/execution; trigger bindings see payload.",
+      "type": "string",
+      "minLength": 1
+    },
+    "pathExpression": {
+      "description": "A CEL path expression: a root identifier followed by field selections and integer indexes, e.g. plan.output.tasks. No function calls - the validator must statically resolve the array schema to prove max_items bounding (Grammar 4.2 / PRD 5.6).",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*|\\[[0-9]+\\])*$"
+    },
+    "duration": {
+      "description": "A duration: <positive integer><ms|s|m|h>, single segment (e.g. 250ms, 30s, 5m, 24h). Grammar 4.4.",
+      "type": "string",
+      "pattern": "^[1-9][0-9]*(ms|s|m|h)$"
+    },
+    "envRef": {
+      "description": "An environment reference: the whole value must be ${ENV_NAME}. Secrets and connection strings are never literals in the spec; refs survive unresolved into the IR and are checked for presence at build/serve/run (Grammar 4.3 / PRD 5.9).",
+      "type": "string",
+      "pattern": "^\\$\\{[A-Z_][A-Z0-9_]*\\}$"
+    },
+    "interpolatedString": {
+      "description": "A string on one of grammar 4.3's class 2 surfaces, where ${ENV_NAME} references may be embedded in text, e.g. \"https://${API_HOST}/v1\": http urls and headers, the whole exec block (command, args, cwd, env values), non-secret provider keys, and non-secret deploy config. Substitution happens at process start. Use $${ for a literal ${.",
+      "type": "string"
+    },
+    "noEnvRefString": {
+      "description": "A string on one of the surfaces where environment references are illegal (grammar 4.3 class 3: prompts, descriptions, schemas, CEL, model and embedding model ids, trigger path/cron/timezone, content types, identifiers and references - anything the classification does not place in class 1 or 2). Nothing is interpolated here, so an unescaped ${ENV_NAME} token is an error rather than text that silently survives. Write $${ENV_NAME} for a literal ${ENV_NAME}. The pattern spells \"unescaped\" as an explicit alternation - at the start of the string, or after one character that is not the `$` of the `$${` escape - rather than as a lookbehind, which is outside the interoperable regex subset this schema keeps to (Decision D108).",
+      "type": "string",
+      "not": { "pattern": "(^|[^$])\\$\\{[A-Z_][A-Z0-9_]*\\}" }
+    },
+
+    "fieldMap": {
+      "description": "An input-surface schema: field name -> type node, denoting a closed object whose properties are all required unless listed in `optional:`. Defaults are permitted here. Grammar 3.1.",
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/identifier" },
+      "additionalProperties": { "$ref": "#/$defs/typeNode" }
+    },
+    "outputFieldMap": {
+      "description": "A result-surface schema: field name -> type node. The result surfaces are the ones grammar 3.5 lists - agent output, tool output, flow outputs, human output, an inline exec/http node's `output` (Decision D96), and the two store schemas. Defaults are illegal here and every array must declare max_items. `{}` is legal and denotes a result with no fields. Grammar 3.5, 3.6, 3.9 / PRD 5.2, 5.6.",
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/identifier" },
+      "additionalProperties": { "$ref": "#/$defs/outputTypeNode" }
+    },
+    "agentOutputFieldMap": {
+      "description": "An agent's result schema: as `outputFieldMap`, but it must declare at least one property - the structured output is what routing reads and what makes every edge serializable, so an empty one is a compile error. Grammar 5.1 / PRD 5.2, 5.3.",
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": { "$ref": "#/$defs/identifier" },
+      "additionalProperties": { "$ref": "#/$defs/outputTypeNode" }
+    },
+
+    "execEnvelopeFields": {
+      "description": "The envelope of an inline `exec:` node: fields synthesized from the child process rather than decoded from its stdout. Declaring one pins its type. Grammar 8.2 / Decision D56.",
+      "properties": {
+        "exit_code": {
+          "description": "The child's exit status, taken from the process (never decoded from stdout). Must be declared as { type: integer }.",
+          "required": ["type"],
+          "properties": { "type": { "const": "integer" } }
+        },
+        "stdout": {
+          "description": "The child's raw stdout, bound as text (never parsed). Must be declared as { type: string }.",
+          "required": ["type"],
+          "properties": { "type": { "const": "string" } }
+        },
+        "stderr": {
+          "description": "The child's raw stderr, bound as text. Must be declared as { type: string }.",
+          "required": ["type"],
+          "properties": { "type": { "const": "string" } }
+        }
+      }
+    },
+    "httpEnvelopeFields": {
+      "description": "The envelope of an inline `http:` node: fields synthesized from the response rather than decoded from its body. Declaring one pins its type. Grammar 8.3 / Decision D56.",
+      "properties": {
+        "status": {
+          "description": "The HTTP status code, taken from the response (never decoded from the body). Must be declared as { type: integer }.",
+          "required": ["type"],
+          "properties": { "type": { "const": "integer" } }
+        },
+        "body": {
+          "description": "The raw response text, bound as-is (never parsed). Must be declared as { type: string }.",
+          "required": ["type"],
+          "properties": { "type": { "const": "string" } }
+        }
+      }
+    },
+
+    "typeNode": {
+      "description": "A type node in an input surface: exactly one of a scalar, enum, object, array, or discriminated union. Grammar 3.2.",
+      "type": "object",
+      "oneOf": [
+        { "$ref": "#/$defs/scalarType" },
+        { "$ref": "#/$defs/enumType" },
+        { "$ref": "#/$defs/objectType" },
+        { "$ref": "#/$defs/arrayType" },
+        { "$ref": "#/$defs/unionType" }
+      ]
+    },
+    "outputTypeNode": {
+      "description": "A type node in a result surface: as `typeNode`, but `default` is illegal and arrays must declare max_items. Grammar 3.5, 3.6.",
+      "type": "object",
+      "oneOf": [
+        { "$ref": "#/$defs/outputScalarType" },
+        { "$ref": "#/$defs/outputEnumType" },
+        { "$ref": "#/$defs/outputObjectType" },
+        { "$ref": "#/$defs/outputArrayType" },
+        { "$ref": "#/$defs/outputUnionType" }
+      ]
+    },
+
+    "scalarConstraints": {
+      "description": "Scalar constraint keys are type-appropriate: string constraints on strings, numeric constraints on integer/number, none on boolean.",
+      "allOf": [
+        {
+          "if": {
+            "properties": { "type": { "enum": ["integer", "number", "boolean"] } },
+            "required": ["type"]
+          },
+          "then": {
+            "not": {
+              "anyOf": [
+                { "required": ["min_length"] },
+                { "required": ["max_length"] },
+                { "required": ["pattern"] },
+                { "required": ["format"] }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "type": { "enum": ["string", "boolean"] } },
+            "required": ["type"]
+          },
+          "then": {
+            "not": {
+              "anyOf": [
+                { "required": ["minimum"] },
+                { "required": ["maximum"] },
+                { "required": ["exclusive_minimum"] },
+                { "required": ["exclusive_maximum"] },
+                { "required": ["multiple_of"] }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "scalarType": {
+      "description": "A scalar: string, integer, number, or boolean, with optional type-appropriate constraints. Grammar 3.3.",
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": {
+          "description": "The scalar type.",
+          "enum": ["string", "integer", "number", "boolean"]
+        },
+        "description": {
+          "description": "Field documentation; surfaces to the model in structured-output schemas and to editors.",
+          "type": "string"
+        },
+        "min_length": { "description": "Minimum string length.", "type": "integer", "minimum": 0 },
+        "max_length": { "description": "Maximum string length.", "type": "integer", "minimum": 0 },
+        "pattern": {
+          "description": "RE2 regular expression the string must match (no backreferences, no lookaround) - RE2 is the common denominator across the Rust validator, generated JS, and provider-side structured output.",
+          "type": "string"
+        },
+        "format": {
+          "description": "A closed set of semantic string formats.",
+          "enum": [
+            "date-time",
+            "date",
+            "time",
+            "duration",
+            "email",
+            "uri",
+            "uuid",
+            "hostname",
+            "ipv4",
+            "ipv6"
+          ]
+        },
+        "minimum": { "description": "Inclusive numeric lower bound.", "type": "number" },
+        "maximum": { "description": "Inclusive numeric upper bound.", "type": "number" },
+        "exclusive_minimum": { "description": "Exclusive numeric lower bound.", "type": "number" },
+        "exclusive_maximum": { "description": "Exclusive numeric upper bound.", "type": "number" },
+        "multiple_of": {
+          "description": "The value must be a multiple of this number.",
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "default": {
+          "description": "Initial/fallback value. Legal on input surfaces and state channels only; a defaulted field is implicitly optional."
+        }
+      },
+      "additionalProperties": false,
+      "$ref": "#/$defs/scalarConstraints"
+    },
+    "outputScalarType": {
+      "description": "A scalar in a result surface: as `scalarType` without `default` - a defaulted model output would silently manufacture routing values (PRD 5.3).",
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": { "description": "The scalar type.", "enum": ["string", "integer", "number", "boolean"] },
+        "description": { "description": "Field documentation.", "type": "string" },
+        "min_length": { "description": "Minimum string length.", "type": "integer", "minimum": 0 },
+        "max_length": { "description": "Maximum string length.", "type": "integer", "minimum": 0 },
+        "pattern": { "description": "RE2 regular expression the string must match.", "type": "string" },
+        "format": {
+          "description": "A closed set of semantic string formats.",
+          "enum": [
+            "date-time",
+            "date",
+            "time",
+            "duration",
+            "email",
+            "uri",
+            "uuid",
+            "hostname",
+            "ipv4",
+            "ipv6"
+          ]
+        },
+        "minimum": { "description": "Inclusive numeric lower bound.", "type": "number" },
+        "maximum": { "description": "Inclusive numeric upper bound.", "type": "number" },
+        "exclusive_minimum": { "description": "Exclusive numeric lower bound.", "type": "number" },
+        "exclusive_maximum": { "description": "Exclusive numeric upper bound.", "type": "number" },
+        "multiple_of": {
+          "description": "The value must be a multiple of this number.",
+          "type": "number",
+          "exclusiveMinimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "$ref": "#/$defs/scalarConstraints"
+    },
+
+    "enumType": {
+      "description": "A closed set of string variants. Enum-typed fields are what edge guards route over and what exhaustiveness checking covers (PRD 5.3). `enum` implies type string; writing `type:` alongside it is an error. Grammar 3.3.",
+      "type": "object",
+      "required": ["enum"],
+      "properties": {
+        "enum": {
+          "description": "Unique, non-empty string variants.",
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "description": { "description": "Field documentation.", "type": "string" },
+        "default": { "description": "Initial value; must be one of the variants.", "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "outputEnumType": {
+      "description": "An enum in a result surface: as `enumType` without `default`.",
+      "type": "object",
+      "required": ["enum"],
+      "properties": {
+        "enum": {
+          "description": "Unique, non-empty string variants.",
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "description": { "description": "Field documentation.", "type": "string" }
+      },
+      "additionalProperties": false
+    },
+
+    "objectType": {
+      "description": "A nested object. Objects are closed: exactly the declared properties, no others. Nesting is explicit - a bare mapping is never a shorthand for an object. Grammar 3.4.",
+      "type": "object",
+      "required": ["type", "properties"],
+      "properties": {
+        "type": { "description": "Must be `object`.", "const": "object" },
+        "description": { "description": "Field documentation.", "type": "string" },
+        "properties": {
+          "description": "Field map of this object's properties.",
+          "$ref": "#/$defs/fieldMap"
+        },
+        "optional": {
+          "description": "Property names that are not required. Every declared property is required unless listed here.",
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/identifier" }
+        },
+        "default": {
+          "description": "Initial/fallback value, supplying every required property. Legal on input surfaces and state channels only; a defaulted field is implicitly optional. Grammar 3.6 / Decision D77.",
+          "type": "object"
+        }
+      },
+      "additionalProperties": false
+    },
+    "outputObjectType": {
+      "description": "A nested object in a result surface.",
+      "type": "object",
+      "required": ["type", "properties"],
+      "properties": {
+        "type": { "description": "Must be `object`.", "const": "object" },
+        "description": { "description": "Field documentation.", "type": "string" },
+        "properties": {
+          "description": "Field map of this object's properties.",
+          "$ref": "#/$defs/outputResultFieldMap"
+        },
+        "optional": {
+          "description": "Property names that are not required.",
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/identifier" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "outputResultFieldMap": {
+      "description": "Nested result field map (no minimum property count, unlike a top-level result surface).",
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/identifier" },
+      "additionalProperties": { "$ref": "#/$defs/outputTypeNode" }
+    },
+
+    "arrayType": {
+      "description": "An array. In input surfaces `max_items` is optional. Grammar 3.5.",
+      "type": "object",
+      "required": ["type", "items"],
+      "properties": {
+        "type": { "description": "Must be `array`.", "const": "array" },
+        "description": { "description": "Field documentation.", "type": "string" },
+        "items": { "description": "The element type node (may be a discriminated union).", "$ref": "#/$defs/typeNode" },
+        "max_items": {
+          "description": "Maximum element count. Required in result surfaces and on any array a map fans out over - unbounded fan-out is a compile error (PRD 5.6).",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000
+        },
+        "min_items": { "description": "Minimum element count.", "type": "integer", "minimum": 0 },
+        "unique_items": { "description": "Whether elements must be unique.", "type": "boolean" },
+        "default": {
+          "description": "Initial/fallback value, an array of the `items:` type. Legal on input surfaces and state channels only; a defaulted field is implicitly optional. Grammar 3.6 / Decision D77.",
+          "type": "array"
+        }
+      },
+      "additionalProperties": false
+    },
+    "outputArrayType": {
+      "description": "An array in a result surface: `max_items` is REQUIRED, so model-produced cardinality is bounded and every edge payload stays finite (PRD 5.6, 5.7).",
+      "type": "object",
+      "required": ["type", "items", "max_items"],
+      "properties": {
+        "type": { "description": "Must be `array`.", "const": "array" },
+        "description": { "description": "Field documentation.", "type": "string" },
+        "items": { "description": "The element type node (may be a discriminated union).", "$ref": "#/$defs/outputTypeNode" },
+        "max_items": {
+          "description": "Maximum element count; enforced at structured-output validation so the model cannot return more.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000
+        },
+        "min_items": { "description": "Minimum element count.", "type": "integer", "minimum": 0 },
+        "unique_items": { "description": "Whether elements must be unique.", "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+
+    "unionType": {
+      "description": "A discriminated (tagged) union: the item shape a heterogeneous `map` routes over. Variants must not redeclare the discriminator field - the compiler synthesizes it as a string constant. Grammar 3.7 / PRD 5.6.",
+      "type": "object",
+      "required": ["discriminator", "variants"],
+      "properties": {
+        "discriminator": {
+          "description": "Name of the tag field. A map's `route_by` must equal this name.",
+          "$ref": "#/$defs/identifier"
+        },
+        "description": { "description": "Field documentation.", "type": "string" },
+        "variants": {
+          "description": "Variant tag -> field map of that variant's payload. At least two variants; each route target is validated against its variant's payload only (schema narrowing).",
+          "type": "object",
+          "minProperties": 2,
+          "propertyNames": { "$ref": "#/$defs/identifier" },
+          "additionalProperties": { "$ref": "#/$defs/fieldMap" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "outputUnionType": {
+      "description": "A discriminated union in a result surface.",
+      "type": "object",
+      "required": ["discriminator", "variants"],
+      "properties": {
+        "discriminator": { "description": "Name of the tag field.", "$ref": "#/$defs/identifier" },
+        "description": { "description": "Field documentation.", "type": "string" },
+        "variants": {
+          "description": "Variant tag -> field map of that variant's payload. At least two variants.",
+          "type": "object",
+          "minProperties": 2,
+          "propertyNames": { "$ref": "#/$defs/identifier" },
+          "additionalProperties": { "$ref": "#/$defs/outputResultFieldMap" }
+        }
+      },
+      "additionalProperties": false
+    },
+
+    "stateChannel": {
+      "description": "A state channel: a type node plus `reduce` (concurrency policy) and `default` (initial value). A channel without `reduce` is unreduced: writing it from a map instance or from concurrent branches is a compile error. Grammar 10 / PRD 5.6, 5.7.",
+      "type": "object",
+      "oneOf": [
+        { "$ref": "#/$defs/channelScalar" },
+        { "$ref": "#/$defs/channelEnum" },
+        { "$ref": "#/$defs/channelObject" },
+        { "$ref": "#/$defs/channelArray" },
+        { "$ref": "#/$defs/channelUnion" }
+      ]
+    },
+    "channelScalar": {
+      "description": "A scalar channel. Only `last_wins` is a meaningful reduce policy for a scalar.",
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": { "description": "The scalar type.", "enum": ["string", "integer", "number", "boolean"] },
+        "description": { "description": "Channel documentation.", "type": "string" },
+        "min_length": { "type": "integer", "minimum": 0, "description": "Minimum string length." },
+        "max_length": { "type": "integer", "minimum": 0, "description": "Maximum string length." },
+        "pattern": { "type": "string", "description": "RE2 regular expression." },
+        "format": {
+          "description": "A closed set of semantic string formats.",
+          "enum": ["date-time", "date", "time", "duration", "email", "uri", "uuid", "hostname", "ipv4", "ipv6"]
+        },
+        "minimum": { "type": "number", "description": "Inclusive numeric lower bound." },
+        "maximum": { "type": "number", "description": "Inclusive numeric upper bound." },
+        "exclusive_minimum": { "type": "number", "description": "Exclusive numeric lower bound." },
+        "exclusive_maximum": { "type": "number", "description": "Exclusive numeric upper bound." },
+        "multiple_of": { "type": "number", "exclusiveMinimum": 0, "description": "Multiple-of constraint." },
+        "default": { "description": "Initial channel value." },
+        "reduce": {
+          "description": "Concurrency policy. `last_wins` declares that concurrent overwrite is intended.",
+          "enum": ["last_wins"]
+        }
+      },
+      "additionalProperties": false,
+      "$ref": "#/$defs/scalarConstraints"
+    },
+    "channelEnum": {
+      "description": "An enum-typed channel.",
+      "type": "object",
+      "required": ["enum"],
+      "properties": {
+        "enum": {
+          "description": "Unique, non-empty string variants.",
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "description": { "description": "Channel documentation.", "type": "string" },
+        "default": { "description": "Initial channel value.", "type": "string" },
+        "reduce": { "description": "Concurrency policy.", "enum": ["last_wins"] }
+      },
+      "additionalProperties": false
+    },
+    "channelObject": {
+      "description": "An object-typed channel. `merge` performs a shallow key-wise merge.",
+      "type": "object",
+      "required": ["type", "properties"],
+      "properties": {
+        "type": { "description": "Must be `object`.", "const": "object" },
+        "description": { "description": "Channel documentation.", "type": "string" },
+        "properties": { "description": "Field map of this object's properties.", "$ref": "#/$defs/fieldMap" },
+        "optional": {
+          "description": "Property names that are not required.",
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/identifier" }
+        },
+        "default": { "description": "Initial channel value.", "type": "object" },
+        "reduce": { "description": "Concurrency policy for an object channel.", "enum": ["merge", "last_wins"] }
+      },
+      "additionalProperties": false
+    },
+    "channelArray": {
+      "description": "An array-typed channel. `append` concatenates; map writes are index-tagged and reordered by source-item index before the join, so replay is deterministic (PRD 5.6).",
+      "type": "object",
+      "required": ["type", "items"],
+      "properties": {
+        "type": { "description": "Must be `array`.", "const": "array" },
+        "description": { "description": "Channel documentation.", "type": "string" },
+        "items": { "description": "The element type node.", "$ref": "#/$defs/typeNode" },
+        "max_items": { "description": "Maximum element count.", "type": "integer", "minimum": 1, "maximum": 10000 },
+        "min_items": { "description": "Minimum element count.", "type": "integer", "minimum": 0 },
+        "unique_items": { "description": "Whether elements must be unique.", "type": "boolean" },
+        "default": { "description": "Initial channel value.", "type": "array" },
+        "reduce": { "description": "Concurrency policy for an array channel.", "enum": ["append", "last_wins"] }
+      },
+      "additionalProperties": false
+    },
+    "channelUnion": {
+      "description": "A discriminated-union-typed channel.",
+      "type": "object",
+      "required": ["discriminator", "variants"],
+      "properties": {
+        "discriminator": { "description": "Name of the tag field.", "$ref": "#/$defs/identifier" },
+        "description": { "description": "Channel documentation.", "type": "string" },
+        "variants": {
+          "description": "Variant tag -> field map.",
+          "type": "object",
+          "minProperties": 2,
+          "propertyNames": { "$ref": "#/$defs/identifier" },
+          "additionalProperties": { "$ref": "#/$defs/fieldMap" }
+        },
+        "reduce": { "description": "Concurrency policy.", "enum": ["last_wins"] }
+      },
+      "additionalProperties": false
+    },
+
+    "policyBlock": {
+      "description": "Policy at a composition-wide level: the `defaults:` section (chain level 3) and a flow node's `policy:` override (level 1). Both reach nodes of flows they do not name, which has two consequences the node-level keys do not share: `on_error:` here takes `fail` or `skip` only (the `fallback` form is flow-local - Decision D103), and neither level supplies `timeout` or `retry` to a `human` node, whose wait is bounded only by `human.timeout:` (Decision D102). Grammar 9.3 / PRD 5.5.",
+      "type": "object",
+      "properties": {
+        "retry": { "$ref": "#/$defs/retry" },
+        "timeout": { "description": "Wall-clock bound on one node execution, retries included. Not applied to `human` nodes at this level or any other (Decision D102).", "$ref": "#/$defs/duration" },
+        "on_error": { "$ref": "#/$defs/compositionOnError" }
+      },
+      "additionalProperties": false
+    },
+    "retry": {
+      "description": "Exponential-backoff retry policy, exhausted before `on_error` applies. Grammar 9.1.",
+      "type": "object",
+      "required": ["max", "backoff"],
+      "properties": {
+        "max": { "description": "Additional attempts after the first.", "type": "integer", "minimum": 1, "maximum": 10 },
+        "backoff": { "description": "Initial delay.", "$ref": "#/$defs/duration" },
+        "multiplier": { "description": "Exponential factor (default 2.0).", "type": "number", "minimum": 1 },
+        "max_backoff": { "description": "Cap on a single delay.", "$ref": "#/$defs/duration" },
+        "jitter": { "description": "Full jitter (default true).", "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "compositionOnError": {
+      "description": "Strategy at a composition-wide level - the `defaults:` section (chain level 3) or a flow node's `policy:` (level 1): fail or skip. The `{ fallback: <node id> }` form is ILLEGAL here. A fallback target is a flow-local node id (grammar 9.2, Decision D21), while neither of these levels names a flow: `defaults:` reaches every node of every flow in the composition, and a `policy:` reaches every node of the instantiated subflow and of everything it instantiates in turn - so the id would have to resolve separately inside flows that need not declare it. \"Retry, then give up\" is still expressible here, since `retry` is a field of its own; a node that needs a fallback declares one on itself. Grammar 9.2, 9.3 / Decision D103.",
+      "enum": ["fail", "skip"]
+    },
+    "onError": {
+      "description": "Strategy applied after retries are exhausted, as a node's own key: fail (default), skip, or transfer control to another node in the same flow. The fallback form is node-level only - `defaults:` and a flow node's `policy:` take `compositionOnError` instead (Decision D103). Grammar 9.2.",
+      "oneOf": [
+        { "description": "fail: abort the execution. skip: produce no output and write nothing.", "enum": ["fail", "skip"] },
+        {
+          "description": "fallback: transfer control to another node in the same flow (may be `end`).",
+          "type": "object",
+          "required": ["fallback"],
+          "properties": {
+            "fallback": {
+              "description": "A flow-local node id, or `end`.",
+              "$ref": "#/$defs/controlTarget"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+
+    "inputBindings": {
+      "description": "Node input bindings on the two kinds where a single unnamed value has a destination (an agent node - only when the agent is string-in - and an exec node, where it becomes stdin): field name -> CEL over input/state/execution, or a bare CEL scalar. Unbound declared fields fall back to the state channel of the same name, then to the flow input of the same name, then to the field's own `default:` if it declares one - and that name-based source must satisfy the field it lands in, a validator check because the state section may live in another file (Decision D111). Grammar 8.0 / Decisions D14, D88.",
+      "oneOf": [
+        { "description": "Scalar binding for a string-in target.", "$ref": "#/$defs/cel" },
+        {
+          "description": "Per-field bindings.",
+          "type": "object",
+          "propertyNames": { "$ref": "#/$defs/identifier" },
+          "additionalProperties": { "$ref": "#/$defs/cel" }
+        }
+      ]
+    },
+    "fieldInputBindings": {
+      "description": "Node input bindings on a kind that names its input fields - an inline http node (whose request object is built from named fields), a function node (checked against the tool's input schema), a flow node (the subflow's declared inputs), a human node (its `human.input` field map). The scalar form is illegal here: a bare value names no destination. Grammar 8.0 / Decision D88.",
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/identifier" },
+      "additionalProperties": { "$ref": "#/$defs/cel" }
+    },
+    "mapInputBindings": {
+      "description": "Per-item bindings. A map dispatch is one of the three positions where a single unnamed value has a destination (D88), so both forms are legal: a field map (field name -> CEL over the item binding `item` unless renamed with `as:`, plus input/state/execution), or a bare CEL scalar binding a string-in agent's single unnamed input. The per-item index is spelled `execution.item_index`; there is no bare `item_index` root. Grammar 4.1, 8.6 rule 12 / Decisions D63, D75, D88.",
+      "oneOf": [
+        { "description": "Scalar binding for a string-in agent target.", "$ref": "#/$defs/cel" },
+        {
+          "description": "Per-field bindings for a target with a declared input object.",
+          "type": "object",
+          "propertyNames": { "$ref": "#/$defs/identifier" },
+          "additionalProperties": { "$ref": "#/$defs/cel" }
+        }
+      ]
+    },
+    "itemBindingName": {
+      "description": "A map's `as:` binding: an identifier that does not shadow a CEL root in scope for per-item expressions. `item` is legal - it is this binding's own default name. Grammar 2.5, 8.6 / Decision D74.",
+      "allOf": [
+        { "$ref": "#/$defs/identifier" },
+        { "not": { "enum": ["input", "state", "execution", "messages", "output", "payload"] } }
+      ]
+    },
+    "writes": {
+      "description": "Write remap: output field name -> state channel name. A remapped field is not also written to its same-named channel. Fixes channel collisions and cross-subgraph renames (PRD 5.7). The validator additionally requires the node's EFFECTIVE write map - remapped and name-based destinations together - to be injective, so one node never makes two unordered writes to one channel (grammar 8.0, 7.6.4 / Decision D93); that half needs the state section and so cannot be checked here.",
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/identifier" },
+      "additionalProperties": { "$ref": "#/$defs/channelName" }
+    },
+
+    "agentDef": {
+      "description": "An agent: one LLM call with structured output. Grammar 5 / PRD 5.2, 5.5.",
+      "type": "object",
+      "required": ["model", "prompt", "output"],
+      "properties": {
+        "model": { "description": "The model binding. Agents reference model.* only - no inline provider or settings overrides (PRD 5.9).", "$ref": "#/$defs/modelRef" },
+        "prompt": {
+          "description": "System instructions. Literal text: there is no interpolation, so an unescaped ${ENV} reference is an error (grammar 4.3) and dynamic content travels through the input schema instead.",
+          "allOf": [{ "$ref": "#/$defs/noEnvRefString" }, { "minLength": 1 }]
+        },
+        "output": { "description": "REQUIRED structured output schema, declaring at least one property. Load-bearing for routing (PRD 5.3) and for making every edge serializable (PRD 5.7).", "$ref": "#/$defs/agentOutputFieldMap" },
+        "input": {
+          "description": "Optional input schema, declaring at least one field. Omitting it is the only way to get the string-in default (a single unnamed string bound with the scalar form at the node); `input: {}` is neither contract and is a compile error.",
+          "allOf": [{ "$ref": "#/$defs/fieldMap" }, { "minProperties": 1 }]
+        },
+        "tools": {
+          "description": "LLM-discovered tools: tool.* definitions and flow.* modules used as tools.",
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/toolOrFlowRef" }
+        },
+        "stores": {
+          "description": "Attached stores; codegen synthesizes LLM-facing tools from each store's kind and schema (PRD 5.8).",
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/storeRef" }
+        },
+        "description": { "description": "Human-facing documentation.", "type": "string" },
+        "max_tool_iterations": {
+          "description": "Bound on the intra-agent tool loop (default 8) - the one loop a compiled graph cannot bound with an SCC rule.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 50
+        }
+      },
+      "additionalProperties": false
+    },
+
+    "toolDef": {
+      "description": "A tool: one definition, two usage surfaces - attached to an agent (LLM-discovered) and invoked as a `function` node (graph-invoked). Grammar 6 / PRD 5.5.",
+      "type": "object",
+      "required": ["description", "input", "output"],
+      "properties": {
+        "description": { "description": "REQUIRED LLM-facing description: the selection signal when the tool is attached to an agent.", "type": "string", "minLength": 1 },
+        "input": { "description": "Parameter schema; also the checked signature for `function` node use. May be {} for a no-argument tool.", "$ref": "#/$defs/fieldMap" },
+        "output": { "description": "Result schema.", "$ref": "#/$defs/outputFieldMap" },
+        "exec": { "description": "Subprocess implementation.", "$ref": "#/$defs/execImpl" },
+        "http": { "description": "HTTP implementation.", "$ref": "#/$defs/httpImpl" },
+        "function": { "description": "Host-registered function implementation (escape hatch; breaks spec portability).", "$ref": "#/$defs/functionImpl" }
+      },
+      "additionalProperties": false,
+      "oneOf": [
+        { "description": "exec implementation", "required": ["exec"] },
+        { "description": "http implementation", "required": ["http"] },
+        { "description": "function implementation", "required": ["function"] }
+      ]
+    },
+    "expectExit": {
+      "description": "Accepted exit statuses (default [0]). An exit outside the list is a node error subject to the retry/on_error chain; one inside it completes the node, so `expect_exit: [0, 1]` is how a command whose 1 means \"no match\" or \"tests failed\" becomes routable data. Non-empty and distinct-membered: an empty list would accept no outcome at all, making every run an error, and membership is a set test, so a repeated member changes nothing (grammar 6.1 / Decisions D84, D100).",
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "type": "integer", "minimum": 0, "maximum": 255 }
+    },
+    "expectStatus": {
+      "description": "Accepted response status codes (default: any 2xx). A status outside the list is a node error subject to the retry/on_error chain; one inside it completes the node, so `expect_status: [200, 404]` is how a 404 becomes routable data. Non-empty and distinct-membered, on the same rule `expect_exit` obeys - the two keys are one construct on two surfaces (grammar 6.1 / Decisions D84, D100).",
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "type": "integer", "minimum": 100, "maximum": 599 }
+    },
+    "execImpl": {
+      "description": "Subprocess binding. An object input is passed as environment variables; a string input is passed on stdin; stdout is decoded as JSON against `output`, or bound raw when `output` declares exactly one property and that property is string-typed - the count is over the whole property set (Decision D109), and the exception is tool-surface only, so inline exec/http nodes never take it (Decision D91). An exit status outside `expect_exit` is a node error. Grammar 6.1.",
+      "type": "object",
+      "required": ["command"],
+      "properties": {
+        "command": {
+          "description": "Executable name or path (argv[0]); never shell-interpreted. May embed ${ENV} references (grammar 4.3 class 2, Decision D92).",
+          "allOf": [{ "$ref": "#/$defs/interpolatedString" }, { "minLength": 1 }]
+        },
+        "args": { "description": "Literal argv entries: no CEL - data is passed by env vars/stdin - but ${ENV} references may be embedded (grammar 4.3 class 2, Decisions D24, D92).", "type": "array", "items": { "$ref": "#/$defs/interpolatedString" } },
+        "cwd": { "description": "Working directory; may embed ${ENV} references.", "$ref": "#/$defs/interpolatedString" },
+        "env": {
+          "description": "Extra environment variables for the child process.",
+          "type": "object",
+          "propertyNames": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+          "additionalProperties": { "$ref": "#/$defs/interpolatedString" }
+        },
+        "expect_exit": { "$ref": "#/$defs/expectExit" }
+      },
+      "additionalProperties": false
+    },
+    "httpImpl": {
+      "description": "HTTP binding. Without `body`/`query` the bound input object is sent as the JSON body (body-bearing methods) or as query parameters. The response is decoded as JSON against `output`, or bound raw when `output` declares exactly one property and that property is string-typed - the count is over the whole property set (Decision D109), and the exception is tool-surface only, so inline exec/http nodes never take it (Decision D91). Grammar 6.1.",
+      "type": "object",
+      "required": ["method", "url"],
+      "properties": {
+        "method": {
+          "description": "HTTP method. Required: effects are never defaulted.",
+          "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
+        },
+        "url": { "description": "Request URL; may embed ${ENV} references.", "$ref": "#/$defs/interpolatedString" },
+        "headers": {
+          "description": "Request headers; values may embed ${ENV} references.",
+          "type": "object",
+          "propertyNames": { "type": "string", "pattern": "^[a-zA-Z0-9_-]+$" },
+          "additionalProperties": { "$ref": "#/$defs/interpolatedString" }
+        },
+        "query": {
+          "description": "Query parameters, each a CEL expression over `input` - the tool's own declared input object, the only root in scope inside a tool binding (grammar 4.1, 6.1, D65).",
+          "type": "object",
+          "propertyNames": { "type": "string", "pattern": "^[a-zA-Z0-9_-]+$" },
+          "additionalProperties": { "$ref": "#/$defs/cel" }
+        },
+        "body": {
+          "description": "JSON body fields, each a CEL expression over `input` - the tool's own declared input object, the only root in scope inside a tool binding (grammar 4.1, 6.1, D65). Illegal for GET/HEAD.",
+          "type": "object",
+          "propertyNames": { "$ref": "#/$defs/identifier" },
+          "additionalProperties": { "$ref": "#/$defs/cel" }
+        },
+        "expect_status": {
+          "$ref": "#/$defs/expectStatus"
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": { "properties": { "method": { "enum": ["GET", "HEAD"] } }, "required": ["method"] },
+          "then": { "not": { "required": ["body"] } }
+        }
+      ]
+    },
+    "functionImpl": {
+      "description": "Host-registered function, looked up by name at build time. Escape hatch: breaks spec portability and is flagged as such by `validate` (PRD 5.5).",
+      "type": "object",
+      "required": ["name"],
+      "properties": {
+        "name": { "description": "Registry key of the host function.", "$ref": "#/$defs/identifier" }
+      },
+      "additionalProperties": false
+    },
+
+    "flowDef": {
+      "description": "A flow: a subgraph module with a declared I/O surface, interchangeable with a tool's. Grammar 7 / PRD 5.1.",
+      "type": "object",
+      "required": ["nodes", "edges", "outputs"],
+      "properties": {
+        "description": { "description": "Documentation; REQUIRED when the flow is used in an agent's `tools:` (the LLM needs one).", "type": "string" },
+        "inputs": { "description": "The module's parameter surface, in scope as `input.<field>` throughout the flow.", "$ref": "#/$defs/fieldMap" },
+        "outputs": { "description": "REQUIRED result surface; each field is read from the state channel of the same name, once, at quiescence - the step where no node is scheduled because every live branch has retired at `end`. Nothing is snapshotted at the moment a branch reaches `end`, so a value a still-running branch writes is included rather than raced (grammar 7.5, 7.6.3 / Decision D70). The validator additionally requires that channel to be declared and to satisfy the field - every value the channel can hold is a legal value of the field, the same requirement a name-based input read carries (grammar 7.5, 8.0, 10.3 / Decision D111); both halves need the state section and so cannot be checked here.", "$ref": "#/$defs/outputFieldMap" },
+        "nodes": {
+          "description": "Node id -> node object. Each node carries exactly one kind key.",
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": { "$ref": "#/$defs/nodeId" },
+          "additionalProperties": { "$ref": "#/$defs/node" }
+        },
+        "edges": {
+          "description": "Control-flow edges, including back-edges. Every SCC must carry a termination guard (PRD 5.4). Two IDENTICAL edges are an error here: the duplicate adds no transition (grammar 7.2). Grammar 7.2's rule is wider - it keys on `from`/`to`/`when` alone, so two edges differing only in a `max_iterations` are also duplicates - and `uniqueItems` cannot see that, so the validator owns the refinement (Appendix B).",
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/edge" },
+          "contains": {
+            "description": "At least one edge leaving `start` must be unconditional or carry `else: true`, so an execution always has a first step instead of dying on \"no viable route\" before doing any work. Guarded `start` edges are legal; they just cannot be the only ones. Grammar 7.6.3 / Decision D71 (no silent dead ends).",
+            "type": "object",
+            "required": ["from"],
+            "properties": { "from": { "const": "start" } },
+            "not": { "required": ["when"] }
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "edge": {
+      "description": "A control-flow edge. All edges whose guard passes fire (concurrent branches); an `else` edge fires only when no guarded sibling fired. Grammar 7.2, 7.3 / PRD 5.3.",
+      "type": "object",
+      "required": ["from", "to"],
+      "properties": {
+        "from": {
+          "description": "Source node id, or the pseudo-node `start`.",
+          "allOf": [
+            { "$ref": "#/$defs/identifier" },
+            { "not": { "const": "end" } },
+            { "not": { "$ref": "#/$defs/reservedRootName" } }
+          ]
+        },
+        "to": {
+          "description": "Target node id, or the pseudo-node `end`.",
+          "allOf": [
+            { "$ref": "#/$defs/identifier" },
+            { "not": { "const": "start" } },
+            { "not": { "$ref": "#/$defs/reservedRootName" } }
+          ]
+        },
+        "when": {
+          "description": "CEL guard over the source node's output plus input/state/execution. The LLM decides the value; the compiled router decides the transition (PRD 5.3). Legal on an edge leaving `start` too, where the only roots are input/state/execution.",
+          "$ref": "#/$defs/cel"
+        },
+        "else": {
+          "description": "Marks the default edge: taken only when no guarded sibling edge from the same source was taken. At most one per source node. `true` is the only legal value - an edge with neither `when` nor `else` is already unconditional, so `else: false` would change nothing (Decision D61). The edge also requires a `when:`-guarded sibling leaving the same node: with none, nothing can suppress it, so it fires on every pass and the keyword says nothing either (grammar 7.3 / Decision D107). That half relates two items of this array through a shared `from` value, which JSON Schema cannot express, so the validator owns it (Appendix B).",
+          "const": true
+        },
+        "max_iterations": {
+          "description": "Cycle bound: maximum traversals of this edge within one flow instance. Every SCC needs at least one bounded edge (PRD 5.4). Requires `when:` on the same edge: an exhausted edge is not taken whatever its guard says, so a budget on an unconditional or `else:` edge would withdraw the guarantee that exhaustiveness, the start-edge rule, the skip escape, and the cycle escape all rest on. Grammar 7.2, 7.3.1 / Decision D90.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000
+        }
+      },
+      "additionalProperties": false,
+      "not": { "required": ["when", "else"] },
+      "dependentRequired": { "max_iterations": ["when"] }
+    },
+
+    "node": {
+      "description": "A flow node: exactly one kind key (agent, exec, http, function, flow, map, human, store) plus bindings and policy. Grammar 8 / PRD 5.5, 5.8.",
+      "type": "object",
+      "oneOf": [
+        { "description": "An agent node.", "required": ["agent"] },
+        { "description": "An inline exec node.", "required": ["exec"] },
+        { "description": "An inline http node.", "required": ["http"] },
+        { "description": "A function node.", "required": ["function"] },
+        { "description": "A subflow node.", "required": ["flow"] },
+        { "description": "A map node.", "required": ["map"] },
+        { "description": "A human node.", "required": ["human"] },
+        { "description": "A store-op node.", "required": ["store"] }
+      ],
+      "allOf": [
+        { "if": { "required": ["agent"] }, "then": { "$ref": "#/$defs/agentNode" } },
+        { "if": { "required": ["exec"] }, "then": { "$ref": "#/$defs/execNode" } },
+        { "if": { "required": ["http"] }, "then": { "$ref": "#/$defs/httpNode" } },
+        { "if": { "required": ["function"] }, "then": { "$ref": "#/$defs/functionNode" } },
+        { "if": { "required": ["flow"] }, "then": { "$ref": "#/$defs/flowNode" } },
+        { "if": { "required": ["map"] }, "then": { "$ref": "#/$defs/mapNode" } },
+        { "if": { "required": ["human"] }, "then": { "$ref": "#/$defs/humanNode" } },
+        { "if": { "required": ["store"] }, "then": { "$ref": "#/$defs/storeNode" } }
+      ]
+    },
+    "agentNode": {
+      "description": "An LLM call with structured output. Grammar 8.1.",
+      "type": "object",
+      "required": ["agent"],
+      "properties": {
+        "agent": { "description": "The agent definition to invoke.", "$ref": "#/$defs/agentRef" },
+        "input": { "description": "Input bindings.", "$ref": "#/$defs/inputBindings" },
+        "writes": { "description": "Write remap.", "$ref": "#/$defs/writes" },
+        "retry": { "$ref": "#/$defs/retry" },
+        "timeout": { "description": "Wall-clock bound on this node.", "$ref": "#/$defs/duration" },
+        "on_error": { "$ref": "#/$defs/onError" },
+        "description": { "description": "Node documentation.", "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "execNode": {
+      "description": "An inline subprocess step. Prefer a tool.* with an `exec:` binding when the implementation is shared or LLM-facing. Grammar 8.2.",
+      "type": "object",
+      "required": ["exec"],
+      "properties": {
+        "exec": {
+          "description": "Subprocess configuration plus an optional result schema.",
+          "type": "object",
+          "required": ["command"],
+          "properties": {
+            "command": {
+              "description": "Executable name or path (argv[0]); never shell-interpreted. May embed ${ENV} references (grammar 4.3 class 2, Decision D92).",
+              "allOf": [{ "$ref": "#/$defs/interpolatedString" }, { "minLength": 1 }]
+            },
+            "args": { "description": "Literal argv entries: no CEL, but ${ENV} references may be embedded (grammar 4.3 class 2, Decisions D24, D92).", "type": "array", "items": { "$ref": "#/$defs/interpolatedString" } },
+            "cwd": { "description": "Working directory; may embed ${ENV} references.", "$ref": "#/$defs/interpolatedString" },
+            "env": {
+              "description": "Extra environment variables.",
+              "type": "object",
+              "propertyNames": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+              "additionalProperties": { "$ref": "#/$defs/interpolatedString" }
+            },
+            "expect_exit": { "$ref": "#/$defs/expectExit" },
+            "output": {
+              "description": "Result schema (default: { exit_code: integer, stdout: string }). `exit_code`, `stdout`, and `stderr` are envelope fields bound from the child process itself, with fixed types; every other field is decoded from stdout as JSON, unconditionally - §6.1's single-string-property exception is a tool-surface rule and does not apply here, because raw stdout already has a name on this surface (Decision D91). Declaring a field is a decoding choice and never changes which outcomes are node errors - widening `expect_exit` is what does (Decision D84). This is a RESULT surface, so every array inside it must declare `max_items` and `default:` is illegal (grammar 3.5, 3.6 / Decision D96). Grammar 8.2.",
+              "allOf": [
+                { "$ref": "#/$defs/outputFieldMap" },
+                { "$ref": "#/$defs/execEnvelopeFields" }
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        "input": { "description": "Input bindings; the bound object becomes environment variables (or stdin for a scalar binding).", "$ref": "#/$defs/inputBindings" },
+        "writes": { "description": "Write remap.", "$ref": "#/$defs/writes" },
+        "retry": { "$ref": "#/$defs/retry" },
+        "timeout": { "description": "Wall-clock bound on this node.", "$ref": "#/$defs/duration" },
+        "on_error": { "$ref": "#/$defs/onError" },
+        "description": { "description": "Node documentation.", "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "httpNode": {
+      "description": "An inline HTTP step. Grammar 8.3.",
+      "type": "object",
+      "required": ["http"],
+      "properties": {
+        "http": {
+          "description": "Request configuration plus an optional result schema.",
+          "type": "object",
+          "required": ["method", "url"],
+          "properties": {
+            "method": { "description": "HTTP method.", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] },
+            "url": { "description": "Request URL; may embed ${ENV} references.", "$ref": "#/$defs/interpolatedString" },
+            "headers": {
+              "description": "Request headers.",
+              "type": "object",
+              "propertyNames": { "type": "string", "pattern": "^[a-zA-Z0-9_-]+$" },
+              "additionalProperties": { "$ref": "#/$defs/interpolatedString" }
+            },
+            "query": {
+              "description": "Query parameters, each a CEL expression over the flow-scoped roots `input`, `state`, `execution` (grammar 4.1) - unlike the same key inside a tool binding, which sees only the tool's own `input`.",
+              "type": "object",
+              "propertyNames": { "type": "string", "pattern": "^[a-zA-Z0-9_-]+$" },
+              "additionalProperties": { "$ref": "#/$defs/cel" }
+            },
+            "body": {
+              "description": "JSON body fields, each a CEL expression over the flow-scoped roots `input`, `state`, `execution` (grammar 4.1).",
+              "type": "object",
+              "propertyNames": { "$ref": "#/$defs/identifier" },
+              "additionalProperties": { "$ref": "#/$defs/cel" }
+            },
+            "expect_status": {
+              "$ref": "#/$defs/expectStatus"
+            },
+            "output": {
+              "description": "Result schema (default: { status: integer, body: string }). `status` and `body` are envelope fields bound from the response itself, with fixed types; every other field is decoded from the response body as JSON, unconditionally - §6.1's single-string-property exception is a tool-surface rule and does not apply here, because the raw response text already has a name on this surface (Decision D91). This is a RESULT surface, so every array inside it must declare `max_items` and `default:` is illegal (grammar 3.5, 3.6 / Decision D96). Grammar 8.3.",
+              "allOf": [
+                { "$ref": "#/$defs/outputFieldMap" },
+                { "$ref": "#/$defs/httpEnvelopeFields" }
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "allOf": [
+            {
+              "if": { "properties": { "method": { "enum": ["GET", "HEAD"] } }, "required": ["method"] },
+              "then": { "not": { "required": ["body"] } }
+            }
+          ]
+        },
+        "input": { "description": "Input bindings, field-map form only: the bound object becomes the JSON body (body-bearing methods) or the query string (GET/HEAD), so it is built from named fields and may not be combined with the in-block key that would otherwise carry it.", "$ref": "#/$defs/fieldInputBindings" },
+        "writes": { "description": "Write remap.", "$ref": "#/$defs/writes" },
+        "retry": { "$ref": "#/$defs/retry" },
+        "timeout": { "description": "Wall-clock bound on this node.", "$ref": "#/$defs/duration" },
+        "on_error": { "$ref": "#/$defs/onError" },
+        "description": { "description": "Node documentation.", "type": "string" }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "description": "Node-level `input:` and an in-block `body:` both claim the request body; declaring both leaves one of them inert, so it is an error (grammar 8.3, D66).",
+          "not": {
+            "allOf": [
+              { "required": ["input"] },
+              { "required": ["http"], "properties": { "http": { "required": ["body"] } } }
+            ]
+          }
+        },
+        {
+          "description": "On GET/HEAD the bound input object becomes the query string, so node-level `input:` and an in-block `query:` both claim it; declaring both is an error (grammar 8.3, D66).",
+          "not": {
+            "allOf": [
+              { "required": ["input"] },
+              {
+                "required": ["http"],
+                "properties": {
+                  "http": { "required": ["query"], "properties": { "method": { "enum": ["GET", "HEAD"] } } }
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "functionNode": {
+      "description": "Deterministic, graph-invoked use of a tool definition; arguments are checked against the tool's input schema. Grammar 8.4 / PRD 5.5.",
+      "type": "object",
+      "required": ["function"],
+      "properties": {
+        "function": { "description": "The tool definition to invoke.", "$ref": "#/$defs/toolRef" },
+        "input": { "description": "Argument bindings, checked field-by-field against the tool's input schema. Field-map form only: a tool always declares a named input object (possibly {}).", "$ref": "#/$defs/fieldInputBindings" },
+        "writes": { "description": "Write remap.", "$ref": "#/$defs/writes" },
+        "retry": { "$ref": "#/$defs/retry" },
+        "timeout": { "description": "Wall-clock bound on this node.", "$ref": "#/$defs/duration" },
+        "on_error": { "$ref": "#/$defs/onError" },
+        "description": { "description": "Node documentation.", "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "flowNode": {
+      "description": "Subgraph instantiation, Terraform-module style. Subgraphs receive parent state only through explicit bindings (PRD 5.7). Grammar 8.5.",
+      "type": "object",
+      "required": ["flow"],
+      "properties": {
+        "flow": { "description": "The flow definition to instantiate. Recursion is a compile error.", "$ref": "#/$defs/flowRef" },
+        "input": {
+          "description": "Explicit input bindings, field-map form only; REQUIRED whenever the subflow declares an input field with no default. Nothing falls through a module boundary by name (PRD 5.7, Decision D68).",
+          "$ref": "#/$defs/fieldInputBindings"
+        },
+        "writes": { "description": "Write remap over the subflow's output fields.", "$ref": "#/$defs/writes" },
+        "context": {
+          "description": "Conversation-history scoping: isolated (default) gives the subflow a fresh history; inherit shares the caller's (PRD 5.7). This key is a flow node's alone - a map dispatch is the other module boundary for history and its isolation is unconditional, so a map block accepts no `context:` (grammar 10.4, 8.6 rule 13 / Decisions D27, D105).",
+          "enum": ["isolated", "inherit"]
+        },
+        "policy": { "description": "Instantiation-site policy override: the highest level of the resolution chain, propagated into nested instantiations.", "$ref": "#/$defs/policyBlock" },
+        "retry": { "$ref": "#/$defs/retry" },
+        "timeout": { "description": "Wall-clock bound on this node.", "$ref": "#/$defs/duration" },
+        "on_error": { "$ref": "#/$defs/onError" },
+        "description": { "description": "Node documentation.", "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "humanNode": {
+      "description": "Human-in-the-loop pause. Grammar is active in v0; runtime support may land in M2. Grammar 8.7 / PRD 5.5, 5.11.",
+      "type": "object",
+      "required": ["human"],
+      "properties": {
+        "human": {
+          "description": "What the human sees, what they return, and what happens if they do not.",
+          "type": "object",
+          "required": ["input", "output"],
+          "properties": {
+            "input": { "description": "Schema of what is rendered for the human.", "$ref": "#/$defs/fieldMap" },
+            "output": { "description": "Schema of what they return; routable like any structured output, and the contract resume payloads are validated against.", "$ref": "#/$defs/outputFieldMap" },
+            "timeout": { "description": "Wall-clock wait budget.", "$ref": "#/$defs/duration" },
+            "on_timeout": { "description": "Where control goes on expiry: a flow-local node id, or `end`. The same targets `on_error.fallback` accepts. The pair is jointly optional and jointly required: `timeout` without `on_timeout` has no route, and `on_timeout` without `timeout` declares a route that can never be taken.", "$ref": "#/$defs/controlTarget" }
+          },
+          "additionalProperties": false,
+          "dependentRequired": { "timeout": ["on_timeout"], "on_timeout": ["timeout"] }
+        },
+        "input": { "description": "Input bindings for the human-facing schema, field-map form only: `human.input` is a field map, so a bare scalar names no destination.", "$ref": "#/$defs/fieldInputBindings" },
+        "writes": { "description": "Write remap.", "$ref": "#/$defs/writes" },
+        "on_error": { "description": "Delivery-failure strategy, resolved through all four levels of the policy chain like any node's. Node-level `timeout`/`retry` are illegal on a human node - a wait is not an activity timeout and re-prompting a human is not a retry - and the exemption is the whole chain's: a human node also takes no `timeout` and no `retry` from a flow node's `policy:` or from `defaults:`, so its wait is bounded only by `human.timeout:` (grammar 8.7, 9.3 / Decisions D52, D102).", "$ref": "#/$defs/onError" },
+        "description": { "description": "Node documentation.", "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "storeNode": {
+      "description": "Deterministic, graph-invoked store operation - the second consumption surface of a store definition. Grammar 8.8 / PRD 5.8.",
+      "type": "object",
+      "required": ["store", "op"],
+      "properties": {
+        "store": { "description": "The store definition to operate on.", "$ref": "#/$defs/storeRef" },
+        "op": {
+          "description": "The operation. Legal values depend on the store's kind: kv = get|set|delete|list, vector = search|upsert|delete, blob = get|put|delete|list. Each op's output schema is derived and fixed (grammar 11.4). `get` is the one op whose result may omit a field: a miss returns `found: false` and no `value`, so a `writes:` of `value` performs no write that pass and reading `<node>.output.value` fails the execution - route on `found` instead (Decision D110).",
+          "enum": ["get", "set", "delete", "list", "search", "upsert", "put"]
+        },
+        "key": { "description": "CEL key expression. Inside a map-dispatched instance a write's key must derive from the item.", "$ref": "#/$defs/cel" },
+        "value": {
+          "description": "Value to write. `kv set` takes a field map of CEL expressions, checked against the store's value_schema; `vector upsert` and `blob put` take a single CEL string (the text / the content). Grammar 11.4.",
+          "oneOf": [
+            { "description": "The text (vector upsert) or content (blob put).", "$ref": "#/$defs/cel" },
+            {
+              "description": "Field -> CEL, matching the store's value_schema (kv set).",
+              "type": "object",
+              "propertyNames": { "$ref": "#/$defs/identifier" },
+              "additionalProperties": { "$ref": "#/$defs/cel" }
+            }
+          ]
+        },
+        "query": { "description": "CEL query text for a vector search.", "$ref": "#/$defs/cel" },
+        "top_k": { "description": "Number of vector matches to return.", "type": "integer", "minimum": 1, "maximum": 100 },
+        "prefix": { "description": "CEL key prefix for a list op.", "$ref": "#/$defs/cel" },
+        "limit": { "description": "Maximum keys returned by a list op.", "type": "integer", "minimum": 1, "maximum": 1000 },
+        "filter": {
+          "description": "Metadata filter for a vector search; keys are checked against metadata_schema.",
+          "type": "object",
+          "propertyNames": { "$ref": "#/$defs/identifier" },
+          "additionalProperties": { "$ref": "#/$defs/cel" }
+        },
+        "metadata": {
+          "description": "Metadata written by a vector upsert; keys are checked against metadata_schema.",
+          "type": "object",
+          "propertyNames": { "$ref": "#/$defs/identifier" },
+          "additionalProperties": { "$ref": "#/$defs/cel" }
+        },
+        "content_type": { "description": "Content type for a blob put: a literal media type, not CEL. Env references are illegal (grammar 4.3 class 3, Decision D92).", "$ref": "#/$defs/noEnvRefString" },
+        "writes": { "description": "Write remap over the op's derived output fields.", "$ref": "#/$defs/writes" },
+        "retry": { "$ref": "#/$defs/retry" },
+        "timeout": { "description": "Wall-clock bound on this node.", "$ref": "#/$defs/duration" },
+        "on_error": { "$ref": "#/$defs/onError" },
+        "description": { "description": "Node documentation.", "type": "string" }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": { "properties": { "op": { "enum": ["get", "delete"] } }, "required": ["op"] },
+          "then": {
+            "description": "`get`/`delete` address one key and take no other parameter. Grammar 11.4.",
+            "required": ["key"],
+            "properties": {
+              "value": false,
+              "query": false,
+              "top_k": false,
+              "prefix": false,
+              "limit": false,
+              "filter": false,
+              "metadata": false,
+              "content_type": false
+            }
+          }
+        },
+        {
+          "if": { "properties": { "op": { "enum": ["set", "upsert", "put"] } }, "required": ["op"] },
+          "then": { "required": ["key", "value"] }
+        },
+        {
+          "if": { "properties": { "op": { "const": "set" } }, "required": ["op"] },
+          "then": {
+            "description": "`kv set` takes `key` and `value` only. Grammar 11.4.",
+            "properties": {
+              "query": false,
+              "top_k": false,
+              "prefix": false,
+              "limit": false,
+              "filter": false,
+              "metadata": false,
+              "content_type": false
+            }
+          }
+        },
+        {
+          "if": { "properties": { "op": { "const": "upsert" } }, "required": ["op"] },
+          "then": {
+            "description": "`vector upsert` takes `key`, `value`, and optional `metadata`. Grammar 11.4.",
+            "properties": {
+              "query": false,
+              "top_k": false,
+              "prefix": false,
+              "limit": false,
+              "filter": false,
+              "content_type": false
+            }
+          }
+        },
+        {
+          "if": { "properties": { "op": { "const": "put" } }, "required": ["op"] },
+          "then": {
+            "description": "`blob put` takes `key`, `value`, and optional `content_type`. Grammar 11.4.",
+            "properties": {
+              "query": false,
+              "top_k": false,
+              "prefix": false,
+              "limit": false,
+              "filter": false,
+              "metadata": false
+            }
+          }
+        },
+        {
+          "if": { "properties": { "op": { "const": "list" } }, "required": ["op"] },
+          "then": {
+            "description": "`list` takes an optional `prefix` and a required `limit`. Grammar 11.4.",
+            "required": ["limit"],
+            "properties": {
+              "key": false,
+              "value": false,
+              "query": false,
+              "top_k": false,
+              "filter": false,
+              "metadata": false,
+              "content_type": false
+            }
+          }
+        },
+        {
+          "if": { "properties": { "op": { "const": "search" } }, "required": ["op"] },
+          "then": {
+            "description": "`vector search` takes `query`, `top_k`, and an optional metadata `filter`. Grammar 11.4.",
+            "required": ["query", "top_k"],
+            "properties": {
+              "key": false,
+              "value": false,
+              "prefix": false,
+              "limit": false,
+              "metadata": false,
+              "content_type": false
+            }
+          }
+        },
+        {
+          "if": { "properties": { "op": { "const": "set" } }, "required": ["op"] },
+          "then": {
+            "description": "`kv set` writes a value_schema-shaped object: `value` is a field map of CEL expressions, never a bare expression.",
+            "properties": {
+              "value": {
+                "type": "object",
+                "propertyNames": { "$ref": "#/$defs/identifier" },
+                "additionalProperties": { "$ref": "#/$defs/cel" }
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "op": { "enum": ["upsert", "put"] } }, "required": ["op"] },
+          "then": {
+            "description": "`vector upsert` and `blob put` write one string: `value` is a CEL expression, never a field map.",
+            "properties": { "value": { "$ref": "#/$defs/cel" } }
+          }
+        }
+      ]
+    },
+    "mapNode": {
+      "description": "Fan-out over an agent-produced collection: the agent emits an array, the map dispatches over it deterministically. Grammar 8.6 / PRD 5.6.",
+      "type": "object",
+      "required": ["map"],
+      "properties": {
+        "map": {
+          "description": "Fan-out configuration. Bounding is mandatory: max_items on the source array plus max_concurrency here. The block accepts no `context:` key: a dispatch is the other module boundary for conversation history and its isolation is unconditional - every instance runs on a fresh history that is discarded when it completes, and the sharing opt-in is a flow node's key (grammar 8.6 rule 13, 10.4 / Decision D105).",
+          "type": "object",
+          "required": ["over", "max_concurrency"],
+          "properties": {
+            "over": { "description": "Path expression resolving to an array schema that declares max_items. Its root node must dominate this map node - every path from `start` to the map passes through it - so the array is guaranteed to exist when the map dispatches (grammar 8.6 rule 11).", "$ref": "#/$defs/pathExpression" },
+            "as": { "description": "Name bound to each item in per-item bindings and traces (default `item`).", "$ref": "#/$defs/itemBindingName" },
+            "node": { "description": "Homogeneous dispatch target. Mutually exclusive with route_by/routes.", "$ref": "#/$defs/mapTargetRef" },
+            "route_by": {
+              "description": "Literal discriminator field name of the item union - never a CEL expression, which is what keeps exhaustiveness decidable (PRD 5.6).",
+              "$ref": "#/$defs/identifier"
+            },
+            "routes": {
+              "description": "Variant tag -> route. Every variant must have a route unless `default` is present.",
+              "type": "object",
+              "minProperties": 1,
+              "propertyNames": { "$ref": "#/$defs/identifier" },
+              "additionalProperties": { "$ref": "#/$defs/mapRoute" }
+            },
+            "default": { "description": "Catch-all route; legal only with route_by.", "$ref": "#/$defs/mapRoute" },
+            "max_concurrency": {
+              "description": "REQUIRED node-wide execution bound; route-level values may only tighten it.",
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 256
+            },
+            "on_item_error": {
+              "description": "Per-item error strategy (default fail), governing every route whose outcome is observed - a detached route's dispatches are resolved at dispatch and have none (Decision D94). A retry carries its policy inline, in the same enum-or-single-key-object shape `on_error:` uses: a bare `retry` would be a retry with no count and no backoff, which is the unbounded loop PRD 5.6 exists to prevent, and there is nothing for it to inherit one from. Grammar 8.6 rule 10 / Decision D73.",
+              "oneOf": [
+                {
+                  "description": "fail (default): the item's failure fails the fan-out. skip: drop the item and carry on.",
+                  "enum": ["fail", "skip"]
+                },
+                {
+                  "description": "Retry the item under this policy, re-executing the dispatched instance from its entry; when the retries are exhausted the item fails as `fail` does.",
+                  "type": "object",
+                  "required": ["retry"],
+                  "properties": { "retry": { "$ref": "#/$defs/retry" } },
+                  "additionalProperties": false
+                }
+              ]
+            },
+            "input": { "description": "Per-item input bindings, homogeneous form only; without it the whole item is passed. Illegal here alongside `route_by:` - each route's bindings are narrowed to its own variant's payload, so a map-wide binding would have to type-check against every variant at once (Decision D85).", "$ref": "#/$defs/mapInputBindings" },
+            "writes": { "description": "Write remap, homogeneous form only; targets must be channels with a declared reduce policy. Illegal here alongside `route_by:` - route targets have different output schemas, so a map-wide remap would name fields only some of them declare (Decision D85).", "$ref": "#/$defs/writes" },
+            "detach": { "description": "Fire-and-forget dispatch, homogeneous form only. Illegal here alongside `route_by:` - a discriminator-routed map declares detach per route. A detached dispatch is resolved at dispatch: the join does not wait for it and `on_item_error` never applies to it (Decision D94), it may not write reduced state, and detach + checkpointing is a v0 validation error.", "type": "boolean" }
+          },
+          "additionalProperties": false,
+          "oneOf": [
+            {
+              "description": "Homogeneous fan-out.",
+              "required": ["node"],
+              "not": {
+                "anyOf": [
+                  { "required": ["route_by"] },
+                  { "required": ["routes"] },
+                  { "required": ["default"] }
+                ]
+              }
+            },
+            {
+              "description": "Heterogeneous, discriminator-routed fan-out.",
+              "required": ["route_by", "routes"],
+              "not": { "required": ["node"] }
+            }
+          ],
+          "allOf": [
+            {
+              "if": { "properties": { "detach": { "const": true } }, "required": ["detach"] },
+              "then": { "not": { "required": ["writes"] } }
+            },
+            {
+              "if": { "required": ["route_by"] },
+              "then": {
+                "description": "A discriminator-routed map declares the three per-dispatch-target keys on its routes, never map-wide: `input:` is narrowed per variant, `writes:` names a target's own output fields, and a blanket `detach:` would silently detach sinks written to be joined. Grammar 8.6 rule 7 / Decisions D31, D85.",
+                "properties": { "detach": false, "input": false, "writes": false }
+              }
+            }
+          ]
+        },
+        "retry": { "$ref": "#/$defs/retry" },
+        "timeout": { "description": "Wall-clock bound on the whole fan-out.", "$ref": "#/$defs/duration" },
+        "on_error": { "$ref": "#/$defs/onError" },
+        "description": { "description": "Node documentation.", "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "mapRoute": {
+      "description": "One destination of a discriminator-routed map. Routes may target non-compute sinks (queues, webhooks, ticketing). Grammar 8.6 / PRD 5.6.",
+      "type": "object",
+      "required": ["node"],
+      "properties": {
+        "node": { "description": "Dispatch target for this variant.", "$ref": "#/$defs/mapTargetRef" },
+        "max_concurrency": { "description": "Per-route bound; must be <= the map's.", "type": "integer", "minimum": 1, "maximum": 256 },
+        "input": { "description": "Per-item input bindings for this route.", "$ref": "#/$defs/mapInputBindings" },
+        "writes": { "description": "Write remap; targets must be reduced channels.", "$ref": "#/$defs/writes" },
+        "detach": { "description": "Fire-and-forget: this route's dispatches are resolved at dispatch, so the join does not wait on them and `on_item_error` never applies to them (Decision D94); it may not write reduced state.", "type": "boolean" }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": { "properties": { "detach": { "const": true } }, "required": ["detach"] },
+          "then": { "not": { "required": ["writes"] } }
+        }
+      ]
+    },
+
+    "storeDef": {
+      "description": "A store: durable, attachable storage with two consumption surfaces (agent-attached tools, store-op nodes). Grammar 11 / PRD 5.8.",
+      "type": "object",
+      "required": ["kind", "scope"],
+      "properties": {
+        "kind": { "description": "Store kind. Relational/SQL is deliberately excluded; wrap a DB client in a `function` tool instead.", "enum": ["kv", "vector", "blob"] },
+        "scope": {
+          "description": "Lifetime: execution (dies with the run), session (persists across executions sharing a session key), or global. Session scope requires a session-keyed trigger.",
+          "enum": ["execution", "session", "global"]
+        },
+        "value_schema": { "description": "Stored value shape. REQUIRED for kv; illegal for vector and blob.", "$ref": "#/$defs/outputFieldMap" },
+        "metadata_schema": { "description": "Filterable metadata shape, narrowing a vector search. Legal for vector stores only: no blob or kv op reads metadata, so the key would be inert there (grammar 11.1, Decision D113).", "$ref": "#/$defs/outputFieldMap" },
+        "embed": {
+          "description": "Embedding configuration. REQUIRED for vector stores, illegal otherwise. Both the model id and the connection that computes the vectors are named here: the storage backend only says where they live (Decision D116).",
+          "type": "object",
+          "required": ["model", "provider"],
+          "properties": {
+            "model": {
+              "description": "Provider-native embedding model id (a bare string, not a model.* reference). Env references are illegal here, exactly as on a model `id:` (grammar 4.3 class 3, Decision D92): the id is part of the composition's identity, not of its environment.",
+              "allOf": [{ "$ref": "#/$defs/noEnvRefString" }, { "minLength": 1 }]
+            },
+            "provider": { "description": "REQUIRED: the provider.* connection that computes the vectors. A storage backend never embeds - `backend:` forks per target and says where vectors live, while the embedding connection is logical-layer and does not, so one store embeds identically under every target (grammar 11.2, Decision D116). The provider must publish embedding capability, checked at this definition.", "$ref": "#/$defs/providerRef" },
+            "dimensions": { "description": "Asserted against the backend index.", "type": "integer", "minimum": 1 }
+          },
+          "additionalProperties": false
+        },
+        "backend": {
+          "description": "Abstract backend alias, defined per target under storage_backends.aliases. Never provider config: physical configuration lives only in the deploy layer (PRD 5.8).",
+          "$ref": "#/$defs/identifier"
+        },
+        "description": { "description": "Documentation; LLM-facing for agent-attached stores.", "type": "string" },
+        "agent_access": {
+          "description": "Narrows the tools synthesized for agents that attach this store (default read_write).",
+          "enum": ["read", "read_write"]
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "const": "kv" } }, "required": ["kind"] },
+          "then": {
+            "description": "A kv store declares `value_schema` and nothing else about shape: metadata is a vector construct (Decision D113) and embedding is vector-only.",
+            "required": ["value_schema"],
+            "properties": { "metadata_schema": false, "embed": false }
+          }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "vector" } }, "required": ["kind"] },
+          "then": {
+            "description": "A vector store declares `embed:` and MAY declare `metadata_schema:`; `value_schema` is kv's (grammar 11.1).",
+            "required": ["embed"],
+            "properties": { "value_schema": false }
+          }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "blob" } }, "required": ["kind"] },
+          "then": {
+            "description": "A blob store declares neither schema: `value_schema` is kv's, and no blob op reads metadata, so `metadata_schema` would be inert (grammar 11.1, Decision D113).",
+            "properties": { "value_schema": false, "metadata_schema": false, "embed": false }
+          }
+        }
+      ]
+    },
+
+    "providerDef": {
+      "description": "An inference connection: kind plus connection config. Credentials are ${ENV} references, never literals. A kind's row in grammar 12.1 is closed: beyond `kind:` and `description:`, a provider takes exactly the keys its own kind admits, and a key belonging to another kind is an error rather than ignored config (Decision D106). Grammar 12.1 / PRD 5.9.",
+      "type": "object",
+      "required": ["kind"],
+      "properties": {
+        "kind": {
+          "description": "Provider plugin. Each kind publishes the settings schema that model `settings:` blocks are checked against, and fixes the rest of this definition's key set (grammar 12.1 / Decisions D38, D106).",
+          "enum": ["anthropic", "openai", "openai_compatible", "azure_openai", "bedrock", "vertex"]
+        },
+        "api_key": { "description": "API key, as an ${ENV} reference.", "$ref": "#/$defs/envRef" },
+        "base_url": { "description": "Endpoint base URL, as an ${ENV} reference.", "$ref": "#/$defs/envRef" },
+        "api_version": { "description": "API version (azure_openai).", "type": "string" },
+        "organization": { "description": "Organization id (openai).", "type": "string" },
+        "region": { "description": "Cloud region (bedrock).", "type": "string" },
+        "location": { "description": "Cloud location (vertex).", "type": "string" },
+        "project": { "description": "Cloud project (vertex).", "type": "string" },
+        "profile": { "description": "Local credential profile name (bedrock).", "type": "string" },
+        "access_key_id": { "description": "AWS access key id, as an ${ENV} reference.", "$ref": "#/$defs/envRef" },
+        "secret_access_key": { "description": "AWS secret access key, as an ${ENV} reference.", "$ref": "#/$defs/envRef" },
+        "session_token": { "description": "AWS session token, as an ${ENV} reference.", "$ref": "#/$defs/envRef" },
+        "credentials_json": { "description": "GCP credentials JSON, as an ${ENV} reference.", "$ref": "#/$defs/envRef" },
+        "headers": {
+          "description": "Extra request headers; values may embed ${ENV} references.",
+          "type": "object",
+          "propertyNames": { "type": "string", "pattern": "^[a-zA-Z0-9_-]+$" },
+          "additionalProperties": { "$ref": "#/$defs/interpolatedString" }
+        },
+        "description": { "description": "Documentation.", "type": "string" }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "const": "anthropic" } }, "required": ["kind"] },
+          "then": {
+            "description": "An `anthropic` provider takes `api_key` (required), `base_url`, and `headers`. Every other kind's key is refused here: a plugin never reads it, so an accepted one would be a connection setting its author believes is in effect and is not. Grammar 12.1 / Decision D106.",
+            "required": ["api_key"],
+            "properties": {
+              "api_version": false,
+              "organization": false,
+              "region": false,
+              "location": false,
+              "project": false,
+              "profile": false,
+              "access_key_id": false,
+              "secret_access_key": false,
+              "session_token": false,
+              "credentials_json": false
+            }
+          }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "openai" } }, "required": ["kind"] },
+          "then": {
+            "description": "An `openai` provider takes `api_key` (required), `base_url`, `headers`, and `organization`. Grammar 12.1 / Decision D106.",
+            "required": ["api_key"],
+            "properties": {
+              "api_version": false,
+              "region": false,
+              "location": false,
+              "project": false,
+              "profile": false,
+              "access_key_id": false,
+              "secret_access_key": false,
+              "session_token": false,
+              "credentials_json": false
+            }
+          }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "openai_compatible" } }, "required": ["kind"] },
+          "then": {
+            "description": "An `openai_compatible` provider takes `base_url` (required), `api_key`, and `headers`. Grammar 12.1 / Decision D106.",
+            "required": ["base_url"],
+            "properties": {
+              "api_version": false,
+              "organization": false,
+              "region": false,
+              "location": false,
+              "project": false,
+              "profile": false,
+              "access_key_id": false,
+              "secret_access_key": false,
+              "session_token": false,
+              "credentials_json": false
+            }
+          }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "azure_openai" } }, "required": ["kind"] },
+          "then": {
+            "description": "An `azure_openai` provider takes `base_url`, `api_key`, and `api_version` (all required) plus `headers`. Grammar 12.1 / Decision D106.",
+            "required": ["base_url", "api_key", "api_version"],
+            "properties": {
+              "organization": false,
+              "region": false,
+              "location": false,
+              "project": false,
+              "profile": false,
+              "access_key_id": false,
+              "secret_access_key": false,
+              "session_token": false,
+              "credentials_json": false
+            }
+          }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "bedrock" } }, "required": ["kind"] },
+          "then": {
+            "description": "A `bedrock` provider takes `region` (required) plus the AWS credential keys `access_key_id`, `secret_access_key`, `session_token`, and `profile`. It is reached through the AWS SDK rather than a bare endpoint, so `base_url`, `api_key`, and `headers` are not its keys. Grammar 12.1 / Decision D106.",
+            "required": ["region"],
+            "properties": {
+              "api_key": false,
+              "base_url": false,
+              "api_version": false,
+              "organization": false,
+              "location": false,
+              "project": false,
+              "credentials_json": false,
+              "headers": false
+            }
+          }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "vertex" } }, "required": ["kind"] },
+          "then": {
+            "description": "A `vertex` provider takes `project` and `location` (both required) plus `credentials_json`. It is reached through the Google SDK rather than a bare endpoint, so `base_url`, `headers`, and the `api_key` credential form are not its keys. Grammar 12.1 / Decision D106.",
+            "required": ["project", "location"],
+            "properties": {
+              "api_key": false,
+              "base_url": false,
+              "api_version": false,
+              "organization": false,
+              "region": false,
+              "profile": false,
+              "access_key_id": false,
+              "secret_access_key": false,
+              "session_token": false,
+              "headers": false
+            }
+          }
+        }
+      ]
+    },
+
+    "modelDef": {
+      "description": "A model: either a direct provider binding or an ordered failover route - never both. `route:` selects the form, so the rest of the definition is checked against that form alone. Grammar 12.2 / PRD 5.9.",
+      "type": "object",
+      "if": { "required": ["route"] },
+      "then": { "$ref": "#/$defs/modelRouteForm" },
+      "else": { "$ref": "#/$defs/modelDirectForm" }
+    },
+    "modelDirectForm": {
+      "description": "Direct binding: a provider connection plus the provider-native model id.",
+      "type": "object",
+      "required": ["provider", "id"],
+      "properties": {
+        "provider": { "description": "The connection this model is served over.", "$ref": "#/$defs/providerRef" },
+        "id": {
+          "description": "Provider-native model id. Env references are illegal here (grammar 4.3): the id is part of the composition's identity, not of its environment.",
+          "allOf": [{ "$ref": "#/$defs/noEnvRefString" }, { "minLength": 1 }]
+        },
+        "settings": { "$ref": "#/$defs/modelSettings" },
+        "description": { "description": "Documentation.", "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "modelRouteForm": {
+      "description": "Ordered fallback route. Members must be direct models (no nested routes) and capability-equivalent, so failover cannot silently break structured output. A route carries no `provider:`/`id:`/`settings:` of its own - those belong to its members.",
+      "type": "object",
+      "required": ["route"],
+      "properties": {
+        "route": {
+          "description": "Ordered model.* members; the first that serves the call wins, and the failover is recorded in the trace.",
+          "type": "array",
+          "minItems": 2,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/modelRef" }
+        },
+        "route_on": {
+          "description": "Infrastructure failure conditions that trigger failover (default [rate_limit, overloaded, timeout]). Content-based routing is out of scope - that is what graph edges are for.",
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "enum": ["rate_limit", "overloaded", "timeout", "server_error"] }
+        },
+        "description": { "description": "Documentation.", "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "modelSettings": {
+      "description": "Model behavior settings, validated by the compiler against the provider plugin's published schema (e.g. `thinking:` on an OpenAI provider is an error). This is the one open object in the logical layer: plugin-specific keys are accepted here. Grammar 12.2 / PRD 5.9.",
+      "type": "object",
+      "properties": {
+        "temperature": { "description": "Sampling temperature.", "type": "number" },
+        "top_p": { "description": "Nucleus sampling cutoff.", "type": "number" },
+        "top_k": { "description": "Top-k sampling cutoff.", "type": "integer" },
+        "max_tokens": { "description": "Maximum output tokens.", "type": "integer", "minimum": 1 },
+        "stop": { "description": "Stop sequences.", "type": "array", "items": { "type": "string" } },
+        "seed": { "description": "Sampling seed, where the provider supports it.", "type": "integer" },
+        "thinking": { "description": "Extended-thinking configuration, where the provider supports it.", "type": "object" },
+        "reasoning_effort": { "description": "Reasoning effort, where the provider supports it.", "type": "string" },
+        "parallel_tool_calls": { "description": "Whether parallel tool calls are permitted.", "type": "boolean" }
+      },
+      "additionalProperties": true
+    },
+
+    "trigger": {
+      "description": "One trigger: a (source, input binding, response mode) tuple targeting a flow. `type:` selects the shape, so the rest of the entry is checked against that shape alone. Grammar 13 / PRD 5.11.",
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": {
+          "description": "Which invocation source this trigger declares. manual and http are active in v0; schedule and event are reserved grammar (parsed and validated, no-op).",
+          "enum": ["manual", "http", "schedule", "event"]
+        }
+      },
+      "allOf": [
+        { "if": { "properties": { "type": { "const": "manual" } }, "required": ["type"] }, "then": { "$ref": "#/$defs/manualTrigger" } },
+        { "if": { "properties": { "type": { "const": "http" } }, "required": ["type"] }, "then": { "$ref": "#/$defs/httpTrigger" } },
+        { "if": { "properties": { "type": { "const": "schedule" } }, "required": ["type"] }, "then": { "$ref": "#/$defs/scheduleTrigger" } },
+        { "if": { "properties": { "type": { "const": "event" } }, "required": ["type"] }, "then": { "$ref": "#/$defs/eventTrigger" } }
+      ]
+    },
+    "triggerInput": {
+      "description": "Flow input field -> CEL over the trigger payload, compile-checked against the target flow's input schema.",
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/identifier" },
+      "additionalProperties": { "$ref": "#/$defs/cel" }
+    },
+    "manualTrigger": {
+      "description": "CLI/SDK invocation: `agent-compose run <flow> --input k=v`. Declares no `input:` bindings - CLI arguments are validated against the flow's input schema at run start instead. Declaring it is optional: the same CLI entry exists implicitly for every flow (grammar 13, Decision D64); writing it out documents the entry and lets it carry `description:` or a `session_key:` remap. Grammar 13.2.",
+      "type": "object",
+      "required": ["type", "flow"],
+      "properties": {
+        "type": { "const": "manual", "description": "Manual (CLI/SDK) invocation." },
+        "flow": { "description": "The flow this trigger starts.", "$ref": "#/$defs/flowRef" },
+        "session_key": { "description": "CEL over payload producing the session identity. Defaults to \"payload.session\" - the CLI's `--session <key>`, the manual payload's only member - so a manual trigger always satisfies the session-coherence check statically (grammar 11.3).", "$ref": "#/$defs/cel" },
+        "description": { "description": "Documentation.", "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "httpTrigger": {
+      "description": "The graph as an endpoint. Generated apps expose start/resume/status routes. Grammar 13.3 / PRD 5.11.",
+      "type": "object",
+      "required": ["type", "flow"],
+      "properties": {
+        "type": { "const": "http", "description": "HTTP invocation." },
+        "flow": { "description": "The flow this trigger starts.", "$ref": "#/$defs/flowRef" },
+        "path": {
+          "description": "Route path: starts with / and contains no whitespace (default /triggers/<trigger name>). Router-specific parameter syntax such as /reviews/:id is passed through unexamined. Env references are illegal: the route is part of the API surface the IR describes (grammar 4.3 class 3, Decision D92). Grammar 13.3.",
+          "allOf": [{ "$ref": "#/$defs/noEnvRefString" }, { "pattern": "^/\\S*$" }]
+        },
+        "method": { "description": "HTTP method for the start route (default POST).", "enum": ["POST", "PUT", "GET"] },
+        "input": { "description": "Bindings, CEL over payload.body / payload.query / payload.headers / payload.path / payload.method.", "$ref": "#/$defs/triggerInput" },
+        "session_key": { "description": "CEL over payload producing the session identity for session-scoped stores and history.", "$ref": "#/$defs/cel" },
+        "respond": {
+          "description": "async (default) returns an execution id immediately; sync blocks and returns the flow's outputs, and requires the flow to be statically interrupt-free.",
+          "enum": ["sync", "async"]
+        },
+        "timeout": { "description": "Response budget for respond: sync (default 60s). On expiry the response upgrades to async (202 + execution id) and the execution continues durably. Illegal on an async trigger, which has already responded: there is no response left for a budget to bound.", "$ref": "#/$defs/duration" },
+        "callback": { "description": "CEL over payload producing a completion webhook URL. Async only: `callback` with `respond: sync` is a compile error, since a synchronous response already returns the outputs.", "$ref": "#/$defs/cel" },
+        "description": { "description": "Documentation.", "type": "string" }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": { "properties": { "respond": { "const": "sync" } }, "required": ["respond"] },
+          "then": {
+            "description": "A synchronous trigger returns the flow's outputs on the request itself; a completion webhook has nothing left to deliver.",
+            "not": { "required": ["callback"] }
+          },
+          "else": {
+            "description": "`respond:` defaults to async, and an async trigger has already responded with an execution id - so `timeout:` bounds nothing observable and is an error rather than a silently inert key (grammar 13.3, Decision D81).",
+            "not": { "required": ["timeout"] }
+          }
+        }
+      ]
+    },
+    "scheduleTrigger": {
+      "description": "RESERVED grammar: parsed and validated in v0, executed in M3. Grammar 13.4 / PRD 5.11.",
+      "type": "object",
+      "required": ["type", "flow", "cron"],
+      "properties": {
+        "type": { "const": "schedule", "description": "Schedule invocation (reserved: no-op in v0)." },
+        "flow": { "description": "The flow this trigger starts.", "$ref": "#/$defs/flowRef" },
+        "cron": {
+          "description": "5-field POSIX cron expression. Shape-checked at compile time, so env references are illegal (grammar 4.3 class 3, Decision D92).",
+          "allOf": [{ "$ref": "#/$defs/noEnvRefString" }, { "pattern": "^\\S+(\\s+\\S+){4}$" }]
+        },
+        "timezone": { "description": "IANA timezone name (default UTC). Shape-checked at compile time, so env references are illegal (grammar 4.3 class 3, Decision D92).", "$ref": "#/$defs/noEnvRefString" },
+        "input": { "description": "Bindings, CEL over payload.scheduled_at / payload.trigger.", "$ref": "#/$defs/triggerInput" },
+        "session_key": { "description": "CEL over payload producing the session identity.", "$ref": "#/$defs/cel" },
+        "description": { "description": "Documentation.", "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "eventTrigger": {
+      "description": "RESERVED grammar: parsed and validated in v0, executed in M3. Backend-agnostic - `source:` is a logical name bound by the deploy layer's event_sources. Grammar 13.5 / PRD 5.11.",
+      "type": "object",
+      "required": ["type", "flow", "source"],
+      "properties": {
+        "type": { "const": "event", "description": "Event invocation (reserved: no-op in v0)." },
+        "flow": { "description": "The flow this trigger starts.", "$ref": "#/$defs/flowRef" },
+        "source": { "description": "Logical source name, bound to infrastructure per target under event_sources.", "$ref": "#/$defs/identifier" },
+        "input": { "description": "Bindings, CEL over payload.id / payload.body / payload.attributes / payload.source.", "$ref": "#/$defs/triggerInput" },
+        "session_key": { "description": "CEL over payload producing the session identity.", "$ref": "#/$defs/cel" },
+        "dedupe_key": { "description": "CEL over payload for inbound at-least-once dedupe (default payload.id).", "$ref": "#/$defs/cel" },
+        "description": { "description": "Documentation.", "type": "string" }
+      },
+      "additionalProperties": false
+    },
+
+    "placement": {
+      "description": "Where a component runs. RESERVED: parsed and validated in v0, executed in M3. Grammar 14.1 / PRD 5.10.",
+      "type": "object",
+      "required": ["runtime"],
+      "properties": {
+        "runtime": {
+          "description": "isolated: its own instance/container, with sandbox, credentials, and network policy. colocated: in the calling process.",
+          "enum": ["isolated", "colocated"]
+        },
+        "network": { "description": "Sandbox network policy (reserved, default all).", "enum": ["none", "egress", "all"] },
+        "description": { "description": "Documentation.", "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "backendCommon": {
+      "description": "Backend configuration keys shared by every storage provider. Connection strings and credentials are ${ENV} references, never literals.",
+      "type": "object",
+      "properties": {
+        "url": { "description": "Connection URL, as an ${ENV} reference.", "$ref": "#/$defs/envRef" },
+        "dsn": { "description": "Connection DSN, as an ${ENV} reference.", "$ref": "#/$defs/envRef" },
+        "endpoint": { "description": "Service endpoint, as an ${ENV} reference.", "$ref": "#/$defs/envRef" },
+        "access_key_id": { "description": "Access key id, as an ${ENV} reference.", "$ref": "#/$defs/envRef" },
+        "secret_access_key": { "description": "Secret access key, as an ${ENV} reference.", "$ref": "#/$defs/envRef" },
+        "region": { "description": "Cloud region.", "type": "string" },
+        "bucket": { "description": "Object-storage bucket.", "type": "string" },
+        "path": { "description": "Local filesystem path.", "$ref": "#/$defs/interpolatedString" },
+        "table": { "description": "Table name.", "type": "string" },
+        "namespace": { "description": "Logical namespace/prefix.", "type": "string" },
+        "index": { "description": "Vector index/collection name.", "type": "string" }
+      }
+    },
+    "kvBackend": {
+      "description": "Key-value backend for this target.",
+      "allOf": [{ "$ref": "#/$defs/backendCommon" }],
+      "type": "object",
+      "required": ["provider"],
+      "properties": {
+        "provider": { "description": "Key-value storage provider plugin.", "enum": ["memory", "sqlite", "redis", "postgres"] }
+      }
+    },
+    "vectorBackend": {
+      "description": "Vector backend for this target. Capability checks apply here: a vector store bound to a non-vector-capable provider is a compile error.",
+      "allOf": [{ "$ref": "#/$defs/backendCommon" }],
+      "type": "object",
+      "required": ["provider"],
+      "properties": {
+        "provider": { "description": "Vector storage provider plugin.", "enum": ["sqlite_vec", "chroma", "pgvector", "qdrant"] }
+      }
+    },
+    "blobBackend": {
+      "description": "Blob backend for this target.",
+      "allOf": [{ "$ref": "#/$defs/backendCommon" }],
+      "type": "object",
+      "required": ["provider"],
+      "properties": {
+        "provider": { "description": "Blob storage provider plugin.", "enum": ["local_fs", "s3", "gcs"] }
+      }
+    },
+    "anyBackend": {
+      "description": "A named backend alias. Its kind is inferred from the stores that reference it, and capability-checked against the provider.",
+      "allOf": [{ "$ref": "#/$defs/backendCommon" }],
+      "type": "object",
+      "required": ["provider"],
+      "properties": {
+        "provider": {
+          "description": "Storage provider plugin.",
+          "enum": [
+            "memory",
+            "sqlite",
+            "redis",
+            "postgres",
+            "sqlite_vec",
+            "chroma",
+            "pgvector",
+            "qdrant",
+            "local_fs",
+            "s3",
+            "gcs"
+          ]
+        }
+      }
+    },
+    "eventSource": {
+      "description": "Binding of a logical event source name to infrastructure. RESERVED: parsed and validated in v0, executed in M3. Grammar 14.3 / PRD 5.11.",
+      "type": "object",
+      "required": ["kind"],
+      "properties": {
+        "kind": { "description": "Consumer plugin.", "enum": ["redis_streams", "sqs", "nats"] },
+        "url": { "description": "Connection URL, as an ${ENV} reference.", "$ref": "#/$defs/envRef" },
+        "stream": { "description": "Stream name (redis_streams).", "type": "string" },
+        "consumer_group": { "description": "Consumer group (redis_streams).", "type": "string" },
+        "queue_url": { "description": "Queue URL (sqs). Not a credential and not on the closed secret-field list of grammar 4.3, so a literal is legal; ${ENV} references may be embedded.", "$ref": "#/$defs/interpolatedString" },
+        "region": { "description": "Cloud region (sqs).", "type": "string" },
+        "subject": { "description": "Subject (nats).", "type": "string" },
+        "durable_name": { "description": "Durable consumer name (nats).", "type": "string" }
+      }
+    }
+  }
+}

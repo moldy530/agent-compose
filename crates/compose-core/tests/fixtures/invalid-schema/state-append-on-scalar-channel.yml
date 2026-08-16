@@ -1,0 +1,7 @@
+# rule: `reduce: append` requires an array channel (grammar 10.2 / PRD 5.6)
+# at: /state/draft
+# via: /$defs/stateChannel/oneOf
+state:
+  draft:
+    type: string
+    reduce: append
