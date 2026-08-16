@@ -41,6 +41,21 @@
 //! that usually has nothing to say can quote from it. A file that cannot be read
 //! back — deleted or rewritten under the command — costs the snippet, never the
 //! diagnostic: the location is printed on its own instead.
+//!
+//! # Where a location points
+//!
+//! A span names its file relative to the **project root**, which is the
+//! entrypoint's own directory (grammar 1.4) — the one name for a file that is
+//! the same wherever the command was run from, which is why the machine format
+//! carries exactly that and the IR is written in it.
+//!
+//! A person, and the coding agent PRD G3 calls the other reader of these
+//! diagnostics, is not standing in the project root: they typed a path to the
+//! entrypoint and are standing wherever that path was relative to. So the human
+//! format prints the location the same way — the root joined onto the span's own
+//! name — and `agent-compose validate services/api/main.yml` reports
+//! `services/api/flows/f.yml:4:5`, a path that opens. Validating from inside the
+//! project is the case where the two coincide and nothing is added.
 
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
@@ -81,7 +96,7 @@ pub(crate) fn human(root: &Path, diagnostics: &[Diagnostic], color: bool) -> Str
     let sources = sources(root, diagnostics);
     let mut report = String::new();
     for diagnostic in diagnostics {
-        report.push_str(&one(&renderer, diagnostic, &sources));
+        report.push_str(&one(&renderer, root, diagnostic, &sources));
         report.push_str("\n\n");
     }
     report
@@ -147,12 +162,7 @@ fn sources(root: &Path, diagnostics: &[Diagnostic]) -> BTreeMap<String, String> 
             if sources.contains_key(name) {
                 continue;
             }
-            // A span's file name is `/`-separated and relative to the project
-            // root (grammar 1.4), which is how it is joined back onto a host
-            // path here.
-            let mut path = PathBuf::from(root);
-            path.extend(name.split('/'));
-            if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Ok(text) = std::fs::read_to_string(at(root, name)) {
                 sources.insert(name.to_string(), text);
             }
         }
@@ -160,8 +170,23 @@ fn sources(root: &Path, diagnostics: &[Diagnostic]) -> BTreeMap<String, String> 
     sources
 }
 
+/// Where a file the report quotes is, from the directory the command ran in: the
+/// project root joined onto the `/`-separated name the span carries
+/// (grammar 1.4). A run from inside the project has an empty root and the two
+/// are the same string.
+fn at(root: &Path, name: &str) -> PathBuf {
+    let mut path = PathBuf::from(root);
+    path.extend(name.split('/'));
+    path
+}
+
 /// One diagnostic: its title, one snippet per file it points into, and its help.
-fn one(renderer: &Renderer, diagnostic: &Diagnostic, sources: &BTreeMap<String, String>) -> String {
+fn one(
+    renderer: &Renderer,
+    root: &Path,
+    diagnostic: &Diagnostic,
+    sources: &BTreeMap<String, String>,
+) -> String {
     let level = match diagnostic.severity {
         Severity::Error => Level::ERROR,
         Severity::Warning => Level::WARNING,
@@ -197,13 +222,15 @@ fn one(renderer: &Renderer, diagnostic: &Diagnostic, sources: &BTreeMap<String, 
                     .span
             };
             group = group.element(
-                Origin::path(name)
+                Origin::path(at(root, name).display().to_string())
                     .line(span.start.line as usize)
                     .char_column(span.start.column as usize),
             );
             continue;
         };
-        let mut snippet = Snippet::source(source.as_str()).path(name).fold(true);
+        let mut snippet = Snippet::source(source.as_str())
+            .path(at(root, name).display().to_string())
+            .fold(true);
         if diagnostic.span.source.as_str() == name {
             snippet =
                 snippet.annotation(AnnotationKind::Primary.span(range(&diagnostic.span, source)));

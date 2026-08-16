@@ -2,11 +2,11 @@
 //!
 //! Error UX is a product feature (PRD G3), so the rendered report is pinned
 //! **byte for byte** rather than probed for substrings: an improvement to a
-//! snippet is a reviewed diff, and a regression is a test failure. The four
-//! scenarios below are the four shapes a report takes — a clean run, one
-//! diagnostic in one file, one diagnostic spanning two files, and the machine
-//! format — plus the three exit codes and a guard against the checks going
-//! quadratic.
+//! snippet is a reviewed diff, and a regression is a test failure. The scenarios
+//! below are the shapes a report takes — a clean run, one diagnostic in one
+//! file, one diagnostic spanning two files, the same report from *outside* the
+//! project, and the machine format — plus the three exit codes and a guard
+//! against the checks going quadratic.
 //!
 //! Every run sets `NO_COLOR` and reads the streams through a pipe, so nothing
 //! here depends on a terminal; `annotate-snippets`' decor is ASCII either way,
@@ -140,9 +140,74 @@ error: `main.yml` is not valid (target `local`): 1 error
     assert_eq!(code(&output), 1);
 }
 
+/// The same two sites, reported from *outside* the project: every path in the
+/// human report is the one the reader would have to type from where they ran the
+/// command, entrypoint and imported file alike. A span names its file relative
+/// to the project root (grammar 1.4) and the machine format keeps it that way —
+/// see below — but a rendered location that cannot be opened from the shell that
+/// printed it is a broken feedback loop, and the coding agent PRD G3 writes these
+/// for is exactly the reader who cannot guess the missing prefix.
+#[test]
+fn a_report_from_outside_the_project_points_at_paths_that_open() {
+    let project = "crates/agent-compose/tests/projects/duplicate-across-files";
+    let output = validate(&repo_root(), &[&format!("{project}/main.yml")]);
+    assert_eq!(
+        stderr(&output),
+        "\
+error[duplicate-definition]: `model.m` is defined twice in this composition
+  --> crates/agent-compose/tests/projects/duplicate-across-files/models.yml:1:1
+   |
+ 1 | model.m:
+   | ^^^^^^^
+   |
+  ::: crates/agent-compose/tests/projects/duplicate-across-files/main.yml:12:1
+   |
+12 | model.m:
+   | ------- first defined here, in `main.yml`
+   |
+   = help: a typed address is global across the composition, whichever file declares it: rename one of the two, or drop the file that duplicates the other (grammar 2.2)
+
+error: `crates/agent-compose/tests/projects/duplicate-across-files/main.yml` is not valid (target `local`): 1 error
+"
+    );
+    assert_eq!(code(&output), 1);
+
+    // Every location the report drew, opened from where the command ran.
+    let mut opened = 0;
+    for line in stderr(&output).lines() {
+        let line = line.trim_start();
+        let Some(rest) = line
+            .strip_prefix("--> ")
+            .or_else(|| line.strip_prefix("::: "))
+        else {
+            continue;
+        };
+        let (path, _) = rest.split_once(".yml:").expect("a location names a file");
+        let path = repo_root().join(format!("{path}.yml"));
+        assert!(path.is_file(), "the report points at `{}`", path.display());
+        opened += 1;
+    }
+    assert_eq!(opened, 2, "both sites were checked");
+
+    // The machine format is the other reader, and its spans stay as the IR
+    // writes them: relative to the project root, wherever the command ran.
+    let output = validate(
+        &repo_root(),
+        &[&format!("{project}/main.yml"), "--format", "json"],
+    );
+    assert!(
+        stdout(&output).contains("\"span\": \"models.yml:1:1..1:8\"")
+            && stdout(&output).contains("\"span\": \"main.yml:12:1..12:8\""),
+        "the JSON spans are project-root-relative:\n{}",
+        stdout(&output)
+    );
+}
+
 /// `--format json` writes one object on stdout and nothing on stderr. The shape
 /// is the `Diagnostic` type itself, with a span in the one string form the IR
-/// already uses.
+/// already uses — **project-root-relative**, matching the IR and unaffected by
+/// where the command ran, which is what a consumer joining spans back onto a
+/// checkout needs.
 #[test]
 fn the_json_report_is_one_object_of_diagnostics() {
     let output = validate(
