@@ -218,6 +218,65 @@ fn every_case_is_named_once() {
     }
 }
 
+/// The one divergence the corpus deliberately does not pin, pinned here
+/// instead.
+///
+/// `size(string)` is the CEL specification's count of **code points**; `cel`
+/// 0.14.3 returns the count of **bytes**, and a JS evaluator over
+/// `String.prototype.length` would return UTF-16 code units — three answers for
+/// `'👍'` (1, 4, 2). `fixtures/cel-conformance/README.md` records why no corpus
+/// case states it: pinning the specification's answer leaves a red test, and
+/// pinning the crate's institutionalises the defect in the artifact whose whole
+/// job is to keep two implementations honest.
+///
+/// A paragraph is not a check, though, and the note has to be *acted on*
+/// before the JS evaluator lands. This test is what makes it impossible to
+/// forget: it pins what the pinned crate does today, so an upstream fix or a
+/// version bump turns it red and sends whoever bumped it back to the README —
+/// where the answer is either a corpus case at last, or a `size` overload this
+/// project supplies.
+#[test]
+fn the_size_of_a_non_ascii_string_still_diverges_from_the_specification() {
+    let size = |source: &str| {
+        let program = Program::compile(source).expect("the expression parses");
+        match program
+            .execute(&Context::default())
+            .expect("the expression evaluates")
+        {
+            Value::Int(count) => count,
+            other => panic!("`{source}` is not an integer: {other:?}"),
+        }
+    };
+    // Specification: 5 and 1. `String.prototype.length`: 5 and 2.
+    assert_eq!(size("size('héllo')"), 6, "cel 0.14.3 counted bytes");
+    assert_eq!(size("size('👍')"), 4, "cel 0.14.3 counted bytes");
+    // ASCII is where all three agree, which is why the corpus states only it.
+    assert_eq!(size("size('abc')"), 3);
+}
+
+/// The second recorded gap, for the same reason and with the same tripwire.
+///
+/// CEL's standard definitions give `matches` two overloads — `s.matches(p)` and
+/// the global `matches(s, p)` — and `cel` 0.14.3 implements only the first. The
+/// compiler's own front-end accepts both, because grammar 4.1 puts the standard
+/// function set on the surface and the specification is what defines it; that
+/// leaves one expression `validate` accepts and the *validator's* evaluator
+/// cannot run, which is a fact worth a red test the day it stops being true.
+#[test]
+fn the_global_spelling_of_matches_is_still_missing_from_the_crate() {
+    let program = Program::compile("matches('a1', '^a[0-9]$')").expect("the expression parses");
+    assert!(
+        program.execute(&Context::default()).is_err(),
+        "cel 0.14.3 gained the global `matches` overload: state it in strings.json"
+    );
+    // The receiver spelling, which both implementations have, is in the corpus.
+    let program = Program::compile("'a1'.matches('^a[0-9]$')").expect("the expression parses");
+    assert_eq!(
+        program.execute(&Context::default()).expect("it evaluates"),
+        Value::Bool(true)
+    );
+}
+
 /// The corpus is the artifact, not this test: it has to be substantial enough
 /// to be worth running a second implementation against.
 #[test]
