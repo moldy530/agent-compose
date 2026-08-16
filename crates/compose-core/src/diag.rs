@@ -25,10 +25,26 @@
 //! Codes are kebab strings rather than `E0001`-style numbers because the
 //! compiler is read by coding agents as much as by humans: `unknown-key` is
 //! self-describing in a terminal, in a test fixture header, and in a grep.
+//!
+//! # Serialization
+//!
+//! [`Diagnostic`] is [`Serialize`], which is what
+//! `agent-compose validate --format json` emits. That is *not* rendering: the
+//! shape written is this module's own type, field for field, so the JSON holds
+//! the same data a Rust caller reads rather than a second, prose-shaped account
+//! of it, and every key is always present so a consumer reads one fixed record.
+//! A code writes as its kebab spelling and a severity as its lowercase name —
+//! both stable identities (above) — and a span writes as the one string form
+//! [`ir::leaf`](crate::ir::leaf) already fixes for the artifact,
+//! `<file>:<line>:<col>..<line>:<col>`, so a span means the same thing wherever
+//! this compiler writes one. Turning any of it into a *snippet* belongs to the
+//! CLI, which is where the renderer lives.
 
 use std::fmt;
 use std::ops::Range;
 use std::sync::Arc;
+
+use serde::{Serialize, Serializer};
 
 /// The name of a source file, as spans and diagnostics refer to it.
 ///
@@ -37,6 +53,12 @@ use std::sync::Arc;
 /// spans one file produces share one allocation.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct SourceName(Arc<str>);
+
+impl Serialize for SourceName {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
 
 impl SourceName {
     /// Intern a source name.
@@ -228,7 +250,8 @@ impl<T: fmt::Debug> fmt::Debug for Spanned<T> {
 }
 
 /// How bad a diagnostic is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Severity {
     /// The composition is rejected.
     Error,
@@ -397,6 +420,29 @@ pub enum DiagnosticCode {
     // --- providers and models (grammar 12) --------------------------------
     /// A provider cannot serve what a model, an agent, or a store asks of it.
     MissingCapability,
+
+    // --- graph analyses (grammar 7.4–7.8, 8.6, 13.3) ----------------------
+    /// A node has a pass on which its branch takes no outgoing edge: it has
+    /// none at all, it declares `on_error: skip` with every edge guarded, or a
+    /// `max_iterations` budget can run out with no escape (grammar 7.6.3, 7.4).
+    DeadEnd,
+    /// A strongly connected component carries no bounded edge (grammar 7.4).
+    UnboundedCycle,
+    /// Two edges of one co-takeable pair reach a node at different step
+    /// distances (grammar 7.6.2, Decision D112).
+    UnbalancedConvergence,
+    /// A node is not reachable from its flow's `start` (grammar 7.8).
+    UnreachableNode,
+    /// A flow reaches itself (grammar 7.5, Decision D26).
+    RecursiveFlow,
+    /// A `respond: sync` trigger's flow reaches a `human` node (grammar 13.3).
+    SyncTriggerInterrupt,
+    /// A `map.over` path reads a node that does not dominate the map node
+    /// (grammar 8.6 rule 11, Decision D76).
+    NonDominatingSource,
+    /// `detach: true` under a durably checkpointed target (grammar 8.6 rule 7,
+    /// Decision D59).
+    UnsupportedDetach,
 }
 
 impl DiagnosticCode {
@@ -455,6 +501,14 @@ impl DiagnosticCode {
         Self::ToolNameCollision,
         Self::MissingSessionKey,
         Self::MissingCapability,
+        Self::DeadEnd,
+        Self::UnboundedCycle,
+        Self::UnbalancedConvergence,
+        Self::UnreachableNode,
+        Self::RecursiveFlow,
+        Self::SyncTriggerInterrupt,
+        Self::NonDominatingSource,
+        Self::UnsupportedDetach,
     ];
 
     /// The stable kebab-case spelling of this code.
@@ -507,7 +561,21 @@ impl DiagnosticCode {
             Self::ToolNameCollision => "tool-name-collision",
             Self::MissingSessionKey => "missing-session-key",
             Self::MissingCapability => "missing-capability",
+            Self::DeadEnd => "dead-end",
+            Self::UnboundedCycle => "unbounded-cycle",
+            Self::UnbalancedConvergence => "unbalanced-convergence",
+            Self::UnreachableNode => "unreachable-node",
+            Self::RecursiveFlow => "recursive-flow",
+            Self::SyncTriggerInterrupt => "sync-trigger-interrupt",
+            Self::NonDominatingSource => "non-dominating-source",
+            Self::UnsupportedDetach => "unsupported-detach",
         }
+    }
+}
+
+impl Serialize for DiagnosticCode {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
     }
 }
 
@@ -518,7 +586,7 @@ impl fmt::Display for DiagnosticCode {
 }
 
 /// A secondary span attached to a diagnostic, with the role it plays.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Label {
     /// Where the related source is.
     pub span: Span,
@@ -527,7 +595,7 @@ pub struct Label {
 }
 
 /// One compiler diagnostic.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Diagnostic {
     /// Stable machine-readable identity of the failure class.
     pub code: DiagnosticCode,
@@ -733,7 +801,7 @@ mod tests {
         }
         assert_eq!(
             DiagnosticCode::ALL.len(),
-            DiagnosticCode::MissingCapability as usize + 1,
+            DiagnosticCode::UnsupportedDetach as usize + 1,
             "`DiagnosticCode::ALL` stops short of the last declared variant"
         );
     }
