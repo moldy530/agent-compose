@@ -127,33 +127,24 @@ fn route(
     headers: BTreeMap<String, String>,
     bytes: &[u8],
 ) -> Answer {
+    let arriving = Arriving {
+        method: method.as_str(),
+        path,
+        query,
+        headers,
+        bytes,
+    };
     match (method.as_str(), path) {
-        ("POST", "/v1/messages") => {
-            provider(store, Surface::Anthropic, None, path, query, headers, bytes)
-        }
-        ("POST", "/v1/chat/completions") => {
-            provider(store, Surface::OpenAi, None, path, query, headers, bytes)
-        }
+        ("POST", "/v1/messages") => provider(store, Surface::Anthropic, None, arriving),
+        ("POST", "/v1/chat/completions") => provider(store, Surface::OpenAi, None, arriving),
         // Azure, both spellings: the deployment sits in the path on the classic
         // route and is absent from the newer `/openai/v1` one.
-        ("POST", "/openai/v1/chat/completions") => provider(
-            store,
-            Surface::AzureOpenAi,
-            None,
-            path,
-            query,
-            headers,
-            bytes,
-        ),
-        ("POST", _) if deployment(path).is_some() => provider(
-            store,
-            Surface::AzureOpenAi,
-            deployment(path),
-            path,
-            query,
-            headers,
-            bytes,
-        ),
+        ("POST", "/openai/v1/chat/completions") => {
+            provider(store, Surface::AzureOpenAi, None, arriving)
+        }
+        ("POST", _) if deployment(path).is_some() => {
+            provider(store, Surface::AzureOpenAi, deployment(path), arriving)
+        }
         ("POST", "/_mock/enqueue") => enqueue(store, bytes),
         ("POST", "/_mock/reset") => {
             let discarded = store.reset();
@@ -182,16 +173,34 @@ fn deployment(path: &str) -> Option<&str> {
     (tail == "chat/completions" && !deployment.is_empty()).then_some(deployment)
 }
 
+/// One arriving request, before a surface has looked at it.
+///
+/// The four things a transcript records about a call's *identity*, kept together
+/// so the routing table can hand them on without either spelling them out at
+/// every call site or hard-coding what it already knows (a method it matched on
+/// is a method it should be passing, not asserting).
+struct Arriving<'a> {
+    method: &'a str,
+    path: &'a str,
+    query: &'a str,
+    headers: BTreeMap<String, String>,
+    bytes: &'a [u8],
+}
+
 /// Check, record, and answer one model call.
 fn provider(
     store: &Store,
     surface: Surface,
     deployment: Option<&str>,
-    path: &str,
-    query: &str,
-    headers: BTreeMap<String, String>,
-    bytes: &[u8],
+    arriving: Arriving<'_>,
 ) -> Answer {
+    let Arriving {
+        method,
+        path,
+        query,
+        headers,
+        bytes,
+    } = arriving;
     let body_text = String::from_utf8_lossy(bytes).into_owned();
     let body: Option<Value> = serde_json::from_slice(bytes).ok();
 
@@ -223,7 +232,7 @@ fn provider(
 
     let (decision, sequence) = store.serve(Incoming {
         surface,
-        method: "POST".to_string(),
+        method: method.to_string(),
         path: path.to_string(),
         query: query.to_string(),
         headers,

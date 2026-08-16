@@ -128,6 +128,11 @@ pub(crate) fn parse(
             .unwrap_or_default()
             .to_string(),
     };
+    // A present `model` that names nothing is its own mistake, asked separately
+    // so it cannot double up on a missing or mistyped one.
+    if body.get("model").and_then(Value::as_str) == Some("") {
+        checker.fail("model", "Invalid value: ''. 'model' must name a model.");
+    }
 
     let tools = check_tools(&mut checker, body);
     let forced = check_tool_choice(&mut checker, body, &tools);
@@ -345,8 +350,11 @@ fn check_messages(checker: &mut Checker, body: &Map<String, Value>, tools: &[Str
         return;
     }
 
-    // The ids the most recent assistant turn is waiting on.
+    // The ids the most recent assistant turn is waiting on, and which turn that
+    // was — a dropped result is reported at the message that asked for it, which
+    // is where the author has to go to fix it.
     let mut awaiting: Vec<String> = Vec::new();
+    let mut asked_at = 0;
 
     for (index, message) in messages.iter().enumerate() {
         let pointer = at("messages", index);
@@ -369,7 +377,7 @@ fn check_messages(checker: &mut Checker, body: &Map<String, Value>, tools: &[Str
         // A turn that is not the answer to the pending tool calls means those
         // calls were dropped — the tool loop losing a result.
         if role != "tool" && !awaiting.is_empty() {
-            unanswered(checker, index, &awaiting);
+            unanswered(checker, asked_at, &awaiting);
             awaiting.clear();
         }
 
@@ -402,6 +410,7 @@ fn check_messages(checker: &mut Checker, body: &Map<String, Value>, tools: &[Str
                     );
                 }
                 awaiting = calls;
+                asked_at = index;
             }
             "tool" => {
                 checker.closed(&pointer, message, &["role", "content", "tool_call_id"]);
@@ -429,10 +438,11 @@ fn check_messages(checker: &mut Checker, body: &Map<String, Value>, tools: &[Str
     }
 
     if !awaiting.is_empty() {
-        unanswered(checker, messages.len(), &awaiting);
+        unanswered(checker, asked_at, &awaiting);
     }
 }
 
+/// The assistant turn at `message` asked for these ids and never got them.
 fn unanswered(checker: &mut Checker, message: usize, ids: &[String]) {
     let list = ids
         .iter()
@@ -440,7 +450,7 @@ fn unanswered(checker: &mut Checker, message: usize, ids: &[String]) {
         .collect::<Vec<_>>()
         .join(", ");
     checker.fail(
-        &at("messages", message.saturating_sub(1)),
+        &at("messages", message),
         format!(
             "An assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id'. The following tool_call_ids did not have response messages: {list}"
         ),
@@ -916,6 +926,25 @@ mod tests {
         assert_eq!(failures, ["headers.authorization"]);
     }
 
+    /// A `model` that is present and names nothing is its own mistake here too.
+    #[test]
+    fn an_empty_model_is_its_own_mistake() {
+        let mut body = request(json!({}));
+        body["model"] = json!("");
+        let failures = parse_direct(&body).failures;
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].pointer, "model");
+
+        body["model"] = json!(7);
+        let failures = parse_direct(&body).failures;
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(
+            failures[0].message.contains("expected string"),
+            "{}",
+            failures[0].message
+        );
+    }
+
     /// An unknown argument is the API's own sentence, not a shrug.
     #[test]
     fn an_unknown_request_argument_is_refused() {
@@ -966,6 +995,11 @@ mod tests {
         let failures = parse_direct(&dropped).failures;
         assert_eq!(failures.len(), 1, "{failures:?}");
         assert!(failures[0].message.contains("'call_2'"), "{failures:?}");
+        assert_eq!(
+            failures[0].pointer, "messages.1",
+            "the complaint is at the assistant turn that asked, not at the turn that \
+             moved on without answering"
+        );
     }
 
     /// The whole loop, correct.

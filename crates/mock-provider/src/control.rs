@@ -763,8 +763,16 @@ impl Store {
         let mut state = self.lock();
         let sequence = state.requests.len() as u64 + 1;
 
+        // Matchers read the **canonical** serialization rather than the bytes
+        // that arrived, so a narrowing like `.matching("task-3")` means the same
+        // thing whatever whitespace a client's serializer chose. A body that did
+        // not parse has no canonical form, and matches on what it sent.
+        let matched_against = incoming
+            .body
+            .as_ref()
+            .map_or_else(|| incoming.body_text.clone(), canonical);
         let decision = if incoming.failures.is_empty() {
-            Self::take(&mut state.queues, &incoming.model, &incoming.body_text)
+            Self::take(&mut state.queues, &incoming.model, &matched_against)
         } else {
             Decision::Rejected(incoming.failures.clone())
         };

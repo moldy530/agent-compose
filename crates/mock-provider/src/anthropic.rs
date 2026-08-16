@@ -91,8 +91,12 @@ pub(crate) fn parse(headers: &BTreeMap<String, String>, body: Option<&Value>) ->
         .required_string("", body, "model")
         .unwrap_or_default()
         .to_string();
-    if model.is_empty() && body.contains_key("model") {
-        checker.fail("model", "model: Field required");
+    // An empty `model` is a *present* key that names nothing — the shape a
+    // codegen bug takes when an id is interpolated from something absent. It is
+    // asked separately from the required/typed checks above so it cannot double
+    // up on a `model` that was missing or was not a string at all.
+    if body.get("model").and_then(Value::as_str) == Some("") {
+        checker.fail("model", "model: String should have at least 1 character");
     }
     check_max_tokens(&mut checker, body);
     check_system(&mut checker, body);
@@ -919,6 +923,25 @@ mod tests {
             ["model", "max_tokens"]
         );
         assert_eq!(check(messages(json!({}))), ["messages"]);
+    }
+
+    /// A `model` that is present and names nothing is one mistake, and a `model`
+    /// of the wrong type is a different one — never both at once.
+    #[test]
+    fn an_empty_model_is_its_own_mistake() {
+        let mut request = messages(json!({ "messages": [{ "role": "user", "content": "hi" }] }));
+        request["model"] = json!("");
+        let failures = parse(&headers(), Some(&request)).failures;
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(
+            failures[0].message,
+            "model: String should have at least 1 character"
+        );
+
+        request["model"] = json!(7);
+        let failures = parse(&headers(), Some(&request)).failures;
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].message, "model: Input should be a valid string");
     }
 
     /// Headers are part of the request, and a missing one is a codegen bug the
