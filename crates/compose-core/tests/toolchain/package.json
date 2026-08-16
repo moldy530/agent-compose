@@ -1,0 +1,26 @@
+{
+  "//": [
+    "The pinned JavaScript toolchain the generated-code gates run against.",
+    "",
+    "Every version here MUST equal the one `compose_core::codegen::project` pins,",
+    "and `the_toolchain_fixture_pins_what_the_emitter_pins` fails when it does not.",
+    "One install serves every golden project because the emitted dependency set is",
+    "a compiler constant: two projects built by one compiler release declare the",
+    "same versions, so installing them once and type-checking each against that",
+    "install is the same check as installing each separately, at a third of the",
+    "network cost."
+  ],
+  "name": "agent-compose-generated-code-gates",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@langchain/langgraph": "1.4.10",
+    "@langchain/core": "1.2.8",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.1",
+    "typescript": "7.0.2"
+  }
+}

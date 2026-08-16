@@ -1,0 +1,79 @@
+[
+  {
+    "golden": "review-loop",
+    "surface": "agent.reviewer.output",
+    "about": "a closed object over an enum and a string (grammar 3.1, 3.3)",
+    "documents": [
+      { "why": "both declared properties, at their declared types", "valid": true, "document": { "verdict": "approve", "feedback": "" } },
+      { "why": "the other enum variant", "valid": true, "document": { "verdict": "revise", "feedback": "tighten it" } },
+      { "why": "a value the enum does not declare", "valid": false, "document": { "verdict": "escalate", "feedback": "" } },
+      { "why": "a required property is missing", "valid": false, "document": { "verdict": "approve" } },
+      { "why": "an undeclared property: objects are closed (D8)", "valid": false, "document": { "verdict": "approve", "feedback": "", "note": "extra" } },
+      { "why": "a property at the wrong type", "valid": false, "document": { "verdict": "approve", "feedback": 3 } }
+    ]
+  },
+  {
+    "golden": "review-loop",
+    "surface": "tool.web_search.input",
+    "about": "string length, integer bounds, and a defaulted property (grammar 3.3, 3.6)",
+    "documents": [
+      { "why": "both properties supplied", "valid": true, "document": { "query": "agent-compose", "max_results": 3 } },
+      { "why": "the defaulted property omitted: a default makes it optional", "valid": true, "document": { "query": "agent-compose" } },
+      { "why": "`min_length: 1` refuses the empty string", "valid": false, "document": { "query": "", "max_results": 3 } },
+      { "why": "`minimum: 1` refuses zero", "valid": false, "document": { "query": "x", "max_results": 0 } },
+      { "why": "`maximum: 10` refuses eleven", "valid": false, "document": { "query": "x", "max_results": 11 } },
+      { "why": "an integer property refuses a fractional number", "valid": false, "document": { "query": "x", "max_results": 2.5 } },
+      { "why": "an integer-valued float is an integer", "valid": true, "document": { "query": "x", "max_results": 3.0 } }
+    ]
+  },
+  {
+    "golden": "review-loop",
+    "surface": "tool.web_search.output",
+    "about": "a bounded array of nested closed objects, with a `format` (grammar 3.4, 3.5)",
+    "documents": [
+      { "why": "one well-formed result", "valid": true, "document": { "results": [{ "title": "t", "url": "https://example.test/a", "snippet": "s" }] } },
+      { "why": "an empty array is within the bound", "valid": true, "document": { "results": [] } },
+      { "why": "the nested object is closed too", "valid": false, "document": { "results": [{ "title": "t", "url": "https://example.test/a", "snippet": "s", "rank": 1 }] } },
+      { "why": "a nested required property is missing", "valid": false, "document": { "results": [{ "title": "t", "url": "https://example.test/a" }] } },
+      { "why": "`format: uri` refuses a bare word", "valid": false, "document": { "results": [{ "title": "t", "url": "not a url", "snippet": "s" }] } },
+      { "why": "the array itself must be an array", "valid": false, "document": { "results": "one" } }
+    ]
+  },
+  {
+    "golden": "triage-fanout",
+    "surface": "agent.triage.output",
+    "about": "a discriminated union inside a bounded array (grammar 3.7, PRD 5.6)",
+    "documents": [
+      { "why": "one variant, fully supplied", "valid": true, "document": { "findings": [{ "kind": "auto_fixable", "file": "src/a.rs", "patch_hint": "swap the branches" }] } },
+      { "why": "another variant, with its own enum", "valid": true, "document": { "findings": [{ "kind": "needs_human", "summary": "unclear", "severity": "high" }] } },
+      { "why": "several variants in one array", "valid": true, "document": { "findings": [{ "kind": "duplicate", "of": "a" }, { "kind": "duplicate", "of": "b" }] } },
+      { "why": "a tag the union does not declare", "valid": false, "document": { "findings": [{ "kind": "unheard_of", "file": "a.rs" }] } },
+      { "why": "the payload of a different variant under this tag", "valid": false, "document": { "findings": [{ "kind": "auto_fixable", "summary": "unclear", "severity": "high" }] } },
+      { "why": "the discriminator is missing", "valid": false, "document": { "findings": [{ "file": "src/a.rs", "patch_hint": "x" }] } },
+      { "why": "a variant is closed like any object", "valid": false, "document": { "findings": [{ "kind": "duplicate", "of": "a", "why": "same stack" }] } },
+      { "why": "an enum inside a variant is still an enum", "valid": false, "document": { "findings": [{ "kind": "needs_human", "summary": "unclear", "severity": "urgent" }] } }
+    ]
+  },
+  {
+    "golden": "triage-fanout",
+    "surface": "store.docs.metadata_schema",
+    "about": "`format: date-time` (grammar 3.3)",
+    "documents": [
+      { "why": "an RFC 3339 timestamp", "valid": true, "document": { "source": "docs/a.md", "updated_at": "2026-08-16T09:30:00Z" } },
+      { "why": "an offset instead of `Z`", "valid": true, "document": { "source": "docs/a.md", "updated_at": "2026-08-16T09:30:00+02:00" } },
+      { "why": "a date alone is not a date-time", "valid": false, "document": { "source": "docs/a.md", "updated_at": "2026-08-16" } },
+      { "why": "not a timestamp at all", "valid": false, "document": { "source": "docs/a.md", "updated_at": "yesterday" } }
+    ]
+  },
+  {
+    "golden": "triage-fanout",
+    "surface": "store.triage_memory.value_schema",
+    "about": "an integer with an inclusive lower bound (grammar 3.3)",
+    "documents": [
+      { "why": "the bound is inclusive", "valid": true, "document": { "last_report": "r", "patch_count": 0 } },
+      { "why": "above the bound", "valid": true, "document": { "last_report": "r", "patch_count": 12 } },
+      { "why": "below the bound", "valid": false, "document": { "last_report": "r", "patch_count": -1 } },
+      { "why": "a boolean is not an integer", "valid": false, "document": { "last_report": "r", "patch_count": true } }
+    ]
+  }
+]
