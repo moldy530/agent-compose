@@ -14,14 +14,17 @@ use std::sync::Arc;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::Incoming as IncomingBody;
+use hyper::header::{CONTENT_TYPE, HeaderName, HeaderValue};
 use hyper::service::service_fn;
 use hyper::{Method, Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde_json::{Value, json};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::control::{Decision, Delay, Incoming, Script, Store, Surface, canonical};
-use crate::wire::{Answer, HARNESS_STATUS, Response as Wire};
+use crate::control::{
+    Decision, Delay, HARNESS_HEADER, Incoming, Script, Store, Surface, canonical,
+};
+use crate::wire::{Answer, HARNESS_STATUS, Response as Wire, UNSENDABLE};
 use crate::{anthropic, openai};
 
 /// The largest request body this server will read.
@@ -323,20 +326,59 @@ fn read_headers(headers: &hyper::HeaderMap) -> BTreeMap<String, String> {
 }
 
 /// Turn an answer into bytes.
+///
+/// Total, deliberately. The one part of a response this server does not write
+/// itself is the header map of a scripted `raw` outcome, and a test can write a
+/// header there that HTTP cannot carry (see [`crate::wire::header`]). Building
+/// that response fails, and a failure here would close the connection without an
+/// answer — which PRD 5.9 classifies as a provider **timeout**. So the headers
+/// are parsed first and an unsendable one is answered as the harness bug it is,
+/// in the same voice as an unscripted call. The transcript still shows the
+/// outcome that was taken, exactly as it does for a `script-mismatch`.
 fn render(answer: Answer) -> hyper::Response<Full<Bytes>> {
     let Answer::Respond(response) = answer else {
         unreachable!("a closed connection never renders");
     };
-    let body = canonical(&response.body);
-    let mut built = hyper::Response::builder()
-        .status(StatusCode::from_u16(response.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
-        .header("content-type", "application/json");
-    for (name, value) in &response.headers {
-        built = built.header(name, value);
+    match sendable(&response.headers) {
+        Ok(headers) => assemble(response.status, headers, &response.body),
+        Err(reason) => assemble(
+            HARNESS_STATUS,
+            // `from_static` cannot fail on these two: both are this crate's own
+            // constants, lowercase and printable ASCII.
+            vec![(
+                HeaderName::from_static(HARNESS_HEADER),
+                HeaderValue::from_static(UNSENDABLE),
+            )],
+            &json!({
+                "mock_provider": format!("the scripted response cannot be sent: {reason}"),
+            }),
+        ),
+    }
+}
+
+/// A response's headers, parsed — or the first one that cannot be sent.
+fn sendable(headers: &BTreeMap<String, String>) -> Result<Vec<(HeaderName, HeaderValue)>, String> {
+    headers
+        .iter()
+        .map(|(name, value)| crate::wire::header(name, value))
+        .collect()
+}
+
+/// Status, headers, and body into the response that goes on the wire.
+fn assemble(
+    status: u16,
+    headers: Vec<(HeaderName, HeaderValue)>,
+    body: &Value,
+) -> hyper::Response<Full<Bytes>> {
+    let mut built = hyper::Response::new(Full::new(Bytes::from(canonical(body))));
+    *built.status_mut() = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let map = built.headers_mut();
+    map.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    // After `content-type`, so a script that means to override it can.
+    for (name, value) in headers {
+        map.insert(name, value);
     }
     built
-        .body(Full::new(Bytes::from(body)))
-        .unwrap_or_else(|_| unreachable!("every header this server sets is well formed"))
 }
 
 /// The address a bound listener is on, for the handle and the binary.
@@ -356,7 +398,7 @@ pub(crate) fn delay_of(answer: &Answer) -> Delay {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control::{HARNESS_HEADER, Outcome, Store};
+    use crate::control::{Outcome, Store};
 
     fn headers(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         pairs
@@ -594,6 +636,77 @@ mod tests {
         assert!(matches!(answer, Answer::Close(_)));
         assert_eq!(delay_of(&answer).duration().as_millis(), 20);
         assert_eq!(store.requests()[0].served, "failure.timeout");
+    }
+
+    /// A scripted `raw` outcome whose headers cannot be sent is answered as a
+    /// harness bug rather than closing the connection — which is what building
+    /// the response would have done, and what PRD 5.9 reads as a timeout.
+    ///
+    /// The control plane refuses such a script by name, but `RawOutcome.headers`
+    /// is a public field, so this is the second gate: the one a struct literal
+    /// still has to pass.
+    #[test]
+    fn a_header_that_cannot_be_sent_is_refused_rather_than_dropping_the_connection() {
+        for (name, value) in [("bad header", "value"), ("x-ok", "a\nb")] {
+            let rendered = render(
+                Wire::new(200, json!({ "ok": true }))
+                    .header(name, value)
+                    .answer(),
+            );
+            assert_eq!(
+                rendered.status().as_u16(),
+                HARNESS_STATUS,
+                "`{name}: {value}` is not sendable"
+            );
+            assert_eq!(rendered.headers()[HARNESS_HEADER], UNSENDABLE);
+        }
+
+        // …and a header that *can* be sent still is, over the content type this
+        // server sets first.
+        let rendered = render(
+            Wire::new(402, json!({ "nope": true }))
+                .header("retry-after", "1")
+                .answer(),
+        );
+        assert_eq!(rendered.status().as_u16(), 402);
+        assert_eq!(rendered.headers()["retry-after"], "1");
+        assert_eq!(rendered.headers()[CONTENT_TYPE], "application/json");
+    }
+
+    /// The same check, at the control plane: a script carrying a header that
+    /// cannot be sent is refused by name instead of queued.
+    #[test]
+    fn a_script_whose_headers_cannot_be_sent_is_refused_by_name() {
+        let store = Store::new();
+        let script = json!({
+            "model": "a",
+            "outcome": { "raw": { "status": 200, "body": {}, "headers": { "bad header": "v" } } },
+        });
+        let Answer::Respond(response) = enqueue(&store, canonical(&script).as_bytes()) else {
+            panic!("enqueue answers");
+        };
+        assert_eq!(response.status, HARNESS_STATUS);
+        assert_eq!(response.headers[HARNESS_HEADER], "bad-control-request");
+        assert!(
+            response.body["mock_provider"]
+                .as_str()
+                .unwrap()
+                .contains("bad header"),
+            "{:?}",
+            response.body
+        );
+        assert!(store.snapshot().is_drained(), "nothing was queued");
+
+        // A sendable one is queued, so the check narrows nothing legitimate.
+        let script = json!({
+            "model": "a",
+            "outcome": { "raw": { "status": 402, "body": {}, "headers": { "retry-after": "1" } } },
+        });
+        let Answer::Respond(response) = enqueue(&store, canonical(&script).as_bytes()) else {
+            panic!("enqueue answers");
+        };
+        assert_eq!(response.status, 200);
+        assert_eq!(store.snapshot().queues["a"], 1);
     }
 
     /// Repeated headers arrive joined, and every name is lowercase, so a

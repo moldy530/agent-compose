@@ -129,7 +129,10 @@ pub(crate) fn parse(headers: &BTreeMap<String, String>, body: Option<&Value>) ->
 fn check_headers(checker: &mut Checker, headers: &BTreeMap<String, String>) {
     let present = |name: &str| headers.get(name).is_some_and(|value| !value.is_empty());
     if !present("x-api-key") {
-        checker.fail(
+        // A credential, not a field: answered 401 rather than 400 (see
+        // `rejected`), because that is the status the SDK's `AuthenticationError`
+        // comes from and generated code may well classify the two apart.
+        checker.credential(
             "headers.x-api-key",
             "x-api-key header is required: authentication failed.",
         );
@@ -737,6 +740,25 @@ fn reply_answer(
             (vec![tool_use_block(sequence, 0, name, value)], "tool_use")
         }
         ReplyBody::Tools { calls, text } => {
+            // The mirror of the two refusals above, in the other direction: a
+            // request may make tool use *impossible* as surely as it can pin it,
+            // and a reply the Messages API could not have sent must not be
+            // rendered just because a script asked for one.
+            if calls.is_empty() {
+                return mismatch(
+                    "a `tools` reply with no calls is not an answer the Messages API can send: \
+                     `stop_reason: \"tool_use\"` names the block that ended the turn, and there \
+                     would be none. Script `text` for prose, or `raw` for a response generated \
+                     code must reject",
+                );
+            }
+            if let Some(forbidden) = forbidden_tool_use(request) {
+                return mismatch(&format!(
+                    "a `tools` reply cannot answer a request carrying {forbidden}: the Messages \
+                     API never calls a tool the request forbade. Script `text` for prose, or \
+                     `raw` for a response generated code must reject"
+                ));
+            }
             let mut content = Vec::new();
             if let Some(text) = text {
                 content.push(text_block(text));
@@ -816,6 +838,18 @@ fn pinned_tool_use(request: &Value) -> Option<String> {
     }
 }
 
+/// How a request forbade tool use, if it forbade it.
+///
+/// The exact inverse of [`pinned_tool_use`], and the reason it is its own
+/// function: `auto` leaves tool use *legal*, so only `none` belongs here. A
+/// request that offers no tools at all is caught further down by the
+/// `offered.contains` check, which names the tool the script invented.
+fn forbidden_tool_use(request: &Value) -> Option<String> {
+    let choice = request.get("tool_choice")?.as_object()?;
+    (choice.get("type").and_then(Value::as_str)? == "none")
+        .then(|| "`tool_choice: {type: \"none\"}`".to_string())
+}
+
 fn text_block(text: &str) -> Value {
     json!({ "type": "text", "text": text })
 }
@@ -868,15 +902,34 @@ fn error(status: u16, kind: &str, message: &str) -> Response {
 }
 
 /// The answer to a request that failed validation.
+///
+/// A missing credential outranks everything else in the list and is answered
+/// **401 `authentication_error`**, because that is what the Messages API does:
+/// authentication is settled before the body is looked at, so the answer names
+/// the credential and nothing else. Every other failure is the 400 the API sends
+/// for a body it could not accept.
 pub(crate) fn rejected(failures: &[ValidationFailure]) -> Answer {
-    let message = failures
+    let (status, kind, reported) = classify(failures);
+    let message = reported
         .iter()
         .map(|failure| failure.message.as_str())
         .collect::<Vec<_>>()
         .join("; ");
-    error(400, "invalid_request_error", &message)
-        .harness(INVALID)
-        .answer()
+    error(status, kind, &message).harness(INVALID).answer()
+}
+
+/// The status, error type, and the failures a refusal reports — see
+/// [`rejected`].
+fn classify(failures: &[ValidationFailure]) -> (u16, &'static str, Vec<&ValidationFailure>) {
+    let credentials: Vec<&ValidationFailure> = failures
+        .iter()
+        .filter(|failure| failure.authentication)
+        .collect();
+    if credentials.is_empty() {
+        (400, "invalid_request_error", failures.iter().collect())
+    } else {
+        (401, "authentication_error", credentials)
+    }
 }
 
 /// The answer to a request no scripted outcome answered.
@@ -1002,15 +1055,41 @@ mod tests {
         let mut without = headers();
         without.remove("anthropic-version");
         without.insert("content-type".to_string(), "text/plain".to_string());
-        let failures: Vec<String> = parse(&without, Some(&request))
+        let parsed = parse(&without, Some(&request));
+        let failures: Vec<String> = parsed
             .failures
-            .into_iter()
-            .map(|failure| failure.pointer)
+            .iter()
+            .map(|failure| failure.pointer.clone())
             .collect();
         assert_eq!(
             failures,
             ["headers.anthropic-version", "headers.content-type"]
         );
+        // Neither is a credential, so both draw the 400 a bad request draws.
+        assert!(
+            parsed
+                .failures
+                .iter()
+                .all(|failure| !failure.authentication)
+        );
+        let Answer::Respond(response) = rejected(&parsed.failures) else {
+            panic!("a rejection is a response");
+        };
+        assert_eq!(response.status, 400);
+        assert_eq!(response.body["error"]["type"], "invalid_request_error");
+
+        // The api key is: a missing one is authentication, and it is answered
+        // 401 — the status the SDK raises `AuthenticationError` from.
+        let mut anonymous = headers();
+        anonymous.remove("x-api-key");
+        let parsed = parse(&anonymous, Some(&request));
+        assert_eq!(parsed.failures[0].pointer, "headers.x-api-key");
+        assert!(parsed.failures[0].authentication);
+        let Answer::Respond(response) = rejected(&parsed.failures) else {
+            panic!("a rejection is a response");
+        };
+        assert_eq!(response.status, 401);
+        assert_eq!(response.body["error"]["type"], "authentication_error");
     }
 
     /// An unknown top-level key is a refusal, not an ignored setting.
@@ -1374,6 +1453,54 @@ mod tests {
                 .unwrap()
                 .contains("web_serch")
         );
+    }
+
+    /// And so is a tool call the request *forbade*, or a tool reply with no call
+    /// in it at all — the two answers the Messages API cannot send in this
+    /// direction, mirroring the prose refusals above.
+    #[test]
+    fn a_tool_reply_the_request_forbids_or_empties_is_a_script_mismatch() {
+        let with = |choice: Value| {
+            messages(json!({
+                "messages": [{ "role": "user", "content": "hi" }],
+                "tools": [{ "name": "lookup", "input_schema": { "type": "object" } }],
+                "tool_choice": choice,
+            }))
+        };
+        let call = || Outcome::tool_calls(vec![crate::control::ToolCall::new("lookup", json!({}))]);
+
+        // `tool_choice: none` says the model must not call a tool.
+        let request = with(json!({ "type": "none" }));
+        let parsed = parse(&headers(), Some(&request));
+        assert!(parsed.failures.is_empty(), "{:?}", parsed.failures);
+        let Answer::Respond(response) = render(1, &request, None, &call()) else {
+            panic!("a mismatch is a response");
+        };
+        assert_eq!(response.status, HARNESS_STATUS);
+        assert_eq!(response.headers[crate::control::HARNESS_HEADER], MISMATCH);
+
+        // An empty call list renders `content: []` with a `tool_use` stop
+        // reason, which is not a shape the API has.
+        for request in [
+            with(json!({ "type": "auto" })),
+            messages(json!({ "messages": [{ "role": "user", "content": "hi" }] })),
+        ] {
+            let Answer::Respond(response) = render(1, &request, None, &Outcome::tool_calls(vec![]))
+            else {
+                panic!("a mismatch is a response");
+            };
+            assert_eq!(response.status, HARNESS_STATUS);
+            assert_eq!(response.headers[crate::control::HARNESS_HEADER], MISMATCH);
+        }
+
+        // The positive half: `auto` leaves a call legal, and it is rendered.
+        let request = with(json!({ "type": "auto" }));
+        let Answer::Respond(response) = render(1, &request, None, &call()) else {
+            panic!("a reply is a response");
+        };
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body["content"][0]["type"], "tool_use");
+        assert_eq!(response.body["stop_reason"], "tool_use");
     }
 
     /// Each failure shape carries the status and body the SDK classifies on.

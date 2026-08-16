@@ -80,13 +80,19 @@ pub const HARNESS_HEADER: &str = "x-mock-provider-error";
 /// retries it. [`HARNESS_HEADER`] names which refusal it is.
 pub const HARNESS_STATUS: u16 = 422;
 
-/// [`HARNESS_HEADER`] on a request the harness refused because it was malformed.
+/// [`HARNESS_HEADER`] on a request the harness refused because it was malformed
+/// or unauthenticated — the two cases a *real* provider refuses too, so they
+/// carry the provider's own status (400 and 401) rather than [`HARNESS_STATUS`],
+/// and the header is what says the refusal came from this server.
 pub const REFUSED_INVALID: &str = "invalid-request";
 /// [`HARNESS_HEADER`] on a request no scripted outcome answered.
 pub const REFUSED_UNSCRIPTED: &str = "unscripted-request";
 /// [`HARNESS_HEADER`] on a request whose scripted outcome could not be rendered
 /// into what the request asked for.
 pub const REFUSED_MISMATCH: &str = "script-mismatch";
+/// [`HARNESS_HEADER`] on a scripted outcome that could not be put on the wire at
+/// all — a `raw` outcome carrying a header name or value HTTP cannot carry.
+pub const REFUSED_UNSENDABLE: &str = "unsendable-response";
 
 /// Which provider surface a request arrived on.
 ///
@@ -260,7 +266,10 @@ pub enum Outcome {
     /// The escape hatch for what the two shapes above deliberately cannot
     /// express: a response the *generated code* must reject — a missing
     /// `content`, a tool call whose arguments are not JSON, a status no
-    /// provider sends. Nothing about it is validated on the way out.
+    /// provider sends. Nothing about its **body** is validated on the way out;
+    /// its `headers` are the one exception, because a header HTTP cannot carry
+    /// is not a response generated code can reject but one it never receives
+    /// (see [`RawOutcome::headers`]).
     Raw(RawOutcome),
 }
 
@@ -281,6 +290,11 @@ impl Outcome {
 
     /// Tool calls, which is how an agent's tool loop is driven: the graph is
     /// expected to run the tools and call back with their results.
+    ///
+    /// At least one call, and only against a request that leaves tool use legal:
+    /// an empty list, or any list against a `tool_choice` of `none`, is a shape
+    /// neither API can send and is refused as a `script-mismatch` — see
+    /// [`ReplyBody::Tools`].
     #[must_use]
     pub fn tool_calls(calls: Vec<ToolCall>) -> Self {
         Self::Reply(Reply::new(ReplyBody::Tools { calls, text: None }))
@@ -402,6 +416,14 @@ pub enum ReplyBody {
     /// Assistant text.
     Text(String),
     /// Tool calls, optionally preceded by text.
+    ///
+    /// Checked against what the request permits, the same way a `structured`
+    /// reply is: every call must name a tool the request offered, the list must
+    /// not be empty (a `tool_use` / `tool_calls` stop reason names the block
+    /// that ended the turn, and there would be none), and the request must not
+    /// have forbidden tool use with `tool_choice: none`. A script that says
+    /// otherwise is answered as the harness bug it is rather than rendered into
+    /// a shape no provider sends.
     Tools {
         calls: Vec<ToolCall>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -489,10 +511,32 @@ pub struct RawOutcome {
     pub status: u16,
     pub body: Value,
     /// Extra response headers, on top of `content-type`.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    ///
+    /// Checked on the way in: a name or value HTTP cannot carry is refused by
+    /// name here rather than queued, because a queue entry that cannot be sent
+    /// is a script that fails as a *dropped connection* — which PRD 5.9
+    /// classifies as a provider timeout. See [`crate::wire::header`].
+    #[serde(
+        default,
+        deserialize_with = "sendable",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub headers: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Delay::is_none")]
     pub delay: Delay,
+}
+
+/// Response headers, refused unless every one of them can be sent — see
+/// [`RawOutcome::headers`].
+fn sendable<'de, D>(deserializer: D) -> Result<BTreeMap<String, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let headers = BTreeMap::<String, String>::deserialize(deserializer)?;
+    for (name, value) in &headers {
+        crate::wire::header(name, value).map_err(serde::de::Error::custom)?;
+    }
+    Ok(headers)
 }
 
 /// A scripted wait, in milliseconds.
@@ -542,6 +586,17 @@ impl From<Duration> for Delay {
 pub struct ValidationFailure {
     pub pointer: String,
     pub message: String,
+    /// Whether this is a missing **credential** rather than a malformed request.
+    ///
+    /// Both real APIs check authentication before they look at the body, and
+    /// both answer a missing key with **401**, which is the status the two
+    /// client SDKs raise `AuthenticationError` from — a different class than the
+    /// 400 a bad body raises. Generated code that classifies the two apart has
+    /// to be taught the same difference here, so the flag travels with the
+    /// complaint and each surface's `rejected()` reads it. Recorded in the
+    /// transcript only when true, so an ordinary failure reads as it always did.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub authentication: bool,
 }
 
 impl ValidationFailure {
@@ -549,6 +604,15 @@ impl ValidationFailure {
         Self {
             pointer: pointer.into(),
             message: message.into(),
+            authentication: false,
+        }
+    }
+
+    /// A missing credential — see [`ValidationFailure::authentication`].
+    pub(crate) fn credential(pointer: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            authentication: true,
+            ..Self::new(pointer, message)
         }
     }
 }

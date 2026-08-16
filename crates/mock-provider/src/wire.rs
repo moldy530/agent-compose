@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 
+use hyper::header::{HeaderName, HeaderValue};
 use serde_json::Value;
 
 use crate::control::{Delay, HARNESS_HEADER};
@@ -69,7 +70,27 @@ impl Response {
     }
 }
 
+/// One response header, parsed into what HTTP can actually carry.
+///
+/// Every header this server sets *itself* is a constant, so this exists for the
+/// one map a **test** writes: the `headers` of a scripted `raw` outcome
+/// (`RawOutcome`). A name with a space in it or a value with a newline cannot be
+/// put on the wire, and hyper answers a request to do so by failing to build the
+/// response — which would end the connection with no answer, and PRD 5.9
+/// classifies a connection that ends with no answer as a **timeout**. A harness
+/// bug must never arrive wearing a failover condition, so an unsendable header is
+/// caught twice: at the control plane when the script is enqueued (by name, as a
+/// bad control request) and again on the way out, because `RawOutcome.headers` is
+/// a public field a struct literal can fill without passing through it.
+pub(crate) fn header(name: &str, value: &str) -> Result<(HeaderName, HeaderValue), String> {
+    let parsed = HeaderName::try_from(name)
+        .map_err(|_| format!("`{name}` is not a header name HTTP can carry"))?;
+    let carried = HeaderValue::try_from(value)
+        .map_err(|_| format!("the value scripted for header `{name}` is not one HTTP can carry"))?;
+    Ok((parsed, carried))
+}
+
 pub(crate) use crate::control::{
     HARNESS_STATUS, REFUSED_INVALID as INVALID, REFUSED_MISMATCH as MISMATCH,
-    REFUSED_UNSCRIPTED as UNSCRIPTED,
+    REFUSED_UNSCRIPTED as UNSCRIPTED, REFUSED_UNSENDABLE as UNSENDABLE,
 };

@@ -127,10 +127,14 @@ pub(crate) fn parse(
 
     checker.closed("", body, REQUEST_KEYS);
 
-    // On the Azure routes the deployment in the path is what selects the model,
-    // and the body's `model` is optional; everywhere else it is required.
-    let model = match (route, body.get("model")) {
-        (Route::Azure, None) => deployment.unwrap_or_default().to_string(),
+    // On the **classic** Azure route the deployment in the path is what selects
+    // the model, so the body's `model` is optional there and the deployment
+    // stands in for it. Everywhere else — including the newer
+    // `/openai/v1/chat/completions`, which carries no deployment and where the
+    // body names the model (WIRE-NOTES §7) — it is required, and a request that
+    // omits it is refused rather than keyed under the empty string.
+    let model = match (route, deployment, body.get("model")) {
+        (Route::Azure, Some(deployment), None) => deployment.to_string(),
         _ => checker
             .required_string("", body, "model")
             .unwrap_or_default()
@@ -165,12 +169,15 @@ pub(crate) fn parse(
 fn check_headers(checker: &mut Checker, route: Route, headers: &BTreeMap<String, String>) {
     let value = |name: &str| headers.get(name).filter(|value| !value.is_empty());
     let bearer = value("authorization").is_some_and(|value| value.starts_with("Bearer "));
+    // A credential, not a field: answered 401 rather than 400 (see `rejected`),
+    // because that is the status the `openai` SDK's `AuthenticationError` comes
+    // from and generated code may well classify the two apart.
     match route {
-        Route::Direct if !bearer => checker.fail(
+        Route::Direct if !bearer => checker.credential(
             "headers.authorization",
             "You didn't provide an API key. You need to provide your API key in an Authorization header using Bearer auth (i.e. Authorization: Bearer YOUR_KEY).",
         ),
-        Route::Azure if !bearer && value("api-key").is_none() => checker.fail(
+        Route::Azure if !bearer && value("api-key").is_none() => checker.credential(
             "headers.api-key",
             "Access denied due to missing subscription key. Make sure to include subscription key when making requests to an API.",
         ),
@@ -833,6 +840,25 @@ fn reply_answer(
             calls: scripted,
             text,
         } => {
+            // The mirror of the two refusals above, in the other direction: a
+            // request may make a tool call *impossible* as surely as it can pin
+            // one, and a reply Chat Completions could not have sent must not be
+            // rendered just because a script asked for one.
+            if scripted.is_empty() {
+                return mismatch(
+                    "a `tools` reply with no calls is not an answer Chat Completions can send: \
+                     `finish_reason: \"tool_calls\"` names the calls that ended the turn, and \
+                     there would be none. Script `text` for prose, or `raw` for a response \
+                     generated code must reject",
+                );
+            }
+            if let Some(forbidden) = forbidden_tool_call(request) {
+                return mismatch(&format!(
+                    "a `tools` reply cannot answer a request carrying {forbidden}: Chat \
+                     Completions never calls a function the request forbade. Script `text` for \
+                     prose, or `raw` for a response generated code must reject"
+                ));
+            }
             let mut calls = Vec::new();
             for (index, call) in scripted.iter().enumerate() {
                 if !offered.contains(&call.name) {
@@ -932,6 +958,20 @@ fn pinned_answer_shape(request: &Value) -> Option<String> {
     }
 }
 
+/// How a request forbade a tool call, if it forbade one.
+///
+/// The exact inverse of [`pinned_answer_shape`]'s tool half, and its own
+/// function for the same reason the Messages surface's is: `auto` leaves a call
+/// *legal*, so only `none` belongs here. A request that offers no functions at
+/// all is caught by the `offered.contains` check, which names the function the
+/// script invented.
+fn forbidden_tool_call(request: &Value) -> Option<String> {
+    match request.get("tool_choice")? {
+        Value::String(choice) if choice == "none" => Some("`tool_choice: \"none\"`".to_string()),
+        _ => None,
+    }
+}
+
 fn call_block(sequence: u64, index: usize, name: &str, input: &Value) -> Value {
     json!({
         "id": format!("call_mock_{sequence:08}_{index}"),
@@ -991,7 +1031,33 @@ fn error(status: u16, kind: &str, code: Option<&str>, message: &str) -> Response
 }
 
 /// The answer to a request that failed validation.
+///
+/// A missing credential outranks everything else in the list and is answered
+/// **401** with `code: "invalid_api_key"`, because that is what the service
+/// does: authentication is settled before the body is looked at, so the answer
+/// names the credential and nothing else, and it carries no `param` — a header
+/// is not a request parameter. Every other failure is the 400 the service sends
+/// for a body it could not accept.
 pub(crate) fn rejected(failures: &[ValidationFailure]) -> Answer {
+    let credentials: Vec<&ValidationFailure> = failures
+        .iter()
+        .filter(|failure| failure.authentication)
+        .collect();
+    if !credentials.is_empty() {
+        let message = credentials
+            .iter()
+            .map(|failure| failure.message.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        return error(
+            401,
+            "invalid_request_error",
+            Some("invalid_api_key"),
+            &message,
+        )
+        .harness(INVALID)
+        .answer();
+    }
     let message = failures
         .iter()
         .map(|failure| failure.message.as_str())
@@ -1298,18 +1364,38 @@ mod tests {
 
         let mut anonymous = headers();
         anonymous.remove("authorization");
-        let failures: Vec<String> = parse(
+        let parsed = parse(
             Route::Direct,
             &anonymous,
             "",
             None,
             Some(&request(json!({}))),
-        )
-        .failures
-        .into_iter()
-        .map(|failure| failure.pointer)
-        .collect();
+        );
+        let failures: Vec<String> = parsed
+            .failures
+            .iter()
+            .map(|failure| failure.pointer.clone())
+            .collect();
         assert_eq!(failures, ["headers.authorization"]);
+        // A credential, so the refusal is a 401 rather than the 400 a bad body
+        // draws — the distinction generated code classifies on.
+        assert!(parsed.failures[0].authentication);
+        let Answer::Respond(response) = rejected(&parsed.failures) else {
+            panic!("a rejection is a response");
+        };
+        assert_eq!(response.status, 401);
+        assert_eq!(response.body["error"]["code"], "invalid_api_key");
+
+        // …while a content-type complaint is about the request, not the caller.
+        let mut plain = headers();
+        plain.insert("content-type".to_string(), "text/plain".to_string());
+        let parsed = parse(Route::Direct, &plain, "", None, Some(&request(json!({}))));
+        assert_eq!(parsed.failures[0].pointer, "headers.content-type");
+        assert!(!parsed.failures[0].authentication);
+        let Answer::Respond(response) = rejected(&parsed.failures) else {
+            panic!("a rejection is a response");
+        };
+        assert_eq!(response.status, 400);
     }
 
     /// A `model` that is present and names nothing is its own mistake here too.
@@ -1507,6 +1593,36 @@ mod tests {
             Some(&named),
         );
         assert_eq!(parsed.model, "gpt-4o-mini");
+
+        // The newer `/openai/v1/chat/completions` carries no deployment, so
+        // nothing stands in for a body that names no model: it is required
+        // there exactly as it is on the direct route (WIRE-NOTES §7). Keyed
+        // under the empty string is how a whole run would collapse into one
+        // queue and a codegen bug would go unreported.
+        let parsed = parse(
+            Route::Azure,
+            &azure,
+            "api-version=preview",
+            None,
+            Some(&body),
+        );
+        assert_eq!(
+            parsed
+                .failures
+                .iter()
+                .map(|failure| failure.pointer.as_str())
+                .collect::<Vec<_>>(),
+            ["model"]
+        );
+        let parsed = parse(
+            Route::Azure,
+            &azure,
+            "api-version=preview",
+            None,
+            Some(&named),
+        );
+        assert!(parsed.failures.is_empty(), "{:?}", parsed.failures);
+        assert_eq!(parsed.model, "gpt-4o-mini");
     }
 
     /// A `json_schema` structured reply is the object, serialized into content.
@@ -1684,6 +1800,57 @@ mod tests {
             panic!("a mismatch is a response");
         };
         assert_eq!(response.headers[HARNESS_HEADER], MISMATCH);
+    }
+
+    /// And so are a call the request *forbade* and a tool reply with no call in
+    /// it — the mirror of the prose refusals, in the other direction.
+    #[test]
+    fn a_tool_reply_the_request_forbids_or_empties_is_a_mismatch() {
+        let with = |choice: Value| {
+            request(json!({
+                "tools": [{
+                    "type": "function",
+                    "function": { "name": "lookup", "parameters": { "type": "object" } },
+                }],
+                "tool_choice": choice,
+            }))
+        };
+        let call = || Outcome::tool_calls(vec![ToolCall::new("lookup", json!({}))]);
+
+        let body = with(json!("none"));
+        let parsed = parse_direct(&body);
+        assert!(parsed.failures.is_empty(), "{:?}", parsed.failures);
+        let Answer::Respond(response) = render(1, &body, &parsed.model, None, &call()) else {
+            panic!("a mismatch is a response");
+        };
+        assert_eq!(response.status, HARNESS_STATUS);
+        assert_eq!(response.headers[HARNESS_HEADER], MISMATCH);
+
+        for body in [with(json!("auto")), request(json!({}))] {
+            let Answer::Respond(response) = render(
+                1,
+                &body,
+                "gpt-4o-mini",
+                None,
+                &Outcome::tool_calls(Vec::new()),
+            ) else {
+                panic!("a mismatch is a response");
+            };
+            assert_eq!(response.status, HARNESS_STATUS, "{body}");
+            assert_eq!(response.headers[HARNESS_HEADER], MISMATCH);
+        }
+
+        // The positive half: `auto` leaves a call legal, and it is rendered.
+        let body = with(json!("auto"));
+        let Answer::Respond(response) = render(1, &body, "gpt-4o-mini", None, &call()) else {
+            panic!("a reply is a response");
+        };
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            response.body["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "lookup"
+        );
+        assert_eq!(response.body["choices"][0]["finish_reason"], "tool_calls");
     }
 
     /// The failure shapes generated code classifies on.

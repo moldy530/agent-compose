@@ -78,6 +78,21 @@ These are load-bearing and pinned by tests in `src/` and `tests/`:
   is refused as a `script-mismatch` for the same reason a `structured` reply to
   a request that pinned nothing is: the harness must not teach generated code
   that a provider answers in a way it cannot.
+* **`tool_choice: none` forbids one**, which is the same rule read backwards, so
+  a `tools` reply scripted against it is refused the same way. So is a `tools`
+  reply carrying **no calls**: `stop_reason: "tool_use"` / `finish_reason:
+  "tool_calls"` names the block that ended the turn, and neither API sends the
+  name with nothing behind it. Prose is `text`; a shape generated code must
+  reject is `raw`.
+* **A missing credential is a 401.** `x-api-key` on the Messages API,
+  `Authorization: Bearer …` / `api-key` on Chat Completions — absent, the answer
+  is 401 (`authentication_error` there, `code: "invalid_api_key"` here), not the
+  400 a malformed body draws, because 401 is the status both SDKs raise
+  `AuthenticationError` from. Authentication is settled before the body is, so
+  the refusal names the credential and nothing else — while the transcript still
+  records every failure the request had. See (12) for what "credential" means
+  here, and (11) for why 401 is safe: neither the failover set nor the SDK retry
+  set claims it.
 * **`tool_choice` requires `tools`**, on both surfaces, and **OpenAI refuses an
   empty `tools` array** (`Invalid 'tools': empty array. Expected an array with
   minimum length 1.`) — which is what a compiled graph sends for an agent with
@@ -152,6 +167,13 @@ where the deployment names the model and the body's `model` is optional. Newer:
 `POST /openai/v1/chat/completions?api-version=preview`, where the body names the
 model. Both are served; when a body names a model it outranks the path, so one
 deployment can host several scripted model ids.
+
+The classic route is therefore the **only** place a body without `model` is
+accepted: on `/openai/v1/...` there is no deployment to stand in for it, so an
+omitted `model` is refused exactly as it is on the direct route. Accepting it
+would key every such call under the empty string — one queue for a whole run, and
+a codegen bug that dropped `model` reported as a confusing "no scripted outcome
+for model ``".
 *Confirmed by*: a live Azure-backed run's recorded `path` and `model`.
 
 ### 8. `max_tokens` is always present on an Anthropic request
@@ -181,10 +203,11 @@ scripts them (`usage` on a reply).
 
 ### 11. The harness's own refusals use a status no provider sends and no SDK retries
 
-An unscripted call, a script that cannot be rendered, and a control-plane
-document that will not parse all answer **422** with an
-`x-mock-provider-error` header, wrapped in the surface's own error envelope so a
-client library can still parse them. Two mechanisms had to be dodged, not one:
+An unscripted call, a script that cannot be rendered, a script whose `raw`
+headers cannot be put on the wire, and a control-plane document that will not
+parse all answer **422** with an `x-mock-provider-error` header, wrapped in the
+surface's own error envelope so a client library can still parse them. Two
+mechanisms had to be dodged, not one:
 
 * **failover.** PRD 5.9 routes on 429/5xx/no-answer, so a harness refusal
   wearing one of those would be silently failed over and the run would report a
@@ -209,6 +232,16 @@ application/json`. Values are never compared: the harness needs **no API keys**
 (PRD §7 M1), so any non-empty placeholder passes. What is being checked is that
 generated code sends the header at all, which a live call would otherwise be the
 first to discover.
+
+The three **credential** headers answer differently from the fourth. A missing
+credential is 401 and a missing or wrong `content-type` is 400 — the split the
+Certain list states, and the one both SDKs classify on (`AuthenticationError` is
+raised from the status alone). *Assumed*: that a **present but placeholder** key
+would also pass a live call, which is the whole basis of a keyless harness, and
+the exact error `code` on the Chat Completions 401 (`invalid_api_key`; a live
+missing-key 401 may carry `code: null`). *If wrong*: only a test asserting the
+string breaks — `tests/openai_wire.rs`'s
+`a_request_without_credentials_is_refused` is where it lives.
 
 ### 13. OpenAI's strict-mode schema rules, and the sentences it refuses with
 

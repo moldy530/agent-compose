@@ -102,8 +102,9 @@ use std::sync::Arc;
 pub use client::{Client, Request, Response};
 pub use control::{
     CREATED, Delay, Failure, HARNESS_HEADER, HARNESS_STATUS, Outcome, REFUSED_INVALID,
-    REFUSED_MISMATCH, REFUSED_UNSCRIPTED, RecordedRequest, Reply, ReplyBody, Script, Snapshot,
-    Store, StructuredOutput, Surface, ToolCall, Usage, ValidationFailure, Verdict,
+    REFUSED_MISMATCH, REFUSED_UNSCRIPTED, REFUSED_UNSENDABLE, RecordedRequest, Reply, ReplyBody,
+    Script, Snapshot, Store, StructuredOutput, Surface, ToolCall, Usage, ValidationFailure,
+    Verdict,
 };
 pub use server::serve;
 

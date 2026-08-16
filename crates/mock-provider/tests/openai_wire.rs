@@ -363,6 +363,40 @@ fn both_azure_routes_are_served() {
     assert_eq!(recorded[1].model, MODEL);
 }
 
+/// The newer Azure route has no deployment in its path, so a body that names no
+/// model is refused there — the same refusal the direct route gives.
+///
+/// The classic route is the only place a missing `model` is legal, because the
+/// deployment in the path is what selects it. Accepting it on `/openai/v1` would
+/// key every such call under the empty string and let codegen that dropped
+/// `model` pass an acceptance run.
+#[test]
+fn the_newer_azure_route_still_requires_a_model_in_the_body() {
+    let provider = MockProvider::start().expect("a port");
+    let response = provider
+        .client()
+        .send(
+            Request::post("/openai/v1/chat/completions?api-version=preview")
+                .azure_auth()
+                .json(&json!({ "messages": [{ "role": "user", "content": "go" }] })),
+        )
+        .expect("the route answers");
+    assert_eq!(response.status, 400);
+    assert_eq!(response.json()["error"]["param"], "model");
+
+    let recorded = provider.requests();
+    assert_eq!(recorded[0].served, "rejected");
+    assert!(!recorded[0].is_valid());
+    assert_eq!(
+        recorded[0]
+            .failures()
+            .iter()
+            .map(|failure| failure.pointer.as_str())
+            .collect::<Vec<_>>(),
+        ["model"]
+    );
+}
+
 /// Azure without `api-version` is a refusal, because the service refuses it.
 #[test]
 fn an_azure_request_without_an_api_version_is_refused() {
@@ -381,6 +415,12 @@ fn an_azure_request_without_an_api_version_is_refused() {
 
 /// A call with no credentials is refused: the harness needs no API *keys*, but
 /// the request still has to carry the header a client sends.
+///
+/// **401**, not 400 — the status the service answers and the one the `openai`
+/// SDK raises `AuthenticationError` from. A harness that answered 400 would
+/// teach generated code that a missing key is a malformed request. Neither the
+/// failover set (PRD 5.9) nor the SDK's retry set claims 401, so nothing else
+/// changes shape.
 #[test]
 fn a_request_without_credentials_is_refused() {
     let provider = MockProvider::start().expect("a port");
@@ -391,10 +431,67 @@ fn a_request_without_credentials_is_refused() {
             "messages": [{ "role": "user", "content": "go" }],
         })))
         .expect("the route answers");
-    assert_eq!(response.status, 400);
+    assert_eq!(response.status, 401);
+    let body = response.json();
+    assert_eq!(body["error"]["code"], "invalid_api_key");
+    assert_eq!(
+        body["error"]["param"],
+        Value::Null,
+        "a header is not a request parameter"
+    );
     assert_eq!(
         provider.requests()[0].failures()[0].pointer,
         "headers.authorization"
+    );
+
+    // Authentication is settled before the body is: a request that is both
+    // unauthenticated and malformed is the 401, naming the credential only.
+    let response = provider
+        .client()
+        .send(Request::post("/v1/chat/completions").json(&json!({ "model": MODEL })))
+        .expect("the route answers");
+    assert_eq!(response.status, 401);
+    let message = response.json()["error"]["message"]
+        .as_str()
+        .expect("a message")
+        .to_string();
+    assert!(message.contains("API key"), "{message}");
+    assert!(!message.contains("messages"), "{message}");
+    assert_eq!(
+        provider.requests()[1]
+            .failures()
+            .iter()
+            .map(|failure| failure.pointer.as_str())
+            .collect::<Vec<_>>(),
+        ["headers.authorization", "messages"],
+        "the transcript still records everything that was wrong"
+    );
+
+    // …and a request that carries its key is refused at 400 as it always was.
+    let response = send(
+        &provider.client(),
+        "/v1/chat/completions",
+        &json!({ "model": MODEL }),
+    );
+    assert_eq!(response.status, 400);
+    assert_eq!(response.json()["error"]["param"], "messages");
+}
+
+/// Azure's missing subscription key is the same 401, on the other credential.
+#[test]
+fn an_azure_request_without_a_subscription_key_is_refused() {
+    let provider = MockProvider::start().expect("a port");
+    let response = provider
+        .client()
+        .send(
+            Request::post("/openai/deployments/smart/chat/completions?api-version=2024-10-21")
+                .json(&json!({ "messages": [{ "role": "user", "content": "go" }] })),
+        )
+        .expect("the route answers");
+    assert_eq!(response.status, 401);
+    assert_eq!(
+        provider.requests()[0].failures()[0].pointer,
+        "headers.api-key"
     );
 }
 

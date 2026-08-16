@@ -240,6 +240,80 @@ fn a_malformed_tool_loop_is_refused_and_recorded() {
     );
 }
 
+/// A call with no `x-api-key` is refused **401 `authentication_error`**, the
+/// status the Messages API answers and the one `@anthropic-ai/sdk` raises
+/// `AuthenticationError` from.
+///
+/// The harness needs no API *keys* (WIRE-NOTES §12 — values are never compared),
+/// but the header still has to be there, and a missing one is an authentication
+/// failure rather than a malformed request: answering 400 would teach generated
+/// code to classify the two the same way. 401 is outside PRD 5.9's failover set
+/// and outside the SDK's retry set, so nothing else changes shape.
+#[test]
+fn a_request_without_an_api_key_is_refused_as_authentication() {
+    let provider = MockProvider::start().expect("a port");
+    provider.enqueue(Script::new(MODEL, Outcome::text("never served")));
+
+    let response = provider
+        .client()
+        .send(
+            Request::post("/v1/messages")
+                .header("anthropic-version", "2023-06-01")
+                .json(&json!({
+                    "model": MODEL,
+                    "max_tokens": 1024,
+                    "messages": [{ "role": "user", "content": "go" }],
+                })),
+        )
+        .expect("the route answers");
+    assert_eq!(response.status, 401);
+    let body = response.json();
+    assert_eq!(body["type"], "error");
+    assert_eq!(body["error"]["type"], "authentication_error");
+    assert_eq!(response.header(HARNESS_HEADER), Some(REFUSED_INVALID));
+
+    let recorded = provider.requests();
+    assert!(!recorded[0].is_valid());
+    assert_eq!(recorded[0].failures()[0].pointer, "headers.x-api-key");
+    assert_eq!(
+        provider.snapshot().queues[MODEL],
+        1,
+        "an unauthenticated call consumes nothing"
+    );
+
+    // Authentication is settled before the body is: a request that is both
+    // unauthenticated and malformed is the 401, naming the credential only.
+    let response = provider
+        .client()
+        .send(
+            Request::post("/v1/messages")
+                .header("anthropic-version", "2023-06-01")
+                .json(&json!({ "model": MODEL })),
+        )
+        .expect("the route answers");
+    assert_eq!(response.status, 401);
+    let message = response.json()["error"]["message"]
+        .as_str()
+        .expect("a message")
+        .to_string();
+    assert!(message.contains("x-api-key"), "{message}");
+    assert!(!message.contains("max_tokens"), "{message}");
+    assert_eq!(
+        provider.requests()[1]
+            .failures()
+            .iter()
+            .map(|failure| failure.pointer.as_str())
+            .collect::<Vec<_>>(),
+        ["headers.x-api-key", "max_tokens", "messages"],
+        "the transcript still records everything that was wrong"
+    );
+
+    // …and a request that carries its key is refused at 400 as it always was.
+    let response = send(&provider.client(), &json!({ "model": MODEL }));
+    assert_eq!(response.status, 400);
+    assert_eq!(response.json()["error"]["type"], "invalid_request_error");
+}
+
 /// Every failover condition PRD 5.9 names, on the wire, with the status and body
 /// the SDK classifies from.
 #[test]

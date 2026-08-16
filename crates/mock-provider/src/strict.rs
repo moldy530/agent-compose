@@ -101,6 +101,13 @@ impl Checker {
             .push(ValidationFailure::new(pointer, message.into()));
     }
 
+    /// Record a **missing credential**, which both surfaces answer 401 rather
+    /// than 400 — see [`ValidationFailure::authentication`].
+    pub(crate) fn credential(&mut self, pointer: &str, message: impl Into<String>) {
+        self.failures
+            .push(ValidationFailure::credential(pointer, message.into()));
+    }
+
     /// A key the request must carry.
     pub(crate) fn required<'a>(
         &mut self,

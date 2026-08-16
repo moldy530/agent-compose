@@ -412,3 +412,92 @@ fn every_outcome_shape_can_be_scripted_over_http() {
     assert_eq!(served["usage"]["input_tokens"], 11);
     assert_eq!(served["usage"]["output_tokens"], 22);
 }
+
+/// A `raw` outcome's headers reach the client, and a header that could not be
+/// put on the wire is refused when it is scripted — never served as a dropped
+/// connection, which PRD 5.9 would read as a provider timeout.
+#[test]
+fn a_raw_outcomes_headers_are_served_or_refused_by_name() {
+    let provider = MockProvider::start().expect("a port");
+    let client = provider.client();
+
+    let staged = client
+        .post_json(
+            "/_mock/enqueue",
+            &json!({
+                "model": MODEL,
+                "outcome": { "raw": {
+                    "status": 402,
+                    "body": { "nope": true },
+                    "headers": { "retry-after": "7", "x-note": "served verbatim" },
+                }},
+            }),
+        )
+        .expect("the control plane answers");
+    assert_eq!(staged.status, 200);
+
+    let served = call(&client, "one");
+    assert_eq!(served.status, 402);
+    assert_eq!(served.header("retry-after"), Some("7"));
+    assert_eq!(served.header("x-note"), Some("served verbatim"));
+
+    for headers in [
+        json!({ "bad header": "value" }),
+        json!({ "x-ok": "a\nb" }),
+        json!({ "x-ok": "a\u{0}b" }),
+    ] {
+        let refused = client
+            .post_json(
+                "/_mock/enqueue",
+                &json!({
+                    "model": MODEL,
+                    "outcome": { "raw": { "status": 200, "body": {}, "headers": headers } },
+                }),
+            )
+            .expect("the control plane answers");
+        assert_eq!(
+            refused.status,
+            mock_provider::HARNESS_STATUS,
+            "{headers} was accepted: {}",
+            refused.text()
+        );
+        assert_eq!(
+            refused.header(mock_provider::HARNESS_HEADER),
+            Some("bad-control-request")
+        );
+    }
+    assert!(
+        provider.snapshot().queues.is_empty(),
+        "a script that cannot be sent is never queued: {:?}",
+        provider.snapshot().queues
+    );
+}
+
+/// The second gate, end to end. A `raw` outcome assembled in Rust never passes
+/// through the control plane's check, so the *client* is what must not be hurt
+/// by one: it gets the harness's refusal rather than a connection that ends with
+/// no answer — which PRD 5.9 classifies as a provider timeout, and which is how
+/// a harness bug would arrive wearing a failover condition.
+#[test]
+fn a_raw_outcome_built_in_rust_cannot_drop_the_connection() {
+    let provider = MockProvider::start().expect("a port");
+    let mut outcome = Outcome::raw(200, json!({ "ok": true }));
+    let Outcome::Raw(raw) = &mut outcome else {
+        panic!("`Outcome::raw` is a raw outcome");
+    };
+    raw.headers
+        .insert("bad header".to_string(), "v".to_string());
+    provider.enqueue(Script::new(MODEL, outcome));
+
+    let answered = call(&provider.client(), "one");
+    assert_eq!(answered.status, mock_provider::HARNESS_STATUS);
+    assert_eq!(
+        answered.header(mock_provider::HARNESS_HEADER),
+        Some(mock_provider::REFUSED_UNSENDABLE)
+    );
+    assert!(
+        answered.text().contains("bad header"),
+        "the refusal names the header: {}",
+        answered.text()
+    );
+}
