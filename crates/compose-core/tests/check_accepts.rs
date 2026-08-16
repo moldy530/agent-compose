@@ -432,6 +432,93 @@ flow.f:
     );
 }
 
+/// A detached instance may fan out further, and a store write is not a state
+/// write: what rule 7 refuses is a channel write, and nothing here makes one.
+/// `flow.leaf` writes `store.docs` from an item-derived key inside two nested
+/// fan-outs, and the only agent result — `receipt` — names no channel (grammar
+/// 8.6 rules 5, 7, 11.4).
+#[test]
+fn a_detached_dispatch_that_fans_out_without_writing_state() {
+    accepts(
+        "detached-dispatch-fans-out",
+        r#"
+provider.local:
+  kind: openai_compatible
+  base_url: ${U}
+store.docs:
+  kind: vector
+  scope: global
+  embed:
+    model: text-embedding-3-small
+    provider: provider.local
+state:
+  tasks:
+    type: array
+    max_items: 5
+    items: { type: string }
+  note:
+    type: array
+    max_items: 5
+    items: { type: string }
+    reduce: append
+agent.sink:
+  model: model.m
+  prompt: Record.
+  input:
+    text: { type: string }
+  output:
+    receipt: { type: string }
+flow.leaf:
+  inputs:
+    text: { type: string }
+  outputs: {}
+  nodes:
+    save:
+      store: store.docs
+      op: upsert
+      key: "input.text"
+      value: "input.text"
+  edges:
+    - { from: start, to: save }
+    - { from: save, to: end }
+flow.sink:
+  inputs:
+    text: { type: string }
+  outputs: {}
+  nodes:
+    inner:
+      map:
+        over: "state.tasks"
+        node: flow.leaf
+        max_concurrency: 2
+        input: { text: "item" }
+    record:
+      map:
+        over: "state.tasks"
+        node: agent.sink
+        max_concurrency: 2
+        input: { text: "item" }
+  edges:
+    - { from: start, to: inner }
+    - { from: inner, to: record }
+    - { from: record, to: end }
+flow.f:
+  outputs: {}
+  nodes:
+    fan:
+      map:
+        over: "state.tasks"
+        node: flow.sink
+        detach: true
+        max_concurrency: 2
+        input: { text: "item" }
+  edges:
+    - { from: start, to: fan }
+    - { from: fan, to: end }
+"#,
+    );
+}
+
 /// An agent may attach both a store and tools; what grammar 11.5 refuses is a
 /// synthesized name that collides with an attached one, and none of these do —
 /// including `prefs_search`, which a `kv` store does not synthesize, and

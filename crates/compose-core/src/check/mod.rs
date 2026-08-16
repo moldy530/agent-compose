@@ -159,6 +159,7 @@ pub(crate) struct Ctx<'a> {
     pub(crate) ir: &'a Ir,
     diagnostics: Diagnostics,
     channels: BTreeMap<&'a str, &'a Channel>,
+    detached: BTreeMap<String, Vec<reach::Detached<'a>>>,
 }
 
 impl<'a> Ctx<'a> {
@@ -174,6 +175,10 @@ impl<'a> Ctx<'a> {
             ir,
             diagnostics: Diagnostics::new(),
             channels,
+            // Two rules ask which instances run inside a detached dispatch, and
+            // one of them asks once per dispatch site, so the walk runs once
+            // (grammar 8.6 rule 7).
+            detached: reach::detached_instances(ir),
         }
     }
 
@@ -243,10 +248,23 @@ impl<'a> Ctx<'a> {
 
     /// The flow definition at this address, by its `flow.<name>` string.
     pub(crate) fn flow_named(&self, address: &str) -> Option<&'a Flow> {
-        match self.ir.definitions.get(address).map(|d| &d.body) {
-            Some(DefinitionBody::Flow(flow)) => Some(flow),
-            _ => None,
-        }
+        reach::flow_at(self.ir, address)
+    }
+
+    // --- detachment ------------------------------------------------------
+
+    /// The detached dispatches an instance of this flow runs inside, if any
+    /// (grammar 8.6 rule 7, Decision D94).
+    pub(crate) fn detached(&self, address: &str) -> &[reach::Detached<'a>] {
+        self.detached
+            .get(address)
+            .map_or(&[][..], std::vec::Vec::as_slice)
+    }
+
+    /// Every detached instance in the composition. Owned, because the rule that
+    /// reads it reports as it walks.
+    pub(crate) fn detached_instances(&self) -> Vec<reach::Detached<'a>> {
+        self.detached.values().flatten().cloned().collect()
     }
 
     // --- state -----------------------------------------------------------

@@ -1,0 +1,63 @@
+# rule: a `map` inside a detached instance writes nothing at its own dispatch site either (grammar 8.6 rule 7, Decision D94)
+# code: detached-write
+# message: the map `fan` of `flow.f` detaches `flow.sink`, whose node `inner` writes the channel `note`
+# at: main.yml:43:7
+# label: main.yml:58:17 the dispatch is detached here
+# help: a detached dispatch is resolved at dispatch: the join is over the moment it is issued and its outcome is never observed, so what it wrote would land — or not — after everything that reads it (grammar 8.6 rule 7, Decisions D31, D94); drop `detach: true`, or send the result out through the target itself
+#
+# The other half of the same reach: the writer here is not a node of a
+# dispatched flow but the fan-out itself — `agent.worker`'s `note` lands in the
+# channel of that name at the map node `inner`, which runs inside an instance
+# resolved at dispatch. `inner` declares no `detach:` of its own, and the
+# reduced channel it writes would be legal at any site the join waits for.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+state:
+  tasks:
+    type: array
+    max_items: 9
+    items: { type: string }
+  note:
+    type: array
+    max_items: 9
+    items: { type: string }
+    reduce: append
+agent.worker:
+  model: model.m
+  prompt: Work.
+  input:
+    text: { type: string }
+  output:
+    note: { type: string }
+flow.sink:
+  inputs:
+    text: { type: string }
+  outputs: {}
+  nodes:
+    inner:
+      map:
+        over: "state.tasks"
+        node: agent.worker
+        max_concurrency: 2
+        input: { text: "item" }
+  edges:
+    - { from: start, to: inner }
+    - { from: inner, to: end }
+flow.f:
+  outputs: {}
+  nodes:
+    fan:
+      map:
+        over: "state.tasks"
+        node: flow.sink
+        detach: true
+        max_concurrency: 2
+        input: { text: "item" }
+  edges:
+    - { from: start, to: fan }
+    - { from: fan, to: end }

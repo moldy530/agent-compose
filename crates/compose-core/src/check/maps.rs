@@ -377,6 +377,12 @@ fn dispatch<'a>(
                     );
                 }
             }
+            // A dispatch issued from inside a detached instance is fire-and-
+            // forget too, whatever this map says: rule 7 refuses these writes
+            // over the instance that carries them
+            // ([`check_dispatched_writes`]), so rule 5's verdict on the same
+            // write is not added on top of it.
+            None if !ctx.detached(cx.address).is_empty() => {}
             None => channels::check_types(ctx, output, &written, subject, true),
         }
     }
@@ -655,7 +661,38 @@ fn resolve(
 /// channel, however deep inside the instance the writer is (grammar 8.6
 /// rule 5) — and a **detached** instance may write nothing at all (rule 7).
 pub(crate) fn check_dispatched_writes(ctx: &mut Ctx) {
+    // Rule 7 first. A detached instance is resolved at dispatch, so every write
+    // it makes lands after the join it was counted in — and that is as true of
+    // the instances it dispatches in turn as of its own nodes, which is why the
+    // relation it is quantified over is `detached_instances` rather than a
+    // dispatch site's frames (Decision D94).
+    for instance in ctx.detached_instances() {
+        for node in &instance.flow.nodes {
+            for write in writes_of(ctx, node) {
+                detached_write(
+                    ctx,
+                    &instance.detach,
+                    &node.span,
+                    write.channel,
+                    format!(
+                        "{} detaches `{}`, whose node `{}` writes the channel `{}`",
+                        instance.dispatcher,
+                        instance.address,
+                        text(&node.id),
+                        text(&write.channel.name)
+                    ),
+                );
+            }
+        }
+    }
+
+    // Rule 5, over every site that is not one of those: a write rule 7 has
+    // already refused is not also reported as unreduced, because an instance
+    // rule 7 speaks about may write nothing at all — reduced or not.
     for frame in reach::frames(ctx) {
+        if frame.detached || !ctx.detached(frame.owner).is_empty() {
+            continue;
+        }
         for node in &frame.flow.nodes {
             let Some(output) = ctx.node_output(node) else {
                 continue;
@@ -664,22 +701,6 @@ pub(crate) fn check_dispatched_writes(ctx: &mut Ctx) {
             // the node is checked as part of its own flow.
             let written = channels::effective(ctx, &output, node.writes.as_ref(), &node.span);
             for write in &written {
-                if let Some(detach) = &frame.detached {
-                    detached_write(
-                        ctx,
-                        detach,
-                        &node.span,
-                        write.channel,
-                        format!(
-                            "{} detaches `{}`, whose node `{}` writes the channel `{}`",
-                            frame.dispatcher,
-                            frame.address,
-                            text(&node.id),
-                            text(&write.channel.name)
-                        ),
-                    );
-                    continue;
-                }
                 if write.channel.reduce.is_none() {
                     ctx.push(
                         Diagnostic::error(
@@ -703,4 +724,38 @@ pub(crate) fn check_dispatched_writes(ctx: &mut Ctx) {
             }
         }
     }
+}
+
+/// Every channel one node of a flow writes: its own result mapped onto the
+/// channels (grammar 8.0), and — for a `map` node, which has no result of its
+/// own (rule 9) — what each of its dispatch targets writes at the dispatch
+/// site.
+///
+/// Silent, like [`channels::effective`]: a remap's own mistakes are reported
+/// where the node is checked as part of its own flow. A dispatch that wrote
+/// `detach: true` itself is left out, because [`dispatch`] reports what it
+/// writes at that dispatch, in the message that names it.
+fn writes_of<'a>(ctx: &Ctx<'a>, node: &'a Node) -> Vec<channels::Written<'a>> {
+    if let crate::ir::flow::NodeKind::Map { map } = &node.kind {
+        let mut written = Vec::new();
+        for dispatch in reach::dispatches(&map.dispatch) {
+            if dispatch.is_detached() {
+                continue;
+            }
+            let Some(output) = ctx.target_output(dispatch.target) else {
+                continue;
+            };
+            written.extend(channels::effective(
+                ctx,
+                output,
+                dispatch.writes,
+                &node.span,
+            ));
+        }
+        return written;
+    }
+    let Some(output) = ctx.node_output(node) else {
+        return Vec::new();
+    };
+    channels::effective(ctx, &output, node.writes.as_ref(), &node.span)
 }

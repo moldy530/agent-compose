@@ -1,0 +1,71 @@
+# rule: detachment is a property of a dispatch, not of the flow it dispatches (grammar 8.6 rules 5, 7)
+# code: unreduced-write
+# message: the map `join` of `flow.b` dispatches `flow.leaf`, whose node `n` writes the unreduced channel `tally`
+# at: main.yml:42:7
+# label: main.yml:27:3 the channel is declared here
+# count: 2
+#
+# `flow.leaf` is dispatched twice: `flow.a` detaches it and `flow.b` joins it.
+# Rule 7 refuses the write at the detached site and stays out of the way of
+# rule 5 there — an instance resolved at dispatch may write nothing at all, so
+# whether the channel it wrote is reduced is not the mistake to report. At the
+# *joined* site the same write is an ordinary concurrent-writer violation, and
+# silencing it because some other dispatch of the same flow is detached would
+# lose it: the two diagnostics this fixture expects are one per site.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+state:
+  tasks:
+    type: array
+    max_items: 9
+    items: { type: string }
+  tally:
+    type: string
+agent.worker:
+  model: model.m
+  prompt: Work.
+  input:
+    text: { type: string }
+  output:
+    tally: { type: string }
+flow.leaf:
+  inputs:
+    text: { type: string }
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.worker
+      input: { text: "input.text" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }
+flow.a:
+  outputs: {}
+  nodes:
+    fan:
+      map:
+        over: "state.tasks"
+        node: flow.leaf
+        detach: true
+        max_concurrency: 2
+        input: { text: "item" }
+  edges:
+    - { from: start, to: fan }
+    - { from: fan, to: end }
+flow.b:
+  outputs: {}
+  nodes:
+    join:
+      map:
+        over: "state.tasks"
+        node: flow.leaf
+        max_concurrency: 2
+        input: { text: "item" }
+  edges:
+    - { from: start, to: join }
+    - { from: join, to: end }
