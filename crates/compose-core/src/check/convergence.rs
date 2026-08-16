@@ -77,6 +77,19 @@
 //! branches could not really both write. Declaring the policy is the cost, and
 //! D32 already holds that a declared overwrite beats a silent race.
 //!
+//! **One diagnostic per channel, not per pair of writers that race it.** A fan
+//! of *w* branches each writing one unreduced channel holds w(w-1)/2 racing
+//! pairs and exactly one mistake — the missing `reduce:` on that one
+//! declaration — so a report of the cross is a report of the same edit w(w-1)/2
+//! times over: 190 errors at twenty branches, 7,140 at a hundred and twenty.
+//! The channel is what the diagnostic is about and what the fix touches, so the
+//! channel is what it is reported per, named through the first two nodes in
+//! declaration order that race it — the same policy the balanced-convergence
+//! rule states above for its own quadratic, and the same reason (PRD G3).
+//! Choosing that pair by declaration order rather than by which fork the walk
+//! reached first is what keeps the choice stable: adding an unrelated fork
+//! elsewhere in the flow moves no diagnostic.
+//!
 //! # What a pair costs
 //!
 //! Both rules are stated over pairs, and a fork of *w* out-edges has w(w-1)/2 of
@@ -118,7 +131,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ::cel::Program;
 
-use crate::diag::{Diagnostic, DiagnosticCode};
+use crate::diag::{Diagnostic, DiagnosticCode, Span};
+use crate::ir::Channel;
 use crate::ir::flow::{MapDispatch, Node, NodeKind};
 use crate::ir::schema::TypeForm;
 
@@ -401,6 +415,9 @@ fn concurrent<'a>(ctx: &mut Ctx<'a>, cx: &FlowCx<'a>, graph: &Graph<'a>, pairs: 
     };
     let mut held: BTreeMap<usize, Branch> = BTreeMap::new();
     let mut crossed: BTreeSet<(usize, usize)> = BTreeSet::new();
+    // One entry per raced channel rather than per racing pair: the fix is the
+    // `reduce:` on that one declaration, and the pairs are w(w-1)/2 of them.
+    let mut raced: BTreeMap<&'a str, Race<'a>> = BTreeMap::new();
     // One bit per ordered pair of *writers*, so a pair is decided once for the
     // whole flow however many forks separate it.
     let mut examined = vec![0u64; writers.count() * writers.words()];
@@ -443,10 +460,13 @@ fn concurrent<'a>(ctx: &mut Ctx<'a>, cx: &FlowCx<'a>, graph: &Graph<'a>, pairs: 
                     {
                         continue;
                     }
-                    races(ctx, cx, graph, &writers, one, other);
+                    races(&mut raced, &writers, one, other);
                 }
             }
         }
+    }
+    for (name, race) in raced {
+        report(ctx, cx, graph, &writers, name, &race);
     }
 }
 
@@ -534,44 +554,85 @@ struct Branch {
     mask: Vec<u64>,
 }
 
-/// The channels two concurrent nodes both write with no `reduce:` policy.
+/// The pair of writers one raced channel is reported through.
+struct Race<'a> {
+    /// The two of them, ascending by node — the order the message names them
+    /// in ([`Writers::order`]).
+    writers: (usize, usize),
+    /// Where each write is: the `writes:` entry that makes it, or the node
+    /// itself for a name-based one ([`Written::at`]), in the same order.
+    sites: (Span, Span),
+    /// The channel they both write.
+    channel: &'a Channel,
+}
+
+/// Record the channels two concurrent nodes both write with no `reduce:`
+/// policy.
+///
+/// A channel is kept once, through the racing pair whose nodes come first in
+/// declaration order: a fan of *w* branches writing it races w(w-1)/2 ways and
+/// is one missing `reduce:` (see this module's header). The rest of the cross is
+/// still walked — every pair has to be *decided* to know the channel is raced at
+/// all — and what the count bounds is the report.
 fn races<'a>(
-    ctx: &mut Ctx<'a>,
-    cx: &FlowCx<'a>,
-    graph: &Graph<'a>,
+    raced: &mut BTreeMap<&'a str, Race<'a>>,
     writers: &Writers<'a>,
     one: usize,
     other: usize,
 ) {
-    let mut seen: BTreeSet<&str> = BTreeSet::new();
     for first in writers.writes(one) {
         for second in writers.writes(other) {
             let name = first.channel.name.value.as_str();
             if second.channel.name.value.as_str() != name || first.channel.reduce.is_some() {
                 continue;
             }
-            if !seen.insert(name) {
+            let earlier = raced.get(name).is_none_or(|best| {
+                (writers.node(one), writers.node(other))
+                    < (writers.node(best.writers.0), writers.node(best.writers.1))
+            });
+            if !earlier {
                 continue;
             }
-            ctx.push(
-                Diagnostic::error(
-                    DiagnosticCode::UnreducedWrite,
-                    second.at.clone(),
-                    format!(
-                        "nodes `{}` and `{}` of `{}` run concurrently and both write the unreduced channel `{name}`",
-                        graph.id(writers.node(one)),
-                        graph.id(writers.node(other)),
-                        cx.address
-                    ),
-                )
-                .with_label(first.at.clone(), "the other write is here")
-                .with_label(first.channel.span.clone(), "the channel is declared here")
-                .with_help(
-                    "two edges of one fork that are not provably exclusive can both fire, so the branches they start are concurrent: the channel they both write needs a declared `reduce:` policy — `append`, `merge`, or an explicit `last_wins` (grammar 7.6.1, 10.2, Decision D32)",
-                ),
+            raced.insert(
+                name,
+                Race {
+                    writers: (one, other),
+                    sites: (first.at.clone(), second.at.clone()),
+                    channel: first.channel,
+                },
             );
         }
     }
+}
+
+/// The one diagnostic a raced channel gets (grammar 7.6.1, 10.2).
+fn report<'a>(
+    ctx: &mut Ctx<'a>,
+    cx: &FlowCx<'a>,
+    graph: &Graph<'a>,
+    writers: &Writers<'a>,
+    name: &str,
+    race: &Race<'a>,
+) {
+    let (one, other) = race.writers;
+    let (first, second) = &race.sites;
+    ctx.push(
+        Diagnostic::error(
+            DiagnosticCode::UnreducedWrite,
+            second.clone(),
+            format!(
+                "nodes `{}` and `{}` of `{}` run concurrently and both write the unreduced channel `{name}`",
+                graph.id(writers.node(one)),
+                graph.id(writers.node(other)),
+                cx.address
+            ),
+        )
+        .with_label(first.clone(), "the other write is here")
+        .with_label(race.channel.span.clone(), "the channel is declared here")
+        .with_help(
+            "two edges of one fork that are not provably exclusive can both fire, so the branches they start are concurrent: the channel they both write needs a declared `reduce:` policy — `append`, `merge`, or an explicit `last_wins` (grammar 7.6.1, 10.2, Decision D32)",
+        ),
+    );
 }
 
 /// Every channel one node writes: its effective write map, or — for a `map`

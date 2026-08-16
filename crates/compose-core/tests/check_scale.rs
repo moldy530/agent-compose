@@ -11,11 +11,15 @@
 //!   documents, and not something `--format json` can report;
 //! * **out-degree** — a per-*pair* analysis of a fork is quadratic in the number
 //!   of edges before it computes anything, so anything it recomputes per pair
-//!   multiplies out. Two shapes are needed, because a fork has two costs: one
+//!   multiplies out. Three shapes are needed, because a fork has three costs: one
 //!   fan of disjoint branches, where the pairs share no answers and what matters
-//!   is that nothing is *walked* per pair, and one of overlapping branches, where
+//!   is that nothing is *walked* per pair; one of overlapping branches, where
 //!   the pairs share almost every answer and what matters is that nothing is
-//!   *compared* or *crossed* per pair;
+//!   *compared* or *crossed* per pair; and one whose branches are **illegal** —
+//!   every one of them writing the same unreduced channel — where what matters is
+//!   that the report is one diagnostic and not one per pair. The first two are
+//!   clean compositions, so they time the analysis with its diagnostic path
+//!   switched off, and a report quadratic in the out-degree is invisible to them;
 //! * **path count** — a branch's step distances (grammar 7.6.2) are a property
 //!   of its paths, of which a graph of *n* nodes has exponentially many and a
 //!   node may be reached at *n* distinct depths. Neither fork shape above shows
@@ -309,15 +313,21 @@ fn skipping_chain_project(dir: &Path, length: usize) {
 /// The minimum of three checks of one artifact, so a scheduling hiccup cannot
 /// fail a test about an algorithm. Resolution is off the clock deliberately:
 /// these are bounds on the graph analyses, not on the parser.
-fn fastest_check(ir: &compose_core::Ir, what: &str) -> Duration {
+///
+/// How many diagnostics come back is part of the measurement rather than a
+/// separate assertion. Most shapes here are legal and report nothing, so the
+/// clock is on the analysis alone; the one that is *not* legal is timed with the
+/// report it is supposed to produce, because a rule whose cost is what it prints
+/// is only bounded if the print is (PRD G3).
+fn fastest_check(ir: &compose_core::Ir, what: &str, reported: usize) -> Duration {
     let fastest = (0..3)
         .map(|_| {
             let started = Instant::now();
             let diagnostics = compose_core::check(ir);
-            assert!(
-                diagnostics.is_empty(),
-                "{what} checks cleanly, got {} diagnostic(s): {:?}",
+            assert_eq!(
                 diagnostics.len(),
+                reported,
+                "{what} reports {reported} diagnostic(s), first was {:?}",
                 diagnostics.first().map(|d| d.message.clone())
             );
             started.elapsed()
@@ -357,7 +367,7 @@ fn a_wide_fork_is_checked_in_proportion_to_its_pairs() {
     let dir = scratch("wide");
     wide_fork_project(&dir, 240);
     let budget = Duration::from_secs(6);
-    let fastest = fastest_check(&artifact(&dir), "240-branch fork");
+    let fastest = fastest_check(&artifact(&dir), "240-branch fork", 0);
     assert!(
         fastest < budget,
         "checking a 240-branch fork took {fastest:?}, and the budget is {budget:?}"
@@ -384,7 +394,7 @@ fn overlapping_branches_are_checked_in_proportion_to_their_writers() {
     let dir = scratch("layered");
     layered_project(&dir, 5, 50);
     let budget = Duration::from_secs(6);
-    let fastest = fastest_check(&artifact(&dir), "5x50 layered fan-out");
+    let fastest = fastest_check(&artifact(&dir), "5x50 layered fan-out", 0);
     assert!(
         fastest < budget,
         "checking a 5-by-50 layered fan-out took {fastest:?}, and the budget is {budget:?}"
@@ -407,9 +417,80 @@ fn multi_valued_distances_are_checked_in_proportion_to_the_nodes() {
     let dir = scratch("skipping");
     skipping_chain_project(&dir, 600);
     let budget = Duration::from_secs(6);
-    let fastest = fastest_check(&artifact(&dir), "600-node skipping chain");
+    let fastest = fastest_check(&artifact(&dir), "600-node skipping chain", 0);
     assert!(
         fastest < budget,
         "checking a 600-node skipping chain took {fastest:?}, and the budget is {budget:?}"
+    );
+}
+
+/// The one backend here whose channel carries **no** `reduce:`, so that every
+/// node writing it by name (grammar 8.0) races every other one.
+///
+/// `BACKEND` declares `last_wins` deliberately — it keeps the shapes above legal
+/// while their branches all write — and that is exactly what switches grammar
+/// 10.2's diagnostic off. This one switches it on.
+const RACED: &str = r#"provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.n:
+  model: model.m
+  prompt: Note.
+  output:
+    note: { type: string }
+state:
+  note: { type: string, default: "" }
+"#;
+
+/// `width` branches straight off `start`, each one node writing the unreduced
+/// channel `note`, each straight to `end`.
+///
+/// `start` is a fork like any other vertex (grammar 7.3 rule 7, 7.6 step 0), so
+/// its unguarded edges are co-takeable in pairs: `width * (width - 1) / 2` pairs,
+/// every one of them a racing pair of writers, and one missing keyword.
+fn racing_fork_project(dir: &Path, width: usize) {
+    let mut nodes = String::new();
+    let mut edges = String::new();
+    for at in 0..width {
+        nodes.push_str(&format!(
+            "    n{at}: {{ agent: agent.n, input: \"'x'\" }}\n"
+        ));
+        edges.push_str(&format!("    - {{ from: start, to: n{at} }}\n"));
+        edges.push_str(&format!("    - {{ from: n{at}, to: end }}\n"));
+    }
+    fs::write(
+        dir.join("main.yml"),
+        format!(
+            "version: \"0.1\"\n{RACED}flow.f:\n  outputs: {{}}\n  nodes:\n{nodes}  edges:\n{edges}"
+        ),
+    )
+    .expect("can write the entrypoint");
+}
+
+/// A fan of branches that all race one channel, which is where anything
+/// **reported** per pair shows.
+///
+/// 120 branches are 7,140 co-takeable pairs, 7,140 racing pairs of writers — and
+/// one mistake: the missing `reduce:` on the one channel they all write. A
+/// diagnostic per pair made that a 7,140-error report taking 1.4 s, against 190
+/// errors at twenty branches and 45 at ten — an ordinary fan of parallel steps
+/// turning one missing keyword into a wall of errors nobody can read (PRD G3),
+/// on a rule whose analysis is fine. Neither shape above can see it: both declare
+/// `reduce: last_wins`, so both cross the same quadratic with nothing to say
+/// about it. The count is the assertion here and the clock is the corroboration —
+/// a report that grows with the pairs cannot stay inside a budget this shape
+/// answers in milliseconds.
+#[test]
+fn a_fan_racing_one_channel_is_one_diagnostic() {
+    let dir = scratch("racing");
+    racing_fork_project(&dir, 120);
+    let budget = Duration::from_secs(6);
+    let fastest = fastest_check(&artifact(&dir), "120-branch fan racing one channel", 1);
+    assert!(
+        fastest < budget,
+        "checking a 120-branch racing fan took {fastest:?}, and the budget is {budget:?}"
     );
 }
