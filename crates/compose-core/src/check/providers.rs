@@ -446,7 +446,7 @@ mod tests {
     /// over the table rather than left as a remark: every kind publishes the
     /// same pair of inference capabilities, so every route is equivalent by
     /// construction and no legal spec can reach that diagnostic. It is the
-    /// evidence `tests/m0_inventory.rs` carries for that rule in place of a
+    /// evidence `tests/static_check_inventory.rs` carries for that rule in place of a
     /// negative fixture, and the day a kind arrives that lacks one of the two,
     /// this test fails and the fixture becomes writable (grammar 12.2).
     #[test]

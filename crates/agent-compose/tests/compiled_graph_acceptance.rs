@@ -6,7 +6,7 @@
 //! begins**. This file is that definition. Each test names one thing PRD §7 M1
 //! promises, in terms of what a compiled graph does when it runs — what it sends
 //! to the provider, what it writes to state, what it prints — rather than in
-//! terms of the TypeScript it is made of. `tests/m1_inventory.rs` is the map from
+//! terms of the TypeScript it is made of. `tests/acceptance_inventory.rs` is the map from
 //! the PRD's own phrases to these test names, and it fails if either side moves.
 //!
 //! # Live and pending
@@ -18,7 +18,7 @@
 //!   real, because PRD §7 M1's third bullet ("Mock provider server + e2e
 //!   harness") is what this PR delivers.
 //! * **Pending** — everything whose subject is codegen. Each carries
-//!   `#[ignore = "M1: …"]` naming what must land first, and each has a **real
+//!   `#[ignore = "pending: …"]` naming what must land first, and each has a **real
 //!   body** written against the harness: build the fixture, run it against the
 //!   mock, assert the transcript and the output. Nothing is stubbed, so
 //!   **un-ignoring is the definition of done** — a codegen PR removes the
@@ -67,7 +67,7 @@
 // harness beside the suite it serves instead of loose in `tests/`, where cargo
 // would not build it as a target but a reader would have to guess what it is
 // for.
-#[path = "m1_acceptance/harness.rs"]
+#[path = "compiled_graph_acceptance/harness.rs"]
 mod harness;
 
 use std::collections::BTreeSet;
@@ -522,7 +522,7 @@ fn a_scripted_delay_makes_completion_order_differ_from_item_order() {
 /// the only thing that can produce them is the declaration: an `integer`
 /// default, and an `append` channel's identity element (grammar 10.1).
 #[test]
-#[ignore = "M1: `agent-compose build` must emit the state model, and `run` must execute it"]
+#[ignore = "pending: `agent-compose build` must emit the state model, and `run` must execute it"]
 fn state_channels_carry_their_declared_types_and_defaults() {
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue(Script::new(
@@ -559,7 +559,7 @@ fn state_channels_carry_their_declared_types_and_defaults() {
 /// A tagged-union output is narrowed per variant, and a response carrying a tag
 /// the schema does not declare is rejected before any edge is evaluated.
 #[test]
-#[ignore = "M1: codegen must emit Zod discriminated unions for tagged-union outputs"]
+#[ignore = "pending: codegen must emit Zod discriminated unions for tagged-union outputs"]
 fn a_tagged_union_output_is_narrowed_per_variant_and_a_bad_tag_is_rejected() {
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue_all([
@@ -602,7 +602,7 @@ fn a_tagged_union_output_is_narrowed_per_variant_and_a_bad_tag_is_rejected() {
 /// output tool and leave another one callable, so no single test can assert
 /// both.
 #[test]
-#[ignore = "M1: codegen must emit agent node fns"]
+#[ignore = "pending: codegen must emit agent node fns"]
 fn an_agent_node_sends_its_prompt_input_and_output_schema() {
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue(Script::new(
@@ -665,7 +665,7 @@ fn an_agent_node_sends_its_prompt_input_and_output_schema() {
 /// codegen bug that no Messages-API test can see, and three of grammar 12.1's
 /// six kinds reach this surface.
 #[test]
-#[ignore = "M1: codegen must emit agent node fns"]
+#[ignore = "pending: codegen must emit agent node fns"]
 fn an_agent_node_sends_its_prompt_input_and_output_schema_on_chat_completions() {
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue(Script::new(
@@ -740,7 +740,7 @@ fn an_agent_node_sends_its_prompt_input_and_output_schema_on_chat_completions() 
 /// makes the bound a runtime default rather than a declared one, and rewrites
 /// this test's fixture and its first assertion, not its subject.
 #[test]
-#[ignore = "M1: codegen must emit the agent tool loop"]
+#[ignore = "pending: codegen must emit the agent tool loop"]
 fn an_agent_node_bounds_its_tool_loop_at_max_tool_iterations() {
     let provider = MockProvider::start().expect("a loopback port");
     // `agent.researcher` declares `max_tool_iterations: 2`, so a model that only
@@ -791,7 +791,7 @@ fn an_agent_node_bounds_its_tool_loop_at_max_tool_iterations() {
 /// A subgraph runs with explicit bindings in, name-based outputs back, and a
 /// conversation history of its own.
 #[test]
-#[ignore = "M1: codegen must emit subgraphs"]
+#[ignore = "pending: codegen must emit subgraphs"]
 fn a_subgraph_runs_with_explicit_bindings_and_isolated_history() {
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue_all([
@@ -833,7 +833,7 @@ fn a_subgraph_runs_with_explicit_bindings_and_isolated_history() {
 /// An edge guard routes on the source node's structured output, deterministically
 /// (PRD 5.3).
 #[test]
-#[ignore = "M1: codegen must emit routers with embedded CEL"]
+#[ignore = "pending: codegen must emit routers with embedded CEL"]
 fn an_edge_guard_routes_on_the_source_nodes_structured_output() {
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue_all([
@@ -872,7 +872,7 @@ fn an_edge_guard_routes_on_the_source_nodes_structured_output() {
 /// the corpus is the mitigation. The Rust side already runs in
 /// `crates/compose-core/tests/cel_conformance.rs`; this is the other half.
 #[test]
-#[ignore = "M1: generated routers must embed a JS CEL evaluator"]
+#[ignore = "pending: generated routers must embed a JS CEL evaluator"]
 fn the_generated_cel_evaluator_agrees_with_the_validator_on_the_conformance_corpus() {
     let built = harness::build("bounded-cycle", "local");
     built.succeeded();
@@ -931,7 +931,7 @@ process.stdout.write(JSON.stringify(divergences));
 /// A bounded cycle stops at its budget and leaves through the escape edge, rather
 /// than looping (PRD 5.4).
 #[test]
-#[ignore = "M1: codegen must emit the per-cycle iteration counter"]
+#[ignore = "pending: codegen must emit the per-cycle iteration counter"]
 fn a_bounded_cycle_leaves_through_its_escape_edge_when_the_budget_is_spent() {
     let provider = MockProvider::start().expect("a loopback port");
     // A model that never approves: only `max_iterations: 3` can end this run.
@@ -974,7 +974,7 @@ fn a_bounded_cycle_leaves_through_its_escape_edge_when_the_budget_is_spent() {
 /// A homogeneous map dispatches one instance per item, bounded by
 /// `max_concurrency`, and joins before the downstream edge fires.
 #[test]
-#[ignore = "M1: codegen must emit `map` as LangGraph `Send`"]
+#[ignore = "pending: codegen must emit `map` as LangGraph `Send`"]
 fn a_homogeneous_map_dispatches_one_instance_per_item() {
     let provider = MockProvider::start().expect("a loopback port");
     let tasks: Vec<Value> = (0..3)
@@ -1013,7 +1013,7 @@ fn a_homogeneous_map_dispatches_one_instance_per_item() {
 /// A discriminator-routed map sends each item to its own route, narrowed to that
 /// variant's payload (PRD 5.6).
 #[test]
-#[ignore = "M1: codegen must emit discriminator-routed `map` dispatch"]
+#[ignore = "pending: codegen must emit discriminator-routed `map` dispatch"]
 fn a_routed_map_sends_each_variant_to_its_own_route() {
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue_all([
@@ -1063,7 +1063,7 @@ fn a_routed_map_sends_each_variant_to_its_own_route() {
 /// Appended results are ordered by source-item index, whatever order the
 /// instances complete in (PRD 5.6's replay guarantee).
 #[test]
-#[ignore = "M1: codegen must emit index-tagged reducers"]
+#[ignore = "pending: codegen must emit index-tagged reducers"]
 fn appended_results_are_ordered_by_source_item_index() {
     let provider = MockProvider::start().expect("a loopback port");
     let tasks: Vec<Value> = (0..3)
@@ -1099,7 +1099,7 @@ fn appended_results_are_ordered_by_source_item_index() {
 /// A node retries its model call per its declared policy, and the retries are
 /// visible as repeated calls.
 #[test]
-#[ignore = "M1: codegen must emit retry policy"]
+#[ignore = "pending: codegen must emit retry policy"]
 fn a_node_retries_its_model_call_per_its_declared_policy() {
     let provider = MockProvider::start().expect("a loopback port");
     // `write` declares `retry: { max: 2, backoff: 1s }`: one attempt plus two
@@ -1132,7 +1132,7 @@ fn a_node_retries_its_model_call_per_its_declared_policy() {
 /// A node timeout fires on a provider that never answers, and the node's error
 /// policy takes over from there.
 #[test]
-#[ignore = "M1: codegen must emit timeout policy"]
+#[ignore = "pending: codegen must emit timeout policy"]
 fn a_node_timeout_fires_and_its_error_policy_takes_over() {
     let provider = MockProvider::start().expect("a loopback port");
     // `review` declares `timeout: 10s`; the scripted provider never answers, and
@@ -1169,7 +1169,7 @@ fn a_node_timeout_fires_and_its_error_policy_takes_over() {
 /// inside the same flow (`reread`) and materializes both halves of that read as
 /// flow outputs — the miss before the write and the hit after it.
 #[test]
-#[ignore = "M1: codegen must emit store-op nodes over the SQLite/local-disk backends"]
+#[ignore = "pending: codegen must emit store-op nodes over the SQLite/local-disk backends"]
 fn a_store_op_node_reads_and_writes_the_local_backend() {
     let provider = MockProvider::start().expect("a loopback port");
     // `agent.grounded` has stores attached, so its tools open a loop: the first
@@ -1228,7 +1228,7 @@ fn a_store_op_node_reads_and_writes_the_local_backend() {
 /// tools, so they open the same loop an agent's `tools:` list does, and the
 /// pinned output call that ends it is a different request.
 #[test]
-#[ignore = "M1: codegen must synthesize store tools"]
+#[ignore = "pending: codegen must synthesize store tools"]
 fn an_attached_store_synthesizes_its_tool_surface_in_the_model_request() {
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue_all([
@@ -1272,7 +1272,7 @@ fn an_attached_store_synthesizes_its_tool_surface_in_the_model_request() {
 /// what survives either way is the criterion the inventory names, which is that
 /// an attached store synthesizes a tool surface at all.
 #[test]
-#[ignore = "M1: codegen must synthesize store tools"]
+#[ignore = "pending: codegen must synthesize store tools"]
 fn agent_access_read_withholds_the_write_tool() {
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue_all([
@@ -1307,7 +1307,7 @@ fn agent_access_read_withholds_the_write_tool() {
 /// A route fails over to its next member on a declared condition, and the trace
 /// records that it did (PRD 5.9).
 #[test]
-#[ignore = "M1: codegen must emit model routing with trace-recorded failover"]
+#[ignore = "pending: codegen must emit model routing with trace-recorded failover"]
 fn a_route_fails_over_to_its_next_member_and_the_trace_records_it() {
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue_all([
@@ -1343,7 +1343,7 @@ fn a_route_fails_over_to_its_next_member_and_the_trace_records_it() {
 /// A failure condition outside `route_on:` fails the node instead of failing
 /// over — otherwise the declaration would mean nothing.
 #[test]
-#[ignore = "M1: codegen must emit model routing with trace-recorded failover"]
+#[ignore = "pending: codegen must emit model routing with trace-recorded failover"]
 fn a_condition_outside_route_on_fails_the_node_instead_of_failing_over() {
     let provider = MockProvider::start().expect("a loopback port");
     // `model.default` routes on rate_limit, overloaded, and timeout — not on
@@ -1372,7 +1372,7 @@ fn a_condition_outside_route_on_fails_the_node_instead_of_failing_over() {
 /// first model call, and never with a key baked into the generated code
 /// (PRD 5.9).
 #[test]
-#[ignore = "M1: generated code must check env-ref presence at process start"]
+#[ignore = "pending: generated code must check env-ref presence at process start"]
 fn a_missing_env_ref_fails_at_process_start_naming_the_variable() {
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue(Script::new(SONNET, Outcome::text("never reached")));
@@ -1405,7 +1405,7 @@ fn a_missing_env_ref_fails_at_process_start_naming_the_variable() {
 
 /// `agent-compose build` writes a TypeScript project for the selected target.
 #[test]
-#[ignore = "M1: `agent-compose build` must exist"]
+#[ignore = "pending: `agent-compose build` must exist"]
 fn build_writes_a_typescript_project_for_the_target() {
     for name in harness::FIXTURES {
         let built = harness::build(name, "local");
@@ -1441,7 +1441,7 @@ fn build_writes_a_typescript_project_for_the_target() {
 /// makes those goldens *mean* anything is the determinism asserted here, because
 /// a regeneration diff is only signal if identical input regenerates identically.
 #[test]
-#[ignore = "M1: `agent-compose build` must exist"]
+#[ignore = "pending: `agent-compose build` must exist"]
 fn build_is_byte_identical_for_byte_identical_input() {
     for name in harness::FIXTURES {
         let first = harness::build(name, "local");
@@ -1466,7 +1466,7 @@ fn build_is_byte_identical_for_byte_identical_input() {
 
 /// `agent-compose run` executes a manual trigger and prints the flow's outputs.
 #[test]
-#[ignore = "M1: `agent-compose run` must exist"]
+#[ignore = "pending: `agent-compose run` must exist"]
 fn run_executes_a_manual_trigger_and_prints_the_flow_outputs() {
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue(Script::new(
@@ -1507,7 +1507,7 @@ fn run_executes_a_manual_trigger_and_prints_the_flow_outputs() {
 /// PRD §7 M1's, while the `human` node runtime the other half needs is scheduled
 /// for M2 (PRD §9, resolved question 4).
 #[test]
-#[ignore = "M1: `agent-compose serve` must exist"]
+#[ignore = "pending: `agent-compose serve` must exist"]
 fn serve_exposes_start_and_status_for_an_http_trigger() {
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue(Script::new(
@@ -1555,7 +1555,7 @@ fn serve_exposes_start_and_status_for_an_http_trigger() {
 /// node runtime, which PRD §9's resolved question 4 puts in M2 — so this is the
 /// one row of the M1 inventory whose blocker is not `serve` itself.
 #[test]
-#[ignore = "M1: `agent-compose serve` must exist, and the `human` node runtime with it"]
+#[ignore = "pending: `agent-compose serve` must exist, and the `human` node runtime with it"]
 fn serve_resumes_an_interrupted_execution_against_the_human_nodes_schema() {
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue(Script::new(
@@ -1609,7 +1609,7 @@ fn serve_resumes_an_interrupted_execution_against_the_human_nodes_schema() {
 /// Every generated project type-checks and constructs its graph under the pinned
 /// LangGraph version (CLAUDE.md, *Generated-code checks*).
 #[test]
-#[ignore = "M1: `agent-compose build` must exist, and the pinned LangGraph toolchain with it"]
+#[ignore = "pending: `agent-compose build` must exist, and the pinned LangGraph toolchain with it"]
 fn every_generated_project_type_checks_and_constructs_its_graph() {
     for name in harness::FIXTURES {
         let built = harness::build(name, "local");

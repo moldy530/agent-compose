@@ -1,7 +1,7 @@
 //! The M1 completion inventory: every criterion PRD §7 M1 promises, mapped to
 //! the acceptance test that decides it and to whether that test runs yet.
 //!
-//! `crates/compose-core/tests/m0_inventory.rs` is the companion for M0, and this
+//! `crates/compose-core/tests/static_check_inventory.rs` is the companion for M0, and this
 //! file is the same idea one milestone on: the PRD's own sentences, transcribed
 //! verbatim and made executable. The difference is what a row points at. M0's
 //! rows point at diagnostic codes, because a static check is a thing the
@@ -30,7 +30,7 @@ struct Criterion {
     bullet: Bullet,
     /// The PRD's own phrase, verbatim.
     phrase: &'static str,
-    /// The tests in `tests/m1_acceptance.rs` that decide it, each with whether
+    /// The tests in `tests/compiled_graph_acceptance.rs` that decide it, each with whether
     /// it runs yet.
     ///
     /// Status is per **test**, not per criterion: one criterion's tests can be
@@ -73,13 +73,13 @@ const CODEGEN: &[Criterion] = &[
             (
                 "state_channels_carry_their_declared_types_and_defaults",
                 Status::Pending(
-                    "M1: `agent-compose build` must emit the state model, and `run` must execute it",
+                    "pending: `agent-compose build` must emit the state model, and `run` must execute it",
                 ),
             ),
             (
                 "a_tagged_union_output_is_narrowed_per_variant_and_a_bad_tag_is_rejected",
                 Status::Pending(
-                    "M1: codegen must emit Zod discriminated unions for tagged-union outputs",
+                    "pending: codegen must emit Zod discriminated unions for tagged-union outputs",
                 ),
             ),
         ],
@@ -90,18 +90,18 @@ const CODEGEN: &[Criterion] = &[
         tests: &[
             (
                 "an_agent_node_sends_its_prompt_input_and_output_schema",
-                Status::Pending("M1: codegen must emit agent node fns"),
+                Status::Pending("pending: codegen must emit agent node fns"),
             ),
             // The same criterion on the other HTTP surface. Three of grammar
             // 12.1's six provider kinds reach Chat Completions, so a node fn
             // that only works on Messages is half a node fn.
             (
                 "an_agent_node_sends_its_prompt_input_and_output_schema_on_chat_completions",
-                Status::Pending("M1: codegen must emit agent node fns"),
+                Status::Pending("pending: codegen must emit agent node fns"),
             ),
             (
                 "an_agent_node_bounds_its_tool_loop_at_max_tool_iterations",
-                Status::Pending("M1: codegen must emit the agent tool loop"),
+                Status::Pending("pending: codegen must emit the agent tool loop"),
             ),
         ],
     },
@@ -110,7 +110,7 @@ const CODEGEN: &[Criterion] = &[
         phrase: "routers with embedded CEL",
         tests: &[(
             "an_edge_guard_routes_on_the_source_nodes_structured_output",
-            Status::Pending("M1: codegen must emit routers with embedded CEL"),
+            Status::Pending("pending: codegen must emit routers with embedded CEL"),
         )],
     },
     Criterion {
@@ -118,7 +118,7 @@ const CODEGEN: &[Criterion] = &[
         phrase: "bounded cycles",
         tests: &[(
             "a_bounded_cycle_leaves_through_its_escape_edge_when_the_budget_is_spent",
-            Status::Pending("M1: codegen must emit the per-cycle iteration counter"),
+            Status::Pending("pending: codegen must emit the per-cycle iteration counter"),
         )],
     },
     Criterion {
@@ -127,15 +127,15 @@ const CODEGEN: &[Criterion] = &[
         tests: &[
             (
                 "a_homogeneous_map_dispatches_one_instance_per_item",
-                Status::Pending("M1: codegen must emit `map` as LangGraph `Send`"),
+                Status::Pending("pending: codegen must emit `map` as LangGraph `Send`"),
             ),
             (
                 "a_routed_map_sends_each_variant_to_its_own_route",
-                Status::Pending("M1: codegen must emit discriminator-routed `map` dispatch"),
+                Status::Pending("pending: codegen must emit discriminator-routed `map` dispatch"),
             ),
             (
                 "appended_results_are_ordered_by_source_item_index",
-                Status::Pending("M1: codegen must emit index-tagged reducers"),
+                Status::Pending("pending: codegen must emit index-tagged reducers"),
             ),
         ],
     },
@@ -144,7 +144,7 @@ const CODEGEN: &[Criterion] = &[
         phrase: "subgraphs",
         tests: &[(
             "a_subgraph_runs_with_explicit_bindings_and_isolated_history",
-            Status::Pending("M1: codegen must emit subgraphs"),
+            Status::Pending("pending: codegen must emit subgraphs"),
         )],
     },
     Criterion {
@@ -153,11 +153,11 @@ const CODEGEN: &[Criterion] = &[
         tests: &[
             (
                 "a_node_retries_its_model_call_per_its_declared_policy",
-                Status::Pending("M1: codegen must emit retry policy"),
+                Status::Pending("pending: codegen must emit retry policy"),
             ),
             (
                 "a_node_timeout_fires_and_its_error_policy_takes_over",
-                Status::Pending("M1: codegen must emit timeout policy"),
+                Status::Pending("pending: codegen must emit timeout policy"),
             ),
         ],
     },
@@ -168,16 +168,16 @@ const CODEGEN: &[Criterion] = &[
             (
                 "a_store_op_node_reads_and_writes_the_local_backend",
                 Status::Pending(
-                    "M1: codegen must emit store-op nodes over the SQLite/local-disk backends",
+                    "pending: codegen must emit store-op nodes over the SQLite/local-disk backends",
                 ),
             ),
             (
                 "an_attached_store_synthesizes_its_tool_surface_in_the_model_request",
-                Status::Pending("M1: codegen must synthesize store tools"),
+                Status::Pending("pending: codegen must synthesize store tools"),
             ),
             (
                 "agent_access_read_withholds_the_write_tool",
-                Status::Pending("M1: codegen must synthesize store tools"),
+                Status::Pending("pending: codegen must synthesize store tools"),
             ),
         ],
     },
@@ -187,11 +187,15 @@ const CODEGEN: &[Criterion] = &[
         tests: &[
             (
                 "a_route_fails_over_to_its_next_member_and_the_trace_records_it",
-                Status::Pending("M1: codegen must emit model routing with trace-recorded failover"),
+                Status::Pending(
+                    "pending: codegen must emit model routing with trace-recorded failover",
+                ),
             ),
             (
                 "a_condition_outside_route_on_fails_the_node_instead_of_failing_over",
-                Status::Pending("M1: codegen must emit model routing with trace-recorded failover"),
+                Status::Pending(
+                    "pending: codegen must emit model routing with trace-recorded failover",
+                ),
             ),
         ],
     },
@@ -200,7 +204,7 @@ const CODEGEN: &[Criterion] = &[
         phrase: "env-ref presence checks at process start",
         tests: &[(
             "a_missing_env_ref_fails_at_process_start_naming_the_variable",
-            Status::Pending("M1: generated code must check env-ref presence at process start"),
+            Status::Pending("pending: generated code must check env-ref presence at process start"),
         )],
     },
 ];
@@ -212,7 +216,7 @@ const COMMANDS: &[Criterion] = &[
         phrase: "`agent-compose build`",
         tests: &[(
             "build_writes_a_typescript_project_for_the_target",
-            Status::Pending("M1: `agent-compose build` must exist"),
+            Status::Pending("pending: `agent-compose build` must exist"),
         )],
     },
     Criterion {
@@ -220,7 +224,7 @@ const COMMANDS: &[Criterion] = &[
         phrase: "`agent-compose run` (manual trigger)",
         tests: &[(
             "run_executes_a_manual_trigger_and_prints_the_flow_outputs",
-            Status::Pending("M1: `agent-compose run` must exist"),
+            Status::Pending("pending: `agent-compose run` must exist"),
         )],
     },
     // Two tests, because the criterion's three verbs do not unlock together.
@@ -238,12 +242,12 @@ const COMMANDS: &[Criterion] = &[
         tests: &[
             (
                 "serve_exposes_start_and_status_for_an_http_trigger",
-                Status::Pending("M1: `agent-compose serve` must exist"),
+                Status::Pending("pending: `agent-compose serve` must exist"),
             ),
             (
                 "serve_resumes_an_interrupted_execution_against_the_human_nodes_schema",
                 Status::Pending(
-                    "M1: `agent-compose serve` must exist, and the `human` node runtime with it",
+                    "pending: `agent-compose serve` must exist, and the `human` node runtime with it",
                 ),
             ),
         ],
@@ -253,7 +257,7 @@ const COMMANDS: &[Criterion] = &[
         phrase: "golden-file codegen tests",
         tests: &[(
             "build_is_byte_identical_for_byte_identical_input",
-            Status::Pending("M1: `agent-compose build` must exist"),
+            Status::Pending("pending: `agent-compose build` must exist"),
         )],
     },
 ];
@@ -307,7 +311,7 @@ const HARNESS: &[Criterion] = &[Criterion {
 /// to mean actually done" is the reason this file exists — but they come from
 /// the working agreement rather than from the PRD's enumeration, so they are
 /// listed apart to keep the transcription honest. This mirrors `GRAMMAR` in
-/// `m0_inventory.rs`.
+/// `static_check_inventory.rs`.
 const STRATEGY: &[Criterion] = &[
     Criterion {
         bullet: Bullet::Strategy,
@@ -315,7 +319,7 @@ const STRATEGY: &[Criterion] = &[
         tests: &[(
             "every_generated_project_type_checks_and_constructs_its_graph",
             Status::Pending(
-                "M1: `agent-compose build` must exist, and the pinned LangGraph toolchain with it",
+                "pending: `agent-compose build` must exist, and the pinned LangGraph toolchain with it",
             ),
         )],
     },
@@ -324,7 +328,7 @@ const STRATEGY: &[Criterion] = &[
         phrase: "shared fixtures (expression + input + expected result) executed against both the Rust validator's interpreter and the JS evaluator embedded in generated code",
         tests: &[(
             "the_generated_cel_evaluator_agrees_with_the_validator_on_the_conformance_corpus",
-            Status::Pending("M1: generated routers must embed a JS CEL evaluator"),
+            Status::Pending("pending: generated routers must embed a JS CEL evaluator"),
         )],
     },
 ];
@@ -382,7 +386,7 @@ fn items(bullet: &str, lead_in: Option<&str>) -> Vec<String> {
         .collect()
 }
 
-/// One test in `tests/m1_acceptance.rs`: its name, and the `#[ignore]` it
+/// One test in `tests/compiled_graph_acceptance.rs`: its name, and the `#[ignore]` it
 /// carries if it carries one.
 struct Test {
     name: String,
@@ -428,9 +432,10 @@ enum Ignore {
 /// the reason is exactly what tells a later PR which feature un-ignores which
 /// test.
 fn suite() -> Vec<Test> {
-    let source =
-        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/m1_acceptance.rs"))
-            .expect("the acceptance suite is readable");
+    let source = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/compiled_graph_acceptance.rs"),
+    )
+    .expect("the acceptance suite is readable");
     parse(&source)
 }
 
@@ -530,7 +535,7 @@ fn every_named_test_exists() {
         for (test, _) in criterion.tests {
             assert!(
                 suite.contains(test),
-                "`{}` names `{test}`, which is not a test in `tests/m1_acceptance.rs`",
+                "`{}` names `{test}`, which is not a test in `tests/compiled_graph_acceptance.rs`",
                 criterion.phrase
             );
         }
@@ -589,7 +594,7 @@ fn a_pending_criterion_names_what_must_land_first() {
                         test.attribute()
                     );
                     assert!(
-                        reason.starts_with("M1: "),
+                        reason.starts_with("pending: "),
                         "a pending reason names the milestone and the feature: `{reason}`"
                     );
                 }
@@ -615,7 +620,7 @@ fn both_ignore_spellings_are_read_and_a_bare_one_claims_nothing() {
         fn it_runs() {}
 
         #[test]
-        #[ignore = "M1: something must land first"]
+        #[ignore = "pending: something must land first"]
         fn it_is_pending() {}
 
         #[test]
@@ -632,10 +637,13 @@ fn both_ignore_spellings_are_read_and_a_bare_one_claims_nothing() {
     assert!(parsed[0].ignore.is_none());
     assert_eq!(parsed[0].reason(), None);
 
-    assert_eq!(parsed[1].reason(), Some("M1: something must land first"));
+    assert_eq!(
+        parsed[1].reason(),
+        Some("pending: something must land first")
+    );
     assert_eq!(
         parsed[1].attribute(),
-        "#[ignore = \"M1: something must land first\"]"
+        "#[ignore = \"pending: something must land first\"]"
     );
 
     assert!(
@@ -681,7 +689,7 @@ fn every_acceptance_fixture_exists() {
     found.sort();
 
     let source = fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/m1_acceptance/harness.rs"),
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/compiled_graph_acceptance/harness.rs"),
     )
     .expect("the harness is readable");
     for name in &found {
