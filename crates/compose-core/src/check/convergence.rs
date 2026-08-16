@@ -93,9 +93,12 @@
 //! # What a pair costs
 //!
 //! Both rules are stated over pairs, and a fork of *w* out-edges has w(w-1)/2 of
-//! them — so a pair has to cost almost nothing. Three things keep it there, and
-//! all three are the same observation: **a pair is read only through the two
-//! nodes its edges deliver to** ([`Graph::entry`](super::graph::Graph::entry)).
+//! them — so a pair has to cost almost nothing. Four things keep it there, and
+//! the first three are the same observation: **a pair is read only through the
+//! two nodes its edges deliver to**
+//! ([`Graph::entry`](super::graph::Graph::entry)). The fourth is its twin one
+//! step earlier — what decides whether a pair *is* a pair is read only through
+//! the two edges themselves.
 //!
 //! 1. *One walk per entry.* The step distances a branch delivers at
 //!    (grammar 7.6.2) and the nodes it holds (grammar 7.6.1) are properties of
@@ -120,6 +123,12 @@
 //!    scan, and every pair it turns up is one being decided for the first and
 //!    last time. The work is then bounded by the answer — pairs of writers — and
 //!    not by how many forks separate them.
+//! 4. *One guard read per edge* ([`possible`]). Grammar 7.6.1's rule 2 asks what
+//!    each guard leaves possible for each enum-typed field of the fork's output,
+//!    and that is a property of the guard rather than of the pair: read per pair
+//!    instead, every guard's AST is walked and its variant sets rebuilt *w*
+//!    times over. It is read once per edge, and a pair costs the disjointness
+//!    test alone, over sets bounded by the field's declared variants.
 //!
 //! A wide fan-out is a shape the grammar admits — nothing bounds a node's
 //! out-degree, and `start` forks like any other vertex — while `validate` is a
@@ -128,8 +137,6 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
-
-use ::cel::Program;
 
 use crate::diag::{Diagnostic, DiagnosticCode, Span};
 use crate::ir::Channel;
@@ -168,22 +175,10 @@ fn pairs<'a>(ctx: &Ctx<'a>, graph: &Graph<'a>) -> Vec<Pair> {
         if outgoing.len() < 2 {
             continue;
         }
-        let programs: Vec<Option<Program>> = outgoing
-            .iter()
-            .map(|edge| {
-                let guard = graph.edge(*edge).when.as_ref()?;
-                // A guard the CEL front-end rejected proves nothing about which
-                // variants it admits, and reading it would turn one mistake into
-                // a second, unrelated diagnostic downstream.
-                ctx.guard_type_checked(&guard.span)
-                    .then(|| guards::parse(guard.value.as_str()))
-                    .flatten()
-            })
-            .collect();
-        let enums = source_enums(ctx, graph, source);
+        let possible = possible(ctx, graph, source, outgoing);
         for left in 0..outgoing.len() {
             for right in (left + 1)..outgoing.len() {
-                if exclusive(graph, source, outgoing, &programs, &enums, left, right) {
+                if exclusive(graph, outgoing, &possible, left, right) {
                     continue;
                 }
                 pairs.push(Pair {
@@ -194,6 +189,61 @@ fn pairs<'a>(ctx: &Ctx<'a>, graph: &Graph<'a>) -> Vec<Pair> {
         }
     }
     pairs
+}
+
+/// What each out-edge of one vertex leaves **possible** for each enum-typed
+/// field of that vertex's output (grammar 7.6.1 rule 2, 7.3.1), in one order —
+/// `None` for an edge rule 2 cannot read at all, whose exclusivity is rule 1's
+/// question alone.
+///
+/// Read once per **edge**, not once per pair. What a guard admits is a property
+/// of that guard, while the rule that consumes it is stated over pairs and a
+/// fork of `w` out-edges has w(w-1)/2 of them — so a guard read per pair is a
+/// guard walked `w` times over, for every enum field, and the variant sets it
+/// builds are rebuilt with it. A 240-branch guarded fork over an output of five
+/// enum fields cost 10.2 s of `check` that way against 1.06 s this way, on a
+/// composition with nothing wrong with it and against a command whose budget is
+/// milliseconds (PRD 5.12). What a pair costs is then the disjointness test
+/// alone, over sets bounded by the field's declared variants
+/// (`tests/check_scale.rs`).
+fn possible<'a>(
+    ctx: &Ctx<'a>,
+    graph: &Graph<'a>,
+    source: Vertex,
+    outgoing: &[usize],
+) -> Vec<Option<Vec<BTreeSet<String>>>> {
+    let enums = source_enums(ctx, graph, source);
+    // `start` has no output for rule 2 to read (grammar 2.4), and neither has a
+    // node whose output declares no enum-typed field: nothing to be disjoint
+    // over, so no guard is worth parsing.
+    let Vertex::Node(at) = source else {
+        return vec![None; outgoing.len()];
+    };
+    if enums.is_empty() {
+        return vec![None; outgoing.len()];
+    }
+    let id = graph.id(at);
+    outgoing
+        .iter()
+        .map(|edge| {
+            let guard = graph.edge(*edge).when.as_ref()?;
+            // A guard the CEL front-end rejected proves nothing about which
+            // variants it admits, and reading it would turn one mistake into a
+            // second, unrelated diagnostic downstream.
+            let program = ctx
+                .guard_type_checked(&guard.span)
+                .then(|| guards::parse(guard.value.as_str()))
+                .flatten()?;
+            Some(
+                enums
+                    .iter()
+                    .map(|(field, variants)| {
+                        guards::coverage(program.expression(), id, field, variants).possible
+                    })
+                    .collect(),
+            )
+        })
+        .collect()
 }
 
 /// The enum-typed fields of a fork's output, with their variant sets. `start`
@@ -231,10 +281,8 @@ fn source_enums<'a>(
 /// Grammar 7.6.1's two exclusivity rules.
 fn exclusive(
     graph: &Graph<'_>,
-    source: Vertex,
     outgoing: &[usize],
-    programs: &[Option<Program>],
-    enums: &[(String, BTreeSet<String>)],
+    possible: &[Option<Vec<BTreeSet<String>>>],
     left: usize,
     right: usize,
 ) -> bool {
@@ -246,19 +294,15 @@ fn exclusive(
     {
         return true;
     }
-    // Rule 2: two guards no enum value satisfies at once.
-    let Vertex::Node(at) = source else {
+    // Rule 2: two guards no enum value satisfies at once. Both lists carry one
+    // entry per enum-typed field of the source's output, in one order
+    // ([`possible`]), so the fields are compared by walking them together.
+    let (Some(one), Some(other)) = (&possible[left], &possible[right]) else {
         return false;
     };
-    let (Some(one), Some(other)) = (&programs[left], &programs[right]) else {
-        return false;
-    };
-    let id = graph.id(at);
-    enums.iter().any(|(field, variants)| {
-        let one = guards::coverage(one.expression(), id, field, variants).possible;
-        let other = guards::coverage(other.expression(), id, field, variants).possible;
-        one.is_disjoint(&other)
-    })
+    one.iter()
+        .zip(other)
+        .any(|(one, other)| one.is_disjoint(other))
 }
 
 /// The two nodes a co-takeable pair starts a branch at, or `None` where it

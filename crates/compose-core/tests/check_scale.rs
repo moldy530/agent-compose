@@ -11,15 +11,17 @@
 //!   documents, and not something `--format json` can report;
 //! * **out-degree** — a per-*pair* analysis of a fork is quadratic in the number
 //!   of edges before it computes anything, so anything it recomputes per pair
-//!   multiplies out. Three shapes are needed, because a fork has three costs: one
+//!   multiplies out. Four shapes are needed, because a fork has four costs: one
 //!   fan of disjoint branches, where the pairs share no answers and what matters
 //!   is that nothing is *walked* per pair; one of overlapping branches, where
 //!   the pairs share almost every answer and what matters is that nothing is
-//!   *compared* or *crossed* per pair; and one whose branches are **illegal** —
+//!   *compared* or *crossed* per pair; one whose branches are **illegal** —
 //!   every one of them writing the same unreduced channel — where what matters is
-//!   that the report is one diagnostic and not one per pair. The first two are
-//!   clean compositions, so they time the analysis with its diagnostic path
-//!   switched off, and a report quadratic in the out-degree is invisible to them;
+//!   that the report is one diagnostic and not one per pair; and one whose edges
+//!   are **guarded**, which is the only shape that enters grammar 7.6.1's rule 2
+//!   at all and where what matters is that no guard is *read* per pair. The
+//!   clean ones among them time the analysis with its diagnostic path switched
+//!   off, and a report quadratic in the out-degree is invisible to them;
 //! * **path count** — a branch's step distances (grammar 7.6.2) are a property
 //!   of its paths, of which a graph of *n* nodes has exponentially many and a
 //!   node may be reached at *n* distinct depths. Neither fork shape above shows
@@ -468,6 +470,102 @@ fn racing_fork_project(dir: &Path, width: usize) {
         ),
     )
     .expect("can write the entrypoint");
+}
+
+/// The one backend here whose fork node carries **enum** output fields, so that
+/// grammar 7.6.1's rule 2 has something to read, and whose one channel no node
+/// writes.
+///
+/// Five enum fields, not one: rule 2 proves a pair exclusive when *some* field
+/// of the source's output separates the two guards, so it is asked of every one
+/// of them, and an agent that returns a verdict alongside a few other closed
+/// choices is an ordinary shape. `agent.g`'s fields are named after no channel,
+/// so the concurrent-write rule short-circuits over an empty writer set and what
+/// is left on the clock is the guard reading alone — the same isolation
+/// `agent.b` gives the distance walk above, and for the same reason.
+const GUARDED: &str = r#"provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.g:
+  model: model.m
+  prompt: Do it.
+  output:
+    outcome: { enum: [approve, revise] }
+    tone: { enum: [warm, plain, terse] }
+    risk: { enum: [low, medium, high] }
+    stage: { enum: [draft, review, final] }
+    mood: { enum: [calm, urgent] }
+state:
+  seen:
+    type: array
+    max_items: 10
+    items: { type: string }
+    default: []
+"#;
+
+/// One `r` node with `width` **guarded** out-edges, each to a leaf of its own,
+/// plus the `else: true` that routes the variant they all leave out.
+///
+/// Every guard is a conjunction of `conjuncts` terms of which only the first is
+/// a shape the coverage table reads; the rest are over `state` and widen nothing
+/// (grammar 7.3.1, Decision D82). All `width` guards leave the same one variant
+/// of `outcome` possible and every variant of the other four, so no pair of them
+/// is disjoint on any field: the fork is co-takeable at full width, and every
+/// pair reaches the end of rule 2 rather than short-circuiting inside it.
+fn guarded_fork_project(dir: &Path, width: usize, conjuncts: usize) {
+    let mut nodes = String::from("    r: { agent: agent.g, input: \"'r'\" }\n");
+    let mut edges = String::from("    - { from: start, to: r }\n");
+    for at in 0..width {
+        nodes.push_str(&format!(
+            "    t{at}: {{ agent: agent.g, input: \"'t'\" }}\n"
+        ));
+        let rest: String = (0..conjuncts - 1)
+            .map(|term| format!(" && size(state.seen) > {}", at + term))
+            .collect();
+        edges.push_str(&format!(
+            "    - {{ from: r, to: t{at}, when: \"r.output.outcome == 'approve'{rest}\" }}\n"
+        ));
+        edges.push_str(&format!("    - {{ from: t{at}, to: end }}\n"));
+    }
+    nodes.push_str("    z: { agent: agent.g, input: \"'z'\" }\n");
+    edges.push_str("    - { from: r, to: z, else: true }\n");
+    edges.push_str("    - { from: z, to: end }\n");
+    fs::write(
+        dir.join("main.yml"),
+        format!(
+            "version: \"0.1\"\n{GUARDED}flow.f:\n  outputs: {{}}\n  nodes:\n{nodes}  edges:\n{edges}"
+        ),
+    )
+    .expect("can write the entrypoint");
+}
+
+/// A fork whose out-edges are **guarded**, which is where anything read off a
+/// guard per pair shows.
+///
+/// The three fan shapes above all carry unconditional edges, so grammar 7.6.1's
+/// rule 1 settles every pair before a guard is looked at, and rule 2 — the one
+/// that walks a CEL AST and builds a variant set — is never entered at width.
+/// Here it is: 240 guarded edges are 28,680 co-takeable pairs, and what a pair
+/// needs of an edge is what that edge's guard leaves *possible* for each of the
+/// five enum fields, which is a property of the guard and not of the pair.
+/// Reading it per pair walked every nineteen-conjunct AST 240 times over for
+/// each field and cost this shape 10.2 s of check against 1.06 s once it is read
+/// per edge — a composition with nothing wrong with it, against a command whose
+/// budget is milliseconds (PRD 5.12). What is left inside the budget is the pair
+/// enumeration itself, which the rule is stated over and no cache removes.
+#[test]
+fn a_guarded_fork_reads_each_guard_once_rather_than_once_per_pair() {
+    let dir = scratch("guarded");
+    guarded_fork_project(&dir, 240, 19);
+    let budget = Duration::from_secs(6);
+    let fastest = fastest_check(&artifact(&dir), "240-branch guarded fork", 0);
+    assert!(
+        fastest < budget,
+        "checking a 240-branch guarded fork took {fastest:?}, and the budget is {budget:?}"
+    );
 }
 
 /// A fan of branches that all race one channel, which is where anything
