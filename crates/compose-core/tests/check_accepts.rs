@@ -1483,6 +1483,87 @@ flow.f:
     );
 }
 
+/// A bounded cycle whose two nodes both write one **unreduced** channel.
+///
+/// `review`'s two out-edges are a `when:` and an `else:`, which grammar 7.3
+/// rule 4 makes exclusive by construction, so the flow has no fork at all — no
+/// co-takeable pair, no concurrency, and two writers that simply alternate
+/// across steps. The concurrency relation is stated over the two edges of one
+/// co-takeable pair (grammar 7.6.1), and a rule that read "in one cycle" as
+/// "concurrent" on its own would make the PRD's flagship loop unwritable
+/// without a `reduce:` policy on every channel it touches. What a cycle does
+/// change is the reading of a pair that already exists, which is
+/// `tests/fixtures/invalid-check/writers-deep-in-a-cycle-reach-each-other`.
+#[test]
+fn a_bounded_loop_with_no_fork_races_nothing() {
+    accepts(
+        "loop-without-a-fork",
+        r#"
+agent.r:
+  model: model.m
+  prompt: Do it.
+  output:
+    note: { type: string }
+    verdict: { enum: [approve, revise] }
+state:
+  note: { type: string, default: "" }
+flow.f:
+  outputs: {}
+  nodes:
+    write: { agent: agent.r, input: "'w'" }
+    review: { agent: agent.r, input: "'r'" }
+  edges:
+    - { from: start, to: write }
+    - { from: write, to: review }
+    - { from: review, to: write, when: "review.output.verdict == 'revise'", max_iterations: 3 }
+    - { from: review, to: end, else: true }
+"#,
+    );
+}
+
+/// The accepting half of `a-fork-inside-a-bounded-cycle-races` and of
+/// `writers-deep-in-a-cycle-reach-each-other`: the very same fan inside the very
+/// same bounded loop, with the `reduce:` policy those two are missing.
+///
+/// A fan inside a review loop is an ordinary shape, and what makes it legal is
+/// the declared policy rather than anything about the cycle — so the rule has to
+/// stop asking the moment the policy is there (grammar 10.2, Decision D32).
+#[test]
+fn a_fan_inside_a_bounded_cycle_needs_only_the_policy() {
+    accepts(
+        "fan-inside-a-cycle",
+        r#"
+agent.a:
+  model: model.m
+  prompt: Do it.
+  output:
+    verdict: { enum: [approve, revise] }
+agent.n:
+  model: model.m
+  prompt: Note.
+  output:
+    note: { type: string }
+state:
+  note: { type: string, reduce: last_wins, default: "" }
+flow.f:
+  outputs: {}
+  nodes:
+    fork: { agent: agent.a, input: "'w'" }
+    x: { agent: agent.n, input: "'x'" }
+    y: { agent: agent.n, input: "'y'" }
+    j: { agent: agent.a, input: "'j'" }
+  edges:
+    - { from: start, to: fork }
+    - { from: fork, to: x }
+    - { from: fork, to: y }
+    - { from: x, to: j }
+    - { from: y, to: j }
+    - { from: j, to: fork, when: "j.output.verdict == 'revise'", max_iterations: 3 }
+    - { from: j, to: end, else: true }
+"#,
+    );
+}
+
 /// Grammar 7.4's escape rule reads over the source of **every** bounded edge,
 /// and outside a cycle only clause (b) is left to satisfy: a node alone in its
 /// component is left by every outgoing edge it has, so an `else: true` sibling

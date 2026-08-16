@@ -1,0 +1,51 @@
+# rule: a fork's own two entries race even where one names the other as its fallback (grammar 7.6, 7.6.1, 10.2)
+# code: unreduced-write
+# message: nodes `left` and `right` of `flow.f` run concurrently and both write the unreduced channel `note`
+# at: main.yml:45:5
+# label: main.yml:44:5 the other write is here
+# label: main.yml:39:3 the channel is declared here
+# help: two edges of one fork that are not provably exclusive can both fire, so the branches they start are concurrent: the channel they both write needs a declared `reduce:` policy — `append`, `merge`, or an explicit `last_wins` (grammar 7.6.1, 10.2, Decision D32)
+#
+# `fork`'s two edges are unconditional, so both fire and grammar 7.6's step rule
+# runs `left` and `right` in one and the same step — both writing `note`. Naming
+# `left` as `right`'s `on_error: { fallback: … }` target adds a *second* run of
+# `left`, on `right`'s branch, where the first one failed; it does not move the
+# run the fork itself scheduled, and the sibling branch is never cancelled
+# (grammar 7.6.3). So "neither is reachable from the other" (7.6.1) cannot be
+# read of the pair's own two entries: reading it over the control-transfer
+# relation there silences the rule on a race one keyword left untouched, and
+# hands M1 a composition breaking 7.6.4's "an unreduced channel has at most one
+# writer per step by construction".
+#
+# Deleting the `on_error:` key leaves the same diagnostic — which is the point.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.a:
+  model: model.m
+  prompt: Do it.
+  output:
+    verdict: { enum: [approve, revise] }
+agent.n:
+  model: model.m
+  prompt: Note.
+  output:
+    note: { type: string }
+state:
+  note: { type: string, default: "" }
+flow.f:
+  outputs: {}
+  nodes:
+    fork: { agent: agent.a, input: "'w'" }
+    left: { agent: agent.n, input: "'x'" }
+    right: { agent: agent.n, input: "'y'", on_error: { fallback: left } }
+  edges:
+    - { from: start, to: fork }
+    - { from: fork, to: left }
+    - { from: fork, to: right }
+    - { from: left, to: end }
+    - { from: right, to: end }

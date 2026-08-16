@@ -69,8 +69,31 @@
 //! (grammar 7.6.3) — so it races that sibling's writers exactly as an
 //! edge-reached node would. Both halves of the definition are read over the one
 //! relation ([`Graph::reachable_through`], [`Graph::reaches`]): the same
-//! transfer that puts a fallback target on its predecessor's branch is what
-//! makes the two of them sequential rather than concurrent.
+//! transfer that puts a fallback target on its predecessor's branch is ordinarily
+//! what makes the two of them sequential rather than concurrent — with the two
+//! exceptions the next paragraph is about.
+//!
+//! **"Reachable from the other" has to mean "runs after the other".** That is
+//! what the clause is for, and reachability says it only where the reaching
+//! relation is the whole story of when the second node runs. Two shapes where it
+//! is not, and both are races the rule has to keep:
+//!
+//! * *The pair's own two entries* ([`entries_race`]). Grammar 7.6's step rule puts
+//!   the targets of every edge taken in step *k* into step *k+1* together, so a
+//!   co-takeable pair that fires both ways runs its two entries in one and the
+//!   same step. Naming one of them as the other's `on_error: { fallback: … }` or
+//!   `human.on_timeout:` target adds a *second* run of it and moves nothing, so
+//!   that one pair is not asked the question.
+//! * *Two nodes that reach each other* ([`sequential`]). That is a loop rather
+//!   than an order: neither runs after the other, both are re-entered on every
+//!   pass, and their arrivals interleave. Grammar 7.6.2 says outright that a
+//!   distance across a cycle is not static and hands that case to the runtime
+//!   rule — of which grammar 10.2 has none, an unreduced channel being a
+//!   compile-time promise of one writer per step (7.6.4) — so mutual
+//!   reachability reads as concurrent. Without it a fan inside a bounded review
+//!   loop falls between the two rules: the back edge makes every node of one
+//!   branch reach every node of the other, while balanced convergence is
+//!   (correctly) silent for a cyclic node.
 //!
 //! The analysis is deliberately conservative: a guard pair it cannot prove
 //! exclusive is co-takeable, so it may ask for a policy on a channel two
@@ -474,6 +497,7 @@ fn concurrent<'a>(ctx: &mut Ctx<'a>, cx: &FlowCx<'a>, graph: &Graph<'a>, pairs: 
         if !crossed.insert((near.min(far), near.max(far))) {
             continue;
         }
+        entries_race(&mut raced, &writers, near, far);
         for entry in [near, far] {
             held.entry(entry)
                 .or_insert_with(|| writers.branch(graph, entry));
@@ -496,12 +520,7 @@ fn concurrent<'a>(ctx: &mut Ctx<'a>, cx: &FlowCx<'a>, graph: &Graph<'a>, pairs: 
                         continue;
                     }
                     let (one, other) = writers.order(one, other);
-                    // Neither reachable from the other: a node downstream of
-                    // both branches runs after them, not beside them — and so
-                    // does a node its predecessor only ever fails over to.
-                    if graph.reaches(writers.node(one), writers.node(other))
-                        || graph.reaches(writers.node(other), writers.node(one))
-                    {
+                    if sequential(graph, writers.node(one), writers.node(other)) {
                         continue;
                     }
                     races(&mut raced, &writers, one, other);
@@ -512,6 +531,53 @@ fn concurrent<'a>(ctx: &mut Ctx<'a>, cx: &FlowCx<'a>, graph: &Graph<'a>, pairs: 
     for (name, race) in raced {
         report(ctx, cx, graph, &writers, name, &race);
     }
+}
+
+/// Record what the pair's own two entries race for: the nodes its edges deliver
+/// to, which the **fork** schedules rather than either branch.
+///
+/// Grammar 7.6's step rule puts the targets of every edge taken in step *k* into
+/// step *k+1* together, so a co-takeable pair that fires both ways runs both of
+/// these in one and the same step — and "neither is reachable from the other"
+/// cannot say otherwise about them. A transfer from one branch to the other's
+/// entry adds a *second* run of that entry; it does not move the first, and the
+/// sibling branch runs on regardless because concurrent branches are never
+/// cancelled (grammar 7.6.3). So this one pair is decided by the pair alone,
+/// outside the reachability test [`sequential`] applies to the rest of the
+/// cross, and outside the examined-pair matrix, which is keyed by the writers
+/// and cannot see which fork put them side by side.
+fn entries_race<'a>(
+    raced: &mut BTreeMap<&'a str, Race<'a>>,
+    writers: &Writers<'a>,
+    near: usize,
+    far: usize,
+) {
+    let (Some(one), Some(other)) = (writers.at(near), writers.at(far)) else {
+        return;
+    };
+    let (one, other) = writers.order(one, other);
+    races(raced, writers, one, other);
+}
+
+/// Whether one node runs strictly **after** the other, which is what takes a
+/// pair out of grammar 7.6.1's rule.
+///
+/// A node downstream of both branches runs after them rather than beside them,
+/// and so does a node its predecessor only ever fails over to: the
+/// control-transfer relation holds one way and not the other, and the same
+/// transfer that puts a fallback target on its predecessor's branch is what
+/// makes the two of them sequential.
+///
+/// Two nodes that reach **each other** are in a loop rather than in an order.
+/// Neither runs after the other; both are re-entered on every pass of the cycle
+/// they share, and their arrivals interleave — grammar 7.6.2 says outright that
+/// a distance across a cycle is not static and leaves that case to the runtime
+/// rule, of which grammar 10.2 has none. So a cycle reads as concurrent, and a
+/// fan inside a bounded review loop is analysed rather than falling between the
+/// two rules: 7.6.2 is silent for a cyclic node by construction
+/// ([`Graph::distances`](super::graph::Graph::distances)).
+fn sequential(graph: &Graph<'_>, one: usize, other: usize) -> bool {
+    graph.reaches(one, other) != graph.reaches(other, one)
 }
 
 /// The nodes of one flow that write a channel at all, and nothing else.
@@ -572,6 +638,11 @@ impl<'a> Writers<'a> {
     /// The node one writer is.
     fn node(&self, at: usize) -> usize {
         self.entries[at].0
+    }
+
+    /// The writer one node is, or `None` where it writes nothing.
+    fn at(&self, node: usize) -> Option<usize> {
+        self.slot[node]
     }
 
     /// Every channel one writer writes.
