@@ -471,6 +471,15 @@ fn spelling(source: &str) -> String {
     text
 }
 
+/// `n` of something, spelled the way a sentence spells a small number.
+fn count(n: usize, noun: &str) -> String {
+    match n {
+        0 => format!("no {noun}s"),
+        1 => format!("one {noun}"),
+        many => format!("{many} {noun}s"),
+    }
+}
+
 /// A path under construction: a root and what has been applied to it so far.
 struct Path {
     root: String,
@@ -851,6 +860,9 @@ impl Walk<'_> {
             }
             "@in" => self.membership(call),
             "size" => {
+                if !self.arity(name, call) {
+                    return Type::Dyn;
+                }
                 let types = self.operands(call);
                 if let Some(ty) = types.first() {
                     match ty {
@@ -874,6 +886,9 @@ impl Walk<'_> {
                 Type::Int
             }
             "startsWith" | "endsWith" | "contains" | "matches" => {
+                if !self.arity(name, call) {
+                    return Type::Dyn;
+                }
                 let types = self.operands(call);
                 for ty in &types {
                     if !ty.is_stringy() {
@@ -881,6 +896,23 @@ impl Walk<'_> {
                     }
                 }
                 Type::Bool
+            }
+            // `has(x.y)` the parser expands into a presence test, so a `has`
+            // that reaches here is one written in a form it does not expand —
+            // no argument, or two. Saying it is unsupported would contradict
+            // grammar 4.1's own list of it, exactly as it would for a macro.
+            "has" => {
+                self.problem(
+                    Problem::new(
+                        DiagnosticCode::InvalidExpression,
+                        "`has` is not written here in a form this expression surface supports"
+                            .to_string(),
+                    )
+                    .with_help(
+                        "`has()` asks whether one selection is present — `has(state.totals.fixed)` — and takes exactly that one argument (grammar 4.1, 10.1)",
+                    ),
+                );
+                Type::Dyn
             }
             // A comprehension the parser recognized is a `Comprehension` node
             // and never reaches here, so a macro name that does is one the
@@ -915,6 +947,68 @@ impl Walk<'_> {
                 Type::Dyn
             }
         }
+    }
+
+    /// Whether a call to one of grammar 4.1's supported functions is written in
+    /// a form that function has.
+    ///
+    /// Arity is not a type question, and nothing else in this walk asks it: an
+    /// arm that reads `types.first()` types `size()` as an `int` and
+    /// `state.draft.startsWith()` as a `bool`, and both are `no such overload`
+    /// the moment they run. Grammar 4.1 requires an expression to be
+    /// type-correct against the declared schemas and this compiler refuses a
+    /// statically visible guaranteed runtime failure, so a misspelled call is
+    /// refused here rather than in a generated router.
+    ///
+    /// The accepted forms are CEL's standard definitions: `size(x)` and
+    /// `x.size()`; `startsWith`, `endsWith` and `contains` as methods on the
+    /// string they test; `matches`, the one string predicate the specification
+    /// also gives a global spelling, either way round.
+    ///
+    /// A call refused here is refused *at the call*, before its operands are
+    /// walked, for the reason the closed-surface arm gives above: one mistake
+    /// reads as one diagnostic (PRD G3), and an operand written for an overload
+    /// that does not exist has nothing to be checked against.
+    ///
+    /// `matches` in its global spelling is the one accepted form the pinned
+    /// Rust evaluator cannot itself evaluate — the specification declares the
+    /// overload and `cel` 0.14.3 does not. Following the specification here is
+    /// deliberate, and the divergence is recorded where the corpus records the
+    /// other one (`tests/fixtures/cel-conformance/README.md`).
+    fn arity(&mut self, name: &str, call: &::cel::common::ast::CallExpr) -> bool {
+        let written = (call.target.is_some(), call.args.len());
+        let (accepted, forms): (&[(bool, usize)], String) = match name {
+            "size" => (
+                &[(false, 1), (true, 0)],
+                "`size(state.tasks)` or `state.tasks.size()`".to_string(),
+            ),
+            "matches" => (
+                &[(true, 1), (false, 2)],
+                "`state.draft.matches('^a')` or `matches(state.draft, '^a')`".to_string(),
+            ),
+            _ => (
+                &[(true, 1)],
+                format!("`state.draft.{name}('# ')` — the string it tests is the receiver"),
+            ),
+        };
+        if accepted.contains(&written) {
+            return true;
+        }
+        let (receiver, args) = written;
+        self.problem(
+            Problem::new(
+                DiagnosticCode::InvalidExpression,
+                format!(
+                    "`{name}` is called with {}{}, which is not a form it has",
+                    count(args, "argument"),
+                    if receiver { " on a receiver" } else { "" }
+                ),
+            )
+            .with_help(format!(
+                "write it as {forms}; every other spelling has no overload to call and fails at evaluation (grammar 4.1)"
+            )),
+        );
+        false
     }
 
     /// The types of a call's operands: its receiver, if it has one, then its
@@ -1469,6 +1563,91 @@ mod tests {
             unsupported.message,
             "`string` is not a function this expression surface supports"
         );
+    }
+
+    /// A supported function called at the wrong arity is a guaranteed `no such
+    /// overload` at evaluation, and grammar 4.1's type-correctness requirement
+    /// is what refuses it here rather than in a generated router. Nothing else
+    /// in the walk asks the question: the arms read `types.first()`, so
+    /// `size()` would otherwise type as an `int` and `x.startsWith()` as a
+    /// `bool`, and both would pass `validate`.
+    #[test]
+    fn a_supported_function_is_called_in_a_form_it_has() {
+        // `size` takes one operand, spelled either way round.
+        assert_eq!(ok("size(state.patches)").ty, Type::Int);
+        assert_eq!(ok("state.patches.size()").ty, Type::Int);
+        for source in [
+            "size()",
+            "size(state.draft, state.draft, 3)",
+            "'a'.size('b')",
+        ] {
+            let refused = problem(source);
+            assert_eq!(refused.code, DiagnosticCode::InvalidExpression);
+            assert!(
+                refused.message.starts_with("`size` is called with"),
+                "{source} reported: {}",
+                refused.message
+            );
+            assert_eq!(
+                refused.help.as_deref(),
+                Some(
+                    "write it as `size(state.tasks)` or `state.tasks.size()`; every other spelling has no overload to call and fails at evaluation (grammar 4.1)"
+                )
+            );
+        }
+        assert_eq!(
+            problem("size()").message,
+            "`size` is called with no arguments, which is not a form it has"
+        );
+        assert_eq!(
+            problem("size(state.draft, state.draft, 3)").message,
+            "`size` is called with 3 arguments, which is not a form it has"
+        );
+
+        // The three string predicates CEL declares receiver-style only.
+        for name in ["startsWith", "endsWith", "contains"] {
+            assert_eq!(ok(&format!("state.draft.{name}('x')")).ty, Type::Bool);
+            assert_eq!(
+                problem(&format!("state.draft.{name}()")).message,
+                format!(
+                    "`{name}` is called with no arguments on a receiver, which is not a form it has"
+                )
+            );
+            // …and the global spelling, which CEL's standard definitions give
+            // to `matches` alone.
+            assert_eq!(
+                problem(&format!("{name}(state.draft, 'x')")).message,
+                format!("`{name}` is called with 2 arguments, which is not a form it has")
+            );
+        }
+
+        // `matches` is the exception: both spellings are standard.
+        assert_eq!(ok("state.draft.matches('^a')").ty, Type::Bool);
+        assert_eq!(ok("matches(state.draft, '^a')").ty, Type::Bool);
+        assert_eq!(
+            problem("matches(state.draft)").message,
+            "`matches` is called with one argument, which is not a form it has"
+        );
+
+        // The refusal is at the call, so an argument written for an overload
+        // that does not exist does not add a diagnostic of its own.
+        let analysis = analyze("size(nope.at.all, 2)", &guard_scope());
+        assert_eq!(analysis.problems.len(), 1);
+    }
+
+    /// `has()` is on grammar 4.1's list, so a `has` written in a form the
+    /// parser does not expand is that form's mistake — never "unsupported",
+    /// which is the answer the closed-surface arm would otherwise give it.
+    #[test]
+    fn has_at_the_wrong_arity_is_not_reported_as_unsupported() {
+        for source in ["has()", "has(state.draft, state.feedback)"] {
+            let refused = problem(source);
+            assert_eq!(refused.code, DiagnosticCode::InvalidExpression);
+            assert_eq!(
+                refused.message,
+                "`has` is not written here in a form this expression surface supports"
+            );
+        }
     }
 
     /// `has()` answers a question about a member; it does not read it.

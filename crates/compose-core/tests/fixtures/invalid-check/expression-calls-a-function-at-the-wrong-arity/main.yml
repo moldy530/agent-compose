@@ -1,0 +1,37 @@
+# rule: a supported function called in a form it does not have is refused (grammar 4.1)
+# code: invalid-expression
+# message: `size` is called with no arguments, which is not a form it has
+# at: main.yml:34:16
+# help: write it as `size(state.tasks)` or `state.tasks.size()`; every other spelling has no overload to call and fails at evaluation (grammar 4.1)
+#
+# Arity is not a type question, and it is the one an expression surface that
+# only reads argument *types* never asks: `size()` would otherwise type as the
+# `int` its arm returns and pass into an `integer` field, then fail at
+# evaluation with no overload to call. Grammar 4.1 requires an expression to be
+# type-correct against the declared schemas, so it is refused at `validate`.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+state:
+  draft: { type: string, default: "" }
+agent.a:
+  model: model.m
+  prompt: Go.
+  input:
+    count: { type: integer }
+  output:
+    draft: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.a
+      input:
+        count: "size()"
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }
