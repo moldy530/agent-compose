@@ -1,0 +1,179 @@
+---
+source: crates/compose-core/tests/parse_examples.rs
+expression: "parse_clean(\"examples/triage-fanout/main.yml\")"
+---
+Spec(
+    SpecFile {
+        source: "examples/triage-fanout/main.yml",
+        version: Some(
+            "0.1" @ 14:10..14:15,
+        ),
+        imports: Some(
+            ImportsSection {
+                paths: [
+                    "providers.yml" @ 17:5..17:18,
+                    "models.yml" @ 18:5..18:15,
+                    "agents/triage.yml" @ 19:5..19:22,
+                    "agents/fixer.yml" @ 20:5..20:21,
+                    "agents/summarizer.yml" @ 21:5..21:26,
+                    "tools/repo_grep.yml" @ 22:5..22:24,
+                    "tools/review_queue.yml" @ 23:5..23:27,
+                    "tools/dead_letter.yml" @ 24:5..24:26,
+                    "stores/docs.yml" @ 25:5..25:20,
+                    "stores/triage_memory.yml" @ 26:5..26:29,
+                    "flows/enrich.yml" @ 27:5..27:21,
+                    "flows/triage.yml" @ 28:5..28:21,
+                    "triggers.yml" @ 29:5..29:17,
+                ],
+                span: 17:3..31:1,
+            },
+        ),
+        defaults: Some(
+            PolicyBlock {
+                retry: Some(
+                    Retry {
+                        max: Some(
+                            1 @ 33:17..33:18,
+                        ),
+                        backoff: Some(
+                            duration("2s") @ 33:29..33:31,
+                        ),
+                        multiplier: None,
+                        max_backoff: None,
+                        jitter: None,
+                        span: 33:10..33:33,
+                    } @ 33:10..33:33,
+                ),
+                timeout: Some(
+                    duration("90s") @ 32:12..32:15,
+                ),
+                on_error: Some(
+                    Fail @ 34:13..34:17,
+                ),
+            } @ 32:3..36:1,
+        ),
+        state: Some(
+            StateSection {
+                channels: [
+                    Channel {
+                        name: "report_normalized" @ 37:3..37:20,
+                        ty: TypeNode {
+                            form: Scalar(
+                                ScalarType {
+                                    kind: String @ 39:11..39:17,
+                                    default: String(
+                                        "",
+                                    ) @ 40:14..40:16,
+                                },
+                            ),
+                            description: Some(
+                                "The report after flow.enrich has normalized it." @ 38:18..38:65,
+                            ),
+                            span: 38:5..42:3,
+                        },
+                        reduce: None,
+                        span: 37:3..42:3,
+                    },
+                    Channel {
+                        name: "matches" @ 42:3..42:10,
+                        ty: TypeNode {
+                            form: Array(
+                                ArrayType {
+                                    items: TypeNode {
+                                        form: Scalar(
+                                            ScalarType {
+                                                kind: String @ 45:20..45:26,
+                                            },
+                                        ),
+                                        description: None,
+                                        span: 45:12..45:28,
+                                    },
+                                },
+                            ),
+                            description: Some(
+                                "Raw grep hits handed to the triage agent." @ 43:18..43:59,
+                            ),
+                            span: 43:5..53:3,
+                        },
+                        reduce: None,
+                        span: 42:3..53:3,
+                    },
+                    Channel {
+                        name: "patches" @ 53:3..53:10,
+                        ty: TypeNode {
+                            form: Array(
+                                ArrayType {
+                                    items: TypeNode {
+                                        form: Scalar(
+                                            ScalarType {
+                                                kind: String @ 57:20..57:26,
+                                            },
+                                        ),
+                                        description: None,
+                                        span: 57:12..57:28,
+                                    },
+                                    max_items: 200 @ 56:16..56:19,
+                                },
+                            ),
+                            description: Some(
+                                "Patches produced by the fixer instances." @ 54:18..54:58,
+                            ),
+                            span: 54:5..60:3,
+                        },
+                        reduce: Some(
+                            Append @ 58:13..58:19,
+                        ),
+                        span: 53:3..60:3,
+                    },
+                    Channel {
+                        name: "summary" @ 60:3..60:10,
+                        ty: TypeNode {
+                            form: Scalar(
+                                ScalarType {
+                                    kind: String @ 62:11..62:17,
+                                    default: String(
+                                        "",
+                                    ) @ 63:14..63:16,
+                                },
+                            ),
+                            description: Some(
+                                "Human-readable summary of the triage run." @ 61:18..61:59,
+                            ),
+                            span: 61:5..65:3,
+                        },
+                        reduce: None,
+                        span: 60:3..65:3,
+                    },
+                    Channel {
+                        name: "human_decision" @ 65:3..65:17,
+                        ty: TypeNode {
+                            form: Enum(
+                                EnumType {
+                                    variants: [
+                                        "approve" @ 67:12..67:19,
+                                        "reject" @ 67:21..67:27,
+                                    ],
+                                    default: Some(
+                                        String(
+                                            "approve",
+                                        ) @ 68:14..68:21,
+                                    ),
+                                },
+                            ),
+                            description: Some(
+                                "What the reviewer decided about the run as a whole." @ 66:18..66:69,
+                            ),
+                            span: 66:5..69:1,
+                        },
+                        reduce: None,
+                        span: 65:3..69:1,
+                    },
+                ],
+                span: 37:3..69:1,
+            },
+        ),
+        triggers: None,
+        definitions: [],
+        span: 14:1..69:1,
+    },
+)

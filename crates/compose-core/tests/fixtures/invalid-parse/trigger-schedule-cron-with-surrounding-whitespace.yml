@@ -1,0 +1,13 @@
+# rule: `cron:` carries no whitespace around its five fields (grammar 13.4, Decision D46)
+# code: invalid-value
+# message: `cron` must not begin or end with whitespace, found "0 3 * * * "
+# at: 13:11
+# help: the expression is five whitespace-separated fields and nothing else, so a leading or trailing space belongs to no field: drop it
+triggers:
+  nightly:
+    type: schedule
+    flow: flow.triage
+    # The field count is right, so counting alone accepts this; the published
+    # schema anchors the shape as `^\S+(\s+\S+){4}$`, and the trailing space
+    # alone is what it rejects.
+    cron: "0 3 * * * "

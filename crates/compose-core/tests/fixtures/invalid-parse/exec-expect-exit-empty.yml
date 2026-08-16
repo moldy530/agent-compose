@@ -1,0 +1,13 @@
+# rule: `expect_exit` is non-empty - an empty list accepts no outcome at all (grammar 6.1, Decision D100)
+# code: invalid-value
+# message: `expect_exit` must declare at least one exit status
+# at: 13:18
+# help: an empty `expect_exit` accepts no outcome at all, so every call would be a node error
+tool.run_checks:
+  description: Run the repository checks.
+  input: {}
+  output:
+    report: { type: string }
+  exec:
+    command: run-checks
+    expect_exit: []

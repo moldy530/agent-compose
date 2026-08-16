@@ -1,0 +1,19 @@
+# rule: a human node binds its declared input fields by name, never with the scalar form (grammar 8.0, 8.7, Decision D14)
+# code: wrong-type
+# message: expected a mapping of bindings for `input` of node `approve`, found a string
+# at: 16:14
+# help: a human node's `input:` field map declares the names to bind (grammar 8.7); the scalar form binds a string-in agent's single unnamed input instead (grammar 5.3, 8.0, Decision D14)
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    approve:
+      human:
+        input:
+          draft: { type: string }
+        output:
+          decision: { enum: [approve, reject] }
+      input: "state.draft"
+  edges:
+    - { from: start, to: approve }
+    - { from: approve, to: end }

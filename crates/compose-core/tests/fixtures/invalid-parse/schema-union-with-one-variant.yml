@@ -1,0 +1,16 @@
+# rule: a discriminated union declares at least two variants (grammar 3.7, Decision D11)
+# code: invalid-value
+# message: a discriminated union declares at least 2 variants, `items` of the schema of `findings` declares 1
+# at: 16:11
+# help: a one-variant union is an object: write it with `type: object`
+agent.reviewer:
+  model: model.smart
+  prompt: Review the draft.
+  output:
+    findings:
+      type: array
+      max_items: 10
+      items:
+        discriminator: kind
+        variants:
+          auto_fixable: { file: { type: string } }

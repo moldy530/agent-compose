@@ -1,0 +1,1050 @@
+---
+source: crates/compose-core/tests/parse_examples.rs
+expression: "parse_clean(\"examples/triage-fanout/flows/triage.yml\")"
+---
+Spec(
+    SpecFile {
+        source: "examples/triage-fanout/flows/triage.yml",
+        version: None,
+        imports: None,
+        defaults: None,
+        state: None,
+        triggers: None,
+        definitions: [
+            Definition {
+                address: flow.triage @ 1:1..1:12,
+                body: Flow(
+                    FlowDef {
+                        description: Some(
+                            "Triage a bug report, fan out fixes, and get a human sign-off." @ 2:16..2:77,
+                        ),
+                        inputs: Some(
+                            FieldMap {
+                                fields: [
+                                    Field {
+                                        name: "report" @ 4:5..4:11,
+                                        ty: TypeNode {
+                                            form: Scalar(
+                                                ScalarType {
+                                                    kind: String @ 6:13..6:19,
+                                                    min_length: 1 @ 7:19..7:20,
+                                                },
+                                            ),
+                                            description: Some(
+                                                "The raw bug report." @ 5:20..5:39,
+                                            ),
+                                            span: 5:7..8:5,
+                                        },
+                                    },
+                                    Field {
+                                        name: "pattern" @ 8:5..8:12,
+                                        ty: TypeNode {
+                                            form: Scalar(
+                                                ScalarType {
+                                                    kind: String @ 10:13..10:19,
+                                                },
+                                            ),
+                                            description: Some(
+                                                "Repository search pattern used to ground the triage agent." @ 9:20..9:78,
+                                            ),
+                                            span: 9:7..11:3,
+                                        },
+                                    },
+                                ],
+                                surface: Input,
+                                span: 4:5..11:3,
+                            },
+                        ),
+                        outputs: Some(
+                            FieldMap {
+                                fields: [
+                                    Field {
+                                        name: "summary" @ 12:5..12:12,
+                                        ty: TypeNode {
+                                            form: Scalar(
+                                                ScalarType {
+                                                    kind: String @ 13:13..13:19,
+                                                },
+                                            ),
+                                            description: None,
+                                            span: 13:7..14:5,
+                                        },
+                                    },
+                                    Field {
+                                        name: "patches" @ 14:5..14:12,
+                                        ty: TypeNode {
+                                            form: Array(
+                                                ArrayType {
+                                                    items: TypeNode {
+                                                        form: Scalar(
+                                                            ScalarType {
+                                                                kind: String @ 17:22..17:28,
+                                                            },
+                                                        ),
+                                                        description: None,
+                                                        span: 17:14..17:30,
+                                                    },
+                                                    max_items: 200 @ 16:18..16:21,
+                                                },
+                                            ),
+                                            description: None,
+                                            span: 15:7..19:3,
+                                        },
+                                    },
+                                ],
+                                surface: Result,
+                                span: 12:5..19:3,
+                            },
+                        ),
+                        nodes: [
+                            Node {
+                                id: "enrich" @ 22:5..22:11,
+                                kind: Flow(
+                                    FlowNode {
+                                        flow: flow.enrich @ 23:13..23:24,
+                                        context: Some(
+                                            Isolated @ 26:16..26:24,
+                                        ),
+                                        policy: Some(
+                                            PolicyBlock {
+                                                retry: None,
+                                                timeout: Some(
+                                                    duration("30s") @ 28:18..28:21,
+                                                ),
+                                                on_error: Some(
+                                                    Fail @ 29:19..29:23,
+                                                ),
+                                            } @ 28:9..32:5,
+                                        ),
+                                    },
+                                ),
+                                input: Some(
+                                    Fields(
+                                        Bindings {
+                                            entries: [
+                                                Binding {
+                                                    name: "report" @ 25:9..25:15,
+                                                    value: cel("input.report") @ 25:17..25:31,
+                                                },
+                                            ],
+                                            span: 25:9..26:7,
+                                        },
+                                    ),
+                                ),
+                                writes: None,
+                                policy: PolicyBlock {
+                                    retry: None,
+                                    timeout: None,
+                                    on_error: None,
+                                },
+                                description: None,
+                                span: 23:7..32:5,
+                            },
+                            Node {
+                                id: "scan" @ 32:5..32:9,
+                                kind: Function(
+                                    tool.repo_grep @ 33:17..33:31,
+                                ),
+                                input: Some(
+                                    Fields(
+                                        Bindings {
+                                            entries: [
+                                                Binding {
+                                                    name: "pattern" @ 35:9..35:16,
+                                                    value: cel("input.pattern") @ 35:18..35:33,
+                                                },
+                                                Binding {
+                                                    name: "max_matches" @ 36:9..36:20,
+                                                    value: cel("25") @ 36:22..36:26,
+                                                },
+                                            ],
+                                            span: 35:9..38:5,
+                                        },
+                                    ),
+                                ),
+                                writes: None,
+                                policy: PolicyBlock {
+                                    retry: None,
+                                    timeout: None,
+                                    on_error: None,
+                                },
+                                description: None,
+                                span: 33:7..38:5,
+                            },
+                            Node {
+                                id: "classify" @ 38:5..38:13,
+                                kind: Agent(
+                                    agent.triage @ 39:14..39:26,
+                                ),
+                                input: Some(
+                                    Fields(
+                                        Bindings {
+                                            entries: [
+                                                Binding {
+                                                    name: "report" @ 41:9..41:15,
+                                                    value: cel("state.report_normalized") @ 41:17..41:42,
+                                                },
+                                                Binding {
+                                                    name: "matches" @ 42:9..42:16,
+                                                    value: cel("state.matches") @ 42:18..42:33,
+                                                },
+                                            ],
+                                            span: 41:9..48:5,
+                                        },
+                                    ),
+                                ),
+                                writes: None,
+                                policy: PolicyBlock {
+                                    retry: None,
+                                    timeout: None,
+                                    on_error: None,
+                                },
+                                description: None,
+                                span: 39:7..48:5,
+                            },
+                            Node {
+                                id: "dispatch" @ 48:5..48:13,
+                                kind: Map(
+                                    MapBlock {
+                                        over: Some(
+                                            path("classify.output.findings") @ 50:15..50:39,
+                                        ),
+                                        item_binding: Some(
+                                            "finding" @ 51:13..51:20,
+                                        ),
+                                        dispatch: Routed {
+                                            route_by: "kind" @ 52:19..52:23,
+                                            routes: [
+                                                MapRoute {
+                                                    tag: Some(
+                                                        "auto_fixable" @ 64:11..64:23,
+                                                    ),
+                                                    node: Some(
+                                                        agent.fixer @ 65:19..65:30,
+                                                    ),
+                                                    max_concurrency: Some(
+                                                        4 @ 66:30..66:31,
+                                                    ),
+                                                    input: Some(
+                                                        Fields(
+                                                            Bindings {
+                                                                entries: [
+                                                                    Binding {
+                                                                        name: "file" @ 68:15..68:19,
+                                                                        value: cel("finding.file") @ 68:21..68:35,
+                                                                    },
+                                                                    Binding {
+                                                                        name: "patch_hint" @ 69:15..69:25,
+                                                                        value: cel("finding.patch_hint") @ 69:27..69:47,
+                                                                    },
+                                                                ],
+                                                                span: 68:15..70:13,
+                                                            },
+                                                        ),
+                                                    ),
+                                                    writes: Some(
+                                                        Writes {
+                                                            entries: [
+                                                                WriteEntry {
+                                                                    field: "patch" @ 71:15..71:20,
+                                                                    channel: "patches" @ 71:22..71:29,
+                                                                },
+                                                            ],
+                                                            span: 71:15..72:11,
+                                                        },
+                                                    ),
+                                                    detach: None,
+                                                    span: 65:13..72:11,
+                                                },
+                                                MapRoute {
+                                                    tag: Some(
+                                                        "needs_human" @ 72:11..72:22,
+                                                    ),
+                                                    node: Some(
+                                                        tool.review_queue @ 73:19..73:36,
+                                                    ),
+                                                    max_concurrency: None,
+                                                    input: Some(
+                                                        Fields(
+                                                            Bindings {
+                                                                entries: [
+                                                                    Binding {
+                                                                        name: "summary" @ 75:15..75:22,
+                                                                        value: cel("finding.summary") @ 75:24..75:41,
+                                                                    },
+                                                                    Binding {
+                                                                        name: "severity" @ 76:15..76:23,
+                                                                        value: cel("finding.severity") @ 76:25..76:43,
+                                                                    },
+                                                                ],
+                                                                span: 75:15..89:9,
+                                                            },
+                                                        ),
+                                                    ),
+                                                    writes: None,
+                                                    detach: None,
+                                                    span: 73:13..89:9,
+                                                },
+                                            ],
+                                            default: Some(
+                                                MapRoute {
+                                                    tag: None,
+                                                    node: Some(
+                                                        tool.dead_letter @ 90:17..90:33,
+                                                    ),
+                                                    max_concurrency: None,
+                                                    input: Some(
+                                                        Fields(
+                                                            Bindings {
+                                                                entries: [
+                                                                    Binding {
+                                                                        name: "kind" @ 93:13..93:17,
+                                                                        value: cel("finding.kind") @ 93:19..93:33,
+                                                                    },
+                                                                    Binding {
+                                                                        name: "payload" @ 94:13..94:20,
+                                                                        value: cel("finding.of") @ 94:22..94:34,
+                                                                    },
+                                                                ],
+                                                                span: 93:13..98:7,
+                                                            },
+                                                        ),
+                                                    ),
+                                                    writes: None,
+                                                    detach: Some(
+                                                        false @ 91:19..91:24,
+                                                    ),
+                                                    span: 90:11..98:7,
+                                                },
+                                            ),
+                                        },
+                                        max_concurrency: Some(
+                                            8 @ 53:26..53:27,
+                                        ),
+                                        on_item_error: Some(
+                                            Retry(
+                                                Retry {
+                                                    max: Some(
+                                                        2 @ 62:25..62:26,
+                                                    ),
+                                                    backoff: Some(
+                                                        duration("2s") @ 62:37..62:39,
+                                                    ),
+                                                    multiplier: None,
+                                                    max_backoff: None,
+                                                    jitter: None,
+                                                    span: 62:18..62:41,
+                                                } @ 62:18..62:41,
+                                            ) @ 62:11..63:9,
+                                        ),
+                                        input: None,
+                                        writes: None,
+                                        detach: None,
+                                        span: 50:9..98:7,
+                                    },
+                                ),
+                                input: None,
+                                writes: None,
+                                policy: PolicyBlock {
+                                    retry: None,
+                                    timeout: None,
+                                    on_error: Some(
+                                        Skip @ 98:17..98:21,
+                                    ),
+                                },
+                                description: None,
+                                span: 49:7..104:5,
+                            },
+                            Node {
+                                id: "announce" @ 104:5..104:13,
+                                kind: Http(
+                                    HttpBlock {
+                                        method: Some(
+                                            Post @ 106:17..106:21,
+                                        ),
+                                        url: Some(
+                                            interpolated("https://${QUEUE_HOST}/v1/triage-started") @ 107:14..107:55,
+                                        ),
+                                        headers: [
+                                            InterpolatedEntry {
+                                                name: "authorization" @ 109:11..109:24,
+                                                value: interpolated("Bearer ${QUEUE_TOKEN}") @ 109:26..109:49,
+                                            },
+                                        ],
+                                        query: None,
+                                        body: Some(
+                                            Bindings {
+                                                entries: [
+                                                    Binding {
+                                                        name: "report" @ 111:11..111:17,
+                                                        value: cel("state.report_normalized") @ 111:19..111:44,
+                                                    },
+                                                ],
+                                                span: 111:11..112:9,
+                                            },
+                                        ),
+                                        expect_status: [],
+                                        output: Some(
+                                            FieldMap {
+                                                fields: [
+                                                    Field {
+                                                        name: "status" @ 113:11..113:17,
+                                                        ty: TypeNode {
+                                                            form: Scalar(
+                                                                ScalarType {
+                                                                    kind: Integer @ 113:27..113:34,
+                                                                },
+                                                            ),
+                                                            description: None,
+                                                            span: 113:19..113:36,
+                                                        },
+                                                    },
+                                                ],
+                                                surface: Result,
+                                                span: 113:11..114:7,
+                                            },
+                                        ),
+                                        span: 106:9..114:7,
+                                    },
+                                ),
+                                input: None,
+                                writes: None,
+                                policy: PolicyBlock {
+                                    retry: None,
+                                    timeout: Some(
+                                        duration("10s") @ 114:16..114:19,
+                                    ),
+                                    on_error: Some(
+                                        Fallback(
+                                            Node(
+                                                "announce_failed",
+                                            ) @ 118:29..118:44,
+                                        ) @ 118:17..118:46,
+                                    ),
+                                },
+                                description: None,
+                                span: 105:7..130:5,
+                            },
+                            Node {
+                                id: "announce_failed" @ 130:5..130:20,
+                                kind: Exec(
+                                    ExecBlock {
+                                        command: Some(
+                                            interpolated("${OPS_BIN}/log-event") @ 132:18..132:40,
+                                        ),
+                                        args: [
+                                            "--kind=announce-failed" @ 133:16..133:40,
+                                            interpolated("--env=${DEPLOY_ENV}") @ 133:42..133:63,
+                                        ],
+                                        cwd: None,
+                                        env: [],
+                                        expect_exit: [],
+                                        output: None,
+                                        span: 132:9..134:7,
+                                    },
+                                ),
+                                input: None,
+                                writes: None,
+                                policy: PolicyBlock {
+                                    retry: None,
+                                    timeout: None,
+                                    on_error: Some(
+                                        Skip @ 134:17..134:21,
+                                    ),
+                                },
+                                description: None,
+                                span: 131:7..147:5,
+                            },
+                            Node {
+                                id: "verify" @ 147:5..147:11,
+                                kind: Exec(
+                                    ExecBlock {
+                                        command: Some(
+                                            "run-checks" @ 149:18..149:28,
+                                        ),
+                                        args: [
+                                            "--fast" @ 150:16..150:24,
+                                        ],
+                                        cwd: Some(
+                                            interpolated("${REPO_ROOT}") @ 151:14..151:28,
+                                        ),
+                                        env: [
+                                            InterpolatedEntry {
+                                                name: "CI" @ 153:11..153:13,
+                                                value: "true" @ 153:15..153:21,
+                                            },
+                                        ],
+                                        expect_exit: [
+                                            0 @ 154:23..154:24,
+                                            1 @ 154:26..154:27,
+                                        ],
+                                        output: Some(
+                                            FieldMap {
+                                                fields: [
+                                                    Field {
+                                                        name: "exit_code" @ 156:11..156:20,
+                                                        ty: TypeNode {
+                                                            form: Scalar(
+                                                                ScalarType {
+                                                                    kind: Integer @ 156:30..156:37,
+                                                                },
+                                                            ),
+                                                            description: None,
+                                                            span: 156:22..156:39,
+                                                        },
+                                                    },
+                                                    Field {
+                                                        name: "stdout" @ 157:11..157:17,
+                                                        ty: TypeNode {
+                                                            form: Scalar(
+                                                                ScalarType {
+                                                                    kind: String @ 157:27..157:33,
+                                                                },
+                                                            ),
+                                                            description: None,
+                                                            span: 157:19..157:35,
+                                                        },
+                                                    },
+                                                ],
+                                                surface: Result,
+                                                span: 156:11..158:7,
+                                            },
+                                        ),
+                                        span: 149:9..158:7,
+                                    },
+                                ),
+                                input: Some(
+                                    Fields(
+                                        Bindings {
+                                            entries: [
+                                                Binding {
+                                                    name: "patches" @ 159:9..159:16,
+                                                    value: cel("state.patches") @ 159:18..159:33,
+                                                },
+                                            ],
+                                            span: 159:9..160:7,
+                                        },
+                                    ),
+                                ),
+                                writes: None,
+                                policy: PolicyBlock {
+                                    retry: None,
+                                    timeout: Some(
+                                        duration("5m") @ 160:16..160:18,
+                                    ),
+                                    on_error: Some(
+                                        Skip @ 161:17..161:21,
+                                    ),
+                                },
+                                description: None,
+                                span: 148:7..163:5,
+                            },
+                            Node {
+                                id: "summarize" @ 163:5..163:14,
+                                kind: Agent(
+                                    agent.summarizer @ 164:14..164:30,
+                                ),
+                                input: Some(
+                                    Fields(
+                                        Bindings {
+                                            entries: [
+                                                Binding {
+                                                    name: "report" @ 166:9..166:15,
+                                                    value: cel("state.report_normalized") @ 166:17..166:42,
+                                                },
+                                                Binding {
+                                                    name: "patches" @ 167:9..167:16,
+                                                    value: cel("state.patches") @ 167:18..167:33,
+                                                },
+                                            ],
+                                            span: 166:9..172:5,
+                                        },
+                                    ),
+                                ),
+                                writes: None,
+                                policy: PolicyBlock {
+                                    retry: None,
+                                    timeout: None,
+                                    on_error: None,
+                                },
+                                description: None,
+                                span: 164:7..172:5,
+                            },
+                            Node {
+                                id: "remember" @ 172:5..172:13,
+                                kind: Store(
+                                    StoreNode {
+                                        store: store.triage_memory @ 173:14..173:33,
+                                        op: Some(
+                                            Set @ 174:11..174:14,
+                                        ),
+                                        params: StoreOpParams {
+                                            key: Some(
+                                                cel("execution.session_key") @ 175:12..175:35,
+                                            ),
+                                            value: Some(
+                                                Fields(
+                                                    Bindings {
+                                                        entries: [
+                                                            Binding {
+                                                                name: "last_report" @ 177:9..177:20,
+                                                                value: cel("input.report") @ 177:22..177:36,
+                                                            },
+                                                            Binding {
+                                                                name: "patch_count" @ 178:9..178:20,
+                                                                value: cel("size(state.patches)") @ 178:22..178:43,
+                                                            },
+                                                        ],
+                                                        span: 177:9..179:7,
+                                                    },
+                                                ),
+                                            ),
+                                            query: None,
+                                            prefix: None,
+                                            top_k: None,
+                                            limit: None,
+                                            filter: None,
+                                            metadata: None,
+                                            content_type: None,
+                                        },
+                                    },
+                                ),
+                                input: None,
+                                writes: None,
+                                policy: PolicyBlock {
+                                    retry: None,
+                                    timeout: None,
+                                    on_error: Some(
+                                        Skip @ 179:17..179:21,
+                                    ),
+                                },
+                                description: None,
+                                span: 173:7..183:5,
+                            },
+                            Node {
+                                id: "approve" @ 183:5..183:12,
+                                kind: Human(
+                                    HumanBlock {
+                                        input: Some(
+                                            FieldMap {
+                                                fields: [
+                                                    Field {
+                                                        name: "summary" @ 186:11..186:18,
+                                                        ty: TypeNode {
+                                                            form: Scalar(
+                                                                ScalarType {
+                                                                    kind: String @ 186:28..186:34,
+                                                                },
+                                                            ),
+                                                            description: None,
+                                                            span: 186:20..186:36,
+                                                        },
+                                                    },
+                                                    Field {
+                                                        name: "patch_count" @ 187:11..187:22,
+                                                        ty: TypeNode {
+                                                            form: Scalar(
+                                                                ScalarType {
+                                                                    kind: Integer @ 187:32..187:39,
+                                                                },
+                                                            ),
+                                                            description: None,
+                                                            span: 187:24..187:41,
+                                                        },
+                                                    },
+                                                ],
+                                                surface: Input,
+                                                span: 186:11..188:9,
+                                            },
+                                        ),
+                                        output: Some(
+                                            FieldMap {
+                                                fields: [
+                                                    Field {
+                                                        name: "decision" @ 189:11..189:19,
+                                                        ty: TypeNode {
+                                                            form: Enum(
+                                                                EnumType {
+                                                                    variants: [
+                                                                        "approve" @ 189:30..189:37,
+                                                                        "reject" @ 189:39..189:45,
+                                                                    ],
+                                                                    default: None,
+                                                                },
+                                                            ),
+                                                            description: None,
+                                                            span: 189:21..189:48,
+                                                        },
+                                                    },
+                                                    Field {
+                                                        name: "note" @ 190:11..190:15,
+                                                        ty: TypeNode {
+                                                            form: Scalar(
+                                                                ScalarType {
+                                                                    kind: String @ 190:25..190:31,
+                                                                },
+                                                            ),
+                                                            description: None,
+                                                            span: 190:17..190:33,
+                                                        },
+                                                    },
+                                                ],
+                                                surface: Result,
+                                                span: 189:11..191:9,
+                                            },
+                                        ),
+                                        timeout: Some(
+                                            duration("24h") @ 191:18..191:21,
+                                        ),
+                                        on_timeout: Some(
+                                            Node(
+                                                "escalate",
+                                            ) @ 192:21..192:29,
+                                        ),
+                                        span: 185:9..193:7,
+                                    },
+                                ),
+                                input: Some(
+                                    Fields(
+                                        Bindings {
+                                            entries: [
+                                                Binding {
+                                                    name: "summary" @ 194:9..194:16,
+                                                    value: cel("state.summary") @ 194:18..194:33,
+                                                },
+                                                Binding {
+                                                    name: "patch_count" @ 195:9..195:20,
+                                                    value: cel("size(state.patches)") @ 195:22..195:43,
+                                                },
+                                            ],
+                                            span: 194:9..196:7,
+                                        },
+                                    ),
+                                ),
+                                writes: Some(
+                                    Writes {
+                                        entries: [
+                                            WriteEntry {
+                                                field: "decision" @ 197:9..197:17,
+                                                channel: "human_decision" @ 197:19..197:33,
+                                            },
+                                        ],
+                                        span: 197:9..201:5,
+                                    },
+                                ),
+                                policy: PolicyBlock {
+                                    retry: None,
+                                    timeout: None,
+                                    on_error: None,
+                                },
+                                description: None,
+                                span: 184:7..201:5,
+                            },
+                            Node {
+                                id: "escalate" @ 201:5..201:13,
+                                kind: Http(
+                                    HttpBlock {
+                                        method: Some(
+                                            Post @ 203:17..203:21,
+                                        ),
+                                        url: Some(
+                                            interpolated("https://${QUEUE_HOST}/v1/escalations") @ 204:14..204:52,
+                                        ),
+                                        headers: [
+                                            InterpolatedEntry {
+                                                name: "authorization" @ 206:11..206:24,
+                                                value: interpolated("Bearer ${QUEUE_TOKEN}") @ 206:26..206:49,
+                                            },
+                                        ],
+                                        query: None,
+                                        body: Some(
+                                            Bindings {
+                                                entries: [
+                                                    Binding {
+                                                        name: "summary" @ 208:11..208:18,
+                                                        value: cel("state.summary") @ 208:20..208:35,
+                                                    },
+                                                ],
+                                                span: 208:11..209:9,
+                                            },
+                                        ),
+                                        expect_status: [],
+                                        output: Some(
+                                            FieldMap {
+                                                fields: [
+                                                    Field {
+                                                        name: "status" @ 210:11..210:17,
+                                                        ty: TypeNode {
+                                                            form: Scalar(
+                                                                ScalarType {
+                                                                    kind: Integer @ 210:27..210:34,
+                                                                },
+                                                            ),
+                                                            description: None,
+                                                            span: 210:19..210:36,
+                                                        },
+                                                    },
+                                                ],
+                                                surface: Result,
+                                                span: 210:11..211:7,
+                                            },
+                                        ),
+                                        span: 203:9..211:7,
+                                    },
+                                ),
+                                input: None,
+                                writes: None,
+                                policy: PolicyBlock {
+                                    retry: Some(
+                                        Retry {
+                                            max: Some(
+                                                3 @ 212:21..212:22,
+                                            ),
+                                            backoff: Some(
+                                                duration("1s") @ 212:33..212:35,
+                                            ),
+                                            multiplier: None,
+                                            max_backoff: None,
+                                            jitter: None,
+                                            span: 212:14..212:37,
+                                        } @ 212:14..212:37,
+                                    ),
+                                    timeout: Some(
+                                        duration("10s") @ 211:16..211:19,
+                                    ),
+                                    on_error: None,
+                                },
+                                description: None,
+                                span: 202:7..214:3,
+                            },
+                        ],
+                        edges: [
+                            Edge {
+                                from: Some(
+                                    Start @ 215:15..215:20,
+                                ),
+                                to: Some(
+                                    Node(
+                                        "enrich",
+                                    ) @ 215:26..215:32,
+                                ),
+                                when: None,
+                                else_edge: None,
+                                max_iterations: None,
+                                span: 215:7..215:34,
+                            },
+                            Edge {
+                                from: Some(
+                                    Node(
+                                        "enrich",
+                                    ) @ 216:15..216:21,
+                                ),
+                                to: Some(
+                                    Node(
+                                        "scan",
+                                    ) @ 216:27..216:31,
+                                ),
+                                when: None,
+                                else_edge: None,
+                                max_iterations: None,
+                                span: 216:7..216:33,
+                            },
+                            Edge {
+                                from: Some(
+                                    Node(
+                                        "scan",
+                                    ) @ 217:15..217:19,
+                                ),
+                                to: Some(
+                                    Node(
+                                        "classify",
+                                    ) @ 217:25..217:33,
+                                ),
+                                when: None,
+                                else_edge: None,
+                                max_iterations: None,
+                                span: 217:7..217:35,
+                            },
+                            Edge {
+                                from: Some(
+                                    Node(
+                                        "classify",
+                                    ) @ 220:15..220:23,
+                                ),
+                                to: Some(
+                                    Node(
+                                        "dispatch",
+                                    ) @ 220:29..220:37,
+                                ),
+                                when: None,
+                                else_edge: None,
+                                max_iterations: None,
+                                span: 220:7..220:39,
+                            },
+                            Edge {
+                                from: Some(
+                                    Node(
+                                        "classify",
+                                    ) @ 221:15..221:23,
+                                ),
+                                to: Some(
+                                    Node(
+                                        "announce",
+                                    ) @ 221:29..221:37,
+                                ),
+                                when: None,
+                                else_edge: None,
+                                max_iterations: None,
+                                span: 221:7..221:39,
+                            },
+                            Edge {
+                                from: Some(
+                                    Node(
+                                        "dispatch",
+                                    ) @ 230:15..230:23,
+                                ),
+                                to: Some(
+                                    Node(
+                                        "verify",
+                                    ) @ 230:29..230:35,
+                                ),
+                                when: None,
+                                else_edge: None,
+                                max_iterations: None,
+                                span: 230:7..230:37,
+                            },
+                            Edge {
+                                from: Some(
+                                    Node(
+                                        "announce",
+                                    ) @ 231:15..231:23,
+                                ),
+                                to: Some(
+                                    Node(
+                                        "verify",
+                                    ) @ 231:29..231:35,
+                                ),
+                                when: None,
+                                else_edge: None,
+                                max_iterations: None,
+                                span: 231:7..231:37,
+                            },
+                            Edge {
+                                from: Some(
+                                    Node(
+                                        "announce_failed",
+                                    ) @ 235:15..235:30,
+                                ),
+                                to: Some(
+                                    End @ 235:36..235:39,
+                                ),
+                                when: None,
+                                else_edge: None,
+                                max_iterations: None,
+                                span: 235:7..235:41,
+                            },
+                            Edge {
+                                from: Some(
+                                    Node(
+                                        "verify",
+                                    ) @ 236:15..236:21,
+                                ),
+                                to: Some(
+                                    Node(
+                                        "summarize",
+                                    ) @ 236:27..236:36,
+                                ),
+                                when: None,
+                                else_edge: None,
+                                max_iterations: None,
+                                span: 236:7..236:38,
+                            },
+                            Edge {
+                                from: Some(
+                                    Node(
+                                        "summarize",
+                                    ) @ 237:15..237:24,
+                                ),
+                                to: Some(
+                                    Node(
+                                        "remember",
+                                    ) @ 237:30..237:38,
+                                ),
+                                when: None,
+                                else_edge: None,
+                                max_iterations: None,
+                                span: 237:7..237:40,
+                            },
+                            Edge {
+                                from: Some(
+                                    Node(
+                                        "remember",
+                                    ) @ 238:15..238:23,
+                                ),
+                                to: Some(
+                                    Node(
+                                        "approve",
+                                    ) @ 238:29..238:36,
+                                ),
+                                when: None,
+                                else_edge: None,
+                                max_iterations: None,
+                                span: 238:7..238:38,
+                            },
+                            Edge {
+                                from: Some(
+                                    Node(
+                                        "approve",
+                                    ) @ 239:15..239:22,
+                                ),
+                                to: Some(
+                                    End @ 239:28..239:31,
+                                ),
+                                when: Some(
+                                    cel("approve.output.decision == 'approve'") @ 239:39..239:78,
+                                ),
+                                else_edge: None,
+                                max_iterations: None,
+                                span: 239:7..239:79,
+                            },
+                            Edge {
+                                from: Some(
+                                    Node(
+                                        "approve",
+                                    ) @ 240:15..240:22,
+                                ),
+                                to: Some(
+                                    Node(
+                                        "escalate",
+                                    ) @ 240:28..240:36,
+                                ),
+                                when: Some(
+                                    cel("approve.output.decision == 'reject'") @ 240:44..240:82,
+                                ),
+                                else_edge: None,
+                                max_iterations: None,
+                                span: 240:7..240:83,
+                            },
+                            Edge {
+                                from: Some(
+                                    Node(
+                                        "escalate",
+                                    ) @ 241:15..241:23,
+                                ),
+                                to: Some(
+                                    End @ 241:29..241:32,
+                                ),
+                                when: None,
+                                else_edge: None,
+                                max_iterations: None,
+                                span: 241:7..241:34,
+                            },
+                        ],
+                    },
+                ),
+                span: 1:1..242:1,
+            },
+        ],
+        span: 1:1..242:1,
+    },
+)

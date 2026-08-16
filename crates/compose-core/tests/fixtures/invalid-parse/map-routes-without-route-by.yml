@@ -1,0 +1,17 @@
+# rule: the routed form of a map declares `route_by:` alongside `routes:` (grammar 8.6 rule 2)
+# code: missing-key
+# message: missing required key `route_by` in the `map` block of node `work`
+# at: 11:9
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    work:
+      map:
+        over: plan.output.findings
+        max_concurrency: 4
+        routes:
+          auto_fixable: { node: agent.fixer }
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }

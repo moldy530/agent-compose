@@ -1,0 +1,15 @@
+# rule: a discriminated union may not be the top level of a declaration surface (grammar 3.7, Decision D11)
+# code: invalid-value
+# message: `output` of tool definition `tool.classify` is a discriminated union, but a field map belongs here
+# at: 10:5
+# help: a union is legal as an array's `items:` or as the type of a named property, never as a whole surface: every declaration surface is a field map, so routing fields have names (grammar 3.7, Decision D11)
+tool.classify:
+  description: Classifies a finding.
+  input: {}
+  output:
+    discriminator: kind
+    variants:
+      auto_fixable: { file: { type: string } }
+      needs_human: { summary: { type: string } }
+  exec:
+    command: classify

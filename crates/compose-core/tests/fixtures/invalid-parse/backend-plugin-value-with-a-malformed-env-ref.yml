@@ -1,0 +1,13 @@
+# rule: a non-secret plugin-config value is interpolable, so it is scanned for well-formed `${ENV}` tokens (grammar 4.3 class 2, 14.2)
+# code: invalid-env-ref
+# message: `${docs_index}` in `index` in backend alias `docs_db` is not a valid environment reference
+# at: 13:14
+# help: environment names are uppercase letters, digits, and `_`, starting with a letter or `_`; write `$${NAME}` for a literal `${NAME}`
+version: "0.1"
+
+storage_backends:
+  aliases:
+    docs_db:
+      provider: chroma
+      url: ${CHROMA_URL}
+      index: "${docs_index}"

@@ -1,0 +1,14 @@
+# rule: an input field and an `env:` key may not claim the same environment slot (grammar 6.1, Decision D66)
+# code: conflicting-keys
+# message: `env` declares `TARGET`, which is also where the input field `target` arrives
+# at: 14:7
+# help: an object input is passed to the child as upper-snake-cased environment variables, so one of the two values would be silently discarded
+tool.probe:
+  description: Probe the deployment.
+  input:
+    target: { type: string }
+  output: {}
+  exec:
+    command: probe
+    env:
+      TARGET: "${DEFAULT_TARGET}"

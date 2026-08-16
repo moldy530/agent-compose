@@ -1,0 +1,8 @@
+# rule: a model's `id:` is part of the composition, not of its environment (grammar 4.3)
+# code: unexpected-env-ref
+# message: model `id` never interpolates environment references, but it contains `${ANTHROPIC_MODEL_ID}`
+# at: 8:7
+# help: write `$${ANTHROPIC_MODEL_ID}` for a literal `${ANTHROPIC_MODEL_ID}`
+model.smart:
+  provider: provider.anthropic
+  id: ${ANTHROPIC_MODEL_ID}

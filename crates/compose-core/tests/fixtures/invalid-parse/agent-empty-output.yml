@@ -1,0 +1,9 @@
+# rule: an agent's `output:` declares at least one property (grammar 5.1)
+# code: invalid-value
+# message: `output` of agent definition `agent.reviewer` must declare at least one property
+# at: 9:11
+# help: an agent's structured output is what routing reads and what makes its edges serializable (grammar 5.1)
+agent.reviewer:
+  model: model.smart
+  prompt: Review the draft.
+  output: {}

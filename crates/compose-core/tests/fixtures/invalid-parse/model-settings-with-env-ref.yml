@@ -1,0 +1,10 @@
+# rule: every value inside a model's `settings:` is part of the composition, not of its environment (grammar 4.3, PRD 5.9)
+# code: unexpected-env-ref
+# message: `settings` of model definition `model.smart` never interpolates environment references, but it contains `${STOP_SEQUENCE}`
+# at: 10:12
+# help: write `$${STOP_SEQUENCE}` for a literal `${STOP_SEQUENCE}`
+model.smart:
+  provider: provider.anthropic
+  id: claude-sonnet-4-6
+  settings:
+    stop: ["${STOP_SEQUENCE}"]

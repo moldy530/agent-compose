@@ -1,0 +1,7 @@
+# rule: a spec file holds exactly one YAML document (grammar 1.1)
+# code: multiple-documents
+# message: a spec file holds exactly one YAML document; `---` starts a second one
+# at: 6:1
+version: "0.1"
+---
+version: "0.1"

@@ -1,0 +1,15 @@
+# rule: a control transfer never targets `start` (grammar 9.2, Decision D21)
+# code: reserved-name
+# message: `fallback` may not be `start`
+# at: 12:29
+# help: control transfers go to a node of this flow or to `end`: re-entering a flow from an error has no defined input
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    write:
+      agent: agent.researcher
+      on_error: { fallback: start }
+  edges:
+    - { from: start, to: write }
+    - { from: write, to: end }

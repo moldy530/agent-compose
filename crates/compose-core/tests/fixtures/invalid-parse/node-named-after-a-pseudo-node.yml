@@ -1,0 +1,12 @@
+# rule: a node may not be named `start` or `end` (grammar 2.4)
+# code: reserved-name
+# message: `end` is a pseudo-node and may not be used as a node id
+# at: 10:5
+# help: `start` is a flow's entry and `end` its exit; they are written on edges
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    end: { agent: agent.researcher }
+  edges:
+    - { from: start, to: end }

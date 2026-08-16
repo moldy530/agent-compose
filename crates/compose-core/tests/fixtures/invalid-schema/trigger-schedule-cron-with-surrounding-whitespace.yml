@@ -1,0 +1,8 @@
+# rule: a schedule trigger's `cron:` is five fields with nothing around them - the shape is anchored, so a trailing space is a rejection (grammar 13.4 / Decision D46)
+# at: /triggers/nightly/cron
+# via: /$defs/scheduleTrigger/properties/cron/allOf/1/pattern
+triggers:
+  nightly:
+    type: schedule
+    flow: flow.triage
+    cron: "0 3 * * * "

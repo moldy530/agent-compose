@@ -1,0 +1,16 @@
+# rule: `expect_exit` members are distinct - membership is a set test, so a repeat is inert (grammar 6.1, Decision D100)
+# code: invalid-value
+# message: `expect_exit` lists 0 twice
+# at: 13:26
+# help: membership in `expect_exit` is a set test, so the second entry changes nothing
+flow.demo:
+  outputs:
+    done: { type: boolean }
+  nodes:
+    verify:
+      exec:
+        command: run-checks
+        expect_exit: [0, 0]
+  edges:
+    - { from: start, to: verify }
+    - { from: verify, to: end }

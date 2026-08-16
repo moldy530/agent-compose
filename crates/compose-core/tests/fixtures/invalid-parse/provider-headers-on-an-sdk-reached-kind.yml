@@ -1,0 +1,10 @@
+# rule: the two SDK-reached kinds take no `headers:` - there is no request the spec composes headers onto (grammar 12.1, Decision D106)
+# code: unknown-key
+# message: provider definition `provider.aws` declares `kind: bedrock`, which has no `headers` key
+# at: 9:3
+# help: the keys of `kind: bedrock` are `kind`, `region`, `access_key_id`, `secret_access_key`, `session_token`, `profile`, `description`
+provider.aws:
+  kind: bedrock
+  region: us-east-1
+  headers:
+    x-trace-id: "${TRACE_ID}"

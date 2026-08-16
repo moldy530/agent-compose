@@ -1,0 +1,10 @@
+# rule: `cron:` is a 5-field POSIX expression (grammar 13.4, Decision D46)
+# code: invalid-value
+# message: `cron` takes a 5-field POSIX cron expression, found 4 field(s)
+# at: 10:11
+# help: the fields are minute, hour, day-of-month, month, and day-of-week
+triggers:
+  nightly:
+    type: schedule
+    flow: flow.triage
+    cron: "0 3 * *"

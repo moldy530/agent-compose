@@ -1,0 +1,7 @@
+# rule: reserved identifiers may not name a state channel (grammar 2.5, Decision D33)
+# code: reserved-name
+# message: `output` may not name a state channel: it is a CEL root identifier
+# at: 7:3
+# help: reserved channel names are `input`, `state`, `execution`, `item`, `messages`, `output`, `payload`
+state:
+  output: { type: string }

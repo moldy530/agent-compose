@@ -1,0 +1,9 @@
+# rule: a trigger declares one of the four types (grammar 13.1)
+# code: unknown-variant
+# message: `webhook` is not a trigger type
+# at: 8:11
+# help: the trigger types are `manual`, `http`, `schedule`, `event`
+triggers:
+  on_request:
+    type: webhook
+    flow: flow.review_loop

@@ -1,0 +1,17 @@
+# rule: a trigger whose `type:` did not read is one mistake, not one more per key that type would have taken (grammar 13.3)
+# code: unknown-variant
+# message: `htttp` is not a trigger type
+# at: 12:11
+# help: did you mean `http`?
+triggers:
+  # `path`, `method`, `respond` and `timeout` are exactly the keys grammar 13.3
+  # gives an `http` trigger — the type this typo meant — so reporting each as an
+  # unknown key would assert four violations this file does not contain, and
+  # bury the one it does.
+  on_request:
+    type: htttp
+    flow: flow.review_loop
+    path: /review
+    method: POST
+    respond: sync
+    timeout: 5s

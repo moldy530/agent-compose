@@ -1,0 +1,9 @@
+# rule: an `imports:` entry is class 3, so it carries no environment references - and its braces must not be mistaken for a glob (grammar 4.3, 1.4)
+# code: invalid-import-path
+# message: `${AGENTS_DIR}/reviewer.yml` carries an environment reference
+# at: 9:5
+# help: an import path is part of what the composition *is*, so it is fixed in the file rather than at process start (grammar 4.3); write `$${` for a literal `${`
+version: "0.1"
+
+imports:
+  - "${AGENTS_DIR}/reviewer.yml"

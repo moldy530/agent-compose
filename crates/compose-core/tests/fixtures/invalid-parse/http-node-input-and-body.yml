@@ -1,0 +1,20 @@
+# rule: an inline node's `input:` never competes with its block for the same slot (grammar 8.3, Decision D66)
+# code: conflicting-keys
+# message: node `notify` declares both `input:` and an in-block `body`, which both claim the request body
+# at: 15:11
+# help: write the request out in full, or let the bindings build it
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    notify:
+      http:
+        method: POST
+        url: "https://${HOOKS_HOST}/notify"
+        body:
+          draft: "state.draft"
+      input:
+        draft: "state.draft"
+  edges:
+    - { from: start, to: notify }
+    - { from: notify, to: end }

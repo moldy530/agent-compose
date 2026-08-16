@@ -1,0 +1,18 @@
+# rule: an `else: true` edge requires a `when:`-guarded sibling leaving the same node (grammar 7.3, Decision D107)
+# code: invalid-value
+# message: the `else: true` edge leaving `review` has no `when`-guarded sibling
+# at: 18:38
+# help: an `else:` edge is taken when no guarded sibling was taken, so with none it fires on every pass — which is what an edge carrying neither keyword already is: drop the `else:`, or guard the sibling it is meant to be else to (grammar 7.3, Decision D107)
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    write:
+      agent: agent.researcher
+    review:
+      agent: agent.reviewer
+  edges:
+    - { from: start, to: write }
+    - { from: write, to: review }
+    - { from: review, to: write }
+    - { from: review, to: end, else: true }

@@ -1,0 +1,19 @@
+# rule: node-level `retry`/`timeout` are illegal on a human node (grammar 8.7, Decision D52)
+# code: invalid-value
+# message: `retry` is not legal on node `approve`
+# at: 16:7
+# help: a human wait is not an activity timeout, and re-prompting a human is not a retry
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    approve:
+      human:
+        input:
+          draft: { type: string }
+        output:
+          decision: { enum: [approve, reject] }
+      retry: { max: 2, backoff: 5s }
+  edges:
+    - { from: start, to: approve }
+    - { from: approve, to: end }

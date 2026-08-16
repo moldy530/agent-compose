@@ -1,0 +1,88 @@
+---
+source: crates/compose-core/tests/parse_examples.rs
+expression: "parse_clean(\"examples/triage-fanout/stores/docs.yml\")"
+---
+Spec(
+    SpecFile {
+        source: "examples/triage-fanout/stores/docs.yml",
+        version: None,
+        imports: None,
+        defaults: None,
+        state: None,
+        triggers: None,
+        definitions: [
+            Definition {
+                address: store.docs @ 12:1..12:11,
+                body: Store(
+                    StoreDef {
+                        kind: Some(
+                            Vector @ 13:9..13:15,
+                        ),
+                        scope: Some(
+                            Global @ 14:10..14:16,
+                        ),
+                        value_schema: None,
+                        metadata_schema: Some(
+                            FieldMap {
+                                fields: [
+                                    Field {
+                                        name: "source" @ 21:5..21:11,
+                                        ty: TypeNode {
+                                            form: Scalar(
+                                                ScalarType {
+                                                    kind: String @ 21:21..21:27,
+                                                },
+                                            ),
+                                            description: None,
+                                            span: 21:13..21:29,
+                                        },
+                                    },
+                                    Field {
+                                        name: "updated_at" @ 22:5..22:15,
+                                        ty: TypeNode {
+                                            form: Scalar(
+                                                ScalarType {
+                                                    kind: String @ 22:25..22:31,
+                                                    format: DateTime @ 22:41..22:50,
+                                                },
+                                            ),
+                                            description: None,
+                                            span: 22:17..22:52,
+                                        },
+                                    },
+                                ],
+                                surface: Result,
+                                span: 21:5..23:3,
+                            },
+                        ),
+                        embed: Some(
+                            EmbedBlock {
+                                model: Some(
+                                    "text-embedding-3-small" @ 17:12..17:34,
+                                ),
+                                provider: Some(
+                                    provider.local @ 18:15..18:29,
+                                ),
+                                dimensions: Some(
+                                    1536 @ 19:17..19:21,
+                                ),
+                                span: 17:5..20:3,
+                            },
+                        ),
+                        backend: Some(
+                            "docs_db" @ 23:12..23:19,
+                        ),
+                        description: Some(
+                            "Project documentation, chunked, for grounding triage decisions." @ 15:16..15:79,
+                        ),
+                        agent_access: Some(
+                            Read @ 24:17..24:21,
+                        ),
+                    },
+                ),
+                span: 12:1..25:1,
+            },
+        ],
+        span: 12:1..25:1,
+    },
+)

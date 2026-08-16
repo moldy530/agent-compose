@@ -1,0 +1,10 @@
+# rule: definition keys name one of the six namespaces (grammar 2.2)
+# code: unknown-key
+# message: unknown top-level key `agnt.reviewer`
+# at: 6:1
+# help: did you mean `agent.reviewer`?
+agnt.reviewer:
+  model: model.smart
+  prompt: Review the draft.
+  output:
+    verdict: { enum: [approve, revise] }

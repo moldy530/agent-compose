@@ -1,0 +1,122 @@
+---
+source: crates/compose-core/tests/parse_examples.rs
+expression: "parse_clean(\"examples/triage-fanout/deploy/staging.yml\")"
+---
+Deploy(
+    DeployFile {
+        source: "examples/triage-fanout/deploy/staging.yml",
+        version: Some(
+            "0.1" @ 4:10..4:15,
+        ),
+        placements: Some(
+            PlacementsSection {
+                placements: [
+                    Placement {
+                        address: agent.fixer @ 10:3..10:14,
+                        runtime: Some(
+                            Isolated @ 11:14..11:22,
+                        ),
+                        network: Some(
+                            Egress @ 12:14..12:20,
+                        ),
+                        description: None,
+                        span: 10:3..13:3,
+                    },
+                    Placement {
+                        address: flow.triage @ 13:3..13:14,
+                        runtime: Some(
+                            Colocated @ 14:14..14:23,
+                        ),
+                        network: None,
+                        description: None,
+                        span: 13:3..16:1,
+                    },
+                ],
+                span: 10:3..16:1,
+            },
+        ),
+        storage_backends: Some(
+            StorageBackendsSection {
+                defaults: [
+                    BackendDefault {
+                        kind: Kv @ 18:5..18:7,
+                        config: BackendConfig {
+                            provider: Some(
+                                Redis @ 19:17..19:22,
+                            ),
+                            connection: [
+                                ConnectionField {
+                                    name: "url" @ 20:7..20:10,
+                                    value: env("${REDIS_URL}") @ 20:12..20:24,
+                                },
+                            ],
+                            extra: [],
+                            span: 19:7..21:3,
+                        },
+                    },
+                ],
+                aliases: [
+                    BackendAlias {
+                        name: "docs_db" @ 24:5..24:12,
+                        config: BackendConfig {
+                            provider: Some(
+                                Chroma @ 25:17..25:23,
+                            ),
+                            connection: [
+                                ConnectionField {
+                                    name: "url" @ 26:7..26:10,
+                                    value: env("${CHROMA_URL}") @ 26:12..26:25,
+                                },
+                            ],
+                            extra: [
+                                PluginEntry {
+                                    key: "index" @ 27:7..27:12,
+                                    value: Text(
+                                        "project-docs",
+                                    ) @ 27:14..27:26,
+                                },
+                            ],
+                            span: 25:7..31:1,
+                        },
+                    },
+                ],
+                span: 17:3..31:1,
+            },
+        ),
+        event_sources: Some(
+            EventSourcesSection {
+                sources: [
+                    EventSource {
+                        name: "bug_reports" @ 32:3..32:14,
+                        kind: Some(
+                            RedisStreams @ 33:11..33:24,
+                        ),
+                        connection: [
+                            ConnectionField {
+                                name: "url" @ 34:5..34:8,
+                                value: env("${REDIS_URL}") @ 34:10..34:22,
+                            },
+                        ],
+                        extra: [
+                            PluginEntry {
+                                key: "stream" @ 35:5..35:11,
+                                value: Text(
+                                    "bug-reports",
+                                ) @ 35:13..35:24,
+                            },
+                            PluginEntry {
+                                key: "consumer_group" @ 36:5..36:19,
+                                value: Text(
+                                    "agent-compose",
+                                ) @ 36:21..36:34,
+                            },
+                        ],
+                        span: 32:3..37:1,
+                    },
+                ],
+                span: 32:3..37:1,
+            },
+        ),
+        span: 4:1..37:1,
+    },
+)

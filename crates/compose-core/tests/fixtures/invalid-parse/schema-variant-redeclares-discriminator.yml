@@ -1,0 +1,17 @@
+# rule: a variant may not redeclare the discriminator field (grammar 3.7, Decision D11)
+# code: invalid-value
+# message: variant `auto_fixable` redeclares the discriminator field `kind`
+# at: 16:27
+# help: the compiler synthesizes the discriminator as a string constant equal to the variant tag
+agent.reviewer:
+  model: model.smart
+  prompt: Review the draft.
+  output:
+    findings:
+      type: array
+      max_items: 10
+      items:
+        discriminator: kind
+        variants:
+          auto_fixable: { kind: { type: string }, file: { type: string } }
+          needs_human: { summary: { type: string } }

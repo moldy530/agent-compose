@@ -1,0 +1,11 @@
+# rule: a `default` is data lowered to JSON, so YAML's `.nan` is not a value it can hold (grammar 3.3, 3.8)
+# code: invalid-value
+# message: `default` in the schema of `ratio` must be a finite number, found NaN
+# at: 9:37
+# help: the compiler lowers every declared number to JSON Schema 2020-12 and to generated code (grammar 3.8), neither of which can write infinity or NaN
+tool.measure:
+  description: Measure something
+  input:
+    ratio: { type: number, default: .nan }
+  output: {}
+  function: { name: measure }

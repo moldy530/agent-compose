@@ -1,0 +1,13 @@
+# rule: a spec file may not declare deploy-layer sections (grammar 1.2, Decision D3)
+# code: misplaced-section
+# message: the `placements` section may only appear in a deploy file
+# at: 11:1
+# help: spec files and deploy files are disjoint: only the deploy layer forks per environment, and `deploy/<target>.yml` is selected with `--target`
+version: "0.1"
+
+state:
+  draft: { type: string }
+
+placements:
+  agent.fixer:
+    runtime: isolated

@@ -1,0 +1,17 @@
+# rule: an inline node's envelope fields have fixed types (grammar 8.2, Decision D56)
+# code: invalid-value
+# message: `exit_code` is an envelope field and must be declared as `{ type: integer }`
+# at: 14:22
+# help: envelope fields are bound from the process or the response itself and are never decoded from its payload, so their types are fixed (grammar 8.2, 8.3)
+flow.demo:
+  outputs:
+    done: { type: boolean }
+  nodes:
+    run:
+      exec:
+        command: run-checks
+        output:
+          exit_code: { type: string }
+  edges:
+    - { from: start, to: run }
+    - { from: run, to: end }

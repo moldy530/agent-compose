@@ -1,0 +1,224 @@
+---
+source: crates/compose-core/tests/parse_examples.rs
+expression: "parse_clean(\"examples/review-loop/flows/review_loop.yml\")"
+---
+Spec(
+    SpecFile {
+        source: "examples/review-loop/flows/review_loop.yml",
+        version: None,
+        imports: None,
+        defaults: None,
+        state: None,
+        triggers: None,
+        definitions: [
+            Definition {
+                address: flow.review_loop @ 4:1..4:17,
+                body: Flow(
+                    FlowDef {
+                        description: Some(
+                            "Draft a document and revise it until the reviewer approves." @ 5:16..5:75,
+                        ),
+                        inputs: Some(
+                            FieldMap {
+                                fields: [
+                                    Field {
+                                        name: "goal" @ 7:5..7:9,
+                                        ty: TypeNode {
+                                            form: Scalar(
+                                                ScalarType {
+                                                    kind: String @ 9:13..9:19,
+                                                    min_length: 1 @ 10:19..10:20,
+                                                },
+                                            ),
+                                            description: Some(
+                                                "What the finished draft must accomplish." @ 8:20..8:60,
+                                            ),
+                                            span: 8:7..11:3,
+                                        },
+                                    },
+                                ],
+                                surface: Input,
+                                span: 7:5..11:3,
+                            },
+                        ),
+                        outputs: Some(
+                            FieldMap {
+                                fields: [
+                                    Field {
+                                        name: "draft" @ 12:5..12:10,
+                                        ty: TypeNode {
+                                            form: Scalar(
+                                                ScalarType {
+                                                    kind: String @ 14:13..14:19,
+                                                },
+                                            ),
+                                            description: Some(
+                                                "The approved draft, read from the `draft` state channel." @ 13:20..13:76,
+                                            ),
+                                            span: 13:7..16:3,
+                                        },
+                                    },
+                                ],
+                                surface: Result,
+                                span: 12:5..16:3,
+                            },
+                        ),
+                        nodes: [
+                            Node {
+                                id: "write" @ 19:5..19:10,
+                                kind: Agent(
+                                    agent.researcher @ 20:14..20:30,
+                                ),
+                                input: Some(
+                                    Fields(
+                                        Bindings {
+                                            entries: [
+                                                Binding {
+                                                    name: "goal" @ 22:9..22:13,
+                                                    value: cel("input.goal") @ 22:15..22:27,
+                                                },
+                                                Binding {
+                                                    name: "feedback" @ 23:9..23:17,
+                                                    value: cel("state.feedback") @ 23:19..23:35,
+                                                },
+                                            ],
+                                            span: 22:9..24:7,
+                                        },
+                                    ),
+                                ),
+                                writes: None,
+                                policy: PolicyBlock {
+                                    retry: Some(
+                                        Retry {
+                                            max: Some(
+                                                2 @ 24:21..24:22,
+                                            ),
+                                            backoff: Some(
+                                                duration("5s") @ 24:33..24:35,
+                                            ),
+                                            multiplier: None,
+                                            max_backoff: None,
+                                            jitter: None,
+                                            span: 24:14..24:37,
+                                        } @ 24:14..24:37,
+                                    ),
+                                    timeout: None,
+                                    on_error: None,
+                                },
+                                description: None,
+                                span: 20:7..26:5,
+                            },
+                            Node {
+                                id: "review" @ 26:5..26:11,
+                                kind: Agent(
+                                    agent.reviewer @ 27:14..27:28,
+                                ),
+                                input: Some(
+                                    Fields(
+                                        Bindings {
+                                            entries: [
+                                                Binding {
+                                                    name: "goal" @ 29:9..29:13,
+                                                    value: cel("input.goal") @ 29:15..29:27,
+                                                },
+                                                Binding {
+                                                    name: "draft" @ 30:9..30:14,
+                                                    value: cel("state.draft") @ 30:16..30:29,
+                                                },
+                                            ],
+                                            span: 29:9..31:7,
+                                        },
+                                    ),
+                                ),
+                                writes: None,
+                                policy: PolicyBlock {
+                                    retry: None,
+                                    timeout: Some(
+                                        duration("90s") @ 31:16..31:19,
+                                    ),
+                                    on_error: Some(
+                                        Fallback(
+                                            End @ 32:29..32:32,
+                                        ) @ 32:17..32:34,
+                                    ),
+                                },
+                                description: None,
+                                span: 27:7..34:3,
+                            },
+                        ],
+                        edges: [
+                            Edge {
+                                from: Some(
+                                    Start @ 35:15..35:20,
+                                ),
+                                to: Some(
+                                    Node(
+                                        "write",
+                                    ) @ 35:26..35:31,
+                                ),
+                                when: None,
+                                else_edge: None,
+                                max_iterations: None,
+                                span: 35:7..35:33,
+                            },
+                            Edge {
+                                from: Some(
+                                    Node(
+                                        "write",
+                                    ) @ 36:15..36:20,
+                                ),
+                                to: Some(
+                                    Node(
+                                        "review",
+                                    ) @ 36:26..36:32,
+                                ),
+                                when: None,
+                                else_edge: None,
+                                max_iterations: None,
+                                span: 36:7..36:34,
+                            },
+                            Edge {
+                                from: Some(
+                                    Node(
+                                        "review",
+                                    ) @ 40:13..40:19,
+                                ),
+                                to: Some(
+                                    Node(
+                                        "write",
+                                    ) @ 41:11..41:16,
+                                ),
+                                when: Some(
+                                    cel("review.output.verdict == 'revise'") @ 42:13..42:48,
+                                ),
+                                else_edge: None,
+                                max_iterations: Some(
+                                    3 @ 43:23..43:24,
+                                ),
+                                span: 40:7..51:5,
+                            },
+                            Edge {
+                                from: Some(
+                                    Node(
+                                        "review",
+                                    ) @ 51:13..51:19,
+                                ),
+                                to: Some(
+                                    End @ 52:11..52:14,
+                                ),
+                                when: None,
+                                else_edge: Some(
+                                    53:13..53:17,
+                                ),
+                                max_iterations: None,
+                                span: 51:7..54:1,
+                            },
+                        ],
+                    },
+                ),
+                span: 4:1..54:1,
+            },
+        ],
+        span: 4:1..54:1,
+    },
+)

@@ -1,0 +1,13 @@
+# rule: an edge declares `when:` or `else:`, never both (grammar 7.2)
+# code: conflicting-keys
+# message: an edge declares `when` or `else`, never both
+# at: 13:71
+# help: `else` marks the edge taken when no guarded sibling was
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    write: { agent: agent.researcher }
+  edges:
+    - { from: start, to: write }
+    - { from: write, to: end, when: "write.output.draft != ''", else: true }

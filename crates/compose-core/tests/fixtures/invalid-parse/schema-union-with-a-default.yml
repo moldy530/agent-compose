@@ -1,0 +1,12 @@
+# rule: `default:` is illegal on a discriminated union at every surface (grammar 3.6, Decision D77)
+# code: invalid-value
+# message: `default` is not allowed on the discriminated union in state channel `finding`
+# at: 12:14
+# help: a union default would have to name a variant, which manufactures a discriminator tag: give the channel or the field one of the union's variants as its own type instead (grammar 3.6, Decision D77)
+state:
+  finding:
+    discriminator: kind
+    variants:
+      auto_fixable: { file: { type: string } }
+      needs_human: { summary: { type: string } }
+    default: { kind: auto_fixable, file: "src/lib.rs" }

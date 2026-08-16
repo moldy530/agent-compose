@@ -1,0 +1,9 @@
+# rule: `metadata_schema` is a `vector` key alone (grammar 11.1, Decision D113)
+# code: conflicting-keys
+# message: `metadata_schema` is not legal on a `blob` store
+# at: 8:3
+store.artifacts:
+  kind: blob
+  scope: global
+  metadata_schema:
+    source: { type: string }

@@ -1,0 +1,15 @@
+# rule: the implicit `messages` channel may not be named in `writes:` (grammar 10.4)
+# code: reserved-name
+# message: `messages` may not name a state channel: `messages` is the implicit conversation-history channel
+# at: 12:24
+# help: reserved channel names are `input`, `state`, `execution`, `item`, `messages`, `output`, `payload`
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    write:
+      agent: agent.researcher
+      writes: { draft: messages }
+  edges:
+    - { from: start, to: write }
+    - { from: write, to: end }

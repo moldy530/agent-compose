@@ -1,0 +1,10 @@
+# rule: the two SDK-reached kinds take no `base_url:` - a cloud SDK connection has no bare endpoint to point at (grammar 12.1, Decision D106)
+# code: unknown-key
+# message: provider definition `provider.gcp` declares `kind: vertex`, which has no `base_url` key
+# at: 10:3
+# help: the keys of `kind: vertex` are `kind`, `project`, `location`, `credentials_json`, `description`
+provider.gcp:
+  kind: vertex
+  project: acme-prod
+  location: us-central1
+  base_url: ${VERTEX_ENDPOINT}

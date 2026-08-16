@@ -1,0 +1,11 @@
+# rule: a composite `default` is checked for unwritable numbers at every depth, not only at the top (grammar 3.8, 10.1)
+# code: invalid-value
+# message: `default` in state channel `scores` must be a finite number, found infinity
+# at: 11:18
+# help: the compiler lowers every declared number to JSON Schema 2020-12 and to generated code (grammar 3.8), neither of which can write infinity or NaN
+state:
+  scores:
+    type: array
+    items: { type: number }
+    max_items: 4
+    default: [1, .inf]

@@ -1,0 +1,18 @@
+# rule: a map node has no output of its own (grammar 8.6 rule 9)
+# code: invalid-value
+# message: `writes` is not legal on node `work`
+# at: 15:7
+# help: a map node has no output of its own: the write remap lives in the `map:` block or on a route
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    work:
+      map:
+        over: plan.output.tasks
+        node: agent.worker
+        max_concurrency: 4
+      writes: { result: results }
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }

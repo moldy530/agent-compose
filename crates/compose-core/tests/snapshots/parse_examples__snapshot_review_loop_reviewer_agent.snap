@@ -1,0 +1,117 @@
+---
+source: crates/compose-core/tests/parse_examples.rs
+expression: "parse_clean(\"examples/review-loop/agents/reviewer.yml\")"
+---
+Spec(
+    SpecFile {
+        source: "examples/review-loop/agents/reviewer.yml",
+        version: None,
+        imports: None,
+        defaults: None,
+        state: None,
+        triggers: None,
+        definitions: [
+            Definition {
+                address: agent.reviewer @ 4:1..4:15,
+                body: Agent(
+                    AgentDef {
+                        model: Some(
+                            model.smart @ 6:10..6:21,
+                        ),
+                        prompt: Some(
+                            "You are a meticulous technical reviewer.\n\nApprove only when the draft fully satisfies the goal, is internally\nconsistent, and contains no unsupported claims. Otherwise ask for a\nrevision and list every required change explicitly.\n" @ 8:5..13:3,
+                        ),
+                        output: Some(
+                            FieldMap {
+                                fields: [
+                                    Field {
+                                        name: "verdict" @ 23:5..23:12,
+                                        ty: TypeNode {
+                                            form: Enum(
+                                                EnumType {
+                                                    variants: [
+                                                        "approve" @ 25:14..25:21,
+                                                        "revise" @ 25:23..25:29,
+                                                    ],
+                                                    default: None,
+                                                },
+                                            ),
+                                            description: Some(
+                                                "approve ends the loop; revise sends the draft back to the writer." @ 24:20..24:85,
+                                            ),
+                                            span: 24:7..26:5,
+                                        },
+                                    },
+                                    Field {
+                                        name: "feedback" @ 26:5..26:13,
+                                        ty: TypeNode {
+                                            form: Scalar(
+                                                ScalarType {
+                                                    kind: String @ 28:13..28:19,
+                                                },
+                                            ),
+                                            description: Some(
+                                                "Required changes, empty when approving." @ 27:20..27:59,
+                                            ),
+                                            span: 27:7..29:1,
+                                        },
+                                    },
+                                ],
+                                surface: Result,
+                                span: 23:5..29:1,
+                            },
+                        ),
+                        input: Some(
+                            FieldMap {
+                                fields: [
+                                    Field {
+                                        name: "goal" @ 16:5..16:9,
+                                        ty: TypeNode {
+                                            form: Scalar(
+                                                ScalarType {
+                                                    kind: String @ 18:13..18:19,
+                                                },
+                                            ),
+                                            description: Some(
+                                                "What the draft must accomplish." @ 17:20..17:51,
+                                            ),
+                                            span: 17:7..19:5,
+                                        },
+                                    },
+                                    Field {
+                                        name: "draft" @ 19:5..19:10,
+                                        ty: TypeNode {
+                                            form: Scalar(
+                                                ScalarType {
+                                                    kind: String @ 21:13..21:19,
+                                                },
+                                            ),
+                                            description: Some(
+                                                "The draft under review." @ 20:20..20:43,
+                                            ),
+                                            span: 20:7..22:3,
+                                        },
+                                    },
+                                ],
+                                surface: Input,
+                                span: 16:5..22:3,
+                            },
+                        ),
+                        tools: [
+                            tool.web_search @ 13:11..13:26,
+                        ],
+                        stores: [],
+                        description: Some(
+                            "Reviews a draft against the goal and returns a routable verdict." @ 5:16..5:80,
+                        ),
+                        max_tool_iterations: Some(
+                            4 @ 14:24..14:25,
+                        ),
+                    },
+                ),
+                span: 4:1..29:1,
+            },
+        ],
+        span: 4:1..29:1,
+    },
+)

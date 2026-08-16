@@ -1,0 +1,5 @@
+# rule: a model route is an ordered fallback of at least two models - one member has nothing to fail over to (grammar 12.2 / PRD 5.9)
+# at: /model.default/route
+# via: /$defs/modelRouteForm/properties/route/minItems
+model.default:
+  route: []

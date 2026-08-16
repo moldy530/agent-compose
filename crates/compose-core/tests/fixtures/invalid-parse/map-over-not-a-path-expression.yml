@@ -1,0 +1,17 @@
+# rule: `map.over` is a path expression with no calls (grammar 4.2, Decision D43)
+# code: invalid-path-expression
+# message: `plan.output.tasks.filter(t, t.ready)` is not a path expression for `over`
+# at: 12:15
+# help: a path expression is a root identifier followed by field selections and integer indexes, e.g. `plan.output.tasks`; calls and operators are not allowed
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    work:
+      map:
+        over: "plan.output.tasks.filter(t, t.ready)"
+        node: agent.worker
+        max_concurrency: 4
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }

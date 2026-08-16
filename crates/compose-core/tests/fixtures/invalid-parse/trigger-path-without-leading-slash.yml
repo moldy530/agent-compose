@@ -1,0 +1,10 @@
+# rule: an http trigger's `path:` starts with `/` (grammar 13.3)
+# code: invalid-value
+# message: `path` must start with `/`, found `review`
+# at: 10:11
+# help: the default is `/triggers/<trigger name>`
+triggers:
+  on_request:
+    type: http
+    flow: flow.review_loop
+    path: review

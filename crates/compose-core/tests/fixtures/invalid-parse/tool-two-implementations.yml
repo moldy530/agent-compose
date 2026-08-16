@@ -1,0 +1,12 @@
+# rule: a tool declares no more than one implementation binding (grammar 6, Decision D25)
+# code: conflicting-keys
+# message: tool definition `tool.probe` declares both `exec` and `function`; a tool carries exactly one implementation
+# at: 11:3
+tool.probe:
+  description: Probe the deployment.
+  input: {}
+  output: {}
+  exec:
+    command: probe
+  function:
+    name: probe

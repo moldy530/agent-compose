@@ -1,0 +1,12 @@
+# rule: a per-kind backend default takes that kind's providers (grammar 14.2, Decision D48)
+# code: invalid-value
+# message: `chroma` is not a `kv` storage provider
+# at: 11:17
+# help: the `kv` providers are `memory`, `sqlite`, `redis`, `postgres`
+version: "0.1"
+
+storage_backends:
+  defaults:
+    kv:
+      provider: chroma
+      url: ${CHROMA_URL}

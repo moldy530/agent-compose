@@ -1,0 +1,11 @@
+# rule: `timeout:` is illegal on an `http` trigger that responds asynchronously (grammar 13.3, Decision D81)
+# code: conflicting-keys
+# message: `timeout` is not legal on the `respond: async` trigger `on_request`
+# at: 11:5
+# help: an async trigger has already responded with an execution id, so there is no response left for a budget to bound: `timeout` belongs to `respond: sync` (grammar 13.3, Decision D81)
+triggers:
+  on_request:
+    type: http
+    flow: flow.review_loop
+    respond: async
+    timeout: 30s

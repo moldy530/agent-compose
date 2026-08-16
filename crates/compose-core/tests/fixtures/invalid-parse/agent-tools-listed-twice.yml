@@ -1,0 +1,10 @@
+# rule: duplicate entries in an agent's `tools:` are an error (grammar 5.4)
+# code: invalid-value
+# message: `tools` lists `tool.web_search` twice
+# at: 8:28
+agent.reviewer:
+  model: model.smart
+  prompt: Review the draft.
+  tools: [tool.web_search, tool.web_search]
+  output:
+    verdict: { enum: [approve, revise] }

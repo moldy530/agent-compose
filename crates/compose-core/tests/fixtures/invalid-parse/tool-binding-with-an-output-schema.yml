@@ -1,0 +1,15 @@
+# rule: a tool declares its result schema on the definition, so `output:` is not a key of its `exec:`/`http:` binding (grammar 6.1, 8.2)
+# code: unknown-key
+# message: unknown key `output` in the `exec` binding of tool definition `tool.grep`
+# at: 14:5
+# help: a tool declares its result schema once, as `output:` on the definition; only an inline node's block carries one of its own (grammar 6.1, 8.2)
+tool.grep:
+  description: Search the repository.
+  input:
+    pattern: { type: string }
+  output:
+    matches: { type: string }
+  exec:
+    command: rg
+    output:
+      stdout: { type: string }

@@ -1,0 +1,9 @@
+# rule: scalar constraints are type-appropriate (grammar 3.3)
+# code: invalid-value
+# message: `min_length` applies to `type: string`, but the schema of `attempts` declares `type: integer`
+# at: 9:44
+agent.reviewer:
+  model: model.smart
+  prompt: Review the draft.
+  output:
+    attempts: { type: integer, min_length: 1 }

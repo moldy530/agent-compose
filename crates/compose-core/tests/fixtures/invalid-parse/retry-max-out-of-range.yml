@@ -1,0 +1,14 @@
+# rule: `retry.max` is an integer in 1..10 (grammar 9.1)
+# code: value-out-of-range
+# message: `max` must be between 1 and 10, found 99
+# at: 11:21
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    write:
+      agent: agent.researcher
+      retry: { max: 99, backoff: 1s }
+  edges:
+    - { from: start, to: write }
+    - { from: write, to: end }

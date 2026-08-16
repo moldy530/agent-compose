@@ -1,0 +1,9 @@
+# rule: imports are relative paths, never absolute ones, URLs, or globs (grammar 1.4)
+# code: invalid-import-path
+# message: `/etc/agent-compose/agents/reviewer.yml` is an absolute path
+# at: 9:5
+# help: imports are relative paths to `.yml`/`.yaml` spec files, resolved against the entrypoint's directory: there is no directory scanning
+version: "0.1"
+
+imports:
+  - /etc/agent-compose/agents/reviewer.yml

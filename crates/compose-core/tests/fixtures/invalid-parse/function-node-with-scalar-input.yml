@@ -1,0 +1,15 @@
+# rule: a `function:` node's arguments are checked field by field, so a scalar `input:` names nothing (grammar 8.0, 8.4, Decision D88)
+# code: wrong-type
+# message: expected a mapping of bindings for `input` of node `lookup`, found a string
+# at: 12:14
+# help: a `function:` node's arguments are checked field by field against the tool's declared `input` (grammar 8.4); the scalar form binds a string-in agent's single unnamed input instead (grammar 5.3, 8.0, Decision D14)
+flow.demo:
+  outputs:
+    done: { type: boolean }
+  nodes:
+    lookup:
+      function: tool.web_search
+      input: "state.goal"
+  edges:
+    - { from: start, to: lookup }
+    - { from: lookup, to: end }

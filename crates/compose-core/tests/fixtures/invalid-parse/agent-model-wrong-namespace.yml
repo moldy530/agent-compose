@@ -1,0 +1,9 @@
+# rule: reference positions accept a fixed set of namespaces (grammar 2.3)
+# code: invalid-reference
+# message: expected a `model.*` reference for `model`, found `tool.web_search`
+# at: 6:10
+agent.reviewer:
+  model: tool.web_search
+  prompt: Review the draft.
+  output:
+    verdict: { enum: [approve, revise] }

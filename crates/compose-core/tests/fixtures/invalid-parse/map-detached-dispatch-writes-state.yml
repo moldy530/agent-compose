@@ -1,0 +1,19 @@
+# rule: a detached dispatch may not declare `writes:` (grammar 8.6 rule 7)
+# code: conflicting-keys
+# message: the `map` block of node `work` is detached, so it may not declare `writes`
+# at: 16:17
+# help: a fire-and-forget dispatch is not joined, so nothing waits to record its result
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    work:
+      map:
+        over: plan.output.tasks
+        node: agent.worker
+        max_concurrency: 4
+        detach: true
+        writes: { result: results }
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }

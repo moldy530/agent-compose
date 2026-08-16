@@ -1,0 +1,10 @@
+# rule: `type:` takes one of the closed set of type keywords (grammar 3.2)
+# code: unknown-variant
+# message: `strng` is not a type in the schema of `verdict`
+# at: 10:22
+# help: did you mean `string`?
+agent.reviewer:
+  model: model.smart
+  prompt: Review the draft.
+  output:
+    verdict: { type: strng }

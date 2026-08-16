@@ -1,0 +1,20 @@
+# rule: the routed form of a map declares `route_by:` alongside `routes:` - routes with nothing to switch on dispatch nowhere (grammar 8.6 rule 2 / PRD 5.6)
+# at: /flow.triage/nodes/dispatch/map
+# via: /$defs/mapNode/properties/map/oneOf
+flow.triage:
+  outputs:
+    done: { type: boolean }
+  nodes:
+    classify:
+      agent: agent.triage
+    dispatch:
+      map:
+        over: classify.output.findings
+        max_concurrency: 4
+        routes:
+          auto_fixable: { node: agent.fixer }
+          needs_human: { node: agent.escalate }
+  edges:
+    - { from: start, to: classify }
+    - { from: classify, to: dispatch }
+    - { from: dispatch, to: end }

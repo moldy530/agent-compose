@@ -1,0 +1,10 @@
+# rule: `imports:` entries are unique (grammar 1.4)
+# code: invalid-import-path
+# message: `agents/reviewer.yml` is imported twice
+# at: 10:5
+# help: import order does not affect semantics, so the second entry adds nothing: drop it
+version: "0.1"
+
+imports:
+  - agents/reviewer.yml
+  - agents/reviewer.yml

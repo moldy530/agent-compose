@@ -1,0 +1,13 @@
+# rule: the whole `exec:` surface is interpolable, so `command` is scanned for well-formed `${ENV}` tokens (grammar 4.3 class 2, Decision D92)
+# code: invalid-env-ref
+# message: `${tool_bin}` in `command` is not a valid environment reference
+# at: 13:14
+# help: environment names are uppercase letters, digits, and `_`, starting with a letter or `_`; write `$${NAME}` for a literal `${NAME}`
+tool.grep:
+  description: Search the repository.
+  input:
+    pattern: { type: string }
+  output:
+    matches: { type: string }
+  exec:
+    command: "${tool_bin}/rg"

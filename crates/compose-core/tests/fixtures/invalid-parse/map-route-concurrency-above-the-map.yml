@@ -1,0 +1,19 @@
+# rule: a route's `max_concurrency` may only tighten the map's (grammar 8.6 rule 1)
+# code: value-out-of-range
+# message: `max_concurrency` of route `auto_fixable` is 8, above the map's 4
+# at: 16:63
+# help: a route may only tighten the map's bound (grammar 8.6 rule 1)
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    work:
+      map:
+        over: plan.output.findings
+        route_by: kind
+        max_concurrency: 4
+        routes:
+          auto_fixable: { node: agent.fixer, max_concurrency: 8 }
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }

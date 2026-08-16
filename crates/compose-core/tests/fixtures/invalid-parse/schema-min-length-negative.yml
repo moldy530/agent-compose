@@ -1,0 +1,11 @@
+# rule: `min_length` is an integer >= 0, a bound with no upper end to name (grammar 3.3)
+# code: value-out-of-range
+# message: `min_length` must be at least 0, found -1
+# at: 8:40
+tool.title:
+  description: Takes a title.
+  input:
+    title: { type: string, min_length: -1 }
+  output: {}
+  exec:
+    command: title

@@ -1,0 +1,9 @@
+# rule: `reduce: append` requires an array channel (grammar 10.2, Decision D32)
+# code: invalid-value
+# message: `reduce: append` requires a `type: array` channel, but state channel `draft` is a scalar
+# at: 9:13
+# help: each write to an `append` channel contributes one element
+state:
+  draft:
+    type: string
+    reduce: append

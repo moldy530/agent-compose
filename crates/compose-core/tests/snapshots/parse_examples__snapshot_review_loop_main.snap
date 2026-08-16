@@ -1,0 +1,85 @@
+---
+source: crates/compose-core/tests/parse_examples.rs
+expression: "parse_clean(\"examples/review-loop/main.yml\")"
+---
+Spec(
+    SpecFile {
+        source: "examples/review-loop/main.yml",
+        version: Some(
+            "0.1" @ 8:10..8:15,
+        ),
+        imports: Some(
+            ImportsSection {
+                paths: [
+                    "providers.yml" @ 11:5..11:18,
+                    "models.yml" @ 12:5..12:15,
+                    "agents/researcher.yml" @ 13:5..13:26,
+                    "agents/reviewer.yml" @ 14:5..14:24,
+                    "tools/web_search.yml" @ 15:5..15:25,
+                    "flows/review_loop.yml" @ 16:5..16:26,
+                    "triggers.yml" @ 17:5..17:17,
+                ],
+                span: 11:3..20:1,
+            },
+        ),
+        defaults: Some(
+            PolicyBlock {
+                retry: None,
+                timeout: Some(
+                    duration("120s") @ 21:12..21:16,
+                ),
+                on_error: Some(
+                    Fail @ 22:13..22:17,
+                ),
+            } @ 21:3..27:1,
+        ),
+        state: Some(
+            StateSection {
+                channels: [
+                    Channel {
+                        name: "draft" @ 28:3..28:8,
+                        ty: TypeNode {
+                            form: Scalar(
+                                ScalarType {
+                                    kind: String @ 30:11..30:17,
+                                    default: String(
+                                        "",
+                                    ) @ 31:14..31:16,
+                                },
+                            ),
+                            description: Some(
+                                "The current draft, rewritten on every pass." @ 29:18..29:61,
+                            ),
+                            span: 29:5..32:3,
+                        },
+                        reduce: None,
+                        span: 28:3..32:3,
+                    },
+                    Channel {
+                        name: "feedback" @ 32:3..32:11,
+                        ty: TypeNode {
+                            form: Scalar(
+                                ScalarType {
+                                    kind: String @ 34:11..34:17,
+                                    default: String(
+                                        "",
+                                    ) @ 35:14..35:16,
+                                },
+                            ),
+                            description: Some(
+                                "The reviewer's most recent feedback, fed back into the writer." @ 33:18..33:80,
+                            ),
+                            span: 33:5..36:1,
+                        },
+                        reduce: None,
+                        span: 32:3..36:1,
+                    },
+                ],
+                span: 28:3..36:1,
+            },
+        ),
+        triggers: None,
+        definitions: [],
+        span: 8:1..36:1,
+    },
+)

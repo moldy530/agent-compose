@@ -1,0 +1,9 @@
+# rule: a vector store's `embed:` names the `provider.*` that computes the vectors (grammar 11.2, Decision D116)
+# code: missing-key
+# message: missing required key `provider` in the `embed` block of store definition `store.docs`
+# at: 9:5
+store.docs:
+  kind: vector
+  scope: global
+  embed:
+    model: text-embedding-3-small

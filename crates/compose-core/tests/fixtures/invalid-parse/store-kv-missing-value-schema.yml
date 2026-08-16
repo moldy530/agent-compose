@@ -1,0 +1,7 @@
+# rule: a `kv` store declares `value_schema` (grammar 11.1)
+# code: missing-key
+# message: missing required key `value_schema` in store definition `store.memory`: a `kv` store declares it
+# at: 6:3
+store.memory:
+  kind: kv
+  scope: session

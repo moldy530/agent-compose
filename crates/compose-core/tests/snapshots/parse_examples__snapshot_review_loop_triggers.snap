@@ -1,0 +1,75 @@
+---
+source: crates/compose-core/tests/parse_examples.rs
+expression: "parse_clean(\"examples/review-loop/triggers.yml\")"
+---
+Spec(
+    SpecFile {
+        source: "examples/review-loop/triggers.yml",
+        version: None,
+        imports: None,
+        defaults: None,
+        state: None,
+        triggers: Some(
+            TriggersSection {
+                triggers: [
+                    Trigger {
+                        name: "cli" @ 9:3..9:6,
+                        flow: Some(
+                            flow.review_loop @ 11:11..11:27,
+                        ),
+                        session_key: None,
+                        description: None,
+                        kind: Some(
+                            Manual,
+                        ),
+                        span: 10:5..13:3,
+                    },
+                    Trigger {
+                        name: "on_request" @ 13:3..13:13,
+                        flow: Some(
+                            flow.review_loop @ 15:11..15:27,
+                        ),
+                        session_key: Some(
+                            cel("payload.headers['x-session-id']") @ 20:18..20:51,
+                        ),
+                        description: None,
+                        kind: Some(
+                            Http(
+                                HttpTrigger {
+                                    path: Some(
+                                        "/review" @ 16:11..16:18,
+                                    ),
+                                    method: Some(
+                                        Post @ 17:13..17:17,
+                                    ),
+                                    input: Some(
+                                        Bindings {
+                                            entries: [
+                                                Binding {
+                                                    name: "goal" @ 19:7..19:11,
+                                                    value: cel("payload.body.goal") @ 19:13..19:32,
+                                                },
+                                            ],
+                                            span: 19:7..20:5,
+                                        },
+                                    ),
+                                    respond: Some(
+                                        Async @ 21:14..21:19,
+                                    ),
+                                    timeout: None,
+                                    callback: Some(
+                                        cel("payload.body.callback_url") @ 22:15..22:42,
+                                    ),
+                                },
+                            ),
+                        ),
+                        span: 14:5..23:1,
+                    },
+                ],
+                span: 9:3..23:1,
+            },
+        ),
+        definitions: [],
+        span: 3:1..23:1,
+    },
+)

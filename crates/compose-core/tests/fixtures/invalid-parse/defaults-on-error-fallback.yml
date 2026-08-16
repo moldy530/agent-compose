@@ -1,0 +1,8 @@
+# rule: the `fallback` form of `on_error` is illegal in `defaults:` (grammar 9.2, 9.3, Decision D103)
+# code: invalid-value
+# message: `on_error: { fallback: … }` is not legal in the `defaults` section
+# at: 8:13
+# help: a fallback names a node of one flow, and this level names no flow: declare the fallback on the node that needs it, and keep `fail` or `skip` here (grammar 9.3, Decision D103)
+defaults:
+  timeout: 60s
+  on_error: { fallback: cleanup }

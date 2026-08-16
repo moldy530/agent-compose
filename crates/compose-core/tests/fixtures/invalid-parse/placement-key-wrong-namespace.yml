@@ -1,0 +1,9 @@
+# rule: placement keys are `agent.*`, `tool.*`, or `flow.*` addresses (grammar 14.1)
+# code: invalid-reference
+# message: expected an `agent.*`, `tool.*`, or `flow.*` reference for a placement key, found `store.docs`
+# at: 8:3
+version: "0.1"
+
+placements:
+  store.docs:
+    runtime: isolated
