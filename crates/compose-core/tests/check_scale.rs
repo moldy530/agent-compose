@@ -2,9 +2,9 @@
 //!
 //! `check_accepts.rs` proves the validator accepts what the grammar admits;
 //! this file proves it still *answers* when what the grammar admits is large.
-//! Neither a flow's node count, nor a node's out-degree, nor a composition's
-//! nesting depth is bounded by anything the compiler controls, and each of the
-//! three has its own failure mode:
+//! Neither a flow's node count, nor a node's out-degree, nor the paths through
+//! it, nor a composition's nesting depth is bounded by anything the compiler
+//! controls, and each of the four has its own failure mode:
 //!
 //! * **depth** — a traversal written with the call stack aborts the process on a
 //!   stack overflow, which is not a diagnostic, not an exit code the CLI
@@ -16,15 +16,20 @@
 //!   is that nothing is *walked* per pair, and one of overlapping branches, where
 //!   the pairs share almost every answer and what matters is that nothing is
 //!   *compared* or *crossed* per pair;
+//! * **path count** — a branch's step distances (grammar 7.6.2) are a property
+//!   of its paths, of which a graph of *n* nodes has exponentially many and a
+//!   node may be reached at *n* distinct depths. Neither fork shape above shows
+//!   it, because both give every node exactly one distance from any entry, so a
+//!   third is needed where a branch's distances are genuinely many;
 //! * **size** — the usual one, and the one the two worked projects already
 //!   guard through `crates/agent-compose/tests/cli.rs`.
 //!
 //! Every case here is written so that a regression shows up as a failure rather
 //! than as a slow test: the depth case runs on a thread whose stack is far too
-//! small to recurse through, and the fork cases time the check pass alone — the
+//! small to recurse through, and the graph cases time the check pass alone — the
 //! project is resolved off the clock — against a budget several times what they
-//! cost and a fraction of what the shape costs a per-pair analysis. Each fork
-//! case names both numbers, so a budget can be re-fitted from what it is for.
+//! cost and a fraction of what the shape costs the analysis they guard. Each
+//! names both numbers, so a budget can be re-fitted from what it is for.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -240,6 +245,67 @@ fn layered_project(dir: &Path, layers: usize, wide: usize) {
     .expect("can write the entrypoint");
 }
 
+/// A chain of `length` nodes in which every node skips one ahead as well as
+/// stepping to the next, and forks aside to a leaf of its own.
+///
+/// The two forward edges are guarded on the source node's own enum field and are
+/// provably exclusive (grammar 7.6.1 rule 2), so no convergence on the chain is
+/// ever unbalanced and the shape is **legal**. The third edge is guarded on
+/// state, which rule 2 cannot read for disjointness, so it is co-takeable with
+/// both: every node is a fork and every branch below one gets walked.
+///
+/// What that buys is the one thing the two shapes above cannot have: a branch
+/// whose distances are *multi-valued*. Stepping and skipping in any mix puts the
+/// node `k` ahead at every depth between `k/2` and `k`, so a walk that enumerates
+/// `(node, distance)` pairs is quadratic in the chain before the walk per branch
+/// is counted at all — a legal flow answering "clean" in tens of seconds, against
+/// a command whose budget is milliseconds (PRD 5.12). Reading a branch as the
+/// nearest and farthest arrival at each node is what makes it one relaxation in
+/// topological order (grammar 7.6.2, `check/graph.rs`).
+///
+/// `agent.b` is the reason this file's one shared channel is *not* wired here:
+/// its output field is named after no channel, so no node of the chain writes
+/// one, grammar 10.2's rule short-circuits over an empty writer set, and what is
+/// left on the clock is the distance walk alone. The cross of two branches'
+/// writers is the shape above's subject, and mixing the two would leave a
+/// regression in either one hiding inside the other's cost.
+fn skipping_chain_project(dir: &Path, length: usize) {
+    let mut nodes = String::new();
+    let mut edges = String::from("    - { from: start, to: n0 }\n");
+    for at in 0..length {
+        nodes.push_str(&format!(
+            "    n{at}: {{ agent: agent.b, input: \"'x'\" }}\n    t{at}: {{ agent: agent.b, input: \"'x'\" }}\n"
+        ));
+        let step = if at + 1 < length {
+            format!("n{}", at + 1)
+        } else {
+            "end".to_string()
+        };
+        let skip = if at + 2 < length {
+            format!("n{}", at + 2)
+        } else {
+            "end".to_string()
+        };
+        edges.push_str(&format!("    - {{ from: t{at}, to: end }}\n"));
+        edges.push_str(&format!(
+            "    - {{ from: n{at}, to: {step}, when: \"n{at}.output.outcome == 'approve'\" }}\n"
+        ));
+        edges.push_str(&format!(
+            "    - {{ from: n{at}, to: {skip}, when: \"n{at}.output.outcome == 'revise'\" }}\n"
+        ));
+        edges.push_str(&format!(
+            "    - {{ from: n{at}, to: t{at}, when: \"state.verdict == 'approve'\" }}\n"
+        ));
+    }
+    fs::write(
+        dir.join("main.yml"),
+        format!(
+            "version: \"0.1\"\n{BACKEND}agent.b:\n  model: model.m\n  prompt: Do it.\n  output:\n    outcome: {{ enum: [approve, revise] }}\nflow.f:\n  outputs: {{}}\n  nodes:\n{nodes}  edges:\n{edges}"
+        ),
+    )
+    .expect("can write the entrypoint");
+}
+
 /// The minimum of three checks of one artifact, so a scheduling hiccup cannot
 /// fail a test about an algorithm. Resolution is off the clock deliberately:
 /// these are bounds on the graph analyses, not on the parser.
@@ -322,5 +388,28 @@ fn overlapping_branches_are_checked_in_proportion_to_their_writers() {
     assert!(
         fastest < budget,
         "checking a 5-by-50 layered fan-out took {fastest:?}, and the budget is {budget:?}"
+    );
+}
+
+/// Branches whose **distances** are many, which is where anything counted per
+/// path rather than per node shows.
+///
+/// 600 chain nodes and their 600 leaves are 1,200 nodes and 2,400 edges, and the
+/// branch below any of the 600 forks reaches the far end of the chain at some
+/// three hundred distinct depths. Neither shape above can see that: a fan of
+/// disjoint chains and a layered rank both give every node exactly one distance
+/// from any entry, so a walk over `(node, distance)` pairs behaves there like a
+/// walk over nodes. Here it does not — enumerating them cost this shape 7 s at
+/// half this size and a minute at twice it, on a flow with nothing wrong with it,
+/// while the two extremes settle it in one pass (grammar 7.6.2, Decision D112).
+#[test]
+fn multi_valued_distances_are_checked_in_proportion_to_the_nodes() {
+    let dir = scratch("skipping");
+    skipping_chain_project(&dir, 600);
+    let budget = Duration::from_secs(6);
+    let fastest = fastest_check(&artifact(&dir), "600-node skipping chain");
+    assert!(
+        fastest < budget,
+        "checking a 600-node skipping chain took {fastest:?}, and the budget is {budget:?}"
     );
 }

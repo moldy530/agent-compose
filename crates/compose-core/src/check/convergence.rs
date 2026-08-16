@@ -74,7 +74,12 @@
 //!    (grammar 7.6.2) and the nodes it holds (grammar 7.6.1) are properties of
 //!    where the edge lands, so both are taken once per entry node and paired out
 //!    of a cache — not once per edge, and never once per pair. A layer of ten
-//!    nodes each edging to the same ten is ten walks, not a hundred.
+//!    nodes each edging to the same ten is ten walks, not a hundred. Each walk
+//!    is proportional to the branch as well: the rule reads a node's distances
+//!    only for whether they are one value and which, so a branch is carried as
+//!    the nearest and farthest arrival at each node it reaches
+//!    ([`Delivery`](super::graph::Delivery)) rather than as the paths that get
+//!    there, of which there may be one per node in the branch.
 //! 2. *One comparison per entry pair.* The verdict of each rule is likewise a
 //!    function of the two entries alone, so the same two branches are compared
 //!    once however many forks put them side by side. The diagnostic is still the
@@ -94,6 +99,7 @@
 //! millisecond-budget command (PRD 5.12); this is the one shape that could spend
 //! that budget, and `tests/check_scale.rs` is where the bound is held.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
 use ::cel::Program;
@@ -103,7 +109,7 @@ use crate::ir::flow::{MapDispatch, Node, NodeKind};
 use crate::ir::schema::TypeForm;
 
 use super::channels::Written;
-use super::graph::{Graph, Vertex};
+use super::graph::{Delivery, Graph, Vertex};
 use super::{Ctx, FlowCx, channels, guards};
 
 /// What two branches deliver to at two different depths: the nearest such node,
@@ -256,7 +262,7 @@ fn branches(graph: &Graph<'_>, pair: &Pair) -> Option<(usize, usize)> {
 /// Grammar 7.6.2: the two edges of a pair may not deliver to one node at two
 /// different depths.
 fn balanced<'a>(ctx: &mut Ctx<'a>, cx: &FlowCx<'a>, graph: &Graph<'a>, pairs: &[Pair]) {
-    let mut distances: BTreeMap<usize, BTreeMap<usize, BTreeSet<usize>>> = BTreeMap::new();
+    let mut distances: BTreeMap<usize, Vec<Delivery>> = BTreeMap::new();
     let mut skew: BTreeMap<(usize, usize), Skew> = BTreeMap::new();
     for pair in pairs {
         let (left, right) = pair.edges;
@@ -311,34 +317,55 @@ fn balanced<'a>(ctx: &mut Ctx<'a>, cx: &FlowCx<'a>, graph: &Graph<'a>, pairs: &[
 
 /// The nearest node the two branches deliver to at two different depths, as the
 /// node and the two distances the diagnostic names.
-fn nearest(
-    near: &BTreeMap<usize, BTreeSet<usize>>,
-    far: &BTreeMap<usize, BTreeSet<usize>>,
-) -> Skew {
+///
+/// Both lists are ascending by node ([`Graph::distances`]), so the nodes the two
+/// branches share are found by walking them side by side — what the pairing
+/// costs is what the two branches hold, not what the flow holds.
+fn nearest(near: &[Delivery], far: &[Delivery]) -> Skew {
+    let (mut left, mut right) = (0, 0);
     let mut nearest: Option<(usize, usize, usize, usize)> = None;
-    // Ascending node index, so a tie on the distance keeps the earlier node —
-    // the order a scan of every node would have found them in.
-    for (node, near) in near {
-        let Some(far) = far.get(node) else {
-            continue;
-        };
-        let Some((one, other)) = differ(near, far) else {
-            continue;
-        };
-        let key = one.min(other);
-        if nearest.as_ref().is_none_or(|(best, ..)| key < *best) {
-            nearest = Some((key, *node, one, other));
+    while left < near.len() && right < far.len() {
+        let (one, other) = (near[left], far[right]);
+        match one.node.cmp(&other.node) {
+            Ordering::Less => left += 1,
+            Ordering::Greater => right += 1,
+            Ordering::Equal => {
+                left += 1;
+                right += 1;
+                let Some((first, second)) = differ(one, other) else {
+                    continue;
+                };
+                // Ascending node index, so a tie on the distance keeps the
+                // earlier node — the order a scan of every node would have found
+                // them in.
+                let key = first.min(second);
+                if nearest.as_ref().is_none_or(|(best, ..)| key < *best) {
+                    nearest = Some((key, one.node, first, second));
+                }
+            }
         }
     }
     nearest.map(|(_, node, one, other)| (node, one, other))
 }
 
-/// One distance from each side that differ, smallest first — never a comparison
-/// inside one side (Decision D112).
-fn differ(left: &BTreeSet<usize>, right: &BTreeSet<usize>) -> Option<(usize, usize)> {
-    left.iter()
-        .flat_map(|one| right.iter().map(move |other| (*one, *other)))
-        .find(|(one, other)| one != other)
+/// One distance from each side that differ — never a comparison inside one side
+/// (Decision D112) — or `None` where every path on either side arrives in the
+/// same step.
+///
+/// Two non-empty sets of distances hold no differing pair only when both are the
+/// same single value, so the nearest and farthest of each side decide it and
+/// name it. The pair returned is left-side-first, matching the two edges the
+/// diagnostic labels, and its smaller half is always the shallower of the two
+/// arrivals — the step the convergence first runs at, which is what orders the
+/// choice of *which* convergence to report.
+fn differ(one: Delivery, other: Delivery) -> Option<(usize, usize)> {
+    if one.nearest != other.nearest {
+        return Some((one.nearest, other.nearest));
+    }
+    if one.farthest != one.nearest {
+        return Some((one.farthest, other.nearest));
+    }
+    (other.farthest != other.nearest).then_some((one.nearest, other.farthest))
 }
 
 fn steps(count: usize) -> String {
@@ -578,5 +605,78 @@ fn describe(graph: &Graph<'_>, source: Vertex) -> String {
     match source {
         Vertex::Node(at) => format!("`{}`", graph.id(at)),
         _ => "`start`".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(node: usize, nearest: usize, farthest: usize) -> Delivery {
+        Delivery {
+            node,
+            nearest,
+            farthest,
+        }
+    }
+
+    /// Grammar 7.6.2 asks whether *some* distance on one side differs from some
+    /// distance on the other, and Decision D112 forbids answering it from one
+    /// side alone. Both sides delivering at one and the same step is the whole of
+    /// balanced — and the two extremes decide it, whatever lies between them.
+    #[test]
+    fn two_sides_differ_unless_both_arrive_at_one_step() {
+        assert_eq!(differ(at(0, 2, 2), at(0, 2, 2)), None, "one step each");
+        assert_eq!(
+            differ(at(0, 4, 4), at(0, 4, 4)),
+            None,
+            "one deeper step each"
+        );
+        assert_eq!(
+            differ(at(0, 1, 1), at(0, 2, 2)),
+            Some((1, 2)),
+            "two singletons that differ"
+        );
+        // A side that arrives at several depths disagrees with a side that
+        // arrives at one of them, because the others are arrivals too.
+        assert_eq!(differ(at(0, 2, 3), at(0, 2, 2)), Some((3, 2)));
+        assert_eq!(differ(at(0, 2, 2), at(0, 2, 3)), Some((2, 3)));
+        // Every value named is one its own side really delivers at.
+        for (one, other) in [
+            (at(0, 2, 5), at(0, 2, 7)),
+            (at(0, 3, 3), at(0, 1, 9)),
+            (at(0, 1, 4), at(0, 6, 6)),
+        ] {
+            let (first, second) = differ(one, other).expect("the two sides differ");
+            assert!((one.nearest..=one.farthest).contains(&first));
+            assert!((other.nearest..=other.farthest).contains(&second));
+            assert_ne!(first, second);
+        }
+    }
+
+    /// One diagnostic per pair, at the nearest convergence it unbalances: every
+    /// node downstream inherits the same skew, and a page of diagnostics for one
+    /// mistake is not a diagnostic (PRD G3). "Nearest" is the shallower of the
+    /// two arrivals, and a tie on it keeps the earlier node.
+    #[test]
+    fn the_shallowest_unbalanced_convergence_is_the_one_reported() {
+        let near = [at(1, 1, 1), at(3, 4, 4), at(7, 2, 2)];
+        let far = [at(1, 1, 1), at(3, 9, 9), at(7, 3, 3)];
+        assert_eq!(
+            nearest(&near, &far),
+            Some((7, 2, 3)),
+            "node 7 is reached at step 2, node 3 not before step 4"
+        );
+
+        // A tie keeps the earlier node.
+        let near = [at(2, 5, 5), at(4, 5, 5)];
+        let far = [at(2, 6, 6), at(4, 8, 8)];
+        assert_eq!(nearest(&near, &far), Some((2, 5, 6)));
+
+        // Nodes only one side reaches are not this pair's error: both sides have
+        // to supply a distance (grammar 7.6.2).
+        assert_eq!(nearest(&[at(1, 1, 1)], &[at(2, 9, 9)]), None);
+        assert_eq!(nearest(&[at(1, 1, 3)], &[]), None);
+        assert_eq!(nearest(&[], &[]), None);
     }
 }

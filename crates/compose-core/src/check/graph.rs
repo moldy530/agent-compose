@@ -35,10 +35,32 @@
 //! one-node SCC, which must be bounded like any other cycle").
 
 use std::cell::OnceCell;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 
 use crate::ast::common::{ControlTarget, EdgeSource, EdgeTarget};
 use crate::ir::flow::{Edge, Flow, Node, NodeKind};
+
+/// What one branch delivers to one node: the fewest and the most steps a path
+/// admitted by grammar 7.6.2 takes to get there.
+///
+/// The rule asks whether *some* distance on one side differs from *some*
+/// distance on the other, and two non-empty sets fail that only when both are
+/// the same one-element set — so the least and the greatest of each decide it,
+/// and the intervening values are never read. Carrying the two instead of the
+/// set is what keeps a branch's answer proportional to the nodes it reaches
+/// rather than to the paths that reach them: a chain of `n` nodes whose every
+/// node also skips one ahead delivers to its far end at `n/2` distinct depths,
+/// and enumerating them costs a walk quadratic in the chain on top of the walk
+/// per branch (grammar 7.6.2, Decision D112).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Delivery {
+    /// The node reached.
+    pub(crate) node: usize,
+    /// The fewest steps a path admitted by grammar 7.6.2 reaches it in.
+    pub(crate) nearest: usize,
+    /// The most steps one does.
+    pub(crate) farthest: usize,
+}
 
 /// A vertex of one flow's graph (grammar 2.4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -75,6 +97,10 @@ pub(crate) struct Graph<'a> {
     /// concurrency relation asks for it (grammar 7.6.1), and a flow with no fork
     /// never does.
     reachable: OnceCell<Vec<Vec<bool>>>,
+    /// The nodes belonging to no cycle, in topological order — the order
+    /// [`Graph::distances`] relaxes in, shared by every branch it is asked
+    /// about. Computed on first use, for the same reason.
+    acyclic_order: OnceCell<Vec<usize>>,
 }
 
 impl<'a> Graph<'a> {
@@ -152,6 +178,7 @@ impl<'a> Graph<'a> {
             components,
             cyclic,
             reachable: OnceCell::new(),
+            acyclic_order: OnceCell::new(),
         }
     }
 
@@ -333,42 +360,93 @@ impl<'a> Graph<'a> {
     /// The step distances from a fork to every node it delivers to, over the
     /// paths that leave it by one edge — read of the node that edge delivers to
     /// ([`Graph::entry`]) — and traverse no node belonging to a cycle
-    /// (grammar 7.6.2).
+    /// (grammar 7.6.2), as the nearest and farthest of each ([`Delivery`]).
     ///
-    /// Excluding cycle nodes is what makes the walk finite *and* the answer
-    /// meaningful: a path that repeats a node passes through a cycle, so a path
-    /// this walk admits visits each node at most once and its length is at most
-    /// the node count. Where a cycle lies on the way, `dist` is not computed and
-    /// the runtime rule governs instead.
+    /// Excluding cycle nodes is what makes the answer meaningful *and* the walk
+    /// a single relaxation: a path that repeats a node passes through a cycle,
+    /// so the nodes left form a DAG, every admitted path visits each node at
+    /// most once, and one pass in topological order settles both extremes
+    /// together — every predecessor of a node is relaxed before the node is read
+    /// from. Where a cycle lies on the way, `dist` is not computed and the
+    /// runtime rule governs instead.
     ///
-    /// Only the nodes this edge actually delivers to are keyed — a node absent
-    /// from the map is one no admitted path reaches, which is the empty set of
-    /// distances said in the space a branch occupies rather than the space the
-    /// flow occupies. The walk itself keeps its running answer positionally,
-    /// because it touches one entry per edge traversed and the flow's edge count
-    /// is the one thing here that is not bounded by its node count.
-    pub(crate) fn distances(&self, entry: usize) -> BTreeMap<usize, BTreeSet<usize>> {
+    /// Only the nodes this edge actually delivers to are listed, ascending — a
+    /// node absent from the list is one no admitted path reaches, which is the
+    /// empty set of distances said in the space a branch occupies rather than
+    /// the space the flow occupies, and the order is what lets a reader pair two
+    /// branches by walking them side by side.
+    pub(crate) fn distances(&self, entry: usize) -> Vec<Delivery> {
         if self.cyclic(entry) {
-            return BTreeMap::new();
+            return Vec::new();
         }
-        let mut reached: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); self.nodes.len()];
-        let mut queue = VecDeque::from([(entry, 1usize)]);
-        reached[entry].insert(1);
-        while let Some((node, distance)) = queue.pop_front() {
-            for next in &self.successors[node] {
+        let mut reached: Vec<Option<(usize, usize)>> = vec![None; self.nodes.len()];
+        reached[entry] = Some((1, 1));
+        for node in self.acyclic_order() {
+            let Some((nearest, farthest)) = reached[*node] else {
+                continue;
+            };
+            for next in &self.successors[*node] {
                 if self.cyclic(*next) {
                     continue;
                 }
-                if reached[*next].insert(distance + 1) {
-                    queue.push_back((*next, distance + 1));
-                }
+                reached[*next] = Some(match reached[*next] {
+                    Some((near, far)) => (near.min(nearest + 1), far.max(farthest + 1)),
+                    None => (nearest + 1, farthest + 1),
+                });
             }
         }
         reached
             .into_iter()
             .enumerate()
-            .filter(|(_, distances)| !distances.is_empty())
+            .filter_map(|(node, found)| {
+                found.map(|(nearest, farthest)| Delivery {
+                    node,
+                    nearest,
+                    farthest,
+                })
+            })
             .collect()
+    }
+
+    /// The nodes belonging to no cycle, in topological order (Kahn's algorithm).
+    ///
+    /// Every cycle lies inside one strongly connected component and puts every
+    /// member of it on [`Graph::cyclic`], so the nodes left induce a DAG and the
+    /// order below covers all of them. It is a property of the flow rather than
+    /// of any one branch, so [`Graph::distances`] takes it once however many
+    /// branches it is asked about.
+    fn acyclic_order(&self) -> &[usize] {
+        self.acyclic_order.get_or_init(|| {
+            let count = self.nodes.len();
+            let mut incoming = vec![0usize; count];
+            for at in 0..count {
+                if self.cyclic(at) {
+                    continue;
+                }
+                for next in &self.successors[at] {
+                    if !self.cyclic(*next) {
+                        incoming[*next] += 1;
+                    }
+                }
+            }
+            let mut queue: VecDeque<usize> = (0..count)
+                .filter(|at| !self.cyclic(*at) && incoming[*at] == 0)
+                .collect();
+            let mut order = Vec::with_capacity(count);
+            while let Some(node) = queue.pop_front() {
+                order.push(node);
+                for next in &self.successors[node] {
+                    if self.cyclic(*next) {
+                        continue;
+                    }
+                    incoming[*next] -= 1;
+                    if incoming[*next] == 0 {
+                        queue.push_back(*next);
+                    }
+                }
+            }
+            order
+        })
     }
 }
 
