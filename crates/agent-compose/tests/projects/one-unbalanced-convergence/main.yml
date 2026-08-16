@@ -1,0 +1,30 @@
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.planner:
+  model: model.m
+  prompt: Plan the work.
+  output:
+    trivial: { type: boolean }
+    need_draft: { type: boolean }
+agent.writer:
+  model: model.m
+  prompt: Write a draft.
+  output:
+    verdict: { enum: [approve, revise] }
+flow.diamond:
+  outputs: {}
+  nodes:
+    plan: { agent: agent.planner, input: "'the goal'" }
+    draft: { agent: agent.writer, input: "'the plan'" }
+    merge: { agent: agent.writer, input: "'the draft'" }
+  edges:
+    - { from: start, to: plan }
+    - { from: plan, to: merge, when: "plan.output.trivial" }
+    - { from: plan, to: draft, when: "plan.output.need_draft" }
+    - { from: draft, to: merge }
+    - { from: merge, to: end }

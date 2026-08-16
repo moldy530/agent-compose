@@ -4,9 +4,9 @@
 //! **byte for byte** rather than probed for substrings: an improvement to a
 //! snippet is a reviewed diff, and a regression is a test failure. The scenarios
 //! below are the shapes a report takes — a clean run, one diagnostic in one
-//! file, one diagnostic spanning two files, the same report from *outside* the
-//! project, and the machine format — plus the three exit codes and a guard
-//! against the checks going quadratic.
+//! file, one diagnostic drawing three sites of one file, one diagnostic spanning
+//! two files, the same report from *outside* the project, and the machine format
+//! — plus the three exit codes and a guard against the checks going quadratic.
 //!
 //! Every run sets `NO_COLOR` and reads the streams through a pipe, so nothing
 //! here depends on a terminal; `annotate-snippets`' decor is ASCII either way,
@@ -132,6 +132,49 @@ error[duplicate-definition]: `model.m` is defined twice in this composition
    | ------- first defined here, in `main.yml`
    |
    = help: a typed address is global across the composition, whichever file declares it: rename one of the two, or drop the file that duplicates the other (grammar 2.2)
+
+error: `main.yml` is not valid (target `local`): 1 error
+"
+    );
+    assert_eq!(stdout(&output), "");
+    assert_eq!(code(&output), 1);
+}
+
+/// One diagnostic, three sites in **one** file: the two secondary labels fold
+/// into the primary snippet rather than opening snippets of their own, and the
+/// lines between the node and its edges are elided to a `...`.
+///
+/// A graph check is where that shape comes from — the mistake is a relation
+/// between declarations that sit apart in the file, so the report has to draw
+/// all three at once — and `unbalanced-convergence` is the ordinary case: a
+/// convergence, and the two edges of the fork that reach it at different depths
+/// (grammar 7.6.2). The project is grammar 7.6.2's own worked diamond with the
+/// `trivial` shortcut added, so what a reader compares this against is written
+/// down. Nothing else pins a check diagnostic through the renderer:
+/// `compose-core`'s corpus asserts on the `Diagnostic` values, which is the
+/// wrong altitude to catch a label that stopped folding or a gap that stopped
+/// eliding, and error UX is a product feature (PRD G3).
+#[test]
+fn a_graph_check_renders_its_two_secondary_labels_in_one_snippet() {
+    let output = validate(
+        &projects().join("one-unbalanced-convergence"),
+        &["main.yml"],
+    );
+    assert_eq!(
+        stderr(&output),
+        "\
+error[unbalanced-convergence]: node `merge` of `flow.diamond` is reached from the fork `plan` at two different depths
+  --> main.yml:24:5
+   |
+24 |     merge: { agent: agent.writer, input: \"'the draft'\" }
+   |     ^^^^^
+...
+27 |     - { from: plan, to: merge, when: \"plan.output.trivial\" }
+   |       ------------------------------------------------------ this edge reaches it in 1 step
+28 |     - { from: plan, to: draft, when: \"plan.output.need_draft\" }
+   |       --------------------------------------------------------- this one in 2 steps
+   |
+   = help: a convergence reached in two different steps runs twice, once per arrival: route the short branch through the same depth, or make the two edges exclusive — `else: true` on one, or guards grammar 7.6.1 can prove disjoint (grammar 7.6.2, Decisions D69, D112)
 
 error: `main.yml` is not valid (target `local`): 1 error
 "
