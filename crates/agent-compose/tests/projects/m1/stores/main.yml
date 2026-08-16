@@ -1,0 +1,121 @@
+# M1 acceptance fixture: both store consumption surfaces (PRD 5.8).
+#
+# One definition, two usage surfaces:
+#
+#   * **store-op nodes** — `load` and `remember` below: deterministic,
+#     graph-invoked, schema-checked against `value_schema`, and under
+#     `--target local` backed by SQLite/local disk with no infrastructure at all;
+#   * **agent-attached** — `store.docs` and `store.prefs` on `agent.grounded`:
+#     codegen synthesizes LLM-facing tools from each store's kind and schema
+#     (grammar 11.5), and they appear in the model request the mock records.
+#
+# `agent_access:` is what makes the second surface worth a fixture of its own:
+# `store.docs` is `read`, so the synthesized surface is `docs_search` and NOT
+# `docs_upsert`, while `store.prefs` takes the `read_write` default and
+# synthesizes `prefs_get` **and** `prefs_set`. The tool list of the recorded
+# request is exactly that claim, checkable.
+#
+# `embed.provider` is an `openai_compatible` connection because embeddings are
+# served by a provider that publishes the capability (grammar 11.2), and it is a
+# different question from where the vectors live (`backend:`, omitted here — the
+# `local` target substitutes local storage for every store unconditionally).
+version: "0.1"
+
+state:
+  prefs_found:
+    description: Whether the preferences store had anything for this key.
+    type: boolean
+    default: false
+  answer:
+    type: string
+    default: ""
+
+provider.mock:
+  kind: anthropic
+  api_key: ${MOCK_API_KEY}
+  base_url: ${MOCK_BASE_URL}
+
+provider.embeddings:
+  kind: openai_compatible
+  base_url: ${MOCK_BASE_URL}
+  api_key: ${MOCK_API_KEY}
+
+model.smart:
+  provider: provider.mock
+  id: claude-sonnet-4-6
+  settings:
+    max_tokens: 4096
+
+store.prefs:
+  kind: kv
+  scope: execution
+  description: What this run has been told about how to answer.
+  value_schema:
+    theme:
+      type: string
+    verbosity:
+      enum: [low, high]
+
+store.docs:
+  kind: vector
+  scope: global
+  description: Project documentation, chunked, for grounding answers.
+  embed:
+    model: text-embedding-3-small
+    provider: provider.embeddings
+    dimensions: 1536
+  metadata_schema:
+    source: { type: string }
+  agent_access: read
+
+agent.grounded:
+  description: Answers a question using the documentation it can search.
+  model: model.smart
+  prompt: |
+    Answer the question. Search the documentation before answering, and record
+    any preference the user states.
+  stores: [store.docs, store.prefs]
+  input:
+    question: { type: string }
+    known: { type: boolean }
+  output:
+    answer:
+      type: string
+      min_length: 1
+
+flow.answer:
+  description: Load preferences, answer a question, and record what was used.
+  inputs:
+    question:
+      type: string
+      min_length: 1
+  outputs:
+    answer:
+      type: string
+  nodes:
+    load:
+      store: store.prefs
+      op: get
+      key: "'preferences'"
+      writes:
+        found: prefs_found
+
+    ask:
+      agent: agent.grounded
+      input:
+        question: "input.question"
+        known: "state.prefs_found"
+
+    remember:
+      store: store.prefs
+      op: set
+      key: "'preferences'"
+      value:
+        theme: "'default'"
+        verbosity: "'low'"
+
+  edges:
+    - { from: start, to: load }
+    - { from: load, to: ask }
+    - { from: ask, to: remember }
+    - { from: remember, to: end }

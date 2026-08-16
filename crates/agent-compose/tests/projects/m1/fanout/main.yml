@@ -1,0 +1,251 @@
+# M1 acceptance fixture: both fan-out forms, index-tagged reducers, a subgraph.
+#
+# `flow.spread` is the homogeneous form — one target for every item — and
+# `flow.triage` is the discriminator-routed one, where the item is a tagged union
+# and each route is narrowed to its own variant's payload (PRD 5.6). Both write
+# into `append` channels, which is where the guarantee that matters lives:
+# instances complete in whatever order the scheduler and the provider produce,
+# and the appended results are still ordered by **source-item index**. The mock's
+# scripted delays are how a test forces completion order to differ from item
+# order, so that promise becomes an assertion rather than a coincidence.
+#
+# `flow.triage` also instantiates `flow.normalize` through a plain `flow:` node,
+# so the subgraph path — explicit bindings in, name-based outputs back, isolated
+# conversation history — is exercised by the same project.
+version: "0.1"
+
+state:
+  normalized:
+    description: The report after flow.normalize has cleaned it.
+    type: string
+    default: ""
+  drafts:
+    description: One element per dispatched instance; index-tagged before the join.
+    type: array
+    max_items: 40
+    items: { type: string }
+    reduce: append
+  tickets:
+    description: The sink route's results, in source-item order.
+    type: array
+    max_items: 40
+    items: { type: string }
+    reduce: append
+
+provider.mock:
+  kind: anthropic
+  api_key: ${MOCK_API_KEY}
+  base_url: ${MOCK_BASE_URL}
+
+model.smart:
+  provider: provider.mock
+  id: claude-sonnet-4-6
+  settings:
+    max_tokens: 4096
+
+model.fast:
+  provider: provider.mock
+  id: claude-haiku-4-5
+  settings:
+    max_tokens: 2000
+
+agent.planner:
+  description: Splits a goal into independently workable tasks.
+  model: model.smart
+  prompt: |
+    Split the goal into independent tasks. Emit one task per unit of work.
+  input:
+    goal:
+      type: string
+  output:
+    tasks:
+      description: The fan-out source; `max_items` is what bounds the cardinality.
+      type: array
+      max_items: 10
+      items:
+        type: object
+        properties:
+          title: { type: string }
+          body: { type: string }
+
+agent.worker:
+  description: Carries out one task.
+  model: model.fast
+  prompt: |
+    Carry out the one task you are given and return its result.
+  input:
+    title: { type: string }
+    body: { type: string }
+  output:
+    result:
+      type: string
+      min_length: 1
+
+agent.normalizer:
+  description: Normalizes a raw report.
+  model: model.fast
+  prompt: |
+    Rewrite the report as one paragraph of plain prose.
+  input:
+    report: { type: string }
+  output:
+    normalized:
+      type: string
+      min_length: 1
+
+agent.triage:
+  description: Classifies findings into routable variants.
+  model: model.smart
+  prompt: |
+    Emit one finding per distinct defect. Tag it `auto_fixable` when the fix is
+    mechanical, and `needs_human` when it needs judgement.
+  input:
+    report: { type: string }
+  output:
+    findings:
+      type: array
+      max_items: 20
+      items:
+        discriminator: kind
+        variants:
+          auto_fixable:
+            file: { type: string }
+            hint: { type: string }
+          needs_human:
+            summary: { type: string }
+            severity: { enum: [low, high] }
+
+agent.fixer:
+  description: Produces a patch for one mechanically fixable finding.
+  model: model.fast
+  prompt: |
+    Write a minimal patch for exactly the described defect.
+  input:
+    file: { type: string }
+    hint: { type: string }
+  output:
+    patch:
+      type: string
+      min_length: 1
+
+agent.escalator:
+  description: Writes the ticket text for one finding a human must look at.
+  model: model.fast
+  prompt: |
+    Write a one-line ticket summary for the finding.
+  input:
+    summary: { type: string }
+    severity: { enum: [low, high] }
+  output:
+    ticket:
+      type: string
+      min_length: 1
+
+flow.normalize:
+  description: Normalize a raw report.
+  inputs:
+    report: { type: string }
+  outputs:
+    normalized: { type: string }
+  nodes:
+    clean:
+      agent: agent.normalizer
+      input:
+        report: "input.report"
+  edges:
+    - { from: start, to: clean }
+    - { from: clean, to: end }
+
+flow.spread:
+  description: Plan a goal and fan out over the plan.
+  inputs:
+    goal:
+      type: string
+      min_length: 1
+  outputs:
+    drafts:
+      type: array
+      max_items: 40
+      items: { type: string }
+  nodes:
+    plan:
+      agent: agent.planner
+      input:
+        goal: "input.goal"
+
+    # Homogeneous: one target for every item. `max_items` on the source array and
+    # `max_concurrency` here are the two mandatory bounds (PRD 5.6).
+    work:
+      map:
+        over: plan.output.tasks
+        as: task
+        node: agent.worker
+        max_concurrency: 4
+        input:
+          title: "task.title"
+          body: "task.body"
+        writes:
+          result: drafts
+        on_item_error:
+          retry: { max: 1, backoff: 1s }
+  edges:
+    - { from: start, to: plan }
+    - { from: plan, to: work }
+    - { from: work, to: end }
+
+flow.triage:
+  description: Normalize a report, classify it, and route each finding.
+  inputs:
+    report:
+      type: string
+      min_length: 1
+  outputs:
+    drafts:
+      type: array
+      max_items: 40
+      items: { type: string }
+    tickets:
+      type: array
+      max_items: 40
+      items: { type: string }
+  nodes:
+    # A subgraph: explicit bindings in, name-based outputs back out.
+    prepare:
+      flow: flow.normalize
+      input:
+        report: "input.report"
+      context: isolated
+
+    classify:
+      agent: agent.triage
+      input:
+        report: "state.normalized"
+
+    # Discriminator-routed: each route is type-checked against its own variant's
+    # payload, and every variant is routed, so no item can be unroutable.
+    dispatch:
+      map:
+        over: classify.output.findings
+        as: finding
+        route_by: kind
+        max_concurrency: 4
+        routes:
+          auto_fixable:
+            node: agent.fixer
+            input:
+              file: "finding.file"
+              hint: "finding.hint"
+            writes:
+              patch: drafts
+          needs_human:
+            node: agent.escalator
+            input:
+              summary: "finding.summary"
+              severity: "finding.severity"
+            writes:
+              ticket: tickets
+  edges:
+    - { from: start, to: prepare }
+    - { from: prepare, to: classify }
+    - { from: classify, to: dispatch }
+    - { from: dispatch, to: end }

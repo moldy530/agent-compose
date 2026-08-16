@@ -1,0 +1,72 @@
+# M1 acceptance fixture: the same agent, on the other HTTP surface.
+#
+# `openai_compatible` is the kind grammar 12.1 gives to "ollama, vllm, proxies" —
+# anything speaking Chat Completions at a URL — so it is both a realistic
+# provider for a local model and the way this suite reaches the mock's OpenAI
+# surface. The graph is deliberately the same shape as `agent-anthropic`: what a
+# test comparing the two asserts is that the *provider kind* is the only
+# difference, which is PRD 5.9's whole claim about the provider/model split.
+version: "0.1"
+
+state:
+  verdict:
+    enum: [approve, revise]
+    default: approve
+  feedback:
+    type: string
+    default: ""
+
+provider.mock:
+  kind: openai_compatible
+  base_url: ${MOCK_BASE_URL}
+  api_key: ${MOCK_API_KEY}
+
+model.local:
+  provider: provider.mock
+  id: qwen3-coder-30b
+  settings:
+    temperature: 0.2
+    max_tokens: 2000
+
+agent.reviewer:
+  description: Reviews a draft against a goal and returns a routable verdict.
+  model: model.local
+  prompt: |
+    You are a meticulous technical reviewer.
+
+    Approve only when the draft fully satisfies the goal. Otherwise ask for a
+    revision and list every required change.
+  input:
+    goal:
+      type: string
+    draft:
+      type: string
+  output:
+    verdict:
+      enum: [approve, revise]
+    feedback:
+      type: string
+
+flow.review:
+  description: Review one draft and return the verdict.
+  inputs:
+    goal:
+      type: string
+      min_length: 1
+    draft:
+      type: string
+      min_length: 1
+  outputs:
+    verdict:
+      enum: [approve, revise]
+    feedback:
+      type: string
+  nodes:
+    review:
+      agent: agent.reviewer
+      input:
+        goal: "input.goal"
+        draft: "input.draft"
+  edges:
+    - { from: start, to: review }
+    - { from: review, to: end }

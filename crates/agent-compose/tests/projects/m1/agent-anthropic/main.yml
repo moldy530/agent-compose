@@ -1,0 +1,105 @@
+# M1 acceptance fixture: one agent node on the Anthropic surface.
+#
+# One flow, one agent, one manual invocation — so the tests that assert about
+# *the agent node itself* have nothing else in the transcript to explain away.
+# What the one node carries is every surface an agent has: a literal prompt, a
+# declared input, a structured output (PRD 5.2), an attached tool, and the
+# `max_tool_iterations` bound on the loop that tool opens (D51).
+#
+# `tool.lookup` is an `exec` binding over `printf` for a reason: the tool loop
+# has to be runnable in CI with no infrastructure, and its output is a single
+# string property, so the raw stdout binds to it (grammar 6.1) and the result is
+# the same on every machine.
+#
+# Every provider here declares `base_url: ${MOCK_BASE_URL}`. That is what lets
+# the acceptance harness point a compiled graph at the mock provider without the
+# spec differing between a scripted run and a real one (PRD 5.9: env refs survive
+# unresolved into the IR and resolve at process start). `examples/` cannot serve
+# as an acceptance fixture for exactly this reason: its `provider.anthropic`
+# names no base URL, so a graph built from it talks to Anthropic.
+version: "0.1"
+
+state:
+  verdict:
+    description: The reviewer's verdict, written by name from its output.
+    enum: [approve, revise]
+    default: approve
+  feedback:
+    description: The reviewer's feedback, written by name from its output.
+    type: string
+    default: ""
+
+provider.mock:
+  kind: anthropic
+  api_key: ${MOCK_API_KEY}
+  base_url: ${MOCK_BASE_URL}
+
+model.smart:
+  provider: provider.mock
+  id: claude-sonnet-4-6
+  settings:
+    max_tokens: 4096
+
+tool.lookup:
+  description: Look up one fact the draft depends on.
+  input:
+    query:
+      description: What to look up.
+      type: string
+      min_length: 1
+  output:
+    snippet:
+      description: The one fact found, as text.
+      type: string
+  exec:
+    command: printf
+    args: ["a looked-up snippet"]
+
+agent.reviewer:
+  description: Reviews a draft against a goal and returns a routable verdict.
+  model: model.smart
+  prompt: |
+    You are a meticulous technical reviewer.
+
+    Approve only when the draft fully satisfies the goal. Otherwise ask for a
+    revision and list every required change.
+  tools: [tool.lookup]
+  max_tool_iterations: 2
+  input:
+    goal:
+      description: What the draft must accomplish.
+      type: string
+    draft:
+      description: The draft under review.
+      type: string
+  output:
+    verdict:
+      description: The routable decision.
+      enum: [approve, revise]
+    feedback:
+      description: Required changes; empty when approving.
+      type: string
+
+flow.review:
+  description: Review one draft and return the verdict.
+  inputs:
+    goal:
+      type: string
+      min_length: 1
+    draft:
+      type: string
+      min_length: 1
+  outputs:
+    verdict:
+      enum: [approve, revise]
+    feedback:
+      type: string
+  nodes:
+    review:
+      agent: agent.reviewer
+      input:
+        goal: "input.goal"
+        draft: "input.draft"
+  edges:
+    - { from: start, to: review }
+    - { from: review, to: end }

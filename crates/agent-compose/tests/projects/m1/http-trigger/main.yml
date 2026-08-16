@@ -1,0 +1,109 @@
+# M1 acceptance fixture: the generated app's three verbs.
+#
+# `agent-compose serve` emits a Fastify app for the `http` triggers of a project,
+# exposing **start**, **resume**, and **status** (PRD 5.11, grammar 13.3). This
+# project has all three surfaces to exercise: an `http` trigger whose `input:`
+# bindings are CEL over the request payload, an interrupting `human` node whose
+# output schema is what a resume payload is validated against, and an `async`
+# response, so a start returns an execution id and the status route is how a
+# caller learns the rest.
+#
+# The `escalate` node is reached only through the `human` node's `on_timeout:`
+# control transfer — one of the two positions node reachability counts besides
+# edges (grammar 7.8) — and still carries an outgoing edge of its own, because
+# reaching `end` is how a branch retires.
+version: "0.1"
+
+defaults:
+  timeout: 60s
+  on_error: fail
+
+state:
+  answer:
+    type: string
+    default: ""
+  decision:
+    enum: [approve, reject]
+    default: approve
+
+triggers:
+  # `respond: async` returns an execution id immediately; the optional callback
+  # fires on completion. A `sync` response would be a compile error here, because
+  # this flow reaches a `human` node and sync triggers must be interrupt-free.
+  on_request:
+    type: http
+    flow: flow.assisted
+    path: /answers
+    method: POST
+    input:
+      question: "payload.body.question"
+    respond: async
+    callback: "payload.body.callback_url"
+
+provider.mock:
+  kind: anthropic
+  api_key: ${MOCK_API_KEY}
+  base_url: ${MOCK_BASE_URL}
+
+model.smart:
+  provider: provider.mock
+  id: claude-sonnet-4-6
+  settings:
+    max_tokens: 4096
+
+agent.answerer:
+  description: Answers one question.
+  model: model.smart
+  prompt: |
+    Answer the question in one paragraph.
+  input:
+    question:
+      type: string
+  output:
+    answer:
+      type: string
+      min_length: 1
+
+flow.assisted:
+  description: Answer a question and have a human sign the answer off.
+  inputs:
+    question:
+      type: string
+      min_length: 1
+  outputs:
+    answer:
+      type: string
+    decision:
+      enum: [approve, reject]
+  nodes:
+    ask:
+      agent: agent.answerer
+      input:
+        question: "input.question"
+
+    # The interrupt. Its `output:` is the schema a resume payload is validated
+    # against, and it is routable structured output like any other.
+    approve:
+      human:
+        input:
+          answer: { type: string }
+        output:
+          decision: { enum: [approve, reject] }
+          note: { type: string }
+        timeout: 24h
+        on_timeout: escalate
+      input:
+        answer: "state.answer"
+
+    # No edge targets this node: it is reached through `on_timeout:` alone.
+    escalate:
+      exec:
+        command: "${OPS_BIN}/escalate"
+        args: ["--reason=human-timeout"]
+      on_error: skip
+
+  edges:
+    - { from: start, to: ask }
+    - { from: ask, to: approve }
+    - { from: approve, to: end }
+    - { from: escalate, to: end }
