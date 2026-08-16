@@ -257,15 +257,19 @@ impl<'a> Graph<'a> {
     /// The nodes reachable over edges from the target of one edge, the edge
     /// itself included — "reachable from a fork **through** this edge"
     /// (grammar 7.6.1).
-    pub(crate) fn reachable_through(&self, edge: usize) -> Vec<bool> {
-        let mut found = vec![false; self.nodes.len()];
-        if let Some(Vertex::Node(entry)) = self.endpoints[edge].1 {
-            found[entry] = true;
-            for (at, reached) in self.reachable()[entry].iter().enumerate() {
-                found[at] |= *reached;
-            }
-        }
-        found
+    ///
+    /// The answer is the node indexes themselves, in ascending order, rather than
+    /// a mask over every node: its reader pairs one edge's answer with another's
+    /// (see [`convergence`](super::convergence)), and pairing two *lists* costs
+    /// what the branches hold instead of what the flow holds.
+    pub(crate) fn reachable_through(&self, edge: usize) -> Vec<usize> {
+        let Some(Vertex::Node(entry)) = self.endpoints[edge].1 else {
+            return Vec::new();
+        };
+        let reached = &self.reachable()[entry];
+        (0..self.nodes.len())
+            .filter(|at| *at == entry || reached[*at])
+            .collect()
     }
 
     /// Whether `dominator` dominates `node`: every path from `start` to `node`
@@ -332,8 +336,8 @@ impl<'a> Graph<'a> {
         transfers
     }
 
-    /// The step distances from a fork to every node, over the paths that leave
-    /// it by one edge and traverse no node belonging to a cycle
+    /// The step distances from a fork to every node it delivers to, over the
+    /// paths that leave it by one edge and traverse no node belonging to a cycle
     /// (grammar 7.6.2).
     ///
     /// Excluding cycle nodes is what makes the walk finite *and* the answer
@@ -341,8 +345,13 @@ impl<'a> Graph<'a> {
     /// this walk admits visits each node at most once and its length is at most
     /// the node count. Where a cycle lies on the way, `dist` is not computed and
     /// the runtime rule governs instead.
-    pub(crate) fn distances(&self, edge: usize) -> Vec<BTreeSet<usize>> {
-        let mut distances = vec![BTreeSet::new(); self.nodes.len()];
+    ///
+    /// Only the nodes this edge actually delivers to are keyed — a node absent
+    /// from the map is one no admitted path reaches, which is the empty set of
+    /// distances said in the space a branch occupies rather than the space the
+    /// flow occupies.
+    pub(crate) fn distances(&self, edge: usize) -> BTreeMap<usize, BTreeSet<usize>> {
+        let mut distances: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
         let Some(Vertex::Node(entry)) = self.endpoints[edge].1 else {
             return distances;
         };
@@ -350,13 +359,13 @@ impl<'a> Graph<'a> {
             return distances;
         }
         let mut queue = VecDeque::from([(entry, 1usize)]);
-        distances[entry].insert(1);
+        distances.entry(entry).or_default().insert(1);
         while let Some((node, distance)) = queue.pop_front() {
             for next in &self.successors[node] {
                 if self.cyclic(*next) {
                     continue;
                 }
-                if distances[*next].insert(distance + 1) {
+                if distances.entry(*next).or_default().insert(distance + 1) {
                     queue.push_back((*next, distance + 1));
                 }
             }

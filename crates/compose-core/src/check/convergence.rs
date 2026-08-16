@@ -56,6 +56,19 @@
 //! exclusive is co-takeable, so it may ask for a policy on a channel two
 //! branches could not really both write. Declaring the policy is the cost, and
 //! D32 already holds that a declared overwrite beats a silent race.
+//!
+//! # One walk per edge, never one per pair
+//!
+//! Both rules are stated over pairs, and a fork of *w* out-edges has w(w-1)/2 of
+//! them — but what each rule reads of an edge is a property of that **edge**:
+//! the step distances it delivers at (grammar 7.6.2) and the nodes it reaches
+//! (grammar 7.6.1). Both are therefore taken once per edge and paired out of a
+//! cache, and both are read as the branch's own nodes rather than as a mask over
+//! the flow's, so pairing two branches costs what those branches hold. A wide
+//! fan-out is a shape the grammar admits — nothing bounds a node's out-degree,
+//! and `start` forks like any other vertex — while `validate` is a
+//! millisecond-budget command (PRD 5.12); recomputing per pair made this the one
+//! shape that could spend that budget.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -188,18 +201,29 @@ fn exclusive(
 /// Grammar 7.6.2: the two edges of a pair may not deliver to one node at two
 /// different depths.
 fn balanced<'a>(ctx: &mut Ctx<'a>, cx: &FlowCx<'a>, graph: &Graph<'a>, pairs: &[Pair]) {
+    let mut distances: BTreeMap<usize, BTreeMap<usize, BTreeSet<usize>>> = BTreeMap::new();
     for pair in pairs {
         let (left, right) = pair.edges;
-        let near = graph.distances(left);
-        let far = graph.distances(right);
+        for edge in [left, right] {
+            distances
+                .entry(edge)
+                .or_insert_with(|| graph.distances(edge));
+        }
+        let near = &distances[&left];
+        let far = &distances[&right];
         let mut nearest: Option<(usize, usize, usize, usize)> = None;
-        for node in 0..graph.nodes().len() {
-            let Some((one, other)) = differ(&near[node], &far[node]) else {
+        // Ascending node index, so a tie on the distance keeps the earlier node
+        // — the order a scan of every node would have found them in.
+        for (node, near) in near {
+            let Some(far) = far.get(node) else {
+                continue;
+            };
+            let Some((one, other)) = differ(near, far) else {
                 continue;
             };
             let key = one.min(other);
             if nearest.as_ref().is_none_or(|(best, ..)| key < *best) {
-                nearest = Some((key, node, one, other));
+                nearest = Some((key, *node, one, other));
             }
         }
         let Some((_, node, one, other)) = nearest else {
@@ -252,16 +276,27 @@ fn steps(count: usize) -> String {
 fn concurrent<'a>(ctx: &mut Ctx<'a>, cx: &FlowCx<'a>, graph: &Graph<'a>, pairs: &[Pair]) {
     let mut reported: BTreeSet<(usize, usize)> = BTreeSet::new();
     let mut writes: BTreeMap<usize, Vec<Written<'a>>> = BTreeMap::new();
+    let mut through: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     for pair in pairs {
         let (left, right) = pair.edges;
-        let near = graph.reachable_through(left);
-        let far = graph.reachable_through(right);
-        for (one, reached) in near.iter().enumerate() {
-            if !reached {
+        for edge in [left, right] {
+            through
+                .entry(edge)
+                .or_insert_with(|| graph.reachable_through(edge));
+        }
+        for one in &through[&left] {
+            let one = *one;
+            // A node that writes no channel cannot race one for it. Asking that
+            // first is what keeps the bookkeeping below proportional to the
+            // *writers* the two branches hold rather than to their nodes: a pair
+            // of them is recorded, and every such pair is a lookup and an entry
+            // that outlives the pass.
+            if !writes_any(ctx, graph, &mut writes, one) {
                 continue;
             }
-            for (other, reached) in far.iter().enumerate() {
-                if one == other || !reached {
+            for other in &through[&right] {
+                let other = *other;
+                if one == other || !writes_any(ctx, graph, &mut writes, other) {
                     continue;
                 }
                 // Neither reachable from the other: a node downstream of both
@@ -273,15 +308,25 @@ fn concurrent<'a>(ctx: &mut Ctx<'a>, cx: &FlowCx<'a>, graph: &Graph<'a>, pairs: 
                 if !reported.insert(key) {
                     continue;
                 }
-                for node in [key.0, key.1] {
-                    writes
-                        .entry(node)
-                        .or_insert_with(|| written(ctx, graph.node(node)));
-                }
                 races(ctx, cx, graph, &writes, key);
             }
         }
     }
+}
+
+/// Whether a node writes any channel at all, filling the cache on the way — the
+/// effective write map of one node is a property of that node, and two nodes are
+/// asked about once per pair they belong to.
+fn writes_any<'a>(
+    ctx: &Ctx<'a>,
+    graph: &Graph<'a>,
+    writes: &mut BTreeMap<usize, Vec<Written<'a>>>,
+    node: usize,
+) -> bool {
+    !writes
+        .entry(node)
+        .or_insert_with(|| written(ctx, graph.node(node)))
+        .is_empty()
 }
 
 /// The channels two concurrent nodes both write with no `reduce:` policy.

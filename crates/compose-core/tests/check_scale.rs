@@ -16,10 +16,14 @@
 //!   guard through `crates/agent-compose/tests/cli.rs`.
 //!
 //! Every case here is written so that a regression shows up as a failure rather
-//! than as a slow test.
+//! than as a slow test: the depth case runs on a thread whose stack is far too
+//! small to recurse through, and the fork case times the check pass alone — the
+//! project is resolved off the clock — against a budget orders of magnitude
+//! above what it costs.
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use compose_core::resolve;
 
@@ -138,4 +142,79 @@ fn a_deeply_nested_composition_is_checked_without_recursing() {
         .join()
         .expect("the pass returns rather than overflowing its stack");
     assert_eq!(checked, 0, "the generated project checks cleanly");
+}
+
+/// One `hub` node with `width` unconditional out-edges, each starting a chain of
+/// six nodes to `end`. Every pair of those edges is co-takeable, so the fork
+/// analysis sees `width * (width - 1) / 2` pairs (grammar 7.6.1).
+fn wide_fork_project(dir: &Path, width: usize) {
+    let chain = 6;
+    let mut nodes = String::from("    hub: { agent: agent.a, input: \"'h'\" }\n");
+    let mut edges = String::from("    - { from: start, to: hub }\n");
+    for branch in 0..width {
+        for step in 0..chain {
+            nodes.push_str(&format!(
+                "    n{branch}_{step}: {{ agent: agent.a, input: \"'x'\" }}\n"
+            ));
+        }
+        edges.push_str(&format!("    - {{ from: hub, to: n{branch}_0 }}\n"));
+        for step in 0..chain - 1 {
+            edges.push_str(&format!(
+                "    - {{ from: n{branch}_{step}, to: n{branch}_{} }}\n",
+                step + 1
+            ));
+        }
+        edges.push_str(&format!(
+            "    - {{ from: n{branch}_{}, to: end }}\n",
+            chain - 1
+        ));
+    }
+    fs::write(
+        dir.join("main.yml"),
+        format!(
+            "version: \"0.1\"\n{BACKEND}flow.f:\n  outputs: {{}}\n  nodes:\n{nodes}  edges:\n{edges}"
+        ),
+    )
+    .expect("can write the entrypoint");
+}
+
+/// A fork wide enough that anything recomputed per *pair* shows.
+///
+/// 240 branches are 28,680 co-takeable pairs over 1,441 nodes. What the two
+/// rules read of an edge — its step distances (grammar 7.6.2) and what it
+/// reaches (grammar 7.6.1) — is a property of the edge, so 480 walks answer for
+/// every pair; taking them per pair instead made this shape cubic in the
+/// out-degree and cost seconds, against a command whose budget is milliseconds
+/// (PRD 5.12). Resolution is off the clock deliberately: this is a bound on the
+/// graph analyses, not on the parser.
+#[test]
+fn a_wide_fork_is_checked_in_proportion_to_its_pairs() {
+    let dir = scratch("wide");
+    wide_fork_project(&dir, 240);
+    let resolution = resolve(dir.join("main.yml"));
+    assert!(
+        resolution.diagnostics.is_empty(),
+        "the generated project resolves cleanly, got {} diagnostic(s)",
+        resolution.diagnostics.len()
+    );
+    let ir = resolution
+        .ir
+        .expect("a clean resolution produces an artifact");
+
+    // The minimum of three runs, so a scheduling hiccup cannot fail the test.
+    let budget = Duration::from_secs(4);
+    let fastest = (0..3)
+        .map(|_| {
+            let started = Instant::now();
+            let diagnostics = compose_core::check(&ir);
+            assert!(diagnostics.is_empty(), "the wide fork checks cleanly");
+            started.elapsed()
+        })
+        .min()
+        .expect("three runs");
+    println!("240-branch fork: {fastest:?}");
+    assert!(
+        fastest < budget,
+        "checking a 240-branch fork took {fastest:?}, and the budget is {budget:?}"
+    );
 }
