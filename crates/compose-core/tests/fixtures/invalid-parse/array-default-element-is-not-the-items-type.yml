@@ -1,0 +1,13 @@
+# rule: an array `default:` holds values of the `items:` type (grammar 3.6, Decision D77)
+# code: invalid-value
+# message: `default` in state channel `names` must be a string, found an integer at `[1]`
+# at: 13:20
+#
+# The literal is walked to its leaves, so the element that is not of the
+# `items:` type is named by its index rather than the whole default being
+# reported as "not an array of strings".
+state:
+  names:
+    type: array
+    items: { type: string }
+    default: ["a", 2]

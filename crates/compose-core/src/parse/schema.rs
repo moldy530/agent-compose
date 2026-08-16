@@ -464,7 +464,7 @@ fn scalar_form(
     }
 
     scalar.default = default_value(fields, subject, surface, cx)
-        .inspect(|value| check_default_kind(value, kind, subject, cx));
+        .inspect(|value| check_default_kind(value, kind, "", subject, cx));
 
     TypeForm::Scalar(scalar)
 }
@@ -583,18 +583,8 @@ fn object_form(
         }
     }
 
-    let default = default_value(fields, subject, surface, cx).inspect(|value| {
-        if !matches!(value.value, Literal::Mapping(_)) {
-            cx.error(
-                DiagnosticCode::InvalidValue,
-                &value.span,
-                format!(
-                    "`default` for an object must be a mapping, found {}",
-                    value.value.description()
-                ),
-            );
-        }
-    });
+    let default = default_value(fields, subject, surface, cx)
+        .inspect(|value| check_object_default(value, &properties, &optional, "", subject, cx));
 
     TypeForm::Object(ObjectType {
         properties,
@@ -660,18 +650,8 @@ fn array_form(
     }
 
     let unique_items = fields.boolean("unique_items", cx);
-    let default = default_value(fields, subject, surface, cx).inspect(|value| {
-        if !matches!(value.value, Literal::Sequence(_)) {
-            cx.error(
-                DiagnosticCode::InvalidValue,
-                &value.span,
-                format!(
-                    "`default` for an array must be a sequence, found {}",
-                    value.value.description()
-                ),
-            );
-        }
-    });
+    let default = default_value(fields, subject, surface, cx)
+        .inspect(|value| check_array_default(value, &items, "", subject, cx));
 
     TypeForm::Array(ArrayType {
         items: Box::new(items),
@@ -726,20 +706,26 @@ fn enum_form(fields: &mut Fields<'_>, subject: &str, surface: Surface, cx: &mut 
     }
 
     let default = default_value(fields, subject, surface, cx)
-        .inspect(|value| check_enum_default(value, &variants, cx));
+        .inspect(|value| check_enum_default(value, &variants, "", cx));
 
     TypeForm::Enum(EnumType { variants, default })
 }
 
 /// An enum's `default:` names one of its declared variants (grammar 3.3).
-fn check_enum_default(value: &Spanned<Literal>, variants: &[Spanned<String>], cx: &mut Cx) {
+fn check_enum_default(
+    value: &Spanned<Literal>,
+    variants: &[Spanned<String>],
+    path: &str,
+    cx: &mut Cx,
+) {
     let Literal::String(text) = &value.value else {
         cx.error(
             DiagnosticCode::InvalidValue,
             &value.span,
             format!(
-                "`default` for an enum must be one of its string variants, found {}",
-                value.value.description()
+                "`default` for an enum must be one of its string variants, found {}{}",
+                value.value.description(),
+                at(path)
             ),
         );
         return;
@@ -753,7 +739,10 @@ fn check_enum_default(value: &Spanned<Literal>, variants: &[Spanned<String>], cx
         Diagnostic::error(
             DiagnosticCode::InvalidValue,
             value.span.clone(),
-            format!("`default` is `{text}`, which is not one of the declared variants"),
+            format!(
+                "`default` is `{text}`, which is not one of the declared variants{}",
+                at(path)
+            ),
         )
         .with_help(format!(
             "the variants are {}",
@@ -952,7 +941,13 @@ pub(crate) fn reject_non_finite_in_literal(value: &Spanned<Literal>, subject: &s
     }
 }
 
-fn check_default_kind(value: &Spanned<Literal>, kind: ScalarKind, subject: &str, cx: &mut Cx) {
+fn check_default_kind(
+    value: &Spanned<Literal>,
+    kind: ScalarKind,
+    path: &str,
+    subject: &str,
+    cx: &mut Cx,
+) {
     let matches = matches!(
         (&value.value, kind),
         (Literal::String(_), ScalarKind::String)
@@ -965,16 +960,206 @@ fn check_default_kind(value: &Spanned<Literal>, kind: ScalarKind, subject: &str,
             DiagnosticCode::InvalidValue,
             &value.span,
             format!(
-                "`default` in {subject} must be {}, found {}",
+                "`default` in {subject} must be {}, found {}{}",
                 match kind {
                     ScalarKind::String => "a string",
                     ScalarKind::Integer => "an integer",
                     ScalarKind::Number => "a number",
                     ScalarKind::Boolean => "a boolean",
                 },
-                value.value.description()
+                value.value.description(),
+                at(path)
             ),
         );
+    }
+}
+
+// --- composite defaults --------------------------------------------------
+//
+// Grammar 3.6 states the whole rule in one sentence: "the literal MUST validate
+// against the type node it sits on — an object default supplies every required
+// property, an array default is an array of the `items:` type" (Decision D77).
+// Reading only the outermost shape would leave the sentence half implemented,
+// and the half it leaves out is the half grammar 10.1 sells to authors — one
+// `default:` makes a whole channel total from step 0, which it does not if the
+// literal skips a required property. So the literal is walked to its leaves,
+// against the declarations that were just read.
+//
+// A value the literal supplies for a **union**-typed property is the one thing
+// not decided here. A union takes no `default:` of its own precisely because
+// naming a variant manufactures a discriminator tag (grammar 3.6), and what a
+// composite default may do at that position is a question §3.6 does not answer:
+// this pass reports nothing rather than inventing an answer to it.
+
+/// Where a nested value sits inside a composite `default:`, as a diagnostic
+/// names it. Empty at the top, so every message that already existed reads
+/// exactly as it did.
+fn at(path: &str) -> String {
+    if path.is_empty() {
+        String::new()
+    } else {
+        format!(" at `{path}`")
+    }
+}
+
+/// One value of a composite `default:`, against the type node it lands on
+/// (grammar 3.6, Decision D77).
+fn check_default_literal(
+    value: &Spanned<Literal>,
+    node: &TypeNode,
+    path: &str,
+    subject: &str,
+    cx: &mut Cx,
+) {
+    match &node.form {
+        TypeForm::Scalar(scalar) => {
+            check_default_kind(value, scalar.kind.value, path, subject, cx);
+        }
+        TypeForm::Enum(enumeration) => {
+            check_enum_default(value, &enumeration.variants, path, cx);
+        }
+        TypeForm::Object(object) => {
+            check_object_default(
+                value,
+                &object.properties,
+                &object.optional,
+                path,
+                subject,
+                cx,
+            );
+        }
+        TypeForm::Array(array) => check_array_default(value, &array.items, path, subject, cx),
+        // A union value, and a node whose own form was already refused: see the
+        // note above.
+        TypeForm::Union(_) | TypeForm::Invalid => {}
+    }
+}
+
+/// An object `default:`: a mapping that supplies every required property and
+/// nothing the object does not declare (grammar 3.4's closedness, 3.6).
+fn check_object_default(
+    value: &Spanned<Literal>,
+    properties: &FieldMap,
+    optional: &[Spanned<Ident>],
+    path: &str,
+    subject: &str,
+    cx: &mut Cx,
+) {
+    let Literal::Mapping(entries) = &value.value else {
+        cx.error(
+            DiagnosticCode::InvalidValue,
+            &value.span,
+            format!(
+                "`default` for an object must be a mapping, found {}{}",
+                value.value.description(),
+                at(path)
+            ),
+        );
+        return;
+    };
+
+    for field in &properties.fields {
+        let name = field.name.value.as_str();
+        if entries.iter().any(|entry| entry.key.value == name) {
+            continue;
+        }
+        // A property with a `default:` of its own is optional at its surface
+        // (grammar 3.6), so the enclosing literal need not repeat it.
+        if declares_default(&field.ty)
+            || optional.iter().any(|other| other.value == field.name.value)
+        {
+            continue;
+        }
+        cx.push(
+            Diagnostic::error(
+                DiagnosticCode::InvalidValue,
+                value.span.clone(),
+                format!(
+                    "`default` in {subject} supplies no value for the required property `{name}`{}",
+                    at(path)
+                ),
+            )
+            .with_label(field.name.span.clone(), "the property is declared here")
+            .with_help(
+                "an object `default:` supplies every required property, so the value it initializes is complete from the first step (grammar 3.6, 10.1, Decision D77)",
+            ),
+        );
+    }
+
+    for entry in entries {
+        let name = entry.key.value.as_str();
+        let Some(field) = properties.field(name) else {
+            let declared: Vec<&str> = properties
+                .fields
+                .iter()
+                .map(|field| field.name.value.as_str())
+                .collect();
+            cx.push(
+                Diagnostic::error(
+                    DiagnosticCode::InvalidValue,
+                    entry.key.span.clone(),
+                    format!(
+                        "`default` in {subject} supplies `{name}`{}, which is not a declared property",
+                        at(path)
+                    ),
+                )
+                .with_help(suggest(name, &declared).map_or_else(
+                    || {
+                        if declared.is_empty() {
+                            "the object declares no properties".to_string()
+                        } else {
+                            format!("the declared properties are {}", list(&declared))
+                        }
+                    },
+                    |property| format!("did you mean `{property}`?"),
+                )),
+            );
+            continue;
+        };
+        check_default_literal(
+            &entry.value,
+            &field.ty,
+            &format!("{path}.{name}"),
+            subject,
+            cx,
+        );
+    }
+}
+
+/// An array `default:`: a sequence whose every element is of the `items:` type
+/// (grammar 3.6).
+fn check_array_default(
+    value: &Spanned<Literal>,
+    items: &TypeNode,
+    path: &str,
+    subject: &str,
+    cx: &mut Cx,
+) {
+    let Literal::Sequence(elements) = &value.value else {
+        cx.error(
+            DiagnosticCode::InvalidValue,
+            &value.span,
+            format!(
+                "`default` for an array must be a sequence, found {}{}",
+                value.value.description(),
+                at(path)
+            ),
+        );
+        return;
+    };
+    for (index, element) in elements.iter().enumerate() {
+        check_default_literal(element, items, &format!("{path}[{index}]"), subject, cx);
+    }
+}
+
+/// Whether a type node carries a `default:` of its own, whichever form it is.
+fn declares_default(node: &TypeNode) -> bool {
+    match &node.form {
+        TypeForm::Scalar(scalar) => scalar.default.is_some(),
+        TypeForm::Enum(enumeration) => enumeration.default.is_some(),
+        TypeForm::Object(object) => object.default.is_some(),
+        TypeForm::Array(array) => array.default.is_some(),
+        TypeForm::Union(_) | TypeForm::Invalid => false,
     }
 }
 
