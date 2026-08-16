@@ -373,33 +373,11 @@ fn scalars(source: &Scalar, target: &Scalar) -> Result<(), Mismatch> {
         }
     }
     if target.kind.is_numeric() {
-        let lower = |scalar: &Scalar| {
-            scalar
-                .minimum
-                .map(number)
-                .into_iter()
-                .chain(scalar.exclusive_minimum.map(number))
-                .fold(f64::NEG_INFINITY, f64::max)
-        };
-        let upper = |scalar: &Scalar| {
-            scalar
-                .maximum
-                .map(number)
-                .into_iter()
-                .chain(scalar.exclusive_maximum.map(number))
-                .fold(f64::INFINITY, f64::min)
-        };
-        if lower(source) < lower(target) {
-            return Err(Mismatch::new(
-                format!("a number at or above {}", lower(target)),
-                "one that is not bounded there".to_string(),
-            ));
-        }
-        if upper(source) > upper(target) {
-            return Err(Mismatch::new(
-                format!("a number at or below {}", upper(target)),
-                "one that is not bounded there".to_string(),
-            ));
+        for end in [End::Lower, End::Upper] {
+            let (have, want) = (bound_at(source, end), bound_at(target, end));
+            if !have.within(want) {
+                return Err(Mismatch::new(want.expected(), have.found(want)));
+            }
         }
         if let Some(step) = target.multiple_of.map(number) {
             let source_step = source.multiple_of.map(number);
@@ -412,6 +390,96 @@ fn scalars(source: &Scalar, target: &Scalar) -> Result<(), Mismatch> {
         }
     }
     Ok(())
+}
+
+/// Which end of a numeric range a bound is.
+#[derive(Clone, Copy)]
+enum End {
+    Lower,
+    Upper,
+}
+
+/// One end of the range a scalar admits: the value, and whether the value
+/// itself is one of them.
+///
+/// The strictness is half the bound and cannot be folded away: `minimum: 0` and
+/// `exclusive_minimum: 0` name the same number and admit different sets, so a
+/// source declaring the first does not satisfy a destination declaring the
+/// second (grammar 3.3, Decision D111).
+#[derive(Clone, Copy)]
+struct Bound {
+    value: f64,
+    inclusive: bool,
+    end: End,
+}
+
+impl Bound {
+    /// Whether every value this bound admits at its end is admitted by
+    /// `other` — a tighter bound, or the same one no less strict.
+    fn within(self, other: Self) -> bool {
+        let tighter = match self.end {
+            End::Lower => self.value > other.value,
+            End::Upper => self.value < other.value,
+        };
+        tighter || (self.value == other.value && (other.inclusive || !self.inclusive))
+    }
+
+    /// How a destination's bound reads in a diagnostic.
+    fn expected(self) -> String {
+        let relation = match (self.end, self.inclusive) {
+            (End::Lower, true) => "at or above",
+            (End::Lower, false) => "above",
+            (End::Upper, true) => "at or below",
+            (End::Upper, false) => "below",
+        };
+        format!("a number {relation} {}", self.value)
+    }
+
+    /// How a source's own bound reads against the destination's: the two ways
+    /// it can be too wide are reaching past the value and admitting it.
+    fn found(self, target: Self) -> String {
+        if self.value == target.value {
+            format!("one that admits {}", self.value)
+        } else {
+            "one that is not bounded there".to_string()
+        }
+    }
+}
+
+/// A scalar's bound at one end. A scalar may declare both spellings, and the
+/// range it admits is then the tighter of the two — with `exclusive_*` winning
+/// a tie, being the stricter reading of the same number.
+fn bound_at(scalar: &Scalar, end: End) -> Bound {
+    let (inclusive, exclusive, unbounded) = match end {
+        End::Lower => (scalar.minimum, scalar.exclusive_minimum, f64::NEG_INFINITY),
+        End::Upper => (scalar.maximum, scalar.exclusive_maximum, f64::INFINITY),
+    };
+    let mut bound = Bound {
+        value: unbounded,
+        inclusive: true,
+        end,
+    };
+    // The exclusive spelling is considered second, so it takes a tie.
+    for declared in [
+        inclusive.map(|value| Bound {
+            value: number(value),
+            inclusive: true,
+            end,
+        }),
+        exclusive.map(|value| Bound {
+            value: number(value),
+            inclusive: false,
+            end,
+        }),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if declared.within(bound) {
+            bound = declared;
+        }
+    }
+    bound
 }
 
 fn arrays(source: &ArrayType, target: &ArrayType) -> Result<(), Mismatch> {
@@ -832,6 +900,55 @@ mod tests {
         assert!(satisfies(&unbounded, &bounded).is_err());
         let wider = array_node(scalar_node(ScalarKind::String, &span()), Some(11), &span());
         assert!(satisfies(&wider, &bounded).is_err());
+    }
+
+    /// The boundary value is the whole difference between the two spellings, so
+    /// the relation has to read it: a source that admits it does not satisfy a
+    /// destination that excludes it, at either end (grammar 3.3, Decision
+    /// D111).
+    #[test]
+    fn an_exclusive_bound_is_not_satisfied_by_one_that_admits_the_boundary() {
+        let bounded = |minimum: Option<i64>,
+                       exclusive_minimum: Option<i64>,
+                       maximum: Option<i64>,
+                       exclusive_maximum: Option<i64>| {
+            let mut node = scalar_node(ScalarKind::Integer, &span());
+            if let TypeForm::Scalar(scalar) = &mut node.form {
+                scalar.minimum = minimum.map(Number::Int);
+                scalar.exclusive_minimum = exclusive_minimum.map(Number::Int);
+                scalar.maximum = maximum.map(Number::Int);
+                scalar.exclusive_maximum = exclusive_maximum.map(Number::Int);
+            }
+            node
+        };
+        let at_zero = bounded(Some(0), None, None, None);
+        let above_zero = bounded(None, Some(0), None, None);
+        let mismatch = satisfies(&at_zero, &above_zero).unwrap_err();
+        assert_eq!(
+            mismatch.describe(),
+            "expected a number above 0, found one that admits 0"
+        );
+        // The same number, said the same way, still satisfies itself — and a
+        // bound that clears the excluded value satisfies it too.
+        assert!(satisfies(&above_zero, &above_zero).is_ok());
+        assert!(satisfies(&above_zero, &at_zero).is_ok());
+        assert!(satisfies(&bounded(Some(1), None, None, None), &above_zero).is_ok());
+
+        let to_ten = bounded(None, None, Some(10), None);
+        let below_ten = bounded(None, None, None, Some(10));
+        let mismatch = satisfies(&to_ten, &below_ten).unwrap_err();
+        assert_eq!(
+            mismatch.describe(),
+            "expected a number below 10, found one that admits 10"
+        );
+        assert!(satisfies(&below_ten, &to_ten).is_ok());
+        assert!(satisfies(&bounded(None, None, Some(9), None), &below_ten).is_ok());
+
+        // Where a scalar declares both spellings, the range it admits is the
+        // tighter of the two, so it is the tighter one that must be satisfied.
+        let both = bounded(Some(0), Some(1), None, None);
+        assert!(satisfies(&both, &bounded(None, Some(1), None, None)).is_ok());
+        assert!(satisfies(&bounded(Some(1), None, None, None), &both).is_err());
     }
 
     #[test]
