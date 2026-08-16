@@ -1,0 +1,8 @@
+# rule: an `imports:` entry may not name the entrypoint (grammar 1.4)
+# code: invalid-import-path
+# message: `./main.yml` imports the entrypoint itself
+# at: main.yml:8:5
+# help: the entrypoint is already part of the composition; an import list names the *other* files (grammar 1.4)
+version: "0.1"
+imports:
+  - ./main.yml

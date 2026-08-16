@@ -1,0 +1,14 @@
+# rule: an `imports:` entry may not climb out of the project root even where it climbs back in (grammar 1.4, PRD 5.12)
+# code: invalid-import-path
+# message: `../import-climbs-out-and-back-in/models.yml` climbs out of the project root
+# at: main.yml:14:5
+# help: a path may contain `..`, but every file of a composition sits inside the project root — the entrypoint's own directory — so no part of an entry may climb out of it, not even one that climbs back in: whether `../<dir>/f.yml` came back would depend on what the checkout happens to be named, and a composition means the same thing on every host (grammar 1.4, PRD 5.12)
+# ---
+# `models.yml` sits next to this file, so the entry below does name a file
+# inside the project root — and it is still refused. Deciding otherwise would
+# mean matching `import-climbs-out-and-back-in` against the name of the
+# directory the project was checked out into, so the same composition would
+# resolve on one machine and not on another.
+version: "0.1"
+imports:
+  - ../import-climbs-out-and-back-in/models.yml

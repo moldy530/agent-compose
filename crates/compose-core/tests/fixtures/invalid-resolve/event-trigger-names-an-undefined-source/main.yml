@@ -1,0 +1,19 @@
+# rule: an `event` trigger's `source:` is defined in the active target (grammar 13.5)
+# code: undefined-reference
+# message: the `staging` target defines no event source `bug_reports`
+# at: main.yml:19:13
+# help: `deploy/staging.yml` defines `other_queue` under `event_sources:`
+# target: staging
+version: "0.1"
+flow.f:
+  outputs: {}
+  nodes:
+    run: { exec: { command: "true" } }
+  edges:
+    - { from: start, to: run }
+    - { from: run, to: end }
+triggers:
+  ingest:
+    type: event
+    flow: flow.f
+    source: bug_reports

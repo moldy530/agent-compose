@@ -26,6 +26,21 @@ pub enum Surface {
 }
 
 impl Surface {
+    /// How this surface is named in the IR and in a diagnostic.
+    ///
+    /// The split the name records is grammar 3.5's: a **result** surface
+    /// requires `max_items` on every array inside it and refuses `default:`,
+    /// an **input** surface does the opposite on both counts, and a **channel**
+    /// is an input surface that additionally takes `reduce:` (grammar 10.1).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Input => "input",
+            Self::Result => "result",
+            Self::Channel => "channel",
+        }
+    }
+
     /// Whether a type node may carry `default:` here (grammar 3.6,
     /// Decision D77).
     ///

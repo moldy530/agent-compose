@@ -201,12 +201,20 @@ pub fn parse_file(path: impl AsRef<Path>) -> ParsedFile {
 
 /// Parse one file from memory, reporting diagnostics against `name`.
 pub fn parse_str(source: &str, name: impl Into<SourceName>) -> ParsedFile {
+    parse_as(source, name, FileRole::Unknown)
+}
+
+/// Parse one file whose place in a composition the caller already knows.
+///
+/// The resolver reads every file this way. See [`FileRole`] for what the extra
+/// knowledge buys.
+pub(crate) fn parse_as(source: &str, name: impl Into<SourceName>, role: FileRole) -> ParsedFile {
     let name = name.into();
     let mut diagnostics = Diagnostics::new();
     let root = yaml::load(source, &name, &mut diagnostics);
     let document = root.and_then(|root| {
         let mut cx = Cx::new(&mut diagnostics);
-        document(&root, name, &mut cx)
+        document(&root, name, role, &mut cx)
     });
     diagnostics.sort();
     ParsedFile {
@@ -215,12 +223,58 @@ pub fn parse_str(source: &str, name: impl Into<SourceName>) -> ParsedFile {
     }
 }
 
+/// What the caller already knows about a file's place in a composition
+/// (grammar 1.2).
+///
+/// Grammar 1.3 states its two `version:` rules over **roles** — REQUIRED in the
+/// entrypoint and in every deploy file, OPTIONAL in an imported file — and this
+/// pass decides everything from one file, so on its own it can only infer the
+/// role from what the file itself declares: a file carrying `imports:` must be
+/// the entrypoint, a file carrying a deploy section must be a deploy file.
+/// Appendix B blesses that approximation for the published JSON Schema, which
+/// also sees one file at a time.
+///
+/// The resolver does not have to approximate — it is holding the composition —
+/// and `validate` is the authority, so it must not contradict itself: telling
+/// an author that `mid.yml` "is the entrypoint" while the next line refuses it
+/// *for being imported* is one mistake reported as two, and one of the two is
+/// false. Passing the role keeps each rule where its premise is true.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FileRole {
+    /// Nothing is known: the file is being read on its own, so both rules are
+    /// approximated from it.
+    Unknown,
+    /// The spec file named on the command line — the only one that may declare
+    /// `imports:` (Decision D1).
+    Entrypoint,
+    /// A spec file reached from the entrypoint's `imports:`. Its `version:` is
+    /// optional, and a role-shaped rule stated against it would be false.
+    Import,
+    /// The active target's `deploy/<target>.yml`, which is selected rather than
+    /// imported (grammar 14).
+    Deploy,
+}
+
+impl FileRole {
+    /// Whether this file could be the entrypoint — the premise of grammar 1.3's
+    /// "a file that declares `imports:` must declare `version:`".
+    const fn may_be_the_entrypoint(self) -> bool {
+        matches!(self, Self::Unknown | Self::Entrypoint)
+    }
+
+    /// Whether this file could be the target's deploy file — the premise of
+    /// grammar 1.3's "every deploy file declares `version:`".
+    const fn may_be_the_deploy_file(self) -> bool {
+        matches!(self, Self::Unknown | Self::Deploy)
+    }
+}
+
 /// Sections that only a deploy file may carry (grammar 1.5).
 const DEPLOY_ONLY: &[&str] = &["placements", "storage_backends", "event_sources"];
 /// Sections that only a spec file may carry (grammar 1.5).
 const SPEC_ONLY: &[&str] = &["imports", "defaults", "state", "triggers"];
 
-fn document(root: &Node, source: SourceName, cx: &mut Cx) -> Option<Document> {
+fn document(root: &Node, source: SourceName, role: FileRole, cx: &mut Cx) -> Option<Document> {
     let mapping = root.as_mapping()?;
 
     // A file is a deploy file when it carries a deploy section and no section
@@ -239,13 +293,16 @@ fn document(root: &Node, source: SourceName, cx: &mut Cx) -> Option<Document> {
         .any(|entry| DEPLOY_ONLY.contains(&entry.key.value.as_str()));
 
     if has_deploy && spec_evidence.is_none() {
-        Some(Document::Deploy(deploy_file(mapping, root, source, cx)))
+        Some(Document::Deploy(deploy_file(
+            mapping, root, source, role, cx,
+        )))
     } else {
         Some(Document::Spec(spec_file(
             mapping,
             root,
             source,
             spec_evidence,
+            role,
             cx,
         )))
     }
@@ -262,6 +319,7 @@ fn spec_file(
     root: &Node,
     source: SourceName,
     spec_evidence: Option<&Entry>,
+    role: FileRole,
     cx: &mut Cx,
 ) -> SpecFile {
     let mut file = SpecFile {
@@ -298,10 +356,14 @@ fn spec_file(
 
     // The entrypoint is the only file that may declare `imports:`, and the
     // entrypoint must declare `version:` — the best per-file approximation of
-    // Decision D4's rule (the resolver knows which file is the entrypoint).
+    // Decision D4's rule, made only where its premise can still be true: a
+    // caller holding the composition has already said which file this is, and
+    // an import or a deploy file is refused for *that* rather than told it is
+    // the entrypoint (see `FileRole`).
     // A `version:` that was declared but rejected has already been reported;
     // saying it is missing as well would be two diagnostics for one mistake.
-    if !mapping.contains_key("version")
+    if role.may_be_the_entrypoint()
+        && !mapping.contains_key("version")
         && let Some(imports) = mapping.entry("imports")
     {
         cx.push(
@@ -320,7 +382,13 @@ fn spec_file(
     file
 }
 
-fn deploy_file(mapping: &Mapping, root: &Node, source: SourceName, cx: &mut Cx) -> DeployFile {
+fn deploy_file(
+    mapping: &Mapping,
+    root: &Node,
+    source: SourceName,
+    role: FileRole,
+    cx: &mut Cx,
+) -> DeployFile {
     let mut file = DeployFile {
         source,
         version: None,
@@ -346,7 +414,12 @@ fn deploy_file(mapping: &Mapping, root: &Node, source: SourceName, cx: &mut Cx) 
         }
     }
 
-    if !mapping.contains_key("version") {
+    // Stated only where its premise can still be true: a file the caller is
+    // holding as an import is refused for being imported at all, and one it is
+    // holding as the entrypoint for being the entrypoint, so a second
+    // diagnostic about its `version:` would be noise on a file that is in the
+    // wrong place entirely (see `FileRole`).
+    if role.may_be_the_deploy_file() && !mapping.contains_key("version") {
         cx.push(
             Diagnostic::error(
                 DiagnosticCode::MissingKey,
@@ -468,4 +541,76 @@ fn version(node: &Node, cx: &mut Cx) -> Option<Spanned<String>> {
         return None;
     }
     Some(Spanned::new(text.clone(), node.span.clone()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DiagnosticCode, FileRole, parse_as};
+
+    const IMPORTS_NO_VERSION: &str = "imports:\n  - other.yml\n";
+    const DEPLOY_NO_VERSION: &str = "placements:\n  flow.f: { runtime: colocated }\n";
+    const ENTRYPOINT_RULE: &str =
+        "a file that declares `imports:` is the entrypoint and must declare `version:`";
+    const DEPLOY_RULE: &str = "a deploy file must declare `version:`";
+
+    /// Every missing-`version:` diagnostic this file draws in that role.
+    fn missing_version(source: &str, role: FileRole) -> Vec<String> {
+        parse_as(source, "f.yml", role)
+            .diagnostics
+            .into_iter()
+            .filter(|diagnostic| diagnostic.code == DiagnosticCode::MissingKey)
+            .map(|diagnostic| diagnostic.message)
+            .collect()
+    }
+
+    /// `Unknown` is the standalone reading — `parse_str`, and the published
+    /// schema's one-file view — where the role can only be guessed from what
+    /// the file declares.
+    #[test]
+    fn a_file_read_on_its_own_is_held_to_the_role_it_looks_like() {
+        assert_eq!(
+            missing_version(IMPORTS_NO_VERSION, FileRole::Unknown),
+            [ENTRYPOINT_RULE]
+        );
+        assert_eq!(
+            missing_version(DEPLOY_NO_VERSION, FileRole::Unknown),
+            [DEPLOY_RULE]
+        );
+    }
+
+    #[test]
+    fn the_entrypoint_is_still_required_to_declare_a_version() {
+        assert_eq!(
+            missing_version(IMPORTS_NO_VERSION, FileRole::Entrypoint),
+            [ENTRYPOINT_RULE]
+        );
+    }
+
+    #[test]
+    fn the_deploy_file_is_still_required_to_declare_a_version() {
+        assert_eq!(
+            missing_version(DEPLOY_NO_VERSION, FileRole::Deploy),
+            [DEPLOY_RULE]
+        );
+    }
+
+    /// An imported file's `version:` is OPTIONAL (grammar 1.3), so neither rule
+    /// may be stated against one. The resolver refuses it for declaring
+    /// `imports:`, or for being a deploy file, and a second diagnostic calling
+    /// it the entrypoint would contradict the pass raising it.
+    #[test]
+    fn an_imported_file_is_told_neither_rule() {
+        assert!(missing_version(IMPORTS_NO_VERSION, FileRole::Import).is_empty());
+        assert!(missing_version(DEPLOY_NO_VERSION, FileRole::Import).is_empty());
+    }
+
+    /// The two roles that *are* required to carry a `version:` are each held to
+    /// their own rule only: an entrypoint that is a deploy file is refused for
+    /// being one, and a deploy file that declares `imports:` for declaring
+    /// them, so neither is also told the rule of the kind it is not.
+    #[test]
+    fn a_file_in_the_wrong_place_is_not_also_told_the_other_rule() {
+        assert!(missing_version(DEPLOY_NO_VERSION, FileRole::Entrypoint).is_empty());
+        assert!(missing_version(IMPORTS_NO_VERSION, FileRole::Deploy).is_empty());
+    }
 }

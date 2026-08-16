@@ -1,0 +1,14 @@
+# rule: a deploy file may not declare a spec file's sections (grammar 1.2, 1.5)
+# code: misplaced-section
+# message: the `imports` section may not appear in the deploy file `deploy/staging.yml`
+# at: deploy/staging.yml:6:3
+# help: spec files and deploy files are disjoint: only the deploy layer forks per environment (grammar 1.2, Decision D3)
+# target: staging
+version: "0.1"
+flow.f:
+  outputs: {}
+  nodes:
+    run: { exec: { command: "true" } }
+  edges:
+    - { from: start, to: run }
+    - { from: run, to: end }

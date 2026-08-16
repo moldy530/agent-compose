@@ -1,0 +1,21 @@
+# rule: an `imports:` entry the parser refused loses its file too, so the reference pass is withheld (grammar 1.4)
+# code: invalid-import-path
+# message: `/models.yml` is an absolute path
+# at: main.yml:15:5
+# help: imports are relative paths to `.yml`/`.yaml` spec files, resolved against the entrypoint's directory: there is no directory scanning
+# ---
+# The third face of `import-names-a-file-that-is-not-there`. There the resolver
+# refused the entry; here the *parser* did, one leading `/` earlier, so the
+# entry never reaches the resolver's list at all — only the section's drop
+# count says a file is missing. The consequence is the same either way:
+# `models.yml` is not in the composition, so `model.m` below is a consequence of
+# the one cause above and is not reported alongside it.
+version: "0.1"
+imports:
+  - /models.yml
+
+agent.a:
+  model: model.m
+  prompt: Summarize the input.
+  output:
+    summary: { type: string }

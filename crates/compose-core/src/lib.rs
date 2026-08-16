@@ -10,21 +10,30 @@
 //!   fully spanned tree;
 //! * [`ast`] — the typed, span-carrying shape of one spec or deploy file;
 //! * [`parse`] — [`parse_file`]/[`parse_str`], turning one file into that AST
-//!   plus diagnostics.
+//!   plus diagnostics;
+//! * [`resolve`] — [`resolve`](resolve()), following the entrypoint's
+//!   `imports:` and binding every name to what it names;
+//! * [`ir`] — the flat, self-contained JSON artifact resolution produces
+//!   (PRD 5.1).
 //!
-//! Everything the parser reports is decidable from a single file. Resolution
-//! (following `imports:`, binding references to definitions) and the static
-//! checks that need the whole composition — exhaustiveness, cycle termination,
-//! schema compatibility, CEL typing — belong to later passes; `docs/grammar.md`
-//! Appendix B is the normative account of that split.
+//! Everything the parser reports is decidable from a single file, and
+//! everything the resolver reports is decidable from names, files, and
+//! addresses. The static checks that need the composition's *graphs* —
+//! exhaustiveness, cycle termination, schema compatibility, CEL typing — read
+//! the IR in a later pass; `docs/grammar.md` Appendix B is the normative
+//! account of that split.
 
 pub mod ast;
 pub mod diag;
+pub mod ir;
 pub mod parse;
+pub mod resolve;
 pub mod yaml;
 
 pub use diag::{Diagnostic, DiagnosticCode, Diagnostics, Severity, Span, Spanned};
+pub use ir::{IR_VERSION, Ir};
 pub use parse::{ParsedFile, parse_file, parse_str};
+pub use resolve::{DEFAULT_TARGET, Resolution, resolve, resolve_with_target};
 
 /// The spec versions this compiler build supports, as accepted values of a
 /// spec file's required `version:` field.

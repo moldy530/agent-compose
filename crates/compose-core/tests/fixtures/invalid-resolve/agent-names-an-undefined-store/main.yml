@@ -1,0 +1,18 @@
+# rule: an agent's `stores:` entries resolve (grammar 2.3)
+# code: undefined-reference
+# message: `store.docs` is not defined in this composition
+# at: main.yml:16:12
+# help: the composition defines no `store.*`: a definition is part of it only when the entrypoint imports the file that declares it (grammar 1.4)
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${KEY}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.a:
+  model: model.m
+  prompt: Do the thing.
+  stores: [store.docs]
+  output:
+    text: { type: string }

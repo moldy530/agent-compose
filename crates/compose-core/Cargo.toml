@@ -17,13 +17,20 @@ saphyr-parser = "0.0.11"
 # unknown enum variants. Zero dependencies; Damerau-Levenshtein also catches
 # transpositions, which a hand-rolled Levenshtein would miss.
 strsim = "0.11"
+# The flat IR is a JSON document (PRD 5.1), so the artifact needs a serializer.
+# `derive` keeps the IR's shape declared next to its types instead of in a
+# hand-written writer that could drift from them.
+serde = { version = "1", features = ["derive"] }
+# The JSON writer itself. Chosen for `BTreeMap` iteration order surviving into
+# the output unchanged, which is what makes the emitted artifact byte-identical
+# for byte-identical input (PRD 5.12).
+serde_json = "1"
 
 [dev-dependencies]
 # Schema-conformance harness only: the compiler itself does not depend on a
 # JSON Schema engine. `jsonschema` speaks draft 2020-12; default features pull
 # HTTP/file `$ref` resolvers and TLS, which the published schema never needs.
 jsonschema = { version = "0.49", default-features = false }
-serde_json = "1"
 # Maintained fork of the (deprecated) `serde_yaml`; used to transcode example
 # and fixture YAML into JSON for validation.
 serde_yaml_ng = "0.10"

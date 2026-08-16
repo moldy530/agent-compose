@@ -1,0 +1,13 @@
+# rule: a store's `backend:` alias is defined in the active target (grammar 11.3)
+# code: undefined-reference
+# message: the `staging` target defines no storage backend alias `docs_db`
+# at: main.yml:11:12
+# help: `deploy/staging.yml` defines `other_db` under `storage_backends.aliases:`
+# target: staging
+version: "0.1"
+store.docs:
+  kind: kv
+  scope: global
+  backend: docs_db
+  value_schema:
+    text: { type: string }

@@ -1,0 +1,7 @@
+# An imported file's `version:` is OPTIONAL (grammar 1.3), so this one omits
+# it: the composition is refused for the `imports:` below and for nothing else.
+imports:
+  - leaf.yml
+provider.p:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}

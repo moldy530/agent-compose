@@ -32,7 +32,15 @@ pub(crate) fn definition_body(
         Namespace::Model => "model",
     };
     let subject = format!("{kind} definition `{}`", address.value);
-    let mapping = expect_mapping(node, &subject, cx)?;
+    // A body that is not a mapping has no key to read, and the wrong-type
+    // diagnostic `expect_mapping` just pushed says so. The *address* is still
+    // one the author declared, so the definition is kept with an `Invalid` body
+    // rather than dropped: the resolver's index is a table of names, and a name
+    // missing from it makes every reference to it undefined — one diagnostic
+    // per reference site, for the one mistake already reported here.
+    let Some(mapping) = expect_mapping(node, &subject, cx) else {
+        return Some(DefinitionBody::Invalid);
+    };
     let mut fields = Fields::new(mapping, node.span.clone(), &subject);
 
     let body = match address.value.namespace {
@@ -597,6 +605,17 @@ fn model(fields: &mut Fields<'_>, subject: &str, cx: &mut Cx) -> ModelDef {
         for entry in &entries {
             lexical::reject_env_refs(&entry.key, &context, cx);
             schema::reject_env_refs_in_literal(&entry.value, &context, cx);
+            // `settings:` is open, but it is still data the compiler lowers into
+            // the artifact and from there into a provider call (grammar 3.8):
+            // JSON has no notation for infinity or NaN, so one written here
+            // would otherwise reach the artifact as `null` — a value the author
+            // never wrote. Refused where it is written, and named by the key it
+            // sits under, because a subtree is where it can hide.
+            schema::reject_non_finite_in_literal(
+                &entry.value,
+                &format!("`{}` in {context}", entry.key.value),
+                cx,
+            );
         }
         Some(Settings {
             entries,

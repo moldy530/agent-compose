@@ -1,0 +1,2 @@
+state:
+  feedback: { type: string }

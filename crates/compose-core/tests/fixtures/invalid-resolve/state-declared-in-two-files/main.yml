@@ -1,0 +1,11 @@
+# rule: a singleton section is declared in at most one file (grammar 1.5, Decision D2)
+# code: duplicate-section
+# message: the `state` section is declared in two files
+# at: channels.yml:2:3
+# label: main.yml:11:3 first declared here, in `main.yml`
+# help: `state` may appear in at most one file of a composition: merging two of them implicitly is the action at a distance the deploy layer already refuses (grammar 1.5, Decision D2)
+version: "0.1"
+imports:
+  - channels.yml
+state:
+  draft: { type: string }

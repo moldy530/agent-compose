@@ -1,0 +1,8 @@
+# rule: the entrypoint is a spec file (grammar 1.2)
+# code: misplaced-section
+# message: the entrypoint `main.yml` is a deploy file
+# at: main.yml:8:3
+# help: spec files and deploy files are disjoint document kinds: a deploy file is selected with `--target <name>` and is never the entrypoint (grammar 1.2, 14)
+version: "0.1"
+placements:
+  flow.f: { runtime: colocated }

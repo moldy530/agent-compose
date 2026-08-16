@@ -1,0 +1,5 @@
+version: "0.1"
+
+storage_backends:
+  aliases:
+    docs_db: { provider: redis, url: "${REDIS_URL}" }

@@ -1,0 +1,8 @@
+# rule: the entrypoint declares `version:` (grammar 1.3, Decision D4)
+# code: missing-key
+# message: the entrypoint `main.yml` must declare `version:`
+# at: main.yml:6:1
+# help: write `version: "0.1"` — quoted, since an unquoted `0.1` is a YAML float; it is the one authoritative version of the composition (grammar 1.3)
+provider.p:
+  kind: anthropic
+  api_key: ${KEY}

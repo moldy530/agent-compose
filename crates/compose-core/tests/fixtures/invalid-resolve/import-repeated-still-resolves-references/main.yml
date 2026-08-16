@@ -1,0 +1,22 @@
+# rule: an `imports:` entry that repeats a file already imported loses no definition, so references are still resolved
+# code: undefined-reference
+# message: `model.gone` is not defined in this composition
+# at: main.yml:19:10
+# count: 2
+# ---
+# The companion to `import-names-a-file-that-is-not-there`, from the other
+# side. There the import failed, the definitions it would have carried went
+# with it, and the reference pass was withheld so one cause would not print a
+# page of consequences. Here `models.yml` did load — the second entry is
+# redundant, not absent — so nothing is missing and the reference below is
+# reported in the same run rather than after a round trip.
+version: "0.1"
+imports:
+  - models.yml
+  - ./models.yml
+
+agent.a:
+  model: model.gone
+  prompt: Summarize the input.
+  output:
+    summary: { type: string }

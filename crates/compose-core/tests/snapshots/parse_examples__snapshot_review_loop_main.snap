@@ -19,6 +19,7 @@ Spec(
                     "flows/review_loop.yml" @ 16:5..16:26,
                     "triggers.yml" @ 17:5..17:17,
                 ],
+                dropped: 0,
                 span: 11:3..20:1,
             },
         ),

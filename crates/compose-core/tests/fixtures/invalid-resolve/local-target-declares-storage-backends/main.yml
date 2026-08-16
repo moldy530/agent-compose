@@ -1,0 +1,13 @@
+# rule: `deploy/local.yml` carries no `storage_backends:` (grammar 14, Decision D87)
+# code: misplaced-section
+# message: `deploy/local.yml` may not declare `storage_backends:`
+# at: deploy/local.yml:3:3
+# help: `local` substitutes local storage for every store unconditionally, so no alias and no per-kind default is ever consulted there: the block could only be a key whose author expected a substitution that never happens (grammar 14, Decision D87)
+version: "0.1"
+flow.f:
+  outputs: {}
+  nodes:
+    run: { exec: { command: "true" } }
+  edges:
+    - { from: start, to: run }
+    - { from: run, to: end }

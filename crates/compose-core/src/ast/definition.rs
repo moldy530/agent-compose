@@ -41,6 +41,14 @@ pub enum DefinitionBody {
     Provider(ProviderDef),
     /// A `model.*` definition.
     Model(ModelDef),
+    /// A definition whose body the parser could not read at all — it was not a
+    /// mapping, so not one key of it is available.
+    ///
+    /// The address survives anyway, because it is the name the author declared
+    /// and the resolver's index is a table of *names*: dropping the entry would
+    /// make every reference to it undefined, and a composition that uses the
+    /// definition ten times would answer one mistake with eleven diagnostics.
+    Invalid,
 }
 
 /// An `agent.*` definition: one LLM call with structured output (grammar 5).
@@ -135,6 +143,18 @@ pub enum StoreScope {
     Global,
 }
 
+impl StoreScope {
+    /// The keyword that names this scope.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Execution => "execution",
+            Self::Session => "session",
+            Self::Global => "global",
+        }
+    }
+}
+
 /// How much of a store's surface an attached agent gets (grammar 11.1,
 /// Decision D37).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -143,6 +163,17 @@ pub enum AgentAccess {
     Read,
     /// Read and write tools (the default).
     ReadWrite,
+}
+
+impl AgentAccess {
+    /// The keyword that names this level of access.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::ReadWrite => "read_write",
+        }
+    }
 }
 
 /// A `store.*` definition (grammar 11.1).

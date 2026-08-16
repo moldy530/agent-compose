@@ -1,0 +1,21 @@
+# rule: a reference position accepts a fixed set of namespaces (grammar 2.3)
+# code: invalid-reference
+# message: expected a `model.*` reference for `model`, found `provider.p`
+# at: main.yml:18:10
+# ---
+# The diagnostic pinned here is the PARSER's. A reference whose *spelling*
+# names a namespace its position does not admit is decidable from one file, so
+# every position in grammar 2.3's table refuses it before resolution, and what
+# this fixture holds is the end-to-end claim: the composition is rejected, with
+# that message. The resolver's own wrong-namespace arm restates the position
+# table where lookup happens and no project can reach it, so it is pinned by a
+# unit test in `resolve::references` instead.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${KEY}
+agent.a:
+  model: provider.p
+  prompt: Do the thing.
+  output:
+    text: { type: string }

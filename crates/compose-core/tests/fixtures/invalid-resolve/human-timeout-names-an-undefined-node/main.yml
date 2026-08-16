@@ -1,0 +1,18 @@
+# rule: a `human.on_timeout:` target names a node of its own flow (grammar 8.7)
+# code: undefined-reference
+# message: `escalate` is not a node of `flow.f`
+# at: main.yml:15:21
+# help: node ids are scoped to their flow, and `flow.f` declares `approve`
+version: "0.1"
+flow.f:
+  outputs: {}
+  nodes:
+    approve:
+      human:
+        input: { draft: { type: string } }
+        output: { decision: { enum: [approve, reject] } }
+        timeout: 24h
+        on_timeout: escalate
+  edges:
+    - { from: start, to: approve }
+    - { from: approve, to: end }

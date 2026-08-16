@@ -1,0 +1,14 @@
+# rule: a target names one path segment under `deploy/` (grammar 1.4, 14)
+# code: invalid-value
+# message: `../evil` is not a target name
+# at: main.yml:1:1
+# help: a target names one file, `deploy/<target>.yml`, so it is a single path segment: it starts with a letter, a digit, or `_`, and carries only letters, digits, `_`, `.`, and `-` (grammar 1.4)
+# target: ../evil
+version: "0.1"
+flow.f:
+  outputs: {}
+  nodes:
+    run: { exec: { command: "true" } }
+  edges:
+    - { from: start, to: run }
+    - { from: run, to: end }

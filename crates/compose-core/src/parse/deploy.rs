@@ -12,7 +12,7 @@ use crate::yaml::{Mapping, Node, Yaml};
 
 use super::definition::description;
 use super::lexical;
-use super::reader::{Cx, Fields, expect_mapping, list};
+use super::reader::{Cx, Fields, expect_finite, expect_mapping, list};
 
 const RUNTIMES: &[(&str, Runtime)] = &[
     ("isolated", Runtime::Isolated),
@@ -269,12 +269,20 @@ fn plugin_config(
 /// A plugin object carries arbitrary YAML, so the walk is recursive: a token
 /// can sit inside a nested mapping or a sequence as easily as at the top, which
 /// is the same reason `settings:` is walked to its leaves for the class-3 rule.
+/// The number check rides along for the same reason and the one in
+/// [`expect_finite`]: the deploy layer is lowered into the artifact and from
+/// there into JSON (grammar 3.8), which cannot write infinity or NaN, so one
+/// written here would otherwise reach the artifact as `null` — a value the
+/// author never wrote.
 fn plugin_value(node: &Node, subject: &str, cx: &mut Cx) -> Spanned<PluginValue> {
     let value = match &node.value {
         Yaml::Null => PluginValue::Null,
         Yaml::Bool(value) => PluginValue::Bool(*value),
         Yaml::Int(value) => PluginValue::Int(*value),
-        Yaml::Float(value) => PluginValue::Float(*value),
+        Yaml::Float(value) => {
+            expect_finite(*value, subject, &node.span, cx);
+            PluginValue::Float(*value)
+        }
         Yaml::String(text) => {
             let text = Spanned::new(text.clone(), node.span.clone());
             PluginValue::Text(lexical::interpolate(text, subject, cx).value)

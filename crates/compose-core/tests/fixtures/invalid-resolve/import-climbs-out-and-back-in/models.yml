@@ -1,0 +1,6 @@
+# Reachable as `models.yml`, and never as the spelling `main.yml` writes: that
+# entry leaves the project root before returning to it, so it is refused before
+# this file is looked for.
+provider.p:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}

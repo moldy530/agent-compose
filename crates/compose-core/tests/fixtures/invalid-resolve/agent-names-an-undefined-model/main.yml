@@ -1,0 +1,17 @@
+# rule: an agent's `model:` resolves to a `model.*` definition (grammar 2.3)
+# code: undefined-reference
+# message: `model.mm` is not defined in this composition
+# at: main.yml:14:10
+# help: did you mean `model.m`?
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${KEY}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.a:
+  model: model.mm
+  prompt: Do the thing.
+  output:
+    text: { type: string }

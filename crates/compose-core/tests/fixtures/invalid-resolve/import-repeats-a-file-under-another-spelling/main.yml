@@ -1,0 +1,10 @@
+# rule: `imports:` entries are unique after normalization (grammar 1.4)
+# code: invalid-import-path
+# message: `./models.yml` names a file that is already imported
+# at: main.yml:10:5
+# label: main.yml:9:5 first imported here
+# help: both entries resolve to `models.yml`, and import order does not affect semantics, so the second adds nothing: drop it
+version: "0.1"
+imports:
+  - models.yml
+  - ./models.yml

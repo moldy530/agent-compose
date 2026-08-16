@@ -1,0 +1,4 @@
+version: "0.1"
+storage_backends:
+  aliases:
+    other_db: { provider: redis, url: "${REDIS_URL}" }

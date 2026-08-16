@@ -1,0 +1,9 @@
+# rule: a model's `provider:` resolves to a `provider.*` definition (grammar 2.3)
+# code: undefined-reference
+# message: `provider.p` is not defined in this composition
+# at: main.yml:8:13
+# help: the composition defines no `provider.*`: a definition is part of it only when the entrypoint imports the file that declares it (grammar 1.4)
+version: "0.1"
+model.m:
+  provider: provider.p
+  id: some-model

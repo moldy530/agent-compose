@@ -1,0 +1,15 @@
+# rule: a model's `settings:` is data lowered to JSON, so no value in it is infinity or NaN, at any depth (grammar 3.8, 12.2)
+# code: invalid-value
+# message: `thinking` in `settings` of model definition `model.smart` must be a finite number, found infinity
+# at: 15:32
+# help: the compiler lowers every declared number to JSON Schema 2020-12 and to generated code (grammar 3.8), neither of which can write infinity or NaN
+#
+# The companion to `state-default-with-infinity`, on the other class-3 surface.
+# `settings:` is open and arbitrarily deep, so the unwritable number is put in a
+# nested mapping here: caught at the top only, it would reach the artifact as
+# `null` — a value the author never wrote.
+model.smart:
+  provider: provider.anthropic
+  id: claude-sonnet-4-6
+  settings:
+    thinking: { budget_tokens: .inf }

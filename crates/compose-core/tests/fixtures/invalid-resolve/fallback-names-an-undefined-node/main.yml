@@ -1,0 +1,15 @@
+# rule: an `on_error: { fallback: ... }` target names a node of its own flow (grammar 9.2)
+# code: undefined-reference
+# message: `cleanup` is not a node of `flow.f`
+# at: main.yml:12:29
+# help: node ids are scoped to their flow, and `flow.f` declares `run`
+version: "0.1"
+flow.f:
+  outputs: {}
+  nodes:
+    run:
+      exec: { command: "true" }
+      on_error: { fallback: cleanup }
+  edges:
+    - { from: start, to: run }
+    - { from: run, to: end }

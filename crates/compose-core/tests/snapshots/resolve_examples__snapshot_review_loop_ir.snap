@@ -1,0 +1,855 @@
+---
+source: crates/compose-core/tests/resolve_examples.rs
+expression: "resolve_clean(\"examples/review-loop\", \"local\")"
+---
+{
+  "ir_version": "1",
+  "spec_version": "0.1",
+  "entrypoint": "main.yml",
+  "target": "local",
+  "sources": [
+    {
+      "path": "main.yml",
+      "role": "entrypoint"
+    },
+    {
+      "path": "agents/researcher.yml",
+      "role": "import"
+    },
+    {
+      "path": "agents/reviewer.yml",
+      "role": "import"
+    },
+    {
+      "path": "flows/review_loop.yml",
+      "role": "import"
+    },
+    {
+      "path": "models.yml",
+      "role": "import"
+    },
+    {
+      "path": "providers.yml",
+      "role": "import"
+    },
+    {
+      "path": "tools/web_search.yml",
+      "role": "import"
+    },
+    {
+      "path": "triggers.yml",
+      "role": "import"
+    }
+  ],
+  "defaults": {
+    "value": {
+      "timeout": {
+        "value": "120s",
+        "span": "main.yml:21:12..21:16"
+      },
+      "on_error": {
+        "strategy": "fail",
+        "span": "main.yml:22:13..22:17"
+      }
+    },
+    "span": "main.yml:21:3..27:1"
+  },
+  "state": {
+    "entries": {
+      "draft": {
+        "name": {
+          "value": "draft",
+          "span": "main.yml:28:3..28:8"
+        },
+        "type": {
+          "description": {
+            "value": "The current draft, rewritten on every pass.",
+            "span": "main.yml:29:18..29:61"
+          },
+          "span": "main.yml:29:5..32:3",
+          "form": "scalar",
+          "type": "string",
+          "default": {
+            "value": "",
+            "span": "main.yml:31:14..31:16"
+          }
+        },
+        "span": "main.yml:28:3..32:3"
+      },
+      "feedback": {
+        "name": {
+          "value": "feedback",
+          "span": "main.yml:32:3..32:11"
+        },
+        "type": {
+          "description": {
+            "value": "The reviewer's most recent feedback, fed back into the writer.",
+            "span": "main.yml:33:18..33:80"
+          },
+          "span": "main.yml:33:5..36:1",
+          "form": "scalar",
+          "type": "string",
+          "default": {
+            "value": "",
+            "span": "main.yml:35:14..35:16"
+          }
+        },
+        "span": "main.yml:32:3..36:1"
+      }
+    },
+    "span": "main.yml:28:3..36:1"
+  },
+  "triggers": {
+    "entries": {
+      "cli": {
+        "name": {
+          "value": "cli",
+          "span": "triggers.yml:9:3..9:6"
+        },
+        "flow": {
+          "value": "flow.review_loop",
+          "span": "triggers.yml:11:11..11:27"
+        },
+        "span": "triggers.yml:10:5..13:3",
+        "type": "manual"
+      },
+      "on_request": {
+        "name": {
+          "value": "on_request",
+          "span": "triggers.yml:13:3..13:13"
+        },
+        "flow": {
+          "value": "flow.review_loop",
+          "span": "triggers.yml:15:11..15:27"
+        },
+        "session_key": {
+          "value": "payload.headers['x-session-id']",
+          "span": "triggers.yml:20:18..20:51"
+        },
+        "span": "triggers.yml:14:5..23:1",
+        "type": "http",
+        "path": {
+          "value": "/review",
+          "span": "triggers.yml:16:11..16:18"
+        },
+        "method": "POST",
+        "input": {
+          "entries": [
+            {
+              "name": {
+                "value": "goal",
+                "span": "triggers.yml:19:7..19:11"
+              },
+              "value": {
+                "value": "payload.body.goal",
+                "span": "triggers.yml:19:13..19:32"
+              }
+            }
+          ],
+          "span": "triggers.yml:19:7..20:5"
+        },
+        "respond": "async",
+        "callback": {
+          "value": "payload.body.callback_url",
+          "span": "triggers.yml:22:15..22:42"
+        }
+      }
+    },
+    "span": "triggers.yml:9:3..23:1"
+  },
+  "definitions": {
+    "agent.researcher": {
+      "address": {
+        "value": "agent.researcher",
+        "span": "agents/researcher.yml:3:1..3:17"
+      },
+      "span": "agents/researcher.yml:3:1..27:1",
+      "namespace": "agent",
+      "model": {
+        "value": "model.default",
+        "span": "agents/researcher.yml:5:10..5:23"
+      },
+      "prompt": {
+        "value": "You are a research writer. Produce a single self-contained draft that\nsatisfies the goal.\n\nIf feedback from a previous review is present, treat every point in it as a\nrequired change and rewrite the draft accordingly. Never return an unchanged\ndraft when feedback is present.\n",
+        "span": "agents/researcher.yml:7:5..13:3"
+      },
+      "output": {
+        "surface": "result",
+        "fields": [
+          {
+            "name": {
+              "value": "draft",
+              "span": "agents/researcher.yml:23:5..23:10"
+            },
+            "type": {
+              "description": {
+                "value": "The complete draft, in Markdown.",
+                "span": "agents/researcher.yml:24:20..24:52"
+              },
+              "span": "agents/researcher.yml:24:7..27:1",
+              "form": "scalar",
+              "type": "string",
+              "min_length": 1
+            }
+          }
+        ],
+        "span": "agents/researcher.yml:23:5..27:1"
+      },
+      "input": {
+        "surface": "input",
+        "fields": [
+          {
+            "name": {
+              "value": "goal",
+              "span": "agents/researcher.yml:15:5..15:9"
+            },
+            "type": {
+              "description": {
+                "value": "What the draft must accomplish.",
+                "span": "agents/researcher.yml:16:20..16:51"
+              },
+              "span": "agents/researcher.yml:16:7..18:5",
+              "form": "scalar",
+              "type": "string"
+            }
+          },
+          {
+            "name": {
+              "value": "feedback",
+              "span": "agents/researcher.yml:18:5..18:13"
+            },
+            "type": {
+              "description": {
+                "value": "Reviewer feedback from the previous pass; empty on the first pass.",
+                "span": "agents/researcher.yml:19:20..19:86"
+              },
+              "span": "agents/researcher.yml:19:7..22:3",
+              "form": "scalar",
+              "type": "string",
+              "default": {
+                "value": "",
+                "span": "agents/researcher.yml:21:16..21:18"
+              }
+            }
+          }
+        ],
+        "span": "agents/researcher.yml:15:5..22:3"
+      },
+      "tools": [
+        {
+          "value": "tool.web_search",
+          "span": "agents/researcher.yml:13:11..13:26"
+        }
+      ],
+      "description": {
+        "value": "Writes and revises a draft until it satisfies the goal.",
+        "span": "agents/researcher.yml:4:16..4:71"
+      }
+    },
+    "agent.reviewer": {
+      "address": {
+        "value": "agent.reviewer",
+        "span": "agents/reviewer.yml:4:1..4:15"
+      },
+      "span": "agents/reviewer.yml:4:1..29:1",
+      "namespace": "agent",
+      "model": {
+        "value": "model.smart",
+        "span": "agents/reviewer.yml:6:10..6:21"
+      },
+      "prompt": {
+        "value": "You are a meticulous technical reviewer.\n\nApprove only when the draft fully satisfies the goal, is internally\nconsistent, and contains no unsupported claims. Otherwise ask for a\nrevision and list every required change explicitly.\n",
+        "span": "agents/reviewer.yml:8:5..13:3"
+      },
+      "output": {
+        "surface": "result",
+        "fields": [
+          {
+            "name": {
+              "value": "verdict",
+              "span": "agents/reviewer.yml:23:5..23:12"
+            },
+            "type": {
+              "description": {
+                "value": "approve ends the loop; revise sends the draft back to the writer.",
+                "span": "agents/reviewer.yml:24:20..24:85"
+              },
+              "span": "agents/reviewer.yml:24:7..26:5",
+              "form": "enum",
+              "variants": [
+                {
+                  "value": "approve",
+                  "span": "agents/reviewer.yml:25:14..25:21"
+                },
+                {
+                  "value": "revise",
+                  "span": "agents/reviewer.yml:25:23..25:29"
+                }
+              ]
+            }
+          },
+          {
+            "name": {
+              "value": "feedback",
+              "span": "agents/reviewer.yml:26:5..26:13"
+            },
+            "type": {
+              "description": {
+                "value": "Required changes, empty when approving.",
+                "span": "agents/reviewer.yml:27:20..27:59"
+              },
+              "span": "agents/reviewer.yml:27:7..29:1",
+              "form": "scalar",
+              "type": "string"
+            }
+          }
+        ],
+        "span": "agents/reviewer.yml:23:5..29:1"
+      },
+      "input": {
+        "surface": "input",
+        "fields": [
+          {
+            "name": {
+              "value": "goal",
+              "span": "agents/reviewer.yml:16:5..16:9"
+            },
+            "type": {
+              "description": {
+                "value": "What the draft must accomplish.",
+                "span": "agents/reviewer.yml:17:20..17:51"
+              },
+              "span": "agents/reviewer.yml:17:7..19:5",
+              "form": "scalar",
+              "type": "string"
+            }
+          },
+          {
+            "name": {
+              "value": "draft",
+              "span": "agents/reviewer.yml:19:5..19:10"
+            },
+            "type": {
+              "description": {
+                "value": "The draft under review.",
+                "span": "agents/reviewer.yml:20:20..20:43"
+              },
+              "span": "agents/reviewer.yml:20:7..22:3",
+              "form": "scalar",
+              "type": "string"
+            }
+          }
+        ],
+        "span": "agents/reviewer.yml:16:5..22:3"
+      },
+      "tools": [
+        {
+          "value": "tool.web_search",
+          "span": "agents/reviewer.yml:13:11..13:26"
+        }
+      ],
+      "description": {
+        "value": "Reviews a draft against the goal and returns a routable verdict.",
+        "span": "agents/reviewer.yml:5:16..5:80"
+      },
+      "max_tool_iterations": 4
+    },
+    "flow.review_loop": {
+      "address": {
+        "value": "flow.review_loop",
+        "span": "flows/review_loop.yml:4:1..4:17"
+      },
+      "span": "flows/review_loop.yml:4:1..54:1",
+      "namespace": "flow",
+      "description": {
+        "value": "Draft a document and revise it until the reviewer approves.",
+        "span": "flows/review_loop.yml:5:16..5:75"
+      },
+      "inputs": {
+        "surface": "input",
+        "fields": [
+          {
+            "name": {
+              "value": "goal",
+              "span": "flows/review_loop.yml:7:5..7:9"
+            },
+            "type": {
+              "description": {
+                "value": "What the finished draft must accomplish.",
+                "span": "flows/review_loop.yml:8:20..8:60"
+              },
+              "span": "flows/review_loop.yml:8:7..11:3",
+              "form": "scalar",
+              "type": "string",
+              "min_length": 1
+            }
+          }
+        ],
+        "span": "flows/review_loop.yml:7:5..11:3"
+      },
+      "outputs": {
+        "surface": "result",
+        "fields": [
+          {
+            "name": {
+              "value": "draft",
+              "span": "flows/review_loop.yml:12:5..12:10"
+            },
+            "type": {
+              "description": {
+                "value": "The approved draft, read from the `draft` state channel.",
+                "span": "flows/review_loop.yml:13:20..13:76"
+              },
+              "span": "flows/review_loop.yml:13:7..16:3",
+              "form": "scalar",
+              "type": "string"
+            }
+          }
+        ],
+        "span": "flows/review_loop.yml:12:5..16:3"
+      },
+      "nodes": [
+        {
+          "id": {
+            "value": "write",
+            "span": "flows/review_loop.yml:19:5..19:10"
+          },
+          "input": {
+            "form": "fields",
+            "bindings": {
+              "entries": [
+                {
+                  "name": {
+                    "value": "goal",
+                    "span": "flows/review_loop.yml:22:9..22:13"
+                  },
+                  "value": {
+                    "value": "input.goal",
+                    "span": "flows/review_loop.yml:22:15..22:27"
+                  }
+                },
+                {
+                  "name": {
+                    "value": "feedback",
+                    "span": "flows/review_loop.yml:23:9..23:17"
+                  },
+                  "value": {
+                    "value": "state.feedback",
+                    "span": "flows/review_loop.yml:23:19..23:35"
+                  }
+                }
+              ],
+              "span": "flows/review_loop.yml:22:9..24:7"
+            }
+          },
+          "retry": {
+            "max": 2,
+            "backoff": {
+              "value": "5s",
+              "span": "flows/review_loop.yml:24:33..24:35"
+            },
+            "span": "flows/review_loop.yml:24:14..24:37"
+          },
+          "span": "flows/review_loop.yml:20:7..26:5",
+          "kind": "agent",
+          "agent": {
+            "value": "agent.researcher",
+            "span": "flows/review_loop.yml:20:14..20:30"
+          }
+        },
+        {
+          "id": {
+            "value": "review",
+            "span": "flows/review_loop.yml:26:5..26:11"
+          },
+          "input": {
+            "form": "fields",
+            "bindings": {
+              "entries": [
+                {
+                  "name": {
+                    "value": "goal",
+                    "span": "flows/review_loop.yml:29:9..29:13"
+                  },
+                  "value": {
+                    "value": "input.goal",
+                    "span": "flows/review_loop.yml:29:15..29:27"
+                  }
+                },
+                {
+                  "name": {
+                    "value": "draft",
+                    "span": "flows/review_loop.yml:30:9..30:14"
+                  },
+                  "value": {
+                    "value": "state.draft",
+                    "span": "flows/review_loop.yml:30:16..30:29"
+                  }
+                }
+              ],
+              "span": "flows/review_loop.yml:29:9..31:7"
+            }
+          },
+          "timeout": {
+            "value": "90s",
+            "span": "flows/review_loop.yml:31:16..31:19"
+          },
+          "on_error": {
+            "strategy": "fallback",
+            "target": {
+              "value": "end",
+              "span": "flows/review_loop.yml:32:29..32:32"
+            },
+            "span": "flows/review_loop.yml:32:17..32:34"
+          },
+          "span": "flows/review_loop.yml:27:7..34:3",
+          "kind": "agent",
+          "agent": {
+            "value": "agent.reviewer",
+            "span": "flows/review_loop.yml:27:14..27:28"
+          }
+        }
+      ],
+      "edges": [
+        {
+          "from": {
+            "value": "start",
+            "span": "flows/review_loop.yml:35:15..35:20"
+          },
+          "to": {
+            "value": "write",
+            "span": "flows/review_loop.yml:35:26..35:31"
+          },
+          "span": "flows/review_loop.yml:35:7..35:33"
+        },
+        {
+          "from": {
+            "value": "write",
+            "span": "flows/review_loop.yml:36:15..36:20"
+          },
+          "to": {
+            "value": "review",
+            "span": "flows/review_loop.yml:36:26..36:32"
+          },
+          "span": "flows/review_loop.yml:36:7..36:34"
+        },
+        {
+          "from": {
+            "value": "review",
+            "span": "flows/review_loop.yml:40:13..40:19"
+          },
+          "to": {
+            "value": "write",
+            "span": "flows/review_loop.yml:41:11..41:16"
+          },
+          "when": {
+            "value": "review.output.verdict == 'revise'",
+            "span": "flows/review_loop.yml:42:13..42:48"
+          },
+          "max_iterations": 3,
+          "span": "flows/review_loop.yml:40:7..51:5"
+        },
+        {
+          "from": {
+            "value": "review",
+            "span": "flows/review_loop.yml:51:13..51:19"
+          },
+          "to": {
+            "value": "end",
+            "span": "flows/review_loop.yml:52:11..52:14"
+          },
+          "else": {
+            "value": true,
+            "span": "flows/review_loop.yml:53:13..53:17"
+          },
+          "span": "flows/review_loop.yml:51:7..54:1"
+        }
+      ]
+    },
+    "model.default": {
+      "address": {
+        "value": "model.default",
+        "span": "models.yml:19:1..19:14"
+      },
+      "span": "models.yml:19:1..22:1",
+      "namespace": "model",
+      "form": "route",
+      "route": [
+        {
+          "value": "model.smart",
+          "span": "models.yml:20:11..20:22"
+        },
+        {
+          "value": "model.fast",
+          "span": "models.yml:20:24..20:34"
+        }
+      ],
+      "route_on": [
+        {
+          "value": "rate_limit",
+          "span": "models.yml:21:14..21:24"
+        },
+        {
+          "value": "overloaded",
+          "span": "models.yml:21:26..21:36"
+        },
+        {
+          "value": "timeout",
+          "span": "models.yml:21:38..21:45"
+        }
+      ]
+    },
+    "model.fast": {
+      "address": {
+        "value": "model.fast",
+        "span": "models.yml:11:1..11:11"
+      },
+      "span": "models.yml:11:1..19:1",
+      "namespace": "model",
+      "form": "direct",
+      "provider": {
+        "value": "provider.anthropic",
+        "span": "models.yml:12:13..12:31"
+      },
+      "id": {
+        "value": "claude-haiku-4-5",
+        "span": "models.yml:13:7..13:23"
+      },
+      "settings": {
+        "temperature": {
+          "value": 0.2,
+          "span": "models.yml:15:5..15:21"
+        }
+      }
+    },
+    "model.smart": {
+      "address": {
+        "value": "model.smart",
+        "span": "models.yml:3:1..3:12"
+      },
+      "span": "models.yml:3:1..11:1",
+      "namespace": "model",
+      "form": "direct",
+      "provider": {
+        "value": "provider.anthropic",
+        "span": "models.yml:4:13..4:31"
+      },
+      "id": {
+        "value": "claude-sonnet-4-6",
+        "span": "models.yml:5:7..5:24"
+      },
+      "settings": {
+        "max_tokens": {
+          "value": 8000,
+          "span": "models.yml:7:5..7:21"
+        },
+        "thinking": {
+          "value": {
+            "budget_tokens": 4000
+          },
+          "span": "models.yml:8:5..11:1"
+        }
+      }
+    },
+    "provider.anthropic": {
+      "address": {
+        "value": "provider.anthropic",
+        "span": "providers.yml:3:1..3:19"
+      },
+      "span": "providers.yml:3:1..6:1",
+      "namespace": "provider",
+      "kind": "anthropic",
+      "api_key": {
+        "value": {
+          "env_ref": "ANTHROPIC_API_KEY"
+        },
+        "span": "providers.yml:5:12..5:32"
+      }
+    },
+    "tool.web_search": {
+      "address": {
+        "value": "tool.web_search",
+        "span": "tools/web_search.yml:4:1..4:16"
+      },
+      "span": "tools/web_search.yml:4:1..37:1",
+      "namespace": "tool",
+      "description": {
+        "value": "Search the public web and return ranked result snippets.",
+        "span": "tools/web_search.yml:5:16..5:72"
+      },
+      "input": {
+        "surface": "input",
+        "fields": [
+          {
+            "name": {
+              "value": "query",
+              "span": "tools/web_search.yml:7:5..7:10"
+            },
+            "type": {
+              "description": {
+                "value": "The search query.",
+                "span": "tools/web_search.yml:8:20..8:37"
+              },
+              "span": "tools/web_search.yml:8:7..11:5",
+              "form": "scalar",
+              "type": "string",
+              "min_length": 1
+            }
+          },
+          {
+            "name": {
+              "value": "max_results",
+              "span": "tools/web_search.yml:11:5..11:16"
+            },
+            "type": {
+              "description": {
+                "value": "How many results to return.",
+                "span": "tools/web_search.yml:12:20..12:47"
+              },
+              "span": "tools/web_search.yml:12:7..17:3",
+              "form": "scalar",
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10,
+              "default": {
+                "value": 5,
+                "span": "tools/web_search.yml:16:16..16:17"
+              }
+            }
+          }
+        ],
+        "span": "tools/web_search.yml:7:5..17:3"
+      },
+      "output": {
+        "surface": "result",
+        "fields": [
+          {
+            "name": {
+              "value": "results",
+              "span": "tools/web_search.yml:18:5..18:12"
+            },
+            "type": {
+              "description": {
+                "value": "Ranked results, most relevant first.",
+                "span": "tools/web_search.yml:19:20..19:56"
+              },
+              "span": "tools/web_search.yml:19:7..28:3",
+              "form": "array",
+              "items": {
+                "span": "tools/web_search.yml:23:9..28:3",
+                "form": "object",
+                "properties": {
+                  "surface": "result",
+                  "fields": [
+                    {
+                      "name": {
+                        "value": "title",
+                        "span": "tools/web_search.yml:25:11..25:16"
+                      },
+                      "type": {
+                        "span": "tools/web_search.yml:25:18..25:34",
+                        "form": "scalar",
+                        "type": "string"
+                      }
+                    },
+                    {
+                      "name": {
+                        "value": "url",
+                        "span": "tools/web_search.yml:26:11..26:14"
+                      },
+                      "type": {
+                        "span": "tools/web_search.yml:26:16..26:45",
+                        "form": "scalar",
+                        "type": "string",
+                        "format": "uri"
+                      }
+                    },
+                    {
+                      "name": {
+                        "value": "snippet",
+                        "span": "tools/web_search.yml:27:11..27:18"
+                      },
+                      "type": {
+                        "span": "tools/web_search.yml:27:20..27:36",
+                        "form": "scalar",
+                        "type": "string"
+                      }
+                    }
+                  ],
+                  "span": "tools/web_search.yml:25:11..28:3"
+                }
+              },
+              "max_items": 10
+            }
+          }
+        ],
+        "span": "tools/web_search.yml:18:5..28:3"
+      },
+      "binding": "http",
+      "http": {
+        "method": {
+          "value": "GET",
+          "span": "tools/web_search.yml:29:13..29:16"
+        },
+        "url": {
+          "value": {
+            "text": "https://${SEARCH_HOST}/v1/search",
+            "env_refs": [
+              "SEARCH_HOST"
+            ]
+          },
+          "span": "tools/web_search.yml:30:10..30:44"
+        },
+        "headers": [
+          {
+            "name": {
+              "value": "authorization",
+              "span": "tools/web_search.yml:32:7..32:20"
+            },
+            "value": {
+              "value": {
+                "text": "Bearer ${SEARCH_API_KEY}",
+                "env_refs": [
+                  "SEARCH_API_KEY"
+                ]
+              },
+              "span": "tools/web_search.yml:32:22..32:48"
+            }
+          }
+        ],
+        "query": {
+          "entries": [
+            {
+              "name": {
+                "value": "q",
+                "span": "tools/web_search.yml:34:7..34:8"
+              },
+              "value": {
+                "value": "input.query",
+                "span": "tools/web_search.yml:34:10..34:23"
+              }
+            },
+            {
+              "name": {
+                "value": "n",
+                "span": "tools/web_search.yml:35:7..35:8"
+              },
+              "value": {
+                "value": "input.max_results",
+                "span": "tools/web_search.yml:35:10..35:29"
+              }
+            }
+          ],
+          "span": "tools/web_search.yml:34:7..36:5"
+        },
+        "expect_status": [
+          200
+        ],
+        "span": "tools/web_search.yml:29:5..37:1"
+      }
+    }
+  },
+  "deploy": {
+    "target": "local"
+  }
+}

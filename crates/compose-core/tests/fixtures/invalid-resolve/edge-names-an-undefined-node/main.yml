@@ -1,0 +1,13 @@
+# rule: an edge endpoint names a node of its own flow (grammar 2.4)
+# code: undefined-reference
+# message: `rnu` is not a node of `flow.f`
+# at: main.yml:13:24
+# help: did you mean `run`?
+version: "0.1"
+flow.f:
+  outputs: {}
+  nodes:
+    run: { exec: { command: "true" } }
+  edges:
+    - { from: start, to: run }
+    - { from: run, to: rnu }

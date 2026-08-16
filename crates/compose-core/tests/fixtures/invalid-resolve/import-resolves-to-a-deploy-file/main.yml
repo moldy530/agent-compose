@@ -1,0 +1,9 @@
+# rule: an imported file may not be a deploy file (grammar 1.2)
+# code: misplaced-section
+# message: `infra.yml` is a deploy file and may not be imported
+# at: infra.yml:5:3
+# label: main.yml:9:5 imported here
+# help: deploy files are selected with `--target <name>`; only that layer forks per environment (grammar 1.2, 14)
+version: "0.1"
+imports:
+  - infra.yml

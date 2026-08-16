@@ -1,0 +1,3 @@
+provider.p:
+  kind: openai
+  api_key: ${OPENAI_API_KEY}
