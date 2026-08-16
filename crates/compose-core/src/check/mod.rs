@@ -77,7 +77,6 @@ pub fn check(ir: &Ir) -> Vec<Diagnostic> {
     triggers::check(&mut ctx);
     stores::check_session_scope(&mut ctx);
     stores::check_map_writes(&mut ctx);
-    maps::check_dispatched_writes(&mut ctx);
 
     let ir = ctx.ir;
     for (address, definition) in &ir.definitions {
@@ -159,7 +158,6 @@ pub(crate) struct Ctx<'a> {
     pub(crate) ir: &'a Ir,
     diagnostics: Diagnostics,
     channels: BTreeMap<&'a str, &'a Channel>,
-    detached: BTreeMap<String, Vec<reach::Detached<'a>>>,
 }
 
 impl<'a> Ctx<'a> {
@@ -175,10 +173,6 @@ impl<'a> Ctx<'a> {
             ir,
             diagnostics: Diagnostics::new(),
             channels,
-            // Two rules ask which instances run inside a detached dispatch, and
-            // one of them asks once per dispatch site, so the walk runs once
-            // (grammar 8.6 rule 7).
-            detached: reach::detached_instances(ir),
         }
     }
 
@@ -251,22 +245,6 @@ impl<'a> Ctx<'a> {
         reach::flow_at(self.ir, address)
     }
 
-    // --- detachment ------------------------------------------------------
-
-    /// The detached dispatches an instance of this flow runs inside, if any
-    /// (grammar 8.6 rule 7, Decision D94).
-    pub(crate) fn detached(&self, address: &str) -> &[reach::Detached<'a>] {
-        self.detached
-            .get(address)
-            .map_or(&[][..], std::vec::Vec::as_slice)
-    }
-
-    /// Every detached instance in the composition. Owned, because the rule that
-    /// reads it reports as it walks.
-    pub(crate) fn detached_instances(&self) -> Vec<reach::Detached<'a>> {
-        self.detached.values().flatten().cloned().collect()
-    }
-
     // --- state -----------------------------------------------------------
 
     /// The channel of this name, if `state:` declares one.
@@ -283,7 +261,14 @@ impl<'a> Ctx<'a> {
                 .values()
                 .map(|channel| Property {
                     name: channel.name.value.to_string(),
-                    ty: model::type_of(&channel.ty),
+                    // A nested object is named by the declaration that carries
+                    // it, exactly as `model::properties` names an agent's, so a
+                    // bad member of `state.totals` reports against the channel
+                    // rather than against an anonymous "this object".
+                    ty: model::type_of_named(
+                        &channel.ty,
+                        format!("the channel `{}`", channel.name.value),
+                    ),
                     // A channel is a value the flow instance holds, not a
                     // property of an object: whether it is *set* is a runtime
                     // question (Decision D78), never a declared one, and a

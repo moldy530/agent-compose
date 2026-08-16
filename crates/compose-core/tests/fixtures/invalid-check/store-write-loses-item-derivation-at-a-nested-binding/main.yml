@@ -1,0 +1,85 @@
+# rule: the binding that flipped a field to not-item-derived is named, however many instantiations away it is (grammar 11.4, Decision D83)
+# code: unkeyed-map-write
+# message: the map `fan` of `flow.f` dispatches `flow.leaf`, whose node `save` writes `store.docs` with a key that is not item-derived
+# at: main.yml:46:12
+# label: main.yml:75:7 the dispatch is here
+# label: main.yml:65:17 `doc_id` is bound here, to a value every instance shares
+#
+# `flow.leaf` is instantiated twice inside one dispatched `flow.mid`, from the
+# same store node and the same map: `ok` binds `doc_id` from `input.text`,
+# which the map bound from the item, and `bad` binds it from `input.fixed`,
+# which the map bound from `state.topic`. Only `bad` is refused — and the site
+# the author has to edit is in neither the store node the diagnostic is
+# anchored on nor the map its first label names, both of which are innocent.
+# The second label is the binding itself, an instantiation away from either.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+provider.local:
+  kind: openai_compatible
+  base_url: ${U}
+store.docs:
+  kind: vector
+  scope: global
+  embed:
+    model: text-embedding-3-small
+    provider: provider.local
+state:
+  tasks:
+    type: array
+    max_items: 5
+    items: { type: string }
+  topic: { type: string, default: "" }
+flow.leaf:
+  inputs:
+    doc_id: { type: string }
+    text: { type: string }
+  outputs: {}
+  nodes:
+    save:
+      store: store.docs
+      op: upsert
+      key: "input.doc_id"
+      value: "input.text"
+  edges:
+    - { from: start, to: save }
+    - { from: save, to: end }
+flow.mid:
+  inputs:
+    text: { type: string }
+    fixed: { type: string }
+  outputs: {}
+  nodes:
+    ok:
+      flow: flow.leaf
+      input:
+        doc_id: "input.text"
+        text: "input.text"
+    bad:
+      flow: flow.leaf
+      input:
+        doc_id: "input.fixed"
+        text: "input.text"
+  edges:
+    - { from: start, to: ok }
+    - { from: ok, to: bad }
+    - { from: bad, to: end }
+flow.f:
+  outputs: {}
+  nodes:
+    fan:
+      map:
+        over: "state.tasks"
+        as: task
+        node: flow.mid
+        max_concurrency: 4
+        input:
+          text: "task"
+          fixed: "state.topic"
+  edges:
+    - { from: start, to: fan }
+    - { from: fan, to: end }

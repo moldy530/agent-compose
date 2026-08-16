@@ -24,6 +24,12 @@
 //! and a comment whose key is not one of the eight above is skipped — so a
 //! fixture may carry as much prose after its header as the case needs.
 //!
+//! `# label:` is the one repeatable key: a rule that points at several sites
+//! declares one line per site, in the order the diagnostic carries them, and
+//! each is asserted. A fixture may declare fewer labels than the diagnostic
+//! draws — pinning the first is enough for a rule whose later labels are
+//! another rule's business — but never a different one.
+//!
 //! Error UX is a product feature (PRD G3), so a change to any of this is a test
 //! failure rather than something a reviewer might miss.
 
@@ -75,7 +81,7 @@ struct Expectation {
     code: String,
     message: String,
     at: Anchor,
-    label: Option<(Anchor, String)>,
+    labels: Vec<(Anchor, String)>,
     help: Option<String>,
     count: usize,
     target: String,
@@ -129,6 +135,7 @@ fn header(case: &Path) -> Expectation {
     let source = fs::read_to_string(case.join("main.yml"))
         .unwrap_or_else(|e| panic!("{label}: cannot read main.yml: {e}"));
     let mut values: BTreeMap<&str, String> = BTreeMap::new();
+    let mut labels: Vec<String> = Vec::new();
     for line in source.lines() {
         let Some(comment) = line.strip_prefix("# ") else {
             break;
@@ -137,11 +144,11 @@ fn header(case: &Path) -> Expectation {
             continue;
         };
         let key = key.trim();
-        if [
-            "rule", "code", "message", "at", "label", "help", "count", "target",
-        ]
-        .contains(&key)
-        {
+        if key == "label" {
+            labels.push(value.trim().to_string());
+            continue;
+        }
+        if ["rule", "code", "message", "at", "help", "count", "target"].contains(&key) {
             values
                 .entry(key)
                 .or_insert_with(|| value.trim().to_string());
@@ -162,12 +169,15 @@ fn header(case: &Path) -> Expectation {
         code: values["code"].clone(),
         message: values["message"].clone(),
         at: anchor(&values["at"], &label),
-        label: values.get("label").map(|value| {
-            let (anchored, message) = value
-                .split_once(' ')
-                .unwrap_or_else(|| panic!("{label}: `# label:` is `<anchor> <message>`"));
-            (anchor(anchored, &label), message.to_string())
-        }),
+        labels: labels
+            .iter()
+            .map(|value| {
+                let (anchored, message) = value
+                    .split_once(' ')
+                    .unwrap_or_else(|| panic!("{label}: `# label:` is `<anchor> <message>`"));
+                (anchor(anchored, &label), message.to_string())
+            })
+            .collect(),
         help: values.get("help").cloned(),
         count: values
             .get("count")
@@ -277,18 +287,28 @@ fn every_fixture_produces_exactly_the_diagnostic_it_declares() {
                     ));
                 }
                 check_anchor(&mut problems, "position", &expected.at, &diagnostic.span);
-                match (&expected.label, diagnostic.labels.as_slice()) {
-                    (None, _) => {}
-                    (Some((anchor, message)), [label, ..]) => {
-                        check_anchor(&mut problems, "label position", anchor, &label.span);
-                        if &label.message != message {
-                            problems.push(format!(
-                                "label differs\n      expected: {message}\n      actual:   {}",
-                                label.message
-                            ));
-                        }
+                for (index, (anchor, message)) in expected.labels.iter().enumerate() {
+                    let Some(label) = diagnostic.labels.get(index) else {
+                        problems.push(format!(
+                            "the diagnostic carries {} label(s), and the fixture declares {}",
+                            diagnostic.labels.len(),
+                            expected.labels.len()
+                        ));
+                        break;
+                    };
+                    check_anchor(
+                        &mut problems,
+                        &format!("label {} position", index + 1),
+                        anchor,
+                        &label.span,
+                    );
+                    if &label.message != message {
+                        problems.push(format!(
+                            "label {} differs\n      expected: {message}\n      actual:   {}",
+                            index + 1,
+                            label.message
+                        ));
                     }
-                    (Some(_), []) => problems.push("the diagnostic carries no label".to_string()),
                 }
                 if let Some(help) = &expected.help
                     && diagnostic.help.as_deref() != Some(help.as_str())

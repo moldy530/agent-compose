@@ -25,23 +25,21 @@
 //! inside of a dispatched flow: a `flow:` node there carries derivation inward
 //! exactly when its binding expression is item-derived in the frame it sits in.
 //!
-//! # Detached instances (grammar 8.6 rule 7, Decision D94)
-//!
-//! Detachment propagates by a different relation, so it is a different walk.
-//! Derivation re-roots at a nested map's own item; detachment does not re-root
-//! at anything — a detached dispatch is resolved the moment it is issued, so
-//! *everything* the dispatched instance goes on to do happens after the join,
-//! whether the instance reaches it through a `flow:` node or through a `map` of
-//! its own. [`detached_instances`] is that reachability, one record per
-//! (detaching dispatch, flow it reaches).
+//! Detachment needs no walk of its own. A dispatched flow instance holds its
+//! own channel values (grammar 10.1), so nothing a node inside it writes
+//! reaches the state of the flow that dispatched it; what crosses is the
+//! dispatch site's effective write map, and both rules stated over that — 8.6
+//! rule 5 and rule 7 — are decided at the site, in [`maps`](super::maps).
+//! A store write is the one effect that *is* shared across instances, which is
+//! why derivation, and only derivation, is traced inward from here.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ast::common::{Address, Namespace};
 use crate::cel::Scope;
-use crate::diag::{Span, Spanned};
+use crate::diag::Span;
 use crate::ir::Ir;
-use crate::ir::binding::{NodeInput, Writes};
+use crate::ir::binding::NodeInput;
 use crate::ir::definition::DefinitionBody;
 use crate::ir::flow::{Flow, MapDispatch, NodeKind};
 
@@ -129,42 +127,26 @@ fn agent_reaches(
 
 /// One dispatch a `map` block issues (grammar 8.6 rule 7).
 ///
-/// The homogeneous form declares `input:`, `writes:` and `detach:` at map
-/// level and the routed form declares them per route (Decision D85), so every
-/// rule stated over a dispatch reads them from here rather than matching the
-/// two forms again — and a key added to one form cannot be read in one place
-/// and forgotten in another.
+/// The homogeneous form declares `input:` at map level and the routed form
+/// declares it per route (Decision D85), so a rule stated over a dispatch reads
+/// it from here rather than matching the two forms again — and a key added to
+/// one form cannot be read in one place and forgotten in another. The
+/// per-dispatch keys the *site* rules need instead — `writes:` and `detach:` —
+/// are read where those rules run, beside the route's own narrowing
+/// ([`maps`](super::maps)), which the flattened view cannot carry.
 pub(crate) struct Dispatch<'a> {
     /// The dispatch target: `agent.*`, `tool.*`, or `flow.*`.
     pub(crate) target: &'a Address,
     /// The per-item binding, absent where the whole item is the input.
     pub(crate) input: Option<&'a NodeInput>,
-    /// The write remap for this target.
-    pub(crate) writes: Option<&'a Writes>,
-    /// `detach:`, as written.
-    pub(crate) detach: Option<&'a Spanned<bool>>,
-}
-
-impl Dispatch<'_> {
-    /// Whether this dispatch is the one that wrote `detach: true`.
-    pub(crate) fn is_detached(&self) -> bool {
-        self.detach.is_some_and(|detach| detach.value)
-    }
 }
 
 /// Every dispatch of a `map` block, in declaration order.
 pub(crate) fn dispatches(dispatch: &MapDispatch) -> Vec<Dispatch<'_>> {
     match dispatch {
-        MapDispatch::Homogeneous {
-            node,
-            input,
-            writes,
-            detach,
-        } => vec![Dispatch {
+        MapDispatch::Homogeneous { node, input, .. } => vec![Dispatch {
             target: &node.value,
             input: input.as_ref(),
-            writes: writes.as_ref(),
-            detach: detach.as_ref(),
         }],
         MapDispatch::Routed {
             routes, default, ..
@@ -174,8 +156,6 @@ pub(crate) fn dispatches(dispatch: &MapDispatch) -> Vec<Dispatch<'_>> {
             .map(|route| Dispatch {
                 target: &route.node.value,
                 input: route.input.as_ref(),
-                writes: route.writes.as_ref(),
-                detach: route.detach.as_ref(),
             })
             .collect(),
     }
@@ -189,115 +169,6 @@ pub(crate) fn targets(dispatch: &MapDispatch) -> Vec<&Address> {
         .collect()
 }
 
-/// One flow instance that runs inside a **detached** dispatch (grammar 8.6
-/// rule 7, Decision D94).
-#[derive(Clone)]
-pub(crate) struct Detached<'a> {
-    /// The instance's flow address.
-    pub(crate) address: String,
-    /// Its definition.
-    pub(crate) flow: &'a Flow,
-    /// How the *detaching* dispatch is named in a diagnostic — the map that
-    /// wrote `detach: true`, however many instances out from the write it is.
-    pub(crate) dispatcher: String,
-    /// Where `detach: true` was written.
-    pub(crate) detach: Spanned<bool>,
-}
-
-/// Every flow instance a detached dispatch reaches, by the flow's address
-/// (grammar 8.6 rule 7).
-///
-/// A detached dispatch is resolved at dispatch, so the join is over before the
-/// instance has done anything at all — and that is as true of the instances it
-/// goes on to dispatch as of its own nodes. The walk therefore follows both
-/// positions a flow instance is entered from inside another flow: a `flow:`
-/// node and a `map` dispatch. One flow reached by two detached dispatches is
-/// recorded twice, because each dispatch is its own mistake to fix.
-pub(crate) fn detached_instances(ir: &Ir) -> BTreeMap<String, Vec<Detached<'_>>> {
-    let mut found: BTreeMap<String, Vec<Detached<'_>>> = BTreeMap::new();
-    for (address, definition) in &ir.definitions {
-        let DefinitionBody::Flow(flow) = &definition.body else {
-            continue;
-        };
-        for node in &flow.nodes {
-            let NodeKind::Map { map } = &node.kind else {
-                continue;
-            };
-            let dispatcher = format!("the map `{}` of `{address}`", node.id.value);
-            for dispatch in dispatches(&map.dispatch) {
-                let Some(detach) = dispatch.detach.filter(|detach| detach.value) else {
-                    continue;
-                };
-                // An `agent.*` or `tool.*` target has no nodes of its own, so
-                // nothing it does is reached from here; what such a dispatch
-                // writes is the dispatch site's own write map, checked there.
-                if dispatch.target.namespace != Namespace::Flow {
-                    continue;
-                }
-                let mut seen = BTreeSet::new();
-                walk_detached(
-                    ir,
-                    &dispatch.target.to_string(),
-                    &dispatcher,
-                    detach,
-                    &mut seen,
-                    &mut found,
-                );
-            }
-        }
-    }
-    found
-}
-
-fn walk_detached<'a>(
-    ir: &'a Ir,
-    address: &str,
-    dispatcher: &str,
-    detach: &Spanned<bool>,
-    seen: &mut BTreeSet<String>,
-    found: &mut BTreeMap<String, Vec<Detached<'a>>>,
-) {
-    // One record per instance per detaching dispatch: a flow this dispatch
-    // reaches twice is one detached instance, and the guard also keeps a
-    // composition the recursion check has yet to refuse from looping here.
-    if !seen.insert(address.to_string()) {
-        return;
-    }
-    let Some(flow) = flow_at(ir, address) else {
-        return;
-    };
-    found
-        .entry(address.to_string())
-        .or_default()
-        .push(Detached {
-            address: address.to_string(),
-            flow,
-            dispatcher: dispatcher.to_string(),
-            detach: detach.clone(),
-        });
-    for node in &flow.nodes {
-        let reached: Vec<String> = match &node.kind {
-            NodeKind::Flow { flow, .. } => vec![flow.value.to_string()],
-            // A dispatch that detached itself is the seed of its own walk, and
-            // what it reaches is reported against *it* — the nearer of the two
-            // `detach: true`s the author would go and read. Following it from
-            // out here would record the same instance a second time and say
-            // one write twice.
-            NodeKind::Map { map } => dispatches(&map.dispatch)
-                .into_iter()
-                .filter(|dispatch| {
-                    !dispatch.is_detached() && dispatch.target.namespace == Namespace::Flow
-                })
-                .map(|dispatch| dispatch.target.to_string())
-                .collect(),
-            _ => Vec::new(),
-        };
-        for address in reached {
-            walk_detached(ir, &address, dispatcher, detach, seen, found);
-        }
-    }
-}
-
 /// One flow instance running inside a fan-out.
 pub(crate) struct Frame<'a> {
     /// The dispatched flow's address.
@@ -307,20 +178,21 @@ pub(crate) struct Frame<'a> {
     /// Which of this instance's input fields are item-derived at this site
     /// (Decision D83).
     pub(crate) derived: BTreeMap<String, bool>,
+    /// Where each of those fields was bound, for the fields a binding decided:
+    /// the `input:` entry at the dispatch, or at the `flow:` node that carried
+    /// derivation inward. A dispatch that passes the whole item, and a field
+    /// nothing binds, leave no entry — there is no binding to point at.
+    ///
+    /// This is what lets a diagnostic name the edit its reader has to make: the
+    /// store node it reports is innocent, and so is the map, so the binding
+    /// that flipped a field to *not derived* is the third site grammar 11.4's
+    /// worked example is about ("reached through a binding that merely *looks*
+    /// item-derived at the store node").
+    pub(crate) bound_at: BTreeMap<String, Span>,
     /// How the dispatching map is named in a diagnostic.
     pub(crate) dispatcher: String,
     /// The dispatching map node's span.
     pub(crate) span: Span,
-    /// The flow whose `map` opened this site — the instance this dispatch is
-    /// issued *from*.
-    pub(crate) owner: &'a str,
-    /// Whether the dispatch that opened this site wrote `detach: true`, carried
-    /// inward through `flow:` nodes: a `flow:` node inside a detached instance
-    /// is dispatched no less fire-and-forget than its caller. What such an
-    /// instance writes is refused by rule 7 over [`detached_instances`], so the
-    /// rules stated over frames read this only to stay silent about a write
-    /// that rule has already spoken about (grammar 8.6 rule 7).
-    pub(crate) detached: bool,
 }
 
 /// Every flow instance any `map` in the composition dispatches, directly or
@@ -348,7 +220,7 @@ pub(crate) fn frames<'a>(ctx: &Ctx<'a>) -> Vec<Frame<'a>> {
                 let Some(dispatched) = ctx.flow_named(&dispatched_at) else {
                     continue;
                 };
-                let derived = seed(dispatched, dispatch.input, item);
+                let (derived, bound_at) = seed(dispatched, dispatch.input, item);
                 let mut path = BTreeSet::new();
                 push_frame(
                     ctx,
@@ -358,10 +230,9 @@ pub(crate) fn frames<'a>(ctx: &Ctx<'a>) -> Vec<Frame<'a>> {
                         address: dispatched_at,
                         flow: dispatched,
                         derived,
+                        bound_at,
                         dispatcher: dispatcher.clone(),
                         span: node.span.clone(),
-                        owner: address,
-                        detached: dispatch.is_detached(),
                     },
                 );
             }
@@ -374,11 +245,10 @@ pub(crate) fn frames<'a>(ctx: &Ctx<'a>) -> Vec<Frame<'a>> {
 /// inward through their bindings (Decision D83).
 ///
 /// A frame that repeats one already recorded — the same flow, dispatched by the
-/// same map with the same derivation and the same detachment — is dropped: it
-/// is the same *site* said twice, and every rule stated over frames would
-/// otherwise report one mistake once per repetition. Two routes of one map that
-/// differ in `detach:` are two sites, not one, because the rules stated over a
-/// frame read that key.
+/// same map with the same derivation — is dropped: it is the same *site* said
+/// twice, and every rule stated over frames would otherwise report one mistake
+/// once per repetition. The dedup reads the derivation itself and not
+/// [`Frame::bound_at`], which only says where the same answer was written.
 fn push_frame<'a>(
     ctx: &Ctx<'a>,
     frames: &mut Vec<Frame<'a>>,
@@ -389,7 +259,6 @@ fn push_frame<'a>(
         recorded.address == frame.address
             && recorded.dispatcher == frame.dispatcher
             && recorded.derived == frame.derived
-            && recorded.detached == frame.detached
     }) {
         return;
     }
@@ -403,8 +272,6 @@ fn push_frame<'a>(
     let derived = frame.derived.clone();
     let dispatcher = frame.dispatcher.clone();
     let span = frame.span.clone();
-    let owner = frame.owner;
-    let detached = frame.detached;
     frames.push(frame);
     for node in &flow.nodes {
         let NodeKind::Flow { flow: target, .. } = &node.kind else {
@@ -415,19 +282,23 @@ fn push_frame<'a>(
             continue;
         };
         let mut inner = BTreeMap::new();
+        let mut bound_at = BTreeMap::new();
         if let Some(inputs) = &nested.inputs {
             for field in &inputs.fields {
                 let name = field.name.value.to_string();
-                let value = match &node.input {
+                let binding = match &node.input {
                     Some(NodeInput::Fields { bindings }) => bindings
                         .entries
                         .iter()
-                        .find(|binding| binding.name.value == name)
-                        .is_some_and(|binding| {
-                            is_item_derived(binding.value.value.as_str(), None, &derived)
-                        }),
-                    _ => false,
+                        .find(|binding| binding.name.value == name),
+                    _ => None,
                 };
+                let value = binding.is_some_and(|binding| {
+                    is_item_derived(binding.value.value.as_str(), None, &derived)
+                });
+                if let Some(binding) = binding {
+                    bound_at.insert(name.clone(), binding.value.span.clone());
+                }
                 inner.insert(name, value);
             }
         }
@@ -439,43 +310,52 @@ fn push_frame<'a>(
                 address,
                 flow: nested,
                 derived: inner,
+                bound_at,
                 dispatcher: dispatcher.clone(),
                 span: span.clone(),
-                owner,
-                detached,
             },
         );
     }
     path.remove(&address);
 }
 
-/// Which input fields of a dispatched flow are item-derived at one site
-/// (Decision D83).
-fn seed(flow: &Flow, input: Option<&NodeInput>, item: &str) -> BTreeMap<String, bool> {
+/// Which input fields of a dispatched flow are item-derived at one site, and
+/// where each answer was written (Decision D83).
+fn seed(
+    flow: &Flow,
+    input: Option<&NodeInput>,
+    item: &str,
+) -> (BTreeMap<String, bool>, BTreeMap<String, Span>) {
     let mut derived = BTreeMap::new();
+    let mut bound_at = BTreeMap::new();
     let Some(inputs) = &flow.inputs else {
-        return derived;
+        return (derived, bound_at);
     };
     for field in &inputs.fields {
         let name = field.name.value.to_string();
         let value = match input {
             // The whole item is the instance's input, so every field is
-            // item-derived.
+            // item-derived — and no binding was written to point at.
             None => true,
-            Some(NodeInput::Fields { bindings }) => bindings
-                .entries
-                .iter()
-                .find(|binding| binding.name.value == name)
-                .is_some_and(|binding| {
+            Some(NodeInput::Fields { bindings }) => {
+                let binding = bindings
+                    .entries
+                    .iter()
+                    .find(|binding| binding.name.value == name);
+                if let Some(binding) = binding {
+                    bound_at.insert(name.clone(), binding.value.span.clone());
+                }
+                binding.is_some_and(|binding| {
                     is_item_derived(binding.value.value.as_str(), Some(item), &BTreeMap::new())
-                }),
+                })
+            }
             // The scalar form binds a string-in agent, and an agent contains no
             // store nodes (grammar 11.4).
             Some(NodeInput::Scalar { .. }) => false,
         };
         derived.insert(name, value);
     }
-    derived
+    (derived, bound_at)
 }
 
 /// Whether one expression is item-derived: it references the item binding, the

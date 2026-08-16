@@ -261,22 +261,42 @@ pub(crate) fn check_map_writes(ctx: &mut Ctx) {
             if derived {
                 continue;
             }
+            let mut diagnostic = Diagnostic::error(
+                DiagnosticCode::UnkeyedMapWrite,
+                params
+                    .key
+                    .as_ref()
+                    .map_or_else(|| node.span.clone(), |key| key.span.clone()),
+                format!(
+                    "{} dispatches `{}`, whose node `{}` writes `{}` with a key that is not item-derived",
+                    frame.dispatcher,
+                    frame.address,
+                    text(&node.id),
+                    store.value
+                ),
+            )
+            .with_label(frame.span.clone(), "the dispatch is here");
+            // The store node and the map are both innocent: the edit is at the
+            // binding that fed this key a value every instance shares, which may
+            // be several instantiations away from either (grammar 11.4's worked
+            // example). Name it, for each `input.<field>` the key reads.
+            let read = params
+                .key
+                .as_ref()
+                .map(|key| input_fields(key.value.as_str()))
+                .unwrap_or_default();
+            for field in read {
+                if frame.derived.get(&field) == Some(&false)
+                    && let Some(at) = frame.bound_at.get(&field)
+                {
+                    diagnostic = diagnostic.with_label(
+                        at.clone(),
+                        format!("`{field}` is bound here, to a value every instance shares"),
+                    );
+                }
+            }
             ctx.push(
-                Diagnostic::error(
-                    DiagnosticCode::UnkeyedMapWrite,
-                    params
-                        .key
-                        .as_ref()
-                        .map_or_else(|| node.span.clone(), |key| key.span.clone()),
-                    format!(
-                        "{} dispatches `{}`, whose node `{}` writes `{}` with a key that is not item-derived",
-                        frame.dispatcher,
-                        frame.address,
-                        text(&node.id),
-                        store.value
-                    ),
-                )
-                .with_label(frame.span.clone(), "the dispatch is here")
+                diagnostic
                 // Every repair named here has to type-check as a `key` as well
                 // as satisfy this rule, which the bare index does not: grammar
                 // 11.4's worked example offers `key: "execution.item_index"`,
@@ -290,6 +310,29 @@ pub(crate) fn check_map_writes(ctx: &mut Ctx) {
             );
         }
     }
+}
+
+/// The `input.<field>` names one expression reads, first occurrence first and
+/// each named once.
+///
+/// This is the read half of what [`reach::is_item_derived`] decides: that
+/// function answers *whether* an expression is item-derived, and a diagnostic
+/// that has to name the binding responsible needs *which* fields it went
+/// through (grammar 11.4, Decision D83).
+fn input_fields(source: &str) -> Vec<String> {
+    let mut fields: Vec<String> = Vec::new();
+    for read in crate::cel::analyze(source, &crate::cel::Scope::default()).reads {
+        if read.root != "input" {
+            continue;
+        }
+        let Some(field) = read.path.first() else {
+            continue;
+        };
+        if !fields.iter().any(|seen| seen == field) {
+            fields.push(field.clone());
+        }
+    }
+    fields
 }
 
 /// A trigger whose flow reaches a `session`-scoped store supplies a session

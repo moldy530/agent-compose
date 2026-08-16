@@ -1,13 +1,18 @@
-# rule: a node inside a detached instance writes no state either (grammar 8.6 rule 7, Decision D94)
+# rule: a detached dispatch of a subflow writes no state through its `outputs:` either (grammar 8.6 rule 7, Decision D94)
 # code: detached-write
-# message: the map `fan` of `flow.f` detaches `flow.sink`, whose node `n` writes the channel `note`
-# at: main.yml:41:7
-# label: main.yml:53:17 the dispatch is detached here
+# message: the `map` of node `fan` is detached, and `note` of `flow.sink` writes the channel `note`
+# at: main.yml:56:9
+# label: main.yml:58:17 the dispatch is detached here
 # help: a detached dispatch is resolved at dispatch: the join is over the moment it is issued and its outcome is never observed, so what it wrote would land — or not — after everything that reads it (grammar 8.6 rule 7, Decisions D31, D94); drop `detach: true`, or send the result out through the target itself
 #
-# The dispatched flow returns nothing — `outputs: {}` — so the dispatch site
-# itself writes nothing; the write is a node *inside* the instance, which is as
-# far from the join as rule 7 reaches.
+# The `agent.*` spelling of rule 7 is
+# `map-detached-dispatch-writes-a-channel`; this is the `flow.*` one, and what
+# crosses at a `flow.*` dispatch is the instance's `outputs:` rather than
+# anything its nodes do (grammar 10.1, 7.6.4 rule 3). `flow.sink` returns
+# `note`, a channel of that name is declared, and the name-based write that
+# results is the write a fire-and-forget dispatch may not make — with no
+# `writes:` key for the parser to refuse
+# (invalid-parse/map-detached-dispatch-writes-state.yml).
 version: "0.1"
 provider.p:
   kind: anthropic
@@ -21,10 +26,9 @@ state:
     max_items: 9
     items: { type: string }
   note:
-    type: array
-    max_items: 9
-    items: { type: string }
-    reduce: append
+    type: string
+    default: ""
+    reduce: last_wins
 agent.worker:
   model: model.m
   prompt: Work.
@@ -35,7 +39,8 @@ agent.worker:
 flow.sink:
   inputs:
     text: { type: string }
-  outputs: {}
+  outputs:
+    note: { type: string }
   nodes:
     n:
       agent: agent.worker

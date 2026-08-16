@@ -1,0 +1,42 @@
+# rule: a nested object inside a channel is named by the channel that declares it (grammar 4.1, 10.1)
+# code: unknown-field
+# message: `state.totals.nope` names no field of the channel `totals`
+# at: main.yml:39:12
+# help: the declared fields are `fixed`
+#
+# Every other object in the type model is named by the declaration that carries
+# it — an agent's nested field reports "names no field of `author`" — and the
+# state root is no exception: `state.totals` is *the channel* `totals`, so a
+# member it does not have is reported against that, never against an anonymous
+# "this object". `expression-reads-an-undeclared-channel` is the level above
+# this one, where the channel itself is the thing that does not exist.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+state:
+  totals:
+    type: object
+    properties:
+      fixed: { type: integer }
+    reduce: merge
+agent.a:
+  model: model.m
+  prompt: Go.
+  input:
+    n: { type: integer }
+  output:
+    draft: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.a
+      input:
+        n: "state.totals.nope"
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }

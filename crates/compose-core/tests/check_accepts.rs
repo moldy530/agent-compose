@@ -571,6 +571,141 @@ flow.f:
     );
 }
 
+/// The idiomatic subflow fan-in: a `map` dispatches a `flow.*`, whose node
+/// writes the channel the subflow's own `outputs:` materialize from, and whose
+/// result the dispatch remaps into an `append` channel of the dispatching flow
+/// (grammar 8.6 rules 5, 6, 10.2's fan-in note).
+///
+/// The channel set is composition-global in **shape** and each flow instance
+/// holds its own **values** (grammar 10.1), so `scratch` inside `flow.ingest`
+/// is that instance's own — one writer, no race — and what crosses is the
+/// instance's `outputs:` through the dispatch's write map (7.6.4 rule 3). Rule
+/// 5 is about the crossing write, and `results` is `append` as it requires.
+/// Reading it over the subflow's internals instead would make this shape
+/// unwritable: `reduce:` on `scratch` is what it would ask for, and an
+/// `append` `scratch` no longer satisfies a `string` output field (7.5).
+#[test]
+fn a_dispatched_subflow_writes_its_own_channels_and_returns_one_element() {
+    accepts(
+        "subflow-fan-in",
+        r#"
+state:
+  tasks:
+    type: array
+    max_items: 5
+    items: { type: string }
+  scratch: { type: string, default: "" }
+  results:
+    type: array
+    max_items: 5
+    items: { type: string }
+    reduce: append
+agent.worker:
+  model: model.m
+  prompt: Work.
+  input:
+    text: { type: string }
+  output:
+    scratch: { type: string }
+flow.ingest:
+  inputs:
+    text: { type: string }
+  outputs:
+    scratch: { type: string }
+  nodes:
+    n:
+      agent: agent.worker
+      input: { text: "input.text" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }
+flow.f:
+  outputs: {}
+  nodes:
+    fan:
+      map:
+        over: "state.tasks"
+        node: flow.ingest
+        max_concurrency: 4
+        input: { text: "item" }
+        writes: { scratch: results }
+  edges:
+    - { from: start, to: fan }
+    - { from: fan, to: end }
+"#,
+    );
+}
+
+/// The same isolation under `detach: true`. What rule 7 refuses is a write to
+/// the *dispatching* flow's state — `flow.sink` returns nothing, so nothing
+/// crosses — and the channels its own nodes write, at any depth and through a
+/// fan-out of its own, belong to the instance that writes them (grammar 8.6
+/// rule 7, 10.1, Decision D94).
+#[test]
+fn a_detached_subflow_dispatch_whose_nodes_write_their_own_channels() {
+    accepts(
+        "detached-subflow-internals",
+        r#"
+state:
+  tasks:
+    type: array
+    max_items: 5
+    items: { type: string }
+  scratch: { type: string, default: "" }
+  note:
+    type: array
+    max_items: 5
+    items: { type: string }
+    reduce: append
+agent.worker:
+  model: model.m
+  prompt: Work.
+  input:
+    text: { type: string }
+  output:
+    scratch: { type: string }
+agent.recorder:
+  model: model.m
+  prompt: Record.
+  input:
+    text: { type: string }
+  output:
+    note: { type: string }
+flow.sink:
+  inputs:
+    text: { type: string }
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.worker
+      input: { text: "input.text" }
+    inner:
+      map:
+        over: "state.tasks"
+        node: agent.recorder
+        max_concurrency: 2
+        input: { text: "item" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: inner }
+    - { from: inner, to: end }
+flow.f:
+  outputs: {}
+  nodes:
+    fan:
+      map:
+        over: "state.tasks"
+        node: flow.sink
+        detach: true
+        max_concurrency: 2
+        input: { text: "item" }
+  edges:
+    - { from: start, to: fan }
+    - { from: fan, to: end }
+"#,
+    );
+}
+
 /// An agent may attach both a store and tools; what grammar 11.5 refuses is a
 /// synthesized name that collides with an attached one, and none of these do —
 /// including `prefs_search`, which a `kv` store does not synthesize, and
