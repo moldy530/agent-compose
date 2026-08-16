@@ -88,7 +88,7 @@ Loops are prominent (evaluator-optimizer, ReAct, plan-revise); DAG-only loses. D
 
 | Node type | Semantics | Codegen |
 |---|---|---|
-| `agent` | LLM call with structured output | node fn + Zod schema + structured output |
+| `agent` | LLM call with structured output; the tool-call loop is bounded by `max_tool_iterations` (default 8, §9.14) | node fn + Zod schema + structured output |
 | `exec` | shell command (map input → env vars; string input → stdin) | child-process wrapper |
 | `http` | HTTP request | fetch wrapper |
 | `function` | host-registered function by name (escape hatch; breaks spec portability — documented) | registry lookup |
@@ -192,6 +192,7 @@ store.docs:
 - **Two consumption modes** (mirrors tool vs function, 5.5):
   1. *Agent-attached* — `stores: [store.docs]` on an agent def; codegen synthesizes LLM-facing tools from the store's schema (`docs_search`, `user_prefs_get/set`). Nondeterministic, agent-invoked, recorded as tool calls.
   2. *Store-op nodes* — `{ store: store.user_prefs, op: get, key: state.user_id }`. Deterministic, graph-invoked (load context before an agent, persist after). Same definition, two usage surfaces, surface-specific validation.
+- **Least-privilege attachment (§9.13)**: a `stores:` entry may declare `agent_access: read` (default `read_write`) to withhold the synthesized write tools from the model — the store-tool counterpart of placement isolation's blast-radius containment.
 - **Scope**: `execution` (dies with the run) | `session` (persists across executions sharing a session key) | `global`. **Triggers supply session identity**: a trigger may declare `session_key: <CEL over payload>`; all session-scoped stores — and conversation history — key off it. Cross-session memory = session-scoped store + trigger-supplied session key, declaratively.
 - **Backend binding (settled — alias-only)**: a store optionally declares `backend: <alias>` — a bare string naming an abstract slot, never provider config. All physical configuration lives in the per-target deploy layer:
 
@@ -425,13 +426,12 @@ Formerly open, now settled — rationale lives in the referenced sections:
 10. **LLM providers & models** → `provider.*` (connection) / `model.*` (behavior) split; schema-validated provider settings; ordered failover routes on infrastructure conditions only; no inline overrides on agents; env-ref-only secrets surviving unresolved into the IR (5.9).
 11. **Codegen target** → LangGraph TypeScript first; a Python backend is a possible v2 target (§4, 5.12).
 12. **Compiler implementation** → Rust single-binary CLI (parse/resolve/validate/codegen); CEL via the Rust `cel` crate at validate time and a JS evaluator at runtime, kept in lockstep by a shared conformance corpus (5.5, 5.12).
+13. **`agent_access` on store attachment** → accepted: a `stores:` entry may narrow the synthesized tool surface to read-only (`agent_access: read`; default `read_write`). One enum buys declarative least-privilege for store tools, the same posture placement isolation takes for compute (5.8, 5.10; grammar D37).
+14. **`max_tool_iterations` on agents** → accepted, default 8: the intra-agent tool loop was the one remaining unbounded loop in a compiled graph; a declarative bound completes the static-termination story that 5.4 starts (5.4, 5.5; grammar D51).
 
 ## 10. Open Questions
 
-_New questions raised during grammar/spec work land here and must be resolved (moved to §9) before implementation of the affected area begins._
-
-1. **`agent_access` on store attachment** (raised by grammar spec, Decision D37): should an agent's `stores:` entry support narrowing the synthesized tool surface to read-only (`agent_access: read`, default `read_write`)? Extends 5.8 with a least-privilege knob the PRD doesn't ask for; changes which tools codegen synthesizes. Must be resolved before M1 implements store-tool synthesis. Declining costs one optional key.
-2. **`max_tool_iterations` on agents** (raised by grammar spec, Decision D51): should agents declare a bound on the intra-agent tool-call loop (default 8)? 5.4 bounds graph cycles only; the tool loop is the one remaining unbounded loop in a compiled graph. Must be resolved before M1 emits the agent tool loop. Declining costs one optional key and defers to runtime defaults.
+_None. New questions raised during grammar/spec work land here and must be resolved (moved to §9) before implementation of the affected area begins._
 
 ## 11. References
 
