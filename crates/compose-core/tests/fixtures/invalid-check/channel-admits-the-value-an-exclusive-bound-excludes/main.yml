@@ -1,0 +1,35 @@
+# rule: an exclusive bound is not satisfied by a source that admits the boundary (grammar 3.3, Decision D111)
+# code: type-mismatch
+# message: the state channel `count` cannot supply `count` of node `n`: expected a number above 0, found one that admits 0
+# at: main.yml:32:7
+# label: main.yml:20:3 the channel is declared here
+# help: a name-based read puts no expression between the two declarations, so the channel must satisfy the field it lands in (grammar 8.0, Decision D111)
+#
+# The two spellings name the same number and admit different sets: `minimum: 0`
+# holds `0` and `exclusive_minimum: 0` does not, so the channel can hold a value
+# the field it lands in refuses. Folding the pair into one bound and comparing
+# the numbers would accept this, which is the one case the strictness decides.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+state:
+  count: { type: integer, minimum: 0, default: 1 }
+agent.a:
+  model: model.m
+  prompt: Do the thing.
+  input:
+    count: { type: integer, exclusive_minimum: 0 }
+  output:
+    result: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.a
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }

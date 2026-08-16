@@ -1,0 +1,33 @@
+# rule: the array a `map.over` resolves to declares `max_items` (grammar 8.6 rule 1, Decision D10)
+# code: unbounded-fan-out
+# message: `over` of the `map` of node `work` resolves to an array with no `max_items`
+# at: main.yml:28:15
+# label: main.yml:16:5 the array is declared here
+# help: bounding is mandatory on both axes: declare `max_items` on the array a `map.over` resolves to, and `max_concurrency` on the map node (grammar 3.5, 8.6 rule 1)
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+state:
+  tasks:
+    type: array
+    items: { type: string }
+agent.worker:
+  model: model.m
+  prompt: Do the thing.
+  output:
+    result: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    work:
+      map:
+        over: "state.tasks"
+        node: agent.worker
+        max_concurrency: 4
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }

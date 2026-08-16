@@ -257,11 +257,20 @@ impl fmt::Display for Severity {
 ///
 /// See the module documentation for the scheme. Variants are grouped by the
 /// layer that raises them: the parser raises every code down to
-/// [`ReservedName`](Self::ReservedName), and the resolver raises the four after
+/// [`ReservedName`](Self::ReservedName), the resolver raises the four after
 /// it — plus [`IoError`](Self::IoError), [`InvalidEncoding`](Self::InvalidEncoding)
 /// and [`InvalidImportPath`](Self::InvalidImportPath), which it shares with the
 /// parser because an unreadable or out-of-tree import is the same failure class
-/// wherever it is noticed.
+/// wherever it is noticed — and the validator raises the rest.
+///
+/// A validator code names a failure class, never a rule: `type-mismatch` is
+/// raised by every check that compares two declared types, and which rule was
+/// broken is what the message says. Several validator checks reuse a code the
+/// parser already owns where the failure really is the same class — a store-op
+/// `value:` that omits a required field is a [`MissingKey`](Self::MissingKey),
+/// a settings key no provider plugin publishes is an
+/// [`UnknownKey`](Self::UnknownKey) — because a second spelling of one class
+/// would make the corpus assert on which pass happened to notice it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DiagnosticCode {
     // --- file level -------------------------------------------------------
@@ -340,9 +349,114 @@ pub enum DiagnosticCode {
     UndefinedReference,
     /// A file's `version:` differs from the entrypoint's.
     VersionMismatch,
+
+    // --- expressions (grammar 4.1) ----------------------------------------
+    /// A CEL expression does not parse, or reads something its surface cannot
+    /// supply.
+    InvalidExpression,
+    /// An expression's root identifier is not in scope on its surface.
+    UnknownRoot,
+    /// A path, a binding, or a write remap names a field the declared schema
+    /// does not have.
+    UnknownField,
+    /// Two declared types meet and the source cannot land in the target.
+    TypeMismatch,
+
+    // --- state (grammar 10) -----------------------------------------------
+    /// A `state.*` read, a `writes:` destination, or a flow `outputs:` field
+    /// names a channel `state:` does not declare.
+    UndefinedChannel,
+    /// A concurrent writer targets a channel with no `reduce:` policy.
+    UnreducedWrite,
+    /// Two output fields of one node land on one channel (Decision D93).
+    ConflictingWrites,
+
+    // --- bindings (grammar 8.0, 13.1) -------------------------------------
+    /// An input field has no binding, no name-based source, and no `default:`.
+    MissingBinding,
+
+    // --- fan-out (grammar 8.6) --------------------------------------------
+    /// A `map.over` path resolves to an array with no `max_items`.
+    UnboundedFanOut,
+    /// A variant of the item union has neither a route nor a `default:`.
+    NonExhaustive,
+    /// A detached dispatch writes state (Decisions D31, D94).
+    DetachedWrite,
+
+    // --- stores (grammar 11) ----------------------------------------------
+    /// A `vector`/`blob` write inside a fan-out has a key that is not
+    /// item-derived (Decision D67).
+    UnkeyedMapWrite,
+    /// A tool an attached store synthesizes has the name of a tool the same
+    /// agent attaches (grammar 11.5).
+    ToolNameCollision,
+    /// A trigger whose flow reaches a `session`-scoped store declares no
+    /// `session_key:`.
+    MissingSessionKey,
+
+    // --- providers and models (grammar 12) --------------------------------
+    /// A provider cannot serve what a model, an agent, or a store asks of it.
+    MissingCapability,
 }
 
 impl DiagnosticCode {
+    /// Every code, in declaration order.
+    ///
+    /// The list is what the tests that must be exhaustive over the enum read,
+    /// so it is pinned to the enum rather than kept in step by hand: each entry
+    /// is asserted to sit at its own variant's position
+    /// (`codes_are_kebab_case_and_unique`), which fails on an entry that is
+    /// missing, duplicated, or out of order. A code appended after the last
+    /// variant below belongs at the end of this list too.
+    pub const ALL: &'static [Self] = &[
+        Self::IoError,
+        Self::InvalidEncoding,
+        Self::YamlSyntax,
+        Self::EmptyDocument,
+        Self::MultipleDocuments,
+        Self::RootNotMapping,
+        Self::NonStringKey,
+        Self::DuplicateKey,
+        Self::MergeKey,
+        Self::YamlTag,
+        Self::MisplacedSection,
+        Self::UnsupportedVersion,
+        Self::InvalidImportPath,
+        Self::UnknownKey,
+        Self::MissingKey,
+        Self::WrongType,
+        Self::InvalidValue,
+        Self::ValueOutOfRange,
+        Self::UnknownVariant,
+        Self::ConflictingKeys,
+        Self::InvalidIdentifier,
+        Self::InvalidReference,
+        Self::InvalidDuration,
+        Self::InvalidPathExpression,
+        Self::InvalidEnvRef,
+        Self::UnexpectedEnvRef,
+        Self::ReservedName,
+        Self::DuplicateDefinition,
+        Self::DuplicateSection,
+        Self::UndefinedReference,
+        Self::VersionMismatch,
+        Self::InvalidExpression,
+        Self::UnknownRoot,
+        Self::UnknownField,
+        Self::TypeMismatch,
+        Self::UndefinedChannel,
+        Self::UnreducedWrite,
+        Self::ConflictingWrites,
+        Self::MissingBinding,
+        Self::UnboundedFanOut,
+        Self::NonExhaustive,
+        Self::DetachedWrite,
+        Self::UnkeyedMapWrite,
+        Self::ToolNameCollision,
+        Self::MissingSessionKey,
+        Self::MissingCapability,
+    ];
+
     /// The stable kebab-case spelling of this code.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -378,6 +492,21 @@ impl DiagnosticCode {
             Self::DuplicateSection => "duplicate-section",
             Self::UndefinedReference => "undefined-reference",
             Self::VersionMismatch => "version-mismatch",
+            Self::InvalidExpression => "invalid-expression",
+            Self::UnknownRoot => "unknown-root",
+            Self::UnknownField => "unknown-field",
+            Self::TypeMismatch => "type-mismatch",
+            Self::UndefinedChannel => "undefined-channel",
+            Self::UnreducedWrite => "unreduced-write",
+            Self::ConflictingWrites => "conflicting-writes",
+            Self::MissingBinding => "missing-binding",
+            Self::UnboundedFanOut => "unbounded-fan-out",
+            Self::NonExhaustive => "non-exhaustive",
+            Self::DetachedWrite => "detached-write",
+            Self::UnkeyedMapWrite => "unkeyed-map-write",
+            Self::ToolNameCollision => "tool-name-collision",
+            Self::MissingSessionKey => "missing-session-key",
+            Self::MissingCapability => "missing-capability",
         }
     }
 }
@@ -582,43 +711,18 @@ mod tests {
         )
     }
 
+    /// The uniqueness rule is only worth as much as the list it runs over, so
+    /// the list is checked against the enum first: every entry of
+    /// [`DiagnosticCode::ALL`] must sit at its own variant's position, which an
+    /// entry that is missing, duplicated, or out of order fails.
     #[test]
     fn codes_are_kebab_case_and_unique() {
-        let codes = [
-            DiagnosticCode::IoError,
-            DiagnosticCode::InvalidEncoding,
-            DiagnosticCode::YamlSyntax,
-            DiagnosticCode::EmptyDocument,
-            DiagnosticCode::MultipleDocuments,
-            DiagnosticCode::RootNotMapping,
-            DiagnosticCode::NonStringKey,
-            DiagnosticCode::DuplicateKey,
-            DiagnosticCode::MergeKey,
-            DiagnosticCode::YamlTag,
-            DiagnosticCode::MisplacedSection,
-            DiagnosticCode::UnsupportedVersion,
-            DiagnosticCode::InvalidImportPath,
-            DiagnosticCode::UnknownKey,
-            DiagnosticCode::MissingKey,
-            DiagnosticCode::WrongType,
-            DiagnosticCode::InvalidValue,
-            DiagnosticCode::ValueOutOfRange,
-            DiagnosticCode::UnknownVariant,
-            DiagnosticCode::ConflictingKeys,
-            DiagnosticCode::InvalidIdentifier,
-            DiagnosticCode::InvalidReference,
-            DiagnosticCode::InvalidDuration,
-            DiagnosticCode::InvalidPathExpression,
-            DiagnosticCode::InvalidEnvRef,
-            DiagnosticCode::UnexpectedEnvRef,
-            DiagnosticCode::ReservedName,
-            DiagnosticCode::DuplicateDefinition,
-            DiagnosticCode::DuplicateSection,
-            DiagnosticCode::UndefinedReference,
-            DiagnosticCode::VersionMismatch,
-        ];
         let mut seen = std::collections::BTreeSet::new();
-        for code in codes {
+        for (position, code) in DiagnosticCode::ALL.iter().enumerate() {
+            assert_eq!(
+                *code as usize, position,
+                "`{code}` is not the {position}th variant: `DiagnosticCode::ALL` is not the enum"
+            );
             let text = code.as_str();
             assert!(
                 text.chars()
@@ -627,6 +731,11 @@ mod tests {
             );
             assert!(seen.insert(text), "{text} is used by two variants");
         }
+        assert_eq!(
+            DiagnosticCode::ALL.len(),
+            DiagnosticCode::MissingCapability as usize + 1,
+            "`DiagnosticCode::ALL` stops short of the last declared variant"
+        );
     }
 
     #[test]

@@ -1,0 +1,25 @@
+# rule: a string-in agent's node must bind its one unnamed input (grammar 5.3)
+# code: missing-binding
+# message: node `n` runs a string-in agent and must bind its input
+# at: main.yml:22:7
+# help: an agent that declares no `input:` takes a single unnamed string, bound at the node as `input: "<CEL>"` (grammar 5.3, Decision D14)
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.a:
+  model: model.m
+  prompt: Do the thing.
+  output:
+    result: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.a
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }

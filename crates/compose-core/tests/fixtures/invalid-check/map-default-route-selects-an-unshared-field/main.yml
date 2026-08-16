@@ -1,0 +1,72 @@
+# rule: a `default:` route sees only the fields every unrouted variant declares (grammar 8.6 rule 4, Decision D30)
+# code: unknown-field
+# message: `finding.summary` names no field of the item narrowed to the unrouted variants
+# at: main.yml:68:29
+# help: the declared fields are `kind`
+#
+# Two variants are unrouted and they declare different payloads, so the
+# narrowing leaves the discriminator alone. The accepting half of the same rule
+# — two unrouted variants that *do* declare one field identically — is
+# `check_accepts.rs`.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.triage:
+  model: model.m
+  prompt: Triage.
+  input:
+    text: { type: string }
+  output:
+    findings:
+      type: array
+      max_items: 10
+      items:
+        discriminator: kind
+        variants:
+          auto_fixable:
+            file: { type: string }
+          needs_human:
+            summary: { type: string }
+          duplicate:
+            of: { type: string }
+agent.fixer:
+  model: model.m
+  prompt: Fix.
+  input:
+    file: { type: string }
+  output:
+    patch: { type: string }
+agent.reviewer:
+  model: model.m
+  prompt: Review.
+  input:
+    summary: { type: string }
+  output:
+    verdict: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    classify:
+      agent: agent.triage
+      input: { text: "'x'" }
+    dispatch:
+      map:
+        over: "classify.output.findings"
+        as: finding
+        route_by: kind
+        max_concurrency: 4
+        routes:
+          auto_fixable:
+            node: agent.fixer
+            input: { file: "finding.file" }
+        default:
+          node: agent.reviewer
+          input: { summary: "finding.summary" }
+  edges:
+    - { from: start, to: classify }
+    - { from: classify, to: dispatch }
+    - { from: dispatch, to: end }

@@ -1,0 +1,47 @@
+# rule: an `optional:` property cannot supply a required one (grammar 3.4, 8.0, Decision D110)
+# code: type-mismatch
+# message: the state channel `author` cannot supply `author` of node `n`: expected `email` to be required, found an optional property
+# at: main.yml:44:7
+# label: main.yml:23:3 the channel is declared here
+# help: a name-based read puts no expression between the two declarations, so the channel must satisfy the field it lands in (grammar 8.0, Decision D111)
+#
+# This is what `optional:` means and a `default:` does not. A property listed
+# here may be **absent from a value** at run time, and reading an absent value
+# fails the execution (Decision D110), so the channel cannot keep the promise a
+# required field makes. A property with a `default:` is optional at its
+# *surface* — a binding need not supply it (grammar 3.6, 8.0 step 4) — and the
+# value carries it either way, which is the accepting half in
+# `check_accepts::a_defaulted_property_is_not_an_absent_one`.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+state:
+  author:
+    type: object
+    properties:
+      name: { type: string }
+      email: { type: string }
+    optional: [email]
+agent.a:
+  model: model.m
+  prompt: Do the thing.
+  input:
+    author:
+      type: object
+      properties:
+        name: { type: string }
+        email: { type: string }
+  output:
+    result: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.a
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }

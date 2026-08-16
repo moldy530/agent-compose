@@ -1,0 +1,30 @@
+# rule: a name-based read is type-checked against the field (grammar 8.0, Decision D111)
+# code: type-mismatch
+# message: the state channel `count` cannot supply `count` of node `n`: expected a number at or above 0, found one that is not bounded there
+# at: main.yml:27:7
+# label: main.yml:15:3 the channel is declared here
+# help: a name-based read puts no expression between the two declarations, so the channel must satisfy the field it lands in (grammar 8.0, Decision D111)
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+state:
+  count: { type: integer, default: 0 }
+agent.a:
+  model: model.m
+  prompt: Do the thing.
+  input:
+    count: { type: integer, minimum: 0 }
+  output:
+    result: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.a
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }

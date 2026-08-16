@@ -1,0 +1,16 @@
+# rule: an object `default:` supplies only properties the object declares (grammar 3.4, 3.6)
+# code: invalid-value
+# message: `default` in the schema of `author` supplies `nickname`, which is not a declared property
+# at: 13:35
+# help: the declared properties are `name`
+tool.publish:
+  description: Publish a document.
+  input:
+    author:
+      type: object
+      properties:
+        name: { type: string }
+      default: { name: "unknown", nickname: "nobody" }
+  output: {}
+  exec:
+    command: publish

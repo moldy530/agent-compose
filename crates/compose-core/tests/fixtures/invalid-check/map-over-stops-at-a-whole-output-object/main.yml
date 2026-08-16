@@ -1,0 +1,42 @@
+# rule: `over` resolves through a node's output to one of its fields, not to the whole object (grammar 8.6 rule 1)
+# code: type-mismatch
+# message: `over` of the `map` of node `work` must resolve to an array, and `plan.output` resolves to `plan`'s output
+# at: main.yml:36:15
+# help: a `map` fans out over an array: an agent emits one and the map dispatches over it (grammar 8.6 rule 1)
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.planner:
+  model: model.m
+  prompt: Plan.
+  input:
+    text: { type: string }
+  output:
+    tasks:
+      type: array
+      max_items: 5
+      items: { type: string }
+agent.worker:
+  model: model.m
+  prompt: Work.
+  output:
+    result: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    plan:
+      agent: agent.planner
+      input: { text: "'x'" }
+    work:
+      map:
+        over: "plan.output"
+        node: agent.worker
+        max_concurrency: 4
+  edges:
+    - { from: start, to: plan }
+    - { from: plan, to: work }
+    - { from: work, to: end }

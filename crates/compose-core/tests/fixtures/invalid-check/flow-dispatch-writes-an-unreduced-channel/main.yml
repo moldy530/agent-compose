@@ -1,0 +1,59 @@
+# rule: a dispatched subflow's `outputs:` are what cross, and they cross into a reduced channel (grammar 8.6 rule 5, 7.6.4 rule 3)
+# code: unreduced-write
+# message: the `map` of node `join` writes the unreduced channel `tally`
+# at: main.yml:53:9
+# label: main.yml:27:3 the channel is declared here
+# help: dispatched instances are concurrent writers, so the channel they write needs a declared `reduce:` policy — `append`, `merge`, or an explicit `last_wins` (grammar 8.6 rule 5, 10.2)
+#
+# A `flow.*` instance holds its own channel values, so what a map dispatch of
+# one writes to the *dispatching* flow's state is the instance's `outputs:`,
+# name-based unless a `writes:` remap moves them (grammar 10.1, 7.6.4 rule 3).
+# `flow.leaf` returns `tally`, the channel of that name is unreduced, and the
+# instances of one map are concurrent writers of it — which is rule 5's error,
+# reported at the dispatch that makes the write rather than inside the subflow,
+# whose own node writes only its own instance's value.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+state:
+  tasks:
+    type: array
+    max_items: 9
+    items: { type: string }
+  tally:
+    type: string
+agent.worker:
+  model: model.m
+  prompt: Work.
+  input:
+    text: { type: string }
+  output:
+    tally: { type: string }
+flow.leaf:
+  inputs:
+    text: { type: string }
+  outputs:
+    tally: { type: string }
+  nodes:
+    n:
+      agent: agent.worker
+      input: { text: "input.text" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }
+flow.f:
+  outputs: {}
+  nodes:
+    join:
+      map:
+        over: "state.tasks"
+        node: flow.leaf
+        max_concurrency: 2
+        input: { text: "item" }
+  edges:
+    - { from: start, to: join }
+    - { from: join, to: end }

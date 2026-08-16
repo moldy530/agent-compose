@@ -1,0 +1,42 @@
+# rule: a binding that lands in an object is refused at the property that disagrees (grammar 8.0, PRD G3)
+# code: type-mismatch
+# message: the binding for `author` expects a string, found an integer at `.name`
+# at: main.yml:39:24
+# label: main.yml:29:7 the destination is declared here
+#
+# The companion of `binding-result-does-not-fit-the-field`, which pins the
+# scalar shape of the same rule. Two objects are two nouns the shapes cannot
+# tell apart — "expects this object, found this object" is the whole of what
+# either can say for itself — so what the message carries is the sub-path they
+# differ at and what each holds there.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+state:
+  writer:
+    type: object
+    properties:
+      name: { type: integer }
+agent.a:
+  model: model.m
+  prompt: Do the thing.
+  input:
+    author:
+      type: object
+      properties:
+        name: { type: string }
+  output:
+    result: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.a
+      input: { author: "state.writer" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }

@@ -1,0 +1,137 @@
+[
+  {
+    "name": "list-literal-index",
+    "expression": "[1, 2, 3][1]",
+    "result": 2
+  },
+  {
+    "name": "size-of-a-list",
+    "expression": "size([1, 2, 3])",
+    "result": 3
+  },
+  {
+    "name": "size-of-the-empty-list",
+    "expression": "size([])",
+    "result": 0
+  },
+  {
+    "name": "list-concatenation",
+    "expression": "[1] + [2]",
+    "result": [1, 2]
+  },
+  {
+    "name": "map-index-by-a-literal-key",
+    "expression": "{'a': 1}['a']",
+    "result": 1
+  },
+  {
+    "name": "map-index-by-an-integer-key",
+    "expression": "{1: 'a', 2: 'b'}[2]",
+    "result": "b"
+  },
+  {
+    "name": "map-index-by-a-boolean-key",
+    "expression": "{true: 'yes', false: 'no'}[false]",
+    "result": "no"
+  },
+  {
+    "name": "size-of-a-map",
+    "expression": "size({'a': 1, 'b': 2})",
+    "result": 2
+  },
+  {
+    "name": "membership-in-a-list",
+    "expression": "2 in [1, 2]",
+    "result": true
+  },
+  {
+    "name": "membership-in-a-list-is-false-when-absent",
+    "expression": "3 in [1, 2]",
+    "result": false
+  },
+  {
+    "name": "membership-of-an-enum-value-in-a-literal-list",
+    "expression": "review.output.verdict in ['approve', 'revise']",
+    "input": { "review": { "output": { "verdict": "approve" } } },
+    "result": true
+  },
+  {
+    "name": "membership-in-a-map-tests-its-keys",
+    "expression": "'a' in {'a': 1}",
+    "result": true
+  },
+  {
+    "name": "select-a-member-of-a-bound-object",
+    "expression": "input.goal",
+    "input": { "input": { "goal": "ship" } },
+    "result": "ship"
+  },
+  {
+    "name": "select-through-two-levels",
+    "expression": "state.totals.fixed",
+    "input": { "state": { "totals": { "fixed": 3 } } },
+    "result": 3
+  },
+  {
+    "name": "index-then-select",
+    "expression": "plan.output.tasks[0].title",
+    "input": {
+      "plan": { "output": { "tasks": [{ "title": "first" }, { "title": "second" }] } }
+    },
+    "result": "first"
+  },
+  {
+    "name": "select-a-whole-object",
+    "expression": "state.totals",
+    "input": { "state": { "totals": { "fixed": 3 } } },
+    "result": { "fixed": 3 }
+  },
+  {
+    "name": "select-a-whole-list",
+    "expression": "state.items",
+    "input": { "state": { "items": ["a", "b"] } },
+    "result": ["a", "b"]
+  },
+  {
+    "name": "index-a-map-by-a-header-name",
+    "expression": "payload.headers['x-session-id']",
+    "input": { "payload": { "headers": { "x-session-id": "s-1" } } },
+    "result": "s-1"
+  },
+  {
+    "name": "has-a-present-member",
+    "expression": "has(state.totals.fixed)",
+    "input": { "state": { "totals": { "fixed": 3 } } },
+    "result": true
+  },
+  {
+    "name": "has-an-absent-member",
+    "expression": "has(state.totals.skipped)",
+    "input": { "state": { "totals": { "fixed": 3 } } },
+    "result": false
+  },
+  {
+    "name": "has-guards-a-read-that-would-fail",
+    "expression": "has(state.totals.skipped) && state.totals.skipped > 0",
+    "input": { "state": { "totals": { "fixed": 3 } } },
+    "result": false
+  },
+  {
+    "name": "size-of-a-bound-list",
+    "expression": "size(state.patches)",
+    "input": { "state": { "patches": ["p1", "p2"] } },
+    "result": 2
+  },
+  {
+    "name": "an-empty-object-is-readable-whole",
+    "expression": "payload.body",
+    "input": { "payload": { "body": {} } },
+    "result": {}
+  },
+  {
+    "name": "has-over-an-empty-object",
+    "expression": "has(payload.body.goal)",
+    "input": { "payload": { "body": {} } },
+    "result": false
+  }
+]

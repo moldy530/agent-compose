@@ -1,0 +1,67 @@
+# rule: a `vector` write inside a fan-out takes an item-derived key (grammar 11.4, Decision D67)
+# code: unkeyed-map-write
+# message: the map `work` of `flow.f` dispatches `flow.ingest`, whose node `save` writes `store.docs` with a key that is not item-derived
+# at: main.yml:48:12
+# label: main.yml:57:7 the dispatch is here
+# label: main.yml:63:19 `doc_id` is bound here, to a value every instance shares
+# help: concurrent instances would address one key, so N items' content would land in one slot: key the write from the item — an `input.<field>` the dispatch binds from the item, or the whole item passed through — or use a `kv` store, whose write is a declared overwrite; `execution.item_index` is item-derived too, but a `key` is a string and the index is an integer, so it keys a write only from inside a string-valued expression (grammar 4.1, 11.4, Decisions D67, D83)
+#
+# The help names only repairs that also type-check: grammar 11.4's own worked
+# example offers `key: "execution.item_index"`, which the same section's typing
+# of `key` as a CEL string refuses — see `check::stores`.
+#
+# Three sites, and the third is the one the author edits: the store node and
+# the map are both innocent, and `doc_id: "state.topic"` is the binding that
+# made `input.doc_id` merely *look* item-derived at the store node — grammar
+# 11.4's worked example, verbatim.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+provider.local:
+  kind: openai_compatible
+  base_url: ${U}
+store.docs:
+  kind: vector
+  scope: global
+  embed:
+    model: text-embedding-3-small
+    provider: provider.local
+state:
+  tasks:
+    type: array
+    max_items: 5
+    items: { type: string }
+  topic: { type: string, default: "" }
+flow.ingest:
+  inputs:
+    doc_id: { type: string }
+    text: { type: string }
+  outputs: {}
+  nodes:
+    save:
+      store: store.docs
+      op: upsert
+      key: "input.doc_id"
+      value: "input.text"
+  edges:
+    - { from: start, to: save }
+    - { from: save, to: end }
+flow.f:
+  outputs: {}
+  nodes:
+    work:
+      map:
+        over: "state.tasks"
+        as: task
+        node: flow.ingest
+        max_concurrency: 4
+        input:
+          doc_id: "state.topic"
+          text: "task"
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }

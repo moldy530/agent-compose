@@ -1,0 +1,15 @@
+# rule: `settings:` is checked against the provider plugin's schema (grammar 12.2, Decision D40)
+# code: unknown-key
+# message: `reasoning_effort` is not a setting the `anthropic` provider plugin publishes
+# at: main.yml:15:5
+# label: main.yml:12:13 the provider is named here
+# help: the `anthropic` provider plugin publishes `temperature`, `top_p`, `max_tokens`, `stop`, `seed`, `parallel_tool_calls`, `top_k`, `thinking`
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+  settings:
+    reasoning_effort: high

@@ -1,0 +1,15 @@
+# rule: `embed.provider` must serve embeddings (grammar 11.2, Decision D116)
+# code: missing-capability
+# message: `store.docs` embeds through `provider.p`, whose `anthropic` plugin publishes no embeddings
+# at: main.yml:15:15
+# help: `embed.provider` names the connection that turns text into a vector, and the storage backend never computes them: name a provider whose kind serves embeddings (grammar 11.2, Decision D116)
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+store.docs:
+  kind: vector
+  scope: global
+  embed:
+    model: text-embedding-3-small
+    provider: provider.p

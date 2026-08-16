@@ -1,0 +1,63 @@
+# rule: a detached dispatch of a subflow writes no state through its `outputs:` either (grammar 8.6 rule 7, Decision D94)
+# code: detached-write
+# message: the `map` of node `fan` is detached, and `note` of `flow.sink` writes the channel `note`
+# at: main.yml:56:9
+# label: main.yml:58:17 the dispatch is detached here
+# help: a detached dispatch is resolved at dispatch: the join is over the moment it is issued and its outcome is never observed, so what it wrote would land — or not — after everything that reads it (grammar 8.6 rule 7, Decisions D31, D94); drop `detach: true`, or send the result out through the target itself
+#
+# The `agent.*` spelling of rule 7 is
+# `map-detached-dispatch-writes-a-channel`; this is the `flow.*` one, and what
+# crosses at a `flow.*` dispatch is the instance's `outputs:` rather than
+# anything its nodes do (grammar 10.1, 7.6.4 rule 3). `flow.sink` returns
+# `note`, a channel of that name is declared, and the name-based write that
+# results is the write a fire-and-forget dispatch may not make — with no
+# `writes:` key for the parser to refuse
+# (invalid-parse/map-detached-dispatch-writes-state.yml).
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+state:
+  tasks:
+    type: array
+    max_items: 9
+    items: { type: string }
+  note:
+    type: string
+    default: ""
+    reduce: last_wins
+agent.worker:
+  model: model.m
+  prompt: Work.
+  input:
+    text: { type: string }
+  output:
+    note: { type: string }
+flow.sink:
+  inputs:
+    text: { type: string }
+  outputs:
+    note: { type: string }
+  nodes:
+    n:
+      agent: agent.worker
+      input: { text: "input.text" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }
+flow.f:
+  outputs: {}
+  nodes:
+    fan:
+      map:
+        over: "state.tasks"
+        node: flow.sink
+        detach: true
+        max_concurrency: 2
+        input: { text: "item" }
+  edges:
+    - { from: start, to: fan }
+    - { from: fan, to: end }

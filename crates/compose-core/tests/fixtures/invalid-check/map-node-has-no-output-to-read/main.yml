@@ -1,0 +1,33 @@
+# rule: a `map` node has no output of its own (grammar 8.6 rule 9)
+# code: unknown-field
+# message: `work.output` reads a node that has no output
+# at: main.yml:33:36
+# help: `work` is a `map` node, which has no output of its own: its dispatched instances write state instead (grammar 8.6 rule 9)
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+state:
+  tasks:
+    type: array
+    max_items: 5
+    items: { type: string }
+agent.worker:
+  model: model.m
+  prompt: Do the thing.
+  output:
+    result: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    work:
+      map:
+        over: "state.tasks"
+        node: agent.worker
+        max_concurrency: 4
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end, when: "work.output.result == 'x'" }

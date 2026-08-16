@@ -1,0 +1,25 @@
+# rule: a tool implementation binding sees one root (grammar 6.1, Decision D65)
+# code: unknown-root
+# message: `state` is not a root in scope here
+# at: main.yml:25:13
+# help: a `tool.t` implementation binding exposes `input` (grammar 4.1)
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+state:
+  draft: { type: string, default: "" }
+tool.t:
+  description: Post the draft somewhere.
+  input:
+    body: { type: string }
+  output:
+    ok: { type: boolean }
+  http:
+    method: POST
+    url: "https://${H}/v1"
+    body:
+      text: "state.draft"

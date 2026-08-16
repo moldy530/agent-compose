@@ -327,6 +327,12 @@ flow.demo:
 /// `default:` is legal on every type-node form but a union, at every input
 /// surface — an object or array default on an input field is ordinary
 /// (grammar 3.6, Decision D77).
+///
+/// Each literal here validates against the node it sits on, to its leaves: the
+/// object default omits only the property `optional:` names, the array defaults
+/// hold values of their `items:` type, and the property that carries a
+/// `default:` of its own is not one the enclosing literal has to repeat
+/// (grammar 3.6).
 #[test]
 fn object_and_array_defaults_at_an_input_surface() {
     accepts(
@@ -346,6 +352,24 @@ tool.publish:
         email: { type: string, format: email }
       optional: [email]
       default: { name: "unknown" }
+    revisions:
+      type: array
+      items:
+        type: object
+        properties:
+          label: { type: string }
+          kind: { enum: [minor, major] }
+          scores: { type: array, items: { type: number } }
+      default:
+        - label: "first"
+          kind: minor
+          scores: [1, 2.5]
+    settings:
+      type: object
+      properties:
+        locale: { type: string, default: "en" }
+        retries: { type: integer }
+      default: { retries: 0 }
   output: {}
   exec:
     command: publish
@@ -559,6 +583,10 @@ flow.demo:
     );
 }
 
+/// A `merge` channel's `default:` is a whole initial value like any other, so
+/// it supplies every required property: `{}` is what the channel starts as with
+/// no `default:` at all, and declaring one is how the channel becomes total
+/// from step 0 (grammar 3.6, 10.1, Decisions D77, D78, D101).
 #[test]
 fn every_channel_form_with_its_reduce_policy() {
     accepts(
@@ -583,7 +611,7 @@ state:
       fixed: { type: integer }
       skipped: { type: integer }
     optional: [skipped]
-    default: {}
+    default: { fixed: 0 }
     reduce: merge
   verdict:
     enum: [approve, revise]

@@ -1,0 +1,32 @@
+# rule: a `writes:` key is an output field of the node (grammar 8.0)
+# code: unknown-field
+# message: `outcome` is not an output field of node `n`
+# at: main.yml:29:17
+# label: main.yml:22:5 the result schema is declared here
+# help: the declared output fields are `result`
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+state:
+  draft: { type: string, default: "" }
+agent.a:
+  model: model.m
+  prompt: Do the thing.
+  input:
+    text: { type: string }
+  output:
+    result: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.a
+      input: { text: "'x'" }
+      writes: { outcome: draft }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }

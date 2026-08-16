@@ -1,0 +1,27 @@
+# rule: an edge guard evaluates to a boolean (grammar 4.1)
+# code: type-mismatch
+# message: an edge guard must evaluate to a boolean, found a string
+# at: main.yml:27:33
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.a:
+  model: model.m
+  prompt: Do the thing.
+  input:
+    text: { type: string }
+  output:
+    result: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.a
+      input: { text: "'x'" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end, when: "n.output.result" }

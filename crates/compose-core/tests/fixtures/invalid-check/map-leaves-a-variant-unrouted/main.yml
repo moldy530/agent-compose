@@ -1,0 +1,63 @@
+# rule: every variant is routed or caught by `default:` (grammar 8.6 rule 4)
+# code: non-exhaustive
+# message: the `map` of node `dispatch` routes no target for `needs_human`
+# at: main.yml:52:9
+# label: main.yml:24:24 the union is declared here
+# help: every variant of the item union needs a `routes:` entry, or a `default:` catch-all: the agent structurally cannot produce an unroutable item (grammar 8.6 rule 4)
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.triage:
+  model: model.m
+  prompt: Triage.
+  input:
+    text: { type: string }
+  output:
+    findings:
+      type: array
+      max_items: 10
+      items:
+        discriminator: kind
+        variants:
+          auto_fixable:
+            file: { type: string }
+          needs_human:
+            summary: { type: string }
+agent.fixer:
+  model: model.m
+  prompt: Fix.
+  input:
+    file: { type: string }
+  output:
+    patch: { type: string }
+agent.reviewer:
+  model: model.m
+  prompt: Review.
+  input:
+    summary: { type: string }
+  output:
+    ticket: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    classify:
+      agent: agent.triage
+      input: { text: "'x'" }
+    dispatch:
+      map:
+        over: "classify.output.findings"
+        as: finding
+        route_by: kind
+        max_concurrency: 4
+        routes:
+          auto_fixable:
+            node: agent.fixer
+            input: { file: "finding.file" }
+  edges:
+    - { from: start, to: classify }
+    - { from: classify, to: dispatch }
+    - { from: dispatch, to: end }

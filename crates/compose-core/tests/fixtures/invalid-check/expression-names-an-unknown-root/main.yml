@@ -1,0 +1,28 @@
+# rule: every root identifier is one the surface exposes (grammar 4.1)
+# code: unknown-root
+# message: `stat` is not a root in scope here
+# at: main.yml:25:22
+# help: did you mean `state`?
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.a:
+  model: model.m
+  prompt: Do the thing.
+  input:
+    text: { type: string }
+  output:
+    result: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.a
+      input: { text: "stat.draft" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }

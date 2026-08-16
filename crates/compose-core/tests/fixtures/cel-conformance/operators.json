@@ -1,0 +1,173 @@
+[
+  {
+    "name": "int-addition",
+    "expression": "1 + 2",
+    "result": 3
+  },
+  {
+    "name": "int-subtraction",
+    "expression": "5 - 2",
+    "result": 3
+  },
+  {
+    "name": "int-multiplication",
+    "expression": "2 * 3",
+    "result": 6
+  },
+  {
+    "name": "int-division-truncates-toward-zero",
+    "expression": "7 / 2",
+    "result": 3
+  },
+  {
+    "name": "negative-int-division-truncates-toward-zero",
+    "expression": "-7 / 2",
+    "result": -3
+  },
+  {
+    "name": "int-modulo",
+    "expression": "7 % 2",
+    "result": 1
+  },
+  {
+    "name": "unary-minus",
+    "expression": "-(1 + 2)",
+    "result": -3
+  },
+  {
+    "name": "double-addition",
+    "expression": "1.5 + 2.25",
+    "result": 3.75
+  },
+  {
+    "name": "double-division-does-not-truncate",
+    "expression": "7.0 / 2.0",
+    "result": 3.5
+  },
+  {
+    "name": "logical-and",
+    "expression": "true && false",
+    "result": false
+  },
+  {
+    "name": "logical-or",
+    "expression": "false || true",
+    "result": true
+  },
+  {
+    "name": "logical-not",
+    "expression": "!true",
+    "result": false
+  },
+  {
+    "name": "conditional-takes-the-then-branch",
+    "expression": "true ? 'a' : 'b'",
+    "result": "a"
+  },
+  {
+    "name": "conditional-takes-the-else-branch",
+    "expression": "1 > 2 ? 'a' : 'b'",
+    "result": "b"
+  },
+  {
+    "name": "int-equality",
+    "expression": "1 == 1",
+    "result": true
+  },
+  {
+    "name": "int-inequality",
+    "expression": "1 != 2",
+    "result": true
+  },
+  {
+    "name": "equality-across-the-numeric-types",
+    "expression": "1.0 == 1",
+    "result": true
+  },
+  {
+    "name": "equality-across-unrelated-types-is-false-at-run-time",
+    "expression": "'a' == 1",
+    "result": false
+  },
+  {
+    "name": "null-equality",
+    "expression": "null == null",
+    "result": true
+  },
+  {
+    "name": "ordering-across-the-numeric-types",
+    "expression": "1 < 2.5",
+    "result": true
+  },
+  {
+    "name": "greater-than",
+    "expression": "2 > 1",
+    "result": true
+  },
+  {
+    "name": "greater-or-equal",
+    "expression": "1 >= 1",
+    "result": true
+  },
+  {
+    "name": "less-or-equal",
+    "expression": "2 <= 1",
+    "result": false
+  },
+  {
+    "name": "string-ordering",
+    "expression": "'a' < 'b'",
+    "result": true
+  },
+  {
+    "name": "list-equality-is-element-wise",
+    "expression": "[1, 2] == [1, 2]",
+    "result": true
+  },
+  {
+    "name": "map-equality-is-entry-wise",
+    "expression": "{'a': 1} == {'a': 1}",
+    "result": true
+  },
+  {
+    "name": "operator-precedence-multiplies-before-adding",
+    "expression": "1 + 2 * 3",
+    "result": 7
+  },
+  {
+    "name": "parentheses-override-precedence",
+    "expression": "(1 + 2) * 3",
+    "result": 9
+  },
+  {
+    "name": "boolean-guard-over-declared-roots",
+    "expression": "state.count > 0 && input.goal != ''",
+    "input": { "state": { "count": 2 }, "input": { "goal": "ship" } },
+    "result": true
+  },
+  {
+    "name": "an-int-literal-past-double-precision-is-exact",
+    "expression": "9007199254740993",
+    "result": 9007199254740993
+  },
+  {
+    "name": "int-arithmetic-past-double-precision-is-exact",
+    "expression": "9007199254740992 + 1",
+    "result": 9007199254740993
+  },
+  {
+    "name": "two-ints-a-double-would-fold-together-stay-apart",
+    "expression": "9007199254740993 != 9007199254740992",
+    "result": true
+  },
+  {
+    "name": "the-largest-int64",
+    "expression": "9223372036854775807",
+    "result": 9223372036854775807
+  },
+  {
+    "name": "int-overflow-is-an-error-and-not-a-wrap",
+    "expression": "9223372036854775807 + 1",
+    "error": true
+  }
+]

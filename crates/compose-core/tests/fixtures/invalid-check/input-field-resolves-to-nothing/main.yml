@@ -1,0 +1,30 @@
+# rule: an unbound input field with no name-based source and no default (grammar 8.0)
+# code: missing-binding
+# message: `goal` of node `n` is not bound
+# at: main.yml:26:7
+# label: main.yml:19:5 the input field is declared here
+# help: bind it with `input: { goal: <CEL> }`, declare a state channel or a flow input of the same name, or give the field a `default:` (grammar 8.0)
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.a:
+  model: model.m
+  prompt: Do the thing.
+  input:
+    text: { type: string }
+    goal: { type: string }
+  output:
+    result: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.a
+      input: { text: "'x'" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }

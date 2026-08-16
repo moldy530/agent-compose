@@ -1,0 +1,37 @@
+# rule: a trigger's `input:` binds fields the flow declares (grammar 13.1)
+# code: unknown-field
+# message: `scope` is not an input of `flow.f`, which the trigger `on_request` targets
+# at: main.yml:26:7
+# help: the declared inputs are `goal`
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.a:
+  model: model.m
+  prompt: Do the thing.
+  input:
+    text: { type: string }
+  output:
+    result: { type: string }
+triggers:
+  on_request:
+    type: http
+    flow: flow.f
+    input:
+      goal: "payload.body.goal"
+      scope: "payload.body.scope"
+flow.f:
+  inputs:
+    goal: { type: string }
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.a
+      input: { text: "input.goal" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }

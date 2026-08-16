@@ -1,0 +1,32 @@
+# rule: a trigger whose flow reaches a session-scoped store declares `session_key:` (grammar 11.3)
+# code: missing-session-key
+# message: the trigger `on_request` declares no `session_key:`, and `flow.f` reaches the session-scoped store `store.memory`
+# at: main.yml:21:5
+# label: main.yml:14:1 the store is declared here
+# help: a session-scoped store keys off the session identity the trigger supplies: declare `session_key: <CEL over payload>` on the trigger, or give the store another `scope:` (grammar 11.3)
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+store.memory:
+  kind: kv
+  scope: session
+  value_schema:
+    last: { type: string }
+triggers:
+  on_request:
+    type: http
+    flow: flow.f
+flow.f:
+  outputs: {}
+  nodes:
+    forget:
+      store: store.memory
+      op: delete
+      key: "'k'"
+  edges:
+    - { from: start, to: forget }
+    - { from: forget, to: end }

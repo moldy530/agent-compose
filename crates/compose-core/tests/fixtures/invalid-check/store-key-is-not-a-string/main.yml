@@ -1,0 +1,27 @@
+# rule: a store-op `key` is one expression whose result is a string (grammar 11.4)
+# code: type-mismatch
+# message: `key` of node `forget` must evaluate to a string, found an integer
+# at: main.yml:24:12
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+store.memory:
+  kind: kv
+  scope: global
+  value_schema:
+    last_report: { type: string }
+    patch_count: { type: integer }
+flow.f:
+  outputs: {}
+  nodes:
+    forget:
+      store: store.memory
+      op: delete
+      key: "1"
+  edges:
+    - { from: start, to: forget }
+    - { from: forget, to: end }

@@ -1,0 +1,28 @@
+# rule: the scalar `input:` form binds a string-in agent (grammar 5.3, Decision D14)
+# code: type-mismatch
+# message: node `n` binds one unnamed value, but its target declares named input fields
+# at: main.yml:25:14
+# help: the target declares `text`: bind them by name with `input: { <field>: <CEL> }`; the scalar form binds a string-in agent, which declares no `input:` at all (grammar 5.3, Decision D14)
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.a:
+  model: model.m
+  prompt: Do the thing.
+  input:
+    text: { type: string }
+  output:
+    result: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.a
+      input: "'x'"
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }

@@ -1,0 +1,28 @@
+# rule: a literal compared against an enum field is one of its variants (grammar 4.1, 7.3.1)
+# code: type-mismatch
+# message: `aprove` is not a variant of the enum this compares against
+# at: main.yml:28:33
+# help: did you mean `approve`?
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.a:
+  model: model.m
+  prompt: Do the thing.
+  input:
+    text: { type: string }
+  output:
+    verdict: { enum: [approve, revise] }
+flow.f:
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.a
+      input: { text: "'x'" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end, when: "n.output.verdict == 'aprove'" }

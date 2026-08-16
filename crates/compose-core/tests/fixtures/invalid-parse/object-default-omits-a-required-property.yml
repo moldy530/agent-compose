@@ -1,0 +1,12 @@
+# rule: an object `default:` supplies every required property (grammar 3.6, Decision D77)
+# code: invalid-value
+# message: `default` in state channel `totals` supplies no value for the required property `skipped`
+# at: 12:14
+# help: an object `default:` supplies every required property, so the value it initializes is complete from the first step (grammar 3.6, 10.1, Decision D77)
+state:
+  totals:
+    type: object
+    properties:
+      fixed: { type: integer }
+      skipped: { type: integer }
+    default: { fixed: 0 }
