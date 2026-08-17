@@ -327,7 +327,15 @@ fn host_functions(ir: &Ir) -> String {
          the node fails on time and the run moves on whether or not the implementation\n\
          looks — but nothing can unschedule a call already in flight. An implementation\n\
          that ignores the signal keeps running after the node it belonged to has failed,\n\
-         and whatever it eventually returns is discarded.\n",
+         and whatever it eventually returns is discarded.\n\n\
+         ### When `context.idempotency_key` is set\n\n\
+         A function reached as the sink of a **detached** `map` dispatch is delivered\n\
+         at-least-once: the fan-out never waits for its outcome, so a retried map node\n\
+         issues the delivery again. `context.idempotency_key` is that dispatch's key\n\
+         (grammar 9.4) and it is stable across every attempt of the same item, so an\n\
+         implementation that records what it has already done under this key can drop a\n\
+         repeat. It is **absent on every other call**, where repeating a call is what a\n\
+         composition asked for.\n",
     );
     text
 }
@@ -532,6 +540,22 @@ tool.rank:
         );
         assert!(
             contents.contains("keeps running after the node it belonged to has failed"),
+            "{contents}"
+        );
+        // The other thing on that second argument a host cannot learn from the
+        // signature: grammar 9.4's delivery surface for a `function:`-bound
+        // target. A sink that is delivered at-least-once and told nothing about
+        // it has no way to dedupe, which is the whole of what the key is for.
+        assert!(
+            contents.contains("### When `context.idempotency_key` is set"),
+            "{contents}"
+        );
+        assert!(
+            contents.contains("stable across every attempt of the same item"),
+            "{contents}"
+        );
+        assert!(
+            contents.contains("**absent on every other call**"),
             "{contents}"
         );
     }

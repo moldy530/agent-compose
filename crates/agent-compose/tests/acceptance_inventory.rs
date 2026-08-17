@@ -332,6 +332,14 @@ const CODEGEN: &[Criterion] = &[
                 "each_traversal_of_a_map_delivers_its_detached_sink_a_key_of_its_own",
                 Status::Live,
             ),
+            // Rule 10's `fail` half, which is the path a fan-out's record is
+            // easiest to lose on: the map node produced no answer, and the items
+            // that already ran — one write, one delivery to a sink — are
+            // accounted for only if the record survives the failure.
+            (
+                "a_fan_out_absorbed_by_its_own_on_error_still_records_every_dispatch",
+                Status::Live,
+            ),
         ],
     },
     Criterion {

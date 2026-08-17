@@ -15,9 +15,10 @@
 // Two sections reach past the runtime on purpose. The channel section builds a
 // real `StateGraph` the way `codegen::state` builds one, because a reduce policy
 // is half reducer and half channel and the half that swallowed a fan-out's batch
-// was the channel. The delivery section intercepts `fetch` and runs a real
-// subprocess, because a key that is derived and recorded but never sent is
-// indistinguishable from a delivered one anywhere else.
+// was the channel. The delivery section intercepts `fetch`, runs a real
+// subprocess, and registers a real host function — one per binding kind grammar
+// 9.4 fixes a surface for — because a key that is derived and recorded but never
+// sent is indistinguishable from a delivered one anywhere else.
 //
 // Every completion order here is deliberately the reverse of source order: an
 // ordering rule that holds only when the instances happen to finish in order is
@@ -203,7 +204,16 @@ const observed = {};
     await runtime.runMap(strict, runtime.mapPlan(strict, viewOf(items)), context);
     observed.failed = null;
   } catch (error) {
-    observed.failed = { name: error.name, index: error.index, attempts: error.attempts };
+    observed.failed = {
+      name: error.name,
+      index: error.index,
+      attempts: error.attempts,
+      // What the fan-out did, carried out on the failure — the map node is about
+      // to be resolved by its own `on_error:` and this is the only account of the
+      // items that already ran (PRD 5.3, 5.6). The two that failed say `failed`
+      // and not `skipped`: nothing skipped them.
+      dispatches: error.dispatches.map((record) => [record.index, record.outcome]),
+    };
   }
 
   // A parameterized retry: two attempts fail, the third answers.
@@ -233,6 +243,29 @@ const observed = {};
     observed.exhausted = null;
   } catch (error) {
     observed.exhausted = { name: error.name, attempts: error.attempts };
+  }
+
+  // …and the count when the node's **deadline** ends the loop mid-backoff: what
+  // the item did, not what its policy allowed. One real attempt was made against
+  // the target here, and a trace saying six would report a run that never
+  // happened (grammar 9.2 bounds the node, and `context.signal` is its clock).
+  const controller = new AbortController();
+  const aborting = descriptor({
+    onItemError: { retry: { max: 5, backoffMs: 200, multiplier: 1, jitter: false } },
+    routes: [route({ run: async () => { throw new Error("never"); } })],
+  });
+  setTimeout(() => controller.abort(new Error("the node's budget ran out")), 50);
+  try {
+    await runtime.runMap(aborting, runtime.mapPlan(aborting, viewOf([{ at: 0 }])), {
+      ...context,
+      signal: controller.signal,
+    });
+    observed.abortedMidBackoff = null;
+  } catch (error) {
+    observed.abortedMidBackoff = {
+      attempts: error.attempts,
+      recorded: error.dispatches[0].attempts,
+    };
   }
 }
 
@@ -361,8 +394,8 @@ const observed = {};
 // --- What a detached delivery carries to its sink (grammar 9.4, PRD 5.6) ----
 //
 // The key is derived for every dispatch and recorded in the trace either way, so
-// nothing about a run says whether it was ever *delivered*. These are the two
-// wire forms a sink can be reached by.
+// nothing about a run says whether it was ever *delivered*. These are the three
+// surfaces grammar 9.4 fixes, one per binding kind a `tool.*` can be bound by.
 {
   const site = { execution: { id: "exec_gate", session_key: "" }, path: ["fan/0/1"], idempotencyKey: "exec_gate/fan/0/1" };
   const keyed = runtime.delivering(context, site);
@@ -394,13 +427,16 @@ const observed = {};
   } finally {
     globalThis.fetch = realFetch;
   }
-  observed.deliveredHeaders = sent.map((one) => one.headers["idempotency-key"] ?? one.headers["Idempotency-Key"] ?? null);
+  // The name reaches the wire as grammar 9.4 spells it, not merely as some
+  // case-fold of it, so the read is by the exact key.
+  observed.deliveredHeaders = sent.map((one) => one.headers["Idempotency-Key"] ?? null);
 
   // The subprocess form: the environment, because `args:` is the author's own
-  // command line.
+  // command line. `IDEMPOTENCY_KEY` is the name grammar 9.4 fixes, and the shell
+  // reads it by that name and no other.
   const exec = {
     command: ["sh"],
-    args: [["-c"], ["printf '%s' \"${AGENT_COMPOSE_IDEMPOTENCY_KEY-}\""]],
+    args: [["-c"], ["printf '%s' \"${IDEMPOTENCY_KEY-}\""]],
     env: [],
     expectExit: [0],
     decoding: { envelope: [], decoded: [], raw: "out", empty: false },
@@ -415,16 +451,38 @@ const observed = {};
         keyed,
       )
     ).out,
+    // `environmentName` spells an input field by upper-casing it, so a target
+    // declaring a field called `idempotency_key` names this same variable. The
+    // delivery wins that collision: grammar 9.4 says the key is never part of
+    // the declared input schema, and a sink with nothing to dedupe on is the
+    // failure the key exists to prevent.
+    collided: (await runtime.runExec(exec, { idempotency_key: "an input field" }, keyed)).out,
   };
+
+  // The host-function form: the `idempotency_key` field of the invocation
+  // context, which is the surface grammar 9.4 fixes for a `function:` binding —
+  // and the whole of what a host implementation has to dedupe on.
+  const seen = [];
+  runtime.registerFunction("sink", async (args, invocation) => {
+    seen.push(invocation.idempotency_key ?? null);
+    return { receipt: "ok" };
+  });
+  await runtime.callFunction("sink", { text: "a1" }, keyed);
+  await runtime.callFunction("sink", { text: "a1" }, context);
+  observed.deliveredContext = seen;
 }
 
-// --- The node-wide bound, and what a detached delivery does to it -----------
+// --- The node-wide bound covers a detached delivery too ---------------------
 //
-// Pinned rather than asserted as correct: grammar 8.6 rule 1 makes
-// `max_concurrency` node-wide and Decision D94 says a detached dispatch may not
-// delay the flow instance, and the two cannot both hold of one counter. See the
-// `a-detached-dispatch-is-bounded-by-its-own-route` row in `codegen::graph`'s
-// ledger — this is the number that row's reading really produces.
+// `max_concurrency` is an **admission** bound over every in-flight dispatch,
+// detached included (grammar 8.6's key table, D28): a detached delivery waits
+// for a node permit to start, so a map declaring 2 beside a detached route
+// bounded at 2 still has at most 2 calls in flight rather than 4. What D94 keeps
+// is the other half — the join never waits on the outcome — which the section
+// above pins by other means.
+//
+// Every dispatch here is *watched*, so the peak is over the joined and the
+// detached together, and half of the six items take the detached route.
 {
   let live = 0;
   let peak = 0;
@@ -450,10 +508,49 @@ const observed = {};
   });
   const items = [0, 1, 2, 3, 4, 5].map((at) => ({ at, kind: at % 2 === 0 ? "joined" : "away" }));
   await runtime.runMap(map, runtime.mapPlan(map, viewOf(items)), context);
-  // The detached deliveries are still in flight when the join returns, which is
-  // the whole point of them — so the peak is read after they have finished.
-  await sleep(200);
-  observed.detachedBound = { declared: 2, peak };
+  // The detached deliveries can still be in flight when the join returns — that
+  // is what the section above pins — so the peak is read after they have all
+  // finished, because every one of them is what this bound is over.
+  await sleep(400);
+
+  // The hazard admission introduces, and the answer to it: at a bound of 1 a
+  // detached delivery cannot start until the joined instance ahead of it has
+  // released the permit, which is after the map node has already returned. It
+  // still runs. A delivery that a bound merely *delayed* past the join would be
+  // a lost message if it were dropped there.
+  const order = [];
+  const queued = descriptor({
+    maxConcurrency: 1,
+    routeBy: "kind",
+    routes: [
+      route({
+        tag: "joined",
+        run: async () => {
+          await sleep(40);
+          order.push("joined");
+          return { output: { result: "0" } };
+        },
+      }),
+    ],
+    fallback: route({
+      tag: "default",
+      detach: true,
+      target: "tool.sink",
+      writes: [],
+      run: async () => {
+        // Long enough that the map node's own return is not racing it inside one
+        // microtask queue: the join is finished, and this has not started.
+        await sleep(40);
+        order.push("delivered");
+        return { output: {} };
+      },
+    }),
+  });
+  const pair = [{ at: 0, kind: "joined" }, { at: 1, kind: "away" }];
+  await runtime.runMap(queued, runtime.mapPlan(queued, viewOf(pair)), context);
+  order.push("returned");
+  await sleep(100);
+  observed.detachedBound = { declared: 2, peak, queuedThenDelivered: order };
 }
 
 // --- Grammar 9.3 level 1, and D79's outermost-wins --------------------------

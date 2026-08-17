@@ -3007,8 +3007,9 @@ fn each_traversal_of_a_map_delivers_its_detached_sink_a_key_of_its_own() {
         scratch.path(),
         "record-audit",
         // What the sink was handed, one line per delivery: the grammar 9.4 key,
-        // out of the environment the runtime put it in.
-        "printf '%s\\n' \"$AGENT_COMPOSE_IDEMPOTENCY_KEY\" >> \"$AUDIT_LOG\"\nprintf 'logged'\n",
+        // out of the `IDEMPOTENCY_KEY` variable that section's delivery surface
+        // says an `exec:`-bound target receives it in.
+        "printf '%s\\n' \"$IDEMPOTENCY_KEY\" >> \"$AUDIT_LOG\"\nprintf 'logged'\n",
     );
 
     let mut environment = harness::environment(&provider);
@@ -3072,6 +3073,135 @@ fn each_traversal_of_a_map_delivers_its_detached_sink_a_key_of_its_own() {
         delivered, keys,
         "each delivery carried its own dispatch's key, which is what a sink \
          dedupes on (PRD 5.6, grammar 9.4)"
+    );
+}
+
+/// A fan-out its own `on_error:` absorbed still says what it dispatched
+/// (grammar 8.6 rule 10, PRD 5.3, 5.6).
+///
+/// This is the `fail` half of rule 10's idiom — "retry each item, and if one
+/// still fails, skip the fan-out" — and it is where a map node's record is worth
+/// the most and easiest to lose: the node produced no answer, so everything it
+/// knew has to travel out on the failure or not at all. The items that did run
+/// are the reason it matters. One of them wrote a patch that the skip then
+/// discarded, and one of them was **delivered to a sink**: the audit line is on
+/// disk, the enqueue is not undone by the node being skipped, and the dispatch
+/// record with its idempotency key is the only place a reader learns that it
+/// happened at all.
+///
+/// The failing item says `failed` rather than `skipped`, because `on_item_error`
+/// here is the default `fail` and nothing skipped it — what was skipped is the
+/// map node.
+#[test]
+fn a_fan_out_absorbed_by_its_own_on_error_still_records_every_dispatch() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({
+                "findings": [
+                    { "kind": "auto_fixable", "file": "a.rs", "hint": "rename it" },
+                    { "kind": "needs_human", "summary": "look at b.rs", "severity": "high" },
+                    { "kind": "auto_fixable", "file": "c.rs", "hint": "widen it" },
+                ],
+            })),
+        ),
+        Script::new(HAIKU, Outcome::structured(json!({ "patch": "patch-a" }))).matching("a.rs"),
+        // `min_length: 1` on `agent.fixer`'s `patch` refuses this, so item 2
+        // fails — and with `on_item_error` at its default `fail`, the map node
+        // fails with it.
+        Script::new(HAIKU, Outcome::structured(json!({ "patch": "" }))).matching("c.rs"),
+    ]);
+
+    let scratch = harness::Scratch::new("absorb");
+    let log = scratch.path().join("audit.log");
+    harness::shim(
+        scratch.path(),
+        "record-audit",
+        "printf '%s\\n' \"$IDEMPOTENCY_KEY\" >> \"$AUDIT_LOG\"\nprintf 'logged'\n",
+    );
+
+    let mut environment = harness::environment(&provider);
+    environment.push(("AUDIT_LOG".to_string(), log.display().to_string()));
+    environment.push((
+        "PATH".to_string(),
+        format!(
+            "{}:{}",
+            scratch.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        ),
+    ));
+
+    let Some(run) = harness::invoke_with(
+        "fanout",
+        "flow.absorb",
+        &json!({ "report": "the build is red" }),
+        &environment,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(
+        run.outputs()["drafts"],
+        json!([]),
+        "the map node was skipped, so none of its writes landed — including the \
+         one item that produced a patch (grammar 9.2)"
+    );
+
+    let entry = run.entries("fan")[0].clone();
+    assert_eq!(
+        entry["outcome"],
+        json!("skipped"),
+        "the map node's own `on_error: skip` absorbed the failed item: {entry}"
+    );
+    let records = entry["dispatches"]
+        .as_array()
+        .unwrap_or_else(|| {
+            panic!("a fan-out that failed still records what it dispatched: {entry}")
+        })
+        .clone();
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| (
+                record["index"].as_u64().expect("an index"),
+                record["route"].as_str().expect("a route").to_string(),
+                record["outcome"].as_str().expect("an outcome").to_string(),
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (0, "auto_fixable".to_string(), "completed".to_string()),
+            (1, "needs_human".to_string(), "detached".to_string()),
+            (2, "auto_fixable".to_string(), "failed".to_string()),
+        ],
+        "every item is accounted for, in source-item order, and the one that \
+         failed says so: {entry}"
+    );
+    assert!(
+        entry["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("item 2")),
+        "…and the node's own error names the item that failed it: {entry}"
+    );
+
+    // The effect that outlived the skip. A detached delivery is issued at
+    // dispatch and never unwound, so the record and its key are what tell a
+    // reader the sink was written to (PRD 5.6, grammar 9.4).
+    let key = records[1]["idempotencyKey"]
+        .as_str()
+        .expect("the detached dispatch carries its key")
+        .to_string();
+    assert!(
+        key.ends_with("/fan/0/1"),
+        "the key names the dispatch site: {key}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&log)
+            .expect("the detached sink ran")
+            .lines()
+            .collect::<Vec<_>>(),
+        [key.as_str()],
+        "the sink was really delivered, under exactly the key the record shows"
     );
 }
 

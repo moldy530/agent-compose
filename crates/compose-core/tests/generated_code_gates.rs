@@ -693,9 +693,23 @@ fn the_fan_out_runtime_bounds_orders_and_resolves_every_dispatch() {
     );
     // …and under `fail`, the item reported is the lowest-indexed failure rather
     // than the first one in time: item 3 failed immediately and item 1 waited.
+    // The failure carries the whole fan-out's account with it, because this is
+    // the path where the map node is about to be absorbed by its own `on_error:`
+    // and the items that ran already had their effects (PRD 5.3, 5.6). The two
+    // that failed say so: under `fail` nothing skipped them.
     assert_eq!(
         observed["failed"],
-        serde_json::json!({ "name": "ItemFailure", "index": 1, "attempts": 1 })
+        serde_json::json!({
+            "name": "ItemFailure",
+            "index": 1,
+            "attempts": 1,
+            "dispatches": [
+                [0, "completed"],
+                [1, "failed"],
+                [2, "completed"],
+                [3, "failed"]
+            ],
+        })
     );
     // A parameterized retry re-executes the whole instance…
     assert_eq!(
@@ -706,6 +720,14 @@ fn the_fan_out_runtime_bounds_orders_and_resolves_every_dispatch() {
     assert_eq!(
         observed["exhausted"],
         serde_json::json!({ "name": "ItemFailure", "attempts": 2 })
+    );
+    // …but a deadline that ends the loop mid-backoff reports what the item
+    // *did*, not what its policy allowed: `max: 5` and one attempt made, because
+    // the node's signal aborted the first backoff (grammar 9.2). Both numbers a
+    // reader sees are that one — the failure's, and the dispatch record's.
+    assert_eq!(
+        observed["abortedMidBackoff"],
+        serde_json::json!({ "attempts": 1, "recorded": 1 })
     );
 
     // Decision D94: the join counted the detached dispatch the moment it was
@@ -773,10 +795,12 @@ fn the_fan_out_runtime_bounds_orders_and_resolves_every_dispatch() {
     );
 
     // PRD 5.6's replay interaction, on the wire: what a **detached** delivery
-    // hands its sink, in each of the two forms a `tool.*` can be reached by. The
-    // joined dispatch beside it carries nothing, because grammar 9.4 fixes the
-    // carriers at two and a joined instance is neither; and a binding that
-    // declares the name itself wins, as it does for `content-type`.
+    // hands its sink, on each of the three surfaces grammar 9.4 fixes — the
+    // `Idempotency-Key` header, the `IDEMPOTENCY_KEY` variable, the
+    // `idempotency_key` field of a host function's invocation context. The
+    // joined dispatch beside each carries nothing, because a key on a call whose
+    // outcome *is* observed would dedupe an effect meant to repeat; and a
+    // binding that declares the name itself wins, as it does for `content-type`.
     assert_eq!(
         observed["deliveredHeaders"],
         serde_json::json!(["exec_gate/fan/0/1", null, "mine"])
@@ -787,17 +811,32 @@ fn the_fan_out_runtime_bounds_orders_and_resolves_every_dispatch() {
             "detached": "exec_gate/fan/0/1",
             "joined": "",
             "declared": "mine",
+            // An input field spelling the same variable is the one thing
+            // grammar 9.4 says the key is never part of, so the delivery wins.
+            "collided": "exec_gate/fan/0/1",
         })
     );
+    assert_eq!(
+        observed["deliveredContext"],
+        serde_json::json!(["exec_gate/fan/0/1", null])
+    );
 
-    // The number the `a-detached-dispatch-is-bounded-by-its-own-route` row in
-    // `codegen::graph`'s ledger really produces: a detached delivery takes its
-    // route's permit and never the node's, so the two bounds add up. Pinned so
-    // that a change to the reading — or the PRD settling which of grammar 8.6
-    // rule 1 and Decision D94 is normative — is a deliberate edit here.
+    // Grammar 8.6's key table: `max_concurrency` is a node-wide **admission**
+    // bound over every in-flight dispatch, detached included. Six items, half of
+    // them down a detached route bounded at 2 of its own — and still never more
+    // than the map's own 2 in flight, which is the whole promise a composition
+    // makes to a rate-limited provider.
+    // …and the hazard that comes with it: at a bound of 1 the delivery cannot be
+    // admitted until the joined instance ahead of it finishes, which is after
+    // the map node has returned. It is still delivered — a message a bound
+    // merely delayed past the join would otherwise be a message lost (D94).
     assert_eq!(
         observed["detachedBound"],
-        serde_json::json!({ "declared": 2, "peak": 4 })
+        serde_json::json!({
+            "declared": 2,
+            "peak": 2,
+            "queuedThenDelivered": ["joined", "returned", "delivered"],
+        })
     );
 
     // Grammar 9.3 level 1: the outermost instantiation site wins a field

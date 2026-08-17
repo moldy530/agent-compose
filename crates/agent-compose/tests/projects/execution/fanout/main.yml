@@ -29,7 +29,11 @@
 #     declares **no** `default:` and so starts unset (Decision D78);
 #   * `flow.recheck` — a map inside a **bounded cycle** with a detached sink, so
 #     one node dispatches twice in one flow instance and grammar 9.4's traversal
-#     ordinal is what keeps the two deliveries' keys apart.
+#     ordinal is what keeps the two deliveries' keys apart;
+#   * `flow.absorb` — the `fail` half of grammar 8.6 rule 10's idiom: one item
+#     fails, the map node fails with it, and the node's own `on_error: skip`
+#     absorbs the fan-out — which is where a fan-out's record of what it
+#     dispatched matters most and is easiest to lose.
 version: "0.1"
 
 state:
@@ -283,10 +287,6 @@ agent.roller:
       type: string
       min_length: 1
 
-# A sink route's target: a queue reached deterministically, waited on by the join
-# like any other route (PRD 5.6 — `detach: true` is the only opt-out). Its
-# `output:` declares exactly one string property, so grammar 6.1's `tool.*`
-# exception takes trimmed stdout whole.
 agent.tallier:
   description: Scores one task, and names the task that is winning so far.
   model: model.fast
@@ -306,6 +306,10 @@ agent.tallier:
       type: string
       min_length: 1
 
+# A sink route's target: a queue reached deterministically, waited on by the join
+# like any other route (PRD 5.6 — `detach: true` is the only opt-out). Its
+# `output:` declares exactly one string property, so grammar 6.1's `tool.*`
+# exception takes trimmed stdout whole.
 tool.review_queue:
   description: Enqueue a finding for a human to look at.
   input:
@@ -653,6 +657,56 @@ flow.recheck:
     # (grammar 7.6 P1), so the guard counts what this pass appended.
     - { from: fan, to: sweep, when: "size(state.drafts) < 2", max_iterations: 2 }
     - { from: fan, to: end, else: true }
+
+flow.absorb:
+  description: Fan out, let one item fail, and absorb the fan-out with the map node's own `on_error:`.
+  inputs:
+    report:
+      type: string
+      min_length: 1
+  outputs:
+    drafts:
+      type: array
+      max_items: 40
+      items: { type: string }
+  nodes:
+    sweep:
+      agent: agent.triage
+      input:
+        report: "input.report"
+
+    # Grammar 8.6 rule 10's own idiom, in its `fail` half: `on_item_error`
+    # defaults to `fail`, so one failed item fails the map node, and the node's
+    # `on_error: skip` is what absorbs the fan-out. The items that did run had
+    # their effects either way — one wrote, one was delivered to a sink — so the
+    # dispatch record is the only account of them and it has to survive the
+    # failure (PRD 5.3, 5.6).
+    fan:
+      map:
+        over: sweep.output.findings
+        as: finding
+        route_by: kind
+        max_concurrency: 4
+        routes:
+          auto_fixable:
+            node: agent.fixer
+            input:
+              file: "finding.file"
+              hint: "finding.hint"
+            writes:
+              patch: drafts
+          needs_human:
+            node: tool.audit_log
+            detach: true
+            input:
+              line: "finding.summary"
+      on_error: skip
+  edges:
+    - { from: start, to: sweep }
+    - { from: sweep, to: fan }
+    # Unconditional, because a skipped node has no result for a guard to read
+    # and `skip` still routes (grammar 7.3, 9.2, Decision D97).
+    - { from: fan, to: end }
 
 flow.continue:
   description: Open a conversation and hand it to a subflow that continues it.
