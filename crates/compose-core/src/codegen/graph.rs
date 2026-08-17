@@ -82,6 +82,18 @@ use super::names::{self, Names};
 use super::policy::{self, Strategy};
 use super::{cel, schema};
 
+/// The canonical path of the shape every declared state channel is read
+/// through.
+///
+/// Not `state.shape`: that is the path a channel **named** `shape` already owns
+/// (`src/schemas.ts` exports its Zod under it), and one key for two declarations
+/// is one *name* for two declarations — the collision this registry exists to
+/// make impossible rather than unlikely. The `$` marks the path as the emitter's
+/// own; grammar 2.1's identifier cannot open with one, and [`names::camel`]
+/// drops it, so the emitted name is `stateShape` exactly as before unless a
+/// composition really does declare a channel called `shape`.
+const STATE_SHAPE: &str = "$state.shape";
+
 /// Every name `src/graph.ts` declares, added to the shared registry.
 ///
 /// Declared in the IR's own canonical order — definitions by address, then each
@@ -110,7 +122,9 @@ pub fn declare(names: &mut Names, ir: &Ir) {
             DefinitionBody::Store(_) => {}
         }
     }
-    names.declare("state.shape");
+    // A key of the emitter's own rather than `state.shape`, which a channel
+    // called `shape` already owns — see [`STATE_SHAPE`].
+    names.declare(STATE_SHAPE);
     for (address, definition) in &ir.definitions {
         if let DefinitionBody::Flow(flow) = &definition.body {
             for node in &flow.nodes {
@@ -207,7 +221,7 @@ fn shapes(ir: &Ir, names: &Names, surfaces: &[schema::Surface<'_>]) -> String {
     ));
     text.push_str(&format!(
         "const {}: runtime.Shape = {{\n  properties: {{\n",
-        names.value("state.shape")
+        names.value(STATE_SHAPE)
     ));
     for (path, channel) in schema::channels(ir) {
         let _ = path;
@@ -656,7 +670,7 @@ fn flow(
     imported: &mut Vec<String>,
 ) -> String {
     let mut text = format!("\n// --- {address} ---\n");
-    let state_shape = names.value("state.shape");
+    let state_shape = names.value(STATE_SHAPE);
     let input_shape = names.value(&format!("{address}.shape"));
 
     if needs_start_router(flow) {
@@ -2341,6 +2355,42 @@ tool.run:
             emitted.contains("export async function runFlow("),
             "{emitted}"
         );
+    }
+
+    /// A channel called `shape` owns `state.shape`, and the shape table this
+    /// module declares takes a name of its own rather than that one.
+    ///
+    /// The registry exists so a collision is impossible rather than unlikely
+    /// (`codegen::names`), and two declarations sharing one *path* would defeat
+    /// it from the inside: one name, two `const`s, and a project that does not
+    /// compile the day `src/graph.ts` imports a state channel's schema. The
+    /// suffix is the registry's ordinary disambiguation, and the composition's
+    /// own surface keeps the plain spelling.
+    #[test]
+    fn a_channel_called_shape_does_not_share_a_name_with_the_shape_table() {
+        let ir = ir_of("version: \"0.1\"\nstate:\n  shape: { type: string, default: \"\" }\n");
+        let mut names = Names::of(&ir);
+        declare(&mut names, &ir);
+        assert_eq!(names.value("state.shape"), "stateShape");
+        assert_eq!(names.value(STATE_SHAPE), "stateShape_2");
+
+        let emitted = module(&ir, &names).contents;
+        assert!(
+            emitted.contains("const stateShape_2: runtime.Shape = {"),
+            "{emitted}"
+        );
+        assert_eq!(
+            emitted.matches("const stateShape:").count(),
+            0,
+            "the name `src/schemas.ts` exports the channel's Zod under is not \
+             redeclared here:\n{emitted}"
+        );
+
+        // The common case is untouched: no channel named `shape`, plain name.
+        let plain = ir_of("version: \"0.1\"\nstate:\n  draft: { type: string, default: \"\" }\n");
+        let mut names = Names::of(&plain);
+        declare(&mut names, &plain);
+        assert_eq!(names.value(STATE_SHAPE), "stateShape");
     }
 
     /// Every host-registered function is listed for the README, which is where
