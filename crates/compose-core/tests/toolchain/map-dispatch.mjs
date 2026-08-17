@@ -1020,6 +1020,146 @@ const observed = {};
   };
 }
 
+// --- A subflow instance is on the instantiating node's clock (grammar 9.2) --
+//
+// A subgraph is the one activity a `timeout:` can really **stop**. Everything
+// else a node runs is cooperative (`fetch`, `spawn`) or uncancellable (a host
+// function), so `runActivity` races the budget and leaves the work to finish
+// into a discarded value — but an instance nothing aborted is a whole graph, and
+// it would carry on to quiescence after the node that started it had already
+// failed: running every node it had left, issuing every effect those were going
+// to issue, and holding the map node's admission permit for the whole of it.
+//
+// Both halves are driven, because the fix is only right if it stops at the
+// boundary D94 draws. A `flow:` node's instance stops; a **detached** dispatch's
+// runs on, because its context carries the signal nothing aborts.
+{
+  /**
+   * A two-node compiled subgraph that reports which of its nodes ran, and the
+   * `runtime.SubflowBinding` a `flow:` node reaches it through — exactly the
+   * shape `codegen::graph` emits, `outputKeys` aside.
+   */
+  const subflow = (effects, firstNodeMs) => {
+    const compiled = new StateGraph(
+      Annotation.Root({
+        $run: Annotation({ reducer: runtime.mergeRun, default: runtime.emptyRun }),
+        note: Annotation({
+          reducer: (left, right) => runtime.setReduce(left, right),
+          default: () => "",
+        }),
+      }),
+    )
+      .addNode("one", async () => {
+        // Deliberately deaf to any signal: what is asserted is that the
+        // *instance* stopped, not that this activity noticed.
+        await sleep(firstNodeMs);
+        effects.push("one");
+        return { note: "one" };
+      })
+      .addNode("two", async () => {
+        effects.push("two");
+        return { note: "two" };
+      })
+      .addEdge("__start__", "one")
+      .addEdge("one", "two")
+      .addEdge("two", "__end__")
+      .compile();
+    return {
+      address: "flow.worker",
+      outputs: ["note"],
+      recursionLimit: 25,
+      stream: (initial, options) => compiled.stream(initial, { ...options, streamMode: "values" }),
+    };
+  };
+
+  // A `flow:` node whose budget runs out while the instance's first node is
+  // still working. Its `run` is what `codegen::graph` writes for `flow:`.
+  const stopped = [];
+  const held = subflow(stopped, 300);
+  const outer = {
+    flow: "flow.probe",
+    node: "sub",
+    policy: { timeoutMs: 120, onError: "skip" },
+    shapes: { input: { properties: {} }, state: { properties: {} }, output: "any" },
+    input: () => ({}),
+    run: async (input, context, view) =>
+      runtime.runSubflow(held, {
+        inputs: input,
+        execution: view.run.execution,
+        path: runtime.instancePath(view, "sub"),
+        signal: context.signal,
+      }),
+    writes: [],
+    edges: [{ to: "next" }],
+  };
+  const entry = entryOf(
+    await runtime.runNode(outer, {
+      $run: { ...runtime.emptyRun(), execution: { id: "exec_clock", session_key: "" } },
+    }),
+  );
+  const atReturn = [...stopped];
+
+  // …and the counterpart. A detached dispatch to a `flow.*` is off the node's
+  // clock (D94): its delivery context carries the signal nothing aborts, so the
+  // instance runs to quiescence after the map node has long since given up. A
+  // joined item beside it is what makes the node's budget expire at all — a
+  // detached-only map returns the moment it has issued, and a deadline nothing
+  // reached would prove nothing about what survives one.
+  const detached = [];
+  const sink = subflow(detached, 200);
+  const away = descriptor({
+    node: "away",
+    maxConcurrency: 2,
+    onItemError: "skip",
+    routeBy: "kind",
+    routes: [
+      route({
+        tag: "joined",
+        writes: [],
+        run: async (_input, context) => {
+          await naps(400, context.signal);
+          return { output: {} };
+        },
+      }),
+      route({
+        tag: "away",
+        detach: true,
+        target: "flow.worker",
+        writes: [],
+        run: async (input, context, site) =>
+          runtime.runSubflow(sink, {
+            inputs: input,
+            execution: site.execution,
+            path: site.path,
+            signal: context.signal,
+          }),
+      }),
+    ],
+  });
+  const fired = mapNode(away, [{ kind: "away" }, { kind: "joined" }], {
+    policy: { timeoutMs: 60, onError: "skip" },
+    id: "exec_clock_detached",
+  });
+  const dispatch = entryOf(await runtime.runNode(fired.descriptor, fired.state));
+
+  // Long enough for every node of both instances to have run had nothing
+  // stopped them.
+  await sleep(600);
+  observed.subflowOnTheNodesClock = {
+    outcome: entry.outcome,
+    timedOut: String(entry.error).includes("timed out"),
+    // Empty at the node's deadline — the first inner node is still working —
+    // and holding only that node once it finishes. `two` is the one that says
+    // whether the instance stopped: it had nothing to wait for.
+    atReturn,
+    effects: stopped,
+    detached: {
+      outcome: dispatch.outcome,
+      effects: detached,
+    },
+  };
+}
+
 // --- A variant tagged `default` is not the catch-all (grammar 8.6 rules 2, 4)
 //
 // Routes are keyed by variant tag and `default:` is a map-block key beside them,

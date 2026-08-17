@@ -71,6 +71,7 @@
 //! | id | where | which way | why it is left |
 //! |---|---|---|---|
 //! | `a-detached-dispatch-is-keyed-and-nothing-else-is` | which calls carry the idempotency key of grammar 9.4, and what wins when a binding names the same slot | only a **detached** dispatch to a `tool.*`, and the binding's own `headers:`/`env:` sit *over* the delivery while a `tool.*`'s input fields sit *under* it | grammar 9.4 fixes the string (D104) and now the surface — `Idempotency-Key`, `IDEMPOTENCY_KEY`, `idempotency_key` — leaving two things it does not say. *Which calls*: an `agent.*` has no delivery slot on the provider wire, and keying it would key the tool calls its own loop makes, which are distinct effects meant to repeat; a `flow.*` is handed the dispatch site itself, so an effect inside the instance derives its own key from the instance path rather than reusing the boundary's; a **joined** dispatch has an observed outcome, which is what dedupe is a substitute for. *What wins*: a binding's declared `headers:`/`env:` is the author configuring their own wire, so it layers over the delivery exactly as it layers over the emitted `content-type`; an `exec:` target's input fields layer under it, because an input field spelling `idempotency_key` is precisely what grammar 9.4 says the key is never part of, and losing the key there would lose the one thing a sink dedupes on |
+//! | `a-subgraph-is-the-one-activity-a-deadline-stops` | what a node's `timeout:` does to the work it was waiting on | a `flow:` node's instance — and a joined `map` dispatch's — is handed that node's `context.signal` and stops advancing; every other activity is raced and left running | grammar 9.2 bounds **one node execution** and says nothing about what becomes of the work, and `runtime.runActivity` records why that is usually all a deadline can mean: a host function cannot be unscheduled, and a raced promise is merely abandoned. A subgraph is not in that position — it is a run of its own, and LangGraph's `RunnableConfig.signal` stops the Pregel loop scheduling supersteps — so here the choice is real rather than forced. It is left the **stopping** way: an instance that runs on issues every effect its remaining nodes were going to issue *after* the node that started it has already failed, and holds the map node's admission permit (`runtime.Admission`) for the whole of it, so a later execution of that node queues behind work its own budget was supposed to have ended. What is still not stopped is the one activity already in flight *inside* the instance, which is the abandoned-host-function case again one level down. A **detached** dispatch keeps the other reading deliberately: its signal is the one nothing aborts, because Decision D94 says the fan-out never waited for it |
 //! | `a-dispatch-runs-inside-the-map-nodes-task` | `map` dispatch and `flow:` instantiation | the instances run **in the node's task**, and a subflow is a separate run of its own compiled graph (PRD 9.17) | a `Send` schedules a node of the **parent** graph, and seven of grammar 8.6's own rules are then unstateable. A Send'd task reads the packet as its whole input and writes the **parent's** channels, so a dispatched `flow.*` cannot hold its own channel values (grammar 10.1, 7.6.4 clause 3) and its instances share the caller's `messages`, which grammar 10.4 and Decision D105 make an unwaivable module boundary. `detach: true` is *resolved at dispatch* (D94) and a superstep barrier waits for every task it scheduled. A dispatch of **zero** instances must complete and fire its edges (rule 6), while `goto: []` retires the branch. `max_concurrency` is a per-node admission bound routes may tighten (D28) and LangGraph's `maxConcurrency` is a run-level config the Pregel runner applies to every task of a superstep. `on_item_error`'s parameterized retry, and the map's own `on_error:` absorbing an exhausted item (rule 10), are policies over an *item* that a node-level `retryPolicy` cannot express — the same mismatch `runtime.runActivity` records for grammar 9. The map's own outgoing edges would be evaluated once per instance, over N different local states, and not at all when N is 0. And LangGraph orders a step's writes by `task.path`, where every `__pregel_pull` sorts before every `__pregel_push`, so a map's writes would land after *every* ordinary node's rather than in the map node's own place in clause 1's node-id order. Index-tagging survives the change: what the map writes is one `runtime.OrderedWrites` per channel, in source-item order, which every emitted reducer unpacks |
 //!
 //! What the row does **not** trade away is grammar 7.6's two properties. P1
@@ -1395,7 +1396,7 @@ fn activity(
             policy,
         } => {
             let binding = names.value(&format!("{}.binding", flow.value));
-            let mut text = String::from("  run: async (input, _context, view) =>\n");
+            let mut text = String::from("  run: async (input, context, view) =>\n");
             text.push_str(&format!("    runtime.runSubflow({binding}, {{\n"));
             text.push_str("      inputs: input as Record<string, unknown>,\n");
             text.push_str("      execution: view.run.execution,\n");
@@ -1403,6 +1404,11 @@ fn activity(
                 "      path: runtime.instancePath(view, {}),\n",
                 names::string(id)
             ));
+            // This node's own deadline, inside the boundary: a subgraph is the
+            // one activity a `timeout:` can stop, and an instance nothing
+            // aborted runs to quiescence after the node has already failed
+            // (grammar 9.2, and see `runtime.runSubflow`).
+            text.push_str("      signal: context.signal,\n");
             // Grammar 9.3 level 1, with D79's outermost-wins: what already
             // reached this instance beats what this site declares, per field.
             text.push_str(&format!(
@@ -1835,12 +1841,18 @@ fn dispatch_run(
             // policy with **level 1 absent** — a `map` has no `policy:` key — so
             // no override crosses this boundary, and its history is fresh and
             // discarded (D105), so no `history:` does either.
+            //
+            // The dispatch's clock does cross: `context.signal` is the map
+            // node's on a joined dispatch, so its `timeout:` ends the instance
+            // rather than only the wait for it, and the delivery's own — which
+            // nothing aborts — on a detached one (D94, `runtime.runSubflow`).
             format!(
-                "{indent}run: async (input, _context, site) =>\n{indent}  \
+                "{indent}run: async (input, context, site) =>\n{indent}  \
                  runtime.runSubflow({binding}, {{\n{indent}    \
                  inputs: input as Record<string, unknown>,\n{indent}    \
                  execution: site.execution,\n{indent}    \
-                 path: site.path,\n{indent}  \
+                 path: site.path,\n{indent}    \
+                 signal: context.signal,\n{indent}  \
                  }}),\n"
             )
         }

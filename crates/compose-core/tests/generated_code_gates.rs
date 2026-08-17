@@ -40,7 +40,9 @@
 //!    survives the **channel** its reducer belongs to and not only the reducer,
 //!    and that the ordering holds under a completion order that is the reverse
 //!    of the source's. A happy-path run produces the same outputs with every one
-//!    of them broken.
+//!    of them broken. It also decides what a node's own `timeout:` does to a
+//!    **subgraph** (grammar 9.2) — the one activity a deadline can stop rather
+//!    than merely stop waiting for.
 //! 6. **Schema-lowering agreement** — the corpus under
 //!    `tests/fixtures/schema-lowering/` is validated twice: against the JSON
 //!    Schema this compiler lowers to (Rust, the `jsonschema` crate) and against
@@ -633,7 +635,7 @@ fn the_run_channel_folds_a_steps_contributions_in_canonical_order() {
 ///   * **that the ordering survives a completion order that is the reverse of
 ///     the source's**, at every one of the three reduce policies.
 ///
-/// Four more are only reachable once the map node's **own policy** is in play,
+/// Five more are only reachable once the map node's **own policy** is in play,
 /// which is every compiled map: grammar 9.3 level 3 puts a `timeout:` and a
 /// `retry:` on every node a `defaults:` block covers, and the emitted
 /// `examples/triage-fanout` carries both on its `dispatch` node. The runner
@@ -652,7 +654,14 @@ fn the_run_channel_folds_a_steps_contributions_in_canonical_order() {
 ///     traversal, or the node's own `retry:`, reach twice the declared number;
 ///   * **a dispatched `flow.*` that failed keeps its own trace** (grammar 8.5),
 ///     which under `on_item_error: skip` is the only account of it there will
-///     ever be, because the run then succeeds.
+///     ever be, because the run then succeeds;
+///   * **a subgraph is the one activity the budget can stop** (grammar 9.2). An
+///     instance is a run of its own, so the node's signal reaches its Pregel
+///     loop and it stops advancing — where an instance nothing aborted would run
+///     every node it had left *after* the node that started it had failed. The
+///     detached counterpart is asserted beside it, because Decision D94 puts
+///     that delivery off the node's clock and the same signal must not cross
+///     there.
 ///
 /// `src/runtime.ts` is a compiler constant, byte-identical in every project this
 /// release builds, so driving it directly is driving what every project runs.
@@ -966,6 +975,31 @@ fn the_fan_out_runtime_bounds_orders_and_resolves_every_dispatch() {
                 "error": "Error: boom",
             }],
             "error": "SubflowFailure: the instance of `flow.worker` did not run to quiescence: Error: boom",
+        })
+    );
+
+    // Grammar 9.2 over a subgraph, which is the one activity a deadline can
+    // really stop. `runActivity` races every other kind and leaves it running,
+    // because a host function cannot be unscheduled — an instance can: it is a
+    // run of its own, and the signal reaches its Pregel loop. So the node's
+    // budget ends the *instance*, not only the node's wait for it: `two` never
+    // ran, and `one` — already in flight, and deaf to any signal on purpose —
+    // finished into a value nobody read, exactly as an abandoned host function
+    // does. Without the signal crossing, `effects` reads `["one", "two"]` and
+    // the instance would have gone on issuing effects, and holding the map
+    // node's admission permit, for as long as it had nodes left.
+    assert_eq!(
+        observed["subflowOnTheNodesClock"],
+        serde_json::json!({
+            "outcome": "skipped",
+            "timedOut": true,
+            "atReturn": [],
+            "effects": ["one"],
+            // …and the boundary the same signal must not cross: a **detached**
+            // dispatch is off the node's clock (D94), so its instance runs to
+            // quiescence after the map node has already given up on the joined
+            // item beside it.
+            "detached": { "outcome": "skipped", "effects": ["one", "two"] },
         })
     );
 

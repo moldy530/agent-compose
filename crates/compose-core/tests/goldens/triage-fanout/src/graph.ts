@@ -578,11 +578,12 @@ const flowTriageNodeEnrich: runtime.NodeDescriptor = {
   input: (roots) => ({
     "report": runtime.toJson(runtime.evaluate("input.report", roots)),
   }),
-  run: async (input, _context, view) =>
+  run: async (input, context, view) =>
     runtime.runSubflow(flowEnrichBinding, {
       inputs: input as Record<string, unknown>,
       execution: view.run.execution,
       path: runtime.instancePath(view, "enrich"),
+      signal: context.signal,
       policy: runtime.instancePolicy(view.run.policy, {
         timeoutMs: 30000,
         onError: "fail",

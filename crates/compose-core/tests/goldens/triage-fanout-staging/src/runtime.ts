@@ -519,6 +519,13 @@ export function backoffFor(policy: RetryPolicy, attempt: number): number {
  * discarded when it arrives. That is the whole of what a timeout can mean here,
  * and the generated `README.md` says so where a host reads about registering
  * one.
+ *
+ * **One activity is an exception**, and it is the one where "keeps running" is a
+ * whole graph rather than a call: a `flow:` node's instance, and a joined `map`
+ * dispatch to a `flow.*`. An instance is a run of its own, so `context.signal`
+ * is handed to it ([`Instantiation.signal`]) and LangGraph stops scheduling its
+ * supersteps — leaving one abandoned activity inside it, exactly as above,
+ * rather than every node the instance had left to run.
  */
 export async function runActivity<T>(
   flow: string,
@@ -2213,11 +2220,17 @@ export function applyWrite(previous: unknown, value: unknown, reduce: Reduce): u
 /**
  * Anything that can be run to quiescence: a compiled flow, or one of them
  * reached as a subflow.
+ *
+ * `signal` is LangGraph's own cancellation key (`RunnableConfig.signal`, which
+ * the Pregel runner races against each superstep), and it is here because a
+ * subgraph is the one activity this runtime can really *stop*: an aborted run
+ * stops scheduling tasks instead of carrying on to quiescence. Who supplies it
+ * is [`Instantiation.signal`].
  */
 export interface Quiescible<S> {
   stream(
     initial: Record<string, unknown>,
-    options: { recursionLimit: number },
+    options: { recursionLimit: number; signal?: AbortSignal },
   ): Promise<AsyncIterable<S>>;
 }
 
@@ -2231,15 +2244,20 @@ export interface Quiescible<S> {
  * of PRD 5.3 with it. Taking the supersteps one at a time keeps every one that
  * did complete, which is what a failure is then reported with. Both callers need
  * that, which is why it is here rather than written twice.
+ *
+ * `signal` is the caller's deadline, when the caller has one: a `flow:` node and
+ * a joined `map` dispatch each run their instance inside a node budget, and a
+ * top-level run has no clock above it to pass. See [`Instantiation.signal`].
  */
 export async function quiesce<S extends { $run: RunChannel }>(
   graph: Quiescible<S>,
   initial: Record<string, unknown>,
   recursionLimit: number,
+  signal?: AbortSignal,
 ): Promise<{ state?: S; error?: unknown }> {
   let state: S | undefined;
   try {
-    const supersteps = await graph.stream(initial, { recursionLimit });
+    const supersteps = await graph.stream(initial, { recursionLimit, signal });
     for await (const superstep of supersteps) {
       // An interrupt is announced as a chunk of its own rather than as a state,
       // and reading it as one would lose the run's.
@@ -2313,6 +2331,26 @@ export interface Instantiation {
   readonly execution: ExecutionIdentity;
   /** Its instance path, for anything nested inside it (grammar 9.4). */
   readonly path: readonly string[];
+  /**
+   * The instantiating node's deadline, which crosses the boundary with it
+   * (grammar 9.2).
+   *
+   * A subgraph is the one activity a `timeout:` can really **stop**. Every other
+   * kind is either cooperative (`fetch` takes a signal, `spawn` is killed) or
+   * uncancellable (a host function), so [`runActivity`] races the budget and the
+   * node fails on time whatever the activity does — but an instance nothing
+   * aborted would run on to quiescence *after* the node that started it had
+   * already failed: issuing every effect its remaining nodes were going to
+   * issue, and holding the [`Admission`] permit a later execution of the same
+   * `map` node has to wait for. LangGraph stops scheduling supersteps when this
+   * aborts, so what is left in flight inside is one abandoned activity rather
+   * than the whole rest of the instance.
+   *
+   * A **detached** dispatch supplies it too, and it is the delivery's own signal
+   * — the one nothing aborts (Decision D94, and see [`runMap`]) — so an instance
+   * reached that way runs to quiescence exactly as its sink does.
+   */
+  readonly signal?: AbortSignal;
   /** Level 1 of grammar 9.3 for every node inside it. */
   readonly policy?: InstancePolicy;
   /**
@@ -2336,6 +2374,11 @@ export interface Instantiation {
  * the caller's graph would share the caller's values instead. Only two things
  * cross the boundary, in each direction: the `inputs:` this instantiation bound,
  * and the `outputs:` read back out of the instance's own channels.
+ *
+ * What crosses beside them is not data but a **clock**: the instantiating node's
+ * deadline ([`Instantiation.signal`]), so a `timeout:` on a `flow:` node — or on
+ * the `map` node a joined dispatch belongs to — ends the instance rather than
+ * only the node's wait for it.
  */
 export async function runSubflow(
   binding: SubflowBinding,
@@ -2353,7 +2396,12 @@ export async function runSubflow(
     ...(instance.history === undefined ? {} : { messages: [...seeded] }),
   };
 
-  const { state, error } = await quiesce(binding, initial, binding.recursionLimit);
+  const { state, error } = await quiesce(
+    binding,
+    initial,
+    binding.recursionLimit,
+    instance.signal,
+  );
   const trace = state?.$run.trace ?? [];
   if (error !== undefined) {
     throw new SubflowFailure(binding.address, "did not run to quiescence", trace, error);
