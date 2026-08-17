@@ -139,6 +139,21 @@ surface, and the specification is what defines it — which left one expression
 implementation under the global name, so the two spellings cannot answer
 differently, and `strings.json` states both.
 
+**The three predicates that have no global spelling**, and `has()` over a value
+with no fields — the gaps that were closed on the *other* side. `matches` is the
+only string predicate CEL's standard definitions give a global overload, so
+`startsWith('abc', 'a')` is `Undeclared reference to 'startsWith'` in the Rust
+column and the compiler's front-end refuses the spelling too; the emitted
+evaluator used to answer `true`. `has(state.patches.goal)` over a list is the
+same shape: the crate errors, the front-end refuses it by type, and the emitted
+evaluator used to answer `false`. Neither is reachable through `validate` +
+`build`, so neither could have bitten anybody — but an evaluator that accepts
+more than the surface is drift pointing the other way (a composition that runs
+and does not validate), which is a claim `compose_core::codegen::cel`'s header
+makes and this corpus has to be able to keep. `strings.json` states the three
+global spellings and `collections.json` the two `has()` refusals, all five as
+`error: true` cases both columns now answer the same way.
+
 **A quote escaped inside the other quote's literal** — the one row the escape
 table leaves behind. CEL admits `\"` and `\'` in either kind of literal and gives
 each one meaning, the quote; `cel` 0.14.3 keeps the backslash for the redundant

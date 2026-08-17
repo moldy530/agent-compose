@@ -133,5 +133,17 @@
     "expression": "has(payload.body.goal)",
     "input": { "payload": { "body": {} } },
     "result": false
+  },
+  {
+    "name": "has-over-a-list-has-no-answer",
+    "expression": "has(state.patches.goal)",
+    "input": { "state": { "patches": ["p1"] } },
+    "error": true
+  },
+  {
+    "name": "has-over-a-string-has-no-answer",
+    "expression": "has(state.draft.goal)",
+    "input": { "state": { "draft": "d" } },
+    "error": true
   }
 ]

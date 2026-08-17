@@ -40,6 +40,21 @@
     "result": false
   },
   {
+    "name": "starts-with-has-no-global-spelling",
+    "expression": "startsWith('draft-1', 'draft')",
+    "error": true
+  },
+  {
+    "name": "ends-with-has-no-global-spelling",
+    "expression": "endsWith('draft-1', '-1')",
+    "error": true
+  },
+  {
+    "name": "contains-has-no-global-spelling",
+    "expression": "contains('a needle here', 'needle')",
+    "error": true
+  },
+  {
     "name": "matches-an-anchored-pattern",
     "expression": "'a1'.matches('^a[0-9]$')",
     "result": true

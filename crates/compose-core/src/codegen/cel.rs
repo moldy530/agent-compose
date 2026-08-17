@@ -80,6 +80,29 @@
 //! was absent, on its eighth seed, and the two columns split. The corpus now
 //! states all six absorption cases, and the evaluator implements them.
 //!
+//! **Two more were closed for the reason the second bullet above gives**, and
+//! they are the shape it names — an evaluator accepting *more* than the surface
+//! rather than reading it differently:
+//!
+//! * `startsWith`, `endsWith` and `contains` are **receiver-only**. CEL's
+//!   standard definitions give a global overload to `matches` alone, which is
+//!   why [`crate::cel`]'s arity table accepts `(receiver, 1)` for the three and
+//!   both forms for `matches`, and why `evaluation_context` registers only
+//!   `matches` globally. This evaluator's first draft flattened receiver and
+//!   arguments before dispatching, so `startsWith('abc', 'a')` answered `true`
+//!   where the crate said `Undeclared reference to 'startsWith'`.
+//! * `has(x.f)` over a value with **no fields** is a refusal, not a `false`. The
+//!   crate errors and the front-end refuses the shape by type
+//!   (`type-mismatch: … selects a field of a list of strings, which has no
+//!   fields`); answering `false` made this column the one that would have run it.
+//!
+//! Neither was reachable through `validate` + `build` — the front-end refuses
+//! both spellings before a router is emitted — which is exactly why they are
+//! worth closing rather than declaring: a ledger row states a difference a
+//! reader has to live with, and a difference nothing can reach is one nobody
+//! would ever be shown. `strings.json` and `collections.json` now state all five
+//! refusals, so the two columns are held to them.
+//!
 //! # Shapes
 //!
 //! JSON cannot tell `1` from `1.0` and CEL must (`1 + 2.5` is an error in the

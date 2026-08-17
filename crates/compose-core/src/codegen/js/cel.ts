@@ -805,8 +805,20 @@ function member(operand: CelValue, field: string, spelling: string): CelValue {
   throw new CelError(`\`${spelling}\` selects a field of a ${typeName(operand)}, which has none`);
 }
 
-function present(operand: CelValue, field: string): boolean {
-  return operand instanceof CelMap && operand.has(field);
+/**
+ * Whether a selection is present (grammar 4.1's `has()`).
+ *
+ * A value with no fields at all is a refusal rather than a `false`, and the
+ * wording is `member`'s because it is the same mistake: `has(x.f)` where `x` is
+ * a list asks a question a list has no answer to, and CEL's own definitions give
+ * the macro no overload there. Answering `false` would make the evaluator accept
+ * an expression the validator refuses (`type-mismatch`) and the pinned Rust
+ * column errors on — a superset of the surface, which is the drift this module's
+ * header calls out by name.
+ */
+function present(operand: CelValue, field: string, spelling: string): boolean {
+  if (operand instanceof CelMap) return operand.has(field);
+  throw new CelError(`\`${spelling}\` selects a field of a ${typeName(operand)}, which has none`);
 }
 
 /** The spelling of a path, for the message an absent read fails with. */
@@ -1096,7 +1108,7 @@ function call(expression: Extract<Expr, { kind: "call" }>, scope: Scope): CelVal
       throw new CelError("`has()` asks whether one selection is present — `has(state.totals.fixed)`");
     }
     const selection = args[0] as Extract<Expr, { kind: "select" }>;
-    return present(evaluateExpr(selection.operand, scope), selection.field);
+    return present(evaluateExpr(selection.operand, scope), selection.field, spell(selection));
   }
 
   if (COMPREHENSIONS.has(name) && target !== undefined) {
@@ -1118,8 +1130,16 @@ function call(expression: Extract<Expr, { kind: "call" }>, scope: Scope): CelVal
     case "startsWith":
     case "endsWith":
     case "contains": {
-      if (operands.length !== 2) {
-        throw new CelError(`\`${name}\` takes one argument on the string it tests`);
+      // Receiver-only, by CEL's standard definitions: `matches` below is the one
+      // string predicate the specification also gives a global overload, which
+      // is why the compiler's own arity table accepts `(receiver, 1)` alone for
+      // these three. Accepting `startsWith(s, p)` here would run an expression
+      // `validate` refuses (`no form it has`) and the pinned Rust column cannot
+      // evaluate either.
+      if (target === undefined || args.length !== 1) {
+        throw new CelError(
+          `\`${name}\` takes one argument on the string it tests — \`state.draft.${name}('a')\``,
+        );
       }
       const subject = expectString(operands[0]!, name);
       const argument = expectString(operands[1]!, name);
