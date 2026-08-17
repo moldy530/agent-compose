@@ -12,26 +12,27 @@
 //!
 //! **`agent-compose build` does not.** Env refs survive *unresolved* into the IR
 //! and into generated code, which is what keeps the artifact committable and
-//! keeps a key out of every file this compiler writes; a build whose success
-//! depended on the building machine's environment could not be reproduced on the
-//! deploying one, and `build --check` is a CI diff (PRD §8) rather than a
-//! deployment. PRD 5.9's own sentence — "`validate` checks ref syntax;
-//! `build`/`serve`/`run` check presence and fail fast naming the missing
-//! variable" — puts `build` in that list, and this branch does not implement it
-//! there: the two readings of 5.9 have not been reconciled in the PRD, and
-//! CLAUDE.md's PRD discipline is that an unresolved question is not implemented
-//! against. What is implemented is the half both readings agree on, and the
-//! generated `README.md` says which command does it rather than leaving a reader
-//! to assume.
+//! keeps a key out of every file this compiler writes. PRD 5.9 says so outright
+//! — "`validate` and `build` check ref syntax only … Presence is a launch-time
+//! check" — and grammar 4.3 agrees, substituting an interpolated ref "at process
+//! start". An earlier draft of 5.9 had put `build` in the presence-checking
+//! list; PRD §9's resolved question 15 settles it the other way, on
+//! artifact portability: a build whose success depended on the building
+//! machine's environment could not be reproduced on the deploying one, an
+//! artifact has to build on a CI box holding no secrets, and `build --check` is
+//! a CI diff (PRD §8) rather than a deployment. The least-privilege
+//! distribution of PRD 5.10 needs the same thing — a deployment receives the
+//! variables its own resolved surfaces name, which is computable only because
+//! nothing upstream resolved them.
 //!
-//! **The conflict is the PRD's to settle, not this module's**, and a module doc
-//! is not where a design question gets decided. What a module doc *can* do is
-//! stop the reading from being invisible, so both halves are pinned by name:
-//! `agent-compose`'s `tests/build_cli.rs::build_emits_with_every_environment_reference_unset`
+//! Both halves are pinned by name rather than left to be inferred from an
+//! absence of tests: `agent-compose`'s
+//! `tests/build_cli.rs::build_emits_with_every_environment_reference_unset`
 //! decides that `build` emits with every referenced variable unset, and
 //! `tests/generated_code_gates.rs::the_generated_project_checks_its_environment_when_it_is_loaded`
-//! decides that loading the emitted project refuses, naming each one. If 5.9
-//! resolves the other way, those two tests are the change.
+//! decides that loading the emitted project refuses, naming each one. The
+//! generated `README.md` says which command does it, so a reader of the emitted
+//! project is not left to assume either.
 //!
 //! # What the module gives the rest of the project
 //!

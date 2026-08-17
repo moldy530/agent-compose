@@ -126,17 +126,16 @@ fn build_writes_the_project_layout_where_out_points() {
 /// `build` reads no environment: every `${ENV}` the composition references is
 /// unset and it emits anyway, moving the check into the artifact.
 ///
-/// **This pins a reading of PRD 5.9 that the PRD does not yet settle.** Its own
-/// bullet lists `build` among the commands that "check presence and fail fast
-/// naming the missing variable"; PRD §7 M1 asks instead for "env-ref presence
-/// checks at process start", which is what the emitted `src/index.ts` does
-/// (`compose-core`'s `tests/generated_code_gates.rs` runs it). This branch
-/// implements the second and argues why in `compose_core::codegen::env` — a
-/// build whose success depended on the building machine's environment could not
-/// be reproduced on the deploying one. The two sentences still have to be
-/// reconciled in the PRD; until they are, the behaviour is written down here
-/// rather than left to be inferred from an absence of tests, and whichever way
-/// the question resolves, this test is what has to change.
+/// This is one half of PRD 5.9's rule that "`validate` and `build` check ref
+/// syntax only … Presence is a launch-time check" — PRD §9's resolved question
+/// 15, decided on artifact portability: a build has to succeed on a CI box
+/// holding no secrets. The other half is the emitted `src/index.ts`, which runs
+/// the check at module scope (PRD §7 M1's "env-ref presence checks at process
+/// start"), and `compose-core`'s
+/// `tests/generated_code_gates.rs::the_generated_project_checks_its_environment_when_it_is_loaded`
+/// is what decides it. Each half is a test rather than a paragraph, because a
+/// build that quietly *started* reading the environment would break no other
+/// test in this file.
 #[test]
 fn build_emits_with_every_environment_reference_unset() {
     let out = scratch("sealed");
