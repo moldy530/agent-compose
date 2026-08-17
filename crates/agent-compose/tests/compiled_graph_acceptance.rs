@@ -860,6 +860,91 @@ fn an_agent_node_sends_its_prompt_input_and_output_schema_on_chat_completions() 
     assert!(provider.snapshot().is_drained());
 }
 
+/// The conversation crosses from one agent node to the next: what the first was
+/// asked, what it answered, then what the second was asked (grammar 10.4, PRD
+/// 5.7 tier 3).
+///
+/// The implicit `messages` channel is state no composition declares and every
+/// agent node writes, so the only place it is visible is the wire: the second
+/// node's request is the first node's exchange plus its own turn. Strict
+/// alternation is the property that makes it *sendable* — an assistant turn is
+/// followed by a user turn, never by another assistant turn — and it is why the
+/// intra-agent tool loop's own turns stay out of the channel: an assistant turn
+/// carrying `tool_use` blocks is well formed only when the very next turn
+/// answers every one of them, which a later node's input never does.
+#[test]
+fn an_agent_nodes_exchange_reaches_the_next_agent_nodes_request() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "verdict": "revise", "feedback": "tighten it" })),
+        ),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "verdict": "approve", "feedback": "tightened" })),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke(
+        "agent-anthropic",
+        "flow.pair",
+        &[("goal", "ship it"), ("draft", "a draft")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+
+    let recorded = provider.requests();
+    assert_eq!(recorded.len(), 2);
+    assert!(recorded.iter().all(RecordedRequest::is_valid));
+    assert_eq!(
+        recorded[0].body()["messages"].as_array().map(Vec::len),
+        Some(1),
+        "the first node opens the conversation: {}",
+        recorded[0].body()["messages"]
+    );
+
+    let messages = recorded[1].body()["messages"].clone();
+    assert_eq!(
+        messages.as_array().map(Vec::len),
+        Some(3),
+        "the second node is called with the first node's exchange and its own \
+         turn, and with nothing else: {messages}"
+    );
+    assert_eq!(messages[0]["role"], "user");
+    assert_eq!(
+        messages[0]["content"], "{\"goal\":\"ship it\",\"draft\":\"a draft\"}",
+        "what the first node was asked, verbatim"
+    );
+    assert_eq!(messages[1]["role"], "assistant");
+    assert_eq!(
+        messages[1]["content"][0]["type"], "text",
+        "and what it answered, as one text block: {}",
+        messages[1]
+    );
+    let answered: Value = messages[1]["content"][0]["text"]
+        .as_str()
+        .and_then(|text| serde_json::from_str(text).ok())
+        .unwrap_or_else(|| panic!("the assistant turn carries its answer: {}", messages[1]));
+    assert_eq!(
+        answered,
+        json!({ "verdict": "revise", "feedback": "tighten it" }),
+        "the structured answer is what crosses, not the tool call that carried \
+         it: {}",
+        messages[1]
+    );
+    assert_eq!(messages[2]["role"], "user");
+    assert_eq!(
+        messages[2]["content"], "{\"goal\":\"ship it\",\"draft\":\"tighten it\"}",
+        "then the second node's own input, which read the channel the first \
+         wrote: {messages}"
+    );
+    assert_eq!(run.outputs()["verdict"], "approve");
+    assert!(provider.snapshot().is_drained());
+}
+
 /// The intra-agent tool loop runs the tool, feeds the result back, and stops at
 /// `max_tool_iterations` rather than looping forever.
 ///

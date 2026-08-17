@@ -132,6 +132,13 @@ const CODEGEN: &[Criterion] = &[
                 "an_agent_node_bounds_its_tool_loop_at_max_tool_iterations",
                 Status::Live,
             ),
+            // What an agent node leaves behind for the next one: the implicit
+            // `messages` channel of grammar 10.4 (PRD 5.7 tier 3), which is
+            // state no composition declares and only the wire makes visible.
+            (
+                "an_agent_nodes_exchange_reaches_the_next_agent_nodes_request",
+                Status::Live,
+            ),
             // The other three kinds this milestone executes, which are not the
             // model's: an inline `exec:`, an inline `http:`, and a `function:`
             // over a `tool.*` (grammar 8.2, 8.3, 8.4).
