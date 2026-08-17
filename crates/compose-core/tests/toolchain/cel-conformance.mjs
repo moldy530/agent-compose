@@ -7,7 +7,17 @@
 // is the Rust runner; this is the other half, and it is deliberately the *same*
 // files with no port of anything.
 //
-// Usage: node cel-conformance.mjs <generated project directory> <corpus directory>
+// It lives in the shared toolchain fixture rather than beside one suite because
+// two suites run it, under the two runtimes PRD §9.18 supports: the acceptance
+// suite's `the_generated_cel_evaluator_agrees_with_the_validator_on_the_
+// conformance_corpus` under Bun, and gate 15 of
+// `crates/compose-core/tests/generated_code_gates.rs` under the Node fallback.
+// The verdicts here are an *engine's* — `BigInt`, `RegExp`, number formatting —
+// so one runtime answering the corpus would leave the other's readers unchecked.
+// It imports only `src/cel.ts`, which has no imports of its own, so neither run
+// needs an installed dependency set.
+//
+// Usage: <bun|node> cel-conformance.mjs <generated project directory> <corpus directory>
 // Output: a JSON array of divergences, empty when the two agree.
 //
 // # Why the corpus is not read with `JSON.parse`
@@ -27,7 +37,7 @@ import { pathToFileURL } from "node:url";
 
 const [, , project, corpus] = process.argv;
 if (project === undefined || corpus === undefined) {
-  throw new Error("usage: node cel-conformance.mjs <project directory> <corpus directory>");
+  throw new Error("usage: cel-conformance.mjs <project directory> <corpus directory>");
 }
 
 const cel = await import(pathToFileURL(path.resolve(project, "src/cel.ts")).href);

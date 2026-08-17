@@ -65,8 +65,9 @@
 //! [`invoke`] runs a compiled graph under **Bun**, which PRD §9.18 makes the
 //! default runtime of every emitted project: an acceptance suite is the claim
 //! that a compiled graph behaves, and it has to make that claim about the runtime
-//! a reader is told to use. `compose-core`'s `tests/generated_code_gates.rs` gate
-//! 13 is where the Node fallback is checked, on a golden rather than here — the
+//! a reader is told to use. `compose-core`'s `tests/generated_code_gates.rs` is
+//! where the Node fallback is checked — gate 13 runs a golden under it and gate 15
+//! answers both shared corpora with it — on goldens rather than here, because the
 //! fallback is a property of the emitted modules, not of any one composition.
 //!
 //! It needs the pinned dependency set installed, and reuses `compose-core`'s

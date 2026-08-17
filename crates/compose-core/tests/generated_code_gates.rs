@@ -2,13 +2,13 @@
 //! the **real** pinned JavaScript toolchain — under **Bun**, which PRD §9.18
 //! makes the default runtime and package manager of every emitted project.
 //!
-//! Fourteen gates. The first four are in increasing strength, each one existing
+//! Fifteen gates. The first four are in increasing strength, each one existing
 //! because the one above it passes on code the one below it catches; the fifth
 //! is about a construct whose guarantees are only observable from inside the
 //! runtime; the next two are about the schemas rather than the graph; the eighth
 //! is about a composition that has no generated project at all; the next four
 //! are about what a binding does on the wire, which no amount of type-checking or
-//! graph construction reaches; and the last two are about the *other* runtime —
+//! graph construction reaches; and the last three are about the *other* runtime —
 //! the Node fallback the same decision keeps supported:
 //!
 //! 1. **`bun run typecheck`** — every golden project type-checks under its own
@@ -50,7 +50,8 @@
 //! 6. **Schema-lowering agreement** — the corpus under
 //!    `tests/fixtures/schema-lowering/` is validated twice: against the JSON
 //!    Schema this compiler lowers to (Rust, the `jsonschema` crate) and against
-//!    the Zod the same module emits (Bun). Grammar 3.8 is one table with two
+//!    the Zod the same module emits (Bun here, and Node in gate 15, because that
+//!    column's verdicts are a regex engine's). Grammar 3.8 is one table with two
 //!    columns and this is what keeps them from drifting apart. Each document
 //!    carries the verdict it *should* get, so two implementations agreeing on a
 //!    wrong answer is still a failure — and where the two columns cannot agree,
@@ -121,6 +122,17 @@
 //!     spelling an import can be written, the bare side-effect form included. A
 //!     whitelist rather than a blacklist, so the next non-portable dependency
 //!     fails too without anyone having thought of it first.
+//! 15. **Both shared corpora, under the other engine** — gates 6 and the
+//!     acceptance suite's CEL check answer their corpora with a *JavaScript*
+//!     column, and what that column answers with belongs to the engine: an
+//!     emitted `format:` is a `RegExp`, an emitted `max_length` is a code-point
+//!     count, and `src/cel.ts` is `BigInt` arithmetic and `RegExp` matching
+//!     throughout. So the schema corpus's Zod column and the whole CEL corpus are
+//!     answered under Node too, with the same assertion code — otherwise a
+//!     JavaScriptCore-only reading of a regex would decide a router or a parse
+//!     differently for every reader on the fallback while every gate stayed
+//!     green. Gate 13 loads, constructs, reduces and launches a golden under
+//!     Node; it never validates a document or evaluates a guard.
 //!
 //! # The toolchain fixture
 //!
@@ -138,10 +150,10 @@
 //! Each golden is **copied** into `tests/toolchain/projects/<name>/` rather than
 //! checked in place, so `node_modules/` resolution finds the shared install by
 //! walking up, and the committed goldens stay exactly the bytes the emitter
-//! wrote. Gate 13's copies go under `tests/toolchain/node-fallback/projects/`
-//! instead, beside an npm-installed `node_modules/` of their own: resolution
-//! takes the nearest one walking up, so the Node gate reaches what npm installed
-//! and never what Bun did.
+//! wrote. The copies gates 13 and 15 run under Node go under
+//! `tests/toolchain/node-fallback/projects/` instead, beside an npm-installed
+//! `node_modules/` of their own: resolution takes the nearest one walking up, so
+//! the Node gates reach what npm installed and never what Bun did.
 //!
 //! # When a runtime is missing
 //!
@@ -1700,7 +1712,30 @@ fn the_emitted_zod_agrees_with_the_json_schema_lowering() {
         return;
     };
 
-    // The Zod column, one Node run per golden the corpus reaches.
+    let checked = zod_column(&cases, root, "schema-lowering", runner, "Bun");
+    assert_eq!(
+        checked,
+        expected.iter().map(Vec::len).sum::<usize>(),
+        "not every document reached both columns"
+    );
+}
+
+/// Answer the corpus's Zod column under one runtime, and hold every verdict to
+/// what the corpus says. Answers how many documents were checked.
+///
+/// `spawn` is the only thing gate 3 and gate 15 differ in: [`runner`] points it
+/// at Bun and [`node_command`] at the Node fallback. The staging, the grouping of
+/// cases by golden, the JSON text each document is handed and the comparison are
+/// all here, so the two engines cannot come to different verdicts by drifting
+/// apart — the same reason gates 9 to 12 hand their assertions to both.
+fn zod_column(
+    cases: &[Case],
+    root: &Path,
+    purpose: &str,
+    spawn: fn(&str) -> Command,
+    runtime: &str,
+) -> usize {
+    // One run per golden the corpus reaches.
     let mut checked = 0usize;
     for directory in cases
         .iter()
@@ -1708,7 +1743,7 @@ fn the_emitted_zod_agrees_with_the_json_schema_lowering() {
         .collect::<BTreeSet<_>>()
     {
         let golden = goldens::golden(directory);
-        let project = staged(golden, root, "schema-lowering");
+        let project = staged(golden, root, purpose);
         let indices: Vec<usize> = cases
             .iter()
             .enumerate()
@@ -1741,14 +1776,14 @@ fn the_emitted_zod_agrees_with_the_json_schema_lowering() {
         )
         .expect("the scratch area is writable");
 
-        let output = runner("zod-conformance.mjs")
+        let output = spawn("zod-conformance.mjs")
             .arg(&input_path)
             .arg(&project)
             .output()
-            .expect("bun runs");
+            .expect("the runtime runs");
         assert!(
             output.status.success(),
-            "the Zod corpus did not run against `{directory}`:\n{}",
+            "the Zod corpus did not run against `{directory}` under {runtime}:\n{}",
             String::from_utf8_lossy(&output.stderr),
         );
         let verdicts: Vec<Vec<bool>> = serde_json::from_slice(&output.stdout)
@@ -1761,8 +1796,8 @@ fn the_emitted_zod_agrees_with_the_json_schema_lowering() {
                 assert_eq!(
                     accepted,
                     document.zod_verdict(),
-                    "the emitted Zod for `{}` {} `{}`; the corpus says it {}{} — grammar 3.8's \
-                     two columns have drifted",
+                    "the emitted Zod for `{}` {} `{}` under {runtime}; the corpus says it {}{} — \
+                     grammar 3.8's two columns have drifted",
                     case.surface,
                     if accepted { "accepts" } else { "rejects" },
                     document.document,
@@ -1780,11 +1815,7 @@ fn the_emitted_zod_agrees_with_the_json_schema_lowering() {
             }
         }
     }
-    assert_eq!(
-        checked,
-        expected.iter().map(Vec::len).sum::<usize>(),
-        "not every document reached both columns"
-    );
+    checked
 }
 
 /// One surface whose emitted Zod says more than the schema a provider would be
@@ -2191,15 +2222,25 @@ fn a_generated_project_installs_type_checks_and_runs_under_the_node_fallback() {
     );
 }
 
+/// A `node` command that runs one of the fixture's runners.
+///
+/// The Node counterpart of [`runner`], and the reason it takes the same argument
+/// in the same order: a gate that re-runs a corpus under the fallback engine
+/// differs from the Bun one in this function and nowhere else.
+fn node_command(script: &str) -> Command {
+    let mut command = Command::new("node");
+    command.arg(toolchain::root().join(script));
+    command
+}
+
 /// One of the fixture's runners, under Node, over a project staged in the npm
 /// install.
 ///
-/// The Node counterpart of [`runner`]: same script, same argument, same JSON
-/// object back — so the assertions gates 9 to 12 make can be handed either
-/// runtime's answer without knowing which one produced it.
+/// Same script, same argument, same JSON object back as [`runner`] — so the
+/// assertions gates 9 to 12 make can be handed either runtime's answer without
+/// knowing which one produced it.
 fn node_runner(script: &str, project: &Path) -> Value {
-    let output = Command::new("node")
-        .arg(toolchain::root().join(script))
+    let output = node_command(script)
         .arg(project)
         .output()
         .expect("node runs");
@@ -2418,6 +2459,135 @@ const other = await import('./cel.ts');
     assert_eq!(
         imports("import { a } from \"./a.ts\"; import { b } from \"./b.ts\";"),
         ["./a.ts", "./b.ts"]
+    );
+}
+
+/// Gate 15: the two shared corpora, answered by the other engine.
+///
+/// CLAUDE.md's validation strategy keeps two pairs of implementations in lockstep
+/// with a shared corpus each — grammar 3.8's schema table (gate 6) and the two
+/// CEL interpreters. The *second* column of both corpora is JavaScript, and what
+/// it answers with belongs to the **engine**: an emitted `format:` is a `RegExp`,
+/// an emitted `max_length` is a code-point count, and `src/cel.ts` is `BigInt`
+/// arithmetic, `RegExp` matching and number formatting the whole way down.
+/// JavaScriptCore and V8 are two engines, so a corpus answered under one of them
+/// says nothing about a reader on the other. It is the argument gate 13 makes for
+/// gates 9 to 12, one layer up: there the question is what `child_process` and
+/// `Headers` do, here it is what a regex and a number do.
+///
+/// So the Zod column of the schema corpus and the whole CEL corpus are answered
+/// under Node as well, against the assertions their Bun runs make — gate 6's own
+/// [`zod_column`], and the same empty divergence list the acceptance suite's
+/// `the_generated_cel_evaluator_agrees_with_the_validator_on_the_conformance_corpus`
+/// demands of the Bun column. Without this, a JavaScriptCore-only reading of a
+/// format regex would make a compiled router or a parse accept-or-reject
+/// differently for every reader on the documented fallback while CI stayed green:
+/// gate 13 type-checks, constructs, reduces and launches a golden under Node, but
+/// never validates a document or evaluates a guard.
+///
+/// One golden carries the CEL corpus, for the reason gate 13 runs one — the
+/// evaluator is a compiler constant — and
+/// [`the_cel_evaluator_is_one_module_every_golden_carries`] is what says so rather
+/// than this comment. The schema corpus names its own goldens and reaches all of
+/// them.
+///
+/// # What is deliberately not re-run here
+///
+/// The **property harness** (`tests/property_conformance.rs`) answers generated
+/// documents and guards with these same two emitted modules, and it stays a
+/// single-engine run. Its experiment is the Rust column against the JS one over
+/// shapes nobody wrote, not one engine against another; a second runtime would
+/// double a twelve-seed build-and-run and need a second dependency install in a
+/// binary cargo already runs in parallel with this one — for an axis the two
+/// corpora now cover on both engines, over every spelling grammar 3.8 and grammar
+/// 4.1 have. The trade is the same shape as gate 5's omission from gate 13, and
+/// this is the paragraph to revisit if it changes.
+///
+/// **Gate 7's converter probe** is not here either, and for a different reason:
+/// its subject is `@langchain/core`'s own Zod-to-JSON-Schema conversion, which is
+/// library code running the same way under either engine. Nothing it asserts —
+/// that a `.refine` has nowhere to go, so `format`, `maxLength` and `uniqueItems`
+/// do not survive — turns on a regex or on a number. It is in the list of things
+/// answered once on purpose, not by omission.
+#[test]
+fn the_shared_corpora_answer_the_same_under_the_node_fallback() {
+    let Some(root) = node_fallback() else {
+        return;
+    };
+
+    // Grammar 3.8's Zod column, over every golden the corpus names.
+    let cases = corpus();
+    assert!(!cases.is_empty(), "the corpus is empty");
+    let checked = zod_column(
+        &cases,
+        root,
+        "schema-lowering-fallback",
+        node_command,
+        "the Node fallback",
+    );
+    assert_eq!(
+        checked,
+        cases.iter().map(|case| case.documents.len()).sum::<usize>(),
+        "not every document reached the fallback engine"
+    );
+
+    // The CEL corpus, over the evaluator a generated project embeds. The driver
+    // is the acceptance suite's, run here unchanged: two runners would be two
+    // readings of the corpus, which is the drift this is written against.
+    let project = staged(goldens::golden(NODE_FALLBACK_GOLDEN), root, "cel-fallback");
+    let corpus_directory =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cel-conformance");
+    let output = node_command("cel-conformance.mjs")
+        .arg(&project)
+        .arg(&corpus_directory)
+        .output()
+        .expect("node runs");
+    assert!(
+        output.status.success(),
+        "the CEL corpus did not run under the Node fallback:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "[]",
+        "the emitted CEL evaluator answers the shared corpus differently under the Node \
+         fallback than the validator does; two interpreters must not diverge (CLAUDE.md), and \
+         the Bun column of this same corpus is the acceptance suite's \
+         `the_generated_cel_evaluator_agrees_with_the_validator_on_the_conformance_corpus`"
+    );
+}
+
+/// `src/cel.ts` is one module every golden carries, which is what lets gate 15
+/// answer the CEL corpus with a single golden.
+///
+/// Only the provenance line differs, and only in the target it names — the
+/// evaluator itself is emitted byte-identically, the way `src/runtime.ts` is. The
+/// day that stops being true, running the corpus against one golden stops being a
+/// statement about the others, and this fails before the gate can quietly narrow.
+#[test]
+fn the_cel_evaluator_is_one_module_every_golden_carries() {
+    let mut evaluators: BTreeSet<String> = BTreeSet::new();
+    for golden in GOLDENS {
+        let project = emitted(golden);
+        let module = project
+            .file("src/cel.ts")
+            .unwrap_or_else(|| panic!("`{}` emits no `src/cel.ts`", golden.directory));
+        let (provenance, body) = module
+            .contents
+            .split_once('\n')
+            .expect("every emitted file carries a provenance line");
+        assert!(
+            provenance.contains(golden.target),
+            "`{}/src/cel.ts` does not name its own target: {provenance}",
+            golden.directory
+        );
+        evaluators.insert(body.to_string());
+    }
+    assert_eq!(
+        evaluators.len(),
+        1,
+        "the emitted CEL evaluator differs between goldens, so gate 15's one-golden run says \
+         nothing about the others"
     );
 }
 

@@ -5,12 +5,14 @@ Rust evaluator the compiler links (`cel`, pinned in
 `crates/compose-core/Cargo.toml`) and the JS evaluator generated routers embed
 (`compose_core::codegen::cel`, emitted as `src/cel.ts`). CLAUDE.md's validation
 strategy requires both to be run against these files, with divergence failing
-CI. Two runners, one corpus:
+CI. Two runners, one corpus — and the JavaScript one runs under **both** runtimes
+PRD §9.18 supports, because what an evaluator built on `BigInt` and `RegExp`
+answers is the engine's rather than the emitted code's:
 
 | runner | column |
 |---|---|
 | `crates/compose-core/tests/cel_conformance.rs` | the pinned `cel` crate, under `compose_core::cel::evaluation_context` |
-| `crates/agent-compose/tests/compiled_graph_acceptance/cel-conformance.mjs` | the evaluator a built project embeds, under the pinned Node |
+| `crates/compose-core/tests/toolchain/cel-conformance.mjs` | the evaluator a built project embeds — under Bun, the default runtime, in the acceptance suite's `the_generated_cel_evaluator_agrees_with_the_validator_on_the_conformance_corpus`, and under the Node fallback in gate 15 of `crates/compose-core/tests/generated_code_gates.rs` |
 
 ## Format
 

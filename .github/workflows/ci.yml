@@ -56,11 +56,15 @@ jobs:
           path: ~/.bun/install/cache
           key: bun-install-${{ runner.os }}-${{ hashFiles('crates/compose-core/tests/toolchain/bun.lock') }}
           restore-keys: bun-install-${{ runner.os }}-
-      # Node is the **fallback** runtime PRD 9.18 keeps supported, and gate 13 of
-      # the generated-code gates is the only thing that checks it: `npm ci` from
-      # the committed `package-lock.json`, then a golden type-checked, constructed
-      # and run under Node. It fails here for the same reason Bun does — an
-      # unchecked fallback is a promise the emitted README goes on making.
+      # Node is the **fallback** runtime PRD 9.18 keeps supported, and gates 13
+      # and 15 of the generated-code gates are the only things that check it:
+      # `npm ci` from the committed `package-lock.json`, then a golden
+      # type-checked, constructed and run under Node (13), and both shared
+      # conformance corpora answered by that engine (15), because a schema's
+      # `format:` and the emitted CEL evaluator are a `RegExp` and a `BigInt`
+      # rather than anything a type-check sees. They fail here for the same reason
+      # Bun does — an unchecked fallback is a promise the emitted README goes on
+      # making.
       #
       # 22.18 is the floor: it is where Node stopped flagging type stripping,
       # which is what lets a generated project run with no build step.

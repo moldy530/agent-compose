@@ -31,6 +31,21 @@
 //! never see it. Widening it is how this file grows: every constraint keyword
 //! added to the generator is one more thing the two columns have to agree about
 //! on inputs nobody chose.
+//!
+//! # Why one JavaScript engine
+//!
+//! The JS column runs under **Bun** only, and that is a decision rather than an
+//! oversight. PRD §9.18 keeps Node a supported fallback, and what an emitted
+//! `format:` regex or `src/cel.ts`'s `BigInt` arithmetic answers really does
+//! belong to the engine — but the axis this file explores is the *Rust* column
+//! against the JS one over shapes nobody wrote, not one engine against another.
+//! The engine axis is covered where it is cheap and total: gate 15 of
+//! `tests/generated_code_gates.rs` answers both hand-written corpora — every
+//! spelling grammar 3.8 and grammar 4.1 have — under Node as well. Adding a
+//! second runtime here would double a twelve-seed build-and-run and need a second
+//! dependency install in a binary cargo already runs in parallel with those
+//! gates, which is a worse trade than the gap it closes. Revisit it together with
+//! gate 15's own *What is deliberately not re-run here*.
 
 #[path = "support/goldens.rs"]
 mod goldens;

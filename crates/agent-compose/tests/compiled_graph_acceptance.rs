@@ -2106,10 +2106,17 @@ fn an_edge_guard_routes_on_the_source_nodes_structured_output() {
 /// the corpus is the mitigation. The Rust side already runs in
 /// `crates/compose-core/tests/cel_conformance.rs`; this is the other half, over
 /// the **same files**, run against the evaluator a
-/// built project embeds (`src/cel.ts`). The driver is committed beside this suite
-/// rather than written inline, because it carries a JSON reader that keeps `1`
-/// and `1.0` apart — the distinction the corpus's int64 cases exist to pin, and
-/// one `JSON.parse` throws away.
+/// built project embeds (`src/cel.ts`). The driver is committed rather than
+/// written inline, because it carries a JSON reader that keeps `1` and `1.0`
+/// apart — the distinction the corpus's int64 cases exist to pin, and one
+/// `JSON.parse` throws away.
+///
+/// This is the **Bun** column, which is the runtime PRD §9.18 makes a generated
+/// project's default. The same driver is run over the same corpus under the Node
+/// fallback by gate 15 of `crates/compose-core/tests/generated_code_gates.rs`,
+/// which is why it lives in the shared toolchain fixture rather than beside this
+/// file: what an evaluator built on `BigInt` and `RegExp` answers is the engine's,
+/// so one runtime alone would leave the other's readers unchecked.
 #[test]
 fn the_generated_cel_evaluator_agrees_with_the_validator_on_the_conformance_corpus() {
     let built = harness::build("bounded-cycle", "local");
@@ -2119,8 +2126,7 @@ fn the_generated_cel_evaluator_agrees_with_the_validator_on_the_conformance_corp
         .parent()
         .expect("crates/")
         .join("compose-core/tests/fixtures/cel-conformance");
-    let driver = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/compiled_graph_acceptance/cel-conformance.mjs");
+    let driver = harness::toolchain::root().join("cel-conformance.mjs");
 
     let output = harness::bun()
         .arg(&driver)

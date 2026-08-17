@@ -28,11 +28,14 @@
 //! The cost is this module's ~900 lines of TypeScript, carried in the compiler
 //! and emitted byte-identically into every project. What buys it back is that
 //! **the corpus runs against it**:
-//! `crates/agent-compose/tests/compiled_graph_acceptance/cel-conformance.mjs`
-//! evaluates every case in `tests/fixtures/cel-conformance/` against the emitted
-//! module under the pinned Node, and
-//! `the_generated_cel_evaluator_agrees_with_the_validator_on_the_conformance_corpus`
-//! fails the build when one case answers differently from the Rust column.
+//! `crates/compose-core/tests/toolchain/cel-conformance.mjs` evaluates every case
+//! in `tests/fixtures/cel-conformance/` against the emitted module, and a case
+//! that answers differently from the Rust column fails the build. It is run under
+//! **both** runtimes PRD §9.18 supports, because `BigInt` arithmetic and `RegExp`
+//! matching are the engine's: under Bun by the acceptance suite's
+//! `the_generated_cel_evaluator_agrees_with_the_validator_on_the_conformance_corpus`,
+//! and under the Node fallback by gate 15 of
+//! `crates/compose-core/tests/generated_code_gates.rs`.
 //!
 //! # The divergence ledger
 //!
