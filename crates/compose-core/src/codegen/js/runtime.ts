@@ -2404,27 +2404,46 @@ export async function runSubflow(
  * instances are in flight at once — every one of them, detached included
  * (grammar 8.6's key table). Which gate a dispatch takes its permit from is
  * [`Admission`]'s: the bound is over a node, not over a call.
+ *
+ * **A joined waiter is served before a detached one**, which is grammar 8.6 rule
+ * 7's "nothing it does can *delay* the enclosing flow instance" enforced at the
+ * one place a detached dispatch could: the queue. A joined instance waiting
+ * behind a queued delivery waits out that delivery's whole duration, and the
+ * queue spans executions — [`Admission`] belongs to the node, so a bounded
+ * cycle's second traversal, or the node's own `retry:`, would otherwise line its
+ * instances up behind deliveries the previous traversal left in flight. Ordering
+ * the queue costs the delivery nothing: it still starts under a permit (the key
+ * table), just never ahead of work the join is waiting for. [`runMap`] keeps the
+ * other half — a delivery is not *issued* until this call's joined instances are
+ * admitted, because a permit already taken cannot be reordered.
+ *
+ * `permits > 0` implies both queues are empty, because [`release`] hands a
+ * permit straight to a waiter rather than returning it to the count — so the
+ * fast path cannot jump a detached dispatch over a waiting joined one.
  */
 class Gate {
   private permits: number;
+  /** Joined waiters: the dispatches the map node's join is waiting on. */
   private readonly waiting: (() => void)[] = [];
+  /** Detached waiters, served only once no joined dispatch wants a permit. */
+  private readonly deferred: (() => void)[] = [];
 
   constructor(permits: number) {
     this.permits = Math.max(1, permits);
   }
 
-  async acquire(): Promise<void> {
+  async acquire(kind: DispatchKind = "joined"): Promise<void> {
     if (this.permits > 0) {
       this.permits -= 1;
       return;
     }
     await new Promise<void>((resolve) => {
-      this.waiting.push(resolve);
+      (kind === "detached" ? this.deferred : this.waiting).push(resolve);
     });
   }
 
   release(): void {
-    const next = this.waiting.shift();
+    const next = this.waiting.shift() ?? this.deferred.shift();
     if (next === undefined) {
       this.permits += 1;
     } else {
@@ -2432,6 +2451,9 @@ class Gate {
     }
   }
 }
+
+/** Which half of grammar 8.6 rule 7 a dispatch queues under (see [`Gate`]). */
+type DispatchKind = "joined" | "detached";
 
 /**
  * The permits one `map` **node** admits its dispatches against (grammar 8.6's
@@ -2460,6 +2482,15 @@ class Gate {
  * never settles keeps its node's entry — and its permit — which is the same
  * unbounded wait an abandoned host function is, and is bounded for the run by
  * the node's own `timeout:` rather than by anything here.
+ *
+ * Spanning executions is also the one way a detached delivery can still be in
+ * front of a joined instance, so it is the reason [`Gate`] orders its queue: the
+ * call that *issued* the delivery cannot queue behind it ([`runMap`] admits its
+ * joined instances first), but a second traversal of a bounded cycle knows
+ * nothing of it. A delivery this table is still holding a permit for is served
+ * after every joined waiter, so the only one that can delay a later execution is
+ * one that already *started* — which is the abandoned-host-function wait above,
+ * and is what that execution's own `timeout:` is racing.
  */
 interface Admission {
   /** `max_concurrency:` — the node-wide bound (grammar 8.6 rule 1). */
@@ -2731,20 +2762,43 @@ function selectRoute(map: MapDescriptor, item: unknown): MapRoute {
  * dispatch of **zero** instances completes immediately and writes nothing, and
  * its edges fire as if every instance had finished (rule 6).
  *
- * **A detached dispatch is admitted, not awaited.** It takes a node permit
- * before it starts, because `max_concurrency` bounds every in-flight dispatch
- * (grammar 8.6's key table) — a map declaring 2 against a rate-limited provider
- * would otherwise reach 2 + the detached route's bound. What the join never does
- * is wait on its *outcome* (D94): the delivery is counted resolved the moment it
- * is issued, and the map node returns while it is still in flight. The two are
- * one bound and one queue, so a delivery that hangs does hold a permit a later
- * instance is waiting for — which is what an author asked for by bounding the
- * node, and what the node's own `timeout:` answers *for the node*, whose
- * next execution then fails on time rather than waiting for ever. Nothing is
- * lost either way: every permit holder is one of this map's own dispatches, and
- * the joined ones have all released theirs by the time the node completes. The
- * permits themselves belong to the node rather than to this call, which is
- * [`Admission`].
+ * **A detached dispatch is admitted, but never ahead of the join.** It takes a
+ * node permit before it starts, because `max_concurrency` bounds every in-flight
+ * dispatch (grammar 8.6's key table) — a map declaring 2 against a rate-limited
+ * provider would otherwise reach 2 + the detached route's bound. What the join
+ * never does is wait on its *outcome* (D94): the delivery is counted resolved
+ * the moment it is issued, and the map node returns while it is still in flight.
+ *
+ * Those two are a bound and a queue, and a queue is the one place the second can
+ * take the first back. A delivery that held a permit a joined instance was
+ * waiting for would *delay* the enclosing flow instance, which rule 7 says
+ * outright that a detached dispatch cannot do: at `max_concurrency: 1` a
+ * detached item ahead of a joined one made the map node wait out the sink, and a
+ * sink that never answered never released the permit at all — the join hung for
+ * ever on a delivery it is defined not to wait for. So a detached dispatch
+ * queues **behind every joined instance**, in both of the ways it could get
+ * ahead of one:
+ *
+ *   * it is not *issued* until every joined instance of this call has been
+ *     admitted. A permit is taken synchronously by whichever dispatch asks
+ *     first, and the loop below issues them in source-item order, so a detached
+ *     item at index 0 would otherwise hold the permit before the joined item at
+ *     index 1 had asked — no queue discipline can reorder a permit already
+ *     taken, so it is not taken;
+ *   * once issued it waits as a `"detached"` [`Gate`] waiter, which is served
+ *     only when no joined dispatch wants a permit. That covers the executions
+ *     this call cannot see: [`Admission`] belongs to the node, so a bounded
+ *     cycle's second traversal — or the node's own `retry:` — would otherwise
+ *     line its joined instances up behind deliveries this one left queued.
+ *
+ * Both halves of the key table then hold at once: a detached dispatch waits for
+ * a permit to *start*, and the join waits for none of it. Nothing is lost to the
+ * ordering either — a delivery that is merely *later* is still delivered, which
+ * is the distinction rule 7 and PRD 5.6 trade dedupe-on-a-key to keep. What
+ * survives is narrower and honest: a delivery that has already *started* and
+ * never settles still holds its permit, exactly as an abandoned host function
+ * holds a slot, and only a *later* execution of this node can meet it there
+ * ([`Admission`]).
  *
  * **A detached delivery is off the node's clock.** It runs under a signal of its
  * own, never `context.signal`. That signal is the map node's `timeout:`
@@ -2789,6 +2843,31 @@ export async function runMap(
   const failed: { index: number; target: string; attempts: number; error: unknown }[] = [];
   const joined: Promise<void>[] = [];
 
+  // What a detached dispatch waits behind before it asks for a permit at all:
+  // every joined instance of this call, admitted (grammar 8.6 rule 7, and see
+  // *A detached dispatch is admitted, but never ahead of the join* above). The
+  // count is taken before anything runs, because the loop below issues the
+  // dispatches in source-item order and a detached item at index 0 would
+  // otherwise take the permit before the joined item at index 1 exists.
+  //
+  // A plan of no joined instances releases it immediately: there is nothing for
+  // a delivery to get ahead of, and a barrier nothing resolves would strand
+  // every delivery a fire-and-forget map exists to make.
+  let unadmitted = plan.instances.reduce(
+    (count, dispatch) => count + (dispatch.route.detach ? 0 : 1),
+    0,
+  );
+  let admitted = (): void => {};
+  const joinedAdmitted: Promise<void> =
+    unadmitted === 0
+      ? Promise.resolve()
+      : new Promise<void>((resolve) => {
+          admitted = () => {
+            unadmitted -= 1;
+            if (unadmitted === 0) resolve();
+          };
+        });
+
   for (const instance of plan.instances) {
     const { index, route, site } = instance;
     const named = route.tag === undefined ? {} : { route: route.tag };
@@ -2814,12 +2893,15 @@ export async function runMap(
         // `max_concurrency` is an **admission** bound over every in-flight
         // dispatch, detached included (grammar 8.6's key table, D28): a detached
         // delivery waits for a node permit to *start*, exactly as a joined
-        // instance does. What D94 keeps is the other half — the join never waits
-        // on the outcome — and this loop is still past it before the delivery
-        // has finished, so a permit a delivery holds after the map node has
-        // completed bounds nothing that is still running here.
-        await gate.acquire();
-        await node.acquire();
+        // instance does. It waits for it **behind the join**, though — rule 7's
+        // "nothing it does can delay the enclosing flow instance" is a statement
+        // about the permit queue as much as about the outcome. Both gates are
+        // taken after the barrier and as a `"detached"` waiter, so a joined
+        // instance of this call never queues behind this delivery and a later
+        // execution of this node never queues behind it either.
+        await joinedAdmitted;
+        await gate.acquire("detached");
+        await node.acquire("detached");
         try {
           await route.run(instance.input, delivery, site);
         } finally {
@@ -2845,6 +2927,12 @@ export async function runMap(
         // instead of holding a node permit another route could have used.
         await gate.acquire();
         await node.acquire();
+        // Both permits held: this instance can no longer be got in front of, so
+        // it is what a detached dispatch was waiting to be behind. Reported here
+        // rather than on completion — the barrier orders the *queue*, and making
+        // a delivery wait for the join to finish would hold back a message the
+        // map node is defined not to wait for (grammar 8.6 rule 7, D94).
+        admitted();
         let attempts = 0;
         try {
           const answer = await attemptItem(map, instance, scoped);

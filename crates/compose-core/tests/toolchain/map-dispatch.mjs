@@ -625,7 +625,96 @@ const observed = {};
   await runtime.runMap(queued, runtime.mapPlan(queued, viewOf(pair)), context);
   order.push("returned");
   await sleep(100);
-  observed.detachedBound = { declared: 2, peak, queuedThenDelivered: order };
+
+  // …and the same two items the other way round, which is the direction the
+  // bound and rule 7 can actually contradict each other in. Grammar 8.6 rule 7
+  // says nothing a detached dispatch does can **delay** the enclosing flow
+  // instance; a delivery that took the node's only permit at index 0 and held it
+  // until it settled would make the joined instance at index 1 — and so the map
+  // node's own join — wait out the sink. So a detached dispatch is not issued
+  // until this call's joined instances are admitted, and the join still returns
+  // before the delivery lands whichever order the items are in. Reverse this
+  // fixture's indices with the permit taken eagerly and `["delivered", "joined",
+  // "returned"]` is what comes back.
+  const reversed = [];
+  const ahead = descriptor({
+    maxConcurrency: 1,
+    routeBy: "kind",
+    routes: [
+      route({
+        tag: "joined",
+        run: async () => {
+          reversed.push("joined");
+          return { output: { result: "0" } };
+        },
+      }),
+    ],
+    fallback: route({
+      tag: "$default",
+      detach: true,
+      target: "tool.sink",
+      writes: [],
+      run: async () => {
+        // Long enough that a delivery which *had* got in front of the join would
+        // be unmistakable rather than a microtask-ordering coin flip.
+        await sleep(40);
+        reversed.push("delivered");
+        return { output: {} };
+      },
+    }),
+  });
+  const detachedFirst = [{ at: 0, kind: "away" }, { at: 1, kind: "joined" }];
+  await runtime.runMap(
+    ahead,
+    runtime.mapPlan(ahead, viewOf(detachedFirst, { id: "exec_ahead" })),
+    context,
+  );
+  reversed.push("returned");
+  await sleep(200);
+
+  // The same direction taken to its end: a sink that never answers. Holding a
+  // permit until the delivery settled did not merely delay the join here, it
+  // ended it — `Promise.all` never resolved, the map node never completed, and a
+  // map with no `timeout:` (grammar 9.3 level 4's built-in, and what
+  // `every-schema-form` emits) blocked its flow instance for ever on a dispatch
+  // rule 7 defines the join as not waiting for. Raced against a budget many
+  // times the join's real cost, so a pass means the join did not wait for the
+  // sink rather than that the sink was quick.
+  const never = descriptor({
+    node: "never",
+    maxConcurrency: 1,
+    routeBy: "kind",
+    routes: [route({ tag: "joined", run: async () => ({ output: { result: "0" } }) })],
+    fallback: route({
+      tag: "$default",
+      detach: true,
+      target: "tool.sink",
+      writes: [],
+      run: () => new Promise(() => {}),
+    }),
+  });
+  // The budget's timer is cleared rather than left to expire: this fixture ends
+  // by draining the event loop, and a pending 2s timer would hold it open. The
+  // delivery itself never settles and holds no handle, so it does not.
+  let overdue;
+  const budget = new Promise((resolve) => {
+    overdue = setTimeout(() => resolve("the join is still waiting on the delivery"), 2000);
+  });
+  const joinedBehind = await Promise.race([
+    runtime
+      .runMap(never, runtime.mapPlan(never, viewOf(detachedFirst, { id: "exec_never" })), context)
+      .then(() => "joined-returned"),
+    budget,
+  ]);
+  clearTimeout(overdue);
+
+  observed.detachedBound = {
+    declared: 2,
+    peak,
+    queuedThenDelivered: order,
+    aheadOfJoined: reversed,
+    joinedBehindAHangingSink: joinedBehind,
+  };
 }
 
 // --- A map node under its own `timeout:` (grammar 9.2, 8.6 rules 7, 9) ------
@@ -814,6 +903,72 @@ const observed = {};
     attempts: absorbed.attempts,
     outcome: absorbed.outcome,
   };
+}
+
+// --- …and that bound must not queue a join behind a delivery (rule 7) ------
+//
+// The two facts above are in tension. The permits belong to the node, so they
+// outlive the call — and a *later* execution knows nothing of the deliveries an
+// earlier one left waiting for one. Rule 7 says nothing a detached dispatch does
+// can delay the enclosing flow instance, and a second traversal whose joined
+// instance sat behind two queued deliveries is delayed by exactly that. Issuing
+// deliveries after the join is admitted answers it inside one call; across calls
+// only the queue can, so a joined waiter is served before a detached one.
+//
+// Reaching the node's queue takes **two** detached routes. A route gate is
+// `min(route, map)`, so two deliveries down one route saturate that route's gate
+// first and queue there, where no joined instance of another route is waiting —
+// the ordering only becomes observable when a delivery's own route gate is free
+// and the node's is not.
+{
+  const order = [];
+  const id = "exec_span";
+  const sink = (tag) =>
+    route({
+      tag,
+      detach: true,
+      target: "tool.sink",
+      writes: [],
+      run: async (input) => {
+        await sleep(60);
+        order.push(`delivered-${input.at}`);
+        return { output: {} };
+      },
+    });
+  const spanning = (joinedRun) =>
+    descriptor({
+      node: "spanning",
+      maxConcurrency: 1,
+      routeBy: "kind",
+      routes: [route({ tag: "joined", writes: [], run: joinedRun }), sink("a")],
+      fallback: sink("$default"),
+    });
+
+  // Execution 1: delivery 0 takes the node's only permit, delivery 1 finds its
+  // own route gate free and queues on the node's. The call returns at once —
+  // both its dispatches are detached, so it has no join to wait for.
+  const first = spanning(async () => ({ output: {} }));
+  const away = [{ at: 0, kind: "a" }, { at: 1, kind: "b" }];
+  await runtime.runMap(first, runtime.mapPlan(first, viewOf(away, { id })), context);
+  await sleep(10);
+
+  // Execution 2 of that same node, with a joined instance. It is served the
+  // permit delivery 0 releases, ahead of delivery 1 which has been queued for it
+  // longer: a join waits out a delivery already *running*, and nothing more.
+  // Under a first-come queue this reads `delivered-1` before `joined`, and the
+  // second traversal takes both sleeps rather than one.
+  const second = spanning(async () => {
+    order.push("joined");
+    return { output: {} };
+  });
+  await runtime.runMap(
+    second,
+    runtime.mapPlan(second, viewOf([{ at: 2, kind: "joined" }], { id })),
+    context,
+  );
+  order.push("returned");
+  await sleep(400);
+  observed.joinAheadOfAQueuedDelivery = order;
 }
 
 // --- A dispatched `flow.*` that failed keeps its own trace (grammar 8.5) ----

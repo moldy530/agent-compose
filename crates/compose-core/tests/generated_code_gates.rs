@@ -856,12 +856,26 @@ fn the_fan_out_runtime_bounds_orders_and_resolves_every_dispatch() {
     // admitted until the joined instance ahead of it finishes, which is after
     // the map node has returned. It is still delivered — a message a bound
     // merely delayed past the join would otherwise be a message lost (D94).
+    //
+    // `aheadOfJoined` is that queue read from the other end, which is the end
+    // where the bound and grammar 8.6 rule 7 can contradict each other: rule 7
+    // says nothing a detached dispatch does can **delay** the enclosing flow
+    // instance, so the detached item is at index 0 and the joined item behind it.
+    // A delivery that took the only permit at index 0 and held it until it
+    // settled would make the join wait out the sink, and the answer here would
+    // read `["delivered", "joined", "returned"]`. `joinedBehindAHangingSink` is
+    // the same shape with a sink that never answers at all — the case where
+    // holding the permit does not delay the join but ends it, since a map node
+    // carrying no `timeout:` (grammar 9.3 level 4) has nothing to cut the wait
+    // short and the flow instance blocks for ever on a fire-and-forget delivery.
     assert_eq!(
         observed["detachedBound"],
         serde_json::json!({
             "declared": 2,
             "peak": 2,
             "queuedThenDelivered": ["joined", "returned", "delivered"],
+            "aheadOfJoined": ["joined", "returned", "delivered"],
+            "joinedBehindAHangingSink": "joined-returned",
         })
     );
 
@@ -918,6 +932,20 @@ fn the_fan_out_runtime_bounds_orders_and_resolves_every_dispatch() {
             "attempts": 2,
             "outcome": "skipped",
         })
+    );
+
+    // The other half of a bound that spans executions. Permits outliving a call
+    // is what makes the bound real, and it is also the one way a detached
+    // delivery can still be in front of a joined instance: a later execution of
+    // the node knows nothing of the deliveries an earlier one left queued, and
+    // grammar 8.6 rule 7 says nothing a detached dispatch does can delay the
+    // enclosing flow instance. Two deliveries are issued at a bound of 1, so the
+    // second is queued on the *node* gate; the next execution's joined instance
+    // is then served ahead of it, waiting out only the delivery already running.
+    // Under a first-come queue this reads `delivered-1` before `joined`.
+    assert_eq!(
+        observed["joinAheadOfAQueuedDelivery"],
+        serde_json::json!(["delivered-0", "joined", "returned", "delivered-1"])
     );
 
     // Grammar 8.5: a dispatched `flow.*` that failed keeps the trace of its own
