@@ -152,11 +152,17 @@ pub fn fixture(name: &str) -> PathBuf {
 
 /// The environment a run needs to reach the mock instead of a real provider.
 ///
-/// This is the whole redirection mechanism, and it is a *spec-level* one: every
-/// fixture declares `base_url: ${MOCK_BASE_URL}` on its providers, env refs
-/// survive unresolved into the IR, and resolution happens at process start
-/// (PRD 5.9). Nothing about the composition differs between a scripted run and a
-/// real one.
+/// For every **fixture** this is the whole redirection mechanism, and it is a
+/// *spec-level* one: each declares `base_url: ${MOCK_BASE_URL}` on its
+/// providers, env refs survive unresolved into the IR, and resolution happens at
+/// process start (PRD 5.9). Nothing about the composition differs between a
+/// scripted run and a real one.
+///
+/// A composition that does **not** parameterise its `base_url:` — which
+/// `examples/review-loop` does not, being written to talk to Anthropic — is
+/// redirected in the host preamble instead ([`invoke_hosted`]). That is a
+/// harness affordance rather than something the spec offers, which is why the
+/// fixtures are written rather than borrowed.
 pub fn environment(provider: &MockProvider) -> Vec<(String, String)> {
     vec![
         (BASE_URL.to_string(), provider.base_url()),
@@ -173,7 +179,7 @@ impl Scratch {
     fn new(purpose: &str) -> Self {
         static NEXT: AtomicU32 = AtomicU32::new(0);
         let path = std::env::temp_dir().join(format!(
-            "agent-compose-m1-{purpose}-{}-{}",
+            "agent-compose-acceptance-{purpose}-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
