@@ -65,6 +65,51 @@
     "result": false
   },
   {
+    "name": "matches-an-alternation",
+    "expression": "'abc'.matches('^(a|z)bc$')",
+    "result": true
+  },
+  {
+    "name": "matches-a-bounded-repetition",
+    "expression": "'aaa'.matches('^a{2,3}$')",
+    "result": true
+  },
+  {
+    "name": "matches-a-bounded-repetition-that-is-too-long",
+    "expression": "'aaaa'.matches('^a{2,3}$')",
+    "result": false
+  },
+  {
+    "name": "matches-the-perl-classes-over-ascii",
+    "expression": "'x9 '.matches('^\\\\w\\\\d\\\\s$')",
+    "result": true
+  },
+  {
+    "name": "matches-a-negated-character-class",
+    "expression": "'abc'.matches('^[^0-9]+$')",
+    "result": true
+  },
+  {
+    "name": "matches-a-named-group-in-the-javascript-spelling",
+    "expression": "'key=value'.matches('^(?<k>[a-z]+)=(?<v>[a-z]+)$')",
+    "result": true
+  },
+  {
+    "name": "matches-a-non-capturing-group-and-a-lazy-quantifier",
+    "expression": "'aab'.matches('^(?:a)+?ab$')",
+    "result": true
+  },
+  {
+    "name": "matches-an-escaped-metacharacter",
+    "expression": "'1+1'.matches('^1\\\\+1$')",
+    "result": true
+  },
+  {
+    "name": "matches-the-empty-pattern-which-every-string-carries",
+    "expression": "'anything'.matches('')",
+    "result": true
+  },
+  {
     "name": "a-single-quoted-escape",
     "expression": "'it\\'s'",
     "result": "it's"

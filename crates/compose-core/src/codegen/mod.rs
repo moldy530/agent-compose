@@ -222,6 +222,18 @@ pub fn emit(ir: &Ir) -> GeneratedProject {
 ///   RE2 (Decision D12) and RE2 is not a subset of ECMAScript (see [`pattern`]).
 ///   Emitting it anyway produces a `src/schemas.ts` that fails to parse: not a
 ///   wrong schema, an unloadable module, and `build` exiting `0` over it.
+/// * **A `matches()` pattern in the same position.** Grammar 4.1 puts CEL's
+///   standard `matches` on the expression surface, and the CEL specification
+///   defines it over RE2 — the *same* second language `pattern:` is written in,
+///   reached through an expression instead of a schema. The emitted evaluator has
+///   only `new RegExp(…)`, so the mismatch runs both ways and both are reachable:
+///   `state.a.matches('(?i)urgent')` validates and dies at the guard with
+///   `SyntaxError: Invalid group`, and `state.a.matches('a(?=b)')` runs happily in
+///   a compiled router while the Rust column refuses to compile it at all. Two
+///   evaluators answering differently is the exact drift PRD 5.5's corpus exists
+///   to prevent, so the target refuses the pattern rather than shipping it — and
+///   refuses a **computed** one too, because a pattern the compiler cannot read is
+///   one it cannot make that promise about (see [`cel::matches_patterns`]).
 /// * **A name every JavaScript object already answers to.** `constructor` is a
 ///   legal grammar 2.1 identifier and grammar 2.5 reserves only the seven roots,
 ///   so the validator accepts it wherever an identifier goes — and three of
@@ -360,6 +372,58 @@ pub fn diagnostics(ir: &Ir) -> Vec<Diagnostic> {
                 );
             }
         });
+    }
+
+    // The same question, asked of the regular expressions an *expression*
+    // carries. One diagnostic per `matches()` call rather than per expression:
+    // two bad patterns in one guard are two things to fix.
+    for expression in cel::expressions(ir) {
+        let site = &expression.site;
+        for found_pattern in crate::cel::matches_patterns(expression.source.value.as_str()) {
+            let source = match found_pattern {
+                crate::cel::MatchesPattern::Computed => {
+                    found.push(
+                        Diagnostic::error(
+                            DiagnosticCode::InvalidValue,
+                            expression.source.span.clone(),
+                            format!(
+                                "{site} calls `matches()` with a pattern this target cannot read: \
+                                 the argument is computed rather than written down, and a regular \
+                                 expression this compiler never sees is one it cannot check \
+                                 against either engine"
+                            ),
+                        )
+                        .with_help(
+                            "write the pattern as a string literal — `matches('^a[0-9]$')` — so \
+                             the compiler can decide it: CEL defines `matches` over RE2 and the \
+                             emitted evaluator has JavaScript's `RegExp`, and the two are not the \
+                             same language (grammar 4.1, Decision D12)",
+                        ),
+                    );
+                    continue;
+                }
+                crate::cel::MatchesPattern::Literal(source) => source,
+            };
+            let Err(unsupported) = pattern::javascript(&source) else {
+                continue;
+            };
+            found.push(
+                Diagnostic::error(
+                    DiagnosticCode::InvalidValue,
+                    expression.source.span.clone(),
+                    format!(
+                        "{} (`{source}`)",
+                        unsupported.about(&format!("{site} calls `matches()` with a pattern that"))
+                    ),
+                )
+                .with_help(format!(
+                    "{} — CEL defines `matches` over RE2 and the emitted evaluator has \
+                     JavaScript's `RegExp`, so a pattern only one of them reads is one the two \
+                     interpreters answer differently about (grammar 4.1, PRD 5.5)",
+                    unsupported.help
+                )),
+            );
+        }
     }
     found.sort();
     found.into_vec()
@@ -525,6 +589,108 @@ flow.f:
     #[test]
     fn the_worked_shapes_have_nothing_the_target_cannot_express() {
         assert_eq!(diagnostics(&ir_of(test_support::EVERY_FORM)), []);
+    }
+
+    /// The same question, asked of the regular expression a `matches()` carries.
+    ///
+    /// One guard writes four patterns: one both engines read alike, one only the
+    /// crate reads (`(?i)`), one only `RegExp` reads (look-ahead), and one the
+    /// compiler never sees. Three are reported, **each on its own**, because two
+    /// bad patterns in one expression are two things to fix — and the fourth is
+    /// not, which is what keeps this from being a check that refuses `matches()`.
+    #[test]
+    fn a_matches_pattern_the_target_cannot_express_is_reported_once_per_call() {
+        let ir = ir_of(
+            r#"version: "0.1"
+
+state:
+  note: { type: string, default: "" }
+  needle: { type: string, default: "^a$" }
+
+flow.f:
+  outputs: {}
+  nodes:
+    read: { exec: { command: printf, args: ["x"] } }
+    act: { exec: { command: printf, args: ["y"] } }
+  edges:
+    - { from: start, to: read }
+    - from: read
+      to: act
+      when: >-
+        state.note.matches('^[a-z]+$') || state.note.matches('(?i)urgent') ||
+        matches(state.note, 'a(?=b)') || state.note.matches(state.needle)
+    - { from: read, to: end, else: true }
+    - { from: act, to: end }
+"#,
+        );
+        let reported = diagnostics(&ir);
+        let messages: Vec<&str> = reported
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+        assert_eq!(
+            messages.len(),
+            3,
+            "one per undecidable call, none for the shared-subset one: {messages:#?}"
+        );
+        assert!(reported.iter().all(Diagnostic::is_error));
+        for expected in [
+            "sets flags inline",
+            "look-around, including look-ahead and look-behind, is not supported",
+            "the argument is computed rather than written down",
+        ] {
+            assert!(
+                messages.iter().any(|message| message.contains(expected)),
+                "no diagnostic carries `{expected}`: {messages:#?}"
+            );
+        }
+        assert!(
+            messages
+                .iter()
+                .all(|message| message.contains("`flow.f`'s edge `read` → `act` guard")),
+            "each names the surface, which a span alone does not: {messages:#?}"
+        );
+        assert!(
+            !messages.iter().any(|message| message.contains("^[a-z]+$")),
+            "the control pattern transfers and is not reported: {messages:#?}"
+        );
+    }
+
+    /// A `matches()` this target *can* express is silent at every surface that
+    /// carries one — the over-refusal guard for the check above.
+    #[test]
+    fn a_matches_pattern_both_engines_read_alike_is_not_reported_anywhere() {
+        let ir = ir_of(
+            r#"version: "0.1"
+
+state:
+  note: { type: string, default: "" }
+  items:
+    type: array
+    max_items: 4
+    items: { type: string }
+    default: []
+
+flow.f:
+  inputs:
+    goal: { type: string }
+  outputs: {}
+  nodes:
+    read:
+      exec:
+        command: printf
+        args: ["x"]
+      input:
+        slug: "input.goal.matches('^[a-z]+-[0-9]{4}$') ? input.goal : ''"
+    act: { exec: { command: printf, args: ["y"] } }
+  edges:
+    - { from: start, to: read }
+    - { from: read, to: act, when: "state.items.exists(i, matches(i, '^(?<w>[a-z]+)$'))" }
+    - { from: read, to: end, else: true }
+    - { from: act, to: end }
+"#,
+        );
+        assert_eq!(diagnostics(&ir), [], "the shared vocabulary is accepted");
     }
 
     /// A channel named after a property every JavaScript object carries is

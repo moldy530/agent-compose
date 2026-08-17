@@ -595,6 +595,98 @@ fn a_pattern_javascript_cannot_express_refuses_the_build_but_not_validation() {
     );
 }
 
+/// The same question asked of a `matches()` argument, which is the other place a
+/// composition writes a regular expression.
+///
+/// Grammar 4.1 puts CEL's standard `matches` on the expression surface and the
+/// specification defines it over RE2, so a guard carries the same second
+/// language a `pattern:` does — while the evaluator a compiled router embeds has
+/// only `new RegExp(…)`. The mismatch is reachable from **both** sides, which is
+/// what the fixture states and this pins:
+///
+/// * `(?i)urgent` is RE2 and a `SyntaxError` in JavaScript, so `validate` accepts
+///   a guard that kills the run at the first edge that evaluates it;
+/// * `a(?=b)` and `(a)\1` are JavaScript and are not RE2, so a compiled router
+///   answers a guard the specification's own engine will not compile — two
+///   interpreters, two answers, which is the drift the conformance corpus exists
+///   to prevent;
+/// * a pattern read out of a channel is one the compiler never sees, so it can
+///   promise nothing about it in either direction.
+///
+/// The two controls are what keep this from being a check that refuses every
+/// `matches()`: both standard spellings, over the vocabulary both engines share,
+/// in the same file and unreported.
+#[test]
+fn a_matches_pattern_javascript_cannot_express_refuses_the_build_but_not_validation() {
+    let projects = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/projects");
+    let out = scratch("matches-pattern");
+
+    let validated = Command::cargo_bin("agent-compose")
+        .expect("the binary under test is built")
+        .current_dir(&projects)
+        .env("NO_COLOR", "1")
+        .args(["validate", "one-untranslatable-matches-pattern/main.yml"])
+        .output()
+        .expect("the command runs");
+    assert_eq!(
+        code(&validated),
+        0,
+        "the composition is valid: every guard is a well-typed CEL bool: {}",
+        stderr(&validated)
+    );
+
+    let built = Command::cargo_bin("agent-compose")
+        .expect("the binary under test is built")
+        .current_dir(&projects)
+        .env("NO_COLOR", "1")
+        .args([
+            "build",
+            "one-untranslatable-matches-pattern/main.yml",
+            "--out",
+        ])
+        .arg(&out)
+        .output()
+        .expect("the command runs");
+
+    assert_eq!(code(&built), 1, "{}", stderr(&built));
+    let report = stderr(&built);
+    for expected in [
+        // Each message names the surface, because a span alone does not say
+        // which of an expression's calls is the one to fix.
+        "`flow.probe`'s edge `read` → `act` guard calls `matches()`",
+        "sets flags inline",
+        "(?i)urgent",
+        "look-around, including look-ahead and look-behind, is not supported",
+        "a(?=b)",
+        "backreferences are not supported",
+        "(a)\\1",
+        "the argument is computed rather than written down",
+        "write the pattern as a string literal",
+        "main.yml:59:36",
+        "main.yml:60:36",
+        "main.yml:61:36",
+        "main.yml:62:36",
+        "is valid and cannot be compiled for `local`: 4 errors",
+    ] {
+        assert!(
+            report.contains(expected),
+            "the report does not carry `{expected}`:\n{report}"
+        );
+    }
+    for control in ["^[a-z]+-[0-9]{4}$", "^(?<word>[a-z]+)$"] {
+        assert!(
+            !report.contains(control),
+            "the control pattern `{control}` uses only what both engines share and is not \
+             reported:\n{report}"
+        );
+    }
+    assert_eq!(
+        files_under(&out),
+        Vec::<String>::new(),
+        "a composition this target cannot express produces no project"
+    );
+}
+
 /// A channel name the target cannot hold refuses the emission, and `validate` is
 /// untouched by it.
 ///

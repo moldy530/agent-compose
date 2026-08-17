@@ -303,6 +303,54 @@ fn the_global_spelling_of_matches_is_supplied_where_the_crate_lacks_it() {
     );
 }
 
+/// The third recorded gap: two constructs a `matches()` pattern may carry that
+/// **both** engines accept and read differently.
+///
+/// `codegen::diagnostics` refuses a `matches()` pattern only one of the two
+/// engines can *parse* — inline flags, `(?P<…>)`, look-around, a backreference —
+/// so what is left is the patterns both parse. Two of those still mean different
+/// things, and they are the same two `codegen::schema`'s ledger already carries
+/// for `pattern:` (`dot-matches-a-code-unit`, `dot-excludes-a-line-terminator`,
+/// `word-boundary-is-unicode-aware`), reached through an expression instead of a
+/// schema:
+///
+/// * `.` is one **code point** to this engine and one UTF-16 **code unit** to
+///   JavaScript's, and it excludes LF here where ECMA-262 excludes every line
+///   terminator;
+/// * `\b` is a boundary between **Unicode** word characters here and ASCII ones
+///   there.
+///
+/// No corpus case can state either pair — the columns disagree, which is what a
+/// corpus case is forbidden to record — so this pins **this** column's answers
+/// and `codegen::cel`'s ledger carries the rows. The emitted evaluator's answers
+/// are written beside each one; they are `RegExp`'s, and
+/// `crates/compose-core/src/codegen/pattern.rs` says why no flag closes the gap.
+#[test]
+fn the_dot_and_the_word_boundary_in_a_matches_pattern_still_read_differently() {
+    let answer = |source: &str| {
+        let program = Program::compile(source).expect("the expression parses");
+        match program
+            .execute(&compose_core::cel::evaluation_context())
+            .expect("the expression evaluates")
+        {
+            Value::Bool(value) => value,
+            other => panic!("`{source}` is not a bool: {other:?}"),
+        }
+    };
+    // `/^.$/.test("😀")` is `false`: two code units, one `.`.
+    assert!(answer("'👍'.matches('^.$')"), "one code point, one `.`");
+    // `/^.$/.test("\r")` is `false`: CR is a line terminator to ECMA-262.
+    assert!(answer("'\\r'.matches('^.$')"), "`.` excludes LF alone here");
+    // `/\bcat\b/.test("caté")` is `true`: `é` is not an ASCII word character.
+    assert!(
+        !answer("'caté'.matches('\\\\bcat\\\\b')"),
+        "`\\b` is a boundary between Unicode word characters here"
+    );
+    // ASCII with no `.` and no `\b` is where the two agree, which is what the
+    // corpus states.
+    assert!(answer("'a1'.matches('^a[0-9]$')"));
+}
+
 /// The corpus is the artifact, not this test: it has to be substantial enough
 /// to be worth running a second implementation against.
 #[test]
