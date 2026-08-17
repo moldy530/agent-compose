@@ -516,10 +516,12 @@ const observed = {};
       )
     ).out,
     // `environmentName` spells an input field by upper-casing it, so a target
-    // declaring a field called `idempotency_key` names this same variable. The
-    // delivery wins that collision: grammar 9.4 says the key is never part of
-    // the declared input schema, and a sink with nothing to dedupe on is the
-    // failure the key exists to prevent.
+    // declaring a field called `idempotency_key` names this same variable. No
+    // composition gets here — the validator refuses a detached dispatch to a
+    // sink declaring the slot (`check::maps`, grammar 9.4, Decision D66) — so
+    // this is the order a direct call resolves it in, and the delivery wins:
+    // a sink with nothing to dedupe on is the failure the key exists to
+    // prevent.
     collided: (await runtime.runExec(exec, { idempotency_key: "an input field" }, keyed)).out,
     // …and the name is a plain one, so a variable this process happened to be
     // started with is not a key: a target reads one when the runtime delivered

@@ -31,6 +31,11 @@
 //! *inside* a dispatched instance has one writer per instance and no race for
 //! either rule to prevent; the concurrency of that flow's own nodes is its own
 //! flow's question (7.6.1), asked wherever that flow is checked.
+//!
+//! A detached dispatch carries one more thing rule 7 gives it — the idempotency
+//! key of 9.4 — and to an `exec:`-bound sink it carries it in the environment
+//! that sink's own input fields arrive in. Which of the two claims the slot is
+//! decidable only over the composition, so [`delivery_slot`] decides it here.
 
 use std::collections::BTreeSet;
 
@@ -38,7 +43,7 @@ use crate::ast::common::{Address, Ident, PathExpr, PathStep};
 use crate::ast::schema::Surface;
 use crate::diag::{Diagnostic, DiagnosticCode, Span, Spanned};
 use crate::ir::binding::{NodeInput, Writes};
-use crate::ir::flow::{Map, MapDispatch, MapRoute, Node};
+use crate::ir::flow::{Map, MapDispatch, MapRoute, Node, ToolImplementation};
 use crate::ir::schema::{Field, FieldMap, TypeForm, TypeNode, UnionType};
 
 use super::model::{self, satisfies};
@@ -369,6 +374,13 @@ fn dispatch<'a>(
         (None, contract) => whole_item(ctx, subject, item, target, contract, at),
     }
 
+    // A detached dispatch carries the idempotency key of grammar 9.4, and to an
+    // `exec:`-bound sink it carries it in the environment — which is where that
+    // sink's declared input fields arrive too.
+    if let Some(detach) = detach.filter(|detach| detach.value) {
+        delivery_slot(ctx, subject, target, detach);
+    }
+
     // What a dispatched instance writes to the **shared** state of the flow
     // that dispatched it is this site's effective write map, and nothing else.
     // A `flow.*` instance holds its own channel *values* — the channel set is
@@ -398,6 +410,64 @@ fn dispatch<'a>(
             }
             None => channels::check_types(ctx, output, &written, subject, true),
         }
+    }
+}
+
+/// The variable grammar 9.4's delivery surface names for an `exec:`-bound
+/// target, and the name an input field of that target would arrive under.
+const IDEMPOTENCY_ENV: &str = "IDEMPOTENCY_KEY";
+
+/// The slot a detached delivery claims in an `exec:`-bound sink's environment
+/// (grammar 9.4, 8.6 rule 7, Decision D66).
+///
+/// Grammar 9.4 fixes the delivery surface per binding kind, and only one of the
+/// three shares a namespace with the target's declared `input:`. An `http:`
+/// target reads the key out of a request *header* and a `function:` target out
+/// of its *invocation context*, both of which sit beside the input object; an
+/// `exec:` target reads it out of the environment, which is the very place
+/// grammar 6.1 delivers that target's input fields to, upper-snake-cased. So a
+/// sink declaring `idempotency_key` claims the slot the delivery claims, and
+/// the two values cannot both arrive.
+///
+/// Which is Decision D66's rule exactly — "wherever an input object becomes
+/// environment variables … a key colliding with the upper-snake-cased name of
+/// one of them is a compile error", because "silently preferring one leaves the
+/// other as a key that changes nothing". D66 states it of the binding's own
+/// `env:`, which the parser refuses where it is written; a delivery is the
+/// third writer into that environment, and the composition is the only place it
+/// is visible — the tool alone is legal, and so is every dispatch of it whose
+/// outcome is observed, because grammar 9.4 gives a key to nothing else.
+///
+/// Reported against the `detach:` that creates the pair rather than against the
+/// field, for the same reason: the field is not wrong, dispatching *to* it
+/// detached is. Grammar 9.4's own sentence is the rule being enforced — "the key
+/// is delivery metadata, never part of the target's declared input schema" —
+/// and this is the one composition under which a target can contradict it.
+fn delivery_slot(ctx: &mut Ctx, subject: &str, target: &Address, detach: &Spanned<bool>) {
+    let Some(tool) = ctx.tool(target) else {
+        return;
+    };
+    if !matches!(tool.implementation, ToolImplementation::Exec { .. }) {
+        return;
+    }
+    for field in &tool.input.fields {
+        let name = text(&field.name);
+        if !name.eq_ignore_ascii_case(IDEMPOTENCY_ENV) {
+            continue;
+        }
+        ctx.push(
+            Diagnostic::error(
+                DiagnosticCode::ConflictingKeys,
+                detach.span.clone(),
+                format!(
+                    "{subject} delivers `{IDEMPOTENCY_ENV}`, which is also where the input field `{name}` of `{target}` arrives"
+                ),
+            )
+            .with_label(field.name.span.clone(), "this input field takes the same slot")
+            .with_help(
+                "a detached dispatch delivers its idempotency key to an `exec:`-bound sink as the `IDEMPOTENCY_KEY` environment variable, and an object input arrives as upper-snake-cased environment variables, so one of the two values would be silently discarded: rename the field, or drop `detach: true` (grammar 9.4, 8.6 rule 7, Decision D66)",
+            ),
+        );
     }
 }
 

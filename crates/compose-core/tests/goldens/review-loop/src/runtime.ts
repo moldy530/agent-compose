@@ -1257,10 +1257,16 @@ export function environmentName(field: string): string {
  *
  * [`environmentName`] spells an input field by upper-casing it, so a target that
  * declared an input field called `idempotency_key` would name this same
- * variable. Grammar 9.4 settles that collision in the delivery's favour — "the
- * key is delivery metadata, never part of the target's declared input schema" —
- * so the delivery is written *after* the input fields and before the binding's
- * own `env:`, which is the layer an author configures their wire from.
+ * variable. **No compiled graph reaches that**: grammar 9.4 says the key is
+ * "delivery metadata, never part of the target's declared input schema", and the
+ * validator refuses a detached dispatch to an `exec:` sink declaring one rather
+ * than letting either value be discarded in silence — the rule Decision D66
+ * already applies to the binding's own `env:` (`check::maps`). What is left for
+ * this function to settle is the order a *direct* call resolves it in, and it is
+ * 9.4's: the delivery is written **after** the input fields, and **before** the
+ * binding's own `env:` — the layer an author configures their wire from, which
+ * sits over the delivery exactly as a declared header sits over the emitted
+ * media type.
  */
 export const IDEMPOTENCY_ENV = "IDEMPOTENCY_KEY";
 
@@ -1301,9 +1307,10 @@ export async function runExec(
   // header sits under the runtime's media type: what the binding wrote out is
   // the author's statement about this process's environment, and an automatic
   // addition that overwrote it would break a sink using its own scheme. Over the
-  // input fields, though — see [`IDEMPOTENCY_ENV`]: an input field that spells
-  // this name is the one thing grammar 9.4 says the key is never part of, and a
-  // delivery a sink cannot dedupe on is the failure the key exists to prevent.
+  // input fields, which no compiled graph puts here — the validator refuses a
+  // composition whose detached sink declares the slot (see [`IDEMPOTENCY_ENV`])
+  // — because a delivery a sink cannot dedupe on is the failure the key exists
+  // to prevent.
   if (context.idempotency_key !== undefined) {
     environment[IDEMPOTENCY_ENV] = context.idempotency_key;
   }

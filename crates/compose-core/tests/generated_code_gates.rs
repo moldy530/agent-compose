@@ -842,7 +842,11 @@ fn the_fan_out_runtime_bounds_orders_and_resolves_every_dispatch() {
             "joined": "",
             "declared": "mine",
             // An input field spelling the same variable is the one thing
-            // grammar 9.4 says the key is never part of, so the delivery wins.
+            // grammar 9.4 says the key is never part of — so the *validator*
+            // refuses that composition (`check::maps`, Decision D66, pinned by
+            // `invalid-check/detached-dispatch-collides-with-its-sinks-delivery-slot`),
+            // and a direct call that reaches this function anyway resolves it
+            // the same way: the delivery wins.
             "collided": "exec_gate/fan/0/1",
             // …and the variable this process was started with is not a key at
             // all: the name grammar 9.4 fixes is a plain one, and a sink that

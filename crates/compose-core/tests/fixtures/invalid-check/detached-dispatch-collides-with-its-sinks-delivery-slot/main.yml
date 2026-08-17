@@ -1,0 +1,48 @@
+# rule: a detached dispatch's idempotency key is never part of its sink's declared input (grammar 9.4, Decision D66)
+# code: conflicting-keys
+# message: the `map` of node `fan` delivers `IDEMPOTENCY_KEY`, which is also where the input field `idempotency_key` of `tool.audit_log` arrives
+# at: main.yml:41:17
+# label: main.yml:30:5 this input field takes the same slot
+# help: a detached dispatch delivers its idempotency key to an `exec:`-bound sink as the `IDEMPOTENCY_KEY` environment variable, and an object input arrives as upper-snake-cased environment variables, so one of the two values would be silently discarded: rename the field, or drop `detach: true` (grammar 9.4, 8.6 rule 7, Decision D66)
+#
+# `tool.audit_log` is an `exec:` sink, so its input object arrives as
+# upper-snake-cased environment variables (grammar 6.1) — and `IDEMPOTENCY_KEY`
+# is the variable grammar 9.4's delivery surface fixes for an `exec:` target.
+# The tool on its own is legal, and so is a joined dispatch of it; what makes
+# the two writers collide is `detach: true`, which is where the diagnostic
+# points.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+state:
+  findings:
+    type: array
+    max_items: 5
+    items: { type: string }
+tool.audit_log:
+  description: Append one finding to the audit log.
+  input:
+    finding: { type: string }
+    idempotency_key: { type: string }
+  output: {}
+  exec:
+    command: audit-log
+flow.f:
+  outputs: {}
+  nodes:
+    fan:
+      map:
+        over: "state.findings"
+        node: tool.audit_log
+        detach: true
+        max_concurrency: 2
+        input:
+          finding: "item"
+          idempotency_key: "item"
+  edges:
+    - { from: start, to: fan }
+    - { from: fan, to: end }

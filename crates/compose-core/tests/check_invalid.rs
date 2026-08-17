@@ -81,6 +81,7 @@ const CHECK_CODES: &[&str] = &[
     "sync-trigger-interrupt",
     "non-dominating-source",
     "unsupported-detach",
+    "conflicting-keys",
 ];
 
 struct Anchor {
