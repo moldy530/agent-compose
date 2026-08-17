@@ -1,0 +1,17 @@
+# rule: `pattern:` is RE2, which has no lookaround (grammar 3.3, Decision D12)
+# code: invalid-value
+# message: `pattern` in the schema of `q` is not a valid regular expression: look-around, including look-ahead and look-behind, is not supported
+# at: 13:33
+# help: `pattern:` is RE2 — no backreferences and no lookaround (grammar 3.3, Decision D12)
+#
+# D12's two exclusions are named by the regex front end rather than enumerated
+# by the parser, so this fixture and its backreference twin are what say the
+# exclusions are really refused rather than merely written down.
+tool.find:
+  description: Finds a thing.
+  input:
+    q: { type: string, pattern: "(?<=a)b" }
+  output:
+    hit: { type: string }
+  exec:
+    command: "true"

@@ -7,6 +7,10 @@
 //! (grammar 10.1). The second clause of the `max_items` rule — an array a
 //! `map.over` path resolves to — needs the resolved composition, so the
 //! validator owns it.
+//!
+//! `pattern:` is RE2 (grammar 3.3, Decision D12), and that too is decidable from
+//! the one node it is written on, so [`is_re2`] refuses a malformed one here
+//! rather than leaving it to a pass that runs only under `build`.
 
 use crate::ast::common::{Ident, Literal, LiteralEntry};
 use crate::ast::schema::{
@@ -404,8 +408,8 @@ fn scalar_form(
             cx,
         )
     {
-        // RE2 syntax is checked by the validator, which owns the regex engine.
-        scalar.pattern = lexical::text(node, &format!("`pattern` in {subject}"), cx);
+        scalar.pattern = lexical::text(node, &format!("`pattern` in {subject}"), cx)
+            .filter(|pattern| is_re2(&pattern.value, &pattern.span, subject, cx));
     }
 
     if let Some(node) = fields.take("format")
@@ -467,6 +471,45 @@ fn scalar_form(
         .inspect(|value| check_default_kind(value, kind, "", subject, cx));
 
     TypeForm::Scalar(scalar)
+}
+
+/// Whether a `pattern:` is a regular expression at all (grammar 3.3,
+/// Decision D12).
+///
+/// RE2 syntax is a **shape** rule of the type node it is written on: it is
+/// decidable from the one file, which `check`'s own account of the split makes
+/// the parser's, and it does not depend on what the composition is later
+/// compiled *to*. A pattern that no engine can parse — `^a{$`, a backreference,
+/// a lookaround — is not a composition that is well formed and unlucky in its
+/// target; it is one `validate` has to refuse, which is the command PRD §7 M0
+/// calls the product's core loop.
+///
+/// `regex_syntax` is the front end of the `regex` crate, so "not RE2 at all"
+/// falls out of it: D12's own two exclusions are reported by name rather than
+/// enumerated here. What is left over for `codegen::pattern` is the narrower
+/// question that really is the target's — a pattern that parses here and that a
+/// JavaScript regular expression cannot hold, or holds differently.
+fn is_re2(pattern: &str, span: &Span, subject: &str, cx: &mut Cx) -> bool {
+    match regex_syntax::ast::parse::Parser::new().parse(pattern) {
+        Ok(_) => true,
+        Err(error) => {
+            cx.push(
+                Diagnostic::error(
+                    DiagnosticCode::InvalidValue,
+                    span.clone(),
+                    format!(
+                        "`pattern` in {subject} is not a valid regular expression: {}",
+                        error.kind()
+                    ),
+                )
+                .with_help(
+                    "`pattern:` is RE2 — no backreferences and no lookaround (grammar 3.3, \
+                     Decision D12)",
+                ),
+            );
+            false
+        }
+    }
 }
 
 fn constraint_applies(

@@ -21,6 +21,14 @@
 //! and [`super::diagnostics`] turns the second answer into a `build` that
 //! refuses rather than a project that will not parse.
 //!
+//! The narrower question is the point. Whether a `pattern:` is a regular
+//! expression **at all** is a shape rule of the type node and is decided by the
+//! parser (`parse::schema`'s `is_re2`), so `validate` refuses `^a{$`, a
+//! backreference and a lookaround on its own. What arrives here is a pattern
+//! every engine can read, and what is asked of it is whether *this target* can
+//! hold it. [`javascript`] still answers for a malformed one, because it is a
+//! total function a library caller may reach without the validator.
+//!
 //! # What is rejected, and why each one
 //!
 //! The walk is over `regex_syntax`'s AST — the same parser the `regex` crate

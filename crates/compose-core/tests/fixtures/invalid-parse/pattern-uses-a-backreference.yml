@@ -1,0 +1,16 @@
+# rule: `pattern:` is RE2, which has no backreferences (grammar 3.3, Decision D12)
+# code: invalid-value
+# message: `pattern` in the schema of `word` is not a valid regular expression: backreferences are not supported
+# at: 14:36
+# help: `pattern:` is RE2 — no backreferences and no lookaround (grammar 3.3, Decision D12)
+#
+# The other half of D12's exclusion list, on an input surface rather than a
+# channel: the rule is the type node's, so where the type node sits does not
+# change it.
+agent.echo:
+  model: model.smart
+  prompt: Echo it back.
+  input:
+    word: { type: string, pattern: "(a)\\1" }
+  output:
+    said: { type: string }
