@@ -128,6 +128,23 @@ const CODEGEN: &[Criterion] = &[
                 "an_agent_node_sends_its_prompt_input_and_output_schema_on_chat_completions",
                 Status::Live,
             ),
+            // What that surface's structured output cannot promise, and what it
+            // still does: an `optional:` property costs `strict`, and the parse
+            // is what holds the answer to the contract instead
+            // (`codegen::runtime`'s divergence ledger).
+            (
+                "a_nested_optional_property_costs_the_strict_decoder_and_not_the_parse",
+                Status::Live,
+            ),
+            // The other two of those three kinds. `azure_openai` and `openai`
+            // differ from `openai_compatible` only in the request — auth header,
+            // route, `api-version` query, `openai-organization` — so a node fn
+            // that compiles them wrong is invisible to every assertion about
+            // what a flow produced.
+            (
+                "each_chat_completions_kind_authenticates_and_routes_the_way_its_row_says",
+                Status::Live,
+            ),
             // The other thing that surface can answer with: a refusal, which
             // carries its reason and is otherwise indistinguishable from a
             // `max_tokens` cut.
@@ -273,6 +290,15 @@ const CODEGEN: &[Criterion] = &[
             // strategy: a fallback replaces the node's own edges (D21).
             (
                 "a_node_timeout_fires_over_a_child_process_and_its_fallback_takes_over",
+                Status::Live,
+            ),
+            // …and over the one activity the runtime does not control: a
+            // grammar 6.1 host function that never looks at `context.signal`.
+            // The other two observe the abort because the runtime spawns and
+            // fetches for them, so only this one decides that the deadline is
+            // raced rather than merely signalled.
+            (
+                "a_node_timeout_fires_over_a_host_function_that_ignores_its_signal",
                 Status::Live,
             ),
             // The criterion's boundary: which errors a policy governs at all.

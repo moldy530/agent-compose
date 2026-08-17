@@ -279,6 +279,14 @@ review the diff.
 /// (PRD 5.5), and the shape of that cost is concrete: the project does not run
 /// until the host has registered an implementation. A reader of the generated
 /// project finds the list here rather than in a runtime error.
+///
+/// The section also states what a `timeout:` means over code the compiler did
+/// not write. The runtime **races** the node's deadline (see `runActivity` in
+/// `src/runtime.ts`), so the node fails on time whatever the implementation does
+/// with `context.signal` — but nothing can unschedule the abandoned call, and a
+/// host that wants the work itself to stop has to observe the signal. That is
+/// the one thing about registering a function which is neither in the grammar
+/// nor visible from the signature.
 fn host_functions(ir: &Ir) -> String {
     let registered = super::graph::host_functions(ir);
     if registered.is_empty() {
@@ -294,14 +302,24 @@ fn host_functions(ir: &Ir) -> String {
     );
     for (name, address) in &registered {
         text.push_str(&format!(
-            "registerFunction({name:?}, async (args) => {{\n  \
+            "registerFunction({name:?}, async (args, context) => {{\n  \
              // the implementation of `{address}`; its arguments have already been\n  \
              // parsed against that tool's declared `input:` schema\n  \
              return {{ /* … its declared `output:` … */ }};\n\
              }});\n"
         ));
     }
-    text.push_str("```\n");
+    text.push_str(
+        "```\n\n\
+         ### What a node's `timeout:` means here\n\n\
+         The second argument carries `context.signal`, which aborts when the node's\n\
+         `timeout:` budget runs out. Observing it is **optional for the node and\n\
+         necessary for the work**: the runtime races the deadline against the call, so\n\
+         the node fails on time and the run moves on whether or not the implementation\n\
+         looks — but nothing can unschedule a call already in flight. An implementation\n\
+         that ignores the signal keeps running after the node it belonged to has failed,\n\
+         and whatever it eventually returns is discarded.\n",
+    );
     text
 }
 
@@ -454,6 +472,59 @@ mod tests {
                 "the README does not document `{package}`"
             );
         }
+    }
+
+    /// A composition with no grammar 6.1 binding gets no host-function section,
+    /// and one with a binding gets the registration it cannot run without —
+    /// under the two-argument signature `src/runtime.ts`'s `HostFunction`
+    /// actually declares, because the second argument is where the node's
+    /// deadline is.
+    #[test]
+    fn a_composition_with_a_function_binding_is_told_what_registering_one_costs() {
+        let plain = readme(&ir_of("version: \"0.1\"\n")).contents;
+        assert!(
+            !plain.contains("## Host functions"),
+            "a composition using no escape hatch is not told about one"
+        );
+
+        let contents = readme(&ir_of(
+            r#"version: "0.1"
+
+tool.rank:
+  description: Rank the candidates by the host's own rule.
+  input:
+    text: { type: string }
+  output:
+    ranked: { type: string }
+  function:
+    name: rank_candidates
+"#,
+        ))
+        .contents;
+        assert!(contents.contains("## Host functions"), "{contents}");
+        assert!(
+            contents.contains("registerFunction(\"rank_candidates\", async (args, context) => {"),
+            "the snippet takes the `RunContext` the registry passes: {contents}"
+        );
+        assert!(
+            contents.contains("the implementation of `tool.rank`"),
+            "{contents}"
+        );
+        // What racing the deadline (`runActivity`) does and does not promise. A
+        // host reading only the signature would take the signal for the whole
+        // mechanism, which is the reading this paragraph exists to refuse.
+        assert!(
+            contents.contains("### What a node's `timeout:` means here"),
+            "{contents}"
+        );
+        assert!(
+            contents.contains("the runtime races the deadline against the call"),
+            "{contents}"
+        );
+        assert!(
+            contents.contains("keeps running after the node it belonged to has failed"),
+            "{contents}"
+        );
     }
 
     #[test]

@@ -189,6 +189,17 @@
 //! stops dropping refinements is the day the choice could be reconsidered, which
 //! is the revisit condition PRD 9.16 names. This comment is the evidence behind
 //! that entry: the measurements above are what the decision was made on.
+//!
+//! One surface cannot keep that equality all the way down, and the gap is
+//! recorded rather than left to be found. OpenAI's structured-output decoder
+//! closes a schema only when every object in it lists every property in
+//! `required`, so an agent whose output nests an `optional:` property (grammar
+//! 3.4) is sent `strict: false` and is constrained by nothing — while the parse
+//! still runs over this module's lowering, unchanged. That row lives in
+//! [`super::runtime`]'s ledger rather than here, because it is a property of the
+//! *request* and not of the lowering: what this module publishes is what goes on
+//! the wire and what the answer is checked against, on both surfaces and at
+//! either `strict`.
 
 use std::borrow::Cow;
 

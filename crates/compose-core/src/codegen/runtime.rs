@@ -21,6 +21,22 @@
 //! and what an agent node contributes to the conversation channel — are argued
 //! in the emitted file's own header, where a reader of a generated project
 //! finds them.
+//!
+//! # The divergence ledger
+//!
+//! What the *wire* cannot be asked to do, in the ledger style [`super::cel`],
+//! [`super::schema`] and [`super::graph`] use: a difference between what the
+//! compiler promises and what a provider surface will accept, signed off on
+//! rather than re-derived.
+//!
+//! | id | where | which way | why it is left |
+//! |---|---|---|---|
+//! | `strict-is-refused-by-an-optional-property` | an agent's `output:` on the Chat Completions surface, when any object in it declares `optional:` | the request carries `strict: false`, so the decoder is **not** constrained by the schema its answer is then parsed with | OpenAI's structured-output decoder closes a schema only when every object in it lists every property in `required` and sets `additionalProperties: false`, all the way down (`crates/mock-provider/WIRE-NOTES.md` (13), which is also what the mock enforces); `optional:` (grammar 3.4) is exactly the construct that breaks the first, and a result schema refuses `default:` (grammar 3.9) so `optional:` is the only way in. The three ways out are all worse. Sending `strict: true` anyway is a 400 — the composition would not run at all. Rewriting the property to the `["string", "null"]`-and-required shape OpenAI documents would make the schema the model is constrained by different from the schema its answer is parsed with, which is the one property PRD 9.16 says must hold and the whole reason `withStructuredOutput` was refused. Refusing the composition at `build` would make a legal grammar unbuildable on three of grammar 12.1's six kinds over a construct the Messages API has no trouble with — `tool_choice` pins the tool and the schema goes on the wire whole. So the parse stays the contract: the emitted node function answers `<agent>Output.parse(…)` over [`super::schema`]'s Zod, which is the same schema at either `strict`, and an unconstrained model that misses it is a node error rather than a bad write. `a_nested_optional_property_costs_the_strict_decoder_and_not_the_parse` pins both halves |
+//!
+//! The row is reachable from ordinary grammar, which is why it is pinned rather
+//! than left to be discovered: `agent-openai`'s `flow.triage` is the shape, and
+//! the acceptance test named above asserts the `strict: false` on the recorded
+//! request *and* that the run still refuses an answer the schema does not admit.
 
 use crate::ir::Ir;
 

@@ -85,6 +85,10 @@ use serde_json::{Value, json};
 const SONNET: &str = "claude-sonnet-4-6";
 const HAIKU: &str = "claude-haiku-4-5";
 const LOCAL: &str = "qwen3-coder-30b";
+/// The `provider-kinds` fixture's two models: one per Chat Completions kind that
+/// is neither `openai_compatible` nor already bound elsewhere.
+const AZURE_HOSTED: &str = "gpt-4o-mini";
+const OPENAI_DIRECT: &str = "gpt-4o";
 
 // ---------------------------------------------------------------------------
 // PRD §7 M1, bullet 3 — "Mock provider server + e2e harness". Live.
@@ -857,6 +861,193 @@ fn an_agent_node_sends_its_prompt_input_and_output_schema_on_chat_completions() 
         json!(["approve", "revise"])
     );
     assert_eq!(run.outputs()["verdict"], "revise");
+    assert!(provider.snapshot().is_drained());
+}
+
+/// What an `optional:` property costs on this surface, and what it does not.
+///
+/// OpenAI's structured-output decoder closes a schema only when every object in
+/// it lists every property in `required`, so an agent whose output nests an
+/// object with `optional:` is sent `strict: false` — the model is *not*
+/// constrained by the schema its answer is then parsed with, which is the one
+/// property PRD 9.16 calls load-bearing. `codegen::runtime`'s
+/// `strict-is-refused-by-an-optional-property` row is where that is signed off
+/// on, with the three alternatives and why each is worse; this is the test the
+/// row names, and it pins both halves of it.
+///
+/// The second half is what keeps the degradation bounded. An unconstrained model
+/// can answer something the schema does not admit — here a `meta` carrying a
+/// property nothing declared, which a closed decoder could not have produced —
+/// and the emitted Zod is what refuses it. The contract moves from the decoder
+/// to the parse; it does not stop being enforced.
+#[test]
+fn a_nested_optional_property_costs_the_strict_decoder_and_not_the_parse() {
+    let provider = MockProvider::start().expect("a loopback port");
+    // `owner` omitted — the property whose being `optional:` is what costs the
+    // strict decoder, answered the way the author said it may be.
+    provider.enqueue(Script::new(
+        LOCAL,
+        Outcome::structured(json!({ "verdict": "revise", "meta": { "severity": "high" } })),
+    ));
+
+    let Some(run) = harness::invoke(
+        "agent-openai",
+        "flow.triage",
+        &[("report", "the build is red")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(run.outputs()["meta"], json!({ "severity": "high" }));
+
+    let recorded = provider.requests();
+    assert_eq!(recorded.len(), 1);
+    let call = &recorded[0];
+    assert!(call.is_valid(), "{:?}", call.failures());
+    let Some(StructuredOutput::JsonSchema { schema, strict, .. }) = call.structured_output.as_ref()
+    else {
+        panic!(
+            "this surface asks with `response_format` (WIRE-NOTES (3)): {:?}",
+            call.structured_output
+        );
+    };
+    assert_eq!(
+        schema["properties"]["meta"]["required"],
+        json!(["severity"]),
+        "the schema on the wire is the whole one, `optional:` included"
+    );
+    assert!(
+        !*strict,
+        "…and a schema with a property outside `required` is one OpenAI's decoder \
+         cannot be asked to close (`strict-is-refused-by-an-optional-property`)"
+    );
+
+    // The other half of the row. The model was unconstrained, so it can answer
+    // what the schema does not admit — and the emitted Zod is what refuses it,
+    // before any edge is evaluated (PRD 5.2).
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        LOCAL,
+        Outcome::structured(json!({
+            "verdict": "revise",
+            "meta": { "severity": "high", "assignee": "nobody" },
+        })),
+    ));
+    let unconstrained = harness::invoke(
+        "agent-openai",
+        "flow.triage",
+        &[("report", "the build is red")],
+        &provider,
+    )
+    .expect("the toolchain was there a moment ago");
+    let failure = unconstrained.failed();
+    assert!(
+        failure.contains("triage"),
+        "the node whose answer did not parse is named: {failure}"
+    );
+    assert!(
+        failure.contains("assignee"),
+        "…and so is the property the schema does not declare: {failure}"
+    );
+}
+
+/// The two Chat Completions kinds the fixture above does not reach, each
+/// authenticating and routing the way grammar 12.1's row for it says.
+///
+/// `openai_compatible` is one of three kinds that speak this surface, and the
+/// other two differ from it *only* in the request — which is precisely the
+/// difference an outputs assertion cannot see, and precisely what codegen can
+/// get wrong. `azure_openai` sends the credential as `api-key:` (a request that
+/// authenticates the direct way is answered 401 by the mock, as
+/// `an_azure_request_without_a_subscription_key_is_refused` pins), reaches
+/// `/openai/v1/chat/completions`, and carries `api_version:` in the query;
+/// `kind: openai` sends a bearer token and the `organization:` of its own row as
+/// `openai-organization:`. Four runtime branches, emitted-but-unrun until here.
+///
+/// This is the same argument
+/// `an_agent_node_sends_its_prompt_input_and_output_schema_on_chat_completions`
+/// makes for itself, one level down: a kind that never runs a compiled graph is
+/// a kind whose regression ships green.
+#[test]
+fn each_chat_completions_kind_authenticates_and_routes_the_way_its_row_says() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(
+            AZURE_HOSTED,
+            Outcome::structured(json!({ "verdict": "revise", "feedback": "tighten it" })),
+        ),
+        Script::new(
+            OPENAI_DIRECT,
+            Outcome::structured(json!({ "summary": "the reviewer asked for one change" })),
+        ),
+    ]);
+
+    let Some(azure) = harness::invoke(
+        "provider-kinds",
+        "flow.azure",
+        &[("goal", "ship it")],
+        &provider,
+    ) else {
+        return;
+    };
+    azure.succeeded();
+    assert_eq!(azure.outputs()["verdict"], "revise");
+
+    let direct = harness::invoke(
+        "provider-kinds",
+        "flow.direct",
+        &[("notes", "tighten it")],
+        &provider,
+    )
+    .expect("the toolchain was there a moment ago");
+    direct.succeeded();
+    assert_eq!(
+        direct.outputs()["summary"],
+        "the reviewer asked for one change"
+    );
+
+    let recorded = provider.requests();
+    assert_eq!(recorded.len(), 2, "one agent node each");
+
+    let hosted = &recorded[0];
+    assert!(hosted.is_valid(), "{:?}", hosted.failures());
+    assert_eq!(hosted.surface, Surface::AzureOpenAi);
+    assert_eq!(hosted.model, AZURE_HOSTED);
+    assert_eq!(
+        hosted.path, "/openai/v1/chat/completions",
+        "`azure_openai` has its own route (WIRE-NOTES §7)"
+    );
+    assert_eq!(
+        hosted.query, "api-version=2024-10-21",
+        "…and its `api_version:` rides the query string"
+    );
+    assert_eq!(
+        hosted.headers["api-key"], "mock-provider-key",
+        "…and the credential is a subscription key, not a bearer token"
+    );
+    assert!(
+        !hosted.headers.contains_key("authorization"),
+        "the direct spelling is not sent beside it: {:?}",
+        hosted.headers
+    );
+
+    let plain = &recorded[1];
+    assert!(plain.is_valid(), "{:?}", plain.failures());
+    assert_eq!(plain.surface, Surface::OpenAi);
+    assert_eq!(plain.model, OPENAI_DIRECT);
+    assert_eq!(plain.path, "/v1/chat/completions");
+    assert_eq!(plain.query, "", "`api-version` belongs to Azure alone");
+    assert_eq!(plain.headers["authorization"], "Bearer mock-provider-key");
+    assert_eq!(
+        plain.headers["openai-organization"], "org-acceptance",
+        "the optional `organization:` of grammar 12.1's `openai` row"
+    );
+    assert!(
+        !plain.headers.contains_key("api-key"),
+        "…and not the Azure spelling: {:?}",
+        plain.headers
+    );
     assert!(provider.snapshot().is_drained());
 }
 
@@ -2420,6 +2611,74 @@ fn a_node_timeout_fires_over_a_child_process_and_its_fallback_takes_over() {
             .is_some_and(|error| error.contains("after 1 attempt(s)")),
         "the message counts what the trace counts: {}",
         slow[0]["error"]
+    );
+}
+
+/// The same budget once more, over the one activity the runtime does not
+/// control: a grammar 6.1 `function:` binding whose host implementation never
+/// looks at `context.signal`.
+///
+/// Neither test above decides this. `exec:` and `http:` observe the abort
+/// because the runtime is what spawns and fetches for them, so a deadline that
+/// only *signalled* — handing `context.signal` to the activity and trusting it
+/// — would still pass both. A host function is arbitrary caller code, and so is
+/// a host-implemented tool called inside an agent's tool loop, which reaches
+/// `invoke` with this same context; grammar 9.2 bounds "one node execution" and
+/// names no kind that is exempt. So `runActivity` **races** the deadline against
+/// the activity, and the node fails on time whatever the implementation does.
+///
+/// What racing cannot do is stop the work, and the assertion is about that
+/// boundary. The host answers `too late` two seconds into a 300ms budget: a
+/// cooperative-only deadline would let the node complete and write that string,
+/// while a raced one fails the node at 300ms and *discards* the value when it
+/// arrives. `rescued` is the fallback's, so only the second reading produces it.
+#[test]
+fn a_node_timeout_fires_over_a_host_function_that_ignores_its_signal() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let Some(run) = harness::invoke_hosted(
+        "activities",
+        "flow.stubborn",
+        &json!({}),
+        &harness::environment(&provider),
+        // No mention of `context.signal` anywhere in here, which is the point:
+        // this is what an ordinary host implementation looks like.
+        Some(
+            r#"import { registerFunction } from "./src/runtime.ts";
+registerFunction("rank_candidates", async () => {
+  await new Promise((resolve) => setTimeout(resolve, 2000));
+  return { ranked: "too late" };
+});
+"#,
+        ),
+    ) else {
+        return;
+    };
+    run.succeeded();
+
+    assert_eq!(
+        run.outputs()["report"],
+        "rescued",
+        "the node failed at its deadline, so the abandoned call's answer was \
+         discarded rather than written"
+    );
+    assert_eq!(run.visited(), ["call", "rescue"]);
+    let call = run.entries("call");
+    assert_eq!(call[0]["outcome"], "failed", "{}", call[0]);
+    assert_eq!(call[0]["fallback"], "rescue", "{}", call[0]);
+    // One attempt, and the budget is what ended it — not a host function that
+    // threw, which would reach the same `outcome` by a different route.
+    assert_eq!(call[0]["attempts"], json!(1));
+    assert!(
+        call[0]["error"]
+            .as_str()
+            .is_some_and(|error| { error.contains("timed out") && error.contains("300ms budget") }),
+        "the trace names the budget that ended it: {}",
+        call[0]["error"]
+    );
+    assert!(
+        call[0]["routing"].is_null(),
+        "a fallback is taken *instead of* the node's own edges: {}",
+        call[0]
     );
 }
 

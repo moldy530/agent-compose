@@ -17,6 +17,11 @@
 #   * `flow.deadline` — a node whose `timeout:` runs out while a child process
 #     sleeps, and whose `on_error: { fallback: … }` schedules another node instead
 #     of evaluating its own edges (grammar 9.2, Decision D21).
+#   * `flow.stubborn` — the same budget over the one activity that is arbitrary
+#     caller code: a `function:` binding (grammar 6.1) whose host implementation
+#     never looks at `context.signal`. Grammar 9.2 bounds one node execution with
+#     no exemption for a kind, so the node fails on time and its fallback takes
+#     over while the abandoned call is still running.
 #   * `flow.plumbing` — how an inline node's parameters reach the process and the
 #     wire: `input:` bindings arriving as upper-snake-cased environment variables
 #     beside the block's own `env:`, a scalar `input:` arriving on stdin, and the
@@ -340,6 +345,42 @@ flow.deadline:
   edges:
     - { from: start, to: slow }
     - { from: slow, to: end }
+    - { from: rescue, to: end }
+
+flow.stubborn:
+  description: A host function that ignores its signal, and the budget anyway.
+  outputs:
+    report:
+      type: string
+  nodes:
+    # The escape hatch under a deadline. `exec:` and `http:` both observe
+    # `context.signal` because the runtime is what spawns and fetches for them;
+    # a `function:` implementation is the host's own code and need not. The
+    # budget bounds the **node** either way (grammar 9.2), which it can only do
+    # by racing the deadline rather than by signalling it — so what this flow
+    # decides is that `slow`'s twin in `flow.deadline` was not passing because
+    # the child happened to die.
+    call:
+      function: tool.rank
+      input:
+        text: "'candidates'"
+      writes:
+        ranked: report
+      timeout: 300ms
+      on_error: { fallback: rescue }
+
+    rescue:
+      exec:
+        command: printf
+        args: ["%s", "rescued"]
+        output:
+          stdout: { type: string }
+      writes:
+        stdout: report
+
+  edges:
+    - { from: start, to: call }
+    - { from: call, to: end }
     - { from: rescue, to: end }
 
 flow.plumbing:

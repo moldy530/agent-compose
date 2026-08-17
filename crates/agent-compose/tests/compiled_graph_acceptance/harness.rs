@@ -107,6 +107,7 @@ pub const FIXTURES: &[&str] = &[
     "fanout",
     "http-trigger",
     "model-failover",
+    "provider-kinds",
     "stores",
 ];
 

@@ -214,6 +214,25 @@ const sleep = (ms: number, signal: AbortSignal): Promise<void> =>
     signal.addEventListener("abort", onAbort, { once: true });
   });
 
+/**
+ * A promise that never resolves and rejects with `signal`'s reason when it
+ * aborts.
+ *
+ * The half of a deadline an `AbortSignal` alone cannot supply: something to
+ * *race*. See [`runActivity`].
+ */
+function untilAborted(signal: AbortSignal): Promise<never> {
+  return new Promise<never>((_, reject) => {
+    const fail = () =>
+      reject(signal.reason instanceof Error ? signal.reason : new Error("aborted"));
+    if (signal.aborted) {
+      fail();
+      return;
+    }
+    signal.addEventListener("abort", fail, { once: true });
+  });
+}
+
 /** The delay before attempt `attempt` (1 = the first retry), per grammar 9.1. */
 export function backoffFor(policy: RetryPolicy, attempt: number): number {
   const raw = policy.backoffMs * policy.multiplier ** (attempt - 1);
@@ -230,6 +249,26 @@ export function backoffFor(policy: RetryPolicy, attempt: number): number {
  * Answers the activity's value, or throws — `on_error` is the router's to
  * apply, because `skip` and `fallback` are routing outcomes rather than values
  * (grammar 9.2, Decision D97).
+ *
+ * # The deadline is raced, not merely signalled
+ *
+ * `context.signal` is the **cooperative** half of the budget, and the activities
+ * that observe it stop on time: `fetch` rejects when its signal aborts, and a
+ * spawned child is killed and its promise rejected. It cannot be the whole
+ * mechanism, because one activity is arbitrary caller code — a `function:`
+ * binding (grammar 6.1), whether it is the node itself or a tool called inside
+ * an agent's loop — and a host implementation that never looks at
+ * `context.signal` would otherwise run to completion and write its result long
+ * after the budget it was given. Grammar 9.2 bounds **one node execution** with
+ * no exemption for a kind, so the deadline is raced against the activity: the
+ * node fails on time whatever the activity does about the signal.
+ *
+ * What racing does not do is *stop* the work. An abandoned host function keeps
+ * running to whatever it was going to do, and JavaScript offers no way to
+ * unschedule it; what the node stops doing is waiting for it, and its value is
+ * discarded when it arrives. That is the whole of what a timeout can mean here,
+ * and the generated `README.md` says so where a host reads about registering
+ * one.
  */
 export async function runActivity<T>(
   flow: string,
@@ -256,6 +295,13 @@ export async function runActivity<T>(
           expired = true;
           controller.abort(new NodeTimeout(node, budget, made));
         }, budget);
+  // One rejection for the whole call rather than one per attempt: its listener
+  // is registered before any activity starts, so it is the *first* reaction to
+  // the abort and the reason a race sees is the `NodeTimeout` rather than
+  // whatever the activity made of the signal. `Promise.race` attaches a handler
+  // to it on every attempt, so a rejection nobody is waiting on is still a
+  // handled one.
+  const expiry = budget === undefined ? undefined : untilAborted(controller.signal);
 
   try {
     let last: unknown;
@@ -263,7 +309,15 @@ export async function runActivity<T>(
       if (expired) break;
       made = attempt;
       try {
-        const value = await activity({ execution, signal: controller.signal, node });
+        const running = activity({ execution, signal: controller.signal, node });
+        // The loser of the race rejects with nobody awaiting it — an activity
+        // that observes the abort, after the deadline has already answered for
+        // the node — and in Node an unhandled rejection ends the process. This
+        // is the handler that keeps an abandoned activity from taking the run
+        // down with it.
+        if (expiry !== undefined) running.catch(() => {});
+        const value =
+          expiry === undefined ? await running : await Promise.race([running, expiry]);
         return { value, attempts: attempt };
       } catch (error) {
         last = error;
@@ -407,7 +461,25 @@ export interface ModelAnswer {
  */
 const ANTHROPIC_MAX_TOKENS = 4096;
 
-/** Whether OpenAI's structured-output decoder can be asked to close this schema. */
+/**
+ * Whether OpenAI's structured-output decoder can be asked to close this schema.
+ *
+ * `strict: true` is a promise the *service* checks: every object closed with
+ * `additionalProperties: false`, and every declared property listed in
+ * `required`, all the way down (`WIRE-NOTES` (13)). A schema that breaks either
+ * is answered 400 rather than decoded loosely, so asking for it here would make
+ * a legal composition unrunnable.
+ *
+ * Answering `false` is not free, and what it costs is written down rather than
+ * discovered: under `strict: false` the decoder is not constrained by the schema
+ * at all, so the model can answer something the emitted Zod then refuses — the
+ * one property PRD 9.16 makes structured output load-bearing for. The
+ * compiler's `codegen::runtime` module records that as
+ * `strict-is-refused-by-an-optional-property`, with the alternatives and why
+ * each is worse. The reachable way in is `optional:` on an object nested in an
+ * agent's `output:`; the contract then lives in the parse, which runs over the
+ * same schema either way.
+ */
 function strictable(schema: unknown): boolean {
   if (typeof schema !== "object" || schema === null) return true;
   const object = schema as Record<string, unknown>;
