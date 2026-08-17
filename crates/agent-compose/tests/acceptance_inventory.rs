@@ -66,15 +66,36 @@ enum Status {
 /// PRD §7 M1's first bullet, decomposed into the ten items its own sentence
 /// lists, in order.
 const CODEGEN: &[Criterion] = &[
-    // The emission half of this criterion has landed: `build` writes the state
-    // model and the Zod discriminated unions, and `compose-core`'s golden corpus
-    // and generated-code gates check both against the pinned toolchain on every
-    // `cargo test`. Both rows stay pending because both tests are about a
-    // *running* graph, which is what these reasons now name.
+    // Four tests, because this criterion splits three ways and only the first
+    // two are decidable now.
+    //
+    // The **emission** half has landed and is claimed here: `build` writes the
+    // state model and the Zod discriminated unions, and the two live rows decide
+    // that through the real command. The **execution** half — that those channel
+    // specs reduce the way their policies say, and that the union refuses a tag
+    // it does not declare — is decided on every `cargo test` by `compose-core`'s
+    // `tests/generated_code_gates.rs`, which invokes the compiled graph under the
+    // pinned LangGraph and runs the schema corpus through both columns of grammar
+    // 3.8's table. It is not a row here because this file maps
+    // `tests/compiled_graph_acceptance.rs`, and pointing a row at another crate's
+    // test would make the status column mean two different things.
+    //
+    // What is left pending is the half that needs a *flow*: the declared defaults
+    // read back as a flow's outputs, and a bad tag failing a run by name. Both
+    // wait on commands this milestone has not built, which is what their reasons
+    // say.
     Criterion {
         bullet: Bullet::Codegen,
         phrase: "state models (incl. tagged unions via Zod)",
         tests: &[
+            (
+                "the_state_model_carries_every_channels_type_default_and_reduce_policy",
+                Status::Live,
+            ),
+            (
+                "a_tagged_union_output_is_emitted_as_a_discriminated_union_narrowed_per_variant",
+                Status::Live,
+            ),
             (
                 "state_channels_carry_their_declared_types_and_defaults",
                 Status::Pending("pending: `agent-compose run` must execute the emitted graph"),

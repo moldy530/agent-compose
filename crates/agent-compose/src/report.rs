@@ -126,6 +126,23 @@ pub(crate) fn build_json(
     Ok(text)
 }
 
+/// Everything one `build` run has to report, apart from where it ran.
+pub(crate) struct Built<'a> {
+    /// What the validator and then codegen had to say, in source order.
+    pub(crate) diagnostics: &'a [Diagnostic],
+    /// How the output directory disagrees, under `--check`.
+    pub(crate) drift: &'a [crate::build::Drift],
+    /// What was written, when anything was.
+    pub(crate) wrote: Option<&'a crate::build::Written>,
+    /// Whether the diagnostics are codegen's rather than the validator's.
+    ///
+    /// The two refuse for different reasons and a reader who has just seen
+    /// `validate` say the file is fine should not now be told it is not: a
+    /// pattern this target cannot express is a composition that is valid and
+    /// cannot be compiled *here* (see `compose_core::codegen::diagnostics`).
+    pub(crate) target_only: bool,
+}
+
 /// `build`'s one-line verdict, plus a line per drifted file.
 ///
 /// The drift lines come first and each names one file and how it disagrees, so a
@@ -134,11 +151,15 @@ pub(crate) fn build_verdict(
     entrypoint: &Path,
     target: &str,
     out: &Path,
-    diagnostics: &[Diagnostic],
-    drift: &[crate::build::Drift],
-    wrote: Option<usize>,
+    built: &Built<'_>,
     color: bool,
 ) -> String {
+    let Built {
+        diagnostics,
+        drift,
+        wrote,
+        target_only,
+    } = *built;
     let renderer = if color {
         Renderer::styled()
     } else {
@@ -149,16 +170,48 @@ pub(crate) fn build_verdict(
     // An invalid composition is reported as `validate` reports it: the emission
     // never happened, and the reason is the diagnostics above this line.
     if !diagnostics.is_empty() {
-        return verdict(entrypoint, target, diagnostics, color);
+        if !target_only {
+            return verdict(entrypoint, target, diagnostics, color);
+        }
+        return format!(
+            "{}\n",
+            renderer.render(&[Group::with_title(
+                Level::ERROR.primary_title(
+                    format!(
+                        "`{}` is valid and cannot be compiled for `{target}`: {}",
+                        entrypoint.display(),
+                        plural(diagnostics.len(), "error")
+                    )
+                    .as_str()
+                )
+            )])
+        );
     }
 
     let out = out.display();
     let (level, title) = match (drift.is_empty(), wrote) {
-        (true, Some(count)) => (
+        (true, Some(written)) => (
             Level::NOTE.no_name(),
             format!(
-                "wrote {} to `{out}` (target `{target}`)",
-                plural(count, "file")
+                "wrote {} to `{out}` (target `{target}`){}",
+                plural(written.files, "file"),
+                // A removal is the one thing a build does that the caller did not
+                // ask for by name, so it is said out loud rather than left for a
+                // later `git status`.
+                if written.removed.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        ", and removed {} it no longer emits: {}",
+                        plural(written.removed.len(), "generated file"),
+                        written
+                            .removed
+                            .iter()
+                            .map(|path| format!("`{path}`"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                }
             ),
         ),
         (true, None) => (

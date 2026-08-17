@@ -508,8 +508,120 @@ fn a_scripted_delay_makes_completion_order_differ_from_item_order() {
 }
 
 // ---------------------------------------------------------------------------
-// PRD §7 M1, bullet 1 — "IR → deterministic LangGraph TypeScript". Pending.
+// PRD §7 M1, bullet 1 — "IR → deterministic LangGraph TypeScript".
+// The state model has landed; everything below it is pending.
 // ---------------------------------------------------------------------------
+
+/// Every `state:` channel reaches the emitted state model with its declared
+/// type, its `default:` as an initial value, and its `reduce:` policy as a
+/// reducer (grammar 10.1, 10.2, 7.6.4).
+///
+/// This is the emission half of "state models", decided through the real
+/// command. The other half — that those channel specs *behave* — is
+/// `compose-core`'s `tests/generated_code_gates.rs`, which invokes the compiled
+/// graph under the pinned LangGraph and compares the state at quiescence against
+/// what the policies say (`the_emitted_state_model_reduces_the_way_its_policies_say`).
+/// What neither can reach from here is the third half, which
+/// `state_channels_carry_their_declared_types_and_defaults` names: a *flow*
+/// returning them, which needs `agent-compose run`.
+#[test]
+fn the_state_model_carries_every_channels_type_default_and_reduce_policy() {
+    let built = harness::build("agent-anthropic", "local");
+    built.succeeded();
+    let state = built.read("src/state.ts");
+    let schemas = built.read("src/schemas.ts");
+
+    // Two defaulted channels of different types: the typed default is the
+    // literal the spec wrote, not its string spelling.
+    assert!(
+        state.contains("default: () => \"approve\","),
+        "the enum channel's `default: approve` is its initial value:\n{state}"
+    );
+    assert!(
+        state.contains("default: () => 1,"),
+        "the integer channel's default is the number `1`, not `\"1\"`:\n{state}"
+    );
+    assert!(
+        state.contains("default: () => \"none yet\","),
+        "the string channel's default is its initial value:\n{state}"
+    );
+
+    // `reduce: append` is the one policy whose update type differs from the
+    // channel type: a write supplies one element (grammar 10.2, D58), and the
+    // channel starts at the policy's identity element rather than unset.
+    assert!(
+        state.contains(
+            "notes: Annotation<z.infer<typeof stateNotes>, z.infer<typeof stateNotes>[number]>({"
+        ),
+        "an `append` channel takes one element per write:\n{state}"
+    );
+    assert!(
+        state.contains("reducer: (left, right) => left.concat([right]),"),
+        "and appends it in write order:\n{state}"
+    );
+    assert!(
+        state.contains("default: () => [],"),
+        "starting from the empty array:\n{state}"
+    );
+
+    // The declared type is the schema, not a restatement of it.
+    assert!(
+        schemas.contains("export const stateVerdict = z.enum([\"approve\", \"revise\"])"),
+        "the channel's type is lowered per grammar 3.8:\n{schemas}"
+    );
+    assert!(
+        schemas.contains(".default(\"approve\");"),
+        "carrying its `default:` into the schema as well as into the channel:\n{schemas}"
+    );
+    assert!(
+        schemas.contains("export const stateNotes = z.array(z.string()).max(8)"),
+        "including the array's bound:\n{schemas}"
+    );
+}
+
+/// A tagged union reaches the emitted schemas as a `z.discriminatedUnion` whose
+/// variants are narrowed one by one and closed (PRD 5.2, grammar 3.7).
+///
+/// The emission half of the same criterion, over the shape the fan-out example
+/// is built on. That the schema then *refuses* a tag it does not declare is
+/// `compose-core`'s `the_emitted_zod_agrees_with_the_json_schema_lowering`, which
+/// runs exactly that document through both columns of grammar 3.8's table; that
+/// the refusal becomes a *run* failure naming the tag is what
+/// `a_tagged_union_output_is_narrowed_per_variant_and_a_bad_tag_is_rejected`
+/// waits on a node function for.
+#[test]
+fn a_tagged_union_output_is_emitted_as_a_discriminated_union_narrowed_per_variant() {
+    let built = harness::build("fanout", "local");
+    built.succeeded();
+    let schemas = built.read("src/schemas.ts");
+
+    assert!(
+        schemas.contains("z.discriminatedUnion(\"kind\", ["),
+        "the union is discriminated on its declared tag field:\n{schemas}"
+    );
+    for (tag, field) in [
+        ("auto_fixable", "hint: z.string()"),
+        ("needs_human", "severity: z.enum(["),
+    ] {
+        let variant = format!("kind: z.literal(\"{tag}\"),");
+        assert!(
+            schemas.contains(&variant),
+            "the variant `{tag}` is pinned to its tag:\n{schemas}"
+        );
+        let payload = schemas
+            .split(&variant)
+            .nth(1)
+            .expect("the variant was just found");
+        let payload = payload
+            .split("}).strict()")
+            .next()
+            .expect("a closed variant");
+        assert!(
+            payload.contains(field),
+            "and carries its own payload `{field}`, not another variant's:\n{payload}"
+        );
+    }
+}
 
 /// State channels carry their declared types, defaults, and reduce policies into
 /// the running graph.

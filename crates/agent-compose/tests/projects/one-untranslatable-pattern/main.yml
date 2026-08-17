@@ -1,0 +1,16 @@
+# A composition `validate` accepts and `build` cannot compile.
+#
+# `pattern:` is RE2 (Decision D12) and both of these are RE2. Neither is a
+# JavaScript regular expression: `(?i)` is a syntax error there, and `(?P<…>`
+# is RE2's spelling of a named group rather than ECMAScript's. Copying either
+# into `src/schemas.ts` produces a module no runtime can load — so `build`
+# refuses, with a span, rather than exiting `0` over it.
+#
+# `slug` is the control: a pattern using the vocabulary both engines share, in
+# the same file, so a check that refused everything would fail this fixture too.
+version: "0.1"
+
+state:
+  slug:  { type: string, pattern: "^(?<word>[a-z]+)-\\d{4}$" }
+  loud:  { type: string, pattern: "(?i)^abc$" }
+  named: { type: string, pattern: "(?P<word>[a-z]+)" }

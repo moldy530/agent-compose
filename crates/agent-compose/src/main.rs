@@ -18,9 +18,13 @@
 //! It runs `validate` first and emits **only** on a clean report — generated
 //! code is a build artifact of a valid composition, and emitting from a broken
 //! one would produce a project whose failures are the spec's, reported by `tsc`
-//! instead of by the compiler that has spans to point at. The work is all
-//! `compose-core`'s; what lives here is the surface — argument parsing, the
-//! choice of report format, writing the files, and the exit code.
+//! instead of by the compiler that has spans to point at. A clean report is then
+//! asked a second question, which `validate` never asks: whether *this target*
+//! can express the composition (`compose_core::target_diagnostics`). `pattern:`
+//! is RE2 and RE2 is not a subset of ECMAScript, so a composition can be valid
+//! and have no TypeScript project. The work is all `compose-core`'s; what lives
+//! here is the surface — argument parsing, the choice of report format, writing
+//! the files, and the exit code.
 //!
 //! # Exit codes
 //!
@@ -31,11 +35,13 @@
 //! | `2` | the command could not run: bad usage, an unreadable entrypoint, or an output directory that could not be written |
 //!
 //! The split between `1` and `2` is the difference between *the composition is
-//! wrong* and *there was no composition to look at*. A missing `imports:` entry
-//! is the composition's problem and exits `1` with a diagnostic naming the file;
-//! an entrypoint that is not a readable file is the command's own precondition
-//! and exits `2` with a plain message, because there is no span to point at.
-//! Argument errors are clap's, which exits `2` for them already.
+//! wrong* and *the command could not be run against it*. A missing `imports:`
+//! entry is the composition's problem and exits `1` with a diagnostic naming the
+//! file; an entrypoint that is not a readable file, or an `--out` whose `src/`
+//! holds files this compiler did not write (see [`build::write`]), is the
+//! command's own precondition and exits `2` with a plain message, because there
+//! is no span to point at. Argument errors are clap's, which exits `2` for them
+//! already.
 //!
 //! `build --check` uses the same three codes for the same three meanings: `1` is
 //! "the answer is no" — the composition is invalid, or the directory no longer
@@ -217,6 +223,13 @@ fn validate(entrypoint: &Path, target: &str, format: Format) -> ExitCode {
 /// warning included. Generated code is a build artifact of a valid composition
 /// (PRD 5.12), and a project emitted from one the compiler had something to say
 /// about would report that thing again, later, as a `tsc` error with no span.
+///
+/// A clean validation is not on its own enough to emit: `validate` answers "is
+/// this composition well formed", which is target-independent, and codegen has
+/// its own preconditions about what *this* target can express. Those are
+/// `compose_core::target_diagnostics`, and they join the same report, so the two
+/// are one verdict and one exit code rather than two passes a caller has to
+/// remember to run in order.
 fn build_project(
     entrypoint: &Path,
     target: &str,
@@ -228,7 +241,27 @@ fn build_project(
         return fail(&reason);
     }
 
-    let (diagnostics, ir) = analyse(entrypoint, target);
+    let (validation, ir) = analyse(entrypoint, target);
+    // What the *target* cannot express, over a composition the validator
+    // accepted: `pattern:` is RE2 and RE2 is not a subset of ECMAScript, so a
+    // legal pattern can be one no JavaScript regular expression holds
+    // (`compose_core::codegen::diagnostics`). It is asked only once validation
+    // is clean, because a composition that does not resolve has no artifact to
+    // ask about, and a second report about the same broken file would bury the
+    // first.
+    let mut report = Diagnostics::new();
+    report.extend(validation);
+    let validated = report.is_empty();
+    if let (Some(ir), true) = (&ir, validated) {
+        report.extend(compose_core::target_diagnostics(ir));
+    }
+    report.sort();
+    let diagnostics = report.into_vec();
+    // A composition that validated and still has something reported against it
+    // is one this target cannot express, which is a different sentence from
+    // "not valid" — see `report::build_verdict`.
+    let target_only = validated && !diagnostics.is_empty();
+
     let project = match (&ir, diagnostics.is_empty()) {
         (Some(ir), true) => Some(compose_core::emit(ir)),
         _ => None,
@@ -246,8 +279,22 @@ fn build_project(
     let wrote = match (&project, checking) {
         (Some(project), false) => match build::write(project, out) {
             Ok(written) => Some(written),
-            Err(error) => {
+            Err(build::Refusal::Io(error)) => {
                 return fail(&format!("cannot write `{}`: {error}", out.display()));
+            }
+            Err(build::Refusal::NotOurs(paths)) => {
+                return fail(&format!(
+                    "`{}` holds {} this compiler did not write ({}), and `src/` is a directory \
+                     `build` owns outright: it replaces what it emits and removes the rest. Point \
+                     `--out` at a directory of its own, or move those files out of `src/`",
+                    out.display(),
+                    if paths.len() == 1 { "a file" } else { "files" },
+                    paths
+                        .iter()
+                        .map(|path| format!("`{path}`"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ));
             }
         },
         _ => None,
@@ -257,6 +304,12 @@ fn build_project(
         CLEAN
     } else {
         REPORTED
+    };
+    let built = report::Built {
+        diagnostics: &diagnostics,
+        drift: &drift,
+        wrote: wrote.as_ref(),
+        target_only,
     };
     let written = match format {
         Format::Json => match report::build_json(&diagnostics, &drift) {
@@ -270,15 +323,7 @@ fn build_project(
             write(&mut stream, &report::human(root, &diagnostics, color)).and_then(|()| {
                 write(
                     &mut stream,
-                    &report::build_verdict(
-                        entrypoint,
-                        target,
-                        out,
-                        &diagnostics,
-                        &drift,
-                        wrote,
-                        color,
-                    ),
+                    &report::build_verdict(entrypoint, target, out, &built, color),
                 )
             })
         }
