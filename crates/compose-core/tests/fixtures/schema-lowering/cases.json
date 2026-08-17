@@ -31,11 +31,11 @@
     "surface": "tool.web_search.output",
     "about": "a bounded array of nested closed objects, with a `format` (grammar 3.4, 3.5)",
     "documents": [
-      { "why": "one well-formed result", "valid": true, "document": { "results": [{ "title": "t", "url": "https://example.test/a", "snippet": "s" }] } },
+      { "why": "one well-formed result", "valid": true, "document": { "results": [ { "title": "t", "url": "https://example.test/a", "snippet": "s" } ] } },
       { "why": "an empty array is within the bound", "valid": true, "document": { "results": [] } },
-      { "why": "the nested object is closed too", "valid": false, "document": { "results": [{ "title": "t", "url": "https://example.test/a", "snippet": "s", "rank": 1 }] } },
-      { "why": "a nested required property is missing", "valid": false, "document": { "results": [{ "title": "t", "url": "https://example.test/a" }] } },
-      { "why": "`format: uri` refuses a bare word", "valid": false, "document": { "results": [{ "title": "t", "url": "not a url", "snippet": "s" }] } },
+      { "why": "the nested object is closed too", "valid": false, "document": { "results": [ { "title": "t", "url": "https://example.test/a", "snippet": "s", "rank": 1 } ] } },
+      { "why": "a nested required property is missing", "valid": false, "document": { "results": [ { "title": "t", "url": "https://example.test/a" } ] } },
+      { "why": "`format: uri` refuses a bare word", "valid": false, "document": { "results": [ { "title": "t", "url": "not a url", "snippet": "s" } ] } },
       { "why": "the array itself must be an array", "valid": false, "document": { "results": "one" } }
     ]
   },
@@ -44,20 +44,20 @@
     "surface": "agent.triage.output",
     "about": "a discriminated union inside a bounded array (grammar 3.7, PRD 5.6)",
     "documents": [
-      { "why": "one variant, fully supplied", "valid": true, "document": { "findings": [{ "kind": "auto_fixable", "file": "src/a.rs", "patch_hint": "swap the branches" }] } },
-      { "why": "another variant, with its own enum", "valid": true, "document": { "findings": [{ "kind": "needs_human", "summary": "unclear", "severity": "high" }] } },
-      { "why": "several variants in one array", "valid": true, "document": { "findings": [{ "kind": "duplicate", "of": "a" }, { "kind": "duplicate", "of": "b" }] } },
-      { "why": "a tag the union does not declare", "valid": false, "document": { "findings": [{ "kind": "unheard_of", "file": "a.rs" }] } },
-      { "why": "the payload of a different variant under this tag", "valid": false, "document": { "findings": [{ "kind": "auto_fixable", "summary": "unclear", "severity": "high" }] } },
-      { "why": "the discriminator is missing", "valid": false, "document": { "findings": [{ "file": "src/a.rs", "patch_hint": "x" }] } },
-      { "why": "a variant is closed like any object", "valid": false, "document": { "findings": [{ "kind": "duplicate", "of": "a", "why": "same stack" }] } },
-      { "why": "an enum inside a variant is still an enum", "valid": false, "document": { "findings": [{ "kind": "needs_human", "summary": "unclear", "severity": "urgent" }] } }
+      { "why": "one variant, fully supplied", "valid": true, "document": { "findings": [ { "kind": "auto_fixable", "file": "src/a.rs", "patch_hint": "swap the branches" } ] } },
+      { "why": "another variant, with its own enum", "valid": true, "document": { "findings": [ { "kind": "needs_human", "summary": "unclear", "severity": "high" } ] } },
+      { "why": "several variants in one array", "valid": true, "document": { "findings": [ { "kind": "duplicate", "of": "a" }, { "kind": "duplicate", "of": "b" } ] } },
+      { "why": "a tag the union does not declare", "valid": false, "document": { "findings": [ { "kind": "unheard_of", "file": "a.rs" } ] } },
+      { "why": "the payload of a different variant under this tag", "valid": false, "document": { "findings": [ { "kind": "auto_fixable", "summary": "unclear", "severity": "high" } ] } },
+      { "why": "the discriminator is missing", "valid": false, "document": { "findings": [ { "file": "src/a.rs", "patch_hint": "x" } ] } },
+      { "why": "a variant is closed like any object", "valid": false, "document": { "findings": [ { "kind": "duplicate", "of": "a", "why": "same stack" } ] } },
+      { "why": "an enum inside a variant is still an enum", "valid": false, "document": { "findings": [ { "kind": "needs_human", "summary": "unclear", "severity": "urgent" } ] } }
     ]
   },
   {
     "golden": "triage-fanout",
     "surface": "store.docs.metadata_schema",
-    "about": "`format: date-time` (grammar 3.3)",
+    "about": "`format: date-time` reached through a nested surface (grammar 3.3, 11.1)",
     "documents": [
       { "why": "an RFC 3339 timestamp", "valid": true, "document": { "source": "docs/a.md", "updated_at": "2026-08-16T09:30:00Z" } },
       { "why": "an offset instead of `Z`", "valid": true, "document": { "source": "docs/a.md", "updated_at": "2026-08-16T09:30:00+02:00" } },
@@ -78,25 +78,123 @@
   },
   {
     "golden": "every-schema-form",
-    "surface": "state.at_time",
-    "about": "`format: time` — RFC 3339 `full-time`, which requires an offset",
+    "surface": "state.round",
+    "about": "`type: integer` — including where the two columns cannot agree, because the target cannot hold the number",
     "documents": [
-      { "why": "`Z` is an offset", "valid": true, "document": "09:30:00Z" },
-      { "why": "so is `+02:00`", "valid": true, "document": "09:30:00+02:00" },
-      { "why": "fractional seconds are allowed", "valid": true, "document": "09:30:00.250Z" },
-      { "why": "no offset is not a full-time", "valid": false, "document": "09:30:00" },
-      { "why": "the hour is out of range", "valid": false, "document": "25:30:00Z" },
-      { "why": "not a time at all", "valid": false, "document": "half past nine" }
+      { "why": "an integer at the inclusive bound", "valid": true, "document": 0 },
+      { "why": "an ordinary integer", "valid": true, "document": 42 },
+      { "why": "an integer-valued float is an integer in JSON Schema and in Zod", "valid": true, "document": 3.0 },
+      { "why": "a fraction is not", "valid": false, "document": 2.5 },
+      { "why": "`minimum: 0` refuses a negative", "valid": false, "document": -1 },
+      { "why": "the largest integer JavaScript can count with", "valid": true, "document": 9007199254740991 },
+      {
+        "why": "one past it: JSON Schema says integer, `z.number().int()` says not one it can trust",
+        "valid": true,
+        "zod": false,
+        "divergence": "integer-beyond-the-safe-range",
+        "document": 9007199254740993
+      },
+      {
+        "why": "and far past it, where the value is exactly representable but no longer countable",
+        "valid": true,
+        "zod": false,
+        "divergence": "integer-beyond-the-safe-range",
+        "document": 1e30
+      }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "state.at",
+    "about": "`format: date-time` — RFC 3339 `date-time`, which is where `z.iso.datetime()` and JSON Schema part company",
+    "documents": [
+      { "why": "the canonical spelling", "valid": true, "document": "2026-08-16T09:30:00Z" },
+      { "why": "RFC 3339 §5.6 admits the lower-case separator and offset", "valid": true, "document": "2026-08-16t09:30:00z" },
+      { "why": "the offset alone in lower case", "valid": true, "document": "2026-08-16T09:30:00z" },
+      { "why": "a numeric offset east", "valid": true, "document": "2026-08-16T09:30:00+02:00" },
+      { "why": "and west, with minutes", "valid": true, "document": "2026-08-16T09:30:00-05:30" },
+      { "why": "fractional seconds", "valid": true, "document": "2026-08-16T09:30:00.250Z" },
+      { "why": "year zero is a date", "valid": true, "document": "0000-01-01T00:00:00Z" },
+      { "why": "the date half is calendar-checked: February has 29 days in a leap year", "valid": true, "document": "2024-02-29T00:00:00Z" },
+      { "why": "a century is not a leap year unless it is a multiple of 400", "valid": true, "document": "2000-02-29T00:00:00Z" },
+      { "why": "1900 is not", "valid": false, "document": "1900-02-29T00:00:00Z" },
+      { "why": "nor is 2026", "valid": false, "document": "2026-02-29T00:00:00Z" },
+      { "why": "no month has 30 days in February", "valid": false, "document": "2026-02-30T00:00:00Z" },
+      { "why": "month 13 does not exist", "valid": false, "document": "2026-13-01T00:00:00Z" },
+      { "why": "hour 24 does not exist", "valid": false, "document": "2026-08-16T24:00:00Z" },
+      { "why": "the offset is required", "valid": false, "document": "2026-08-16T09:30:00" },
+      { "why": "a space is not the separator", "valid": false, "document": "2026-08-16 09:30:00Z" },
+      { "why": "a date alone is not a date-time", "valid": false, "document": "2026-08-16" },
+      { "why": "neither is a time alone", "valid": false, "document": "T09:30:00Z" },
+      { "why": "an offset's hour is two digits", "valid": false, "document": "2026-08-16T09:30:00+2:00" },
+      { "why": "and below 24", "valid": false, "document": "2026-08-16T09:30:00+24:00" },
+      { "why": "a fraction with no digits is not a fraction", "valid": false, "document": "2026-08-16T09:30:00.Z" },
+      { "why": "not a timestamp at all", "valid": false, "document": "not a value" },
+      { "why": "the empty string is not one either", "valid": false, "document": "" },
+      { "why": "a leap second at the minute it happens", "valid": true, "document": "2026-08-16T23:59:60Z" },
+      { "why": "and at that minute expressed in another zone", "valid": true, "document": "2026-08-16T00:59:60+01:00" },
+      {
+        "why": "a leap second at a minute that never has one",
+        "valid": false,
+        "zod": true,
+        "divergence": "leap-second-away-from-midnight",
+        "document": "2026-08-16T12:00:60Z"
+      },
+      {
+        "why": "the same, written with an explicit zero offset",
+        "valid": false,
+        "zod": true,
+        "divergence": "leap-second-away-from-midnight",
+        "document": "2026-08-16T12:00:60+00:00"
+      }
     ]
   },
   {
     "golden": "every-schema-form",
     "surface": "state.on_day",
-    "about": "`format: date`",
+    "about": "`format: date` — an RFC 3339 `full-date`, calendar-checked",
     "documents": [
       { "why": "a calendar date", "valid": true, "document": "2026-08-16" },
+      { "why": "a leap day in a leap year", "valid": true, "document": "2024-02-29" },
+      { "why": "a leap day in a multiple-of-400 century", "valid": true, "document": "2000-02-29" },
+      { "why": "year zero", "valid": true, "document": "0000-01-01" },
+      { "why": "1900 is a century that is not a leap year", "valid": false, "document": "1900-02-29" },
+      { "why": "2026 is not a leap year", "valid": false, "document": "2026-02-29" },
+      { "why": "February never has 30 days", "valid": false, "document": "2026-02-30" },
       { "why": "month 13 does not exist", "valid": false, "document": "2026-13-01" },
+      { "why": "nor does month 0", "valid": false, "document": "2026-00-01" },
+      { "why": "nor day 0", "valid": false, "document": "2026-01-00" },
+      { "why": "January has 31 days", "valid": false, "document": "2026-01-32" },
+      { "why": "the fields are zero-padded", "valid": false, "document": "2026-8-16" },
+      { "why": "the separators are required", "valid": false, "document": "20260816" },
+      { "why": "a trailing space is not part of a date", "valid": false, "document": "2026-08-16 " },
       { "why": "a date-time is not a date", "valid": false, "document": "2026-08-16T09:30:00Z" }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "state.at_time",
+    "about": "`format: time` — RFC 3339 `full-time`, which requires an offset",
+    "documents": [
+      { "why": "`Z` is an offset", "valid": true, "document": "09:30:00Z" },
+      { "why": "so is its lower-case spelling", "valid": true, "document": "09:30:00z" },
+      { "why": "and so is `+02:00`", "valid": true, "document": "09:30:00+02:00" },
+      { "why": "fractional seconds are allowed", "valid": true, "document": "09:30:00.250Z" },
+      { "why": "no offset is not a full-time", "valid": false, "document": "09:30:00" },
+      { "why": "the hour is out of range", "valid": false, "document": "25:30:00Z" },
+      { "why": "so is the minute", "valid": false, "document": "09:60:00Z" },
+      { "why": "the fields are zero-padded", "valid": false, "document": "9:30:00Z" },
+      { "why": "an offset's hour is below 24", "valid": false, "document": "09:30:00+24:00" },
+      { "why": "not a time at all", "valid": false, "document": "half past nine" },
+      { "why": "a leap second at the minute it happens", "valid": true, "document": "23:59:60Z" },
+      { "why": "and at that minute in another zone", "valid": true, "document": "00:59:60+01:00" },
+      {
+        "why": "a leap second at a minute that never has one",
+        "valid": false,
+        "zod": true,
+        "divergence": "leap-second-away-from-midnight",
+        "document": "12:00:60Z"
+      }
     ]
   },
   {
@@ -106,28 +204,106 @@
     "documents": [
       { "why": "a day and two hours", "valid": true, "document": "P1DT2H" },
       { "why": "seconds alone", "valid": true, "document": "PT30S" },
+      { "why": "every designator, in order", "valid": true, "document": "P1Y2M3DT4H5M6S" },
+      { "why": "weeks are their own form", "valid": true, "document": "P1W" },
+      { "why": "a date part and a time part with nothing skipped between them", "valid": true, "document": "P1YT1S" },
+      { "why": "`P` alone designates nothing", "valid": false, "document": "P" },
+      { "why": "nor does `PT`", "valid": false, "document": "PT" },
+      { "why": "a `T` with no time component", "valid": false, "document": "P1DT" },
+      { "why": "the designator is required", "valid": false, "document": "1D" },
+      { "why": "a time component outside the time part", "valid": false, "document": "P1S" },
       { "why": "English is not ISO 8601", "valid": false, "document": "1 day" },
-      { "why": "the designator is required", "valid": false, "document": "1DT2H" }
+      {
+        "why": "years and days with the months between them skipped",
+        "valid": false,
+        "zod": true,
+        "divergence": "duration-skips-a-designator",
+        "document": "P1Y1D"
+      },
+      {
+        "why": "and the same shape in the time part",
+        "valid": false,
+        "zod": true,
+        "divergence": "duration-skips-a-designator",
+        "document": "PT1H1S"
+      }
     ]
   },
   {
     "golden": "every-schema-form",
     "surface": "state.who",
-    "about": "`format: email`",
+    "about": "`format: email` — an RFC 5322 `addr-spec`, which is a good deal wider than `z.email()`",
     "documents": [
       { "why": "an ordinary address", "valid": true, "document": "someone@example.test" },
+      { "why": "a single-label domain is a domain", "valid": true, "document": "a@b" },
+      { "why": "dots and a plus in the local part", "valid": true, "document": "a.b+c@example.test" },
+      { "why": "every `atext` punctuation character", "valid": true, "document": "a!#$%&'*+-/=?^_`{|}~@example.test" },
+      { "why": "a quoted local part, where a space is legal", "valid": true, "document": "\"quoted local\"@example.test" },
+      { "why": "a quoted local part may hold the `@` that does not split it", "valid": true, "document": "\"a@b\"@example.test" },
+      { "why": "an IPv4 address literal", "valid": true, "document": "a@[192.0.2.1]" },
+      { "why": "an IPv6 address literal", "valid": true, "document": "a@[IPv6:::1]" },
+      { "why": "a dotted-quad domain is also a legal host name", "valid": true, "document": "a@192.0.2.1" },
+      { "why": "several labels", "valid": true, "document": "a@b.c.d.e.test" },
+      { "why": "a punycode domain whose payload decodes", "valid": true, "document": "a@xn--bcher-kva.test" },
+      { "why": "a non-ASCII local part is `atext`", "valid": true, "document": "üser@example.test" },
+      { "why": "a non-ASCII domain is not a host name; it has to be punycoded", "valid": false, "document": "a@exämple.test" },
+      { "why": "an address literal that is not an address", "valid": false, "document": "a@[999.0.2.1]" },
       { "why": "no domain", "valid": false, "document": "someone@" },
-      { "why": "no at sign", "valid": false, "document": "someone" }
+      { "why": "no local part", "valid": false, "document": "@example.test" },
+      { "why": "no at sign", "valid": false, "document": "someone" },
+      { "why": "an unquoted space", "valid": false, "document": "a b@example.test" },
+      { "why": "two at signs leave `a@` as the local part, which is not `atext`", "valid": false, "document": "a@@example.test" },
+      { "why": "a trailing root dot is not part of a host name", "valid": false, "document": "a@example.test." },
+      { "why": "a label may not start with a hyphen", "valid": false, "document": "a@-bad.test" },
+      { "why": "nor end with one", "valid": false, "document": "a@bad-.test" },
+      { "why": "an underscore is not a host-name character", "valid": false, "document": "a@ex_ample.test" },
+      { "why": "hyphens in the third and fourth positions are reserved for `xn--`", "valid": false, "document": "a@ab--cd.test" },
+      { "why": "an empty atom between two dots", "valid": false, "document": "a..b@example.test" },
+      { "why": "a leading dot leaves an empty atom", "valid": false, "document": ".a@example.test" },
+      { "why": "so does a trailing one", "valid": false, "document": "a.@example.test" },
+      { "why": "a local part is at most 64 characters", "valid": false, "document": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@example.test" },
+      {
+        "why": "a display name wrapping an address is a `name-addr`, not the `Mailbox` JSON Schema names",
+        "valid": true,
+        "zod": false,
+        "divergence": "display-name-is-not-an-addr-spec",
+        "document": "Name <a@example.test>"
+      },
+      {
+        "why": "a syntactically well-formed `xn--` label whose payload is not punycode",
+        "valid": false,
+        "zod": true,
+        "divergence": "punycode-payload-undecoded",
+        "document": "a@xn--a.test"
+      }
     ]
   },
   {
     "golden": "every-schema-form",
     "surface": "state.where",
-    "about": "`format: uri`",
+    "about": "`format: uri` — an absolute RFC 3986 URI, which is not what `new URL()` means",
     "documents": [
-      { "why": "an absolute https URL", "valid": true, "document": "https://example.test/a?b=c" },
-      { "why": "another scheme", "valid": true, "document": "mailto:someone@example.test" },
+      { "why": "an absolute https URL with a query", "valid": true, "document": "https://example.test/a?b=c" },
+      { "why": "every optional part at once", "valid": true, "document": "https://user:pw@example.test:8080/a/b?c=d#e" },
+      { "why": "an IP-literal authority", "valid": true, "document": "https://[2001:db8::1]/a" },
+      { "why": "a fragment may hold a `?`", "valid": true, "document": "https://example.test/#frag?x" },
+      { "why": "the scheme is case-insensitive", "valid": true, "document": "HTTP://EXAMPLE.TEST" },
+      { "why": "an empty authority and an empty path is still a URI", "valid": true, "document": "https://" },
+      { "why": "a scheme and nothing else", "valid": true, "document": "a:" },
+      { "why": "an opaque path", "valid": true, "document": "a:b" },
+      { "why": "another scheme entirely", "valid": true, "document": "mailto:someone@example.test" },
+      { "why": "and a non-hierarchical one", "valid": true, "document": "urn:isbn:0451450523" },
+      { "why": "a percent-encoded space", "valid": true, "document": "https://example.test/a%20b" },
+      { "why": "a raw space is not a URI character", "valid": false, "document": "https://example.test/a b" },
+      { "why": "neither is a non-ASCII one", "valid": false, "document": "http://example.test/é" },
+      { "why": "a truncated percent-encoding", "valid": false, "document": "https://example.test/a%2" },
+      { "why": "a backslash is not a URI character", "valid": false, "document": "https://example.test/a\\b" },
+      { "why": "nor is a pipe", "valid": false, "document": "https://example.test/a|b" },
+      { "why": "a non-ASCII authority has to be punycoded", "valid": false, "document": "https://exämple.test/" },
       { "why": "a bare host is not a URI", "valid": false, "document": "example.test" },
+      { "why": "a relative reference is not a URI", "valid": false, "document": "/relative" },
+      { "why": "nor is a protocol-relative one", "valid": false, "document": "//example.test/a" },
+      { "why": "a scheme may not start with a digit", "valid": false, "document": "1http://example.test" },
       { "why": "not a URI at all", "valid": false, "document": "not a uri" }
     ]
   },
@@ -137,19 +313,45 @@
     "about": "`format: uuid`",
     "documents": [
       { "why": "a version 4 UUID", "valid": true, "document": "3f2504e0-4f89-41d3-9a0c-0305e82c3301" },
+      { "why": "the nil UUID", "valid": true, "document": "00000000-0000-0000-0000-000000000000" },
+      { "why": "upper case is the same UUID", "valid": true, "document": "3F2504E0-4F89-41D3-9A0C-0305E82C3301" },
       { "why": "a hyphen out of place", "valid": false, "document": "3f2504e04f8941d39a0c0305e82c3301" },
+      { "why": "one hex digit short", "valid": false, "document": "3f2504e0-4f89-41d3-9a0c-0305e82c330" },
       { "why": "not a UUID", "valid": false, "document": "nope" }
     ]
   },
   {
     "golden": "every-schema-form",
     "surface": "state.host",
-    "about": "`format: hostname`",
+    "about": "`format: hostname` — an RFC 1123 host name, where `z.hostname()` is looser than JSON Schema",
     "documents": [
       { "why": "a dotted hostname", "valid": true, "document": "api.example.test" },
       { "why": "a single label", "valid": true, "document": "localhost" },
+      { "why": "one character is a label", "valid": true, "document": "x" },
+      { "why": "so is one digit", "valid": true, "document": "1" },
+      { "why": "a dotted quad is a legal host name", "valid": true, "document": "192.0.2.1" },
+      { "why": "many labels", "valid": true, "document": "a.b.c.d.e.f" },
+      { "why": "a 63-character label is the longest one", "valid": true, "document": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.test" },
+      { "why": "a punycode label whose payload decodes", "valid": true, "document": "xn--bcher-kva.test" },
+      { "why": "64 characters is one too many", "valid": false, "document": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.test" },
+      { "why": "the trailing root dot is not part of the name", "valid": false, "document": "example.test." },
+      { "why": "a label may not start with a hyphen", "valid": false, "document": "-bad.example.test" },
+      { "why": "nor end with one", "valid": false, "document": "bad-.example.test" },
+      { "why": "an underscore is not a host-name character", "valid": false, "document": "a_b.test" },
+      { "why": "hyphens in the third and fourth positions are reserved for `xn--`", "valid": false, "document": "ab--cd.test" },
+      { "why": "the `xn--` prefix is lower case", "valid": false, "document": "XN--bcher-kva.test" },
+      { "why": "a non-ASCII label has to be punycoded", "valid": false, "document": "exämple.test" },
+      { "why": "an empty label", "valid": false, "document": "example..test" },
+      { "why": "a leading dot is an empty label too", "valid": false, "document": ".example.test" },
       { "why": "a space is not a hostname", "valid": false, "document": "not a host" },
-      { "why": "a label may not start with a hyphen", "valid": false, "document": "-bad.example.test" }
+      { "why": "the empty string is not a hostname", "valid": false, "document": "" },
+      {
+        "why": "a syntactically well-formed `xn--` label whose payload is not punycode",
+        "valid": false,
+        "zod": true,
+        "divergence": "punycode-payload-undecoded",
+        "document": "xn--a.test"
+      }
     ]
   },
   {
@@ -158,6 +360,9 @@
     "about": "`format: ipv4`",
     "documents": [
       { "why": "a documentation address", "valid": true, "document": "192.0.2.1" },
+      { "why": "the unspecified address", "valid": true, "document": "0.0.0.0" },
+      { "why": "the broadcast address", "valid": true, "document": "255.255.255.255" },
+      { "why": "a leading zero is not a dotted quad", "valid": false, "document": "192.0.2.001" },
       { "why": "an octet out of range", "valid": false, "document": "192.0.2.256" },
       { "why": "three octets is not an address", "valid": false, "document": "192.0.2" }
     ]
@@ -168,6 +373,9 @@
     "about": "`format: ipv6`",
     "documents": [
       { "why": "a documentation address", "valid": true, "document": "2001:db8::1" },
+      { "why": "the loopback address", "valid": true, "document": "::1" },
+      { "why": "an IPv4-mapped address", "valid": true, "document": "::ffff:192.0.2.1" },
+      { "why": "upper case is the same address", "valid": true, "document": "2001:DB8::1" },
       { "why": "two elisions", "valid": false, "document": "2001::db8::1" },
       { "why": "an IPv4 address is not an IPv6 one", "valid": false, "document": "192.0.2.1" }
     ]
@@ -181,6 +389,27 @@
       { "why": "uppercase is not in the class", "valid": false, "document": "A-Slug" },
       { "why": "it may not start with a digit", "valid": false, "document": "2slug" },
       { "why": "`max_length: 64`", "valid": false, "document": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "state.digits",
+    "about": "the escapes and repetitions a `pattern` carries across, and what `\\d` means in each column",
+    "documents": [
+      { "why": "the counted repetitions match", "valid": true, "document": "123-4567" },
+      { "why": "one digit short", "valid": false, "document": "12-4567" },
+      { "why": "the pattern is anchored", "valid": false, "document": "x123-4567" },
+      { "why": "a JSON Schema `pattern` is ECMAScript, so `\\d` is `[0-9]` in both columns", "valid": false, "document": "١٢٣-٤٥٦٧" }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "state.anything",
+    "about": "the degenerate `pattern: \"\"`, which is `/(?:)/` and not the line comment `//`",
+    "documents": [
+      { "why": "an empty pattern matches everywhere, including in the empty string", "valid": true, "document": "" },
+      { "why": "and in anything else", "valid": true, "document": "anything at all" },
+      { "why": "it is still a string check", "valid": false, "document": 1 }
     ]
   },
   {

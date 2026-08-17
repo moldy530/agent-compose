@@ -5,9 +5,11 @@
 // is the single source of truth (PRD 5.12); to own this code instead, copy
 // the whole directory out and stop regenerating it.
 //
-// Every `${ENV}` reference the composition makes, and the presence check that
-// runs before the graph does (PRD 5.9, grammar 4.3). No value is baked in here:
-// the spec never contains a credential, and neither does this file.
+// Every `${ENV}` reference the composition makes, and `readEnvironment()`, the
+// presence check over them (PRD 5.9, grammar 4.3). `./index.ts` is what calls
+// it, at module scope, so loading this project is what checks its environment.
+// No value is baked in here: the spec never contains a credential, and neither
+// does this file — `agent-compose build` resolved nothing.
 
 import process from "node:process";
 

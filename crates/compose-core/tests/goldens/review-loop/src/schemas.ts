@@ -12,6 +12,18 @@
 
 import { z } from "zod";
 
+/**
+ * `format: uri` (grammar 3.3): an absolute RFC 3986 URI — a scheme, a
+ * hierarchical part, and the optional query and fragment — spelled as the
+ * grammar's own production. `z.url()` is not this check: it is `new URL()`,
+ * which is the WHATWG parser, and that one *repairs* what it is given. It
+ * accepts a space and a non-ASCII character in a path (percent-encoding them)
+ * and rejects `https://`, which RFC 3986 admits as a URI with an empty
+ * authority — divergences in both directions from the column beside it.
+ */
+const rfc3986Uri =
+  /^[A-Za-z][A-Za-z0-9+\-.]*:(?:\/\/(?:(?:[A-Za-z0-9\-._~!$&'()*+,;=:]|%[0-9A-Fa-f]{2})*@)?(?:\[[A-Za-z0-9:.]+\]|(?:[A-Za-z0-9\-._~!$&'()*+,;=]|%[0-9A-Fa-f]{2})*)(?::\d*)?(?:\/(?:[A-Za-z0-9\-._~!$&'()*+,;=:@]|%[0-9A-Fa-f]{2})*)*|\/?(?:(?:[A-Za-z0-9\-._~!$&'()*+,;=:@]|%[0-9A-Fa-f]{2})+(?:\/(?:[A-Za-z0-9\-._~!$&'()*+,;=:@]|%[0-9A-Fa-f]{2})*)*)?)(?:\?(?:[A-Za-z0-9\-._~!$&'()*+,;=:@/?]|%[0-9A-Fa-f]{2})*)?(?:#(?:[A-Za-z0-9\-._~!$&'()*+,;=:@/?]|%[0-9A-Fa-f]{2})*)?$/;
+
 /** `agent.researcher` — its declared input (grammar 5.3). */
 export const agentResearcherInput = z.object({
   goal: z.string().describe("What the draft must accomplish."),
@@ -68,7 +80,7 @@ export type ToolWebSearchInput = z.infer<typeof toolWebSearchInput>;
 export const toolWebSearchOutput = z.object({
   results: z.array(z.object({
     title: z.string(),
-    url: z.url(),
+    url: z.string().regex(rfc3986Uri),
     snippet: z.string(),
   }).strict()).max(10).describe("Ranked results, most relevant first."),
 }).strict();

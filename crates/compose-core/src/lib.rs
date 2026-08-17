@@ -54,6 +54,7 @@ pub mod resolve;
 pub mod yaml;
 
 pub use check::check;
+pub use codegen::diagnostics as target_diagnostics;
 pub use codegen::{COMPILER_VERSION, GeneratedFile, GeneratedProject, emit};
 pub use diag::{Diagnostic, DiagnosticCode, Diagnostics, Severity, Span, Spanned};
 pub use ir::{IR_VERSION, Ir};

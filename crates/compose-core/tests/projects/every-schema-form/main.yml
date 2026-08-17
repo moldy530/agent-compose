@@ -57,6 +57,13 @@ state:
 
   # The rest of the constraint vocabulary.
   slug:      { type: string, pattern: "^[a-z][a-z0-9-]*$", min_length: 1, max_length: 64 }
+  # RE2 is not a subset of ECMAScript, so `pattern:` is a lowering rather than a
+  # copy: these two are the corners of it. `\d` and a counted repetition are the
+  # vocabulary that transfers, and `\d` means the ASCII digits in *both* columns
+  # — a JSON Schema `pattern` is ECMAScript by definition. The empty pattern is
+  # the degenerate one: `//` is a line comment, so it emits `/(?:)/`.
+  digits:    { type: string, pattern: "^\\d{3}-\\d{4}$" }
+  anything:  { type: string, pattern: "" }
   ratio:     { type: number, exclusive_minimum: 0, exclusive_maximum: 1 }
   step:      { type: number, minimum: -1.5, maximum: 1.5, multiple_of: 0.5 }
   urgent:    { type: boolean, default: false }

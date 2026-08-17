@@ -96,11 +96,14 @@
 pub mod env;
 pub mod graph;
 pub mod names;
+pub mod pattern;
 pub mod project;
 pub mod schema;
 pub mod state;
 
+use crate::diag::{Diagnostic, DiagnosticCode};
 use crate::ir::Ir;
+use crate::ir::schema::TypeForm;
 
 /// The compiler release this build is, as it appears in every generated header.
 pub const COMPILER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -194,6 +197,50 @@ pub fn emit(ir: &Ir) -> GeneratedProject {
     ])
 }
 
+/// What this target cannot express, over a composition the validator accepted.
+///
+/// [`emit`] is total: it answers a project for every artifact, and it has no
+/// span to report against anyway. But not every legal composition *has* a
+/// TypeScript project — `pattern:` is RE2 (Decision D12) and RE2 is not a subset
+/// of ECMAScript, so a pattern the validator blessed can be one no JavaScript
+/// regular expression can hold (see [`pattern`]). Emitting it anyway produces a
+/// `src/schemas.ts` that fails to parse: not a wrong schema, an unloadable
+/// module, and `build` exiting `0` over it.
+///
+/// So this is the pass between the validator and the emitter. It is the same
+/// shape as the validator — an [`Ir`] in, [`Diagnostic`]s out, spans included —
+/// and `build` folds its report into the one the validator produced, refusing to
+/// emit when either has anything to say. It is **not** a static check:
+/// `validate` answers "is this composition well formed", which does not depend
+/// on which target it is later compiled for, and this answers "can *this* target
+/// express it".
+#[must_use]
+pub fn diagnostics(ir: &Ir) -> Vec<Diagnostic> {
+    let mut found = crate::diag::Diagnostics::new();
+    for surface in schema::surfaces(ir) {
+        surface.walk(&mut |ty| {
+            let TypeForm::Scalar(scalar) = &ty.form else {
+                return;
+            };
+            let Some(source) = &scalar.pattern else {
+                return;
+            };
+            if let Err(unsupported) = pattern::javascript(source) {
+                found.push(
+                    Diagnostic::error(
+                        DiagnosticCode::InvalidValue,
+                        ty.span.clone(),
+                        format!("{} (`{source}`)", unsupported.message),
+                    )
+                    .with_help(unsupported.help),
+                );
+            }
+        });
+    }
+    found.sort();
+    found.into_vec()
+}
+
 /// The header every generated file opens with.
 ///
 /// `comment` is the line-comment marker of the file's own language, so the one
@@ -244,6 +291,55 @@ pub fn header_lines(ir: &Ir) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::codegen::test_support::ir_of;
+
+    /// The target check reaches every type node, not only the top-level ones,
+    /// and reports each pattern once against its own span.
+    #[test]
+    fn a_pattern_the_target_cannot_express_is_reported_wherever_it_is_nested() {
+        let ir = ir_of(
+            r#"version: "0.1"
+
+state:
+  fine: { type: string, pattern: "^(?<word>[a-z]+)\\d*$" }
+  deep:
+    type: array
+    max_items: 4
+    items:
+      type: object
+      properties:
+        inner: { type: string, pattern: "(?P<word>[a-z]+)" }
+  flagged: { type: string, pattern: "(?i)abc" }
+"#,
+        );
+        let reported = diagnostics(&ir);
+        assert_eq!(
+            reported.len(),
+            2,
+            "one per unrepresentable pattern, and none for the representable one: {reported:#?}"
+        );
+        assert!(reported.iter().all(Diagnostic::is_error));
+        assert!(
+            reported[0].message.contains("(?P<word>…)"),
+            "the nested one is found: {:?}",
+            reported[0].message
+        );
+        assert!(
+            reported[1].message.contains("inline"),
+            "{:?}",
+            reported[1].message
+        );
+        assert!(
+            reported[0].span.bytes.start < reported[1].span.bytes.start,
+            "the report is in source order"
+        );
+    }
+
+    /// Every `pattern:` in a composition the rest of the suite compiles is one
+    /// this target can express, so the check is not a blanket refusal.
+    #[test]
+    fn the_worked_shapes_have_nothing_the_target_cannot_express() {
+        assert_eq!(diagnostics(&ir_of(test_support::EVERY_FORM)), []);
+    }
 
     #[test]
     fn every_generated_file_carries_the_header_and_ends_in_a_newline() {

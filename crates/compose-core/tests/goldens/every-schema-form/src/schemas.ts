@@ -20,13 +20,118 @@ const uniqueItems = (items: readonly unknown[]): boolean =>
   new Set(items.map((item) => JSON.stringify(item))).size === items.length;
 
 /**
+ * `format: hostname` (grammar 3.3): an RFC 1123 host name, which is what JSON
+ * Schema's `hostname` means. `z.hostname()` is a looser reading — it accepts the
+ * root-relative `example.test.`, which JSON Schema refuses — and a value one
+ * column accepts and the other refuses is the drift grammar 3.8's table exists
+ * to prevent, so the rule is written out.
+ */
+const rfc1123Hostname = (value: string): boolean => {
+  if (value.length === 0 || value.length > 253 || value.endsWith(".")) {
+    return false;
+  }
+  return value.split(".").every((label) => {
+    if (label.length === 0 || label.length > 63) {
+      return false;
+    }
+    if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/.test(label)) {
+      return false;
+    }
+    // RFC 5891: hyphens in the third and fourth positions are reserved for the
+    // `xn--` prefix of an internationalized label.
+    return !(label.length >= 4 && label[2] === "-" && label[3] === "-") || label.startsWith("xn--");
+  });
+};
+
+/**
+ * `format: date` (grammar 3.3): an RFC 3339 `full-date`, calendar-checked — the
+ * month bounds the day, and February bounds it by the proleptic Gregorian leap
+ * rule, so `2026-02-30` is not a date.
+ */
+const rfc3339Date = (value: string): boolean => {
+  const parts = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (parts === null) {
+    return false;
+  }
+  const [, year, month, day] = parts.map(Number);
+  if (month < 1 || month > 12 || day < 1) {
+    return false;
+  }
+  const leap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+  return day <= [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1];
+};
+
+/**
  * `format: time` (grammar 3.3), which JSON Schema reads as RFC 3339 `full-time`
  * — an offset is required. Zod's `z.iso.time()` refuses an offset outright, so
  * the check is written here rather than borrowed from a constructor that means
- * something else.
+ * something else. The offset may be `Z`, `z`, or `±HH:MM`, and a leap second is
+ * spelled `:60`.
  */
 const rfc3339Time =
   /^([01]\d|2[0-3]):[0-5]\d:([0-5]\d|60)(\.\d+)?([Zz]|[+-]([01]\d|2[0-3]):[0-5]\d)$/;
+
+/**
+ * `format: date-time` (grammar 3.3): an RFC 3339 `date-time`, which is a
+ * `full-date`, the separator, and a `full-time`. The separator is `T` or `t` and
+ * the offset may be `Z` or `z`: RFC 3339 says so in as many words, and the JSON
+ * Schema column agrees, while `z.iso.datetime()` accepts only the upper-case
+ * spellings.
+ */
+const rfc3339DateTime = (value: string): boolean => {
+  const separator = value.search(/[Tt]/);
+  return (
+    separator > 0 &&
+    rfc3339Date(value.slice(0, separator)) &&
+    rfc3339Time.test(value.slice(separator + 1))
+  );
+};
+
+/**
+ * `format: uri` (grammar 3.3): an absolute RFC 3986 URI — a scheme, a
+ * hierarchical part, and the optional query and fragment — spelled as the
+ * grammar's own production. `z.url()` is not this check: it is `new URL()`,
+ * which is the WHATWG parser, and that one *repairs* what it is given. It
+ * accepts a space and a non-ASCII character in a path (percent-encoding them)
+ * and rejects `https://`, which RFC 3986 admits as a URI with an empty
+ * authority — divergences in both directions from the column beside it.
+ */
+const rfc3986Uri =
+  /^[A-Za-z][A-Za-z0-9+\-.]*:(?:\/\/(?:(?:[A-Za-z0-9\-._~!$&'()*+,;=:]|%[0-9A-Fa-f]{2})*@)?(?:\[[A-Za-z0-9:.]+\]|(?:[A-Za-z0-9\-._~!$&'()*+,;=]|%[0-9A-Fa-f]{2})*)(?::\d*)?(?:\/(?:[A-Za-z0-9\-._~!$&'()*+,;=:@]|%[0-9A-Fa-f]{2})*)*|\/?(?:(?:[A-Za-z0-9\-._~!$&'()*+,;=:@]|%[0-9A-Fa-f]{2})+(?:\/(?:[A-Za-z0-9\-._~!$&'()*+,;=:@]|%[0-9A-Fa-f]{2})*)*)?)(?:\?(?:[A-Za-z0-9\-._~!$&'()*+,;=:@/?]|%[0-9A-Fa-f]{2})*)?(?:#(?:[A-Za-z0-9\-._~!$&'()*+,;=:@/?]|%[0-9A-Fa-f]{2})*)?$/;
+
+/**
+ * `format: email` (grammar 3.3): an RFC 5322 `addr-spec` whose domain is an RFC
+ * 1123 host name or an address literal — the reading JSON Schema's `email`
+ * takes. `z.email()` is a deliberately narrow subset of it and refuses three
+ * things the column beside it accepts: a quoted local part, a single-label
+ * domain (`a@b`), and `a@[192.0.2.1]`.
+ */
+const rfc5321Email = (value: string): boolean => {
+  // The *last* `@` splits: an unquoted local part cannot hold one, and a quoted
+  // one can hold as many as it likes.
+  const at = value.lastIndexOf("@");
+  if (at <= 0 || at === value.length - 1 || at > 64) {
+    return false;
+  }
+  const local = value.slice(0, at);
+  const domain = value.slice(at + 1);
+  const atext = /^[A-Za-z0-9!#$%&'*+\-/=?^_`{|}~\u0080-\uffff]+$/;
+  const quoted = /^(?:[\t \x21\x23-\x5b\x5d-\x7e\u0080-\uffff]|\\[\x21-\x7e])*$/;
+  const localOk =
+    local.length > 2 && local.startsWith('"') && local.endsWith('"')
+      ? quoted.test(local.slice(1, -1))
+      : local.split(".").every((atom) => atext.test(atom));
+  if (!localOk) {
+    return false;
+  }
+  if (domain.length > 2 && domain.startsWith("[") && domain.endsWith("]")) {
+    const literal = domain.slice(1, -1);
+    return literal.startsWith("IPv6:")
+      ? z.ipv6().safeParse(literal.slice(5)).success
+      : z.ipv4().safeParse(literal).success;
+  }
+  return rfc1123Hostname(domain);
+};
 
 /** `agent.shaper` — its declared input (grammar 5.3). */
 export const agentShaperInput = z.object({
@@ -53,7 +158,7 @@ export const agentShaperOutput = z.object({
   ])).max(16).describe("A union inside a bounded array, the fan-out shape."),
   author: z.object({
     name: z.string(),
-    email: z.email().optional(),
+    email: z.string().refine(rfc5321Email, { message: "expected an email address" }).optional(),
   }).strict(),
 }).strict();
 export type AgentShaperOutput = z.infer<typeof agentShaperOutput>;
@@ -90,7 +195,7 @@ export type FlowShapeNodeAskOutput = z.infer<typeof flowShapeNodeAskOutput>;
 /** `store.docs` — the metadata a match carries (grammar 11.1). */
 export const storeDocsMetadataSchema = z.object({
   source: z.string(),
-  updated_at: z.iso.datetime({ offset: true }),
+  updated_at: z.string().refine(rfc3339DateTime, { message: "expected an RFC 3339 date-time" }),
 }).strict();
 export type StoreDocsMetadataSchema = z.infer<typeof storeDocsMetadataSchema>;
 
@@ -109,8 +214,12 @@ export type ToolPingInput = z.infer<typeof toolPingInput>;
 export const toolPingOutput = z.object({}).strict();
 export type ToolPingOutput = z.infer<typeof toolPingOutput>;
 
+/** State channel `anything` — its declared type (grammar 10.1). */
+export const stateAnything = z.string().regex(/(?:)/);
+export type StateAnything = z.infer<typeof stateAnything>;
+
 /** State channel `at` — its declared type (grammar 10.1). */
-export const stateAt = z.iso.datetime({ offset: true });
+export const stateAt = z.string().refine(rfc3339DateTime, { message: "expected an RFC 3339 date-time" });
 export type StateAt = z.infer<typeof stateAt>;
 
 /** State channel `at_time` — its declared type (grammar 10.1). */
@@ -120,17 +229,21 @@ export type StateAtTime = z.infer<typeof stateAtTime>;
 /** State channel `author` — its declared type (grammar 10.1). */
 export const stateAuthor = z.object({
   name: z.string(),
-  email: z.email().optional(),
-  home: z.url().optional(),
+  email: z.string().refine(rfc5321Email, { message: "expected an email address" }).optional(),
+  home: z.string().regex(rfc3986Uri).optional(),
 }).strict();
 export type StateAuthor = z.infer<typeof stateAuthor>;
+
+/** State channel `digits` — its declared type (grammar 10.1). */
+export const stateDigits = z.string().regex(/^\d{3}-\d{4}$/);
+export type StateDigits = z.infer<typeof stateDigits>;
 
 /** State channel `draft` — its declared type (grammar 10.1). */
 export const stateDraft = z.string();
 export type StateDraft = z.infer<typeof stateDraft>;
 
 /** State channel `host` — its declared type (grammar 10.1). */
-export const stateHost = z.hostname();
+export const stateHost = z.string().refine(rfc1123Hostname, { message: "expected a hostname" });
 export type StateHost = z.infer<typeof stateHost>;
 
 /** State channel `lasting` — its declared type (grammar 10.1). */
@@ -150,7 +263,7 @@ export const stateNotes = z.array(z.string()).max(32).describe("One element per 
 export type StateNotes = z.infer<typeof stateNotes>;
 
 /** State channel `on_day` — its declared type (grammar 10.1). */
-export const stateOnDay = z.iso.date();
+export const stateOnDay = z.string().refine(rfc3339Date, { message: "expected an RFC 3339 date" });
 export type StateOnDay = z.infer<typeof stateOnDay>;
 
 /** State channel `origin` — its declared type (grammar 10.1). */
@@ -162,7 +275,7 @@ export const stateOrigin = z.object({
     }).strict(),
     z.object({
       kind: z.literal("crawl"),
-      url: z.url(),
+      url: z.string().regex(rfc3986Uri),
       depth: z.number().int().min(0),
     }).strict(),
   ]),
@@ -215,7 +328,7 @@ export const stateV6 = z.ipv6();
 export type StateV6 = z.infer<typeof stateV6>;
 
 /** State channel `where` — its declared type (grammar 10.1). */
-export const stateWhere = z.url();
+export const stateWhere = z.string().regex(rfc3986Uri);
 export type StateWhere = z.infer<typeof stateWhere>;
 
 /** State channel `which` — its declared type (grammar 10.1). */
@@ -223,5 +336,5 @@ export const stateWhich = z.uuid();
 export type StateWhich = z.infer<typeof stateWhich>;
 
 /** State channel `who` — its declared type (grammar 10.1). */
-export const stateWho = z.email();
+export const stateWho = z.string().refine(rfc5321Email, { message: "expected an email address" });
 export type StateWho = z.infer<typeof stateWho>;

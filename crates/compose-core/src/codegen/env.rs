@@ -1,16 +1,28 @@
-//! `src/env.ts`: every `${ENV}` reference, and the check that runs at process
-//! start (PRD 5.9, grammar 4.3).
+//! `src/env.ts`: every `${ENV}` reference, and `readEnvironment()`, the presence
+//! check over them (PRD 5.9, grammar 4.3).
 //!
-//! # Why the compiler never reads the environment
+//! # Who runs the check
 //!
-//! Env refs survive **unresolved** into the IR and into generated code: PRD 5.9
-//! is explicit that "resolution happens at process start in generated code, never
-//! at compile", which is what keeps the artifact committable and keeps a key out
-//! of every file this compiler writes. `build` therefore emits the checker and
-//! does not run it — a build whose success depended on the building machine's
-//! environment could not be reproduced on the deploying one, and the acceptance
-//! harness relies on exactly that (it seals the environment around `run` and
-//! `serve`, and leaves `validate` and `build` alone).
+//! **`src/index.ts` does**, at module scope — see [`super::project`]. Loading the
+//! generated project resolves every reference or throws naming all the missing
+//! ones, which is PRD 5.9's "resolution happens at process start in generated
+//! code, never at compile" and PRD §7 M1's "env-ref presence checks at process
+//! start". This module emits the check; the barrel calls it; nothing here reads
+//! `process.env` at compile time.
+//!
+//! **`agent-compose build` does not.** Env refs survive *unresolved* into the IR
+//! and into generated code, which is what keeps the artifact committable and
+//! keeps a key out of every file this compiler writes; a build whose success
+//! depended on the building machine's environment could not be reproduced on the
+//! deploying one, and `build --check` is a CI diff (PRD §8) rather than a
+//! deployment. PRD 5.9's own sentence — "`validate` checks ref syntax;
+//! `build`/`serve`/`run` check presence and fail fast naming the missing
+//! variable" — puts `build` in that list, and this branch does not implement it
+//! there: the two readings of 5.9 have not been reconciled in the PRD, and
+//! CLAUDE.md's PRD discipline is that an unresolved question is not implemented
+//! against. What is implemented is the half both readings agree on, and the
+//! generated `README.md` says which command does it rather than leaving a reader
+//! to assume.
 //!
 //! # What the module gives the rest of the project
 //!
@@ -263,9 +275,11 @@ pub fn module(ir: &Ir, references: &References) -> super::GeneratedFile {
 
 const MODULE_DOC: &str = "\
 //
-// Every `${ENV}` reference the composition makes, and the presence check that
-// runs before the graph does (PRD 5.9, grammar 4.3). No value is baked in here:
-// the spec never contains a credential, and neither does this file.
+// Every `${ENV}` reference the composition makes, and `readEnvironment()`, the
+// presence check over them (PRD 5.9, grammar 4.3). `./index.ts` is what calls
+// it, at module scope, so loading this project is what checks its environment.
+// No value is baked in here: the spec never contains a credential, and neither
+// does this file — `agent-compose build` resolved nothing.
 ";
 
 const DECLARATIONS: &str = r#"

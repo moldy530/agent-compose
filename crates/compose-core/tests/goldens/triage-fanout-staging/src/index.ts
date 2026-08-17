@@ -9,8 +9,21 @@
 // the schemas, the state model, the graph itself, and the environment it
 // requires — is re-exported here, so an ejected project has one entry point
 // and `run`/`serve` have one module to import.
+//
+// It is also where the env-ref presence check of PRD 5.9 runs. `readEnvironment`
+// is called at module scope, so loading this module is what "process start"
+// means for this project: any `node src/index.ts`, and any import of it, throws
+// naming every missing variable before a graph is built or a model is called.
+// The compiler never runs it — `agent-compose build` reads no environment, which
+// is what keeps a build on one machine reproducible on another and keeps a
+// credential out of every file it writes (PRD 5.9: refs "survive into the IR
+// unresolved").
+
+import { readEnvironment } from "./env.ts";
 
 export * from "./env.ts";
 export * from "./graph.ts";
 export * from "./schemas.ts";
 export * from "./state.ts";
+
+readEnvironment();

@@ -21,9 +21,6 @@
 //! | DSL | JSON Schema | Zod | why |
 //! |---|---|---|---|
 //! | `description` | `description` | `.describe(…)` | it reaches the model in a structured-output schema (grammar 3.2) |
-//! | `format: email` | `format: "email"` | `z.email()` | Zod 4's format constructors are the non-deprecated spelling; `z.string().email()` is the one it tells you not to write |
-//! | `format: date-time` | `format: "date-time"` | `z.iso.datetime({ offset: true })` | JSON Schema's `date-time` is RFC 3339, which admits `+02:00`; Zod's default admits only `Z` |
-//! | `format: time` | `format: "time"` | `z.string().regex(rfc3339Time)` | RFC 3339 `full-time` **requires** an offset and `z.iso.time()` **refuses** one, so the two constructors are disjoint rather than merely different |
 //! | `exclusive_minimum` | `exclusiveMinimum` | `.gt(…)` | Zod spells the exclusive bounds `gt`/`lt` |
 //! | `multiple_of` | `multipleOf` | `.multipleOf(…)` | |
 //! | `min_items` | `minItems` | `.min(…)` | |
@@ -35,20 +32,48 @@
 //! `z.strictObject`), and an integer is `z.number().int()` (not `z.int()`). The
 //! grammar is normative and both pairs denote the same schema.
 //!
-//! One divergence is **known and left**: a leap second. `rfc3339Time` admits
-//! `:60` wherever the rest of the value parses, while the JSON Schema column
-//! admits it only at `23:59:60`. Narrowing the regex to `[0-5]\d` would trade
-//! that corner for the opposite one — refusing a value JSON Schema accepts — and
-//! neither is reachable from a model that emits a wall-clock time.
+//! # `format:`, and why six of the ten are written out
+//!
+//! Grammar 3.3 fixes a closed vocabulary of ten formats and grammar 3.8's table
+//! says nothing about any of them, so the reading is this module's to choose —
+//! and choosing a Zod constructor by *name* is how the two columns drift. Zod's
+//! constructors are not implementations of JSON Schema's `format` keyword and do
+//! not claim to be: `z.url()` is `new URL()`, which repairs its input;
+//! `z.iso.datetime()` is an upper-case-only ISO 8601 profile, not RFC 3339;
+//! `z.email()` is a deliberately narrow subset; `z.hostname()` admits the root
+//! dot. Every one of those was a document the published JSON Schema accepted and
+//! the emitted Zod refused — a model answering its own contract and failing the
+//! parse.
+//!
+//! So the reading is named by RFC, and where Zod's constructor reads a different
+//! one the check is written out in [`HELPERS`] (`rfc3339Date`, `rfc3339Time`,
+//! `rfc3339DateTime`, `rfc3986Uri`, `rfc1123Hostname`, `rfc5321Email`). Four
+//! formats keep their constructor because on those four the two agree:
+//! `duration`, `uuid`, `ipv4`, `ipv6`. [`zod_format`] is the whole table.
+//!
+//! # The divergence ledger
+//!
+//! Agreement is a **test**, not a claim: `tests/generated_code_gates.rs` runs
+//! `tests/fixtures/schema-lowering/cases.json` against both columns and pins
+//! each column's verdict on each document separately, so a document the two
+//! answer differently cannot pass as agreement. A corpus case that records two
+//! different verdicts must name one of the divergences below, and every
+//! divergence below must be exercised by a case — the two lists are asserted
+//! against each other.
+//!
+//! | id | where | which way | why it is left |
+//! |---|---|---|---|
+//! | `integer-beyond-the-safe-range` | `type: integer` | JSON accepts, Zod refuses | grammar 3.8 fixes both spellings, and `z.number().int()` is JavaScript's safe-integer range. Past 2^53 the language cannot count: `JSON.parse` has already rounded `9007199254740993` to an even neighbour by the time any check sees it, so the emitted parse refuses what it cannot represent rather than accepting a number that is no longer the one that was sent |
+//! | `display-name-is-not-an-addr-spec` | `format: email` | JSON accepts, Zod refuses | `Name <a@example.test>`. JSON Schema defines `email` as RFC 5321's `Mailbox` rule, which has no display-name form; the Rust column's parser offers one and accepts it. This is the one row where the emitted Zod is the **stricter and more correct** column, so it is recorded rather than widened |
+//! | `leap-second-away-from-midnight` | `format: time`, `format: date-time` | Zod accepts, JSON refuses | `rfc3339Time` admits `:60` wherever the rest parses; the JSON column admits it only where the value normalizes to `23:59:60` UTC. Narrowing the regex to `[0-5]\d` would trade this corner for the opposite one, and neither is reachable from a model emitting a wall-clock time |
+//! | `duration-skips-a-designator` | `format: duration` | Zod accepts, JSON refuses | `P1Y1D`, `PT1H1S`. ISO 8601 admits a skipped designator and RFC 3339's appendix-A ABNF nests them (`dur-year = Y [dur-month]`); grammar 3.3's `duration` is the ISO 8601 one, which is what `z.iso.duration()` reads |
+//! | `punycode-payload-undecoded` | `format: hostname`, `format: email` | Zod accepts, JSON refuses | an `xn--` label whose payload is not decodable punycode. `rfc1123Hostname` checks the label's *shape*; decoding it would be a punycode implementation inside a generated module, for a case a model does not produce |
 //!
 //! # Patterns
 //!
-//! `pattern:` is RE2 (Decision D12), a subset of JavaScript's syntax, so the
-//! source text transfers unchanged. It is written as a regex **literal** with
-//! any unescaped `/` escaped, and falls back to `new RegExp("…")` for a pattern
-//! carrying a line terminator, which a literal cannot hold. No flags are added:
-//! `u` mode rejects escapes RE2 accepts, and both `RegExp.test` and JSON
-//! Schema's `pattern` are unanchored searches, so the two agree without one.
+//! `pattern:` is RE2 (Decision D12), which is **not** a subset of JavaScript's
+//! syntax — [`super::pattern`] is the module that decides what transfers, and
+//! [`super::diagnostics`] is what refuses a `build` whose patterns do not.
 
 use serde_json::{Map, Value, json};
 
@@ -260,22 +285,13 @@ pub fn module(ir: &Ir, names: &Names) -> super::GeneratedFile {
     contents.push_str(MODULE_DOC);
     contents.push_str("\nimport { z } from \"zod\";\n");
 
-    // Two helpers, each emitted only where the composition reaches the form that
-    // needs it — an unused `const` in a generated module is a question a reader
-    // has to answer for nothing.
-    if surfaces.iter().any(|surface| {
-        surface.declares(
-            &|ty| matches!(&ty.form, TypeForm::Array(array) if array.unique_items == Some(true)),
-        )
-    }) {
-        contents.push_str(UNIQUE_ITEMS_HELPER);
-    }
-    if surfaces.iter().any(|surface| {
-        surface.declares(&|ty| {
-            matches!(&ty.form, TypeForm::Scalar(scalar) if scalar.format == Some(StringFormat::Time))
-        })
-    }) {
-        contents.push_str(RFC3339_TIME_HELPER);
+    for helper in HELPERS {
+        if surfaces
+            .iter()
+            .any(|surface| surface.declares(&|ty| helper.wanted_by(ty)))
+        {
+            contents.push_str(helper.source);
+        }
     }
 
     for surface in &surfaces {
@@ -305,27 +321,240 @@ const MODULE_DOC: &str = "\
 // schema, and a state channel's type is the schema its channel is built from.
 ";
 
-const UNIQUE_ITEMS_HELPER: &str = r#"
+/// One module-level helper the emitted schemas can lean on.
+///
+/// A helper is written only where the composition reaches the form that wants it
+/// — an unused `const` in a generated module is a question a reader has to
+/// answer for nothing — and the table is walked in order, so a helper that calls
+/// another (`rfc5321Email` calls `rfc1123Hostname`, `rfc3339DateTime` calls both
+/// of its halves) is declared after it. `wants` lists those callees, so asking
+/// for one asks for its dependencies too and the order of the table is the only
+/// thing keeping them in scope.
+struct Helper {
+    /// The `format:` values whose lowering calls it directly.
+    formats: &'static [StringFormat],
+    /// Whether an array's `unique_items` calls it.
+    unique_items: bool,
+    /// Other helpers it calls, which therefore must be emitted with it.
+    wants: &'static [&'static str],
+    /// Its own name, for [`Helper::wants`] to name it by.
+    name: &'static str,
+    /// The declaration, opening with a blank line.
+    source: &'static str,
+}
+
+impl Helper {
+    /// Whether this type node reaches this helper, directly or through one that
+    /// does.
+    fn wanted_by(&self, ty: &TypeNode) -> bool {
+        HELPERS.iter().any(|helper| {
+            (helper.name == self.name || helper.wants.contains(&self.name)) && helper.called_by(ty)
+        })
+    }
+
+    /// Whether this type node's own lowering calls this helper by name.
+    fn called_by(&self, ty: &TypeNode) -> bool {
+        match &ty.form {
+            TypeForm::Scalar(scalar) => scalar
+                .format
+                .is_some_and(|format| self.formats.contains(&format)),
+            TypeForm::Array(array) => self.unique_items && array.unique_items == Some(true),
+            TypeForm::Enum(_) | TypeForm::Object(_) | TypeForm::Union(_) => false,
+        }
+    }
+}
+
+/// Every helper, in declaration order — callees before their callers.
+const HELPERS: &[Helper] = &[
+    Helper {
+        formats: &[],
+        unique_items: true,
+        wants: &[],
+        name: "uniqueItems",
+        source: r#"
 /**
  * `unique_items: true` (grammar 3.5). Zod has no built-in, and JSON encodings
  * are what JSON Schema's `uniqueItems` compares, so that is what this compares.
  */
 const uniqueItems = (items: readonly unknown[]): boolean =>
   new Set(items.map((item) => JSON.stringify(item))).size === items.length;
-"#;
-
-const RFC3339_TIME_HELPER: &str = r#"
+"#,
+    },
+    Helper {
+        formats: &[StringFormat::Hostname],
+        unique_items: false,
+        wants: &[],
+        name: "rfc1123Hostname",
+        source: r#"
+/**
+ * `format: hostname` (grammar 3.3): an RFC 1123 host name, which is what JSON
+ * Schema's `hostname` means. `z.hostname()` is a looser reading — it accepts the
+ * root-relative `example.test.`, which JSON Schema refuses — and a value one
+ * column accepts and the other refuses is the drift grammar 3.8's table exists
+ * to prevent, so the rule is written out.
+ */
+const rfc1123Hostname = (value: string): boolean => {
+  if (value.length === 0 || value.length > 253 || value.endsWith(".")) {
+    return false;
+  }
+  return value.split(".").every((label) => {
+    if (label.length === 0 || label.length > 63) {
+      return false;
+    }
+    if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/.test(label)) {
+      return false;
+    }
+    // RFC 5891: hyphens in the third and fourth positions are reserved for the
+    // `xn--` prefix of an internationalized label.
+    return !(label.length >= 4 && label[2] === "-" && label[3] === "-") || label.startsWith("xn--");
+  });
+};
+"#,
+    },
+    Helper {
+        formats: &[StringFormat::Date, StringFormat::DateTime],
+        unique_items: false,
+        wants: &[],
+        name: "rfc3339Date",
+        source: r#"
+/**
+ * `format: date` (grammar 3.3): an RFC 3339 `full-date`, calendar-checked — the
+ * month bounds the day, and February bounds it by the proleptic Gregorian leap
+ * rule, so `2026-02-30` is not a date.
+ */
+const rfc3339Date = (value: string): boolean => {
+  const parts = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (parts === null) {
+    return false;
+  }
+  const [, year, month, day] = parts.map(Number);
+  if (month < 1 || month > 12 || day < 1) {
+    return false;
+  }
+  const leap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+  return day <= [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1];
+};
+"#,
+    },
+    Helper {
+        formats: &[StringFormat::Time, StringFormat::DateTime],
+        unique_items: false,
+        wants: &[],
+        name: "rfc3339Time",
+        source: r#"
 /**
  * `format: time` (grammar 3.3), which JSON Schema reads as RFC 3339 `full-time`
  * — an offset is required. Zod's `z.iso.time()` refuses an offset outright, so
  * the check is written here rather than borrowed from a constructor that means
- * something else.
+ * something else. The offset may be `Z`, `z`, or `±HH:MM`, and a leap second is
+ * spelled `:60`.
  */
 const rfc3339Time =
   /^([01]\d|2[0-3]):[0-5]\d:([0-5]\d|60)(\.\d+)?([Zz]|[+-]([01]\d|2[0-3]):[0-5]\d)$/;
-"#;
+"#,
+    },
+    Helper {
+        formats: &[StringFormat::DateTime],
+        unique_items: false,
+        wants: &["rfc3339Date", "rfc3339Time"],
+        name: "rfc3339DateTime",
+        source: r#"
+/**
+ * `format: date-time` (grammar 3.3): an RFC 3339 `date-time`, which is a
+ * `full-date`, the separator, and a `full-time`. The separator is `T` or `t` and
+ * the offset may be `Z` or `z`: RFC 3339 says so in as many words, and the JSON
+ * Schema column agrees, while `z.iso.datetime()` accepts only the upper-case
+ * spellings.
+ */
+const rfc3339DateTime = (value: string): boolean => {
+  const separator = value.search(/[Tt]/);
+  return (
+    separator > 0 &&
+    rfc3339Date(value.slice(0, separator)) &&
+    rfc3339Time.test(value.slice(separator + 1))
+  );
+};
+"#,
+    },
+    Helper {
+        formats: &[StringFormat::Uri],
+        unique_items: false,
+        wants: &[],
+        name: "rfc3986Uri",
+        source: r#"
+/**
+ * `format: uri` (grammar 3.3): an absolute RFC 3986 URI — a scheme, a
+ * hierarchical part, and the optional query and fragment — spelled as the
+ * grammar's own production. `z.url()` is not this check: it is `new URL()`,
+ * which is the WHATWG parser, and that one *repairs* what it is given. It
+ * accepts a space and a non-ASCII character in a path (percent-encoding them)
+ * and rejects `https://`, which RFC 3986 admits as a URI with an empty
+ * authority — divergences in both directions from the column beside it.
+ */
+const rfc3986Uri =
+  /^[A-Za-z][A-Za-z0-9+\-.]*:(?:\/\/(?:(?:[A-Za-z0-9\-._~!$&'()*+,;=:]|%[0-9A-Fa-f]{2})*@)?(?:\[[A-Za-z0-9:.]+\]|(?:[A-Za-z0-9\-._~!$&'()*+,;=]|%[0-9A-Fa-f]{2})*)(?::\d*)?(?:\/(?:[A-Za-z0-9\-._~!$&'()*+,;=:@]|%[0-9A-Fa-f]{2})*)*|\/?(?:(?:[A-Za-z0-9\-._~!$&'()*+,;=:@]|%[0-9A-Fa-f]{2})+(?:\/(?:[A-Za-z0-9\-._~!$&'()*+,;=:@]|%[0-9A-Fa-f]{2})*)*)?)(?:\?(?:[A-Za-z0-9\-._~!$&'()*+,;=:@/?]|%[0-9A-Fa-f]{2})*)?(?:#(?:[A-Za-z0-9\-._~!$&'()*+,;=:@/?]|%[0-9A-Fa-f]{2})*)?$/;
+"#,
+    },
+    Helper {
+        formats: &[StringFormat::Email],
+        unique_items: false,
+        wants: &["rfc1123Hostname"],
+        name: "rfc5321Email",
+        source: r#"
+/**
+ * `format: email` (grammar 3.3): an RFC 5322 `addr-spec` whose domain is an RFC
+ * 1123 host name or an address literal — the reading JSON Schema's `email`
+ * takes. `z.email()` is a deliberately narrow subset of it and refuses three
+ * things the column beside it accepts: a quoted local part, a single-label
+ * domain (`a@b`), and `a@[192.0.2.1]`.
+ */
+const rfc5321Email = (value: string): boolean => {
+  // The *last* `@` splits: an unquoted local part cannot hold one, and a quoted
+  // one can hold as many as it likes.
+  const at = value.lastIndexOf("@");
+  if (at <= 0 || at === value.length - 1 || at > 64) {
+    return false;
+  }
+  const local = value.slice(0, at);
+  const domain = value.slice(at + 1);
+  const atext = /^[A-Za-z0-9!#$%&'*+\-/=?^_`{|}~\u0080-\uffff]+$/;
+  const quoted = /^(?:[\t \x21\x23-\x5b\x5d-\x7e\u0080-\uffff]|\\[\x21-\x7e])*$/;
+  const localOk =
+    local.length > 2 && local.startsWith('"') && local.endsWith('"')
+      ? quoted.test(local.slice(1, -1))
+      : local.split(".").every((atom) => atext.test(atom));
+  if (!localOk) {
+    return false;
+  }
+  if (domain.length > 2 && domain.startsWith("[") && domain.endsWith("]")) {
+    const literal = domain.slice(1, -1);
+    return literal.startsWith("IPv6:")
+      ? z.ipv6().safeParse(literal.slice(5)).success
+      : z.ipv4().safeParse(literal).success;
+  }
+  return rfc1123Hostname(domain);
+};
+"#,
+    },
+];
 
 impl Surface<'_> {
+    /// Visit every type node inside this surface, outermost first.
+    ///
+    /// [`super::diagnostics`] reads it: a rule stated over a type node has to
+    /// reach the nested ones too, and the only enumeration of "every type node
+    /// there is" should be the one [`surfaces`] already fixes.
+    pub fn walk(&self, visit: &mut dyn FnMut(&TypeNode)) {
+        match self.body {
+            Body::Fields(fields) => {
+                for field in &fields.fields {
+                    walk(&field.ty, visit);
+                }
+            }
+            Body::Type(ty) => walk(ty, visit),
+        }
+    }
+
     /// Whether any type node anywhere inside this surface satisfies `predicate`.
     fn declares(&self, predicate: &dyn Fn(&TypeNode) -> bool) -> bool {
         match self.body {
@@ -335,6 +564,27 @@ impl Surface<'_> {
                 .any(|field| declares(&field.ty, predicate)),
             Body::Type(ty) => declares(ty, predicate),
         }
+    }
+}
+
+/// Visit this type node and everything nested inside it, outermost first.
+fn walk(ty: &TypeNode, visit: &mut dyn FnMut(&TypeNode)) {
+    visit(ty);
+    match &ty.form {
+        TypeForm::Array(array) => walk(&array.items, visit),
+        TypeForm::Object(object) => {
+            for field in &object.properties.fields {
+                walk(&field.ty, visit);
+            }
+        }
+        TypeForm::Union(union) => {
+            for variant in &union.variants {
+                for field in &variant.fields.fields {
+                    walk(&field.ty, visit);
+                }
+            }
+        }
+        TypeForm::Scalar(_) | TypeForm::Enum(_) => {}
     }
 }
 
@@ -490,30 +740,46 @@ fn scalar_expression(scalar: &Scalar) -> String {
     text
 }
 
-/// Zod 4's constructor for one `format:` (grammar 3.3).
+/// The check one `format:` lowers to (grammar 3.3).
 ///
-/// Two of the ten need more than the bare constructor, because Zod's default
-/// reading of the ISO form is narrower than the RFC 3339 one JSON Schema's
-/// `format` keyword means — and the JSON Schema is what a model is handed, so a
-/// value it blessed that the emitted Zod then refused would be a run failing on
-/// its own contract:
+/// Four of the ten are Zod's own constructor, because on those four Zod's
+/// reading and JSON Schema's `format` keyword agree on every document the
+/// conformance corpus can find: `duration`, `uuid`, `ipv4`, `ipv6`.
 ///
-/// * `date-time` takes `{ offset: true }`. Zod's default accepts only `Z`;
-///   RFC 3339 — and therefore JSON Schema — accepts `+02:00` just as happily.
-/// * `time` is not `z.iso.time()` at all. That constructor **refuses** an offset,
-///   and RFC 3339's `full-time` **requires** one, so the two are disjoint rather
-///   than merely different; there is no option to reconcile them on this pinned
-///   Zod. The check is written out as [`RFC3339_TIME`] instead.
+/// The other six are written out in [`HELPERS`] instead, because their
+/// constructors read a *different specification* from the one JSON Schema's
+/// keyword names — and JSON Schema is what a model is handed, so a value it
+/// blessed that the emitted Zod then refused is a run failing on its own
+/// contract. Each is one sentence:
+///
+/// * `date-time`/`date` — `z.iso.datetime()` and `z.iso.date()` take the
+///   upper-case-only ISO 8601 profile; RFC 3339 admits `t` and `z`, and a leap
+///   second.
+/// * `time` — `z.iso.time()` **refuses** an offset and RFC 3339's `full-time`
+///   **requires** one, so the two are disjoint rather than merely different.
+/// * `email` — `z.email()` is a narrow subset that refuses a quoted local part,
+///   a single-label domain, and an address literal.
+/// * `uri` — `z.url()` is the WHATWG parser, which repairs its input rather than
+///   validating it.
+/// * `hostname` — `z.hostname()` accepts a trailing root dot.
 const fn zod_format(format: StringFormat) -> &'static str {
     match format {
-        StringFormat::DateTime => "z.iso.datetime({ offset: true })",
-        StringFormat::Date => "z.iso.date()",
+        StringFormat::DateTime => {
+            "z.string().refine(rfc3339DateTime, { message: \"expected an RFC 3339 date-time\" })"
+        }
+        StringFormat::Date => {
+            "z.string().refine(rfc3339Date, { message: \"expected an RFC 3339 date\" })"
+        }
         StringFormat::Time => "z.string().regex(rfc3339Time)",
         StringFormat::Duration => "z.iso.duration()",
-        StringFormat::Email => "z.email()",
-        StringFormat::Uri => "z.url()",
+        StringFormat::Email => {
+            "z.string().refine(rfc5321Email, { message: \"expected an email address\" })"
+        }
+        StringFormat::Uri => "z.string().regex(rfc3986Uri)",
         StringFormat::Uuid => "z.uuid()",
-        StringFormat::Hostname => "z.hostname()",
+        StringFormat::Hostname => {
+            "z.string().refine(rfc1123Hostname, { message: \"expected a hostname\" })"
+        }
         StringFormat::Ipv4 => "z.ipv4()",
         StringFormat::Ipv6 => "z.ipv6()",
     }
@@ -572,31 +838,15 @@ fn union_expression(union: &crate::ir::schema::UnionType, indent: &str) -> Strin
     text
 }
 
-/// A `pattern:` as a JavaScript regular expression (see the module docs).
+/// A `pattern:` as a JavaScript regular expression.
+///
+/// The decision — whether RE2's source text *has* a JavaScript spelling — is
+/// [`super::pattern`]'s, and [`super::diagnostics`] is what stops `build` before
+/// a pattern with no spelling reaches here. Emission stays total for the
+/// library caller who skipped that step: the refused text is written out as it
+/// would have been, which is a module `tsc` and the first `import` both report.
 fn regex_expression(pattern: &str) -> String {
-    if pattern.contains(['\n', '\r', '\u{2028}', '\u{2029}']) {
-        return format!("new RegExp({})", names::string(pattern));
-    }
-    let mut literal = String::with_capacity(pattern.len() + 2);
-    literal.push('/');
-    let mut escaped = false;
-    for character in pattern.chars() {
-        if escaped {
-            literal.push(character);
-            escaped = false;
-            continue;
-        }
-        match character {
-            '\\' => {
-                literal.push('\\');
-                escaped = true;
-            }
-            '/' => literal.push_str("\\/"),
-            other => literal.push(other),
-        }
-    }
-    literal.push('/');
-    literal
+    super::pattern::javascript(pattern).unwrap_or_else(|_| super::pattern::verbatim(pattern))
 }
 
 // ---------------------------------------------------------------------------
@@ -825,16 +1075,17 @@ mod tests {
         );
     }
 
+    /// Six of the ten formats are written out rather than borrowed from a Zod
+    /// constructor that reads a different specification (see the module docs).
     #[test]
-    fn a_format_selects_zods_constructor_for_it() {
+    fn a_format_lowers_to_the_check_the_rfc_names() {
         assert_eq!(
             schema_of(
                 &format!("{CHANNEL}  a: {{ type: string, format: date-time }}\n"),
                 "state.a"
             ),
-            "z.iso.datetime({ offset: true })",
-            "RFC 3339 admits an offset and so does JSON Schema's `date-time`; \
-             Zod's default does not"
+            "z.string().refine(rfc3339DateTime, { message: \"expected an RFC 3339 date-time\" })",
+            "`z.iso.datetime()` is an upper-case-only ISO 8601 profile, not RFC 3339"
         );
         assert_eq!(
             schema_of(
@@ -849,14 +1100,68 @@ mod tests {
                 &format!("{CHANNEL}  a: {{ type: string, format: email, max_length: 320 }}\n"),
                 "state.a"
             ),
-            "z.email().max(320)"
+            "z.string().refine(rfc5321Email, { message: \"expected an email address\" })\
+             .max(320)",
+            "a constraint still chains onto the refined string"
         );
         assert_eq!(
             schema_of(
                 &format!("{CHANNEL}  a: {{ type: string, format: uri }}\n"),
                 "state.a"
             ),
-            "z.url()"
+            "z.string().regex(rfc3986Uri)"
+        );
+        assert_eq!(
+            schema_of(
+                &format!("{CHANNEL}  a: {{ type: string, format: uuid }}\n"),
+                "state.a"
+            ),
+            "z.uuid()",
+            "the four that agree with JSON Schema keep their constructor"
+        );
+    }
+
+    /// A helper is written only where the composition reaches it, and a helper
+    /// that calls another brings it along.
+    #[test]
+    fn the_helper_prelude_holds_what_the_composition_reaches_and_no_more() {
+        let module = |source: &str| {
+            let ir = ir_of(source);
+            crate::codegen::schema::module(&ir, &Names::of(&ir)).contents
+        };
+
+        let bare = module(&format!("{CHANNEL}  a: {{ type: string }}\n"));
+        for helper in HELPERS {
+            assert!(
+                !bare.contains(&format!("const {} ", helper.name)),
+                "`{}` is declared in a module that never calls it",
+                helper.name
+            );
+        }
+
+        // `date-time` calls both halves of itself, and neither is declared after
+        // the caller that needs it.
+        let stamped = module(&format!(
+            "{CHANNEL}  a: {{ type: string, format: date-time }}\n"
+        ));
+        let at = |name: &str| {
+            stamped
+                .find(&format!("const {name} "))
+                .map(|at| at as isize)
+        };
+        assert!(at("rfc3339Date").is_some() && at("rfc3339Time").is_some());
+        assert!(at("rfc3339DateTime") > at("rfc3339Date"));
+        assert!(at("rfc3339DateTime") > at("rfc3339Time"));
+        assert!(at("rfc5321Email").is_none(), "and nothing it does not call");
+
+        // `email` calls `rfc1123Hostname`, which `hostname` also selects.
+        let addressed = module(&format!(
+            "{CHANNEL}  a: {{ type: string, format: email }}\n"
+        ));
+        assert!(addressed.contains("const rfc1123Hostname "));
+        assert!(
+            addressed.find("const rfc1123Hostname ") < addressed.find("const rfc5321Email "),
+            "a callee is declared before its caller"
         );
     }
 
@@ -931,7 +1236,8 @@ mod tests {
                 ),
                 "state.a"
             ),
-            "z.object({\n  name: z.string(),\n  email: z.email().optional(),\n}).strict()"
+            "z.object({\n  name: z.string(),\n  email: z.string().refine(rfc5321Email, \
+             { message: \"expected an email address\" }).optional(),\n}).strict()"
         );
     }
 

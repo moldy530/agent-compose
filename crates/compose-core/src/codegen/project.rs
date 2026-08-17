@@ -22,15 +22,18 @@
 //! install-time scripts, no workspace protocol, and no dependency that needs a
 //! native build. `npm install`, `pnpm install`, and `bun install` all resolve it
 //! to the same versions, because every version is exact.
-//! `tests/generated_project_typechecks.rs` installs with npm and runs the type
-//! gate; the neutrality claim is about what the manifest *contains*, which is
-//! checked by `the_manifest_stays_package_manager_neutral`.
+//! `tests/generated_code_gates.rs` installs with npm and runs the type gate; the
+//! neutrality claim is about what the manifest *contains*, which is checked by
+//! `the_manifest_stays_package_manager_neutral`.
 //!
 //! # `src/index.ts`
 //!
 //! A barrel over the modules, which is what makes the generated project usable
 //! as a library — the eject path (PRD 5.12) and, later, what `run` and `serve`
-//! import.
+//! import — and the one emitted module with a side effect: it calls
+//! [`super::env`]'s `readEnvironment()` at module scope, which is where PRD
+//! 5.9's "resolution happens at process start in generated code" happens.
+//! Loading the project is the check.
 
 use crate::ir::Ir;
 
@@ -200,11 +203,18 @@ const README_BODY: &str = r#"
 
 | path | what it holds |
 |---|---|
-| `src/env.ts` | every `${ENV}` reference the composition makes, and the presence check that runs at process start |
+| `src/env.ts` | every `${ENV}` reference the composition makes, and `readEnvironment()`, the presence check over them |
 | `src/schemas.ts` | every schema the composition declares, as Zod |
 | `src/state.ts` | the graph's state model: one channel per `state:` channel, plus the implicit conversation history |
 | `src/graph.ts` | the compiled graph |
-| `src/index.ts` | the project's public surface |
+| `src/index.ts` | the project's public surface, and the one caller of `readEnvironment()` |
+
+`src/index.ts` calls `readEnvironment()` at module scope, so loading this project
+is what checks its environment: a missing variable throws before anything runs,
+naming every variable that is missing rather than the first (PRD 5.9, grammar
+4.3). `agent-compose build` itself reads no environment — no value is resolved at
+compile time, which is what keeps this directory committable and free of
+credentials.
 
 `src/` is owned by the compiler. `agent-compose build` removes files under it
 that it did not write, and `agent-compose build --check` reports them. Everything
@@ -276,11 +286,24 @@ const INDEX: &str = r#"//
 // the schemas, the state model, the graph itself, and the environment it
 // requires — is re-exported here, so an ejected project has one entry point
 // and `run`/`serve` have one module to import.
+//
+// It is also where the env-ref presence check of PRD 5.9 runs. `readEnvironment`
+// is called at module scope, so loading this module is what "process start"
+// means for this project: any `node src/index.ts`, and any import of it, throws
+// naming every missing variable before a graph is built or a model is called.
+// The compiler never runs it — `agent-compose build` reads no environment, which
+// is what keeps a build on one machine reproducible on another and keeps a
+// credential out of every file it writes (PRD 5.9: refs "survive into the IR
+// unresolved").
+
+import { readEnvironment } from "./env.ts";
 
 export * from "./env.ts";
 export * from "./graph.ts";
 export * from "./schemas.ts";
 export * from "./state.ts";
+
+readEnvironment();
 "#;
 
 #[cfg(test)]

@@ -15,9 +15,11 @@ import { Annotation, MessagesAnnotation } from "@langchain/langgraph";
 import type { z } from "zod";
 
 import {
+  stateAnything,
   stateAt,
   stateAtTime,
   stateAuthor,
+  stateDigits,
   stateDraft,
   stateHost,
   stateLasting,
@@ -50,6 +52,11 @@ export const channels = {
    * Unreduced: single-writer, and a write supplies the whole value.
    * Starts **unset**: reading it before its first write fails the execution (Decision D78).
    */
+  anything: Annotation<z.infer<typeof stateAnything>>,
+  /**
+   * Unreduced: single-writer, and a write supplies the whole value.
+   * Starts **unset**: reading it before its first write fails the execution (Decision D78).
+   */
   at: Annotation<z.infer<typeof stateAt>>,
   /**
    * Unreduced: single-writer, and a write supplies the whole value.
@@ -61,6 +68,11 @@ export const channels = {
    * Starts **unset**: reading it before its first write fails the execution (Decision D78).
    */
   author: Annotation<z.infer<typeof stateAuthor>>,
+  /**
+   * Unreduced: single-writer, and a write supplies the whole value.
+   * Starts **unset**: reading it before its first write fails the execution (Decision D78).
+   */
+  digits: Annotation<z.infer<typeof stateDigits>>,
   /**
    * Unreduced: single-writer, and a write supplies the whole value.
    * Starts **unset**: reading it before its first write fails the execution (Decision D78).

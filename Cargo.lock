@@ -296,6 +296,7 @@ dependencies = [
  "cel",
  "insta",
  "jsonschema",
+ "regex-syntax",
  "saphyr-parser",
  "serde",
  "serde_json",

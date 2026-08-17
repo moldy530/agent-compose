@@ -13,11 +13,18 @@ The LangGraph TypeScript project `agent-compose build` produced from `main.yml`,
 
 | path | what it holds |
 |---|---|
-| `src/env.ts` | every `${ENV}` reference the composition makes, and the presence check that runs at process start |
+| `src/env.ts` | every `${ENV}` reference the composition makes, and `readEnvironment()`, the presence check over them |
 | `src/schemas.ts` | every schema the composition declares, as Zod |
 | `src/state.ts` | the graph's state model: one channel per `state:` channel, plus the implicit conversation history |
 | `src/graph.ts` | the compiled graph |
-| `src/index.ts` | the project's public surface |
+| `src/index.ts` | the project's public surface, and the one caller of `readEnvironment()` |
+
+`src/index.ts` calls `readEnvironment()` at module scope, so loading this project
+is what checks its environment: a missing variable throws before anything runs,
+naming every variable that is missing rather than the first (PRD 5.9, grammar
+4.3). `agent-compose build` itself reads no environment — no value is resolved at
+compile time, which is what keeps this directory committable and free of
+credentials.
 
 `src/` is owned by the compiler. `agent-compose build` removes files under it
 that it did not write, and `agent-compose build --check` reports them. Everything

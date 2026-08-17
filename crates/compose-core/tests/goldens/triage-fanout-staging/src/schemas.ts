@@ -12,6 +12,50 @@
 
 import { z } from "zod";
 
+/**
+ * `format: date` (grammar 3.3): an RFC 3339 `full-date`, calendar-checked — the
+ * month bounds the day, and February bounds it by the proleptic Gregorian leap
+ * rule, so `2026-02-30` is not a date.
+ */
+const rfc3339Date = (value: string): boolean => {
+  const parts = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (parts === null) {
+    return false;
+  }
+  const [, year, month, day] = parts.map(Number);
+  if (month < 1 || month > 12 || day < 1) {
+    return false;
+  }
+  const leap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+  return day <= [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1];
+};
+
+/**
+ * `format: time` (grammar 3.3), which JSON Schema reads as RFC 3339 `full-time`
+ * — an offset is required. Zod's `z.iso.time()` refuses an offset outright, so
+ * the check is written here rather than borrowed from a constructor that means
+ * something else. The offset may be `Z`, `z`, or `±HH:MM`, and a leap second is
+ * spelled `:60`.
+ */
+const rfc3339Time =
+  /^([01]\d|2[0-3]):[0-5]\d:([0-5]\d|60)(\.\d+)?([Zz]|[+-]([01]\d|2[0-3]):[0-5]\d)$/;
+
+/**
+ * `format: date-time` (grammar 3.3): an RFC 3339 `date-time`, which is a
+ * `full-date`, the separator, and a `full-time`. The separator is `T` or `t` and
+ * the offset may be `Z` or `z`: RFC 3339 says so in as many words, and the JSON
+ * Schema column agrees, while `z.iso.datetime()` accepts only the upper-case
+ * spellings.
+ */
+const rfc3339DateTime = (value: string): boolean => {
+  const separator = value.search(/[Tt]/);
+  return (
+    separator > 0 &&
+    rfc3339Date(value.slice(0, separator)) &&
+    rfc3339Time.test(value.slice(separator + 1))
+  );
+};
+
 /** `agent.fixer` — its declared input (grammar 5.3). */
 export const agentFixerInput = z.object({
   file: z.string(),
@@ -151,7 +195,7 @@ export type FlowTriageNodeEscalateOutput = z.infer<typeof flowTriageNodeEscalate
 /** `store.docs` — the metadata a match carries (grammar 11.1). */
 export const storeDocsMetadataSchema = z.object({
   source: z.string(),
-  updated_at: z.iso.datetime({ offset: true }),
+  updated_at: z.string().refine(rfc3339DateTime, { message: "expected an RFC 3339 date-time" }),
 }).strict();
 export type StoreDocsMetadataSchema = z.infer<typeof storeDocsMetadataSchema>;
 
