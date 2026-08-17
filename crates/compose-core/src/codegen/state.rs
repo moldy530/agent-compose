@@ -60,13 +60,24 @@
 //! # Ordering
 //!
 //! A reducer sees writes one at a time and can only be as ordered as the caller.
-//! The canonical write order of grammar 7.6.4 — writers of a step by node id, a
-//! `map`'s instances by source-item index — is imposed by the pass that *applies*
-//! the writes, which is a later M1 bullet. What is fixed here is that each policy
-//! is **order-faithful**: `append` appends in the order it is called, `merge`
-//! lets the last call win a key, `last_wins` keeps the last call. A reducer that
-//! sorted or deduplicated on its own would make the canonical order unobservable
-//! and unfixable.
+//! The canonical write order of grammar 7.6.4 is imposed by the pass that
+//! *applies* the writes, and half of that pass has landed. **Clause 1** —
+//! the writers of a step ordered by ascending node id — holds today, inherited
+//! from the scheduler that calls the emitted node functions rather than imposed
+//! by anything this module emits, which is why
+//! `concurrent_writers_append_in_node_id_order_not_completion_order`
+//! (`crates/agent-compose/tests/compiled_graph_acceptance.rs`) asserts it over a
+//! compiled graph whose three orders — node id, declaration, completion — all
+//! disagree. **Clause 2** — a `map`'s instances by source-item index, occupying
+//! the map node's own place in that order — is the half still pending: `map` is
+//! emitted as a node that throws [`super::graph`]'s `Unimplemented`, so nothing
+//! here has dispatched instances to order yet.
+//!
+//! What is fixed here either way is that each policy is **order-faithful**:
+//! `append` appends in the order it is called, `merge` lets the last call win a
+//! key, `last_wins` keeps the last call. A reducer that sorted or deduplicated on
+//! its own would make the canonical order unobservable and unfixable — including
+//! by the clause-2 pass that still has to arrive.
 
 use crate::ast::document::Reduce;
 use crate::ir::Ir;
