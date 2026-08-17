@@ -100,7 +100,11 @@ use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-pub use toolchain::{bun, installed};
+// `bun_command` beside `bun`: a test that needs the *runtime* and not the pinned
+// install — the CEL conformance driver imports one dependency-free emitted module
+// — takes the runtime directly rather than installing a dependency set it never
+// resolves, and still gets the skip-locally, fail-in-CI rule `toolchain` states.
+pub use toolchain::{bun, bun_command, installed};
 
 use mock_provider::{Client, MockProvider};
 use serde_json::Value;

@@ -2117,8 +2117,19 @@ fn an_edge_guard_routes_on_the_source_nodes_structured_output() {
 /// which is why it lives in the shared toolchain fixture rather than beside this
 /// file: what an evaluator built on `BigInt` and `RegExp` answers is the engine's,
 /// so one runtime alone would leave the other's readers unchecked.
+///
+/// It takes the runtime rather than the install ([`harness::bun_command`] rather
+/// than [`harness::installed`]) because that is all it needs: the driver imports
+/// `src/cel.ts` and nothing else, and that module has no imports of its own. What
+/// it must not do is take neither — [`harness::bun`] panics when Bun is absent,
+/// and a machine without it is owed the skip `support/toolchain.rs` documents
+/// rather than one test out of step with the rest of this binary.
 #[test]
 fn the_generated_cel_evaluator_agrees_with_the_validator_on_the_conformance_corpus() {
+    let Some(mut bun) = harness::bun_command() else {
+        return;
+    };
+
     let built = harness::build("bounded-cycle", "local");
     built.succeeded();
 
@@ -2128,7 +2139,7 @@ fn the_generated_cel_evaluator_agrees_with_the_validator_on_the_conformance_corp
         .join("compose-core/tests/fixtures/cel-conformance");
     let driver = harness::toolchain::root().join("cel-conformance.mjs");
 
-    let output = harness::bun()
+    let output = bun
         .arg(&driver)
         .arg(built.root())
         .arg(&corpus)
