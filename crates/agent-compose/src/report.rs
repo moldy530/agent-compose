@@ -132,6 +132,11 @@ pub(crate) struct Built<'a> {
     pub(crate) diagnostics: &'a [Diagnostic],
     /// How the output directory disagrees, under `--check`.
     pub(crate) drift: &'a [crate::build::Drift],
+    /// What a rebuild would refuse over, under `--check`
+    /// (`crate::build::not_ours`): the files in the output directory this
+    /// compiler did not write and would have replaced or removed. Empty when a
+    /// rebuild would go through, which is what makes it the remedy.
+    pub(crate) not_ours: &'a [String],
     /// What was written, when anything was.
     pub(crate) wrote: Option<&'a crate::build::Written>,
     /// Whether the diagnostics are codegen's rather than the validator's.
@@ -146,7 +151,9 @@ pub(crate) struct Built<'a> {
 /// `build`'s one-line verdict, plus a line per drifted file.
 ///
 /// The drift lines come first and each names one file and how it disagrees, so a
-/// CI log says what to regenerate rather than only that something did.
+/// CI log says what to regenerate rather than only that something did — and the
+/// help under them says which command does the regenerating, which is not
+/// unconditionally `build` (see [`drift_help`]).
 pub(crate) fn build_verdict(
     entrypoint: &Path,
     target: &str,
@@ -157,6 +164,7 @@ pub(crate) fn build_verdict(
     let Built {
         diagnostics,
         drift,
+        not_ours,
         wrote,
         target_only,
     } = *built;
@@ -237,9 +245,46 @@ pub(crate) fn build_verdict(
         renderer.render(&[Group::with_title(level.primary_title(title.as_str()))])
     ));
     if !drift.is_empty() {
-        report.push_str("help: run `agent-compose build` to regenerate\n");
+        report.push_str(&drift_help(not_ours));
     }
     report
+}
+
+/// What to do about the drift just reported.
+///
+/// Ordinarily that is `agent-compose build`, which is the whole point of
+/// `--check`: CI says the committed project no longer matches its spec, and one
+/// command settles it (PRD §8).
+///
+/// It is not the answer for every directory that drifts, though, and a help line
+/// that said so anyway would send a reader from an exit `1` they can act on to an
+/// exit `2` they cannot. `build` replaces and removes only files carrying its own
+/// generated-file header (see [`crate::build::write`]), so a `src/` holding
+/// somebody's own TypeScript, or a `package.json` in a directory this compiler
+/// has never built into, is drift a rebuild **refuses** rather than fixes — and
+/// a [`Drift`](crate::build::Drift) line cannot tell that case from the stale
+/// module beside it, because both are the same state. `crate::build::not_ours`
+/// answers it off the same scan the write makes, so the remedy printed here is
+/// the one the next command actually performs.
+fn drift_help(not_ours: &[String]) -> String {
+    if not_ours.is_empty() {
+        return "help: run `agent-compose build` to regenerate\n".to_string();
+    }
+    let (noun, pronoun) = if not_ours.len() == 1 {
+        ("a file", "it")
+    } else {
+        ("files", "them")
+    };
+    format!(
+        "help: `agent-compose build` will not regenerate this directory: it holds {noun} this \
+         compiler did not write ({}), and the build would have replaced or removed {pronoun}. \
+         Point `--out` at a directory of its own, or move {pronoun} aside\n",
+        not_ours
+            .iter()
+            .map(|path| format!("`{path}`"))
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
 }
 
 /// The human report, as one string ready for stderr.
@@ -517,6 +562,33 @@ mod tests {
         assert_eq!(
             verdict(Path::new("main.yml"), "local", &[diagnostic()], false),
             "error: `main.yml` is not valid (target `local`): 1 error\n"
+        );
+    }
+
+    /// The remedy a drift report prints is one that runs.
+    ///
+    /// `tests/build_cli.rs` pins both lines through the real binary, on a
+    /// directory that produces each. What it cannot reach cheaply is the plural
+    /// form — two files that are not the compiler's, in one output directory —
+    /// and that is a fact about the sentence rather than about the filesystem.
+    #[test]
+    fn the_drift_help_names_a_command_that_would_run() {
+        assert_eq!(
+            drift_help(&[]),
+            "help: run `agent-compose build` to regenerate\n"
+        );
+        assert_eq!(
+            drift_help(&["src/mine.ts".to_string()]),
+            "help: `agent-compose build` will not regenerate this directory: it holds a file this \
+             compiler did not write (`src/mine.ts`), and the build would have replaced or removed \
+             it. Point `--out` at a directory of its own, or move it aside\n"
+        );
+        assert_eq!(
+            drift_help(&["package.json".to_string(), "src/mine.ts".to_string()]),
+            "help: `agent-compose build` will not regenerate this directory: it holds files this \
+             compiler did not write (`package.json`, `src/mine.ts`), and the build would have \
+             replaced or removed them. Point `--out` at a directory of its own, or move them \
+             aside\n"
         );
     }
 

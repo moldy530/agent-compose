@@ -276,6 +276,19 @@ fn build_project(
         },
         _ => Vec::new(),
     };
+    // Whether the `build` the drift report is about to recommend would run at
+    // all. Asked only when there is drift to report a remedy for: a directory
+    // that matches gets no help line, and a clean `--check` is the common CI
+    // path, which is not the place for a second walk of the output directory.
+    let not_ours = match (&project, drift.is_empty()) {
+        (Some(project), false) => match build::not_ours(project, out) {
+            Ok(paths) => paths,
+            Err(error) => {
+                return fail(&format!("cannot read `{}`: {error}", out.display()));
+            }
+        },
+        _ => Vec::new(),
+    };
     let wrote = match (&project, checking) {
         (Some(project), false) => match build::write(project, out) {
             Ok(written) => Some(written),
@@ -311,6 +324,7 @@ fn build_project(
     let built = report::Built {
         diagnostics: &diagnostics,
         drift: &drift,
+        not_ours: &not_ours,
         wrote: wrote.as_ref(),
         target_only,
     };

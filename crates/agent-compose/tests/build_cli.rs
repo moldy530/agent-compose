@@ -302,6 +302,72 @@ fn a_rebuild_prunes_src_and_leaves_the_rest_alone() {
     assert!(out.join(".env").is_file(), "neither is a `.env`");
 }
 
+/// The remedy a `--check` prints is a command that would actually run.
+///
+/// This is the combination `a_rebuild_prunes_src_and_leaves_the_rest_alone` and
+/// `a_src_directory_the_compiler_did_not_write_is_refused` cover one half of
+/// each. A stale *generated* module is drift `build` settles; a file under
+/// `src/` the compiler did not write is drift `build` **refuses** over; and the
+/// drift report gives both the same line — "under `src/` and is not generated" —
+/// because the generated-file header is what tells them apart and the reported
+/// state does not carry it. A help line that named `build` unconditionally would
+/// send a CI reader from an exit `1` they can act on to an exit `2` they cannot,
+/// which is the hazard `build.rs`'s own module doc argues for the neighbouring
+/// case.
+#[test]
+fn a_drift_a_rebuild_would_refuse_over_does_not_send_the_reader_to_build() {
+    let out = scratch("blocked-remedy");
+    let path = out.to_str().expect("a UTF-8 scratch path");
+    assert_eq!(
+        code(&build(&["examples/review-loop/main.yml", "--out", path])),
+        0
+    );
+    fs::write(out.join("src/mine.ts"), "export const mine = 1;\n").expect("writable");
+
+    let drifted = build(&["examples/review-loop/main.yml", "--out", path, "--check"]);
+    assert_eq!(code(&drifted), 1, "{}", stderr(&drifted));
+    assert!(
+        stderr(&drifted).contains("`src/mine.ts` is under `src/` and is not generated"),
+        "{}",
+        stderr(&drifted)
+    );
+    assert!(
+        stderr(&drifted).contains(
+            "help: `agent-compose build` will not regenerate this directory: it holds a file this \
+             compiler did not write (`src/mine.ts`), and the build would have replaced or removed \
+             it. Point `--out` at a directory of its own, or move it aside"
+        ),
+        "{}",
+        stderr(&drifted)
+    );
+    assert!(
+        !stderr(&drifted).contains("help: run `agent-compose build` to regenerate"),
+        "the help a rebuild cannot honour is not printed as well: {}",
+        stderr(&drifted)
+    );
+
+    // …and the help is right about it: the command it refused to name is the
+    // one that refuses.
+    let refused = build(&["examples/review-loop/main.yml", "--out", path]);
+    assert_eq!(code(&refused), 2, "{}", stderr(&refused));
+
+    // The remedy it *did* name settles it, which is what makes the branch a
+    // distinction rather than a warning.
+    fs::remove_file(out.join("src/mine.ts")).expect("removable");
+    fs::write(out.join("src/state.ts"), "// mine now\n").expect("writable");
+    let editable = build(&["examples/review-loop/main.yml", "--out", path, "--check"]);
+    assert_eq!(code(&editable), 1, "{}", stderr(&editable));
+    assert!(
+        stderr(&editable).contains("help: run `agent-compose build` to regenerate"),
+        "a hand-edited generated file is drift a rebuild fixes: {}",
+        stderr(&editable)
+    );
+    assert_eq!(
+        code(&build(&["examples/review-loop/main.yml", "--out", path])),
+        0
+    );
+}
+
 /// A `src/` full of hand-written TypeScript stops the build instead of being
 /// emptied.
 ///
