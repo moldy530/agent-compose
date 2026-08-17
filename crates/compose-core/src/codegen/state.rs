@@ -450,6 +450,61 @@ mod tests {
         assert!(emitted.contains("`reduce: last_wins`"), "{emitted}");
     }
 
+    /// The pairing `runtime.orderedUpdate` rests on, asserted where the initial
+    /// value is decided (grammar 7.6.4 clause 2, 10.1).
+    ///
+    /// A `map` node's contributions reach a channel as **one**
+    /// `runtime.OrderedWrites` batch that the channel's reducer unpacks — for
+    /// every policy but the one that cannot be handed a batch at all, which
+    /// `orderedUpdate` folds before it writes. LangGraph's
+    /// `BinaryOperatorAggregate.update` calls a reducer only while the channel
+    /// *holds* a value (the first update to an empty one is kept verbatim), so a
+    /// policy whose batch is **not** folded has to start at a value whatever the
+    /// composition declared — or the batch object itself becomes the channel's
+    /// value, read back by every `state.<channel>` expression and by the flow's
+    /// own `outputs:`.
+    ///
+    /// The guard and the invariant live in two modules and neither can see the
+    /// other, which is what this test is for. Every channel here declares **no**
+    /// `default:`, so what is measured is the policy's own identity element
+    /// rather than something the composition supplied; and the `match` is
+    /// exhaustive, so a new reduce policy is a compile error until someone says
+    /// which side of the pairing it is on.
+    #[test]
+    fn every_policy_a_map_batch_reaches_unfolded_starts_at_a_value() {
+        for reduce in [
+            None,
+            Some(Reduce::LastWins),
+            Some(Reduce::Append),
+            Some(Reduce::Merge),
+        ] {
+            // Which side of `runtime.orderedUpdate`'s `batch.reduce !== "set"`
+            // this policy's emitted reducer falls on.
+            let (folded, declaration) = match reduce {
+                None => (true, "  c: { type: string }\n"),
+                Some(Reduce::LastWins) => (true, "  c: { type: string, reduce: last_wins }\n"),
+                Some(Reduce::Append) => (
+                    false,
+                    "  c:\n    type: array\n    items: { type: string }\n    reduce: append\n",
+                ),
+                Some(Reduce::Merge) => (
+                    false,
+                    "  c:\n    type: object\n    properties: { a: { type: integer } }\n    reduce: merge\n",
+                ),
+            };
+            let emitted = state_of(declaration);
+            let starts_unset = !emitted.contains("    default: () =>");
+            assert_eq!(
+                folded, starts_unset,
+                "`reduce: {reduce:?}` is on both sides of the pairing at once. A policy \
+                 whose batch `runtime.orderedUpdate` does not fold must start at a \
+                 value, or the batch becomes the channel's value; a policy that starts \
+                 at one has no business being folded, since grammar 10.1 and Decision \
+                 D78 give an undefaulted channel no initial value to invent:\n{emitted}"
+            );
+        }
+    }
+
     /// Grammar 10.4: the history channel is never declared and every graph has
     /// it — including one whose `state:` section is absent entirely.
     #[test]

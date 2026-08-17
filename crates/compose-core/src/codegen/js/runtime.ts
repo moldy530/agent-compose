@@ -2146,6 +2146,13 @@ export function isOrdered(value: unknown): value is OrderedWrites {
  * [`setReduce`] would have returned — the highest-indexed item's write
  * (grammar 8.6 rule 5, 10.2). The value a run ends with is the same under
  * either shaping; what changes is that it reaches the channel as the value.
+ *
+ * The half of that argument this function cannot see is the channel table, which
+ * `codegen::state` emits: the identity elements are what make "always called"
+ * true for `append` and `merge`, and a policy that stopped declaring one would
+ * turn an unfolded batch into a channel's value with nothing here to notice.
+ * `every_policy_a_map_batch_reaches_unfolded_starts_at_a_value`
+ * (`codegen::state`) is the pairing asserted where the initial value is decided.
  */
 export function orderedUpdate(batch: ChannelWrite): unknown {
   if (batch.reduce !== "set") return new OrderedWrites(batch.values);
