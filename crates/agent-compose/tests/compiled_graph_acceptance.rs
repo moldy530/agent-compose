@@ -1532,7 +1532,8 @@ fn a_missing_env_ref_fails_at_process_start_naming_the_variable() {
 }
 
 // ---------------------------------------------------------------------------
-// PRD §7 M1, bullet 2 — build, run, serve, golden files. Pending.
+// PRD §7 M1, bullet 2 — build, run, serve, golden files.
+// `build` has landed, goldens with it; `run` and `serve` are pending.
 // ---------------------------------------------------------------------------
 
 /// `agent-compose build` writes a TypeScript project for the selected target.
