@@ -102,17 +102,25 @@
 //!     without Bun, done the way the emitted `README.md` says to do it: `npm ci`
 //!     from the committed `package-lock.json`, `tsc --noEmit`, graph
 //!     construction, a real invocation of the state model, and
-//!     `node src/index.ts`. One golden, because this is a claim about the
-//!     *runtime* rather than about any composition — every other gate above is
-//!     what says the emitted code is right, and this is what says the second
-//!     supported runtime can still run it.
+//!     `node src/index.ts`. It also re-runs the three runners behind gates 9 to
+//!     12, because those four verdicts are the *runtime's* rather than the
+//!     emitted code's — an EPIPE's delivery, a `Headers` composition, a query
+//!     string's spelling — and it asserts them with the very functions those
+//!     gates use, so the two runtimes cannot come to different answers unnoticed.
+//!     One golden, because what is in question is the runtime rather than any
+//!     composition — every other gate above is what says the emitted code is
+//!     right, and this is what says the second supported runtime can still run
+//!     it. The `node` it finds is checked against the `engines.node` floor first:
+//!     an older one cannot run a `.ts` file at all, and saying so is more use
+//!     than a failure about a file extension.
 //! 14. **No Bun-only API** — the same promise, statically and over the whole
 //!     corpus. Gate 13 runs one golden, so a Bun-only call on a path that golden
 //!     never takes would survive it; this reads every emitted module instead and
 //!     refuses a `Bun` global, a `bun:` specifier, and any import that is not
-//!     relative, a `node:` builtin, or one of the pinned packages. A whitelist
-//!     rather than a blacklist, so the next non-portable dependency fails too
-//!     without anyone having thought of it first.
+//!     relative, a `node:` builtin, or one of the pinned packages — in every
+//!     spelling an import can be written, the bare side-effect form included. A
+//!     whitelist rather than a blacklist, so the next non-portable dependency
+//!     fails too without anyone having thought of it first.
 //!
 //! # The toolchain fixture
 //!
@@ -180,16 +188,19 @@ fn node_fallback() -> Option<&'static Path> {
     static FALLBACK: OnceLock<Option<PathBuf>> = OnceLock::new();
     FALLBACK
         .get_or_init(|| {
-            if !runs("node") || !runs("npm") {
+            if let Some(blocker) = node_fallback_blocker() {
                 assert!(
                     !required(),
-                    "`node` and `npm` are required: PRD §9.18 keeps Node >= 22.18 a supported \
-                     fallback for every generated project, and gate 13 is the only thing that \
-                     checks it. CI installs them; see .github/workflows/ci.yml."
+                    "the Node fallback cannot be checked here: {blocker}. PRD §9.18 keeps \
+                     Node {engine} a supported fallback for every generated project, and gate 13 \
+                     is the only thing that checks it. CI installs it; see \
+                     .github/workflows/ci.yml.",
+                    engine = compose_core::codegen::project::NODE_ENGINE,
                 );
                 eprintln!(
-                    "warning: skipping the Node-fallback gate — `node`/`npm` are not on PATH. \
-                     They are required in CI (`CI` is set there) and this run is not CI."
+                    "warning: skipping the Node-fallback gate — {blocker}. A Node satisfying \
+                     `{engine}` is required in CI (`CI` is set there) and this run is not CI.",
+                    engine = compose_core::codegen::project::NODE_ENGINE,
                 );
                 return None;
             }
@@ -214,6 +225,107 @@ fn node_fallback() -> Option<&'static Path> {
             Some(root)
         })
         .as_deref()
+}
+
+/// Why gate 13 cannot run here, or `None` when it can.
+///
+/// Presence is not the question — the **floor** is. `engines.node` in every
+/// emitted manifest declares `compose_core::codegen::project::NODE_ENGINE`, and
+/// that number is load-bearing: below 22.18 Node does not strip types, so
+/// `node src/index.ts` fails on the first `.ts` it is handed. A gate that took
+/// any `node` on `PATH` would turn a developer machine whose default Node is
+/// older into a red suite reporting `ERR_UNKNOWN_FILE_EXTENSION` — a message
+/// about a file extension, for a machine that simply is not the one the fallback
+/// is promised to. So the version is read and compared, and the answer is the
+/// same rule the rest of the toolchain follows: in CI a failure, locally a skip,
+/// naming what was found beside what is required.
+fn node_fallback_blocker() -> Option<String> {
+    let floor = version(
+        compose_core::codegen::project::NODE_ENGINE
+            .strip_prefix(">=")
+            .expect("`NODE_ENGINE` is a `>=` floor"),
+    )
+    .expect("`NODE_ENGINE` names a version");
+
+    let reported = Command::new("node")
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string());
+    let Some(reported) = reported else {
+        return Some("`node` does not answer `--version` on PATH".to_string());
+    };
+    let Some(found) = version(&reported) else {
+        return Some(format!(
+            "`node --version` said `{reported}`, which is not a version"
+        ));
+    };
+    if found < floor {
+        return Some(format!(
+            "the `node` on PATH is `{reported}`, below the `{}` floor every emitted \
+             `package.json` declares — it does not strip types, so `node src/index.ts` cannot run \
+             at all",
+            compose_core::codegen::project::NODE_ENGINE,
+        ));
+    }
+    (!runs("npm")).then(|| "`npm` does not answer `--version` on PATH".to_string())
+}
+
+/// `major.minor.patch` from a version string, ordered as a tuple.
+///
+/// It reads two dialects: `v22.18.0` from `node --version` and `22.18.0` out of
+/// the `>=` floor. A component that is absent is zero — `>=23` is 23.0.0 — and a
+/// prerelease (`v25.0.0-nightly…`) is taken at its release number, because a
+/// nightly of a major above the floor is above the floor. A component that is
+/// present and is not a number is refused rather than guessed at.
+fn version(text: &str) -> Option<(u64, u64, u64)> {
+    fn number(part: &str) -> Option<u64> {
+        part.split(|character: char| !character.is_ascii_digit())
+            .next()
+            .filter(|digits| !digits.is_empty())?
+            .parse()
+            .ok()
+    }
+    let mut parts = text.trim().trim_start_matches('v').split('.');
+    let major = number(parts.next()?)?;
+    let minor = parts.next().map_or(Some(0), number)?;
+    let patch = parts.next().map_or(Some(0), number)?;
+    Some((major, minor, patch))
+}
+
+/// The floor gate 13 holds `node` to is a number, and it is the emitter's own.
+///
+/// `NODE_ENGINE` is what every generated `package.json` declares and what the
+/// emitted README tells a reader without Bun to install; the comparison that
+/// decides whether this machine can check that promise has to be over the same
+/// number, read as a number. A string compare would put `v9` above `v22.18.0`
+/// and a presence check — which is what this gate did — would put *every* Node
+/// above it, including the ones that cannot run a `.ts` file at all.
+#[test]
+fn the_node_fallback_floor_is_the_one_the_emitted_manifest_declares() {
+    let engine = compose_core::codegen::project::NODE_ENGINE;
+    let floor =
+        version(engine.strip_prefix(">=").expect("a `>=` floor")).expect("the floor is a version");
+    assert_eq!(
+        floor,
+        (22, 18, 0),
+        "`{engine}` is not the floor gate 13 reads"
+    );
+
+    for above in ["v22.18.0", "v22.22.2", "v24.0.1", "v25.0.0-nightly20260101"] {
+        assert!(
+            version(above).expect("a version") >= floor,
+            "`{above}` strips types and would be refused"
+        );
+    }
+    for below in ["v22.17.1", "v20.20.2", "v9.11.2"] {
+        assert!(
+            version(below).expect("a version") < floor,
+            "`{below}` does not strip types, so `node src/index.ts` cannot run there"
+        );
+    }
+    assert_eq!(version("not-a-version"), None);
 }
 
 /// Copy one golden into the toolchain's scratch area and answer where it landed.
@@ -1097,7 +1209,19 @@ fn a_raw_binding_trims_stdout_and_takes_a_response_body_verbatim() {
     );
     let answer: Value =
         serde_json::from_slice(&output.stdout).expect("the runner prints one JSON object");
+    a_raw_binding_bound(&answer);
+}
 
+/// The verdict `raw-decoding.mjs` has to come back with, whichever runtime ran
+/// it.
+///
+/// A function rather than a body, because gate 13 runs the same runner under
+/// Node: what a binding binds is the *runtime's* answer — `child_process`,
+/// `fetch` and a `TextDecoder` all belong to the engine — so a verdict that held
+/// under one and not the other is a composition that reads differently for half
+/// its readers. Sharing the assertions is what keeps the two runs one claim
+/// instead of two that can drift.
+fn a_raw_binding_bound(answer: &Value) {
     let sent = answer["sent"].as_str().expect("the payload it sent");
     assert_ne!(
         sent.trim(),
@@ -1127,6 +1251,12 @@ fn a_raw_binding_trims_stdout_and_takes_a_response_body_verbatim() {
 /// `skip` and `fallback` alike, past the `catch` that writes the run's trace
 /// (PRD 5.3), and under `serve` it would end every concurrent execution.
 ///
+/// That sentence is about **Node**, and this gate runs under Bun, which is why
+/// the assertions live in [`the_unread_input_was_survived`] and gate 13 hands
+/// them Node's own answer to the same runner. How a stream delivers a write that
+/// failed is the engine's to decide, so a gate about it that asked only one
+/// engine would be evidence for whichever half of the claim it happened to run.
+///
 /// A gate rather than a unit test because the failure is a property of the
 /// **process**: nothing about the returned value is wrong, the returned value
 /// never arrives. And a payload larger than a pipe buffer rather than a
@@ -1150,7 +1280,15 @@ fn a_command_that_never_reads_its_input_still_completes() {
     );
     let answer: Value =
         serde_json::from_slice(&output.stdout).expect("the runner prints one JSON object");
+    the_unread_input_was_survived(&answer);
+}
 
+/// The verdict `unread-stdin.mjs` has to come back with, whichever runtime ran
+/// it — shared with gate 13 for the reason [`a_raw_binding_bound`] gives, and
+/// most sharply here: which of a rejected promise and an `error` event an EPIPE
+/// arrives as is a property of the engine's own stream implementation, so this is
+/// the gate whose subject is least the compiler's and most the runtime's.
+fn the_unread_input_was_survived(answer: &Value) {
     assert!(
         answer["sent"].as_u64().is_some_and(|bytes| bytes > 65_536),
         "the payload has to exceed a pipe buffer for the write to fail at all, \
@@ -1186,6 +1324,15 @@ fn a_declared_content_type_replaces_the_one_the_runtime_would_have_sent() {
     let Some(answer) = http_request_gate("declared-headers") else {
         return;
     };
+    the_declared_media_type_arrived_alone(&answer);
+}
+
+/// The media-type half of `http-request.mjs`'s answer, whichever runtime ran it.
+///
+/// Shared with gate 13 for the reason [`a_raw_binding_bound`] gives: `fetch` and
+/// its `Headers` are the runtime's, and the appending behaviour this is about is
+/// a property of that implementation rather than of the emitted code.
+fn the_declared_media_type_arrived_alone(answer: &Value) {
     assert_eq!(
         answer["declared"]["header"].as_str(),
         Some("application/vnd.acme+json"),
@@ -1218,6 +1365,13 @@ fn a_bound_input_object_reaches_a_get_as_its_query_string() {
     let Some(answer) = http_request_gate("query-string") else {
         return;
     };
+    the_bound_object_arrived_as_parameters(&answer);
+}
+
+/// The query-string half of `http-request.mjs`'s answer, whichever runtime ran
+/// it — shared with gate 13, because how a `URL`'s `searchParams` spell a
+/// non-string and encode a space is the runtime's answer too.
+fn the_bound_object_arrived_as_parameters(answer: &Value) {
     let url = answer["query"]["url"]
         .as_str()
         .expect("the URL it received");
@@ -1871,6 +2025,35 @@ fn the_toolchain_fixture_pins_what_the_emitter_pins() {
 /// corpus, because what is in question is the runtime rather than any
 /// composition — gate 14 is the one that covers every emitted module, statically.
 ///
+/// # The gates whose subject is the runtime itself
+///
+/// Type-checking, construction and a reduction are about the emitted code, and
+/// they would answer the same under any engine that runs it. Gates 9 to 12 are
+/// not like that: an EPIPE arriving as a rejected promise or as an `error` event
+/// is `child_process`'s answer, a `Content-Type` composed by appending is
+/// `Headers`'s, a spelled-out number in a query string is `URLSearchParams`'s,
+/// and what a raw binding binds runs through all of them. Those were the gates
+/// running under Node before Bun became the default, and a Bun-only suite would
+/// let `node src/index.ts` break for a reader while every gate stayed green. So
+/// the three runners behind them are re-run here, under Node, against the
+/// assertions their own gates make — the *same functions*, so the two runs cannot
+/// come to different verdicts by drifting apart.
+///
+/// They are pointed at this gate's own staged project rather than a second copy:
+/// `src/runtime.ts` is a compiler constant, byte-identical in every project this
+/// release builds (see `codegen::runtime`), and `runExec`/`runHttp` are all the
+/// runners import.
+///
+/// Gate 5 is deliberately **not** among them, and the reason is worth writing
+/// down so the omission stays a decision. Its subject is the emitted runtime's
+/// own scheduling rather than an engine API — `map-dispatch.mjs` answers
+/// identically under both today — and it decides deadline questions on margins of
+/// tens of milliseconds (`timeoutMs: 80` against a 120 ms activity, and more like
+/// it). Running it a second time would double this suite's exposure to a loaded
+/// runner's timing for a claim that is not about the runtime, which is a worse
+/// trade than the gap it closes: gate 14 is what says nothing engine-specific is
+/// in those paths, and this gate is what says the engine can run them.
+///
 /// The inherited-property probe rides along for a reason of its own: gate 8's
 /// list is the JavaScript **engine's**, and `codegen::state` refuses channel names
 /// from it at compile time. A list checked only against JavaScriptCore would be a
@@ -1967,6 +2150,15 @@ fn a_generated_project_installs_type_checks_and_runs_under_the_node_fallback() {
         String::from_utf8_lossy(&launch.stderr),
     );
 
+    // Gates 9 to 12, asked of the runtime that answers them differently or not at
+    // all. `http-request.mjs` covers two of them in one process — the runners are
+    // split under Bun so each gate fails on its own, and there is one gate here.
+    a_raw_binding_bound(&node_runner("raw-decoding.mjs", &project));
+    the_unread_input_was_survived(&node_runner("unread-stdin.mjs", &project));
+    let request = node_runner("http-request.mjs", &project);
+    the_declared_media_type_arrived_alone(&request);
+    the_bound_object_arrived_as_parameters(&request);
+
     // Gate 8's list, asked of the other engine.
     let refused = compose_core::codegen::state::INHERITED_PROPERTY_NAMES;
     let probed: Vec<&str> = refused
@@ -1997,6 +2189,26 @@ fn a_generated_project_installs_type_checks_and_runs_under_the_node_fallback() {
         serde_json::to_value(refused).expect("the names serialize"),
         "the names `build` refuses are not the names LangGraph refuses under Node"
     );
+}
+
+/// One of the fixture's runners, under Node, over a project staged in the npm
+/// install.
+///
+/// The Node counterpart of [`runner`]: same script, same argument, same JSON
+/// object back — so the assertions gates 9 to 12 make can be handed either
+/// runtime's answer without knowing which one produced it.
+fn node_runner(script: &str, project: &Path) -> Value {
+    let output = Command::new("node")
+        .arg(toolchain::root().join(script))
+        .arg(project)
+        .output()
+        .expect("node runs");
+    assert!(
+        output.status.success(),
+        "`{script}` failed under the Node fallback:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    serde_json::from_slice(&output.stdout).expect("the runner prints one JSON object")
 }
 
 /// A module specifier no emitted file may import, or an expression no emitted
@@ -2107,9 +2319,18 @@ fn no_emitted_module_reaches_for_an_api_the_fallback_runtime_lacks() {
 
 /// Every module specifier a source file names.
 ///
-/// Both spellings the emitter can produce: a static `from "…"` and a dynamic
-/// `import("…")`. Quotes are matched on both sides, so a specifier holding one is
-/// read as far as its own closing quote rather than to the end of the line.
+/// All three spellings a module can reach a package by: a static `from "…"`, a
+/// dynamic `import("…")`, and a bare **side-effect** `import "…";`, which names
+/// no binding and so is the one form the `from` rows never see. The whitelist of
+/// [`no_emitted_module_reaches_for_an_api_the_fallback_runtime_lacks`] is only
+/// "over every import" if the scan is, and a side-effect import of a package the
+/// manifest does not pin resolves in the toolchain's shared install — where the
+/// gates run — while resolving nowhere in a reader's directory.
+///
+/// `import(` and `import ` cannot both match one occurrence: the character after
+/// the keyword is a parenthesis in the dynamic form and a quote in the bare one.
+/// Quotes are matched on both sides, so a specifier holding one is read as far as
+/// its own closing quote rather than to the end of the line.
 fn imports(source: &str) -> Vec<String> {
     let mut found = Vec::new();
     for (opening, quote) in [
@@ -2117,6 +2338,8 @@ fn imports(source: &str) -> Vec<String> {
         ("from '", '\''),
         ("import(\"", '"'),
         ("import('", '\''),
+        ("import \"", '"'),
+        ("import '", '\''),
     ] {
         for (index, _) in source.match_indices(opening) {
             let rest = &source[index + opening.len()..];
@@ -2140,6 +2363,62 @@ fn portable(specifier: &str) -> bool {
         .iter()
         .chain(compose_core::codegen::project::DEV_PINS)
         .any(|(package, _)| specifier == *package || specifier.starts_with(&format!("{package}/")))
+}
+
+/// Gate 14 reads every import, in every spelling — asserted here rather than in
+/// the corpus, because the corpus cannot show it.
+///
+/// The whitelist above is only as wide as the scan beneath it, and a spelling
+/// [`imports`] does not read is a package that is never checked at all. No
+/// emitted module uses a bare side-effect `import "…";` today, so the corpus
+/// would pass whether or not that form is scanned: this is the test that fails
+/// when it stops being.
+///
+/// The `@langchain/langgraph/prebuilt` row is there because the scan hands over
+/// the specifier **as written** rather than the package it belongs to, which is
+/// the reading [`portable`] has to admit a subpath under.
+#[test]
+fn the_import_scan_reads_every_spelling_a_module_can_reach_a_package_by() {
+    let source = r#"
+import { StateGraph } from "@langchain/langgraph";
+import type { Thing } from './state.ts';
+import "@langchain/langgraph/prebuilt";
+import 'node:process';
+const lazy = await import("node:fs/promises");
+const other = await import('./cel.ts');
+"#;
+    let mut found = imports(source);
+    found.sort_unstable();
+    assert_eq!(
+        found,
+        [
+            "./cel.ts",
+            "./state.ts",
+            "@langchain/langgraph",
+            "@langchain/langgraph/prebuilt",
+            "node:fs/promises",
+            "node:process",
+        ],
+        "a spelling the scan misses is an import gate 14 never whitelists"
+    );
+    assert!(found.iter().all(|specifier| portable(specifier)));
+
+    // The form the `from` rows cannot see, naming a package the manifest does
+    // not pin: read, and refused.
+    let bare = imports("import \"js-tiktoken\";\n");
+    assert_eq!(bare, ["js-tiktoken"]);
+    assert!(
+        !portable(&bare[0]),
+        "a bare import of an unpinned package resolves in the toolchain's shared \
+         install and nowhere in a reader's directory"
+    );
+
+    // A specifier is read to its own closing quote rather than to the end of the
+    // line, so the second one on a line is a specifier and not a tail.
+    assert_eq!(
+        imports("import { a } from \"./a.ts\"; import { b } from \"./b.ts\";"),
+        ["./a.ts", "./b.ts"]
+    );
 }
 
 /// The staged copy is the golden, byte for byte.

@@ -25,7 +25,11 @@
 //! than asserted — see gate 13 of `tests/generated_code_gates.rs`, which installs
 //! a golden with npm and type-checks, constructs and runs it under Node. That is
 //! the one place `node` and `npm` are still required, and the reason
-//! [`runs`] and [`required`] live here beside the Bun half.
+//! [`runs`] and [`required`] live here beside the Bun half. The Node half also
+//! reads `node --version` and holds it to the `engines.node` floor before
+//! deciding anything, because a Node below it cannot run a `.ts` file at all —
+//! that comparison lives beside the gate, since the floor is the *emitter's*
+//! constant rather than the toolchain's.
 //!
 //! # Where `bun` is looked for
 //!
