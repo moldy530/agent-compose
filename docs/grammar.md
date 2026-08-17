@@ -2211,7 +2211,7 @@ dispatch:
 | `route_by` | identifier | heterogeneous only | — | MUST equal the item union's `discriminator` |
 | `routes` | map tag→route, **≥ 1 entry** | with `route_by` | — | keys MUST be variant tags; an empty `routes:` would dispatch a union to one target and give up narrowing (D30) |
 | `default` | route | no | — | catch-all; legal only with `route_by` |
-| `max_concurrency` | integer 1..256 | **yes** | — | node-wide bound (D28) |
+| `max_concurrency` | integer 1..256 | **yes** | — | node-wide **admission** bound over every in-flight dispatch, detached included (D28; a detached dispatch waits for a permit to *start* — the join still never waits on its outcome, D94) |
 | `on_item_error` | `fail` \| `skip` \| `{ retry: <retry block, §9.1> }` | no | `fail` | per item (PRD 5.6); rule 10. The one per-item key that stays map-wide |
 | `input` | map field→CEL, or scalar CEL | homogeneous form only | whole item | per-item input binding; rules 7, 12 |
 | `writes` | map output-field→channel | homogeneous form only | name-based | target channels MUST be reduced; rule 7 |
@@ -2647,6 +2647,13 @@ from the **root flow instance** — the one the invocation started (§13) — do
 the effect site, **outermost first**, joined with `/`. A `flow:` node and a `map`
 node each contribute their own frame on the way in; integers are decimal; node
 ids are identifiers (§2.1), so no component can contain a separator.
+
+**Delivery surface.** How the key reaches the sink is fixed per binding kind, so
+sinks can be written against a stable contract: an `http:`-bound target receives
+it as the `Idempotency-Key` request header; an `exec:`-bound target receives it
+as the `IDEMPOTENCY_KEY` environment variable; a `function:`-bound target
+receives it as the `idempotency_key` field of its invocation context. The key is
+delivery metadata, never part of the target's declared input schema.
 
 ```
 exec_01/a/0/save/0          # store node `save`, in flow.ingest instantiated by node `a`
