@@ -154,9 +154,9 @@
 //!
 //! # What a provider is handed
 //!
-//! PRD 5.2 delivers an agent's output schema through `withStructuredOutput`, and
-//! what that mechanism *does* with the Zod this module emits is a fact worth
-//! writing down before the PR that wires it: `@langchain/core` 1.2.8 converts a
+//! `withStructuredOutput` is the mechanism PRD 5.2 named before 9.16 amended it,
+//! and what that mechanism *does* with the Zod this module emits is the
+//! measurement the amendment rests on: `@langchain/core` 1.2.8 converts a
 //! Zod v4 schema by calling `toJSONSchema` from `zod/v4/core`
 //! (`dist/utils/json_schema.js`), and that conversion keeps what Zod models as a
 //! *check* and drops what it models as a *refinement*, silently. Against the
@@ -170,9 +170,10 @@
 //! The `.regex`-spelled formats (`uri`, `time`, `uuid`) survive as `pattern`, so
 //! the loss tracks the spelling rather than the keyword.
 //!
-//! **Which schema a provider is handed is now decided, and it is not that
-//! conversion.** The question PRD 5.2 leaves open — a conversion of this Zod, or
-//! [`json_field_map`]'s lowering — was answered by the one property that makes
+//! **Which schema a provider is handed is decided, and it is not that
+//! conversion** — PRD 9.16 is where the decision is logged, and PRD 5.2 is
+//! amended to it. The question that log entry closes — a conversion of this Zod,
+//! or [`json_field_map`]'s lowering — was answered by the one property that makes
 //! structured output load-bearing for routing: the schema a model is
 //! *constrained by* has to be the schema its answer is then *parsed with*, or an
 //! agent can answer its own contract and fail the parse. Those two are equal by
@@ -185,9 +186,9 @@
 //! `what_the_structured_output_mechanism_would_be_handed` in
 //! `tests/generated_code_gates.rs` runs the real conversion over the real
 //! goldens, and it now measures **the road not taken** — the day that conversion
-//! stops dropping refinements is the day the choice could be reconsidered. The
-//! decision itself belongs in PRD §9's resolved log; this comment is where the
-//! reasoning lives until it is written there.
+//! stops dropping refinements is the day the choice could be reconsidered, which
+//! is the revisit condition PRD 9.16 names. This comment is the evidence behind
+//! that entry: the measurements above are what the decision was made on.
 
 use std::borrow::Cow;
 

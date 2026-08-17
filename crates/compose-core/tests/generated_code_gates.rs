@@ -37,13 +37,12 @@
 //!    so a difference is something a reader signed off on rather than something
 //!    a thin corpus failed to notice.
 //! 6. **What a provider would be handed** — `@langchain/core`'s own converter is
-//!    run over the emitted schemas, because PRD 5.2 delivers an output schema
-//!    through `withStructuredOutput` and that mechanism sends JSON Schema rather
-//!    than the Zod it was given. The conversion drops every check spelled
-//!    `.refine`, so the contract a model is constrained by is weaker than the
-//!    parse that follows it — see `codegen::schema`'s *What a provider is handed*.
-//!    Gate 5 is what makes the two columns agree; this is what says which of them
-//!    a model actually sees.
+//!    run over the emitted schemas, because `withStructuredOutput` sends JSON
+//!    Schema rather than the Zod it was given, and the conversion drops every
+//!    check spelled `.refine`. That is why PRD 9.16 sends the compiler's own
+//!    lowering instead, and this gate measures the road not taken — see
+//!    `codegen::schema`'s *What a provider is handed*. Gate 5 is what makes the
+//!    two columns agree; this is what says why a model is shown the one it is.
 //! 7. **The refusal's evidence** — `compose_core::codegen::diagnostics` refuses to
 //!    build a composition whose `state:` names a channel after a property every
 //!    JavaScript object carries (`constructor`). That refusal is an
@@ -1007,13 +1006,14 @@ const WEAKENINGS: &[Weakening] = &[
 /// which is the failure `codegen::schema` was written to prevent, pointed the
 /// other way.
 ///
-/// This gate does not fix that; the schema a node fn hands over is the next PR's
-/// emission, and *which* schema (a conversion of this Zod, or the lowering this
-/// compiler already publishes and the corpus proves equal to the parse) is a
-/// design question PRD 5.2 does not answer. What it does is keep the evidence
-/// current: the conversion is the library's own, the schemas are the committed
-/// goldens, and the day either half stops being true this fails and the question
-/// can be answered differently.
+/// That question — a conversion of this Zod, or the lowering this compiler
+/// already publishes and the corpus proves equal to the parse — is **answered**:
+/// PRD 9.16 takes the lowering, and `codegen::runtime`'s agent call sends it over
+/// `fetch` with no `withStructuredOutput` in the path. So this gate measures the
+/// road not taken, and that is the point of keeping it: the conversion is the
+/// library's own, the schemas are the committed goldens, and the day it stops
+/// dropping refinements this fails — which is exactly the revisit condition 9.16
+/// names.
 #[test]
 fn what_the_structured_output_mechanism_would_be_handed() {
     let golden = goldens::golden("every-schema-form");
