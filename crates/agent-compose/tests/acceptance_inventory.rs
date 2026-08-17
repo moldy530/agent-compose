@@ -340,6 +340,16 @@ const CODEGEN: &[Criterion] = &[
                 "a_fan_out_absorbed_by_its_own_on_error_still_records_every_dispatch",
                 Status::Live,
             ),
+            // …and the same two obligations under the other way a map node
+            // fails, which is the harder one: its own `timeout:` (rule 9,
+            // grammar 9.2). The deadline is *raced*, so the map's promise is
+            // abandoned and carries nothing out — and a detached sink queued
+            // behind the instance the budget cut short still has to be
+            // delivered, on a clock that is not the node's.
+            (
+                "a_fan_out_cut_short_by_its_own_timeout_still_delivers_and_records_its_sink",
+                Status::Live,
+            ),
         ],
     },
     Criterion {

@@ -744,7 +744,7 @@ const flowTriageNodeDispatchMap: runtime.MapDescriptor = {
     },
   ],
   fallback: {
-    tag: "default",
+    tag: "$default",
     target: "tool.dead_letter",
     maxConcurrency: 8,
     detach: false,

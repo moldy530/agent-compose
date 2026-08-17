@@ -1647,7 +1647,15 @@ fn map_descriptor(
                     imported,
                     &DispatchSite {
                         target: &default.node.value,
-                        tag: Some("default"),
+                        // Not `default`: a route's tag is a **variant tag**, and
+                        // a union may declare a variant called `default` beside
+                        // a `default:` catch-all — two different routes, legal
+                        // together, that `selectRoute` tells apart (named routes
+                        // are searched first) and a trace could not. The sigil
+                        // is the settlement: grammar §2.1's identifier is
+                        // `lower , { lower | digit | "_" }`, so no variant tag
+                        // an author can spell reaches this spelling.
+                        tag: Some(CATCH_ALL_TAG),
                         max_concurrency: default.max_concurrency.unwrap_or(map.max_concurrency),
                         input: default.input.as_ref(),
                         writes: default.writes.as_ref(),
@@ -1667,6 +1675,14 @@ fn map_descriptor(
     text.push_str("};\n");
     text
 }
+
+/// What a `map`'s `default:` catch-all is called in a dispatch record.
+///
+/// A reserved spelling rather than `default`, because a route's tag is otherwise
+/// a variant tag the author chose and one of them may *be* `default` — see the
+/// note at the emission site. `$` is outside grammar §2.1's identifier, so this
+/// name collides with nothing a composition can declare.
+const CATCH_ALL_TAG: &str = "$default";
 
 /// One dispatch target of a `map`, and everything it decides (grammar 8.6).
 struct DispatchSite<'ir> {

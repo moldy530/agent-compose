@@ -633,6 +633,27 @@ fn the_run_channel_folds_a_steps_contributions_in_canonical_order() {
 ///   * **that the ordering survives a completion order that is the reverse of
 ///     the source's**, at every one of the three reduce policies.
 ///
+/// Four more are only reachable once the map node's **own policy** is in play,
+/// which is every compiled map: grammar 9.3 level 3 puts a `timeout:` and a
+/// `retry:` on every node a `defaults:` block covers, and the emitted
+/// `examples/triage-fanout` carries both on its `dispatch` node. The runner
+/// drives those through `runtime.runNode`, which is the seam a real map node
+/// runs through:
+///
+///   * **a detached delivery still queued for a permit when the budget runs
+///     out** is delivered anyway (rule 7, PRD 5.6) — its signal is its own, and
+///     one that started against the node's already-aborted signal would be
+///     recorded as `detached` and never sent;
+///   * **a node that returned no answer still says what it dispatched.** A
+///     deadline is raced, so the map's promise — and the `ItemFailure` its
+///     records would have ridden out on — is abandoned;
+///   * **the bound spans two executions of one node.** A detached delivery
+///     outlives its call, so a bound counted per call lets a cycle's second
+///     traversal, or the node's own `retry:`, reach twice the declared number;
+///   * **a dispatched `flow.*` that failed keeps its own trace** (grammar 8.5),
+///     which under `on_item_error: skip` is the only account of it there will
+///     ever be, because the run then succeeds.
+///
 /// `src/runtime.ts` is a compiler constant, byte-identical in every project this
 /// release builds, so driving it directly is driving what every project runs.
 #[test]
@@ -842,6 +863,96 @@ fn the_fan_out_runtime_bounds_orders_and_resolves_every_dispatch() {
             "peak": 2,
             "queuedThenDelivered": ["joined", "returned", "delivered"],
         })
+    );
+
+    // A map node under its own `timeout:`, driven through `runNode`. The
+    // delivery was still **queued** for a permit when the budget ran out — the
+    // joined instance ahead of it held the map's only one — and it was still
+    // delivered: it runs under a signal of its own, so it does not start against
+    // the node's already-aborted one, throw before anything reaches the wire,
+    // and disappear into the catch that keeps a detached dispatch from failing
+    // the flow. A record saying `detached` for a message nobody sent is the lost
+    // message grammar 8.6 rule 7 and PRD 5.6 trade dedupe-on-a-key to avoid.
+    assert_eq!(
+        observed["deadlineWhileQueued"],
+        serde_json::json!({
+            "outcome": "skipped",
+            "timedOut": true,
+            "attempted": ["exec_probe/queued/0/1"],
+            "delivered": ["exec_probe/queued/0/1"],
+        })
+    );
+    // …and the account the node still owes. A deadline is *raced* (grammar 9.2),
+    // so the map's promise is abandoned where it stands and neither its answer
+    // nor an `ItemFailure` ever arrives — yet item 0 completed and item 1 was
+    // delivered to a sink before the budget expired, and the record is the only
+    // place either is visible. Item 2 was still in flight, so it has no outcome
+    // to report and the entry's own error accounts for it.
+    assert_eq!(
+        observed["deadlineKeepsTheRecord"],
+        serde_json::json!({
+            "outcome": "skipped",
+            "dispatches": [[0, "completed"], [1, "detached"]],
+            "keys": ["exec_probe/partial/0/0", "exec_probe/partial/0/1"],
+        })
+    );
+
+    // Grammar 8.6's key table again, over the span the bound has to cover: a
+    // detached delivery outlives the call that issued it (D94), so permits
+    // counted per *call* are not a bound on the node at all. Both ways a node
+    // runs twice are driven — a second traversal of a bounded cycle, and the
+    // node's own `retry:` re-executing the whole fan-out — and each would reach
+    // 2 in flight against a declared 1 if the gates were rebuilt per call.
+    assert_eq!(
+        observed["admissionAcrossTraversals"],
+        serde_json::json!({ "declared": 1, "peak": 1 })
+    );
+    assert_eq!(
+        observed["admissionAcrossRetries"],
+        serde_json::json!({
+            "declared": 1,
+            "peak": 1,
+            // The node really did run its fan-out twice, and its own `on_error:`
+            // absorbed the second failure — otherwise "the bound held" would be
+            // a claim about one execution.
+            "attempts": 2,
+            "outcome": "skipped",
+        })
+    );
+
+    // Grammar 8.5: a dispatched `flow.*` that failed keeps the trace of its own
+    // instance. `on_item_error: skip` drops the item and the run **succeeds**,
+    // so every guard, budget and attempt inside that boundary is either on this
+    // record or nowhere at all (PRD 5.3).
+    assert_eq!(
+        observed["failedSubflowRecord"],
+        serde_json::json!({
+            "outcome": "skipped",
+            "inner": [{
+                "step": 1,
+                "flow": "flow.worker",
+                "node": "work",
+                "traversal": 0,
+                "outcome": "failed",
+                "attempts": 2,
+                "error": "Error: boom",
+            }],
+            "error": "SubflowFailure: the instance of `flow.worker` did not run to quiescence: Error: boom",
+        })
+    );
+
+    // Rules 2 and 4: a union may declare a variant tagged `default` and a
+    // `default:` catch-all beside it — routes are keyed by variant tag and
+    // `default:` is a map-block key, so the two never collide in the source.
+    // They must not collide in the record either: `selectRoute` searches the
+    // named routes first and gets it right, and two routes may share a target,
+    // so the tag is the only thing that could tell a reader which ran.
+    assert_eq!(
+        observed["defaultTagCollision"],
+        serde_json::json!([
+            [0, "default", "agent.named"],
+            [1, "$default", "agent.catchall"]
+        ])
     );
 
     // Grammar 9.3 level 1: the outermost instantiation site wins a field

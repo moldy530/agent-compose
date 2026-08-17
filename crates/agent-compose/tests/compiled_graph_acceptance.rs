@@ -2717,7 +2717,7 @@ fn a_sink_route_is_joined_and_a_detached_one_is_resolved_at_dispatch() {
         [
             (0, "auto_fixable".to_string(), "completed".to_string()),
             (1, "needs_human".to_string(), "completed".to_string()),
-            (2, "default".to_string(), "detached".to_string()),
+            (2, "$default".to_string(), "detached".to_string()),
             (3, "auto_fixable".to_string(), "skipped".to_string()),
         ],
         "every item is accounted for, in source-item order: {dispatched}"
@@ -3205,6 +3205,156 @@ fn a_fan_out_absorbed_by_its_own_on_error_still_records_every_dispatch() {
     );
 }
 
+/// A fan-out its own **`timeout:`** cut short still delivers the sink it had
+/// queued, and still says what it dispatched (grammar 8.6 rules 7, 9, 9.2,
+/// PRD 5.3, 5.6).
+///
+/// A `map` takes a node policy like any other node, and grammar 9.3 level 3 puts
+/// one on every node a `defaults:` block covers — the emitted
+/// `examples/triage-fanout` carries `timeoutMs: 90000` on its `dispatch` node —
+/// so a fan-out under a deadline is the ordinary compiled shape rather than an
+/// exotic one. It is also the one shape where both of a fan-out's promises are
+/// hardest to keep, because a deadline is *raced* (grammar 9.2): the map's
+/// promise is abandoned where it stands, so nothing it was holding comes back.
+///
+/// Two things have to survive that, and `max_concurrency: 1` is what makes each
+/// decidable. The `auto_fixable` item takes the only permit and waits on an
+/// answer scripted to arrive long after the budget; the detached sink behind it
+/// is still in the **queue** when the budget runs out.
+///
+///   * **The delivery is issued anyway.** Its clock is its own rather than the
+///     node's, so it does not start against an already-aborted signal, throw
+///     before anything reaches the wire, and disappear into the catch that keeps
+///     a detached dispatch from failing the flow. That would be a message
+///     recorded as `detached` and never sent — the lost message PRD 5.6 trades
+///     at-least-once delivery and a dedupe key to avoid. The sink is an `exec:`
+///     tool that writes the `IDEMPOTENCY_KEY` it was handed to a file, so the
+///     claim is settled on disk rather than in a record.
+///   * **The record survives.** The item that was delivered had its effect, and
+///     with no answer and no `ItemFailure` the dispatch record is the only
+///     account of it there will ever be — while the run itself *succeeds*,
+///     because the node's `on_error: skip` absorbs the deadline.
+#[test]
+fn a_fan_out_cut_short_by_its_own_timeout_still_delivers_and_records_its_sink() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({
+                "findings": [
+                    { "kind": "auto_fixable", "file": "a.rs", "hint": "rename it" },
+                    { "kind": "needs_human", "summary": "look at b.rs", "severity": "high" },
+                ],
+            })),
+        ),
+        // Far longer than the node's 400ms budget, so the deadline is what ends
+        // the item rather than the answer.
+        Script::new(
+            HAIKU,
+            Outcome::structured(json!({ "patch": "patch-a" })).after(Duration::from_secs(5)),
+        )
+        .matching("a.rs"),
+    ]);
+
+    let scratch = harness::Scratch::new("expire");
+    let log = scratch.path().join("audit.log");
+    harness::shim(
+        scratch.path(),
+        "record-audit",
+        // The sink does a little work before it acknowledges, and that is what
+        // makes the difference observable. `spawn` is handed the delivery's
+        // signal, and an already-aborted one kills the child on the next tick —
+        // after it has started, so a sink that wrote its line and exited in the
+        // same instant would race that kill and settle nothing. Any real sink
+        // takes longer than a tick to do its work; this one says so out loud.
+        "sleep 0.3\nprintf '%s\\n' \"$IDEMPOTENCY_KEY\" >> \"$AUDIT_LOG\"\nprintf 'logged'\n",
+    );
+
+    let mut environment = harness::environment(&provider);
+    environment.push(("AUDIT_LOG".to_string(), log.display().to_string()));
+    environment.push((
+        "PATH".to_string(),
+        format!(
+            "{}:{}",
+            scratch.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        ),
+    ));
+
+    let Some(run) = harness::invoke_with(
+        "fanout",
+        "flow.expire",
+        &json!({ "report": "the build is red" }),
+        &environment,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(
+        run.outputs()["drafts"],
+        json!([]),
+        "the map node was skipped, so none of its writes landed (grammar 9.2)"
+    );
+
+    let entry = run.entries("fan")[0].clone();
+    assert_eq!(
+        entry["outcome"],
+        json!("skipped"),
+        "the node's own `on_error: skip` absorbed the deadline: {entry}"
+    );
+    assert!(
+        entry["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("timed out")),
+        "…and the error says what ended it: {entry}"
+    );
+
+    // The record the abandoned promise could not have carried. Only the detached
+    // dispatch is here: it is resolved at dispatch (D94), while the joined
+    // instance was still in flight when the budget expired and so had no outcome
+    // to report — the entry's own error is what accounts for that one.
+    let records = entry["dispatches"]
+        .as_array()
+        .unwrap_or_else(|| {
+            panic!("a fan-out its deadline cut short still records what it dispatched: {entry}")
+        })
+        .clone();
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| (
+                record["index"].as_u64().expect("an index"),
+                record["route"].as_str().expect("a route").to_string(),
+                record["outcome"].as_str().expect("an outcome").to_string(),
+            ))
+            .collect::<Vec<_>>(),
+        [(1, "needs_human".to_string(), "detached".to_string())],
+        "the dispatch that resolved is accounted for: {entry}"
+    );
+
+    // …and the delivery itself, which the bound had merely *delayed* past the
+    // deadline. It reaches the sink under exactly the key the record shows.
+    let key = records[0]["idempotencyKey"]
+        .as_str()
+        .expect("the detached dispatch carries its key")
+        .to_string();
+    assert!(
+        key.ends_with("/fan/0/1"),
+        "the key names the dispatch site: {key}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&log)
+            .expect(
+                "the detached sink ran: a delivery still queued for a permit when the node's \
+                 budget ran out is issued anyway (grammar 8.6 rule 7, PRD 5.6)"
+            )
+            .lines()
+            .collect::<Vec<_>>(),
+        [key.as_str()],
+        "the sink was delivered under the key the record shows"
+    );
+}
+
 /// `context: inherit` shares the caller's conversation with the instance in both
 /// directions, and the instantiation site's `policy:` is level 1 for the nodes
 /// inside it (grammar 8.5, 9.3, 10.4).
@@ -3439,7 +3589,7 @@ fn the_triage_fanout_example_routes_every_finding_and_joins_them_in_source_order
             ),
             (
                 json!(2),
-                json!("default"),
+                json!("$default"),
                 json!("tool.dead_letter"),
                 json!("completed")
             ),

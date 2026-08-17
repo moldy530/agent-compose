@@ -20,6 +20,21 @@
 // 9.4 fixes a surface for — because a key that is derived and recorded but never
 // sent is indistinguishable from a delivered one anywhere else.
 //
+// Four sections drive a map through **`runtime.runNode`** rather than calling
+// `runMap` directly, because a compiled map node is always inside one: grammar
+// 9.3 level 3 (`defaults:`) puts a `timeout:` and a `retry:` on every node a
+// composition declares, maps included, and the emitted `examples/triage-fanout`
+// carries both on its `dispatch` node. `runMap` on its own never sees them —
+// its `context.signal` never aborts and its call is never repeated — so the
+// rules that only exist at that seam (a queued delivery when the budget runs
+// out, the record a node that returned no answer still owes, a bound that has to
+// span two executions of one node) are decided from `runNode` downwards.
+//
+// One consequence worth stating: `max_concurrency` is admitted against a table
+// keyed by **node identity**, which is process-wide and outlives a call. Every
+// section therefore lets its detached deliveries finish before the next one
+// starts, and the sections that cannot are given an execution id of their own.
+//
 // Every completion order here is deliberately the reverse of source order: an
 // ordering rule that holds only when the instances happen to finish in order is
 // not a rule.
@@ -43,12 +58,26 @@ const runtime = await import(pathToFileURL(path.resolve(project, "src/runtime.ts
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** A sleep that a node's deadline can cut short, the way a real activity's does. */
+const naps = (ms, signal) =>
+  new Promise((resolve, reject) => {
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(timer);
+        reject(signal.reason instanceof Error ? signal.reason : new Error("aborted"));
+      },
+      { once: true },
+    );
+  });
+
 /** A `NodeView` over a `state.items` array, which is what `over` reads here. */
-function viewOf(items, { path: instancePath = [], traversals = {} } = {}) {
+function viewOf(items, { path: instancePath = [], traversals = {}, id = "exec_gate" } = {}) {
   const shape = { properties: { items: { items: "any" } } };
   const run = {
     ...runtime.emptyRun(),
-    execution: { id: "exec_gate", session_key: "" },
+    execution: { id, session_key: "" },
     path: instancePath,
     traversals,
   };
@@ -91,6 +120,41 @@ function descriptor(fields) {
     routes: [route({})],
     ...fields,
   };
+}
+
+/**
+ * A map node as `runtime.runNode` sees one: the descriptor a compiled `graph.ts`
+ * emits for a `map:`, and the graph state it is called against.
+ *
+ * The input phase and the activity are exactly what `codegen::graph` writes —
+ * `runtime.mapPlan(map, view)` and `runtime.runMap(map, plan, context)` — so
+ * what runs here is the seam a real node runs through, policy and all.
+ */
+function mapNode(map, items, { policy = {}, id = "exec_probe" } = {}) {
+  const state = {
+    items,
+    $run: { ...runtime.emptyRun(), execution: { id, session_key: "" } },
+  };
+  const descriptor = {
+    flow: "flow.probe",
+    node: map.node,
+    policy,
+    shapes: {
+      input: { properties: {} },
+      state: { properties: { items: { items: "any" } } },
+      output: "any",
+    },
+    input: (_roots, view) => runtime.mapPlan(map, view),
+    run: async (input, context) => runtime.runMap(map, input, context),
+    writes: [],
+    edges: [{ to: "next" }],
+  };
+  return { descriptor, state };
+}
+
+/** The one trace entry a `runNode` answer carries, as a plain object. */
+function entryOf(command) {
+  return command.update.$run.trace[0];
 }
 
 const observed = {};
@@ -288,7 +352,7 @@ const observed = {};
       }),
     ],
     fallback: route({
-      tag: "default",
+      tag: "$default",
       detach: true,
       target: "tool.sink",
       writes: [],
@@ -509,7 +573,7 @@ const observed = {};
     routeBy: "kind",
     routes: [route({ tag: "joined", run: watched })],
     fallback: route({
-      tag: "default",
+      tag: "$default",
       detach: true,
       target: "tool.sink",
       maxConcurrency: 2,
@@ -544,7 +608,7 @@ const observed = {};
       }),
     ],
     fallback: route({
-      tag: "default",
+      tag: "$default",
       detach: true,
       target: "tool.sink",
       writes: [],
@@ -562,6 +626,280 @@ const observed = {};
   order.push("returned");
   await sleep(100);
   observed.detachedBound = { declared: 2, peak, queuedThenDelivered: order };
+}
+
+// --- A map node under its own `timeout:` (grammar 9.2, 8.6 rules 7, 9) ------
+//
+// A `map` takes a node policy like any other node, and grammar 9.3 level 3 puts
+// one on every node a composition declares. Two of the guarantees above only
+// mean anything once that policy is in play, and neither is reachable from a
+// bare `runMap` call:
+//
+//   * a detached delivery still **queued for a permit** when the budget runs out
+//     is delivered anyway. Its signal is its own, not the node's, so it does not
+//     start against an already-aborted one and vanish into the catch that keeps
+//     it from failing the flow — a message that is recorded as `detached` and
+//     never sent is the lost message the key exists to prevent (rule 7, 5.6);
+//   * the node still says **what it dispatched**. A deadline is raced, so the
+//     map's promise is abandoned and neither its answer nor an `ItemFailure`
+//     arrives; the record is the only account of effects that already happened.
+{
+  const attempted = [];
+  const delivered = [];
+  /** A sink that reports the difference between being started and being sent. */
+  const sink = (fields) =>
+    route({
+      tag: "$default",
+      detach: true,
+      target: "tool.sink",
+      writes: [],
+      run: async (_input, context, site) => {
+        attempted.push(site.idempotencyKey);
+        // What `fetch` and `spawn` do with a signal that has already aborted,
+        // and therefore what `runHttp` and `runExec` would do here.
+        if (context.signal.aborted) throw new Error("the delivery started aborted");
+        delivered.push(site.idempotencyKey);
+        return { output: {} };
+      },
+      ...fields,
+    });
+
+  // One joined instance holds the only permit and honours the node's signal; the
+  // detached delivery behind it is still in the queue when the budget expires.
+  const queued = descriptor({
+    node: "queued",
+    maxConcurrency: 1,
+    onItemError: "skip",
+    routeBy: "kind",
+    routes: [
+      route({
+        tag: "joined",
+        writes: [],
+        run: async (_input, context) => {
+          await naps(400, context.signal);
+          return { output: {} };
+        },
+      }),
+    ],
+    fallback: sink({}),
+  });
+  const held = mapNode(queued, [{ kind: "joined" }, { kind: "away" }], {
+    policy: { timeoutMs: 80, onError: "skip" },
+  });
+  const answer = await runtime.runNode(held.descriptor, held.state);
+  const timedOut = entryOf(answer);
+  // The delivery has not started yet — that is the whole point — so this waits
+  // for the permit its predecessor gives up when the deadline aborts it.
+  await sleep(200);
+  observed.deadlineWhileQueued = {
+    outcome: timedOut.outcome,
+    timedOut: String(timedOut.error).includes("timed out"),
+    attempted,
+    delivered,
+  };
+
+  // …and the record. Item 0 completes and item 1 is detached before the budget
+  // runs out; item 2 is still in flight when it does, so it has no outcome to
+  // report and the entry's own error is what accounts for it.
+  const partial = descriptor({
+    node: "partial",
+    maxConcurrency: 2,
+    onItemError: "skip",
+    routeBy: "kind",
+    routes: [
+      route({
+        tag: "joined",
+        writes: [],
+        run: async (input, context) => {
+          await naps(input.at === 0 ? 10 : 400, context.signal);
+          return { output: {} };
+        },
+      }),
+    ],
+    fallback: sink({ run: async () => ({ output: {} }) }),
+  });
+  const cut = mapNode(
+    partial,
+    [
+      { at: 0, kind: "joined" },
+      { at: 1, kind: "away" },
+      { at: 2, kind: "joined" },
+    ],
+    { policy: { timeoutMs: 90, onError: "skip" } },
+  );
+  const entry = entryOf(await runtime.runNode(cut.descriptor, cut.state));
+  await sleep(200);
+  observed.deadlineKeepsTheRecord = {
+    outcome: entry.outcome,
+    dispatches: (entry.dispatches ?? null)?.map((record) => [record.index, record.outcome]) ?? null,
+    keys: (entry.dispatches ?? []).map((record) => record.idempotencyKey),
+  };
+}
+
+// --- The bound belongs to the node, not to the call (grammar 8.6's key table)
+//
+// A detached delivery outlives the call that issued it (D94), so a bound counted
+// inside one call is not a bound at all: the next execution of the same node —
+// a second traversal of a bounded cycle, or the node's own `retry:` — would
+// admit a fresh set of permits beside deliveries that are still in flight, and a
+// map declaring 1 would reach 2. Both routes to a second execution are driven.
+{
+  let live = 0;
+  let peak = 0;
+  const watched = async () => {
+    live += 1;
+    peak = Math.max(peak, live);
+    await sleep(120);
+    live -= 1;
+    return { output: {} };
+  };
+
+  const cycled = descriptor({
+    node: "cycled",
+    maxConcurrency: 1,
+    routes: [route({ detach: true, target: "tool.sink", writes: [], run: watched })],
+  });
+  const items = [{ at: 0 }];
+  // Two traversals of one node in one flow instance. The first returns at once —
+  // its only dispatch is detached — so the second is planned while the first's
+  // delivery is still running.
+  const options = { id: "exec_cycle" };
+  await runtime.runMap(cycled, runtime.mapPlan(cycled, viewOf(items, options)), context);
+  await runtime.runMap(
+    cycled,
+    runtime.mapPlan(cycled, viewOf(items, { ...options, traversals: { cycled: 1 } })),
+    context,
+  );
+  await sleep(400);
+  observed.admissionAcrossTraversals = { declared: 1, peak };
+
+  live = 0;
+  peak = 0;
+  // …and the node's own `retry:`, which re-executes the whole fan-out. Attempt
+  // 1's joined item fails immediately and its detached delivery runs on; attempt
+  // 2 must wait for that delivery's permit before it can dispatch anything.
+  const retried = descriptor({
+    node: "retried",
+    maxConcurrency: 1,
+    routeBy: "kind",
+    routes: [
+      route({
+        tag: "joined",
+        writes: [],
+        run: async () => {
+          throw new Error("item refused");
+        },
+      }),
+    ],
+    fallback: route({
+      tag: "$default",
+      detach: true,
+      target: "tool.sink",
+      writes: [],
+      run: watched,
+    }),
+  });
+  const node = mapNode(retried, [{ kind: "joined" }, { kind: "away" }], {
+    policy: {
+      retry: { max: 1, backoffMs: 1, multiplier: 1, jitter: false },
+      onError: "skip",
+    },
+    id: "exec_retry",
+  });
+  const absorbed = entryOf(await runtime.runNode(node.descriptor, node.state));
+  await sleep(400);
+  observed.admissionAcrossRetries = {
+    declared: 1,
+    peak,
+    attempts: absorbed.attempts,
+    outcome: absorbed.outcome,
+  };
+}
+
+// --- A dispatched `flow.*` that failed keeps its own trace (grammar 8.5) ----
+//
+// `DispatchRecord.inner` is the instance's trace, and the case it exists for is
+// the one where the caller learns nothing else: under `on_item_error: skip` the
+// run carries on and succeeds, so every guard, budget and attempt inside the
+// boundary is either on this record or nowhere (PRD 5.3).
+{
+  const innerTrace = [
+    {
+      step: 1,
+      flow: "flow.worker",
+      node: "work",
+      traversal: 0,
+      outcome: "failed",
+      attempts: 2,
+      error: "Error: boom",
+    },
+  ];
+  const map = descriptor({
+    node: "sub",
+    onItemError: "skip",
+    routes: [
+      route({
+        target: "flow.worker",
+        writes: [],
+        run: async () => {
+          throw new runtime.SubflowFailure(
+            "flow.worker",
+            "did not run to quiescence",
+            innerTrace,
+            new Error("boom"),
+          );
+        },
+      }),
+    ],
+  });
+  const answer = await runtime.runMap(
+    map,
+    runtime.mapPlan(map, viewOf([{ at: 0 }], { id: "exec_sub" })),
+    context,
+  );
+  const record = answer.dispatches[0];
+  observed.failedSubflowRecord = {
+    outcome: record.outcome,
+    inner: record.inner ?? null,
+    error: record.error,
+  };
+}
+
+// --- A variant tagged `default` is not the catch-all (grammar 8.6 rules 2, 4)
+//
+// Routes are keyed by variant tag and `default:` is a map-block key beside them,
+// so a union may declare a variant called `default` *and* a catch-all. The
+// runtime resolves them correctly — named routes are searched first — and the
+// record has to keep them apart too, because two routes may share a target.
+{
+  const map = descriptor({
+    node: "collide",
+    routeBy: "kind",
+    routes: [
+      route({
+        tag: "default",
+        target: "agent.named",
+        writes: [],
+        run: async () => ({ output: {} }),
+      }),
+    ],
+    fallback: route({
+      tag: "$default",
+      target: "agent.catchall",
+      writes: [],
+      run: async () => ({ output: {} }),
+    }),
+  });
+  const answer = await runtime.runMap(
+    map,
+    runtime.mapPlan(map, viewOf([{ kind: "default" }, { kind: "other" }], { id: "exec_tags" })),
+    context,
+  );
+  observed.defaultTagCollision = answer.dispatches.map((record) => [
+    record.index,
+    record.route,
+    record.target,
+  ]);
 }
 
 // --- Grammar 9.3 level 1, and D79's outermost-wins --------------------------

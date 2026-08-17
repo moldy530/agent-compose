@@ -33,7 +33,13 @@
 #   * `flow.absorb` — the `fail` half of grammar 8.6 rule 10's idiom: one item
 #     fails, the map node fails with it, and the node's own `on_error: skip`
 #     absorbs the fan-out — which is where a fan-out's record of what it
-#     dispatched matters most and is easiest to lose.
+#     dispatched matters most and is easiest to lose;
+#   * `flow.expire` — the same question one rung harder: a map node's own
+#     `timeout:` (grammar 9.2, 8.6 rule 9), which is a *raced* deadline, so the
+#     map's promise is abandoned and there is no failure for its record to ride
+#     out on. A detached sink is queued behind the instance the budget cuts
+#     short, so the run also decides that a delivery a bound merely delayed past
+#     the deadline is still delivered rather than dropped (rule 7, PRD 5.6).
 version: "0.1"
 
 state:
@@ -706,6 +712,68 @@ flow.absorb:
     - { from: sweep, to: fan }
     # Unconditional, because a skipped node has no result for a guard to read
     # and `skip` still routes (grammar 7.3, 9.2, Decision D97).
+    - { from: fan, to: end }
+
+flow.expire:
+  description: Fan out under a budget shorter than one instance, with a sink queued behind it.
+  inputs:
+    report:
+      type: string
+      min_length: 1
+  outputs:
+    drafts:
+      type: array
+      max_items: 40
+      items: { type: string }
+  nodes:
+    sweep:
+      agent: agent.triage
+      input:
+        report: "input.report"
+
+    # A `map` takes a node policy like any other node (grammar 8.6 rule 9), and
+    # grammar 9.3 level 3 puts one on every node a `defaults:` block covers — so
+    # this is the ordinary shape of a compiled fan-out rather than an exotic one.
+    #
+    # `max_concurrency: 1` is what makes the two rules here decidable. The
+    # `auto_fixable` item takes the only permit and waits on an answer that will
+    # not come inside the budget; the detached sink behind it is still in the
+    # **queue** when the budget runs out. Two things then have to hold, and
+    # neither is visible from a run that completes:
+    #
+    #   * the delivery is issued anyway. Its clock is its own, not this node's,
+    #     so it does not start against an already-aborted signal and vanish —
+    #     that would be a message recorded as `detached` and never sent, which
+    #     is what grammar 9.4's key exists to make unnecessary;
+    #   * the node still says what it dispatched. The deadline is *raced*
+    #     (grammar 9.2), so the map's promise is abandoned where it stands and
+    #     no failure carries its records out.
+    fan:
+      map:
+        over: sweep.output.findings
+        as: finding
+        route_by: kind
+        max_concurrency: 1
+        routes:
+          auto_fixable:
+            node: agent.fixer
+            input:
+              file: "finding.file"
+              hint: "finding.hint"
+            writes:
+              patch: drafts
+          needs_human:
+            node: tool.audit_log
+            detach: true
+            input:
+              line: "finding.summary"
+      timeout: 400ms
+      on_error: skip
+  edges:
+    - { from: start, to: sweep }
+    - { from: sweep, to: fan }
+    # Unconditional, for the reason `flow.absorb`'s is: a skipped node has no
+    # result for a guard to read, and `skip` still routes (grammar 7.3, 9.2, D97).
     - { from: fan, to: end }
 
 flow.continue:
