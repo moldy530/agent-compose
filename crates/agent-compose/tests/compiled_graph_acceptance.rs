@@ -1950,6 +1950,14 @@ fn a_node_timeout_fires_and_its_error_policy_takes_over() {
         failure.contains("timeout") || failure.contains("timed out"),
         "…and what happened to it: {failure}"
     );
+    // The abort reason becomes the failure's `cause`, and a run prints the whole
+    // chain — so it counts the attempts the node *made* too. One attempt was
+    // made here; a chain saying `0` under a message saying `1` reads as two
+    // facts about one node.
+    assert!(
+        failure.contains("after 1 attempt(s)") && !failure.contains("after 0 attempt(s)"),
+        "the message and the cause count the same attempts: {failure}"
+    );
 }
 
 /// The same budget, spent on a child process rather than on a provider — and the
@@ -1992,6 +2000,16 @@ fn a_node_timeout_fires_over_a_child_process_and_its_fallback_takes_over() {
     // budget across attempts rather than resetting it per attempt. A trace that
     // reported 4 here would be describing three sleeps that never ran.
     assert_eq!(slow[0]["attempts"], json!(1));
+    // The count the *message* carries is the same one, which it has to be: the
+    // abort reason becomes the failure's `cause` and a run prints the chain, so
+    // two numbers for one fact would be read as two facts.
+    assert!(
+        slow[0]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("after 1 attempt(s)")),
+        "the message counts what the trace counts: {}",
+        slow[0]["error"]
+    );
 }
 
 /// A store-op node reads and writes the local backend, with no infrastructure

@@ -225,20 +225,23 @@ export async function runActivity<T>(
   const controller = new AbortController();
   const budget = policy.timeoutMs;
   let expired = false;
+  // What the node *did*, not what its policy allowed: a budget that ran out
+  // during the second of three attempts made two, and a trace that reported
+  // three would describe a run that did not happen. Declared out here because
+  // the abort reason is read too — it becomes the `cause` of the failure below,
+  // which a run prints under the message, and two different counts in one report
+  // is worse than either.
+  let made = 0;
   const timer =
     budget === undefined
       ? undefined
       : setTimeout(() => {
           expired = true;
-          controller.abort(new NodeTimeout(node, budget, 0));
+          controller.abort(new NodeTimeout(node, budget, made));
         }, budget);
 
   try {
     let last: unknown;
-    // What the node *did*, not what its policy allowed: a budget that ran out
-    // during the second of three attempts made two, and a trace that reported
-    // three would describe a run that did not happen.
-    let made = 0;
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
       if (expired) break;
       made = attempt;
