@@ -1,19 +1,23 @@
 //! The generated-code checks of CLAUDE.md's *Validation strategy*, run against
-//! the **real** pinned JavaScript toolchain.
+//! the **real** pinned JavaScript toolchain — under **Bun**, which PRD §9.18
+//! makes the default runtime and package manager of every emitted project.
 //!
-//! Twelve gates. The first four are in increasing strength, each one existing
+//! Fourteen gates. The first four are in increasing strength, each one existing
 //! because the one above it passes on code the one below it catches; the fifth
 //! is about a construct whose guarantees are only observable from inside the
 //! runtime; the next two are about the schemas rather than the graph; the eighth
-//! is about a composition that has no generated project at all; and the last
-//! four are about what a binding does on the wire, which no amount of
-//! type-checking or graph construction reaches:
+//! is about a composition that has no generated project at all; the next four
+//! are about what a binding does on the wire, which no amount of type-checking or
+//! graph construction reaches; and the last two are about the *other* runtime —
+//! the Node fallback the same decision keeps supported:
 //!
-//! 1. **`tsc --noEmit`** — every golden project type-checks under its own strict
-//!    `tsconfig.json`, against installed `@langchain/langgraph`, `@langchain/core`
-//!    and `zod`. Not a stub, not a shim: the versions
-//!    `compose_core::codegen::project::PINS` names, downloaded and resolved.
-//! 2. **Construction** — Node runs the emitted TypeScript and builds a
+//! 1. **`bun run typecheck`** — every golden project type-checks under its own
+//!    strict `tsconfig.json`, against installed `@langchain/langgraph`,
+//!    `@langchain/core` and `zod`. Not a stub, not a shim: the versions
+//!    `compose_core::codegen::project::PINS` names, downloaded and resolved. The
+//!    command is the emitted `README.md`'s own, run through the emitted
+//!    `scripts.typecheck`, so a manifest that stopped declaring it fails here.
+//! 2. **Construction** — Bun runs the emitted TypeScript and builds a
 //!    `StateGraph` over the state model. A channel spec LangGraph refuses is a
 //!    green `tsc` and a runtime failure, so type-checking alone would not catch
 //!    it. The channel names come back and are compared against the composition's
@@ -24,7 +28,7 @@
 //!    `default:` became an initial value. A wrong reducer type-checks, constructs,
 //!    and would be committed as a correct golden, so [`REDUCTIONS`] states what
 //!    every golden's state holds after two rounds of writes.
-//! 4. **The environment check** — `node src/index.ts`, once with the
+//! 4. **The environment check** — `bun src/index.ts`, once with the
 //!    composition's `${ENV}` variables removed and once with them supplied. The
 //!    emitted `README.md` says loading the project is what checks its
 //!    environment (PRD 5.9); a `readEnvironment` that was declared and never
@@ -46,7 +50,7 @@
 //! 6. **Schema-lowering agreement** — the corpus under
 //!    `tests/fixtures/schema-lowering/` is validated twice: against the JSON
 //!    Schema this compiler lowers to (Rust, the `jsonschema` crate) and against
-//!    the Zod the same module emits (Node). Grammar 3.8 is one table with two
+//!    the Zod the same module emits (Bun). Grammar 3.8 is one table with two
 //!    columns and this is what keeps them from drifting apart. Each document
 //!    carries the verdict it *should* get, so two implementations agreeing on a
 //!    wrong answer is still a failure — and where the two columns cannot agree,
@@ -66,9 +70,12 @@
 //!    over-refusal until something shows the runtime really cannot take the
 //!    name, and no golden can show it, because the compiler will not emit one.
 //!    So this gate builds the channel table itself and makes LangGraph fail on
-//!    it — and asks Node for `Object.getOwnPropertyNames(Object.prototype)`, so
-//!    the Rust-side list is checked against the object model rather than against
-//!    a memory of it.
+//!    it — and asks the runtime for `Object.getOwnPropertyNames(
+//!    Object.prototype)`, so the Rust-side list is checked against the object
+//!    model rather than against a memory of it. Gate 13 asks Node the same
+//!    question, because the list is the *engine's* and a refusal that held under
+//!    one runtime and not the other would be a compiler constant that is wrong
+//!    for half its users.
 //! 9. **What a raw binding binds** — the single string-typed property of a
 //!    `tool.*` takes *trimmed* raw stdout from an `exec:` implementation and the
 //!    raw response text from an `http:` one, which is grammar 6.1 stating one
@@ -91,35 +98,53 @@
 //!     sentence: without `query:`/`body:`, the object goes out as query
 //!     parameters rather than as a body. Which slot codegen fills is a golden's
 //!     to commit; this is what the runtime does with what it was handed.
+//! 13. **The Node fallback** — the whole of what PRD §9.18 promises a reader
+//!     without Bun, done the way the emitted `README.md` says to do it: `npm ci`
+//!     from the committed `package-lock.json`, `tsc --noEmit`, graph
+//!     construction, a real invocation of the state model, and
+//!     `node src/index.ts`. One golden, because this is a claim about the
+//!     *runtime* rather than about any composition — every other gate above is
+//!     what says the emitted code is right, and this is what says the second
+//!     supported runtime can still run it.
+//! 14. **No Bun-only API** — the same promise, statically and over the whole
+//!     corpus. Gate 13 runs one golden, so a Bun-only call on a path that golden
+//!     never takes would survive it; this reads every emitted module instead and
+//!     refuses a `Bun` global, a `bun:` specifier, and any import that is not
+//!     relative, a `node:` builtin, or one of the pinned packages. A whitelist
+//!     rather than a blacklist, so the next non-portable dependency fails too
+//!     without anyone having thought of it first.
 //!
 //! # The toolchain fixture
 //!
-//! `tests/toolchain/` holds a `package.json` and a committed `package-lock.json`
-//! pinning exactly what the emitter pins, and `npm ci` installs it once per run.
-//! One install serves every golden because the emitted dependency set is a
-//! compiler constant rather than a per-project one — two projects built by one
-//! compiler release declare identical versions, so installing once and
-//! type-checking each against that install is the same check at a third of the
-//! network cost. `the_toolchain_fixture_pins_what_the_emitter_pins` is what keeps
-//! the fixture and the emitter from disagreeing.
+//! `tests/toolchain/` holds a `package.json` pinning exactly what the emitter
+//! pins, and a lockfile per supported runtime: `bun.lock`, which
+//! `bun install --frozen-lockfile` installs once per run for every gate but one,
+//! and `package-lock.json`, which gate 13 installs with `npm ci`. One install
+//! serves every golden because the emitted dependency set is a compiler constant
+//! rather than a per-project one — two projects built by one compiler release
+//! declare identical versions, so installing once and type-checking each against
+//! that install is the same check at a third of the network cost.
+//! `the_toolchain_fixture_pins_what_the_emitter_pins` is what keeps the fixture,
+//! both lockfiles, and the emitter from disagreeing.
 //!
 //! Each golden is **copied** into `tests/toolchain/projects/<name>/` rather than
 //! checked in place, so `node_modules/` resolution finds the shared install by
 //! walking up, and the committed goldens stay exactly the bytes the emitter
-//! wrote.
+//! wrote. Gate 13's copies go under `tests/toolchain/node-fallback/projects/`
+//! instead, beside an npm-installed `node_modules/` of their own: resolution
+//! takes the nearest one walking up, so the Node gate reaches what npm installed
+//! and never what Bun did.
 //!
-//! # When Node is missing
+//! # When a runtime is missing
 //!
-//! **In CI these gates fail; on a developer machine they skip.** CI is where "the
-//! suite is green" has to mean "the generated code is checked" (CLAUDE.md), so a
-//! missing toolchain there is a broken job, not an absent one — the workflow
-//! installs Node for exactly this. Locally, a contributor working on the parser
-//! should not be blocked by a Node install, and the skip says so on stderr rather
-//! than passing silently. `CI` (any non-empty value, which every CI provider
-//! sets) is the switch.
+//! **In CI these gates fail; on a developer machine they skip** — for Bun and for
+//! Node alike. The rule, the search order that finds `bun`, and why both halves
+//! are required in CI are in `support/toolchain.rs`.
 
 #[path = "support/goldens.rs"]
 mod goldens;
+#[path = "support/toolchain.rs"]
+mod toolchain;
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -129,40 +154,52 @@ use std::sync::OnceLock;
 
 use goldens::{GOLDENS, Golden, artifact, emitted, files_under, goldens_root};
 use serde_json::Value;
+use toolchain::{bun, installed, required, runner, runs};
 
-/// Where the pinned toolchain and the runners live.
-fn toolchain() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/toolchain")
-}
-
-/// Whether a missing Node toolchain is a failure rather than a skip.
-fn required() -> bool {
-    std::env::var_os("CI").is_some_and(|value| !value.is_empty())
-}
-
-/// The installed toolchain, or `None` when Node is absent and this is not CI.
+/// The golden gate 13 runs under Node.
 ///
-/// The install runs once per test binary. `npm ci` rather than `npm install`:
-/// it installs exactly the committed lockfile and never rewrites it, so a run of
-/// the suite cannot quietly change what the next one checks against.
-fn installed() -> Option<&'static Path> {
-    static TOOLCHAIN: OnceLock<Option<PathBuf>> = OnceLock::new();
-    TOOLCHAIN
+/// The richest emitted surface in the corpus: a fan-out, a subflow, stores, an
+/// `http:` binding and an `exec:` one, so a Node incompatibility in any of the
+/// runtime's wrappers has a module here that reaches it. Its `${ENV}` references
+/// also make it the golden whose `node src/index.ts` is a real presence check
+/// rather than a no-op load.
+const NODE_FALLBACK_GOLDEN: &str = "triage-fanout";
+
+/// The npm-installed toolchain gate 13 uses, or `None` when Node is absent and
+/// this is not CI.
+///
+/// A directory of its own beneath the fixture, holding a copy of the committed
+/// manifest and `package-lock.json` and an npm-installed `node_modules/`. Two
+/// reasons it is not the fixture directory itself: `bun install` and `npm ci`
+/// would take turns rewriting one `node_modules/`, and the point of the gate is
+/// that the code Node runs was resolved by **npm** from the lockfile a reader
+/// without Bun would use. Module resolution takes the nearest `node_modules/`
+/// walking up, so a project staged inside this directory reaches this install and
+/// never the Bun one above it.
+fn node_fallback() -> Option<&'static Path> {
+    static FALLBACK: OnceLock<Option<PathBuf>> = OnceLock::new();
+    FALLBACK
         .get_or_init(|| {
             if !runs("node") || !runs("npm") {
                 assert!(
                     !required(),
-                    "`node` and `npm` are required: the generated-code gates are what make \
-                     `cargo test` mean the emitted TypeScript compiles and runs (CLAUDE.md). \
-                     CI installs them; see .github/workflows/ci.yml."
+                    "`node` and `npm` are required: PRD §9.18 keeps Node >= 22.18 a supported \
+                     fallback for every generated project, and gate 13 is the only thing that \
+                     checks it. CI installs them; see .github/workflows/ci.yml."
                 );
                 eprintln!(
-                    "warning: skipping the generated-code gates — `node`/`npm` are not on PATH. \
+                    "warning: skipping the Node-fallback gate — `node`/`npm` are not on PATH. \
                      They are required in CI (`CI` is set there) and this run is not CI."
                 );
                 return None;
             }
-            let root = toolchain();
+            let source = toolchain::root();
+            let root = source.join("node-fallback");
+            fs::create_dir_all(&root).expect("the scratch area is writable");
+            for manifest in ["package.json", "package-lock.json"] {
+                fs::copy(source.join(manifest), root.join(manifest))
+                    .expect("the committed manifest is readable");
+            }
             let install = Command::new("npm")
                 .args(["ci", "--no-audit", "--no-fund"])
                 .current_dir(&root)
@@ -170,21 +207,13 @@ fn installed() -> Option<&'static Path> {
                 .expect("npm runs");
             assert!(
                 install.status.success(),
-                "the pinned toolchain did not install:\n{}\n{}",
+                "the pinned toolchain did not install under npm:\n{}\n{}",
                 String::from_utf8_lossy(&install.stdout),
                 String::from_utf8_lossy(&install.stderr),
             );
             Some(root)
         })
         .as_deref()
-}
-
-/// Whether a command is on `PATH` and answers `--version`.
-fn runs(program: &str) -> bool {
-    Command::new(program)
-        .arg("--version")
-        .output()
-        .is_ok_and(|output| output.status.success())
 }
 
 /// Copy one golden into the toolchain's scratch area and answer where it landed.
@@ -206,6 +235,13 @@ fn staged(golden: &Golden, root: &Path, purpose: &str) -> PathBuf {
 }
 
 /// Gate 1: every golden project type-checks against the installed pins.
+///
+/// `bun run typecheck` rather than a path to `tsc`, because that is the command
+/// the emitted `README.md` gives a reader: it goes through the project's own
+/// `scripts.typecheck`, resolves `tsc` from the shared install by walking up, and
+/// runs it under Bun — so a manifest that stopped declaring the script, and a
+/// pinned TypeScript that stopped running under the default runtime, both fail
+/// here rather than in a reader's terminal.
 #[test]
 fn every_generated_project_type_checks_under_the_pinned_toolchain() {
     let Some(root) = installed() else {
@@ -220,11 +256,11 @@ fn every_generated_project_type_checks_under_the_pinned_toolchain() {
 
     for golden in GOLDENS {
         let project = staged(golden, root, "typecheck");
-        let output = Command::new(&tsc)
-            .args(["--noEmit", "-p", "."])
+        let output = bun()
+            .args(["run", "typecheck"])
             .current_dir(&project)
             .output()
-            .expect("tsc runs");
+            .expect("bun runs");
         assert!(
             output.status.success(),
             "`{}` does not type-check:\n{}\n{}",
@@ -245,11 +281,10 @@ fn every_generated_project_constructs_its_state_model() {
 
     for golden in GOLDENS {
         let project = staged(golden, root, "construct");
-        let output = Command::new("node")
-            .arg(root.join("state-channels.mjs"))
+        let output = runner("state-channels.mjs")
             .arg(&project)
             .output()
-            .expect("node runs");
+            .expect("bun runs");
         assert!(
             output.status.success(),
             "`{}` does not construct its graph:\n{}",
@@ -495,12 +530,11 @@ fn the_emitted_state_model_reduces_the_way_its_policies_say() {
         let writes = project.join("state-writes.json");
         fs::write(&writes, entry.writes).expect("the scratch area is writable");
 
-        let output = Command::new("node")
-            .arg(root.join("state-reduction.mjs"))
+        let output = runner("state-reduction.mjs")
             .arg(&project)
             .arg(&writes)
             .output()
-            .expect("node runs");
+            .expect("bun runs");
         assert!(
             output.status.success(),
             "`{}` did not run its state model:\n{}",
@@ -575,12 +609,11 @@ fn the_run_channel_folds_a_steps_contributions_in_canonical_order() {
     let fold = |contributions: &str, purpose: &str| -> Value {
         let path = project.join(format!("run-{purpose}.json"));
         fs::write(&path, contributions).expect("the scratch area is writable");
-        let output = Command::new("node")
-            .arg(root.join("run-channel.mjs"))
+        let output = runner("run-channel.mjs")
             .arg(&project)
             .arg(&path)
             .output()
-            .expect("node runs");
+            .expect("bun runs");
         assert!(
             output.status.success(),
             "the run channel did not fold:\n{}",
@@ -671,11 +704,10 @@ fn the_fan_out_runtime_bounds_orders_and_resolves_every_dispatch() {
         return;
     };
     let project = staged(goldens::golden("triage-fanout"), root, "map-dispatch");
-    let output = Command::new("node")
-        .arg(root.join("map-dispatch.mjs"))
+    let output = runner("map-dispatch.mjs")
         .arg(&project)
         .output()
-        .expect("node runs");
+        .expect("bun runs");
     assert!(
         output.status.success(),
         "the fan-out runtime did not run:\n{}",
@@ -1054,11 +1086,10 @@ fn a_raw_binding_trims_stdout_and_takes_a_response_body_verbatim() {
     };
     let project = staged(goldens::golden("review-loop"), root, "raw-decoding");
 
-    let output = Command::new("node")
-        .arg(root.join("raw-decoding.mjs"))
+    let output = runner("raw-decoding.mjs")
         .arg(&project)
         .output()
-        .expect("node runs");
+        .expect("bun runs");
     assert!(
         output.status.success(),
         "the raw-binding runner failed:\n{}",
@@ -1108,11 +1139,10 @@ fn a_command_that_never_reads_its_input_still_completes() {
     };
     let project = staged(goldens::golden("review-loop"), root, "unread-stdin");
 
-    let output = Command::new("node")
-        .arg(root.join("unread-stdin.mjs"))
+    let output = runner("unread-stdin.mjs")
         .arg(&project)
         .output()
-        .expect("node runs");
+        .expect("bun runs");
     assert!(
         output.status.success(),
         "writing to a command that does not read its input killed the process:\n{}",
@@ -1214,11 +1244,10 @@ fn http_request_gate(purpose: &str) -> Option<Value> {
     let root = installed()?;
     let project = staged(goldens::golden("review-loop"), root, purpose);
 
-    let output = Command::new("node")
-        .arg(root.join("http-request.mjs"))
+    let output = runner("http-request.mjs")
         .arg(&project)
         .output()
-        .expect("node runs");
+        .expect("bun runs");
     assert!(
         output.status.success(),
         "the `http:` request runner failed:\n{}",
@@ -1239,15 +1268,17 @@ fn http_request_gate(purpose: &str) -> Option<Value> {
 /// Two claims, both of them things that could quietly stop being true:
 ///
 /// * the list is the object model's own — `Object.getOwnPropertyNames(
-///   Object.prototype)` under the pinned Node, not a transcription of it;
+///   Object.prototype)` under the default runtime, not a transcription of it.
+///   Gate 13 asks Node the same question, because the list is the JavaScript
+///   engine's and this compiler's refusal has to hold for both;
 /// * every name on it really breaks construction under the pinned LangGraph, and
 ///   two ordinary names do not. A release that fixed the lookup would fail here,
 ///   which is the signal to drop the refusal rather than keep it out of habit.
 #[test]
 fn a_channel_named_after_an_inherited_property_cannot_be_built_at_all() {
-    let Some(root) = installed() else {
+    if installed().is_none() {
         return;
-    };
+    }
 
     let refused = compose_core::codegen::state::INHERITED_PROPERTY_NAMES;
     // Two names a check matching on shape rather than on membership would take
@@ -1255,11 +1286,10 @@ fn a_channel_named_after_an_inherited_property_cannot_be_built_at_all() {
     let controls = ["draft", "constructors"];
     let probed: Vec<&str> = refused.iter().copied().chain(controls).collect();
 
-    let output = Command::new("node")
-        .arg(root.join("inherited-channel-names.mjs"))
+    let output = runner("inherited-channel-names.mjs")
         .arg(serde_json::to_string(&probed).expect("the names serialize"))
         .output()
-        .expect("node runs");
+        .expect("bun runs");
     assert!(
         output.status.success(),
         "the inherited-name runner failed:\n{}",
@@ -1299,8 +1329,9 @@ fn a_channel_named_after_an_inherited_property_cannot_be_built_at_all() {
 /// when it runs; both are claims about a call, and a module that declared
 /// `readEnvironment` and never called it would satisfy `tsc`, construct its
 /// graph, and leave both sentences false. So the gate is the command the README
-/// names: `node src/index.ts`, once with the composition's variables removed and
-/// once with them set.
+/// names first: `bun src/index.ts`, once with the composition's variables removed
+/// and once with them set. Gate 13 runs the fallback spelling of the same command
+/// on one golden, because the claim is about the module rather than the runtime.
 #[test]
 fn the_generated_project_checks_its_environment_when_it_is_loaded() {
     let Some(root) = installed() else {
@@ -1314,12 +1345,12 @@ fn the_generated_project_checks_its_environment_when_it_is_loaded() {
         let references = compose_core::codegen::env::References::of(&ir);
         let names: Vec<&str> = references.names().collect();
 
-        let mut sealed = Command::new("node");
+        let mut sealed = bun();
         sealed.arg(project.join("src/index.ts"));
         for name in &names {
             sealed.env_remove(name);
         }
-        let sealed = sealed.output().expect("node runs");
+        let sealed = sealed.output().expect("bun runs");
 
         if names.is_empty() {
             assert!(
@@ -1354,12 +1385,12 @@ fn the_generated_project_checks_its_environment_when_it_is_loaded() {
             );
         }
 
-        let mut supplied = Command::new("node");
+        let mut supplied = bun();
         supplied.arg(project.join("src/index.ts"));
         for name in &names {
             supplied.env(name, "supplied");
         }
-        let supplied = supplied.output().expect("node runs");
+        let supplied = supplied.output().expect("bun runs");
         assert!(
             supplied.status.success(),
             "`{}` refused to load with every variable set:\n{}",
@@ -1556,12 +1587,11 @@ fn the_emitted_zod_agrees_with_the_json_schema_lowering() {
         )
         .expect("the scratch area is writable");
 
-        let output = Command::new("node")
-            .arg(root.join("zod-conformance.mjs"))
+        let output = runner("zod-conformance.mjs")
             .arg(&input_path)
             .arg(&project)
             .output()
-            .expect("node runs");
+            .expect("bun runs");
         assert!(
             output.status.success(),
             "the Zod corpus did not run against `{directory}`:\n{}",
@@ -1702,14 +1732,12 @@ fn what_the_structured_output_mechanism_would_be_handed() {
         return;
     };
     let project = staged(golden, root, "structured-output");
-    let mut runner = Command::new("node");
-    runner
-        .arg(root.join("structured-output-schema.mjs"))
-        .arg(&project);
+    let mut convert = runner("structured-output-schema.mjs");
+    convert.arg(&project);
     for row in WEAKENINGS {
-        runner.arg(names.value(row.surface));
+        convert.arg(names.value(row.surface));
     }
-    let output = runner.output().expect("node runs");
+    let output = convert.output().expect("bun runs");
     assert!(
         output.status.success(),
         "the emitted schemas did not convert:\n{}",
@@ -1744,14 +1772,17 @@ fn mentions(schema: &Value, keyword: &str) -> bool {
     }
 }
 
-/// The fixture and the emitter pin the same versions.
+/// The fixture, **both** its lockfiles, and the emitter pin the same versions.
 ///
 /// Without this the gates would keep passing against whatever was installed the
 /// last time someone touched the fixture, while `build` emitted a manifest for
-/// something else — a green suite about the wrong toolchain.
+/// something else — a green suite about the wrong toolchain. Both lockfiles are
+/// read, because a pin bump that regenerated one of them and not the other would
+/// leave the two supported runtimes checked against different resolutions, which
+/// is the one thing having two of them must not cost.
 #[test]
 fn the_toolchain_fixture_pins_what_the_emitter_pins() {
-    let path = toolchain().join("package.json");
+    let path = toolchain::root().join("package.json");
     let text = fs::read_to_string(&path).expect("the toolchain fixture is readable");
     let manifest: Value = serde_json::from_str(&text).expect("the fixture is JSON");
 
@@ -1776,10 +1807,38 @@ fn the_toolchain_fixture_pins_what_the_emitter_pins() {
         }
     }
 
-    // The lockfile is what `npm ci` installs; a fixture whose lockfile predates a
-    // pin bump would install the old version and the gates would check it.
-    let lock = fs::read_to_string(toolchain().join("package-lock.json"))
-        .expect("the toolchain lockfile is committed");
+    // A lockfile is what a `--frozen-lockfile` install resolves from; one that
+    // predates a pin bump would install the old version and the gates would
+    // check it. `bun.lock` first, because that is the default install.
+    let lock = fs::read_to_string(toolchain::root().join("bun.lock"))
+        .expect("the Bun lockfile is committed");
+    let declared = &lock;
+    for (section, pins) in [
+        ("dependencies", compose_core::codegen::project::PINS),
+        ("devDependencies", compose_core::codegen::project::DEV_PINS),
+    ] {
+        for (package, version) in pins {
+            // `bun.lock` is JSONC — trailing commas and all — so it is read as
+            // text rather than parsed. The two spellings are the workspace's own
+            // declaration and the resolved entry, and both have to name the pin:
+            // the first is what `--frozen-lockfile` compares the manifest
+            // against, and the second is what actually gets installed.
+            for entry in [
+                format!("\"{package}\": \"{version}\""),
+                format!("\"{package}\": [\"{package}@{version}\""),
+            ] {
+                assert!(
+                    declared.contains(&entry),
+                    "the committed `bun.lock` does not carry `{entry}` for `{section}`; \
+                     run `bun install` in `tests/toolchain` and commit it"
+                );
+            }
+        }
+    }
+
+    // …and `package-lock.json`, which gate 13 installs with `npm ci`.
+    let lock = fs::read_to_string(toolchain::root().join("package-lock.json"))
+        .expect("the npm lockfile is committed");
     let lock: Value = serde_json::from_str(&lock).expect("the lockfile is JSON");
     let root = &lock["packages"][""];
     for (section, pins) in [
@@ -1790,11 +1849,297 @@ fn the_toolchain_fixture_pins_what_the_emitter_pins() {
             assert_eq!(
                 root[section][*package].as_str(),
                 Some(*version),
-                "the committed lockfile does not pin `{package}` at `{version}`; \
+                "the committed `package-lock.json` does not pin `{package}` at `{version}`; \
                  run `npm install --package-lock-only` in `tests/toolchain`"
             );
         }
     }
+}
+
+/// Gate 13: the Node fallback, installed with npm and run under Node.
+///
+/// PRD §9.18 makes Bun the default and keeps **Node >= 22.18 a supported
+/// fallback**, and the emitted `README.md` prints the commands for it. Every gate
+/// above runs under Bun, so without this one that whole second column would be a
+/// paragraph nothing executes — and it would rot silently, because a Bun-only API
+/// slipping into `codegen::runtime` breaks nothing a Bun-run suite can see.
+///
+/// So this is the README's fallback block, run: `npm ci` from the committed
+/// `package-lock.json`, `npm run typecheck`, the graph constructed, the state
+/// model **invoked** against the same expectations gate 2b holds it to, and
+/// `node src/index.ts`. One golden ([`NODE_FALLBACK_GOLDEN`]) rather than the
+/// corpus, because what is in question is the runtime rather than any
+/// composition — gate 14 is the one that covers every emitted module, statically.
+///
+/// The inherited-property probe rides along for a reason of its own: gate 8's
+/// list is the JavaScript **engine's**, and `codegen::state` refuses channel names
+/// from it at compile time. A list checked only against JavaScriptCore would be a
+/// compiler constant that is wrong for every reader on V8, so both engines are
+/// asked the same question.
+#[test]
+fn a_generated_project_installs_type_checks_and_runs_under_the_node_fallback() {
+    let Some(root) = node_fallback() else {
+        return;
+    };
+    let golden = goldens::golden(NODE_FALLBACK_GOLDEN);
+    let project = staged(golden, root, "node-fallback");
+
+    let tsc = root.join("node_modules/.bin/tsc");
+    assert!(
+        tsc.is_file(),
+        "`npm ci` did not install the pinned TypeScript: {}",
+        tsc.display()
+    );
+    let typecheck = Command::new("npm")
+        .args(["run", "typecheck"])
+        .current_dir(&project)
+        .output()
+        .expect("npm runs");
+    assert!(
+        typecheck.status.success(),
+        "`{NODE_FALLBACK_GOLDEN}` does not type-check under the npm install:\n{}\n{}",
+        String::from_utf8_lossy(&typecheck.stdout),
+        String::from_utf8_lossy(&typecheck.stderr),
+    );
+
+    let construct = Command::new("node")
+        .arg(toolchain::root().join("state-channels.mjs"))
+        .arg(&project)
+        .output()
+        .expect("node runs");
+    assert!(
+        construct.status.success(),
+        "`{NODE_FALLBACK_GOLDEN}` does not construct its graph under Node:\n{}",
+        String::from_utf8_lossy(&construct.stderr),
+    );
+
+    // The same table gate 2b holds every golden to, answered by Node instead of
+    // Bun. A run rather than a load: this is where the emitted reducers, the
+    // initial values and LangGraph's own scheduler all execute.
+    let entry = REDUCTIONS
+        .iter()
+        .find(|entry| entry.golden == NODE_FALLBACK_GOLDEN)
+        .expect("the fallback golden has a reduction row");
+    let writes = project.join("state-writes.json");
+    fs::write(&writes, entry.writes).expect("the scratch area is writable");
+    let reduced = Command::new("node")
+        .arg(toolchain::root().join("state-reduction.mjs"))
+        .arg(&project)
+        .arg(&writes)
+        .output()
+        .expect("node runs");
+    assert!(
+        reduced.status.success(),
+        "`{NODE_FALLBACK_GOLDEN}` did not run its state model under Node:\n{}",
+        String::from_utf8_lossy(&reduced.stderr),
+    );
+    let mut answer: Value =
+        serde_json::from_slice(&reduced.stdout).expect("the runner prints the state as JSON");
+    answer
+        .as_object_mut()
+        .expect("the state is an object")
+        .remove("$run")
+        .expect("every state model carries the compiler's own channel");
+    let expected: Value = serde_json::from_str(entry.expected).expect("the row is JSON");
+    assert_eq!(
+        answer, expected,
+        "`{NODE_FALLBACK_GOLDEN}` reduces differently under the fallback runtime"
+    );
+
+    // `node src/index.ts`, the README's fallback launch, with the composition's
+    // variables supplied.
+    let references = compose_core::codegen::env::References::of(&artifact(golden));
+    let names: Vec<&str> = references.names().collect();
+    assert!(
+        !names.is_empty(),
+        "`{NODE_FALLBACK_GOLDEN}` references no variable, so loading it says nothing about \
+         the presence check the README promises"
+    );
+    let mut launch = Command::new("node");
+    launch.arg(project.join("src/index.ts"));
+    for name in &names {
+        launch.env(name, "supplied");
+    }
+    let launch = launch.output().expect("node runs");
+    assert!(
+        launch.status.success(),
+        "`node src/index.ts` — the fallback launch the emitted README documents — failed:\n{}",
+        String::from_utf8_lossy(&launch.stderr),
+    );
+
+    // Gate 8's list, asked of the other engine.
+    let refused = compose_core::codegen::state::INHERITED_PROPERTY_NAMES;
+    let probed: Vec<&str> = refused
+        .iter()
+        .copied()
+        .chain(["draft", "constructors"])
+        .collect();
+    let probe = Command::new("node")
+        .arg(toolchain::root().join("inherited-channel-names.mjs"))
+        .arg(serde_json::to_string(&probed).expect("the names serialize"))
+        .output()
+        .expect("node runs");
+    assert!(
+        probe.status.success(),
+        "the inherited-name runner failed under Node:\n{}",
+        String::from_utf8_lossy(&probe.stderr),
+    );
+    let probe: Value =
+        serde_json::from_slice(&probe.stdout).expect("the runner prints one JSON object");
+    assert_eq!(
+        probe["inherited"],
+        serde_json::to_value(refused).expect("the names serialize"),
+        "`INHERITED_PROPERTY_NAMES` is not `Object.getOwnPropertyNames(Object.prototype)` under \
+         Node; the compiler refuses a set of channel names the fallback runtime does not"
+    );
+    assert_eq!(
+        probe["rejected"],
+        serde_json::to_value(refused).expect("the names serialize"),
+        "the names `build` refuses are not the names LangGraph refuses under Node"
+    );
+}
+
+/// A module specifier no emitted file may import, or an expression no emitted
+/// file may write.
+struct Unportable {
+    /// The text that gives it away, matched literally.
+    token: &'static str,
+    /// What it is, for the failure message.
+    about: &'static str,
+}
+
+/// Everything a generated module is forbidden to reach for.
+///
+/// Every entry is Bun-only, or new enough that the Node floor
+/// `compose_core::codegen::project::NODE_ENGINE` declares does not have it. The
+/// `Bun.` row is matched with an identifier character after the dot on purpose:
+/// a sentence in a comment that happens to end in "…under Bun." is prose, and a
+/// gate that failed on it would be a gate people learn to work around.
+const UNPORTABLE: &[Unportable] = &[
+    Unportable {
+        token: "globalThis.Bun",
+        about: "the `Bun` global, which no other runtime defines",
+    },
+    Unportable {
+        token: "process.isBun",
+        about: "a Bun-detection flag, which the fallback runtime does not set",
+    },
+    Unportable {
+        token: "import.meta.main",
+        about: "`import.meta.main`, which Node did not have at 22.18",
+    },
+    Unportable {
+        token: "\"bun:",
+        about: "a `bun:` module specifier (`bun:sqlite`, `bun:ffi`, `bun:test`)",
+    },
+    Unportable {
+        token: "'bun:",
+        about: "a `bun:` module specifier (`bun:sqlite`, `bun:ffi`, `bun:test`)",
+    },
+];
+
+/// Gate 14: no emitted module reaches for an API only Bun has.
+///
+/// Bun being the default (PRD §9.18) is a statement about how a generated project
+/// is installed, launched and gated — never about what may be written into one.
+/// The emitted modules stay runtime-neutral, and that is what makes
+/// `node src/index.ts` a promise the README can keep.
+///
+/// Gate 13 runs one golden under Node, which catches a Bun-only call on a path
+/// that golden takes. This is the other half, and it is the stronger one: every
+/// module of every golden, read rather than run, so a Bun-only call behind a
+/// `store:` branch nothing in the corpus exercises fails here too.
+///
+/// The import check is a **whitelist**: relative, a `node:` builtin, or a package
+/// `compose_core::codegen::project::PINS` names. A blacklist would only ever
+/// catch what somebody had already thought of, and the interesting failure is the
+/// dependency nobody has added yet.
+#[test]
+fn no_emitted_module_reaches_for_an_api_the_fallback_runtime_lacks() {
+    let mut modules = 0usize;
+    for golden in GOLDENS {
+        for file in emitted(golden).files() {
+            if !file.path.starts_with("src/") || !file.path.ends_with(".ts") {
+                continue;
+            }
+            modules += 1;
+            let source = &file.contents;
+
+            for entry in UNPORTABLE {
+                assert!(
+                    !source.contains(entry.token),
+                    "`{}/{}` writes `{}` — {}. A generated module runs on Bun and on Node \
+                     (PRD §9.18), so it may use neither runtime's private surface.",
+                    golden.directory,
+                    file.path,
+                    entry.token,
+                    entry.about,
+                );
+            }
+            for (index, _) in source.match_indices("Bun.") {
+                let next = source[index + "Bun.".len()..].chars().next();
+                assert!(
+                    !next.is_some_and(|character| character.is_alphabetic()
+                        || character == '_'
+                        || character == '$'),
+                    "`{}/{}` calls the `Bun` global, which no other runtime defines. \
+                     A generated module runs on Bun and on Node (PRD §9.18).",
+                    golden.directory,
+                    file.path,
+                );
+            }
+
+            for specifier in imports(source) {
+                assert!(
+                    portable(&specifier),
+                    "`{}/{}` imports `{specifier}`, which is neither relative, a `node:` \
+                     builtin, nor one of the packages the manifest pins. A generated project \
+                     installs exactly `PINS` + `DEV_PINS` under any of three installers, so an \
+                     import outside that set does not resolve in a reader's directory at all.",
+                    golden.directory,
+                    file.path,
+                );
+            }
+        }
+    }
+    assert!(modules > 0, "no emitted module was read");
+}
+
+/// Every module specifier a source file names.
+///
+/// Both spellings the emitter can produce: a static `from "…"` and a dynamic
+/// `import("…")`. Quotes are matched on both sides, so a specifier holding one is
+/// read as far as its own closing quote rather than to the end of the line.
+fn imports(source: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for (opening, quote) in [
+        ("from \"", '"'),
+        ("from '", '\''),
+        ("import(\"", '"'),
+        ("import('", '\''),
+    ] {
+        for (index, _) in source.match_indices(opening) {
+            let rest = &source[index + opening.len()..];
+            if let Some(end) = rest.find(quote) {
+                found.push(rest[..end].to_string());
+            }
+        }
+    }
+    found
+}
+
+/// Whether a specifier resolves in a directory holding only the pinned install.
+fn portable(specifier: &str) -> bool {
+    if specifier.starts_with("./") || specifier.starts_with("../") {
+        return true;
+    }
+    if let Some(builtin) = specifier.strip_prefix("node:") {
+        return !builtin.is_empty();
+    }
+    compose_core::codegen::project::PINS
+        .iter()
+        .chain(compose_core::codegen::project::DEV_PINS)
+        .any(|(package, _)| specifier == *package || specifier.starts_with(&format!("{package}/")))
 }
 
 /// The staged copy is the golden, byte for byte.

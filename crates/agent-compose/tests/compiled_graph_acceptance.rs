@@ -2122,12 +2122,12 @@ fn the_generated_cel_evaluator_agrees_with_the_validator_on_the_conformance_corp
     let driver = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/compiled_graph_acceptance/cel-conformance.mjs");
 
-    let output = std::process::Command::new("node")
+    let output = harness::bun()
         .arg(&driver)
         .arg(built.root())
         .arg(&corpus)
         .output()
-        .expect("node runs the generated evaluator");
+        .expect("bun runs the generated evaluator");
     assert!(
         output.status.success(),
         "the conformance driver failed: {}",
@@ -4430,17 +4430,11 @@ fn every_generated_project_type_checks_and_constructs_its_graph() {
             String::from_utf8_lossy(&built.stderr)
         );
 
-        let typecheck = std::process::Command::new(
-            project
-                .parent()
-                .and_then(Path::parent)
-                .expect("the toolchain root")
-                .join("node_modules/.bin/tsc"),
-        )
-        .args(["--noEmit", "-p", "."])
-        .current_dir(&project)
-        .output()
-        .expect("tsc runs");
+        let typecheck = harness::bun()
+            .args(["run", "typecheck"])
+            .current_dir(&project)
+            .output()
+            .expect("bun runs");
         assert!(
             typecheck.status.success(),
             "`{name}` does not type-check:\n{}",
@@ -4451,9 +4445,8 @@ fn every_generated_project_type_checks_and_constructs_its_graph() {
         // an edge to a node that is not registered, or a node reachable only
         // through a control-transfer position that `ends` did not declare, is a
         // runtime error at construction and a green `tsc` either way.
-        let construct = std::process::Command::new("node")
+        let construct = harness::bun()
             .args([
-                "--input-type=module",
                 "-e",
                 "const graph = await import('./src/graph.ts');\
                  graph.createBuilder();\
@@ -4464,7 +4457,7 @@ fn every_generated_project_type_checks_and_constructs_its_graph() {
             ])
             .current_dir(&project)
             .output()
-            .expect("node runs");
+            .expect("bun runs");
         assert!(
             construct.status.success(),
             "`{name}`'s graph does not construct: {}",
