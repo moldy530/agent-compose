@@ -336,6 +336,60 @@ fn a_src_directory_the_compiler_did_not_write_is_refused() {
     assert!(out.join("README-mine.md").is_file());
 }
 
+/// Neither is somebody's `package.json`, and `src/` is not what makes it theirs.
+///
+/// The scenario is a real Node project whose sources are not under `src/`, which
+/// is what the `src/` scan cannot see: there is nothing under `src/` to refuse
+/// over, and the four files the emitter writes at the root were replaced in
+/// place — no refusal, no removal to report, exit `0`, originals gone. Nothing
+/// but `git status` would have said so, and an ejected copy (PRD 5.12) is
+/// exactly the directory a user points `--out` at by mistake.
+#[test]
+fn root_files_the_compiler_did_not_write_are_refused() {
+    let out = scratch("root-not-ours");
+    let path = out.to_str().expect("a UTF-8 scratch path");
+    fs::write(out.join("package.json"), "{\"name\":\"my-real-app\"}\n").expect("writable");
+    fs::write(out.join("README.md"), "# My real project\n").expect("writable");
+    fs::create_dir_all(out.join("lib")).expect("writable");
+    fs::write(out.join("lib/index.ts"), "export const mine = 1;\n").expect("writable");
+
+    let refused = build(&["examples/review-loop/main.yml", "--out", path]);
+    assert_eq!(code(&refused), 2, "{}", stderr(&refused));
+    for expected in ["`README.md`", "`package.json`", "generated-file header"] {
+        assert!(
+            stderr(&refused).contains(expected),
+            "the refusal does not carry `{expected}`: {}",
+            stderr(&refused)
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(out.join("package.json")).expect("readable"),
+        "{\"name\":\"my-real-app\"}\n",
+        "the manifest is the user's and is still theirs"
+    );
+    assert_eq!(
+        fs::read_to_string(out.join("README.md")).expect("readable"),
+        "# My real project\n"
+    );
+    assert_eq!(
+        files_under(&out),
+        ["README.md", "lib/index.ts", "package.json"],
+        "the refusal is total: nothing was written"
+    );
+
+    // …and the same directory with those two files gone builds, which is what
+    // makes this a refusal rather than a rule against building into a directory
+    // that has anything in it.
+    fs::remove_file(out.join("package.json")).expect("removable");
+    fs::remove_file(out.join("README.md")).expect("removable");
+    let built = build(&["examples/review-loop/main.yml", "--out", path]);
+    assert_eq!(code(&built), 0, "{}", stderr(&built));
+    assert!(
+        out.join("lib/index.ts").is_file(),
+        "and the code that was never in the way is still there"
+    );
+}
+
 /// The target selects the deploy layer, and the emitted project says which one
 /// it is (grammar 14, PRD 5.8's per-target invariant).
 #[test]

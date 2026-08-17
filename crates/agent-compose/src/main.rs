@@ -37,11 +37,11 @@
 //! The split between `1` and `2` is the difference between *the composition is
 //! wrong* and *the command could not be run against it*. A missing `imports:`
 //! entry is the composition's problem and exits `1` with a diagnostic naming the
-//! file; an entrypoint that is not a readable file, or an `--out` whose `src/`
-//! holds files this compiler did not write (see [`build::write`]), is the
-//! command's own precondition and exits `2` with a plain message, because there
-//! is no span to point at. Argument errors are clap's, which exits `2` for them
-//! already.
+//! file; an entrypoint that is not a readable file, or an `--out` holding files
+//! this compiler did not write and would have replaced (see [`build::write`]),
+//! is the command's own precondition and exits `2` with a plain message, because
+//! there is no span to point at. Argument errors are clap's, which exits `2` for
+//! them already.
 //!
 //! `build --check` uses the same three codes for the same three meanings: `1` is
 //! "the answer is no" — the composition is invalid, or the directory no longer
@@ -284,9 +284,10 @@ fn build_project(
             }
             Err(build::Refusal::NotOurs(paths)) => {
                 return fail(&format!(
-                    "`{}` holds {} this compiler did not write ({}), and `src/` is a directory \
-                     `build` owns outright: it replaces what it emits and removes the rest. Point \
-                     `--out` at a directory of its own, or move those files out of `src/`",
+                    "`{}` holds {} this compiler did not write ({}), and this build would have \
+                     replaced or removed {}: it touches only files carrying its own \
+                     generated-file header. Point `--out` at a directory of its own, or move \
+                     {} aside",
                     out.display(),
                     if paths.len() == 1 { "a file" } else { "files" },
                     paths
@@ -294,6 +295,8 @@ fn build_project(
                         .map(|path| format!("`{path}`"))
                         .collect::<Vec<_>>()
                         .join(", "),
+                    if paths.len() == 1 { "it" } else { "them" },
+                    if paths.len() == 1 { "it" } else { "them" },
                 ));
             }
         },

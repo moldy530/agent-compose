@@ -217,10 +217,16 @@ naming every variable that is missing rather than the first (PRD 5.9, grammar
 compile time, which is what keeps this directory committable and free of
 credentials.
 
-`src/` is owned by the compiler. `agent-compose build` removes files under it
-that it did not write, and `agent-compose build --check` reports them. Everything
-else in this directory — `node_modules/`, a lockfile, a `.env` — is yours and is
-never touched.
+`src/` is owned by the compiler: `agent-compose build` replaces the modules it
+emits, removes the ones it no longer emits, and `agent-compose build --check`
+reports either as drift. `package.json`, `tsconfig.json`, `.gitignore` and this
+README are generated too, and a rebuild replaces them. Everything else in this
+directory — `node_modules/`, a lockfile, a `.env` — is yours and is never
+removed.
+
+Every file the compiler replaces or removes carries the header above, which is
+how it tells its own work from yours: a `build` into a directory holding none of
+its files refuses rather than overwriting what is there.
 
 ## Running it
 
