@@ -6,9 +6,18 @@
 // the other half: the rules that are only *observable* from inside — how many
 // instances were in flight at once, which item a failure was reported about when
 // two of them failed, whether the join returned before a detached delivery
-// finished — and the ones a composition cannot make adversarial enough on
-// purpose. `src/runtime.ts` is a compiler constant, byte-identical in every
-// project, so driving it directly is driving what every project runs.
+// finished, what that delivery put on the wire, how many attempts an item made
+// when the node's deadline cut a backoff short — and the ones a composition
+// cannot make adversarial enough on purpose. `src/runtime.ts` is a compiler
+// constant, byte-identical in every project, so driving it directly is driving
+// what every project runs.
+//
+// Two sections reach past the runtime on purpose. The channel section builds a
+// real `StateGraph` the way `codegen::state` builds one, because a reduce policy
+// is half reducer and half channel and the half that swallowed a fan-out's batch
+// was the channel. The delivery section intercepts `fetch` and runs a real
+// subprocess, because a key that is derived and recorded but never sent is
+// indistinguishable from a delivered one anywhere else.
 //
 // Every completion order here is deliberately the reverse of source order: an
 // ordering rule that holds only when the instances happen to finish in order is
@@ -21,6 +30,8 @@
 import path from "node:path";
 import process from "node:process";
 import { pathToFileURL } from "node:url";
+
+import { Annotation, StateGraph } from "@langchain/langgraph";
 
 const [, , project] = process.argv;
 if (project === undefined) {
@@ -304,6 +315,47 @@ const observed = {};
     setOne: runtime.setReduce("a", "b"),
     setBatch: runtime.setReduce("a", batch),
   };
+}
+
+// --- …and the channel they are called by, which is not always the reducer ---
+//
+// A reducer that folds a batch correctly is only half of it: LangGraph keeps the
+// first update to an **empty** channel verbatim rather than calling the reducer
+// with it, so a channel with no initial value never gets the chance. Every
+// policy is driven here through a real `StateGraph` built exactly the way
+// `codegen::state` builds one — `append` and `merge` at their identity elements,
+// `last_wins` with a default and without one — over a batch of three.
+{
+  const channels = {
+    notes: Annotation({
+      reducer: (left, right) => runtime.appendReduce(left, right),
+      default: () => [],
+    }),
+    totals: Annotation({
+      reducer: (left, right) => runtime.mergeReduce(left, right),
+      default: () => ({}),
+    }),
+    latest: Annotation({
+      reducer: (left, right) => runtime.setReduce(left, right),
+      default: () => "",
+    }),
+    // The shape with no `default:` (grammar 10.1, Decision D78) — the one a
+    // batch cannot be handed to.
+    winner: Annotation({ reducer: (left, right) => runtime.setReduce(left, right) }),
+  };
+  const write = (channel, reduce, values) =>
+    runtime.orderedUpdate({ channel, reduce, values });
+  const graph = new StateGraph(Annotation.Root(channels))
+    .addNode("fan", () => ({
+      notes: write("notes", "append", ["n-A", "n-B", "n-C"]),
+      totals: write("totals", "merge", [{ who: "A" }, { who: "B", note: "b" }, { who: "C" }]),
+      latest: write("latest", "set", ["l-A", "l-B", "l-C"]),
+      winner: write("winner", "set", ["w-A", "w-B", "w-C"]),
+    }))
+    .addEdge("__start__", "fan")
+    .addEdge("fan", "__end__")
+    .compile();
+  observed.batched = await graph.invoke({});
 }
 
 // --- Grammar 9.3 level 1, and D79's outermost-wins --------------------------

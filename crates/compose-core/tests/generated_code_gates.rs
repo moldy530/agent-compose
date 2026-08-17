@@ -30,13 +30,17 @@
 //!    environment (PRD 5.9); a `readEnvironment` that was declared and never
 //!    called would pass every gate above and make that sentence false.
 //! 5. **The fan-out** — `map` dispatch, driven directly against a golden's own
-//!    `src/runtime.ts`. Five of grammar 8.6's guarantees are invisible from
-//!    outside: how many instances were in flight at once, which item a `fail`
-//!    names when two of them fail, whether the join returned before a detached
-//!    delivery did, that an exhausted item retry resolves as `fail` does, and
-//!    that the ordering holds under a completion order that is the reverse of
-//!    the source's. A happy-path run produces the same outputs with every one of
-//!    them broken.
+//!    `src/runtime.ts`. Nine of grammar 8.6's guarantees are invisible from
+//!    outside: how many instances were in flight at once — with and without a
+//!    detached route beside them — which item a `fail` names when two of them
+//!    fail, whether the join returned before a detached delivery did, what that
+//!    delivery handed its sink, that an exhausted item retry resolves as `fail`
+//!    does, how many attempts an item *made* when the node's deadline cut a
+//!    backoff short, what a fan-out that failed still records, that a batch
+//!    survives the **channel** its reducer belongs to and not only the reducer,
+//!    and that the ordering holds under a completion order that is the reverse
+//!    of the source's. A happy-path run produces the same outputs with every one
+//!    of them broken.
 //! 6. **Schema-lowering agreement** — the corpus under
 //!    `tests/fixtures/schema-lowering/` is validated twice: against the JSON
 //!    Schema this compiler lowers to (Rust, the `jsonschema` crate) and against
@@ -749,6 +753,22 @@ fn the_fan_out_runtime_bounds_orders_and_resolves_every_dispatch() {
             "mergeBatch": { "a": 1, "b": 3, "c": 4 },
             "setOne": "b",
             "setBatch": "c",
+        })
+    );
+    // …and the same batches through the **channels** those reducers belong to,
+    // which is a different question: LangGraph keeps the first update to an
+    // empty channel verbatim instead of calling the reducer with it, so a
+    // channel with no initial value never gets the chance to unpack one. The
+    // `last_wins` row without a `default:` is the one that shape reaches
+    // (grammar 10.1, Decision D78), and `winner` holding the batch object
+    // rather than a string is what this row is here to refuse.
+    assert_eq!(
+        observed["batched"],
+        serde_json::json!({
+            "notes": ["n-A", "n-B", "n-C"],
+            "totals": { "who": "C", "note": "b" },
+            "latest": "l-C",
+            "winner": "w-C",
         })
     );
 

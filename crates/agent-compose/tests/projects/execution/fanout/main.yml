@@ -22,7 +22,11 @@
 #     one dispatch is two instance-path frames deep and `execution.item_index`
 #     names the innermost map (grammar 4.1, 9.4);
 #   * `flow.continue` — `context: inherit`, and an instantiation-site `policy:`
-#     that is grammar 9.3's level 1 for the nodes inside the instance.
+#     that is grammar 9.3's level 1 for the nodes inside the instance;
+#   * `flow.tally` — the two reduce policies the `append` flows above leave
+#     untouched, which grammar 8.6 rule 5 gives their own sentence: a `merge`
+#     channel written by several instances, and a `last_wins` channel that
+#     declares **no** `default:` and so starts unset (Decision D78);
 version: "0.1"
 
 state:
@@ -62,6 +66,25 @@ state:
     max_items: 40
     items: { type: string }
     reduce: append
+
+  # The other two reduce policies a fan-out may write (grammar 8.6 rule 5). Both
+  # are written by instances that complete in the reverse of source order, so
+  # "the highest-indexed item's write" is an assertion rather than a coincidence.
+  totals:
+    description: One partial object per instance, merged key-wise in source-item order.
+    type: object
+    properties:
+      who: { type: string }
+      note: { type: string }
+    reduce: merge
+  winner:
+    description: >-
+      The last write in canonical order. Declared with **no** `default:`, so it
+      starts unset (grammar 10.1, Decision D78) — the one channel shape whose
+      first update never reaches its reducer, and so the one a `map`'s ordered
+      batch cannot be handed to.
+    type: string
+    reduce: last_wins
 
 provider.mock:
   kind: anthropic
@@ -261,6 +284,25 @@ agent.roller:
 # like any other route (PRD 5.6 — `detach: true` is the only opt-out). Its
 # `output:` declares exactly one string property, so grammar 6.1's `tool.*`
 # exception takes trimmed stdout whole.
+agent.tallier:
+  description: Scores one task, and names the task that is winning so far.
+  model: model.fast
+  prompt: |
+    Score the task you are given.
+  input:
+    title: { type: string }
+  output:
+    piece:
+      description: A `merge` write — the properties this instance has an answer for.
+      type: object
+      properties:
+        who: { type: string }
+        note: { type: string }
+    label:
+      description: A `last_wins` write — the whole value, and the last one in order wins.
+      type: string
+      min_length: 1
+
 tool.review_queue:
   description: Enqueue a finding for a human to look at.
   input:
@@ -271,6 +313,7 @@ tool.review_queue:
   exec:
     command: printf
     args: ["queued"]
+
 
 flow.normalize:
   description: Normalize a raw report.
@@ -506,6 +549,45 @@ flow.nested:
     - { from: start, to: plan }
     - { from: plan, to: work }
     - { from: work, to: end }
+
+flow.tally:
+  description: Fan out into a `merge` channel and an undefaulted `last_wins` one.
+  inputs:
+    goal:
+      type: string
+      min_length: 1
+  outputs:
+    totals:
+      type: object
+      properties:
+        who: { type: string }
+        note: { type: string }
+    winner: { type: string }
+  nodes:
+    plan:
+      agent: agent.planner
+      input:
+        goal: "input.goal"
+
+    # Two writes per instance, into the two policies `append` does not cover.
+    # Neither channel's value depends on which instance finished first: `merge`
+    # resolves each key to the highest-indexed item's write and `last_wins` takes
+    # that item's write outright (grammar 8.6 rule 5, 10.2).
+    score:
+      map:
+        over: plan.output.tasks
+        as: task
+        node: agent.tallier
+        max_concurrency: 4
+        input:
+          title: "task.title"
+        writes:
+          piece: totals
+          label: winner
+  edges:
+    - { from: start, to: plan }
+    - { from: plan, to: score }
+    - { from: score, to: end }
 
 flow.continue:
   description: Open a conversation and hand it to a subflow that continues it.

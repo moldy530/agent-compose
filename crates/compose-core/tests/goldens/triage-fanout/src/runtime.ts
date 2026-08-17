@@ -1896,6 +1896,35 @@ export function isOrdered(value: unknown): value is OrderedWrites {
   return value instanceof OrderedWrites;
 }
 
+/**
+ * What a `map`'s contributions to one channel go to LangGraph **as**: a batch
+ * for the policies that unpack one, and the folded value for the one that
+ * cannot be handed a batch at all.
+ *
+ * A channel that starts **unset** never calls its reducer for the first write.
+ * LangGraph's `BinaryOperatorAggregate.update` keeps the first value verbatim
+ * while it holds nothing — `if (this.value === void 0) { this.value = first;
+ * newValues = newValues.slice(1); }` — so a batch arriving there would *become*
+ * the channel's value: an `OrderedWrites` object where a declared type says
+ * `string`, read back by every `state.<channel>` expression, every downstream
+ * write, and the flow's own `outputs:`.
+ *
+ * Exactly one policy can be in that position. `append` and `merge` start at the
+ * identity element their policy names (`[]`, `{}` — see `codegen::state`), so
+ * their channel always holds a value and their reducer is always called;
+ * `reduce: last_wins` with no `default:` starts unset, because grammar 10.1 and
+ * Decision D78 say a channel with no declared default does and reading one
+ * before its first write is an execution failure rather than a silent default.
+ * So the batch is folded here for `set`, and the fold is exactly what
+ * [`setReduce`] would have returned — the highest-indexed item's write
+ * (grammar 8.6 rule 5, 10.2). The value a run ends with is the same under
+ * either shaping; what changes is that it reaches the channel as the value.
+ */
+export function orderedUpdate(batch: ChannelWrite): unknown {
+  if (batch.reduce !== "set") return new OrderedWrites(batch.values);
+  return batch.values[batch.values.length - 1];
+}
+
 /** `reduce: append` — one element per write, in canonical order (D58). */
 export function appendReduce<T>(left: readonly T[], right: Written<T>): T[] {
   return isOrdered(right) ? [...left, ...(right.values as readonly T[])] : [...left, right];
@@ -2816,9 +2845,14 @@ export async function runNode(
     }
     // A `map`'s writers are its instances, so what it landed arrives already
     // ordered by source-item index and goes to the channel as one batch its
-    // reducer unpacks (grammar 7.6.4 clause 2, and see `OrderedWrites`).
+    // reducer unpacks — or as the folded value where the channel could not be
+    // handed a batch (grammar 7.6.4 clause 2, and see `orderedUpdate`).
     for (const batch of channels ?? []) {
-      update[batch.channel] = new OrderedWrites(batch.values);
+      // A channel with no contribution at all is not a write: `orderedChannels`
+      // opens an entry only for a field an instance really produced, so this
+      // guards the invariant rather than naming a case.
+      if (batch.values.length === 0) continue;
+      update[batch.channel] = orderedUpdate(batch);
       localState[batch.channel] = batch.values.reduce(
         (held, value) => applyWrite(held, value, batch.reduce),
         state[batch.channel],

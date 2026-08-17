@@ -78,6 +78,15 @@
 //!   goes through `./runtime.ts`, which unpacks that batch and otherwise behaves
 //!   exactly as the hand-written spelling did.
 //!
+//! One channel cannot be handed that batch, and it is the one this table gives
+//! no initial value: a **`last_wins` channel with no `default:`**. LangGraph
+//! keeps the first update to an empty channel *verbatim* rather than calling the
+//! reducer with it, so a batch arriving first would become the channel's value
+//! instead of being unpacked into it. The map node folds a `set` batch before it
+//! writes (`runtime.orderedUpdate`), which is why this module can leave the
+//! channel starting unset — the reading grammar 10.1 and Decision D78 require —
+//! rather than inventing an initial value to make a reducer run.
+//!
 //! What is fixed here either way is that each policy is **order-faithful**:
 //! `append` appends in the order it is called, `merge` lets the last call win a
 //! key, `last_wins` keeps the last call — and a batch is replayed into the same

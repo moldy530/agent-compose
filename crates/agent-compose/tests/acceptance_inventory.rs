@@ -316,6 +316,15 @@ const CODEGEN: &[Criterion] = &[
                 "the_triage_fanout_example_routes_every_finding_and_joins_them_in_source_order",
                 Status::Live,
             ),
+            // Rule 5's other two policies. `append` is the one every flow above
+            // writes; a `merge` channel and a `last_wins` channel with no
+            // `default:` are the shapes where "index-tagged" is decided by the
+            // reducer's *interface* rather than by its order alone — an unset
+            // channel never calls its reducer for the first write.
+            (
+                "a_merge_and_an_undefaulted_last_wins_channel_take_the_highest_indexed_write",
+                Status::Live,
+            ),
         ],
     },
     Criterion {

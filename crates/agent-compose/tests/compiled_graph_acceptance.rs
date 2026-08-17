@@ -2900,6 +2900,75 @@ fn an_empty_fan_out_completes_and_its_downstream_edge_still_fires() {
     );
 }
 
+/// The two reduce policies a fan-out may write besides `append`: a `merge`
+/// channel resolves each key to the **highest-indexed** item's write, and a
+/// `last_wins` channel takes that item's write outright (grammar 8.6 rule 5,
+/// 10.2).
+///
+/// `winner` declares **no** `default:`, which is the shape that makes this more
+/// than a restatement of the `append` tests. A channel with no initial value
+/// holds nothing until its first write, and LangGraph keeps the first update to
+/// an empty channel *verbatim* rather than passing it through the reducer — so a
+/// map that handed its ordered batch straight to the channel would leave the
+/// batch object there, and every read of `winner` would get an object where the
+/// composition declares a string. Nothing in a run says so except the value: it
+/// type-checks, it constructs, and the flow's own `outputs:` carry it out.
+///
+/// Completion order is the reverse of source order, so an implementation that
+/// folded in completion order would answer `w-A`/`who: A` here.
+#[test]
+fn a_merge_and_an_undefaulted_last_wins_channel_take_the_highest_indexed_write() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let tasks: Vec<Value> = ["A", "B", "C"]
+        .into_iter()
+        .map(|name| json!({ "title": format!("task-{name}"), "body": "do it" }))
+        .collect();
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "tasks": tasks })),
+    ));
+    // Item 0 answers last, item 2 first.
+    for (name, delay) in [("A", 300), ("B", 150), ("C", 0)] {
+        provider.enqueue(
+            Script::new(
+                HAIKU,
+                Outcome::structured(json!({
+                    "piece": { "who": name, "note": format!("note-{name}") },
+                    "label": format!("w-{name}"),
+                }))
+                .after(Duration::from_millis(delay)),
+            )
+            .matching(format!("task-{name}")),
+        );
+    }
+
+    let Some(run) = harness::invoke("fanout", "flow.tally", &[("goal", "ship it")], &provider)
+    else {
+        return;
+    };
+    run.succeeded();
+
+    let outputs = run.outputs();
+    assert_eq!(
+        outputs["winner"],
+        json!("w-C"),
+        "a `last_wins` channel with no `default:` holds the last write in \
+         canonical order — the value, not the batch it arrived in: {outputs}"
+    );
+    assert_eq!(
+        outputs["totals"],
+        json!({ "who": "C", "note": "note-C" }),
+        "and a `merge` channel resolves each key to the highest-indexed item's \
+         write, whatever order the instances finished in: {outputs}"
+    );
+    assert_eq!(
+        run.entries("score")[0]["writes"],
+        json!(["totals", "winner"]),
+        "the map records both channels it wrote"
+    );
+    assert!(provider.snapshot().is_drained());
+}
+
 /// `context: inherit` shares the caller's conversation with the instance in both
 /// directions, and the instantiation site's `policy:` is level 1 for the nodes
 /// inside it (grammar 8.5, 9.3, 10.4).
