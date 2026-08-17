@@ -1236,6 +1236,10 @@ export function environmentName(field: string): string {
  * arguments — while the environment is the out-of-band channel a process already
  * has.
  *
+ * The name is a plain one, so [`runExec`] clears it out of the inherited
+ * environment first: a target receives it when this runtime delivered it, and
+ * not because the process happened to be started with a variable by that name.
+ *
  * [`environmentName`] spells an input field by upper-casing it, so a target that
  * declared an input field called `idempotency_key` would name this same
  * variable. Grammar 9.4 settles that collision in the delivery's favour — "the
@@ -1261,6 +1265,13 @@ export async function runExec(
   context: RunContext,
 ): Promise<unknown> {
   const environment: Record<string, string> = { ...(process.env as Record<string, string>) };
+  // The delivery slot starts empty, whatever the process was started with. The
+  // name grammar 9.4 fixes is a plain one, and a variable that happened to be in
+  // this process's environment would otherwise reach every `exec:` target in the
+  // composition as a key a sink dedupes on — silently dropping repeat calls that
+  // were meant to repeat. A target receives this variable when, and only when,
+  // this runtime delivered it (or the binding's own `env:` set it, below).
+  delete environment[IDEMPOTENCY_ENV];
   let stdin: string | undefined;
   if (typeof input === "string") {
     stdin = input;

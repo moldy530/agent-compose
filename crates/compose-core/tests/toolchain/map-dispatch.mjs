@@ -457,6 +457,17 @@ const observed = {};
     // the declared input schema, and a sink with nothing to dedupe on is the
     // failure the key exists to prevent.
     collided: (await runtime.runExec(exec, { idempotency_key: "an input field" }, keyed)).out,
+    // …and the name is a plain one, so a variable this process happened to be
+    // started with is not a key: a target reads one when the runtime delivered
+    // it, and a joined dispatch beside it still reads nothing.
+    ambient: await (async () => {
+      process.env.IDEMPOTENCY_KEY = "from the process environment";
+      try {
+        return (await runtime.runExec(exec, {}, context)).out;
+      } finally {
+        delete process.env.IDEMPOTENCY_KEY;
+      }
+    })(),
   };
 
   // The host-function form: the `idempotency_key` field of the invocation
