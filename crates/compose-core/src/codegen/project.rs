@@ -22,9 +22,10 @@
 //! install-time scripts, no workspace protocol, and no dependency that needs a
 //! native build. `npm install`, `pnpm install`, and `bun install` all resolve it
 //! to the same versions, because every version is exact.
-//! `tests/generated_code_gates.rs` installs with npm and runs the type gate; the
-//! neutrality claim is about what the manifest *contains*, which is checked by
-//! `the_manifest_stays_package_manager_neutral`.
+//! `tests/generated_code_gates.rs` installs with npm and runs the type gate,
+//! which is one installer rather than three; the neutrality claim is about what
+//! the manifest *contains*, and is checked by
+//! `the_manifest_stays_package_manager_neutral` in this module's own `tests`.
 //!
 //! # `src/index.ts`
 //!

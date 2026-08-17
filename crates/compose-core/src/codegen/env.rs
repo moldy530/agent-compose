@@ -24,6 +24,15 @@
 //! generated `README.md` says which command does it rather than leaving a reader
 //! to assume.
 //!
+//! **The conflict is the PRD's to settle, not this module's**, and a module doc
+//! is not where a design question gets decided. What a module doc *can* do is
+//! stop the reading from being invisible, so both halves are pinned by name:
+//! `agent-compose`'s `tests/build_cli.rs::build_emits_with_every_environment_reference_unset`
+//! decides that `build` emits with every referenced variable unset, and
+//! `tests/generated_code_gates.rs::the_generated_project_checks_its_environment_when_it_is_loaded`
+//! decides that loading the emitted project refuses, naming each one. If 5.9
+//! resolves the other way, those two tests are the change.
+//!
 //! # What the module gives the rest of the project
 //!
 //! * `environmentReferences` — every name the composition references, sorted,

@@ -179,7 +179,7 @@ fn analyse(entrypoint: &Path, target: &str) -> (Vec<compose_core::Diagnostic>, O
 }
 
 fn validate(entrypoint: &Path, target: &str, format: Format) -> ExitCode {
-    if let Err(reason) = usable(entrypoint) {
+    if let Err(reason) = usable(entrypoint, "validate") {
         return fail(&reason);
     }
 
@@ -237,7 +237,7 @@ fn build_project(
     checking: bool,
     format: Format,
 ) -> ExitCode {
-    if let Err(reason) = usable(entrypoint) {
+    if let Err(reason) = usable(entrypoint, "build") {
         return fail(&reason);
     }
 
@@ -365,11 +365,15 @@ fn fail(reason: &str) -> ExitCode {
 }
 
 /// Whether there is an entrypoint to read at all.
-fn usable(entrypoint: &Path) -> Result<(), String> {
+///
+/// `command` is the subcommand asking, because the sentence that follows names
+/// it — every command here takes an entrypoint, and one that told a `build` user
+/// what `validate` takes would be answering a question nobody asked.
+fn usable(entrypoint: &Path, command: &str) -> Result<(), String> {
     match std::fs::metadata(entrypoint) {
         Ok(metadata) if metadata.is_file() => Ok(()),
         Ok(_) => Err(format!(
-            "`{}` is not a file: `validate` takes a spec entrypoint, conventionally `main.yml`",
+            "`{}` is not a file: `{command}` takes a spec entrypoint, conventionally `main.yml`",
             entrypoint.display()
         )),
         Err(error) => Err(format!("cannot read `{}`: {error}", entrypoint.display())),

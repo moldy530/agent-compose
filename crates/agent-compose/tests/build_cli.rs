@@ -123,6 +123,61 @@ fn build_writes_the_project_layout_where_out_points() {
     );
 }
 
+/// `build` reads no environment: every `${ENV}` the composition references is
+/// unset and it emits anyway, moving the check into the artifact.
+///
+/// **This pins a reading of PRD 5.9 that the PRD does not yet settle.** Its own
+/// bullet lists `build` among the commands that "check presence and fail fast
+/// naming the missing variable"; PRD §7 M1 asks instead for "env-ref presence
+/// checks at process start", which is what the emitted `src/index.ts` does
+/// (`compose-core`'s `tests/generated_code_gates.rs` runs it). This branch
+/// implements the second and argues why in `compose_core::codegen::env` — a
+/// build whose success depended on the building machine's environment could not
+/// be reproduced on the deploying one. The two sentences still have to be
+/// reconciled in the PRD; until they are, the behaviour is written down here
+/// rather than left to be inferred from an absence of tests, and whichever way
+/// the question resolves, this test is what has to change.
+#[test]
+fn build_emits_with_every_environment_reference_unset() {
+    let out = scratch("sealed");
+    let entrypoint = repo_root().join("examples/review-loop/main.yml");
+    let resolution = compose_core::resolve_with_target(&entrypoint, compose_core::DEFAULT_TARGET);
+    let ir = resolution.ir.expect("the worked example resolves");
+    let references = compose_core::codegen::env::References::of(&ir);
+    let names: Vec<&str> = references.names().collect();
+    assert!(
+        !names.is_empty(),
+        "the composition references no variable, so nothing is being sealed off"
+    );
+
+    let mut command = Command::cargo_bin("agent-compose").expect("the binary under test is built");
+    command
+        .current_dir(repo_root())
+        .env("NO_COLOR", "1")
+        .args(["build", "examples/review-loop/main.yml", "--out"])
+        .arg(&out);
+    for name in &names {
+        command.env_remove(name);
+    }
+    let output = command.output().expect("the command runs");
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("wrote 9 files"),
+        "{}",
+        stderr(&output)
+    );
+
+    // …and the check is in the emitted project rather than skipped: every name
+    // reaches `src/env.ts`, which `src/index.ts` calls at module scope.
+    let env_module = fs::read_to_string(out.join("src/env.ts")).expect("`src/env.ts` was written");
+    for name in &names {
+        assert!(
+            env_module.contains(name),
+            "`{name}` is referenced by the composition and not by `src/env.ts`:\n{env_module}"
+        );
+    }
+}
+
 /// A build whose output already matches checks clean, and a `--check` against an
 /// empty directory does not.
 #[test]
@@ -420,6 +475,33 @@ fn an_unreadable_entrypoint_exits_two() {
         stderr(&output).starts_with("error: cannot read"),
         "{}",
         stderr(&output)
+    );
+}
+
+/// A directory where an entrypoint should be is the same precondition, on its
+/// other branch — and the sentence names the command the user actually ran.
+///
+/// The two branches of `main::usable` say different things, and only one of them
+/// names a command; a message that told a `build` user what `validate` takes
+/// would send them to the wrong page.
+#[test]
+fn a_directory_as_the_entrypoint_exits_two_naming_this_command() {
+    let out = scratch("directory-entrypoint");
+    let output = build(&[
+        "examples/review-loop",
+        "--out",
+        out.to_str().expect("a UTF-8 scratch path"),
+    ]);
+    assert_eq!(code(&output), 2);
+    assert_eq!(
+        stderr(&output),
+        "error: `examples/review-loop` is not a file: `build` takes a spec entrypoint, \
+         conventionally `main.yml`\n"
+    );
+    assert_eq!(
+        files_under(&out),
+        Vec::<String>::new(),
+        "the command never got as far as emitting"
     );
 }
 
