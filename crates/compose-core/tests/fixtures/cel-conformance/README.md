@@ -79,9 +79,9 @@ follows the specification. The row is carried in the divergence ledger in
 the crate does today, so an upstream fix or a pin bump goes red and sends
 whoever made it back here to add the cases.
 
-**A `matches()` pattern carrying `.` or `\b`** — the other two the corpus cannot
-state, and for the same reason. The pattern is a *second* language inside the
-expression, and its two implementations are not CEL's two: the specification
+**A `matches()` pattern whose engine has to be Unicode-aware** — the other gap the
+corpus cannot state, and for the same reason. The pattern is a *second* language
+inside the expression, and its two implementations are not CEL's two: the specification
 defines `matches` over RE2, the crate runs the `regex` crate, and the emitted
 evaluator has only `new RegExp(…)`. Most of the difference is refused rather than
 recorded — `compose_core::codegen::diagnostics` refuses to **build** a
@@ -95,16 +95,24 @@ parse and read differently:
   terminator** in `RegExp` — so `'👍'.matches('^.$')` and `'\r'.matches('^.$')`
   are `true` there and `false` here;
 - `\b` sits between **Unicode** word characters in the crate and **ASCII** ones
-  in `RegExp` — so `'caté'.matches('\bcat\b')` is `false` there and `true` here.
+  in `RegExp` — so `'caté'.matches('\bcat\b')` is `false` there and `true` here;
+- `\w`, `\d` and `\s` are the **Unicode** classes in the crate and ECMA-262's in
+  `RegExp` — so `'é'.matches('^\w$')` and `'١'.matches('^\d$')` are `true` there
+  and `false` here.
 
-Both are the rows `compose_core::codegen::schema`'s ledger already carries for
-`pattern:` (`dot-matches-a-code-unit`, `dot-excludes-a-line-terminator`,
-`word-boundary-is-unicode-aware`), reached through a guard instead of a schema;
-`compose_core::codegen::cel`'s ledger carries them for this surface, and
-`the_dot_and_the_word_boundary_in_a_matches_pattern_still_read_differently` pins
+The first two are the rows `compose_core::codegen::schema`'s ledger already
+carries for `pattern:` (`dot-matches-a-code-unit`,
+`dot-excludes-a-line-terminator`, `word-boundary-is-unicode-aware`), reached
+through a guard instead of a schema. The third is **only** here, and the reason
+is the point: a `pattern:` is read by a JSON Schema validator, and JSON Schema
+*defines* `pattern` as ECMA-262, so that column translates the Perl classes and
+both sides of grammar 3.8's table agree; nothing translates for `matches()`.
+`compose_core::codegen::cel`'s ledger carries all three for this surface, and
+`the_unicode_aware_constructs_of_a_matches_pattern_still_read_differently` pins
 the crate's answers. So `strings.json` states patterns built from anchors,
-classes, alternation, repetition, groups and escaped metacharacters — where both
-engines agree — and neither construct appears in one.
+written-out classes, alternation, repetition, groups and escaped metacharacters —
+where both engines agree — and none of the three constructs appears in one
+except over ASCII, where they do agree.
 
 `matches` in its **global** spelling is the gap that **was** closed. CEL's
 standard definitions give the predicate two overloads, `s.matches(p)` and

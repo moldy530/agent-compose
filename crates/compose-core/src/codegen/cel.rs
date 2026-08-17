@@ -44,18 +44,22 @@
 //! |---|---|---|---|
 //! | `size-of-a-string-counts-code-points` | `size(<string>)` | the crate counts **bytes**, this counts **code points** | the specification says code points, and `[...value].length` is that. The crate's answer is a defect (`size('héllo')` is 6 there and 5 by the specification) and cannot be corrected from outside it: `Context::add_function("size", …)` does not override a built-in, the standard set being consulted first. What makes the gap harmless is *where* each evaluator runs — the compiler never evaluates an expression (`crate::cel` type-checks and stops), so the crate is the corpus's reference column rather than a runtime, and the only evaluator a compiled graph runs is this one. The corpus states only ASCII `size()` cases, where all readings agree, and `the_size_of_a_non_ascii_string_still_diverges_from_the_specification` pins the crate's answer so a fix or a pin bump goes red |
 //! | `a-matches-dot-is-a-code-unit-and-excludes-more` | `matches(…, '<pattern with `.`>')` | the crate's `.` is one **code point** and excludes **LF alone**; `RegExp`'s is one UTF-16 **code unit** and excludes every **line terminator** | the pattern is a second language inside the expression, and `matches()` reaches the same two regex engines `pattern:` does — so this is `codegen::schema`'s `dot-matches-a-code-unit` and `dot-excludes-a-line-terminator`, reached through a guard instead of a schema. `'👍'.matches('^.$')` is `true` in the crate and `false` here, and `'\r'` likewise. Closing it means a second regex engine in every generated module, or the `u` flag — which [`super::pattern`] shows refuses escapes RE2 accepts — or rewriting the pattern's text, which this compiler does not do to a `pattern:` either |
-//! | `a-matches-word-boundary-is-unicode-aware` | `matches(…, '<pattern with `\b`>')` | the crate's `\b` sits between **Unicode** word characters, `RegExp`'s between **ASCII** ones | `codegen::schema`'s `word-boundary-is-unicode-aware`, same surface change. `'caté'.matches('\\bcat\\b')` is `false` in the crate and `true` here. The translation that makes `\w`, `\d` and `\s` agree rewrites the *classes* and leaves the boundary alone, which is why this row survives the one above being about `.` |
+//! | `a-matches-word-boundary-is-unicode-aware` | `matches(…, '<pattern with `\b`>')` | the crate's `\b` sits between **Unicode** word characters, `RegExp`'s between **ASCII** ones | `codegen::schema`'s `word-boundary-is-unicode-aware`, same surface change. `'caté'.matches('\\bcat\\b')` is `false` in the crate and `true` here. It is a separate row from the one above because a `\b` is not a `.`: closing either would not close the other |
+//! | `a-matches-perl-class-is-unicode-aware` | `matches(…, '<pattern with `\w`, `\d` or `\s`>')` | the crate's are the **Unicode** classes, `RegExp`'s are ECMA-262's | the one row with **no** counterpart in `codegen::schema`'s ledger, and the reason is worth stating because it looks like it should have one. A `pattern:` is read by a JSON Schema validator, and JSON Schema *defines* `pattern` as ECMA-262 — so that column translates the Perl classes and `^\d+$` refuses `١٢٣` on both sides of grammar 3.8's table. Nothing translates here: `matches()` reaches `regex` directly through the crate, so `'é'.matches('^\\w$')` and `'١'.matches('^\\d$')` are `true` there and `false` in a compiled router. Writing the class out — `[a-z]`, `[0-9]` — is what agrees, which is what the corpus and the property harness generate |
 //!
-//! `size` is not reachable from a shape the validator has to refuse. The two
+//! `size` is not reachable from a shape the validator has to refuse. The three
 //! `matches` rows are what is **left over** from a refusal: every pattern only
 //! one engine can *parse* — inline flags, `(?P<…>)`, look-around, a
-//! backreference — is refused by [`super::diagnostics`], and these two are the
+//! backreference — is refused by [`super::diagnostics`], and these are the
 //! constructs both engines parse and read differently, which no refusal can tell
-//! apart from the patterns that transfer. Neither is a validate-time rejection:
-//! `validate` answers a target-independent question, and both of these are about
-//! what *this* target's engine does. `the_dot_and_the_word_boundary_in_a_matches_pattern_still_read_differently`
-//! pins the crate's answers, and the corpus states only patterns with neither
-//! construct in them.
+//! apart from the patterns that transfer. They are one difference wearing three
+//! faces: the crate's engine is Unicode-aware and `RegExp` without a `u` flag is
+//! not, and [`super::pattern`] says why the flag is not available to add. None is
+//! a validate-time rejection: `validate` answers a target-independent question,
+//! and all three are about what *this* target's engine does.
+//! `the_unicode_aware_constructs_of_a_matches_pattern_still_read_differently`
+//! pins the crate's answers, and the corpus states only patterns carrying none of
+//! them.
 //!
 //! **One row was closed rather than declared**, and how it was found is the
 //! point: CEL's logical operators are commutative in the presence of errors —

@@ -303,30 +303,33 @@ fn the_global_spelling_of_matches_is_supplied_where_the_crate_lacks_it() {
     );
 }
 
-/// The third recorded gap: two constructs a `matches()` pattern may carry that
+/// The third recorded gap: the constructs a `matches()` pattern may carry that
 /// **both** engines accept and read differently.
 ///
 /// `codegen::diagnostics` refuses a `matches()` pattern only one of the two
 /// engines can *parse* — inline flags, `(?P<…>)`, look-around, a backreference —
-/// so what is left is the patterns both parse. Two of those still mean different
-/// things, and they are the same two `codegen::schema`'s ledger already carries
-/// for `pattern:` (`dot-matches-a-code-unit`, `dot-excludes-a-line-terminator`,
-/// `word-boundary-is-unicode-aware`), reached through an expression instead of a
-/// schema:
+/// so what is left is the patterns both parse. Four constructs among those still
+/// mean different things, and every one of them is the same difference: the
+/// crate's engine is **Unicode-aware** and `RegExp` without a `u` flag is not.
 ///
-/// * `.` is one **code point** to this engine and one UTF-16 **code unit** to
-///   JavaScript's, and it excludes LF here where ECMA-262 excludes every line
-///   terminator;
+/// * `.` is one **code point** here and one UTF-16 **code unit** there, and it
+///   excludes LF here where ECMA-262 excludes every line terminator;
 /// * `\b` is a boundary between **Unicode** word characters here and ASCII ones
-///   there.
+///   there;
+/// * `\w` and `\d` are the **Unicode** classes here and `[A-Za-z0-9_]` and
+///   `[0-9]` there. This is the one difference `codegen::schema`'s ledger does
+///   **not** already carry: a `pattern:` is read by a JSON Schema validator,
+///   which translates the Perl classes because JSON Schema *defines* `pattern`
+///   as ECMA-262 — so `^\d+$` refuses `١٢٣` in both of those columns. Nothing
+///   translates for `matches()`: the crate runs `regex` directly.
 ///
-/// No corpus case can state either pair — the columns disagree, which is what a
+/// No corpus case can state any of them — the columns disagree, which is what a
 /// corpus case is forbidden to record — so this pins **this** column's answers
 /// and `codegen::cel`'s ledger carries the rows. The emitted evaluator's answers
 /// are written beside each one; they are `RegExp`'s, and
 /// `crates/compose-core/src/codegen/pattern.rs` says why no flag closes the gap.
 #[test]
-fn the_dot_and_the_word_boundary_in_a_matches_pattern_still_read_differently() {
+fn the_unicode_aware_constructs_of_a_matches_pattern_still_read_differently() {
     let answer = |source: &str| {
         let program = Program::compile(source).expect("the expression parses");
         match program
@@ -337,7 +340,7 @@ fn the_dot_and_the_word_boundary_in_a_matches_pattern_still_read_differently() {
             other => panic!("`{source}` is not a bool: {other:?}"),
         }
     };
-    // `/^.$/.test("😀")` is `false`: two code units, one `.`.
+    // `/^.$/.test("👍")` is `false`: two code units, one `.`.
     assert!(answer("'👍'.matches('^.$')"), "one code point, one `.`");
     // `/^.$/.test("\r")` is `false`: CR is a line terminator to ECMA-262.
     assert!(answer("'\\r'.matches('^.$')"), "`.` excludes LF alone here");
@@ -346,9 +349,18 @@ fn the_dot_and_the_word_boundary_in_a_matches_pattern_still_read_differently() {
         !answer("'caté'.matches('\\\\bcat\\\\b')"),
         "`\\b` is a boundary between Unicode word characters here"
     );
-    // ASCII with no `.` and no `\b` is where the two agree, which is what the
-    // corpus states.
-    assert!(answer("'a1'.matches('^a[0-9]$')"));
+    // `/^\w$/.test("é")` and `/^\d$/.test("١")` are both `false`.
+    assert!(
+        answer("'é'.matches('^\\\\w$')"),
+        "`\\w` is the Unicode word class here"
+    );
+    assert!(
+        answer("'١'.matches('^\\\\d$')"),
+        "`\\d` is the Unicode decimal class here"
+    );
+    // ASCII, with the classes written out, is where the two agree — which is
+    // what the corpus states and what the property harness generates.
+    assert!(answer("'a1'.matches('^[a-z][0-9]$')"));
 }
 
 /// The corpus is the artifact, not this test: it has to be substantial enough
