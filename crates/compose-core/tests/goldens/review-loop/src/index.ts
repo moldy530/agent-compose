@@ -6,9 +6,9 @@
 // the whole directory out and stop regenerating it.
 //
 // The project's public surface. Everything a consumer of this graph needs —
-// the schemas, the state model, the graph itself, and the environment it
-// requires — is re-exported here, so an ejected project has one entry point
-// and `run`/`serve` have one module to import.
+// the schemas, the state model, the graph itself, `runFlow`, and the
+// environment it requires — is re-exported here, so an ejected project has one
+// entry point and `run`/`serve` have one module to import.
 //
 // It is also where the env-ref presence check of PRD 5.9 runs. `readEnvironment`
 // is called at module scope, so loading this module is what "process start"

@@ -437,7 +437,27 @@ pub fn invoke_with(
     inputs: &Value,
     environment: &[(String, String)],
 ) -> Option<Invocation> {
+    invoke_hosted(name, flow, inputs, environment, None)
+}
+
+/// The same again, with the host half of grammar 6.1's `function:` escape hatch.
+///
+/// `host` is a module the driver imports **before** the graph — which is where a
+/// real host registers its implementations, and the only way a composition using
+/// the escape hatch runs at all. `None` is what a test that wants the
+/// unregistered failure passes.
+pub fn invoke_hosted(
+    name: &str,
+    flow: &str,
+    inputs: &Value,
+    environment: &[(String, String)],
+    host: Option<&str>,
+) -> Option<Invocation> {
     let (project, built) = build_under_toolchain(name, "invoke")?;
+    if let Some(source) = host {
+        std::fs::write(project.join("host-functions.mjs"), source)
+            .expect("the project directory is writable");
+    }
     assert!(
         built.status.success(),
         "the fixture `{name}` did not build:\n{}",

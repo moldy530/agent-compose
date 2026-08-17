@@ -1093,17 +1093,35 @@ function evaluateExpr(expression: Expr, scope: Scope): CelValue {
     }
     default: {
       const { operator, left, right } = expression;
-      if (operator === "&&") {
-        return (
-          expectBool(evaluateExpr(left, scope), "`&&`") &&
-          expectBool(evaluateExpr(right, scope), "`&&`")
-        );
-      }
-      if (operator === "||") {
-        return (
-          expectBool(evaluateExpr(left, scope), "`||`") ||
-          expectBool(evaluateExpr(right, scope), "`||`")
-        );
+      // CEL's logical operators are **commutative in the presence of errors**:
+      // `false && <error>` and `<error> && false` are both `false`, and the same
+      // for `true` under `||`. An evaluator that only short-circuits answers the
+      // first and throws on the second, which is a real difference — a guard
+      // reading an `optional:` property that is absent, conjoined with something
+      // already false, is exactly the shape (Decision D110's read failure, under
+      // grammar 7.3's guard). Both implementations of this project answer the
+      // specification's way; `tests/property_conformance.rs` is what found it.
+      if (operator === "&&" || operator === "||") {
+        const absorbing = operator === "&&" ? false : true;
+        let held: unknown;
+        try {
+          if (expectBool(evaluateExpr(left, scope), `\`${operator}\``) === absorbing) {
+            return absorbing;
+          }
+        } catch (error) {
+          held = error;
+        }
+        try {
+          if (expectBool(evaluateExpr(right, scope), `\`${operator}\``) === absorbing) {
+            return absorbing;
+          }
+        } catch (error) {
+          // The left-hand error is the one reported when both sides fail: an
+          // author reads an expression left to right.
+          throw held ?? error;
+        }
+        if (held !== undefined) throw held;
+        return !absorbing;
       }
       const a = evaluateExpr(left, scope);
       const b = evaluateExpr(right, scope);

@@ -965,6 +965,53 @@ fn the_deterministic_node_kinds_run_and_decode_their_results() {
     assert_eq!(provider.requests().len(), 1, "one agent, one call");
 }
 
+/// The `function:` binding is the escape hatch, and what it costs is a
+/// registration the host has to make (grammar 6.1, PRD 5.5).
+///
+/// Both halves, because either alone would be a claim about the other: an
+/// unregistered function fails the run by name and says how to fix it, and a
+/// registered one is called with arguments already parsed against the tool's own
+/// declared `input:` — the checked signature grammar 8.4 asks for.
+#[test]
+fn a_host_registered_function_runs_and_an_unregistered_one_says_so() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let environment = harness::environment(&provider);
+
+    let Some(unregistered) =
+        harness::invoke_with("activities", "flow.hosted", &json!({}), &environment)
+    else {
+        return;
+    };
+    let failure = unregistered.failed();
+    assert!(
+        failure.contains("rank_candidates"),
+        "the failure names the registration that is missing: {failure}"
+    );
+    assert!(
+        failure.contains("registerFunction"),
+        "…and how to supply it: {failure}"
+    );
+
+    let registered = harness::invoke_hosted(
+        "activities",
+        "flow.hosted",
+        &json!({}),
+        &environment,
+        Some(
+            r#"import { registerFunction } from "./src/runtime.ts";
+registerFunction("rank_candidates", (args) => ({ ranked: `ranked: ${args.text}` }));
+"#,
+        ),
+    )
+    .expect("the toolchain was there a moment ago");
+    registered.succeeded();
+    assert_eq!(
+        registered.outputs()["report"],
+        "ranked: candidates",
+        "the host's answer reached the channel the node's `writes:` names"
+    );
+}
+
 /// Two edges of one fork both fire, and the node they meet at runs **once**
 /// (grammar 7.3 rule 6, 7.6 P1/P2).
 #[test]
@@ -1013,6 +1060,30 @@ fn a_multicast_fork_fires_every_true_edge_and_the_convergence_runs_once() {
         "the two branches are one step"
     );
     assert_eq!(step("merge"), step("probe") + 1);
+}
+
+/// A guard on an edge leaving `start` decides the first step, over the roots
+/// grammar 4.1 gives it (`start` has no output).
+#[test]
+fn a_guarded_start_edge_decides_the_first_step() {
+    let provider = MockProvider::start().expect("a loopback port");
+    for (pick, expected) in [(true, "left"), (false, "right")] {
+        let Some(run) = harness::invoke_with(
+            "activities",
+            "flow.entry",
+            &json!({ "pick": pick }),
+            &harness::environment(&provider),
+        ) else {
+            return;
+        };
+        run.succeeded();
+        assert_eq!(run.outputs()["report"], expected);
+        assert_eq!(
+            run.visited(),
+            ["$start", expected],
+            "the guards are evaluated at a node, because `start` is not one"
+        );
+    }
 }
 
 /// A skipped node writes nothing, and the one thing that changes about its

@@ -132,6 +132,11 @@ const CODEGEN: &[Criterion] = &[
                 "the_deterministic_node_kinds_run_and_decode_their_results",
                 Status::Live,
             ),
+            // The escape hatch of grammar 6.1, and the registration it costs.
+            (
+                "a_host_registered_function_runs_and_an_unregistered_one_says_so",
+                Status::Live,
+            ),
         ],
     },
     Criterion {
@@ -153,6 +158,9 @@ const CODEGEN: &[Criterion] = &[
                 "a_skipped_node_routes_through_its_else_edge_and_writes_nothing",
                 Status::Live,
             ),
+            // A guard on an edge leaving `start`, which grammar 7.2 admits and
+            // which has no node to be evaluated at.
+            ("a_guarded_start_edge_decides_the_first_step", Status::Live),
         ],
     },
     Criterion {

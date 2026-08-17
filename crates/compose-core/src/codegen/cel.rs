@@ -43,11 +43,19 @@
 //! | id | where | which way | why it is left |
 //! |---|---|---|---|
 //! | `size-of-a-string-counts-code-points` | `size(<string>)` | the crate counts **bytes**, this counts **code points** | the specification says code points, and `[...value].length` is that. The crate's answer is a defect (`size('héllo')` is 6 there and 5 by the specification) and cannot be corrected from outside it: `Context::add_function("size", …)` does not override a built-in, the standard set being consulted first. What makes the gap harmless is *where* each evaluator runs — the compiler never evaluates an expression (`crate::cel` type-checks and stops), so the crate is the corpus's reference column rather than a runtime, and the only evaluator a compiled graph runs is this one. The corpus states only ASCII `size()` cases, where all readings agree, and `the_size_of_a_non_ascii_string_still_diverges_from_the_specification` pins the crate's answer so a fix or a pin bump goes red |
-//! | `logical-operators-short-circuit-rather-than-absorb` | `&&`, `\|\|` | both short-circuit; neither absorbs an error from the other side | the specification's commutative reading answers `false` for `error && false`; both implementations answer with the error. Identical on every expression whose operands evaluate, which is every expression the corpus states and every guard shape grammar 7.3.1 recognizes — a guard reads a declared field, and the one case where a read legitimately fails is the one `has()` is for (grammar 4.1). Closing it means evaluating both sides of every conjunction, which is a change to *when* effects happen for a language whose expressions have none |
 //!
-//! Neither row is reachable from a shape the validator has to refuse, so nothing
+//! The row is not reachable from a shape the validator has to refuse, so nothing
 //! here is a validate-time rejection. A future divergence that *is* reachable
 //! belongs in [`super::diagnostics`] beside the two the target already refuses.
+//!
+//! **One row was closed rather than declared**, and how it was found is the
+//! point: CEL's logical operators are commutative in the presence of errors —
+//! `<error> && false` is `false`, not an error — and the first draft of this
+//! evaluator short-circuited instead, which agreed with the crate on every case
+//! the hand-written corpus states. `tests/property_conformance.rs` generated
+//! `(state.c2.n > 0) && false` over a `merge`-shaped channel whose optional `n`
+//! was absent, on its eighth seed, and the two columns split. The corpus now
+//! states all six absorption cases, and the evaluator implements them.
 //!
 //! # Shapes
 //!
@@ -61,8 +69,6 @@
 
 use crate::ir::Ir;
 use crate::ir::schema::{FieldMap, TypeForm, TypeNode};
-
-use super::names;
 
 /// The evaluator's source, carried in the compiler and emitted verbatim.
 const SOURCE: &str = include_str!("js/cel.ts");
@@ -78,25 +84,23 @@ pub fn module(ir: &Ir) -> super::GeneratedFile {
     }
 }
 
-/// The `Shape` a field map's values are read through, as TypeScript source.
+/// The `Shape` a field map's values are read through.
+///
+/// A `Shape` is **data** — the emitted type is a union of string tags and two
+/// object forms, every one of them JSON-representable — so it is built as JSON
+/// once and rendered from there. That is what lets a test hand the very same
+/// shape to the emitted evaluator (`tests/property_conformance.rs`) instead of
+/// re-deriving one that would then be the thing under test.
 #[must_use]
-pub fn shape_of_field_map(map: &FieldMap, indent: &str) -> String {
-    let inner = format!("{indent}  ");
-    let mut text = String::from("{\n");
-    text.push_str(&format!("{inner}properties: {{\n"));
+pub fn shape_json_of_field_map(map: &FieldMap) -> serde_json::Value {
+    let mut properties = serde_json::Map::new();
     for field in &map.fields {
-        text.push_str(&format!(
-            "{inner}  {}: {},\n",
-            names::string(field.name.value.as_str()),
-            shape_of_type(&field.ty, &format!("{inner}  "))
-        ));
+        properties.insert(field.name.value.as_str().to_string(), shape_json(&field.ty));
     }
-    text.push_str(&format!("{inner}}},\n"));
-    text.push_str(&format!("{indent}}}"));
-    text
+    serde_json::json!({ "properties": serde_json::Value::Object(properties) })
 }
 
-/// The `Shape` one type node's values are read through, as TypeScript source.
+/// The `Shape` one type node's values are read through.
 ///
 /// A **union** is the one form with no total answer: the payload a value carries
 /// depends on the tag it carries, so the shape names the discriminator — a
@@ -105,25 +109,37 @@ pub fn shape_of_field_map(map: &FieldMap, indent: &str) -> String {
 /// narrows it by tag first (grammar 8.6 rule 4), and narrowing is the `map`
 /// construct's, which is a later M1 bullet.
 #[must_use]
-pub fn shape_of_type(ty: &TypeNode, indent: &str) -> String {
+pub fn shape_json(ty: &TypeNode) -> serde_json::Value {
     match &ty.form {
-        TypeForm::Scalar(scalar) => match scalar.kind {
-            crate::ast::schema::ScalarKind::String => "\"string\"".to_string(),
-            crate::ast::schema::ScalarKind::Integer => "\"int\"".to_string(),
-            crate::ast::schema::ScalarKind::Number => "\"double\"".to_string(),
-            crate::ast::schema::ScalarKind::Boolean => "\"bool\"".to_string(),
-        },
-        TypeForm::Enum(_) => "\"string\"".to_string(),
-        TypeForm::Object(object) => shape_of_field_map(&object.properties, indent),
-        TypeForm::Array(array) => format!(
-            "{{ items: {} }}",
-            shape_of_type(&array.items, &format!("{indent}  "))
+        TypeForm::Scalar(scalar) => serde_json::Value::String(
+            match scalar.kind {
+                crate::ast::schema::ScalarKind::String => "string",
+                crate::ast::schema::ScalarKind::Integer => "int",
+                crate::ast::schema::ScalarKind::Number => "double",
+                crate::ast::schema::ScalarKind::Boolean => "bool",
+            }
+            .to_string(),
         ),
-        TypeForm::Union(union) => format!(
-            "{{ properties: {{ {}: \"string\" }}, rest: \"any\" }}",
-            names::string(union.discriminator.value.as_str())
-        ),
+        TypeForm::Enum(_) => serde_json::Value::String("string".to_string()),
+        TypeForm::Object(object) => shape_json_of_field_map(&object.properties),
+        TypeForm::Array(array) => serde_json::json!({ "items": shape_json(&array.items) }),
+        TypeForm::Union(union) => serde_json::json!({
+            "properties": { union.discriminator.value.as_str(): "string" },
+            "rest": "any",
+        }),
     }
+}
+
+/// The same, as the TypeScript source `src/graph.ts` declares.
+#[must_use]
+pub fn shape_of_field_map(map: &FieldMap, indent: &str) -> String {
+    super::graph::json_literal(&shape_json_of_field_map(map), indent)
+}
+
+/// The same, for one type node.
+#[must_use]
+pub fn shape_of_type(ty: &TypeNode, indent: &str) -> String {
+    super::graph::json_literal(&shape_json(ty), indent)
 }
 
 /// Whether an expression reads `<node>.output` — the one thing a `skip` changes
@@ -186,9 +202,28 @@ mod tests {
             "version: \"0.1\"\nstate:\n  rows:\n    type: array\n    max_items: 4\n    items:\n      type: object\n      properties:\n        n: { type: integer }\n",
         );
         let channels = crate::codegen::schema::channels(&ir);
+        assert_eq!(
+            shape_json(&channels[0].1.ty),
+            serde_json::json!({ "items": { "properties": { "n": "int" } } })
+        );
+        // …and the TypeScript the emitter writes is that JSON, rendered.
         let shape = shape_of_type(&channels[0].1.ty, "");
-        assert!(shape.contains("items:"), "{shape}");
+        assert!(shape.contains("\"items\":"), "{shape}");
         assert!(shape.contains("\"n\": \"int\""), "{shape}");
+    }
+
+    /// The shape a test hands the emitted evaluator is the emitter's own, so a
+    /// harness comparing the two columns is not comparing a copy of one of them
+    /// (`tests/property_conformance.rs`).
+    #[test]
+    fn the_shape_a_test_reads_is_the_shape_the_project_carries() {
+        let ir = ir_of("version: \"0.1\"\nstate:\n  count: { type: integer }\n");
+        let channels = crate::codegen::schema::channels(&ir);
+        let ty = &channels[0].1.ty;
+        assert_eq!(
+            shape_of_type(ty, ""),
+            crate::codegen::graph::json_literal(&shape_json(ty), "")
+        );
     }
 
     /// Decision D97's test: which guards a `skip` turns false.

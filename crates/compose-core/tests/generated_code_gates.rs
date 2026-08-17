@@ -473,10 +473,9 @@ fn the_emitted_state_model_reduces_the_way_its_policies_say() {
             serde_json::from_slice(&output.stdout).expect("the runner prints the state as JSON");
         // The compiler's own channel is not what this gate is about: it holds no
         // reduce policy an author wrote, and its own reducer is decided by
-        // `the_run_channel_folds_concurrent_contributions_deterministically`
-        // in `codegen::runtime`'s corpus. What is asserted here is that it is
-        // *there* and starts empty, which is the one thing a wrong `default:`
-        // would break.
+        // `the_run_channel_folds_a_steps_contributions_in_canonical_order`
+        // below. What is asserted here is that it is *there* and starts empty,
+        // which is the one thing a wrong `default:` would break.
         let run = answer
             .as_object_mut()
             .expect("the state is an object")
@@ -496,6 +495,84 @@ fn the_emitted_state_model_reduces_the_way_its_policies_say() {
             entry.golden
         );
     }
+}
+
+/// Gate 2d: the compiler's own channel folds a step's contributions in the
+/// canonical order, whatever order they arrive in (grammar 7.6.4).
+///
+/// Concurrent nodes of one step each write a piece of `$run`, and a reducer sees
+/// them one at a time in whatever order the scheduler finished them. Grammar
+/// 7.6.4 says completion order is never what decides the result, so the two
+/// orders below have to fold to the same channel — and the trace has to come out
+/// ordered by `(step, node)` rather than by arrival, or a replay would produce a
+/// plausible alternative to the live run's record instead of a reproduction of
+/// it.
+#[test]
+fn the_run_channel_folds_a_steps_contributions_in_canonical_order() {
+    let Some(root) = installed() else {
+        return;
+    };
+    let project = staged(goldens::golden("review-loop"), root, "run-channel");
+
+    // Two nodes completing in one step, plus a later step: the shape a fork
+    // produces. `review` finished first and `draft` second, which is the order
+    // the canonical one is *not*.
+    let arrived = r#"[
+        { "step": 1, "traversals": { "review": 1 },
+          "trace": [{ "step": 1, "node": "review", "outcome": "completed" }] },
+        { "step": 1, "traversals": { "draft": 1 }, "iterations": { "flow.f#2": 1 },
+          "trace": [{ "step": 1, "node": "draft", "outcome": "completed" }] },
+        { "step": 2, "traversals": { "merge": 1 },
+          "trace": [{ "step": 2, "node": "merge", "outcome": "completed" }] }
+    ]"#;
+    let reversed = r#"[
+        { "step": 1, "traversals": { "draft": 1 }, "iterations": { "flow.f#2": 1 },
+          "trace": [{ "step": 1, "node": "draft", "outcome": "completed" }] },
+        { "step": 1, "traversals": { "review": 1 },
+          "trace": [{ "step": 1, "node": "review", "outcome": "completed" }] },
+        { "step": 2, "traversals": { "merge": 1 },
+          "trace": [{ "step": 2, "node": "merge", "outcome": "completed" }] }
+    ]"#;
+
+    let fold = |contributions: &str, purpose: &str| -> Value {
+        let path = project.join(format!("run-{purpose}.json"));
+        fs::write(&path, contributions).expect("the scratch area is writable");
+        let output = Command::new("node")
+            .arg(root.join("run-channel.mjs"))
+            .arg(&project)
+            .arg(&path)
+            .output()
+            .expect("node runs");
+        assert!(
+            output.status.success(),
+            "the run channel did not fold:\n{}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        serde_json::from_slice(&output.stdout).expect("the runner prints the channel as JSON")
+    };
+
+    let folded = fold(arrived, "arrived");
+    assert_eq!(
+        folded,
+        fold(reversed, "reversed"),
+        "completion order decided the channel's value"
+    );
+
+    // The step is the larger of the two, the counters merged key-wise, and the
+    // trace is in `(step, node)` order rather than arrival order.
+    assert_eq!(folded["step"], 2);
+    assert_eq!(folded["iterations"]["flow.f#2"], 1);
+    assert_eq!(
+        folded["traversals"],
+        serde_json::json!({ "draft": 1, "merge": 1, "review": 1 })
+    );
+    let nodes: Vec<&str> = folded["trace"]
+        .as_array()
+        .expect("a trace")
+        .iter()
+        .map(|entry| entry["node"].as_str().expect("a node id"))
+        .collect();
+    assert_eq!(nodes, ["draft", "review", "merge"]);
 }
 
 /// Gate 7: the channel names the compiler refuses are names LangGraph refuses.

@@ -15,7 +15,7 @@
 // Output: the flow's outputs as one JSON object on stdout; the trace is written
 // to <trace.json>, so stdout stays exactly what `agent-compose run` prints.
 
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { pathToFileURL } from "node:url";
@@ -26,6 +26,14 @@ if (project === undefined || flow === undefined || inputsPath === undefined) {
 }
 
 const inputs = JSON.parse(readFileSync(inputsPath, "utf8"));
+
+// The host half of grammar 6.1's `function:` escape hatch. A project using one
+// does not run until an implementation is registered, and this is where a host
+// would do it — before the graph runs, from a module of its own. A test that
+// wants the *unregistered* failure simply does not write this file.
+const host = path.resolve(project, "host-functions.mjs");
+if (existsSync(host)) await import(pathToFileURL(host).href);
+
 const { runFlow } = await import(pathToFileURL(path.resolve(project, "src/index.ts")).href);
 
 let run;

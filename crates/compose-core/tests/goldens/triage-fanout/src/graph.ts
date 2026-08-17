@@ -48,8 +48,12 @@ import type { GraphState } from "./state.ts";
 const stateShape: runtime.Shape = {
   properties: {
     "human_decision": "string",
-    "matches": { items: "string" },
-    "patches": { items: "string" },
+    "matches": {
+      "items": "string"
+    },
+    "patches": {
+      "items": "string"
+    },
     "report_normalized": "string",
     "summary": "string",
   },
@@ -57,109 +61,118 @@ const stateShape: runtime.Shape = {
 
 /** `flow.enrich` — the `input` root inside it (grammar 7.5). */
 const flowEnrichShape: runtime.Shape = {
-  properties: {
-    "report": "string",
-  },
+  "properties": {
+    "report": "string"
+  }
 };
 
 /** `flow.enrich` node `fetch` — the `fetch.output` root its guards read. */
 const flowEnrichNodeFetchShape: runtime.Shape = {
-  properties: {
-    "report_normalized": "string",
-  },
+  "properties": {
+    "report_normalized": "string"
+  }
 };
 
 /** `flow.triage` — the `input` root inside it (grammar 7.5). */
 const flowTriageShape: runtime.Shape = {
-  properties: {
-    "report": "string",
+  "properties": {
     "pattern": "string",
-  },
+    "report": "string"
+  }
 };
 
 /** `flow.triage` node `enrich` — the `enrich.output` root its guards read. */
 const flowTriageNodeEnrichShape: runtime.Shape = {
-  properties: {
-    "report_normalized": "string",
-  },
+  "properties": {
+    "report_normalized": "string"
+  }
 };
 
 /** `flow.triage` node `scan` — the `scan.output` root its guards read. */
 const flowTriageNodeScanShape: runtime.Shape = {
-  properties: {
-    "matches": { items: "string" },
-  },
+  "properties": {
+    "matches": {
+      "items": "string"
+    }
+  }
 };
 
 /**
  * `flow.triage` node `classify` — the `classify.output` root its guards read.
  */
 const flowTriageNodeClassifyShape: runtime.Shape = {
-  properties: {
-    "findings": { items: { properties: { "kind": "string" }, rest: "any" } },
-  },
+  "properties": {
+    "findings": {
+      "items": {
+        "properties": {
+          "kind": "string"
+        },
+        "rest": "any"
+      }
+    }
+  }
 };
 
 /**
  * `flow.triage` node `announce` — the `announce.output` root its guards read.
  */
 const flowTriageNodeAnnounceShape: runtime.Shape = {
-  properties: {
-    "status": "int",
-  },
+  "properties": {
+    "status": "int"
+  }
 };
 
 /**
  * `flow.triage` node `announce_failed` — the `announce_failed.output` root its guards read.
  */
 const flowTriageNodeAnnounceFailedShape: runtime.Shape = {
-  properties: {
+  "properties": {
     "exit_code": "int",
-    "stdout": "string",
-  },
+    "stdout": "string"
+  }
 };
 
 /** `flow.triage` node `verify` — the `verify.output` root its guards read. */
 const flowTriageNodeVerifyShape: runtime.Shape = {
-  properties: {
+  "properties": {
     "exit_code": "int",
-    "stdout": "string",
-  },
+    "stdout": "string"
+  }
 };
 
 /**
  * `flow.triage` node `summarize` — the `summarize.output` root its guards read.
  */
 const flowTriageNodeSummarizeShape: runtime.Shape = {
-  properties: {
-    "summary": "string",
-  },
+  "properties": {
+    "summary": "string"
+  }
 };
 
 /**
  * `flow.triage` node `remember` — the `remember.output` root its guards read.
  */
 const flowTriageNodeRememberShape: runtime.Shape = {
-  properties: {
-    "key": "string",
-  },
+  "properties": {
+    "key": "string"
+  }
 };
 
 /** `flow.triage` node `approve` — the `approve.output` root its guards read. */
 const flowTriageNodeApproveShape: runtime.Shape = {
-  properties: {
+  "properties": {
     "decision": "string",
-    "note": "string",
-  },
+    "note": "string"
+  }
 };
 
 /**
  * `flow.triage` node `escalate` — the `escalate.output` root its guards read.
  */
 const flowTriageNodeEscalateShape: runtime.Shape = {
-  properties: {
-    "status": "int",
-  },
+  "properties": {
+    "status": "int"
+  }
 };
 
 /**
@@ -226,10 +239,10 @@ const modelSmart: runtime.ModelBinding = {
 async function toolDeadLetter(args: unknown, context: runtime.RunContext): Promise<unknown> {
   const input = toolDeadLetterInput.parse(args);
   const roots = { input: runtime.bind(input, {
-    properties: {
+    "properties": {
       "kind": "string",
-      "payload": "string",
-    },
+      "payload": "string"
+    }
   }) };
   return toolDeadLetterOutput.parse(
     await runtime.runHttp({
@@ -277,10 +290,10 @@ async function toolRepoGrep(args: unknown, context: runtime.RunContext): Promise
 async function toolReviewQueue(args: unknown, context: runtime.RunContext): Promise<unknown> {
   const input = toolReviewQueueInput.parse(args);
   const roots = { input: runtime.bind(input, {
-    properties: {
-      "summary": "string",
+    "properties": {
       "severity": "string",
-    },
+      "summary": "string"
+    }
   }) };
   return toolReviewQueueOutput.parse(
     await runtime.runHttp({

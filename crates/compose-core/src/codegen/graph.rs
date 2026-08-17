@@ -1794,7 +1794,11 @@ fn interpolation(text: &Interpolated, site: &str) -> String {
 }
 
 /// A JSON value as a TypeScript literal, indented to sit inside an object.
-fn json_literal(value: &serde_json::Value, indent: &str) -> String {
+///
+/// JSON is a subset of TypeScript's object-literal syntax, so a schema and a
+/// shape are both emitted this way — quoted keys and all, which is what makes
+/// them legible as the data they are.
+pub(super) fn json_literal(value: &serde_json::Value, indent: &str) -> String {
     let rendered = serde_json::to_string_pretty(value).expect("a schema serializes");
     indent_block(&rendered, indent)
 }
@@ -1831,4 +1835,470 @@ pub fn host_functions(ir: &Ir) -> Vec<(String, String)> {
         }
     }
     found
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codegen::test_support::ir_of;
+
+    /// The emitted module for one composition, through the real name registry.
+    fn emit(source: &str) -> String {
+        let ir = ir_of(source);
+        let mut names = Names::of(&ir);
+        declare(&mut names, &ir);
+        module(&ir, &names).contents
+    }
+
+    const PREAMBLE: &str = r#"version: "0.1"
+
+state:
+  draft: { type: string, default: "" }
+  feedback: { type: string, default: "" }
+  notes:
+    type: array
+    max_items: 4
+    items: { type: string }
+    reduce: append
+
+provider.p:
+  kind: anthropic
+  api_key: ${MODEL_KEY}
+
+model.m:
+  provider: provider.p
+  id: some-model
+
+agent.reviewer:
+  model: model.m
+  prompt: Review it.
+  input:
+    goal: { type: string }
+    draft: { type: string }
+  output:
+    verdict: { enum: [approve, revise] }
+    feedback: { type: string }
+"#;
+
+    /// Grammar 7.3 evaluates a node's outgoing edges in **declaration order**,
+    /// so that is the order they are emitted in — with the guard, the `else:`
+    /// marker and the budget each carried as data rather than as control flow.
+    #[test]
+    fn a_nodes_edges_are_emitted_in_declaration_order_with_their_guards() {
+        let emitted = emit(&format!(
+            r#"{PREAMBLE}
+flow.f:
+  inputs: {{ goal: {{ type: string }} }}
+  outputs: {{ draft: {{ type: string }} }}
+  nodes:
+    write: {{ agent: agent.reviewer }}
+    review: {{ agent: agent.reviewer }}
+  edges:
+    - {{ from: start, to: write }}
+    - {{ from: write, to: review }}
+    - {{ from: review, to: write, when: "review.output.verdict == 'revise'", max_iterations: 3 }}
+    - {{ from: review, to: end, else: true }}
+"#
+        ));
+        let edges = emitted
+            .split("const flowFNodeReview: runtime.NodeDescriptor")
+            .nth(1)
+            .expect("the node is emitted")
+            .split("edges: [")
+            .nth(1)
+            .expect("its edges are emitted")
+            .split("],")
+            .next()
+            .expect("the list closes");
+        let lines: Vec<&str> = edges
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "{ to: \"write\", when: \"review.output.verdict == 'revise'\", readsOutput: true, \
+                 budget: { key: \"flow.f#2\", max: 3 } },",
+                "{ to: END, otherwise: true },",
+            ]
+        );
+    }
+
+    /// One counter per bounded **edge** (grammar 7.4): an SCC carrying two
+    /// budgeted edges carries two counters, one budget each.
+    #[test]
+    fn each_bounded_edge_gets_its_own_counter() {
+        let emitted = emit(&format!(
+            r#"{PREAMBLE}
+flow.f:
+  inputs: {{ goal: {{ type: string }} }}
+  outputs: {{ draft: {{ type: string }} }}
+  nodes:
+    write: {{ agent: agent.reviewer }}
+    review: {{ agent: agent.reviewer }}
+  edges:
+    - {{ from: start, to: write }}
+    - {{ from: write, to: review }}
+    - {{ from: review, to: write, when: "review.output.verdict == 'revise'", max_iterations: 3 }}
+    - {{ from: review, to: write, when: "review.output.feedback != ''", max_iterations: 5 }}
+    - {{ from: review, to: end, else: true }}
+"#
+        ));
+        assert!(
+            emitted.contains("budget: { key: \"flow.f#2\", max: 3 }"),
+            "{emitted}"
+        );
+        assert!(
+            emitted.contains("budget: { key: \"flow.f#3\", max: 5 }"),
+            "{emitted}"
+        );
+    }
+
+    /// Grammar 8.0's chain, resolved per field: an explicit binding, a channel
+    /// of the same name, the enclosing flow input, then the field's own default.
+    #[test]
+    fn each_input_field_is_resolved_through_grammar_eight_zeros_chain() {
+        let emitted = emit(&format!(
+            r#"{PREAMBLE}
+agent.mixed:
+  model: model.m
+  prompt: Mix it.
+  input:
+    goal: {{ type: string }}
+    draft: {{ type: string }}
+    feedback: {{ type: string }}
+    tone: {{ type: string, default: calm }}
+  output:
+    verdict: {{ enum: [approve, revise] }}
+
+flow.f:
+  inputs: {{ goal: {{ type: string }} }}
+  outputs: {{ draft: {{ type: string }} }}
+  nodes:
+    mix:
+      agent: agent.mixed
+      input:
+        feedback: "'explicit'"
+  edges:
+    - {{ from: start, to: mix }}
+    - {{ from: mix, to: end }}
+"#
+        ));
+        let builder = emitted
+            .split("const flowFNodeMix: runtime.NodeDescriptor")
+            .nth(1)
+            .expect("the node is emitted")
+            .split("run:")
+            .next()
+            .expect("the input builder closes");
+        // The flow input of the same name (step 3)…
+        assert!(
+            builder.contains("\"goal\": runtime.flowInput(view.run, \"goal\","),
+            "{builder}"
+        );
+        // …the channel of the same name (step 2)…
+        assert!(
+            builder.contains("\"draft\": runtime.channelValue(view.state, \"draft\","),
+            "{builder}"
+        );
+        // …the explicit binding (step 1), which beats the channel of that name…
+        assert!(
+            builder
+                .contains("\"feedback\": runtime.toJson(runtime.evaluate(\"'explicit'\", roots))"),
+            "{builder}"
+        );
+        // …and the field's own `default:` (step 4).
+        assert!(builder.contains("\"tone\": \"calm\""), "{builder}");
+    }
+
+    /// A string-in agent binds one unnamed value (Decision D14), which is a
+    /// scalar rather than an object.
+    #[test]
+    fn a_string_in_agent_is_bound_with_the_scalar_form() {
+        let emitted = emit(&format!(
+            r#"{PREAMBLE}
+agent.plain:
+  model: model.m
+  prompt: Answer.
+  output: {{ draft: {{ type: string }} }}
+
+flow.f:
+  inputs: {{ goal: {{ type: string }} }}
+  outputs: {{ draft: {{ type: string }} }}
+  nodes:
+    say: {{ agent: agent.plain, input: "input.goal" }}
+  edges:
+    - {{ from: start, to: say }}
+    - {{ from: say, to: end }}
+"#
+        ));
+        assert!(
+            emitted.contains(
+                "input: (roots) => runtime.toJson(runtime.evaluate(\"input.goal\", roots)),"
+            ),
+            "{emitted}"
+        );
+    }
+
+    /// Grammar 9.3's chain is applied here, and the emitted policy says which
+    /// level each field came from — the artifact keeps them unresolved, so the
+    /// comment is where a reader learns what won.
+    #[test]
+    fn the_resolved_policy_names_the_level_each_field_came_from() {
+        let emitted = emit(&format!(
+            r#"{PREAMBLE}
+defaults:
+  timeout: 30s
+  on_error: fail
+
+flow.f:
+  inputs: {{ goal: {{ type: string }} }}
+  outputs: {{ draft: {{ type: string }} }}
+  nodes:
+    review:
+      agent: agent.reviewer
+      retry: {{ max: 2, backoff: 1s, jitter: false }}
+      on_error: {{ fallback: end }}
+  edges:
+    - {{ from: start, to: review }}
+    - {{ from: review, to: end }}
+"#
+        ));
+        assert!(
+            emitted.contains(
+                "// Grammar 9.3, resolved: `retry` from the node, `timeout` from `defaults:`, \
+                 `on_error` from the node."
+            ),
+            "{emitted}"
+        );
+        assert!(emitted.contains("backoffMs: 1000,"), "{emitted}");
+        assert!(emitted.contains("jitter: false,"), "{emitted}");
+        assert!(emitted.contains("timeoutMs: 30000,"), "{emitted}");
+        assert!(
+            emitted.contains("onError: { fallback: \"__end__\" },"),
+            "{emitted}"
+        );
+    }
+
+    /// A construct this release does not execute is emitted as a real node with
+    /// its real topology, whose activity says what it is and which milestone
+    /// bullet lands it — rather than as a plausible answer.
+    #[test]
+    fn an_unimplemented_kind_throws_and_names_the_bullet_it_waits_on() {
+        let emitted = emit(&format!(
+            r#"{PREAMBLE}
+flow.f:
+  inputs: {{ goal: {{ type: string }} }}
+  outputs: {{ draft: {{ type: string }} }}
+  nodes:
+    ask:
+      human:
+        input: {{ question: {{ type: string }} }}
+        output: {{ decision: {{ enum: [approve, reject] }} }}
+        timeout: 24h
+        on_timeout: rescue
+    rescue: {{ agent: agent.reviewer }}
+  edges:
+    - {{ from: start, to: ask }}
+    - {{ from: ask, to: end }}
+    - {{ from: rescue, to: end }}
+"#
+        ));
+        assert!(
+            emitted.contains("throw new runtime.Unimplemented(\"a `human` pause\","),
+            "{emitted}"
+        );
+        // Grammar 7.8 clause 3: a node reached only by `on_timeout` is live
+        // code, and the graph has to be told so or it will not compile.
+        assert!(
+            emitted.contains("ends: [END, \"rescue\"],"),
+            "the control-transfer target is an end of the node that transfers to it:\n{emitted}"
+        );
+    }
+
+    /// A `model.*` route binds its first member, and the note says failover is
+    /// not what this release does with the rest.
+    #[test]
+    fn a_route_binds_its_first_member_and_says_what_is_missing() {
+        let emitted = emit(&format!(
+            r#"{PREAMBLE}
+model.fast:
+  provider: provider.p
+  id: another-model
+
+model.default:
+  route: [model.m, model.fast]
+
+agent.routed:
+  model: model.default
+  prompt: Answer.
+  output: {{ draft: {{ type: string }} }}
+
+flow.f:
+  inputs: {{ goal: {{ type: string }} }}
+  outputs: {{ draft: {{ type: string }} }}
+  nodes:
+    say: {{ agent: agent.routed, input: "input.goal" }}
+  edges:
+    - {{ from: start, to: say }}
+    - {{ from: say, to: end }}
+"#
+        ));
+        let routed = emitted
+            .split("const modelDefault: runtime.ModelBinding")
+            .nth(1)
+            .expect("the route is emitted");
+        assert!(routed.contains("id: \"some-model\","), "{routed}");
+        assert!(
+            emitted.contains("failover is not executed by this compiler release"),
+            "{emitted}"
+        );
+    }
+
+    /// The output schema is offered under `<agent>_output` — except where the
+    /// agent already attaches a tool of that name, which would make the pinned
+    /// choice ambiguous on the wire.
+    #[test]
+    fn the_output_tool_never_shares_a_name_with_an_attached_tool() {
+        let emitted = emit(&format!(
+            r#"{PREAMBLE}
+tool.collides_output:
+  description: A tool that happens to be named like an output schema.
+  input: {{ q: {{ type: string }} }}
+  output: {{ a: {{ type: string }} }}
+  exec:
+    command: printf
+    args: ["a"]
+
+agent.collides:
+  model: model.m
+  prompt: Answer.
+  tools: [tool.collides_output]
+  output: {{ draft: {{ type: string }} }}
+
+flow.f:
+  inputs: {{ goal: {{ type: string }} }}
+  outputs: {{ draft: {{ type: string }} }}
+  nodes:
+    say: {{ agent: agent.collides, input: "input.goal" }}
+  edges:
+    - {{ from: start, to: say }}
+    - {{ from: say, to: end }}
+"#
+        ));
+        // `agent.reviewer`'s output keeps the plain spelling…
+        assert!(emitted.contains("name: \"reviewer_output\","), "{emitted}");
+        // …and the agent that attaches a tool of that name gets another.
+        assert!(
+            emitted.contains("name: \"collides_output_2\","),
+            "{emitted}"
+        );
+    }
+
+    /// A `start` edge carrying a guard needs a node to evaluate it at, because
+    /// `start` is not one (grammar 7.2, 7.6.3 rule 2).
+    #[test]
+    fn guarded_start_edges_get_a_synthetic_entry_node() {
+        let plain = emit(&format!(
+            r#"{PREAMBLE}
+flow.f:
+  inputs: {{ goal: {{ type: string }} }}
+  outputs: {{ draft: {{ type: string }} }}
+  nodes:
+    review: {{ agent: agent.reviewer }}
+  edges:
+    - {{ from: start, to: review }}
+    - {{ from: review, to: end }}
+"#
+        ));
+        assert!(plain.contains(".addEdge(START, \"review\")"), "{plain}");
+        assert!(!plain.contains("$start"), "{plain}");
+
+        let guarded = emit(&format!(
+            r#"{PREAMBLE}
+flow.f:
+  inputs: {{ goal: {{ type: string }} }}
+  outputs: {{ draft: {{ type: string }} }}
+  nodes:
+    review: {{ agent: agent.reviewer }}
+    rework: {{ agent: agent.reviewer }}
+  edges:
+    - {{ from: start, to: rework, when: "state.draft != ''" }}
+    - {{ from: start, to: review, else: true }}
+    - {{ from: review, to: end }}
+    - {{ from: rework, to: end }}
+"#
+        ));
+        assert!(guarded.contains("node: \"$start\","), "{guarded}");
+        assert!(guarded.contains(".addNode(\"$start\""), "{guarded}");
+        assert!(guarded.contains(".addEdge(START, \"$start\")"), "{guarded}");
+        assert!(
+            guarded.contains("{ to: \"rework\", when: \"state.draft != ''\" },"),
+            "the start edges are the synthetic node's:\n{guarded}"
+        );
+    }
+
+    /// Grammar 4.3 class 2: an interpolable string reaches the runtime as its
+    /// parts, and `$${` is the escape for a literal `${`.
+    #[test]
+    fn an_interpolable_string_is_emitted_as_its_parts() {
+        let emitted = emit(&format!(
+            r#"{PREAMBLE}
+tool.run:
+  description: Run something.
+  input: {{}}
+  output: {{}}
+  exec:
+    command: "${{TOOLBIN}}/rg"
+    args: ["--config=$${{HOME}}/rc", "plain"]
+"#
+        ));
+        assert!(
+            emitted.contains(
+                "command: [{ env: \"TOOLBIN\", site: \"tool.run.exec.command\" }, \"/rg\"],"
+            ),
+            "{emitted}"
+        );
+        assert!(
+            emitted.contains("[\"--config=${HOME}/rc\"],"),
+            "an escaped token is text, not a reference:\n{emitted}"
+        );
+    }
+
+    /// A composition with no flows emits a registry with nothing in it rather
+    /// than no registry at all.
+    #[test]
+    fn a_composition_with_no_flows_still_declares_its_surface() {
+        let emitted = emit("version: \"0.1\"\n");
+        assert!(
+            emitted.contains("export const flows: Readonly<Record<string, CompiledFlow>> = {\n};"),
+            "{emitted}"
+        );
+        assert!(
+            emitted.contains("export async function runFlow("),
+            "{emitted}"
+        );
+    }
+
+    /// Every host-registered function is listed for the README, which is where
+    /// the cost of grammar 6.1's escape hatch is written down.
+    #[test]
+    fn the_host_functions_of_a_composition_are_listed() {
+        let ir = ir_of(&format!(
+            r#"{PREAMBLE}
+tool.rank:
+  description: Rank things.
+  input: {{ text: {{ type: string }} }}
+  output: {{ ranked: {{ type: string }} }}
+  function:
+    name: rank_candidates
+"#
+        ));
+        assert_eq!(
+            host_functions(&ir),
+            [("rank_candidates".to_string(), "tool.rank".to_string())]
+        );
+        assert!(host_functions(&ir_of("version: \"0.1\"\n")).is_empty());
+    }
 }

@@ -46,12 +46,19 @@
 //! tsconfig.json         strict, NodeNext, no build step
 //! README.md             what this directory is, how to run it, how to eject
 //! .gitignore            the one directory a generated project acquires
+//! src/cel.ts            the CEL evaluator the routers embed (PRD 5.5)
 //! src/env.ts            every `${ENV}` reference, and the process-start check
+//! src/runtime.ts        what a node does when it runs (grammar 8, 9)
 //! src/schemas.ts        every schema in the composition, as Zod (grammar 3.8)
 //! src/state.ts          the LangGraph state model (grammar 10)
-//! src/graph.ts          the graph module
+//! src/graph.ts          the compiled graph, and `runFlow`
 //! src/index.ts          the project's public surface
 //! ```
+//!
+//! Two of those are **constants**: `src/cel.ts` and `src/runtime.ts` are
+//! byte-identical in every project a compiler release builds, which is what
+//! keeps a golden diff about the composition rather than about the machinery
+//! beside it. The other five are the composition, lowered.
 //!
 //! `src/` is **compiler-owned**: `build` removes files under it that it did not
 //! emit, and `build --check` reports them as drift. Nothing outside `src/` is
@@ -88,10 +95,12 @@
 //!
 //! # What is not here yet
 //!
-//! Node functions, routers, bounded-cycle counters, `map`→`Send`, subgraphs,
-//! store ops, and model routing are the later M1 bullets. [`graph`] emits the
-//! module they will land in and the state model they will build on; what it does
-//! not do is pretend to a topology it cannot execute.
+//! `map`→`Send`, subgraph instantiation, store ops, the `human` runtime and
+//! model failover are the remaining M1 bullets. A composition using one still
+//! **builds**, and its topology is still emitted in full — the edges, the
+//! budgets, the node's place in the graph — with an activity that throws naming
+//! the construct and the bullet that lands it ([`graph`]). Nothing answers a
+//! plausible value.
 
 pub mod cel;
 pub mod env;

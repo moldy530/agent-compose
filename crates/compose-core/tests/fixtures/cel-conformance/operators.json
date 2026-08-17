@@ -142,7 +142,14 @@
   {
     "name": "boolean-guard-over-declared-roots",
     "expression": "state.count > 0 && input.goal != ''",
-    "input": { "state": { "count": 2 }, "input": { "goal": "ship" } },
+    "input": {
+      "state": {
+        "count": 2
+      },
+      "input": {
+        "goal": "ship"
+      }
+    },
     "result": true
   },
   {
@@ -168,6 +175,54 @@
   {
     "name": "int-overflow-is-an-error-and-not-a-wrap",
     "expression": "9223372036854775807 + 1",
+    "error": true
+  },
+  {
+    "name": "logical-and-is-false-when-the-other-side-errors",
+    "expression": "state.missing && false",
+    "input": {
+      "state": {}
+    },
+    "result": false
+  },
+  {
+    "name": "logical-and-is-false-when-the-error-is-on-the-right",
+    "expression": "false && state.missing",
+    "input": {
+      "state": {}
+    },
+    "result": false
+  },
+  {
+    "name": "logical-and-propagates-the-error-when-nothing-absorbs-it",
+    "expression": "state.missing && true",
+    "input": {
+      "state": {}
+    },
+    "error": true
+  },
+  {
+    "name": "logical-or-is-true-when-the-other-side-errors",
+    "expression": "state.missing || true",
+    "input": {
+      "state": {}
+    },
+    "result": true
+  },
+  {
+    "name": "logical-or-is-true-when-the-error-is-on-the-right",
+    "expression": "true || state.missing",
+    "input": {
+      "state": {}
+    },
+    "result": true
+  },
+  {
+    "name": "logical-or-propagates-the-error-when-nothing-absorbs-it",
+    "expression": "state.missing || false",
+    "input": {
+      "state": {}
+    },
     "error": true
   }
 ]

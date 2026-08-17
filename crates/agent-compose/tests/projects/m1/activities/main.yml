@@ -87,6 +87,21 @@ tool.echo:
     command: printf
     args: ["%s", "echoed"]
 
+tool.rank:
+  description: Rank the candidates by the host's own rule.
+  input:
+    text:
+      type: string
+      min_length: 1
+  output:
+    ranked:
+      type: string
+  # Grammar 6.1's escape hatch: the implementation lives outside the spec, and a
+  # project using one does not run until the host registers it. That is the whole
+  # of what "breaks spec portability" costs, made observable.
+  function:
+    name: rank_candidates
+
 flow.pipeline:
   description: Fan out over two checks, join them, and finish.
   inputs:
@@ -192,6 +207,56 @@ flow.pipeline:
     - { from: tally, to: publish, else: true }
     - { from: publish, to: end }
     - { from: rework, to: end }
+
+flow.entry:
+  description: Guarded `start` edges, which have no node to be evaluated at.
+  inputs:
+    pick:
+      type: boolean
+  outputs:
+    report:
+      type: string
+  nodes:
+    left:
+      exec:
+        command: printf
+        args: ["%s", "left"]
+        output:
+          stdout: { type: string }
+      writes:
+        stdout: report
+    right:
+      exec:
+        command: printf
+        args: ["%s", "right"]
+        output:
+          stdout: { type: string }
+      writes:
+        stdout: report
+  edges:
+    # Grammar 7.2 admits a guard on an edge leaving `start`, where the roots are
+    # `input`/`state`/`execution` — `start` has no output. Grammar 7.6.3 rule 2
+    # then requires one of them to be guaranteed, which the `else:` is.
+    - { from: start, to: left, when: "input.pick" }
+    - { from: start, to: right, else: true }
+    - { from: left, to: end }
+    - { from: right, to: end }
+
+flow.hosted:
+  description: The escape hatch, on its own, so what it costs is visible.
+  outputs:
+    report:
+      type: string
+  nodes:
+    rank:
+      function: tool.rank
+      input:
+        text: "'candidates'"
+      writes:
+        ranked: report
+  edges:
+    - { from: start, to: rank }
+    - { from: rank, to: end }
 
 flow.deadline:
   description: A node that runs out of time, and the fallback that takes over.

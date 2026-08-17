@@ -41,18 +41,20 @@ const stateShape: runtime.Shape = {
     "at": "string",
     "at_time": "string",
     "author": {
-      properties: {
-        "name": "string",
+      "properties": {
         "email": "string",
         "home": "string",
-      },
+        "name": "string"
+      }
     },
-    "authors": { items: {
-        properties: {
+    "authors": {
+      "items": {
+        "properties": {
           "name": "string",
-          "rank": "int",
-        },
-      } },
+          "rank": "int"
+        }
+      }
+    },
     "cadence": "double",
     "digits": "string",
     "draft": "string",
@@ -62,38 +64,49 @@ const stateShape: runtime.Shape = {
     "latest": "string",
     "mark": "string",
     "mood": "string",
-    "notes": { items: "string" },
+    "notes": {
+      "items": "string"
+    },
     "on_day": "string",
     "origin": {
-      properties: {
-        "source": { properties: { "kind": "string" }, rest: "any" },
-      },
+      "properties": {
+        "source": {
+          "properties": {
+            "kind": "string"
+          },
+          "rest": "any"
+        }
+      }
     },
     "ratio": "double",
     "round": "int",
     "seen": {
-      properties: {
-        "count": "int",
-      },
+      "properties": {
+        "count": "int"
+      }
     },
     "slug": "string",
     "step": "double",
-    "tags": { items: "string" },
+    "tags": {
+      "items": "string"
+    },
     "totals": {
-      properties: {
+      "properties": {
         "fixed": "int",
-        "skipped": "int",
-      },
+        "skipped": "int"
+      }
     },
     "urgent": "bool",
     "v4": "string",
     "v6": "string",
-    "visits": { items: {
-        properties: {
+    "visits": {
+      "items": {
+        "properties": {
           "page": "string",
-          "via": "string",
-        },
-      } },
+          "via": "string"
+        }
+      }
+    },
     "where": "string",
     "which": "string",
     "who": "string",
@@ -103,65 +116,74 @@ const stateShape: runtime.Shape = {
 
 /** `flow.shape` — the `input` root inside it (grammar 7.5). */
 const flowShapeShape: runtime.Shape = {
-  properties: {
-    "goal": "string",
-  },
+  "properties": {
+    "goal": "string"
+  }
 };
 
 /** `flow.shape` node `shape` — the `shape.output` root its guards read. */
 const flowShapeNodeShapeShape: runtime.Shape = {
-  properties: {
-    "draft": "string",
-    "findings": { items: { properties: { "kind": "string" }, rest: "any" } },
+  "properties": {
     "author": {
-      properties: {
-        "name": "string",
+      "properties": {
         "email": "string",
-      },
+        "name": "string"
+      }
     },
-  },
+    "draft": "string",
+    "findings": {
+      "items": {
+        "properties": {
+          "kind": "string"
+        },
+        "rest": "any"
+      }
+    }
+  }
 };
 
 /** `flow.shape` node `ask` — the `ask.output` root its guards read. */
 const flowShapeNodeAskShape: runtime.Shape = {
-  properties: {
-    "decision": "string",
-  },
+  "properties": {
+    "decision": "string"
+  }
 };
 
 /** `flow.shape` node `probe` — the `probe.output` root its guards read. */
 const flowShapeNodeProbeShape: runtime.Shape = {
-  properties: {
+  "properties": {
     "exit_code": "int",
-    "stdout": "string",
-  },
+    "stdout": "string"
+  }
 };
 
 /** `flow.shape` node `notify` — the `notify.output` root its guards read. */
 const flowShapeNodeNotifyShape: runtime.Shape = {
-  properties: {
-    "status": "int",
+  "properties": {
     "body": "string",
-  },
+    "status": "int"
+  }
 };
 
 /** `flow.shape` node `recall` — the `recall.output` root its guards read. */
 const flowShapeNodeRecallShape: runtime.Shape = {
-  properties: {
-    "matches": { items: {
-        properties: {
+  "properties": {
+    "matches": {
+      "items": {
+        "properties": {
           "id": "string",
-          "score": "double",
-          "text": "string",
           "metadata": {
-            properties: {
+            "properties": {
               "source": "string",
-              "updated_at": "string",
-            },
+              "updated_at": "string"
+            }
           },
-        },
-      } },
-  },
+          "score": "double",
+          "text": "string"
+        }
+      }
+    }
+  }
 };
 
 /**

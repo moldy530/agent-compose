@@ -185,6 +185,7 @@ pub fn readme(ir: &Ir) -> super::GeneratedFile {
         ir.entrypoint, ir.target
     ));
     contents.push_str(README_BODY);
+    contents.push_str(&host_functions(ir));
 
     let mut pins = String::from("\n| package | version |\n|---|---|\n");
     for (package, version) in PINS.iter().chain(DEV_PINS) {
@@ -204,11 +205,30 @@ const README_BODY: &str = r#"
 
 | path | what it holds |
 |---|---|
+| `src/cel.ts` | the CEL evaluator the routers embed (PRD 5.5) |
 | `src/env.ts` | every `${ENV}` reference the composition makes, and `readEnvironment()`, the presence check over them |
+| `src/runtime.ts` | what every node does when it runs: the retry/timeout/error policy of grammar 9, the provider surfaces, the `exec`/`http` wrappers, and the router |
 | `src/schemas.ts` | every schema the composition declares, as Zod |
-| `src/state.ts` | the graph's state model: one channel per `state:` channel, plus the implicit conversation history |
-| `src/graph.ts` | the compiled graph |
+| `src/state.ts` | the graph's state model: one channel per `state:` channel, the implicit conversation history, and `$run` — what the runtime keeps beside them |
+| `src/graph.ts` | the compiled graph: one node per flow node, the `flows` registry, and `runFlow` |
 | `src/index.ts` | the project's public surface, and the one caller of `readEnvironment()` |
+
+## Running a flow
+
+```ts
+import { runFlow } from "./src/index.ts";
+
+const run = await runFlow("flow.<name>", { /* the flow's declared inputs */ });
+console.log(run.outputs); // its `outputs:`, materialized at quiescence
+console.log(run.trace);   // every routing decision the run made, as data
+```
+
+Every flow is runnable whether or not a `manual` trigger names it (PRD 5.11),
+so `flows` holds them all. The inputs are parsed against the flow's own
+`inputs:` schema before anything runs, and the trace is the routing record
+PRD 5.3 asks for: one entry per node execution, carrying the guards that were
+evaluated, what they answered, which edges were taken, and the state of any
+`max_iterations` budget they spent.
 
 `src/index.ts` calls `readEnvironment()` at module scope, so loading this project
 is what checks its environment: a missing variable throws before anything runs,
@@ -248,6 +268,38 @@ A compiler release targets one LangGraph release (PRD 5.12). Upgrading is a
 change to the compiler, not to this directory: bump the pins there, rebuild, and
 review the diff.
 "#;
+
+/// The section a composition using grammar 6.1's `function:` binding gets.
+///
+/// The escape hatch is the one construct that makes a composition non-portable
+/// (PRD 5.5), and the shape of that cost is concrete: the project does not run
+/// until the host has registered an implementation. A reader of the generated
+/// project finds the list here rather than in a runtime error.
+fn host_functions(ir: &Ir) -> String {
+    let registered = super::graph::host_functions(ir);
+    if registered.is_empty() {
+        return String::new();
+    }
+    let mut text = String::from(
+        "\n## Host functions\n\n\
+         This composition uses grammar 6.1's `function:` binding, which is the escape hatch\n\
+         that puts an implementation outside the spec (PRD 5.5). Each one below has to be\n\
+         registered before a graph that reaches it runs:\n\n\
+         ```ts\n\
+         import { registerFunction } from \"./src/runtime.ts\";\n\n",
+    );
+    for (name, address) in &registered {
+        text.push_str(&format!(
+            "registerFunction({name:?}, async (args) => {{\n  \
+             // the implementation of `{address}`; its arguments have already been\n  \
+             // parsed against that tool's declared `input:` schema\n  \
+             return {{ /* … its declared `output:` … */ }};\n\
+             }});\n"
+        ));
+    }
+    text.push_str("```\n");
+    text
+}
 
 const README_TAIL: &str = r#"
 ## Ejecting
@@ -290,9 +342,9 @@ pub fn index(ir: &Ir) -> super::GeneratedFile {
 
 const INDEX: &str = r#"//
 // The project's public surface. Everything a consumer of this graph needs —
-// the schemas, the state model, the graph itself, and the environment it
-// requires — is re-exported here, so an ejected project has one entry point
-// and `run`/`serve` have one module to import.
+// the schemas, the state model, the graph itself, `runFlow`, and the
+// environment it requires — is re-exported here, so an ejected project has one
+// entry point and `run`/`serve` have one module to import.
 //
 // It is also where the env-ref presence check of PRD 5.9 runs. `readEnvironment`
 // is called at module scope, so loading this module is what "process start"

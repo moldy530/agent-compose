@@ -41,26 +41,26 @@ const stateShape: runtime.Shape = {
 
 /** `flow.review_loop` — the `input` root inside it (grammar 7.5). */
 const flowReviewLoopShape: runtime.Shape = {
-  properties: {
-    "goal": "string",
-  },
+  "properties": {
+    "goal": "string"
+  }
 };
 
 /** `flow.review_loop` node `write` — the `write.output` root its guards read. */
 const flowReviewLoopNodeWriteShape: runtime.Shape = {
-  properties: {
-    "draft": "string",
-  },
+  "properties": {
+    "draft": "string"
+  }
 };
 
 /**
  * `flow.review_loop` node `review` — the `review.output` root its guards read.
  */
 const flowReviewLoopNodeReviewShape: runtime.Shape = {
-  properties: {
-    "verdict": "string",
+  "properties": {
     "feedback": "string",
-  },
+    "verdict": "string"
+  }
 };
 
 /**
@@ -116,10 +116,10 @@ const modelSmart: runtime.ModelBinding = {
 async function toolWebSearch(args: unknown, context: runtime.RunContext): Promise<unknown> {
   const input = toolWebSearchInput.parse(args);
   const roots = { input: runtime.bind(input, {
-    properties: {
-      "query": "string",
+    "properties": {
       "max_results": "int",
-    },
+      "query": "string"
+    }
   }) };
   return toolWebSearchOutput.parse(
     await runtime.runHttp({
