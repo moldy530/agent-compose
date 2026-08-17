@@ -170,15 +170,24 @@
 //! The `.regex`-spelled formats (`uri`, `time`, `uuid`) survive as `pattern`, so
 //! the loss tracks the spelling rather than the keyword.
 //!
-//! This module does not get to fix that: the schema a provider is handed is the
-//! node-fn PR's emission, and *which* schema it hands over — a conversion of
-//! this Zod, or [`json_field_map`]'s lowering, which is the column the
-//! conformance corpus already proves equal to the parse — is a design question
-//! PRD 5.2 does not answer and CLAUDE.md's PRD discipline says must be resolved
-//! before that area is implemented. What belongs here is the evidence, and a
-//! gate that keeps it true: `what_the_structured_output_mechanism_would_be_handed`
-//! in `tests/generated_code_gates.rs` runs the real conversion over the real
-//! goldens and fails when either half of the premise changes.
+//! **Which schema a provider is handed is now decided, and it is not that
+//! conversion.** The question PRD 5.2 leaves open — a conversion of this Zod, or
+//! [`json_field_map`]'s lowering — was answered by the one property that makes
+//! structured output load-bearing for routing: the schema a model is
+//! *constrained by* has to be the schema its answer is then *parsed with*, or an
+//! agent can answer its own contract and fail the parse. Those two are equal by
+//! construction only for the JSON column, which
+//! `the_emitted_zod_agrees_with_the_json_schema_lowering` proves document by
+//! document — so [`super::runtime`]'s agent call sends [`json_field_map`]'s
+//! lowering, over `fetch`, with no `withStructuredOutput` in the path.
+//!
+//! The evidence stays, and so does the gate that keeps it true:
+//! `what_the_structured_output_mechanism_would_be_handed` in
+//! `tests/generated_code_gates.rs` runs the real conversion over the real
+//! goldens, and it now measures **the road not taken** — the day that conversion
+//! stops dropping refinements is the day the choice could be reconsidered. The
+//! decision itself belongs in PRD §9's resolved log; this comment is where the
+//! reasoning lives until it is written there.
 
 use std::borrow::Cow;
 
