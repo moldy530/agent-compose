@@ -32,8 +32,8 @@ export const channels = {
    * Unreduced: single-writer, and a write supplies the whole value.
    * Starts at `""`.
    */
-  draft: Annotation<z.infer<typeof stateDraft>>({
-    reducer: (_left, right) => right,
+  draft: Annotation<z.infer<typeof stateDraft>, runtime.Written<z.infer<typeof stateDraft>>>({
+    reducer: (left, right) => runtime.setReduce(left, right),
     default: () => "",
   }),
   /**
@@ -42,8 +42,8 @@ export const channels = {
    * Unreduced: single-writer, and a write supplies the whole value.
    * Starts at `""`.
    */
-  feedback: Annotation<z.infer<typeof stateFeedback>>({
-    reducer: (_left, right) => right,
+  feedback: Annotation<z.infer<typeof stateFeedback>, runtime.Written<z.infer<typeof stateFeedback>>>({
+    reducer: (left, right) => runtime.setReduce(left, right),
     default: () => "",
   }),
   /**

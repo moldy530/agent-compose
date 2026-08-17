@@ -115,8 +115,8 @@ export const channels = {
    * `reduce: last_wins`: concurrent overwrite, declared explicitly; a write supplies the whole value.
    * Starts at `""`.
    */
-  latest: Annotation<z.infer<typeof stateLatest>>({
-    reducer: (_left, right) => right,
+  latest: Annotation<z.infer<typeof stateLatest>, runtime.Written<z.infer<typeof stateLatest>>>({
+    reducer: (left, right) => runtime.setReduce(left, right),
     default: () => "",
   }),
   /**
@@ -128,8 +128,8 @@ export const channels = {
    * Unreduced: single-writer, and a write supplies the whole value.
    * Starts at `"calm"`.
    */
-  mood: Annotation<z.infer<typeof stateMood>>({
-    reducer: (_left, right) => right,
+  mood: Annotation<z.infer<typeof stateMood>, runtime.Written<z.infer<typeof stateMood>>>({
+    reducer: (left, right) => runtime.setReduce(left, right),
     default: () => "calm",
   }),
   /**
@@ -138,8 +138,8 @@ export const channels = {
    * `reduce: append`: a write supplies **one element**, appended in canonical write order (grammar 7.6.4, Decision D58).
    * Starts at `[]`.
    */
-  notes: Annotation<z.infer<typeof stateNotes>, z.infer<typeof stateNotes>[number]>({
-    reducer: (left, right) => left.concat([right]),
+  notes: Annotation<z.infer<typeof stateNotes>, runtime.Written<z.infer<typeof stateNotes>[number]>>({
+    reducer: (left, right) => runtime.appendReduce(left, right),
     default: () => [],
   }),
   /**
@@ -161,16 +161,16 @@ export const channels = {
    * Unreduced: single-writer, and a write supplies the whole value.
    * Starts at `1`.
    */
-  round: Annotation<z.infer<typeof stateRound>>({
-    reducer: (_left, right) => right,
+  round: Annotation<z.infer<typeof stateRound>, runtime.Written<z.infer<typeof stateRound>>>({
+    reducer: (left, right) => runtime.setReduce(left, right),
     default: () => 1,
   }),
   /**
    * `reduce: merge`: a write supplies a subset of the properties, merged key-wise in canonical write order — so the value is `Partial` until every property has been supplied (grammar 10.1, Decision D101).
    * Starts at `{ "count": 0 }`.
    */
-  seen: Annotation<Partial<z.infer<typeof stateSeen>>, Partial<z.infer<typeof stateSeen>>>({
-    reducer: (left, right) => ({ ...left, ...right }),
+  seen: Annotation<Partial<z.infer<typeof stateSeen>>, runtime.Written<Partial<z.infer<typeof stateSeen>>>>({
+    reducer: (left, right) => runtime.mergeReduce(left, right),
     default: () => ({ "count": 0 }),
   }),
   /**
@@ -194,16 +194,16 @@ export const channels = {
    * `reduce: merge`: a write supplies a subset of the properties, merged key-wise in canonical write order — so the value is `Partial` until every property has been supplied (grammar 10.1, Decision D101).
    * Starts at `{}`.
    */
-  totals: Annotation<Partial<z.infer<typeof stateTotals>>, Partial<z.infer<typeof stateTotals>>>({
-    reducer: (left, right) => ({ ...left, ...right }),
+  totals: Annotation<Partial<z.infer<typeof stateTotals>>, runtime.Written<Partial<z.infer<typeof stateTotals>>>>({
+    reducer: (left, right) => runtime.mergeReduce(left, right),
     default: () => ({}),
   }),
   /**
    * Unreduced: single-writer, and a write supplies the whole value.
    * Starts at `false`.
    */
-  urgent: Annotation<z.infer<typeof stateUrgent>>({
-    reducer: (_left, right) => right,
+  urgent: Annotation<z.infer<typeof stateUrgent>, runtime.Written<z.infer<typeof stateUrgent>>>({
+    reducer: (left, right) => runtime.setReduce(left, right),
     default: () => false,
   }),
   /**

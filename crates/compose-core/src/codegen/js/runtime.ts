@@ -2379,9 +2379,9 @@ export async function runMap(
     if (route.detach) {
       // Resolved at dispatch (Decision D94): the record is written now, the
       // delivery is issued now, and the join never learns what became of it.
-      // The bound still applies to the work — the gate is taken inside the
-      // detached task rather than before it, so waiting for a permit delays the
-      // delivery and never the enclosing flow instance.
+      // It takes its **route's** permit and never the node's — see the
+      // `a-detached-dispatch-is-bounded-by-its-own-route` row in
+      // `codegen::graph`'s ledger for why the two bounds cannot be one here.
       records.push({
         index,
         ...named,
@@ -2393,11 +2393,9 @@ export async function runMap(
       const gate = gateOf(route);
       void (async () => {
         await gate.acquire();
-        await node.acquire();
         try {
           await route.run(instance.input, scoped, site);
         } finally {
-          node.release();
           gate.release();
         }
       })().catch(() => {
@@ -2716,19 +2714,27 @@ export async function runNode(
   let failure: NodeFailure | undefined;
 
   /** This node's entry, for a failure that leaves nothing else behind. */
-  const aborted = (error: unknown, made: number, routing?: RoutingDecision): TraceEntry => ({
-    step,
-    flow: descriptor.flow,
-    node: descriptor.node,
-    traversal,
-    outcome: "failed",
-    attempts: made,
-    ...(routing === undefined ? {} : { routing }),
+  const aborted = (error: unknown, made: number, routing?: RoutingDecision): TraceEntry => {
     // A subflow that failed still made a trace, and it is the only account of
-    // what happened inside the boundary (grammar 8.5, PRD 5.3).
-    ...(error instanceof SubflowFailure ? { inner: error.trace } : {}),
-    error: describe(error),
-  });
+    // what happened inside the boundary (grammar 8.5, PRD 5.3). The cause chain
+    // is walked because `runActivity` wraps whatever the activity threw.
+    let held = inner;
+    for (let cause: unknown = error; held === undefined && cause !== undefined; ) {
+      if (cause instanceof SubflowFailure) held = cause.trace;
+      cause = (cause as { cause?: unknown } | null)?.cause;
+    }
+    return {
+      step,
+      flow: descriptor.flow,
+      node: descriptor.node,
+      traversal,
+      outcome: "failed",
+      attempts: made,
+      ...(routing === undefined ? {} : { routing }),
+      ...(held === undefined ? {} : { inner: held }),
+      error: describe(error),
+    };
+  };
 
   // Outside the `try` on purpose — see *Which errors `on_error` governs* above.
   // A `map`'s whole dispatch is decided here too: which items, which routes, and

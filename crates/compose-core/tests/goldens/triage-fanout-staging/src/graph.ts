@@ -14,10 +14,11 @@
 // state it writes — including the counter a bounded edge spends (grammar 7.4) —
 // land in one write. `./runtime.ts` is what the descriptors drive.
 
-import { END, START, StateGraph, isInterrupted } from "@langchain/langgraph";
+import { END, START, StateGraph } from "@langchain/langgraph";
 
 import * as runtime from "./runtime.ts";
 import {
+  agentFixerOutput,
   agentSummarizerOutput,
   agentTriageOutput,
   flowEnrichInputs,
@@ -237,14 +238,15 @@ const modelSmart: runtime.ModelBinding = {
  * `tool.dead_letter` — an HTTP request (grammar 6.1). Its arguments are parsed with its own declared `input:` before the implementation sees them, which is the checked signature grammar 8.4 asks for and the model's arguments are held to.
  */
 async function toolDeadLetter(args: unknown, context: runtime.RunContext): Promise<unknown> {
-  const input = toolDeadLetterInput.parse(args);
+  const input = runtime.parseResult(toolDeadLetterInput, args, "the arguments `tool.dead_letter` was called with");
   const roots = { input: runtime.bind(input, {
     "properties": {
       "kind": "string",
       "payload": "string"
     }
   }) };
-  return toolDeadLetterOutput.parse(
+  return runtime.parseResult(
+    toolDeadLetterOutput,
     await runtime.runHttp({
       method: "POST",
       url: ["https://", { env: "QUEUE_HOST", site: "tool.dead_letter.http.url" }, "/v1/dead-letter"],
@@ -259,6 +261,7 @@ async function toolDeadLetter(args: unknown, context: runtime.RunContext): Promi
         "payload": runtime.toJson(runtime.evaluate("input.payload", roots)),
       },
     }, context),
+    "the result of `tool.dead_letter`",
   );
 }
 
@@ -266,8 +269,9 @@ async function toolDeadLetter(args: unknown, context: runtime.RunContext): Promi
  * `tool.repo_grep` — a subprocess (grammar 6.1). Its arguments are parsed with its own declared `input:` before the implementation sees them, which is the checked signature grammar 8.4 asks for and the model's arguments are held to.
  */
 async function toolRepoGrep(args: unknown, context: runtime.RunContext): Promise<unknown> {
-  const input = toolRepoGrepInput.parse(args);
-  return toolRepoGrepOutput.parse(
+  const input = runtime.parseResult(toolRepoGrepInput, args, "the arguments `tool.repo_grep` was called with");
+  return runtime.parseResult(
+    toolRepoGrepOutput,
     await runtime.runExec({
       command: ["repo-grep"],
       args: [
@@ -281,6 +285,7 @@ async function toolRepoGrep(args: unknown, context: runtime.RunContext): Promise
       expectExit: [0],
       decoding: { envelope: [], decoded: ["matches"], empty: false },
     }, input, context),
+    "the result of `tool.repo_grep`",
   );
 }
 
@@ -288,14 +293,15 @@ async function toolRepoGrep(args: unknown, context: runtime.RunContext): Promise
  * `tool.review_queue` — an HTTP request (grammar 6.1). Its arguments are parsed with its own declared `input:` before the implementation sees them, which is the checked signature grammar 8.4 asks for and the model's arguments are held to.
  */
 async function toolReviewQueue(args: unknown, context: runtime.RunContext): Promise<unknown> {
-  const input = toolReviewQueueInput.parse(args);
+  const input = runtime.parseResult(toolReviewQueueInput, args, "the arguments `tool.review_queue` was called with");
   const roots = { input: runtime.bind(input, {
     "properties": {
       "severity": "string",
       "summary": "string"
     }
   }) };
-  return toolReviewQueueOutput.parse(
+  return runtime.parseResult(
+    toolReviewQueueOutput,
     await runtime.runHttp({
       method: "POST",
       url: ["https://", { env: "QUEUE_HOST", site: "tool.review_queue.http.url" }, "/v1/tickets"],
@@ -310,6 +316,7 @@ async function toolReviewQueue(args: unknown, context: runtime.RunContext): Prom
         "severity": runtime.toJson(runtime.evaluate("input.severity", roots)),
       },
     }, context),
+    "the result of `tool.review_queue`",
   );
 }
 
@@ -494,7 +501,8 @@ const flowEnrichNodeFetch: runtime.NodeDescriptor = {
     },
   }),
   run: async (input, context) => ({
-    output: flowEnrichNodeFetchOutput.parse(
+    output: runtime.parseResult(
+      flowEnrichNodeFetchOutput,
       await runtime.runHttp(
 {
                   method: "POST",
@@ -508,6 +516,7 @@ const flowEnrichNodeFetch: runtime.NodeDescriptor = {
         input as { query?: Record<string, unknown>; body?: unknown },
         context,
       ),
+      "the result of `flow.enrich` node `fetch`",
     ),
   }),
   writes: [
@@ -533,6 +542,21 @@ function flowEnrich() {
  */
 const flowEnrichGraph = flowEnrich();
 
+/**
+ * `flow.enrich` as a module: what a `flow:` node instantiates and a `map` dispatches to (grammar 7.5, 8.5).
+ */
+const flowEnrichBinding: runtime.SubflowBinding = {
+  address: "flow.enrich",
+  outputs: ["report_normalized"],
+  recursionLimit: 26,
+  stream: (initial, options) =>
+    flowEnrichGraph.stream(initial, {
+      ...options,
+      streamMode: "values",
+      outputKeys: flowEnrichGraph.outputChannels,
+    }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
+};
+
 // --- flow.triage ---
 
 /** `flow.triage` node `enrich` — `flow.enrich` (grammar 8.5). */
@@ -551,10 +575,19 @@ const flowTriageNodeEnrich: runtime.NodeDescriptor = {
     onError: "fail",
   },
   shapes: { input: flowTriageShape, state: stateShape, output: flowTriageNodeEnrichShape },
-  input: () => null,
-  run: () => {
-    throw new runtime.Unimplemented("instantiating `flow.enrich`", "subgraphs");
-  },
+  input: (roots) => ({
+    "report": runtime.toJson(runtime.evaluate("input.report", roots)),
+  }),
+  run: async (input, _context, view) =>
+    runtime.runSubflow(flowEnrichBinding, {
+      inputs: input as Record<string, unknown>,
+      execution: view.run.execution,
+      path: runtime.instancePath(view, "enrich"),
+      policy: runtime.instancePolicy(view.run.policy, {
+        timeoutMs: 30000,
+        onError: "fail",
+      }),
+    }),
   writes: [
     { field: "report_normalized", channel: "report_normalized", reduce: "set" },
   ],
@@ -607,6 +640,7 @@ const flowTriageNodeClassify: runtime.NodeDescriptor = {
     timeoutMs: 90000,
     onError: "fail",
   },
+  retains: true,
   shapes: { input: flowTriageShape, state: stateShape, output: flowTriageNodeClassifyShape },
   input: (roots, view) => ({
     "report": runtime.toJson(runtime.evaluate("state.report_normalized", roots)),
@@ -619,13 +653,114 @@ const flowTriageNodeClassify: runtime.NodeDescriptor = {
       runtime.historyTurns(view.state["messages"] as unknown[]),
       context,
     );
-    return { output: agentTriageOutput.parse(answer.output), history: answer.history };
+    return {
+      output: runtime.parseResult(agentTriageOutput, answer.output, "the answer of `agent.triage`"),
+      history: answer.history,
+    };
   },
   writes: [],
   edges: [
     { to: "dispatch" },
     { to: "announce" },
   ],
+};
+
+/**
+ * `flow.triage` node `dispatch` — the fan-out it dispatches (grammar 8.6). `over` resolves against `classify.output.findings`, and `finding` is what an instance's own bindings call the item.
+ */
+const flowTriageNodeDispatchMap: runtime.MapDescriptor = {
+  node: "dispatch",
+  as: "finding",
+  source: {
+    path: "classify.output.findings",
+    producer: "classify",
+    shape: {
+      "properties": {
+        "findings": {
+          "items": {
+            "properties": {
+              "kind": "string"
+            },
+            "rest": "any"
+          }
+        }
+      }
+    },
+  },
+  maxConcurrency: 8,
+  onItemError: { retry: {
+    max: 2,
+    backoffMs: 2000,
+    multiplier: 2,
+    jitter: true,
+  } },
+  routeBy: "kind",
+  routes: [
+    {
+      tag: "auto_fixable",
+      target: "agent.fixer",
+      maxConcurrency: 4,
+      detach: false,
+      itemShape: {
+        "properties": {
+          "file": "string",
+          "kind": "string",
+          "patch_hint": "string"
+        }
+      },
+      input: (roots) => ({
+        "file": runtime.toJson(runtime.evaluate("finding.file", roots)),
+        "patch_hint": runtime.toJson(runtime.evaluate("finding.patch_hint", roots)),
+      }),
+      run: async (input, context) => ({
+        output: runtime.parseResult(
+          agentFixerOutput,
+          (await runtime.callAgent(agentFixer, input, [], context)).output,
+          "the answer of `agent.fixer`",
+        ),
+      }),
+      writes: [
+        { field: "patch", channel: "patches", reduce: "append" },
+      ],
+    },
+    {
+      tag: "needs_human",
+      target: "tool.review_queue",
+      maxConcurrency: 8,
+      detach: false,
+      itemShape: {
+        "properties": {
+          "kind": "string",
+          "severity": "string",
+          "summary": "string"
+        }
+      },
+      input: (roots) => ({
+        "summary": runtime.toJson(runtime.evaluate("finding.summary", roots)),
+        "severity": runtime.toJson(runtime.evaluate("finding.severity", roots)),
+      }),
+      run: async (input, context) => ({ output: await toolReviewQueue(input, context) }),
+      writes: [],
+    },
+  ],
+  fallback: {
+    tag: "default",
+    target: "tool.dead_letter",
+    maxConcurrency: 8,
+    detach: false,
+    itemShape: {
+      "properties": {
+        "kind": "string",
+        "of": "string"
+      }
+    },
+    input: (roots) => ({
+      "kind": runtime.toJson(runtime.evaluate("finding.kind", roots)),
+      "payload": runtime.toJson(runtime.evaluate("finding.of", roots)),
+    }),
+    run: async (input, context) => ({ output: await toolDeadLetter(input, context) }),
+    writes: [],
+  },
 };
 
 /** `flow.triage` node `dispatch` — a fan-out (grammar 8.6). */
@@ -644,10 +779,9 @@ const flowTriageNodeDispatch: runtime.NodeDescriptor = {
     onError: "skip",
   },
   shapes: { input: flowTriageShape, state: stateShape, output: "any" },
-  input: () => null,
-  run: () => {
-    throw new runtime.Unimplemented("a `map` dispatch", "homogeneous + discriminator-routed `map`→`Send` with index-tagged reducers");
-  },
+  input: (_roots, view) => runtime.mapPlan(flowTriageNodeDispatchMap, view),
+  run: async (input, context) =>
+    runtime.runMap(flowTriageNodeDispatchMap, input as runtime.MapPlan, context),
   writes: [],
   edges: [
     { to: "verify" },
@@ -676,7 +810,8 @@ const flowTriageNodeAnnounce: runtime.NodeDescriptor = {
     },
   }),
   run: async (input, context) => ({
-    output: flowTriageNodeAnnounceOutput.parse(
+    output: runtime.parseResult(
+      flowTriageNodeAnnounceOutput,
       await runtime.runHttp(
 {
                   method: "POST",
@@ -690,6 +825,7 @@ const flowTriageNodeAnnounce: runtime.NodeDescriptor = {
         input as { query?: Record<string, unknown>; body?: unknown },
         context,
       ),
+      "the result of `flow.triage` node `announce`",
     ),
   }),
   writes: [],
@@ -716,7 +852,8 @@ const flowTriageNodeAnnounceFailed: runtime.NodeDescriptor = {
   shapes: { input: flowTriageShape, state: stateShape, output: flowTriageNodeAnnounceFailedShape },
   input: () => ({}),
   run: async (input, context) => ({
-    output: flowTriageNodeAnnounceFailedOutput.parse(
+    output: runtime.parseResult(
+      flowTriageNodeAnnounceFailedOutput,
       await runtime.runExec({
         command: [{ env: "OPS_BIN", site: "flow.triage.node.announce_failed.exec.command" }, "/log-event"],
         args: [
@@ -727,6 +864,7 @@ const flowTriageNodeAnnounceFailed: runtime.NodeDescriptor = {
         expectExit: [0],
         decoding: { envelope: ["exit_code", "stdout"], decoded: [], empty: false },
       }, input, context),
+      "the result of `flow.triage` node `announce_failed`",
     ),
   }),
   writes: [],
@@ -755,7 +893,8 @@ const flowTriageNodeVerify: runtime.NodeDescriptor = {
     "patches": runtime.toJson(runtime.evaluate("state.patches", roots)),
   }),
   run: async (input, context) => ({
-    output: flowTriageNodeVerifyOutput.parse(
+    output: runtime.parseResult(
+      flowTriageNodeVerifyOutput,
       await runtime.runExec({
         command: ["run-checks"],
         args: [
@@ -768,6 +907,7 @@ const flowTriageNodeVerify: runtime.NodeDescriptor = {
         expectExit: [0, 1],
         decoding: { envelope: ["exit_code", "stdout"], decoded: [], empty: false },
       }, input, context),
+      "the result of `flow.triage` node `verify`",
     ),
   }),
   writes: [],
@@ -803,7 +943,10 @@ const flowTriageNodeSummarize: runtime.NodeDescriptor = {
       runtime.historyTurns(view.state["messages"] as unknown[]),
       context,
     );
-    return { output: agentSummarizerOutput.parse(answer.output), history: answer.history };
+    return {
+      output: runtime.parseResult(agentSummarizerOutput, answer.output, "the answer of `agent.summarizer`"),
+      history: answer.history,
+    };
   },
   writes: [
     { field: "summary", channel: "summary", reduce: "set" },
@@ -849,6 +992,7 @@ const flowTriageNodeApprove: runtime.NodeDescriptor = {
   policy: {
     onError: "fail",
   },
+  exempt: true,
   shapes: { input: flowTriageShape, state: stateShape, output: flowTriageNodeApproveShape },
   input: () => null,
   run: () => {
@@ -885,7 +1029,8 @@ const flowTriageNodeEscalate: runtime.NodeDescriptor = {
     },
   }),
   run: async (input, context) => ({
-    output: flowTriageNodeEscalateOutput.parse(
+    output: runtime.parseResult(
+      flowTriageNodeEscalateOutput,
       await runtime.runHttp(
 {
                   method: "POST",
@@ -899,6 +1044,7 @@ const flowTriageNodeEscalate: runtime.NodeDescriptor = {
         input as { query?: Record<string, unknown>; body?: unknown },
         context,
       ),
+      "the result of `flow.triage` node `escalate`",
     ),
   }),
   writes: [],
@@ -951,6 +1097,21 @@ function flowTriage() {
  * `flow.triage`, compiled once. Building it at import is also what checks it: a state model LangGraph refuses, or an edge to a node that is not registered, fails here rather than at the first invocation.
  */
 const flowTriageGraph = flowTriage();
+
+/**
+ * `flow.triage` as a module: what a `flow:` node instantiates and a `map` dispatches to (grammar 7.5, 8.5).
+ */
+const flowTriageBinding: runtime.SubflowBinding = {
+  address: "flow.triage",
+  outputs: ["summary", "patches"],
+  recursionLimit: 36,
+  stream: (initial, options) =>
+    flowTriageGraph.stream(initial, {
+      ...options,
+      streamMode: "values",
+      outputKeys: flowTriageGraph.outputChannels,
+    }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
+};
 
 /** One compiled flow: what it takes, what it answers, and how to run it. */
 export interface CompiledFlow {
@@ -1061,36 +1222,29 @@ export async function runFlow(
   }
   const parsed = flow.parse(inputs);
   const ceiling = options.recursionLimit ?? flow.recursionLimit;
-  let state: GraphState | undefined;
-  try {
-    const supersteps = await flow.stream(
-      {
-        $run: {
-          ...runtime.emptyRun(),
-          input: parsed,
-          execution: {
-            id: options.executionId ?? `exec_${globalThis.crypto.randomUUID()}`,
-            session_key: options.sessionKey ?? "",
-          },
+  // `runtime.quiesce` keeps the last state each superstep produced, which is
+  // what makes a failure's trace survive; the one failure it restates on the way
+  // out is LangGraph stopping the run at the ceiling.
+  const { state, error } = await runtime.quiesce(
+    flow,
+    {
+      $run: {
+        ...runtime.emptyRun(),
+        input: parsed,
+        execution: {
+          id: options.executionId ?? `exec_${globalThis.crypto.randomUUID()}`,
+          session_key: options.sessionKey ?? "",
         },
       },
-      { recursionLimit: ceiling },
-    );
-    for await (const superstep of supersteps) {
-      // What LangGraph's own `invoke` keeps: the last chunk that is a state.
-      // An interrupt is announced as a chunk of its own rather than as one, and
-      // reading it as state would lose the run's — `human:` nodes are the
-      // construct that raises one, and resuming them is a later bullet (PRD §7).
-      if (!isInterrupted(superstep)) state = superstep;
-    }
-  } catch (error) {
+    },
+    ceiling,
+  );
+  if (error !== undefined) {
     throw new runtime.FlowFailure(
       address,
       "did not run to quiescence",
       runtime.failedTrace(state, error),
-      // The one failure here that is not the composition's: LangGraph stopping
-      // the run at the ceiling, announced in its own vocabulary.
-      runtime.restateCeiling(ceiling, error),
+      error,
     );
   }
   if (state === undefined) {

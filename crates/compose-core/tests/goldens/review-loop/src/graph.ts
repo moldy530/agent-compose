@@ -14,7 +14,7 @@
 // state it writes — including the counter a bounded edge spends (grammar 7.4) —
 // land in one write. `./runtime.ts` is what the descriptors drive.
 
-import { END, START, StateGraph, isInterrupted } from "@langchain/langgraph";
+import { END, START, StateGraph } from "@langchain/langgraph";
 
 import * as runtime from "./runtime.ts";
 import {
@@ -114,14 +114,15 @@ const modelSmart: runtime.ModelBinding = {
  * `tool.web_search` — an HTTP request (grammar 6.1). Its arguments are parsed with its own declared `input:` before the implementation sees them, which is the checked signature grammar 8.4 asks for and the model's arguments are held to.
  */
 async function toolWebSearch(args: unknown, context: runtime.RunContext): Promise<unknown> {
-  const input = toolWebSearchInput.parse(args);
+  const input = runtime.parseResult(toolWebSearchInput, args, "the arguments `tool.web_search` was called with");
   const roots = { input: runtime.bind(input, {
     "properties": {
       "max_results": "int",
       "query": "string"
     }
   }) };
-  return toolWebSearchOutput.parse(
+  return runtime.parseResult(
+    toolWebSearchOutput,
     await runtime.runHttp({
       method: "GET",
       url: ["https://", { env: "SEARCH_HOST", site: "tool.web_search.http.url" }, "/v1/search"],
@@ -136,6 +137,7 @@ async function toolWebSearch(args: unknown, context: runtime.RunContext): Promis
         "n": runtime.toJson(runtime.evaluate("input.max_results", roots)),
       },
     }, context),
+    "the result of `tool.web_search`",
   );
 }
 
@@ -290,7 +292,10 @@ const flowReviewLoopNodeWrite: runtime.NodeDescriptor = {
       runtime.historyTurns(view.state["messages"] as unknown[]),
       context,
     );
-    return { output: agentResearcherOutput.parse(answer.output), history: answer.history };
+    return {
+      output: runtime.parseResult(agentResearcherOutput, answer.output, "the answer of `agent.researcher`"),
+      history: answer.history,
+    };
   },
   writes: [
     { field: "draft", channel: "draft", reduce: "set" },
@@ -321,7 +326,10 @@ const flowReviewLoopNodeReview: runtime.NodeDescriptor = {
       runtime.historyTurns(view.state["messages"] as unknown[]),
       context,
     );
-    return { output: agentReviewerOutput.parse(answer.output), history: answer.history };
+    return {
+      output: runtime.parseResult(agentReviewerOutput, answer.output, "the answer of `agent.reviewer`"),
+      history: answer.history,
+    };
   },
   writes: [
     { field: "feedback", channel: "feedback", reduce: "set" },
@@ -349,6 +357,21 @@ function flowReviewLoop() {
  * `flow.review_loop`, compiled once. Building it at import is also what checks it: a state model LangGraph refuses, or an edge to a node that is not registered, fails here rather than at the first invocation.
  */
 const flowReviewLoopGraph = flowReviewLoop();
+
+/**
+ * `flow.review_loop` as a module: what a `flow:` node instantiates and a `map` dispatches to (grammar 7.5, 8.5).
+ */
+const flowReviewLoopBinding: runtime.SubflowBinding = {
+  address: "flow.review_loop",
+  outputs: ["draft"],
+  recursionLimit: 33,
+  stream: (initial, options) =>
+    flowReviewLoopGraph.stream(initial, {
+      ...options,
+      streamMode: "values",
+      outputKeys: flowReviewLoopGraph.outputChannels,
+    }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
+};
 
 /** One compiled flow: what it takes, what it answers, and how to run it. */
 export interface CompiledFlow {
@@ -446,36 +469,29 @@ export async function runFlow(
   }
   const parsed = flow.parse(inputs);
   const ceiling = options.recursionLimit ?? flow.recursionLimit;
-  let state: GraphState | undefined;
-  try {
-    const supersteps = await flow.stream(
-      {
-        $run: {
-          ...runtime.emptyRun(),
-          input: parsed,
-          execution: {
-            id: options.executionId ?? `exec_${globalThis.crypto.randomUUID()}`,
-            session_key: options.sessionKey ?? "",
-          },
+  // `runtime.quiesce` keeps the last state each superstep produced, which is
+  // what makes a failure's trace survive; the one failure it restates on the way
+  // out is LangGraph stopping the run at the ceiling.
+  const { state, error } = await runtime.quiesce(
+    flow,
+    {
+      $run: {
+        ...runtime.emptyRun(),
+        input: parsed,
+        execution: {
+          id: options.executionId ?? `exec_${globalThis.crypto.randomUUID()}`,
+          session_key: options.sessionKey ?? "",
         },
       },
-      { recursionLimit: ceiling },
-    );
-    for await (const superstep of supersteps) {
-      // What LangGraph's own `invoke` keeps: the last chunk that is a state.
-      // An interrupt is announced as a chunk of its own rather than as one, and
-      // reading it as state would lose the run's — `human:` nodes are the
-      // construct that raises one, and resuming them is a later bullet (PRD §7).
-      if (!isInterrupted(superstep)) state = superstep;
-    }
-  } catch (error) {
+    },
+    ceiling,
+  );
+  if (error !== undefined) {
     throw new runtime.FlowFailure(
       address,
       "did not run to quiescence",
       runtime.failedTrace(state, error),
-      // The one failure here that is not the composition's: LangGraph stopping
-      // the run at the ceiling, announced in its own vocabulary.
-      runtime.restateCeiling(ceiling, error),
+      error,
     );
   }
   if (state === undefined) {

@@ -14,7 +14,7 @@
 // state it writes — including the counter a bounded edge spends (grammar 7.4) —
 // land in one write. `./runtime.ts` is what the descriptors drive.
 
-import { END, START, StateGraph, isInterrupted } from "@langchain/langgraph";
+import { END, START, StateGraph } from "@langchain/langgraph";
 
 import * as runtime from "./runtime.ts";
 import {
@@ -234,7 +234,7 @@ const modelM: runtime.ModelBinding = {
  * `tool.dispatch` — an HTTP request (grammar 6.1). Its arguments are parsed with its own declared `input:` before the implementation sees them, which is the checked signature grammar 8.4 asks for and the model's arguments are held to.
  */
 async function toolDispatch(args: unknown, context: runtime.RunContext): Promise<unknown> {
-  const input = toolDispatchInput.parse(args);
+  const input = runtime.parseResult(toolDispatchInput, args, "the arguments `tool.dispatch` was called with");
   const roots = { input: runtime.bind(input, {
     "properties": {
       "payload": {
@@ -245,7 +245,8 @@ async function toolDispatch(args: unknown, context: runtime.RunContext): Promise
       "trace": "string"
     }
   }) };
-  return toolDispatchOutput.parse(
+  return runtime.parseResult(
+    toolDispatchOutput,
     await runtime.runHttp({
       method: "POST",
       url: ["https://example.test/dispatch"],
@@ -258,6 +259,7 @@ async function toolDispatch(args: unknown, context: runtime.RunContext): Promise
       },
       body: input,
     }, context),
+    "the result of `tool.dispatch`",
   );
 }
 
@@ -265,8 +267,9 @@ async function toolDispatch(args: unknown, context: runtime.RunContext): Promise
  * `tool.file_ticket` — an HTTP request (grammar 6.1). Its arguments are parsed with its own declared `input:` before the implementation sees them, which is the checked signature grammar 8.4 asks for and the model's arguments are held to.
  */
 async function toolFileTicket(args: unknown, context: runtime.RunContext): Promise<unknown> {
-  const input = toolFileTicketInput.parse(args);
-  return toolFileTicketOutput.parse(
+  const input = runtime.parseResult(toolFileTicketInput, args, "the arguments `tool.file_ticket` was called with");
+  return runtime.parseResult(
+    toolFileTicketOutput,
     await runtime.runHttp({
       method: "POST",
       url: ["https://example.test/tickets"],
@@ -276,6 +279,7 @@ async function toolFileTicket(args: unknown, context: runtime.RunContext): Promi
     }, {
       body: input,
     }, context),
+    "the result of `tool.file_ticket`",
   );
 }
 
@@ -283,8 +287,9 @@ async function toolFileTicket(args: unknown, context: runtime.RunContext): Promi
  * `tool.lookup` — an HTTP request (grammar 6.1). Its arguments are parsed with its own declared `input:` before the implementation sees them, which is the checked signature grammar 8.4 asks for and the model's arguments are held to.
  */
 async function toolLookup(args: unknown, context: runtime.RunContext): Promise<unknown> {
-  const input = toolLookupInput.parse(args);
-  return toolLookupOutput.parse(
+  const input = runtime.parseResult(toolLookupInput, args, "the arguments `tool.lookup` was called with");
+  return runtime.parseResult(
+    toolLookupOutput,
     await runtime.runHttp({
       method: "GET",
       url: ["https://example.test/search"],
@@ -294,6 +299,7 @@ async function toolLookup(args: unknown, context: runtime.RunContext): Promise<u
     }, {
       query: input,
     }, context),
+    "the result of `tool.lookup`",
   );
 }
 
@@ -301,8 +307,9 @@ async function toolLookup(args: unknown, context: runtime.RunContext): Promise<u
  * `tool.ping` — a subprocess (grammar 6.1). Its arguments are parsed with its own declared `input:` before the implementation sees them, which is the checked signature grammar 8.4 asks for and the model's arguments are held to.
  */
 async function toolPing(args: unknown, context: runtime.RunContext): Promise<unknown> {
-  const input = toolPingInput.parse(args);
-  return toolPingOutput.parse(
+  const input = runtime.parseResult(toolPingInput, args, "the arguments `tool.ping` was called with");
+  return runtime.parseResult(
+    toolPingOutput,
     await runtime.runExec({
       command: ["true"],
       args: [],
@@ -310,6 +317,7 @@ async function toolPing(args: unknown, context: runtime.RunContext): Promise<unk
       expectExit: [0],
       decoding: { envelope: [], decoded: [], empty: true },
     }, input, context),
+    "the result of `tool.ping`",
   );
 }
 
@@ -436,7 +444,10 @@ const flowShapeNodeShape: runtime.NodeDescriptor = {
       runtime.historyTurns(view.state["messages"] as unknown[]),
       context,
     );
-    return { output: agentShaperOutput.parse(answer.output), history: answer.history };
+    return {
+      output: runtime.parseResult(agentShaperOutput, answer.output, "the answer of `agent.shaper`"),
+      history: answer.history,
+    };
   },
   writes: [
     { field: "draft", channel: "draft", reduce: "set" },
@@ -455,6 +466,7 @@ const flowShapeNodeAsk: runtime.NodeDescriptor = {
   policy: {
     onError: "fail",
   },
+  exempt: true,
   shapes: { input: flowShapeShape, state: stateShape, output: flowShapeNodeAskShape },
   input: () => null,
   run: () => {
@@ -477,7 +489,8 @@ const flowShapeNodeProbe: runtime.NodeDescriptor = {
   shapes: { input: flowShapeShape, state: stateShape, output: flowShapeNodeProbeShape },
   input: () => ({}),
   run: async (input, context) => ({
-    output: flowShapeNodeProbeOutput.parse(
+    output: runtime.parseResult(
+      flowShapeNodeProbeOutput,
       await runtime.runExec({
         command: ["true"],
         args: [],
@@ -485,6 +498,7 @@ const flowShapeNodeProbe: runtime.NodeDescriptor = {
         expectExit: [0],
         decoding: { envelope: ["exit_code", "stdout"], decoded: [], empty: false },
       }, input, context),
+      "the result of `flow.shape` node `probe`",
     ),
   }),
   writes: [],
@@ -508,7 +522,8 @@ const flowShapeNodeNotify: runtime.NodeDescriptor = {
     },
   }),
   run: async (input, context) => ({
-    output: flowShapeNodeNotifyOutput.parse(
+    output: runtime.parseResult(
+      flowShapeNodeNotifyOutput,
       await runtime.runHttp(
 {
                   method: "POST",
@@ -520,6 +535,7 @@ const flowShapeNodeNotify: runtime.NodeDescriptor = {
         input as { query?: Record<string, unknown>; body?: unknown },
         context,
       ),
+      "the result of `flow.shape` node `notify`",
     ),
   }),
   writes: [],
@@ -573,6 +589,21 @@ function flowShape() {
  * `flow.shape`, compiled once. Building it at import is also what checks it: a state model LangGraph refuses, or an edge to a node that is not registered, fails here rather than at the first invocation.
  */
 const flowShapeGraph = flowShape();
+
+/**
+ * `flow.shape` as a module: what a `flow:` node instantiates and a `map` dispatches to (grammar 7.5, 8.5).
+ */
+const flowShapeBinding: runtime.SubflowBinding = {
+  address: "flow.shape",
+  outputs: ["draft", "notes"],
+  recursionLimit: 30,
+  stream: (initial, options) =>
+    flowShapeGraph.stream(initial, {
+      ...options,
+      streamMode: "values",
+      outputKeys: flowShapeGraph.outputChannels,
+    }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
+};
 
 /** One compiled flow: what it takes, what it answers, and how to run it. */
 export interface CompiledFlow {
@@ -670,36 +701,29 @@ export async function runFlow(
   }
   const parsed = flow.parse(inputs);
   const ceiling = options.recursionLimit ?? flow.recursionLimit;
-  let state: GraphState | undefined;
-  try {
-    const supersteps = await flow.stream(
-      {
-        $run: {
-          ...runtime.emptyRun(),
-          input: parsed,
-          execution: {
-            id: options.executionId ?? `exec_${globalThis.crypto.randomUUID()}`,
-            session_key: options.sessionKey ?? "",
-          },
+  // `runtime.quiesce` keeps the last state each superstep produced, which is
+  // what makes a failure's trace survive; the one failure it restates on the way
+  // out is LangGraph stopping the run at the ceiling.
+  const { state, error } = await runtime.quiesce(
+    flow,
+    {
+      $run: {
+        ...runtime.emptyRun(),
+        input: parsed,
+        execution: {
+          id: options.executionId ?? `exec_${globalThis.crypto.randomUUID()}`,
+          session_key: options.sessionKey ?? "",
         },
       },
-      { recursionLimit: ceiling },
-    );
-    for await (const superstep of supersteps) {
-      // What LangGraph's own `invoke` keeps: the last chunk that is a state.
-      // An interrupt is announced as a chunk of its own rather than as one, and
-      // reading it as state would lose the run's — `human:` nodes are the
-      // construct that raises one, and resuming them is a later bullet (PRD §7).
-      if (!isInterrupted(superstep)) state = superstep;
-    }
-  } catch (error) {
+    },
+    ceiling,
+  );
+  if (error !== undefined) {
     throw new runtime.FlowFailure(
       address,
       "did not run to quiescence",
       runtime.failedTrace(state, error),
-      // The one failure here that is not the composition's: LangGraph stopping
-      // the run at the ceiling, announced in its own vocabulary.
-      runtime.restateCeiling(ceiling, error),
+      error,
     );
   }
   if (state === undefined) {

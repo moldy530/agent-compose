@@ -1,12 +1,13 @@
 //! The generated-code checks of CLAUDE.md's *Validation strategy*, run against
 //! the **real** pinned JavaScript toolchain.
 //!
-//! Eleven gates. The first four are in increasing strength, each one existing
-//! because the one above it passes on code the one below it catches; the next two
-//! are about the schemas rather than the graph; the seventh is about a
-//! composition that has no generated project at all; and the last four are
-//! about what a binding does on the wire, which no amount of type-checking or
-//! graph construction reaches:
+//! Twelve gates. The first four are in increasing strength, each one existing
+//! because the one above it passes on code the one below it catches; the fifth
+//! is about a construct whose guarantees are only observable from inside the
+//! runtime; the next two are about the schemas rather than the graph; the eighth
+//! is about a composition that has no generated project at all; and the last
+//! four are about what a binding does on the wire, which no amount of
+//! type-checking or graph construction reaches:
 //!
 //! 1. **`tsc --noEmit`** — every golden project type-checks under its own strict
 //!    `tsconfig.json`, against installed `@langchain/langgraph`, `@langchain/core`
@@ -28,7 +29,15 @@
 //!    emitted `README.md` says loading the project is what checks its
 //!    environment (PRD 5.9); a `readEnvironment` that was declared and never
 //!    called would pass every gate above and make that sentence false.
-//! 5. **Schema-lowering agreement** — the corpus under
+//! 5. **The fan-out** — `map` dispatch, driven directly against a golden's own
+//!    `src/runtime.ts`. Five of grammar 8.6's guarantees are invisible from
+//!    outside: how many instances were in flight at once, which item a `fail`
+//!    names when two of them fail, whether the join returned before a detached
+//!    delivery did, that an exhausted item retry resolves as `fail` does, and
+//!    that the ordering holds under a completion order that is the reverse of
+//!    the source's. A happy-path run produces the same outputs with every one of
+//!    them broken.
+//! 6. **Schema-lowering agreement** — the corpus under
 //!    `tests/fixtures/schema-lowering/` is validated twice: against the JSON
 //!    Schema this compiler lowers to (Rust, the `jsonschema` crate) and against
 //!    the Zod the same module emits (Node). Grammar 3.8 is one table with two
@@ -38,14 +47,14 @@
 //!    the document carries **both** verdicts and names one of [`DIVERGENCES`],
 //!    so a difference is something a reader signed off on rather than something
 //!    a thin corpus failed to notice.
-//! 6. **What a provider would be handed** — `@langchain/core`'s own converter is
+//! 7. **What a provider would be handed** — `@langchain/core`'s own converter is
 //!    run over the emitted schemas, because `withStructuredOutput` sends JSON
 //!    Schema rather than the Zod it was given, and the conversion drops every
 //!    check spelled `.refine`. That is why PRD 9.16 sends the compiler's own
 //!    lowering instead, and this gate measures the road not taken — see
-//!    `codegen::schema`'s *What a provider is handed*. Gate 5 is what makes the
+//!    `codegen::schema`'s *What a provider is handed*. Gate 6 is what makes the
 //!    two columns agree; this is what says why a model is shown the one it is.
-//! 7. **The refusal's evidence** — `compose_core::codegen::diagnostics` refuses to
+//! 8. **The refusal's evidence** — `compose_core::codegen::diagnostics` refuses to
 //!    build a composition whose `state:` names a channel after a property every
 //!    JavaScript object carries (`constructor`). That refusal is an
 //!    over-refusal until something shows the runtime really cannot take the
@@ -54,25 +63,25 @@
 //!    it — and asks Node for `Object.getOwnPropertyNames(Object.prototype)`, so
 //!    the Rust-side list is checked against the object model rather than against
 //!    a memory of it.
-//! 8. **What a raw binding binds** — the single string-typed property of a
+//! 9. **What a raw binding binds** — the single string-typed property of a
 //!    `tool.*` takes *trimmed* raw stdout from an `exec:` implementation and the
 //!    raw response text from an `http:` one, which is grammar 6.1 stating one
 //!    exception once per surface with one word different between them. Both are
 //!    driven out of a golden's own runtime, over a payload with whitespace at
 //!    either end, so which reading this compiler took is a committed fact rather
 //!    than an accident of a shared decoder.
-//! 9. **A command that never reads its input** — grammar 8.2 writes a scalar
-//!    `input:` to the child's stdin, and `printf` exits without draining it. The
-//!    EPIPE that follows arrives as an `error` *event*, outside the promise the
-//!    node's own error policy is built on, so an unhandled one aborts the whole
-//!    process rather than failing the node. Nothing about a returned value is
-//!    wrong there — no value is returned — which is why it is a gate and not an
-//!    assertion.
-//! 10. **A declared `Content-Type`** — header names are case-insensitive
+//! 10. **A command that never reads its input** — grammar 8.2 writes a scalar
+//!     `input:` to the child's stdin, and `printf` exits without draining it.
+//!     The EPIPE that follows arrives as an `error` *event*, outside the promise
+//!     the node's own error policy is built on, so an unhandled one aborts the
+//!     whole process rather than failing the node. Nothing about a returned
+//!     value is wrong there — no value is returned — which is why it is a gate
+//!     and not an assertion.
+//! 11. **A declared `Content-Type`** — header names are case-insensitive
 //!     (grammar 6.1) and `fetch` composes its `Headers` by appending, so a
 //!     binding's own media type would ride out beside the runtime's instead of
 //!     replacing it. The server here is loopback and reports what it received.
-//! 11. **A bound input object on a `GET`** — the other half of the same
+//! 12. **A bound input object on a `GET`** — the other half of the same
 //!     sentence: without `query:`/`body:`, the object goes out as query
 //!     parameters rather than as a body. Which slot codegen fills is a golden's
 //!     to commit; this is what the runtime does with what it was handed.
@@ -596,6 +605,166 @@ fn the_run_channel_folds_a_steps_contributions_in_canonical_order() {
         .map(|entry| entry["node"].as_str().expect("a node id"))
         .collect();
     assert_eq!(nodes, ["draft", "review", "merge"]);
+}
+
+/// Gate 2i: what a fan-out does, decided from inside the runtime that does it
+/// (grammar 8.6, 7.6.4, 9.4).
+///
+/// The acceptance suite runs both fan-out forms through a compiled graph against
+/// scripted answers, which is where "the composition behaves" is settled. Five
+/// of grammar 8.6's guarantees are not observable from there, and each is a rule
+/// a wrong implementation would still pass a happy-path run with:
+///
+///   * **how many instances were in flight at once.** `max_concurrency` is a
+///     normative bound (Decision D28) and an unenforced one produces the same
+///     outputs, only faster and against a provider's rate limit;
+///   * **which item a `fail` names.** Two items failing at different times must
+///     report the **lowest-indexed** one, or two runs over one array fail about
+///     different items;
+///   * **whether the join returned before a detached delivery did.** "Resolved
+///     at dispatch" (Decision D94) is a statement about *when*, and an outputs
+///     assertion cannot see when;
+///   * **that an exhausted `on_item_error: { retry: … }` resolves as `fail`
+///     does** (rule 10), which needs an item that never answers;
+///   * **that the ordering survives a completion order that is the reverse of
+///     the source's**, at every one of the three reduce policies.
+///
+/// `src/runtime.ts` is a compiler constant, byte-identical in every project this
+/// release builds, so driving it directly is driving what every project runs.
+#[test]
+fn the_fan_out_runtime_bounds_orders_and_resolves_every_dispatch() {
+    let Some(root) = installed() else {
+        return;
+    };
+    let project = staged(goldens::golden("triage-fanout"), root, "map-dispatch");
+    let output = Command::new("node")
+        .arg(root.join("map-dispatch.mjs"))
+        .arg(&project)
+        .output()
+        .expect("node runs");
+    assert!(
+        output.status.success(),
+        "the fan-out runtime did not run:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let observed: Value =
+        serde_json::from_slice(&output.stdout).expect("the runner prints its observations as JSON");
+
+    // Grammar 7.6.4 clause 2: one write per channel, carrying every instance's
+    // contribution in ascending source-item index — over a run whose completion
+    // order was exactly the reverse.
+    assert_eq!(
+        observed["orderedByIndex"],
+        serde_json::json!([
+            { "channel": "results", "reduce": "append", "values": ["done-0", "done-1", "done-2"] }
+        ])
+    );
+    assert_eq!(observed["orderedDispatches"], serde_json::json!([0, 1, 2]));
+
+    // Grammar 8.6 rule 1 and Decision D28: the node's bound, and a route that
+    // only ever tightens it.
+    assert_eq!(observed["nodeBound"], 2, "six items ran two at a time");
+    assert_eq!(observed["routedNodeBound"], 4);
+    assert_eq!(
+        observed["tightenedRouteBound"], 1,
+        "the route's own bound held while the map's left room"
+    );
+
+    // Rule 10: `skip` drops the item and the fan-out carries on, and the writes
+    // that landed are still in source-item order with the gaps closed up.
+    assert_eq!(
+        observed["skipped"],
+        serde_json::json!([
+            [0, "completed"],
+            [1, "skipped"],
+            [2, "completed"],
+            [3, "skipped"]
+        ])
+    );
+    assert_eq!(
+        observed["skippedChannels"],
+        serde_json::json!([
+            { "channel": "results", "reduce": "append", "values": ["done-0", "done-2"] }
+        ])
+    );
+    // …and under `fail`, the item reported is the lowest-indexed failure rather
+    // than the first one in time: item 3 failed immediately and item 1 waited.
+    assert_eq!(
+        observed["failed"],
+        serde_json::json!({ "name": "ItemFailure", "index": 1, "attempts": 1 })
+    );
+    // A parameterized retry re-executes the whole instance…
+    assert_eq!(
+        observed["retried"],
+        serde_json::json!({ "attempts": 3, "tries": 3 })
+    );
+    // …and when it runs out, the item fails, resolving as `fail` does (rule 10).
+    assert_eq!(
+        observed["exhausted"],
+        serde_json::json!({ "name": "ItemFailure", "attempts": 2 })
+    );
+
+    // Decision D94: the join counted the detached dispatch the moment it was
+    // issued. The delivery finished *after* the map node had already returned,
+    // which is what "resolved at dispatch" means and what no output can show.
+    assert_eq!(
+        observed["detachOrder"],
+        serde_json::json!(["joined-0", "joined", "detached"])
+    );
+    assert_eq!(
+        observed["detachChannels"],
+        serde_json::json!([{ "channel": "results", "reduce": "append", "values": ["0"] }]),
+        "a detached dispatch writes no reduced state (grammar 8.6 rule 7)"
+    );
+    // Grammar 9.4: the execution id, then the frames of every node crossed from
+    // the root instance down — here an outer `flow:` node, then this map's own
+    // second traversal, then the item index.
+    assert_eq!(
+        observed["detachRecords"],
+        serde_json::json!([
+            { "index": 0, "outcome": "completed", "attempts": 1, "key": "exec_gate/outer/0/fan/1/0" },
+            { "index": 1, "outcome": "detached", "attempts": 0, "key": "exec_gate/outer/0/fan/1/1" }
+        ])
+    );
+
+    // Rule 6: a dispatch of zero instances writes nothing and completes — from
+    // an empty array, and from a producer that was skipped (rule 11).
+    assert_eq!(
+        observed["empty"],
+        serde_json::json!({ "channels": [], "dispatches": [] })
+    );
+    assert_eq!(
+        observed["skippedProducer"],
+        serde_json::json!({ "dispatches": 0 })
+    );
+
+    // Grammar 10.2, over both kinds of update: a plain write, and a map's batch
+    // replayed into the same reducer in index order.
+    assert_eq!(
+        observed["reducers"],
+        serde_json::json!({
+            "appendOne": ["a", "b"],
+            "appendBatch": ["a", "b", "c"],
+            "mergeOne": { "a": 1, "b": 2 },
+            "mergeBatch": { "a": 1, "b": 3, "c": 4 },
+            "setOne": "b",
+            "setBatch": "c",
+        })
+    );
+
+    // Grammar 9.3 level 1: the outermost instantiation site wins a field
+    // (Decision D79), an absent one is filled in from the inner site, and a
+    // `human` node takes neither `timeout` nor `retry` from it (Decision D102).
+    assert_eq!(
+        observed["policy"],
+        serde_json::json!({
+            "outermost": { "timeoutMs": 30_000 },
+            "filledIn": { "timeoutMs": 30_000, "onError": "skip" },
+            "none": null,
+            "exempt": { "onError": "skip" },
+            "plain": { "timeoutMs": 10_000, "onError": "fail" },
+        })
+    );
 }
 
 /// Gate 2e: what the single string-typed property of a `tool.*` binds, on each

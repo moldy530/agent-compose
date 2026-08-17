@@ -1,0 +1,325 @@
+// Drives a generated project's fan-out machinery directly, and reports what it
+// did (grammar 8.6, 7.6.4, 9.4).
+//
+// The acceptance suite runs a fan-out through a compiled graph against scripted
+// model answers, which is where "the composition behaves" is decided. This is
+// the other half: the rules that are only *observable* from inside — how many
+// instances were in flight at once, which item a failure was reported about when
+// two of them failed, whether the join returned before a detached delivery
+// finished — and the ones a composition cannot make adversarial enough on
+// purpose. `src/runtime.ts` is a compiler constant, byte-identical in every
+// project, so driving it directly is driving what every project runs.
+//
+// Every completion order here is deliberately the reverse of source order: an
+// ordering rule that holds only when the instances happen to finish in order is
+// not a rule.
+//
+// Usage: node map-dispatch.mjs <generated project directory>
+// Output: one JSON object of observations; the expectations live in the Rust
+// test that reads it (`generated_code_gates.rs`).
+
+import path from "node:path";
+import process from "node:process";
+import { pathToFileURL } from "node:url";
+
+const [, , project] = process.argv;
+if (project === undefined) {
+  throw new Error("usage: node map-dispatch.mjs <generated project directory>");
+}
+
+const runtime = await import(pathToFileURL(path.resolve(project, "src/runtime.ts")).href);
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** A `NodeView` over a `state.items` array, which is what `over` reads here. */
+function viewOf(items, { path: instancePath = [], traversals = {} } = {}) {
+  const shape = { properties: { items: { items: "any" } } };
+  const run = {
+    ...runtime.emptyRun(),
+    execution: { id: "exec_gate", session_key: "" },
+    path: instancePath,
+    traversals,
+  };
+  return {
+    state: { items },
+    run,
+    roots: {
+      input: runtime.bind({}, { properties: {} }),
+      state: runtime.bind({ items }, shape),
+      execution: runtime.bind(run.execution, {
+        properties: { id: "string", session_key: "string", item_index: "int" },
+      }),
+    },
+  };
+}
+
+const context = { execution: { id: "exec_gate", session_key: "" }, signal: new AbortController().signal, node: "fan" };
+
+/** One route, with a `run` the caller supplies. */
+function route(fields) {
+  return {
+    target: "agent.worker",
+    maxConcurrency: 8,
+    detach: false,
+    itemShape: "any",
+    input: (roots) => runtime.toJson(runtime.evaluate("item", roots)),
+    writes: [{ field: "result", channel: "results", reduce: "append" }],
+    ...fields,
+  };
+}
+
+/** A map descriptor over `state.items`, with the routes the caller supplies. */
+function descriptor(fields) {
+  return {
+    node: "fan",
+    as: "item",
+    source: { path: "state.items", shape: "any" },
+    maxConcurrency: 8,
+    onItemError: "fail",
+    routes: [route({})],
+    ...fields,
+  };
+}
+
+const observed = {};
+
+// --- Ordering, under a completion order that is the reverse of the source's ---
+{
+  const map = descriptor({
+    routes: [
+      route({
+        run: async (input) => {
+          // Item 0 waits longest, item 2 not at all.
+          await sleep((3 - Number(input.at)) * 60);
+          return { output: { result: `done-${input.at}` } };
+        },
+      }),
+    ],
+  });
+  const view = viewOf([{ at: 0 }, { at: 1 }, { at: 2 }]);
+  const answer = await runtime.runMap(map, runtime.mapPlan(map, view), context);
+  observed.orderedByIndex = answer.channels;
+  observed.orderedDispatches = answer.dispatches.map((record) => record.index);
+}
+
+// --- The bound: the node's own, and a route that tightens it ----------------
+{
+  let live = 0;
+  let peak = 0;
+  const watched = (fields) =>
+    route({
+      ...fields,
+      run: async (input) => {
+        live += 1;
+        peak = Math.max(peak, live);
+        await sleep(25);
+        live -= 1;
+        return { output: { result: String(input.at) } };
+      },
+    });
+
+  const wide = descriptor({ maxConcurrency: 2, routes: [watched({})] });
+  const items = [0, 1, 2, 3, 4, 5].map((at) => ({ at }));
+  await runtime.runMap(wide, runtime.mapPlan(wide, viewOf(items)), context);
+  observed.nodeBound = peak;
+
+  live = 0;
+  peak = 0;
+  let tight = 0;
+  let tightPeak = 0;
+  const routed = descriptor({
+    maxConcurrency: 4,
+    routeBy: "kind",
+    routes: [
+      watched({ tag: "wide", itemShape: "any" }),
+      route({
+        tag: "narrow",
+        maxConcurrency: 1,
+        run: async (input) => {
+          tight += 1;
+          tightPeak = Math.max(tightPeak, tight);
+          live += 1;
+          peak = Math.max(peak, live);
+          await sleep(25);
+          live -= 1;
+          tight -= 1;
+          return { output: { result: String(input.at) } };
+        },
+      }),
+    ],
+  });
+  const mixed = [0, 1, 2, 3, 4, 5].map((at) => ({ at, kind: at % 2 === 0 ? "wide" : "narrow" }));
+  await runtime.runMap(routed, runtime.mapPlan(routed, viewOf(mixed)), context);
+  observed.routedNodeBound = peak;
+  observed.tightenedRouteBound = tightPeak;
+}
+
+// --- `on_item_error`: skip, a bounded retry, and which item a `fail` names ---
+{
+  const failing = (at) => at === 1 || at === 3;
+  const map = descriptor({
+    onItemError: "skip",
+    routes: [
+      route({
+        run: async (input) => {
+          if (failing(input.at)) throw new Error(`item ${input.at} refused`);
+          return { output: { result: `done-${input.at}` } };
+        },
+      }),
+    ],
+  });
+  const items = [0, 1, 2, 3].map((at) => ({ at }));
+  const answer = await runtime.runMap(map, runtime.mapPlan(map, viewOf(items)), context);
+  observed.skipped = answer.dispatches.map((record) => [record.index, record.outcome]);
+  observed.skippedChannels = answer.channels;
+
+  // The same items under `fail`, where the *lowest-indexed* failure is the one
+  // reported — item 3 fails first in time, and item 1 is what the error names.
+  const strict = descriptor({
+    routes: [
+      route({
+        run: async (input) => {
+          if (failing(input.at)) {
+            await sleep(input.at === 1 ? 60 : 0);
+            throw new Error(`item ${input.at} refused`);
+          }
+          return { output: { result: `done-${input.at}` } };
+        },
+      }),
+    ],
+  });
+  try {
+    await runtime.runMap(strict, runtime.mapPlan(strict, viewOf(items)), context);
+    observed.failed = null;
+  } catch (error) {
+    observed.failed = { name: error.name, index: error.index, attempts: error.attempts };
+  }
+
+  // A parameterized retry: two attempts fail, the third answers.
+  let tries = 0;
+  const retried = descriptor({
+    onItemError: { retry: { max: 2, backoffMs: 1, multiplier: 1, jitter: false } },
+    routes: [
+      route({
+        run: async (input) => {
+          tries += 1;
+          if (tries < 3) throw new Error("not yet");
+          return { output: { result: `done-${input.at}` } };
+        },
+      }),
+    ],
+  });
+  const once = await runtime.runMap(retried, runtime.mapPlan(retried, viewOf([{ at: 0 }])), context);
+  observed.retried = { attempts: once.dispatches[0].attempts, tries };
+
+  // …and one that never answers: an exhausted retry resolves as `fail` does.
+  const exhausted = descriptor({
+    onItemError: { retry: { max: 1, backoffMs: 1, multiplier: 1, jitter: false } },
+    routes: [route({ run: async () => { throw new Error("never"); } })],
+  });
+  try {
+    await runtime.runMap(exhausted, runtime.mapPlan(exhausted, viewOf([{ at: 0 }])), context);
+    observed.exhausted = null;
+  } catch (error) {
+    observed.exhausted = { name: error.name, attempts: error.attempts };
+  }
+}
+
+// --- `detach: true`: resolved at dispatch, and keyed (D94, grammar 9.4) -----
+{
+  const order = [];
+  let release;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  const map = descriptor({
+    routeBy: "kind",
+    routes: [
+      route({
+        tag: "joined",
+        run: async (input) => {
+          order.push(`joined-${input.at}`);
+          return { output: { result: String(input.at) } };
+        },
+      }),
+    ],
+    fallback: route({
+      tag: "default",
+      detach: true,
+      target: "tool.sink",
+      writes: [],
+      run: async () => {
+        await held;
+        order.push("detached");
+        return { output: {} };
+      },
+    }),
+  });
+  // The map node is two frames deep: an outer `flow:` node, then this map.
+  const view = viewOf([{ at: 0, kind: "joined" }, { at: 1, kind: "away" }], {
+    path: ["outer/0"],
+    traversals: { fan: 1 },
+  });
+  const answer = await runtime.runMap(map, runtime.mapPlan(map, view), context);
+  order.push("joined");
+  release();
+  await sleep(20);
+  observed.detachOrder = order;
+  observed.detachRecords = answer.dispatches.map((record) => ({
+    index: record.index,
+    outcome: record.outcome,
+    attempts: record.attempts,
+    key: record.idempotencyKey,
+  }));
+  observed.detachChannels = answer.channels;
+}
+
+// --- Zero instances (grammar 8.6 rule 6) -----------------------------------
+{
+  const map = descriptor({ routes: [route({ run: async () => ({ output: { result: "x" } }) })] });
+  const answer = await runtime.runMap(map, runtime.mapPlan(map, viewOf([])), context);
+  observed.empty = { channels: answer.channels, dispatches: answer.dispatches };
+
+  // …and a producer that was skipped, which is the other way rule 11 gets there.
+  const fromProducer = descriptor({
+    source: { path: "plan.output.tasks", producer: "plan", shape: { properties: { tasks: { items: "any" } } } },
+  });
+  const view = viewOf([]);
+  const answer2 = await runtime.runMap(
+    fromProducer,
+    runtime.mapPlan(fromProducer, view),
+    context,
+  );
+  observed.skippedProducer = { dispatches: answer2.dispatches.length };
+}
+
+// --- The reducers a map's batch goes through (grammar 7.6.4, 10.2) ---------
+{
+  const batch = new runtime.OrderedWrites(["b", "c"]);
+  observed.reducers = {
+    appendOne: runtime.appendReduce(["a"], "b"),
+    appendBatch: runtime.appendReduce(["a"], batch),
+    mergeOne: runtime.mergeReduce({ a: 1 }, { b: 2 }),
+    mergeBatch: runtime.mergeReduce({ a: 1 }, new runtime.OrderedWrites([{ b: 2 }, { b: 3, c: 4 }])),
+    setOne: runtime.setReduce("a", "b"),
+    setBatch: runtime.setReduce("a", batch),
+  };
+}
+
+// --- Grammar 9.3 level 1, and D79's outermost-wins --------------------------
+{
+  observed.policy = {
+    outermost: runtime.instancePolicy({ timeoutMs: 30_000 }, { timeoutMs: 10_000 }),
+    filledIn: runtime.instancePolicy({ timeoutMs: 30_000 }, { onError: "skip" }),
+    none: runtime.instancePolicy(undefined, undefined) ?? null,
+    // A `human` node takes neither `timeout` nor `retry` from any level (D102).
+    exempt: runtime.effectivePolicy(
+      { onError: "fail" },
+      true,
+      { timeoutMs: 10_000, retry: { max: 1, backoffMs: 1, multiplier: 1, jitter: false }, onError: "skip" },
+    ),
+    plain: runtime.effectivePolicy({ onError: "fail", timeoutMs: 1 }, false, { timeoutMs: 10_000 }),
+  };
+}
+
+process.stdout.write(JSON.stringify(observed));

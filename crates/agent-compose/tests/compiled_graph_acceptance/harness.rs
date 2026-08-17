@@ -173,11 +173,35 @@ pub fn environment(provider: &MockProvider) -> Vec<(String, String)> {
     ]
 }
 
+/// An executable script on `PATH`, for a composition that names a command.
+///
+/// A `tool.*` with an `exec:` binding names a real program, and a worked example
+/// names the programs its author has — `repo-grep`, `run-checks`. A test that
+/// wanted those to be absent would be testing the failure path; one that wants
+/// the graph to *run* supplies them, prepends this directory to `PATH`, and
+/// keeps the composition exactly as the example ships it.
+///
+/// # Panics
+///
+/// Panics when the scratch directory is not writable, which is a broken test
+/// rather than a finding.
+pub fn shim(directory: &Path, name: &str, body: &str) {
+    let path = directory.join(name);
+    std::fs::write(&path, format!("#!/bin/sh\n{body}")).expect("the scratch area is writable");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("the shim is made executable");
+    }
+}
+
 /// A directory that removes itself.
 pub struct Scratch(PathBuf);
 
 impl Scratch {
-    fn new(purpose: &str) -> Self {
+    /// A fresh one, named for what it holds.
+    pub fn new(purpose: &str) -> Self {
         static NEXT: AtomicU32 = AtomicU32::new(0);
         let path = std::env::temp_dir().join(format!(
             "agent-compose-acceptance-{purpose}-{}-{}",

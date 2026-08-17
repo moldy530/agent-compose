@@ -2755,8 +2755,12 @@ fn a_sink_route_is_joined_and_a_detached_one_is_resolved_at_dispatch() {
     );
     for record in records {
         assert!(
-            record["idempotencyKey"].as_str().is_some_and(|held| held
-                .ends_with(&format!("/route/0/{}", record["index"].as_u64().expect("an index")))),
+            record["idempotencyKey"]
+                .as_str()
+                .is_some_and(|held| held.ends_with(&format!(
+                    "/route/0/{}",
+                    record["index"].as_u64().expect("an index")
+                ))),
             "every dispatch derives its own key: {record}"
         );
     }
@@ -2780,10 +2784,8 @@ fn a_nested_fan_out_keys_and_isolates_each_instance_by_its_whole_path() {
         Script::new(HAIKU, Outcome::structured(json!({ "part": "made-alpha" }))).matching("alpha"),
         Script::new(HAIKU, Outcome::structured(json!({ "part": "made-beta" }))).matching("beta"),
         Script::new(HAIKU, Outcome::structured(json!({ "part": "made-gamma" }))).matching("gamma"),
-        Script::new(HAIKU, Outcome::structured(json!({ "line": "line-0" })))
-            .matching("made-alpha"),
-        Script::new(HAIKU, Outcome::structured(json!({ "line": "line-1" })))
-            .matching("made-gamma"),
+        Script::new(HAIKU, Outcome::structured(json!({ "line": "line-0" }))).matching("made-alpha"),
+        Script::new(HAIKU, Outcome::structured(json!({ "line": "line-1" }))).matching("made-gamma"),
     ]);
 
     let Some(run) = harness::invoke("fanout", "flow.nested", &[("goal", "ship it")], &provider)
@@ -2962,6 +2964,306 @@ fn a_subflow_inherits_the_callers_history_and_takes_its_instantiation_policy() {
     );
     assert!(provider.snapshot().is_drained());
 }
+
+/// The documented fan-out example runs: a subgraph, a discriminated fan-out to
+/// fixer agents and two sinks, a concurrent branch, and a join whose result is
+/// in source-item order (PRD 5.6).
+///
+/// `examples/triage-fanout` is the project PRD 5.6 is written about, and running
+/// the *example* rather than a fixture is the only way an acceptance test speaks
+/// about what a reader is shown. It reaches further than any fixture does,
+/// because it is written for a reader rather than for a test: a `flow:` node into
+/// `flow.enrich`, a `function:` node over an `exec` tool, a four-item tagged
+/// union across three routes — two of them `tool.*` sinks the join waits on — a
+/// concurrent `http:` branch converging at equal depth, and an inline `exec:`
+/// node after it.
+///
+/// It **stops** at `approve`, which is a `human:` node — the one construct on its
+/// path this compiler release does not execute (PRD §7 M1 leaves the `human`
+/// runtime to `serve`). That is asserted rather than worked around: the run gets
+/// all the way there, the trace holds every step it took, and the node it stopped
+/// at names the construct and the bullet that lands it.
+///
+/// The fixer answering **item 0** is delayed past the one answering item 3, so
+/// the two patches complete in the reverse of source order. What `summarize` is
+/// then sent is the whole claim of PRD 5.6's replay guarantee, observed on the
+/// wire rather than inferred.
+#[test]
+fn the_triage_fanout_example_routes_every_finding_and_joins_them_in_source_order() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({
+                "findings": [
+                    { "kind": "auto_fixable", "file": "src/a.rs", "patch_hint": "rename it" },
+                    { "kind": "needs_human", "summary": "needs judgement", "severity": "high" },
+                    { "kind": "duplicate", "of": "the first finding" },
+                    { "kind": "auto_fixable", "file": "src/b.rs", "patch_hint": "widen it" },
+                ],
+            })),
+        ),
+        // Item 0 answers last. Completion order is the reverse of source order,
+        // which is the only arrangement under which the join means anything.
+        Script::new(
+            HAIKU,
+            Outcome::structured(json!({ "patch": "patch-a", "explanation": "renamed" }))
+                .after(Duration::from_millis(300)),
+        )
+        .matching("src/a.rs"),
+        Script::new(
+            HAIKU,
+            Outcome::structured(json!({ "patch": "patch-b", "explanation": "widened" })),
+        )
+        .matching("src/b.rs"),
+        Script::new(
+            HAIKU,
+            Outcome::structured(json!({ "summary": "one fix, one ticket" })),
+        )
+        .matching("Summarize the triage run"),
+    ]);
+
+    let shims = harness::Scratch::new("triage-shims");
+    harness::shim(
+        shims.path(),
+        "repo-grep",
+        "printf '{\"matches\":[\"src/a.rs:42:boom\"]}'\n",
+    );
+    harness::shim(
+        shims.path(),
+        "run-checks",
+        "printf 'two checks failed'\nexit 1\n",
+    );
+    let sinks = shims.path().join("sinks.jsonl");
+
+    let mut environment = harness::environment(&provider);
+    for (name, value) in [
+        ("ANTHROPIC_API_KEY", "mock-provider-key".to_string()),
+        ("LOCAL_LLM_KEY", "mock-provider-key".to_string()),
+        ("LOCAL_LLM_URL", provider.base_url()),
+        ("DEPLOY_ENV", "acceptance".to_string()),
+        ("QUEUE_HOST", "queue.invalid".to_string()),
+        ("QUEUE_TOKEN", "queue-token".to_string()),
+        ("TRIAGE_HOST", "triage.invalid".to_string()),
+        ("TRIAGE_TOKEN", "triage-token".to_string()),
+        ("REPO_ROOT", shims.path().display().to_string()),
+        ("RG_CONFIG_PATH", shims.path().display().to_string()),
+        ("SINK_LOG", sinks.display().to_string()),
+        (
+            "PATH",
+            format!(
+                "{}:{}",
+                shims.path().display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        ),
+    ] {
+        environment.push((name.to_string(), value));
+    }
+
+    let Some(run) = harness::invoke_entrypoint(
+        &harness::example("triage-fanout"),
+        "examples/triage-fanout",
+        "flow.triage",
+        &json!({ "report": "the parser panics", "pattern": "panic!" }),
+        &environment,
+        Some(ANSWER_THE_EXAMPLES_INFRASTRUCTURE),
+    ) else {
+        return;
+    };
+
+    // Everything up to the one construct this release does not execute.
+    let failure = run.failed();
+    assert!(
+        failure.contains("a `human` pause is not executed by this compiler release"),
+        "the run reaches `approve` and stops there, saying what it is: {failure}"
+    );
+    assert_eq!(
+        run.visited(),
+        [
+            "enrich",
+            "scan",
+            "classify",
+            "announce",
+            "dispatch",
+            "verify",
+            "summarize",
+            "remember",
+            "approve",
+        ],
+        "the whole path, with `dispatch` and `announce` concurrent in one step \
+         and `verify` running once after both"
+    );
+
+    // The two concurrent branches ran in the same step, and the convergence in
+    // the next one — the fan-out barrier is what put them there (grammar 7.6).
+    let step = |node: &str| run.entries(node)[0]["step"].clone();
+    assert_eq!(step("dispatch"), step("announce"));
+    assert_eq!(
+        step("verify").as_i64().expect("a step"),
+        step("dispatch").as_i64().expect("a step") + 1,
+    );
+
+    // Every finding reached its own route, in source-item order, and the two
+    // sink routes were waited on like any other (PRD 5.6).
+    let dispatched = run.entries("dispatch")[0]["dispatches"].clone();
+    assert_eq!(
+        dispatched
+            .as_array()
+            .expect("the map records what it dispatched")
+            .iter()
+            .map(|record| (
+                record["index"].clone(),
+                record["route"].clone(),
+                record["target"].clone(),
+                record["outcome"].clone(),
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (
+                json!(0),
+                json!("auto_fixable"),
+                json!("agent.fixer"),
+                json!("completed")
+            ),
+            (
+                json!(1),
+                json!("needs_human"),
+                json!("tool.review_queue"),
+                json!("completed")
+            ),
+            (
+                json!(2),
+                json!("default"),
+                json!("tool.dead_letter"),
+                json!("completed")
+            ),
+            (
+                json!(3),
+                json!("auto_fixable"),
+                json!("agent.fixer"),
+                json!("completed")
+            ),
+        ],
+        "{dispatched}"
+    );
+
+    // The join's result, on the wire: `summarize` reads `state.patches`, and the
+    // fixer that answered *last* is the one whose patch is *first* — because the
+    // order is the source array's, never the providers' (grammar 7.6.4 clause 2).
+    let summarized = provider
+        .requests()
+        .into_iter()
+        .find(|request| {
+            request.body()["system"]
+                .as_str()
+                .is_some_and(|prompt| prompt.starts_with("Summarize the triage run"))
+        })
+        .expect("the summarizer ran");
+    let turns = summarized.body()["messages"].clone();
+    let asked = turns
+        .as_array()
+        .and_then(|turns| turns.last())
+        .expect("a request carries at least the node's own turn")["content"]
+        .as_str()
+        .expect("the bound input is the last user turn")
+        .to_string();
+    assert_eq!(
+        asked, "{\"report\":\"a normalized report\",\"patches\":[\"patch-a\",\"patch-b\"]}",
+        "the subgraph's output and the fan-out's, both read back from state"
+    );
+
+    // What the sinks were actually sent, recorded by the preamble that answered
+    // them: the narrowed payload of each variant, and nothing from another's.
+    let delivered: Vec<Value> = std::fs::read_to_string(&sinks)
+        .expect("the preamble logged what the example's infrastructure was sent")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("one JSON object per line"))
+        .collect();
+    let sent = |path: &str| -> Value {
+        delivered
+            .iter()
+            .find(|entry| entry["path"] == path)
+            .unwrap_or_else(|| panic!("nothing reached `{path}`: {delivered:#?}"))["body"]
+            .clone()
+    };
+    assert_eq!(
+        sent("/v1/normalize"),
+        json!({ "report": "the parser panics" }),
+        "the subgraph got its input through the instantiating node's bindings alone"
+    );
+    assert_eq!(
+        sent("/v1/tickets"),
+        json!({ "summary": "needs judgement", "severity": "high" }),
+        "the `needs_human` route is narrowed to its own variant's payload"
+    );
+    assert_eq!(
+        sent("/v1/dead-letter"),
+        json!({ "kind": "duplicate", "payload": "the first finding" }),
+        "…and the catch-all to the unrouted variant's"
+    );
+    assert_eq!(
+        sent("/v1/triage-started"),
+        json!({ "report": "a normalized report" }),
+        "the concurrent branch ran too"
+    );
+    assert!(provider.snapshot().is_drained());
+}
+
+/// The host preamble `examples/triage-fanout` needs to run without a network.
+///
+/// Two jobs, and both are the *host's* rather than the composition's. The
+/// example names no `base_url:`, so its provider resolves `https://api.anthropic.com`
+/// and the mock is where that goes — the same redirect
+/// `the_review_loop_example_runs_its_cycle_against_the_mock_provider` uses. And
+/// the four HTTPS endpoints it talks to are a normalizer, a ticket queue, a
+/// dead-letter queue and a webhook: infrastructure the example documents talking
+/// to and this milestone is not about. They are answered here, in their own
+/// declared shapes, and what each was sent is logged so a test can assert on the
+/// payloads a sink route delivered.
+const ANSWER_THE_EXAMPLES_INFRASTRUCTURE: &str = r#"import { appendFileSync } from "node:fs";
+import process from "node:process";
+
+const upstream = "https://api.anthropic.com";
+const mock = process.env["MOCK_BASE_URL"].replace(/\/+$/, "");
+const log = process.env["SINK_LOG"];
+
+// Each endpoint answers the shape the tool that calls it declares, at the status
+// it declares: `tool.review_queue` expects 201 and decodes two fields,
+// `flow.enrich`'s `fetch` expects 200 and decodes one.
+const answers = {
+  "/v1/normalize": [200, { report_normalized: "a normalized report" }],
+  "/v1/tickets": [201, { ticket_id: "T-1", queued: true }],
+  "/v1/dead-letter": [200, { accepted: true }],
+  "/v1/triage-started": [202, { started: true }],
+};
+
+const inner = globalThis.fetch;
+globalThis.fetch = async (resource, init) => {
+  const href =
+    typeof resource === "string"
+      ? resource
+      : resource instanceof URL
+        ? resource.href
+        : resource.url;
+  if (href.startsWith(upstream)) {
+    return inner(mock + href.slice(upstream.length), init);
+  }
+  const answer = answers[new URL(href).pathname];
+  if (answer === undefined) return inner(href, init);
+  appendFileSync(
+    log,
+    `${JSON.stringify({
+      path: new URL(href).pathname,
+      body: JSON.parse(init?.body ?? "null"),
+    })}\n`,
+  );
+  return new Response(JSON.stringify(answer[1]), {
+    status: answer[0],
+    headers: { "content-type": "application/json" },
+  });
+};
+"#;
 
 /// A node retries its model call per its declared policy, and the retries are
 /// visible as repeated calls.

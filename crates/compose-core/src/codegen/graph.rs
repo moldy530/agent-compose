@@ -72,6 +72,7 @@
 //!
 //! | id | where | which way | why it is left |
 //! |---|---|---|---|
+//! | `a-detached-dispatch-is-bounded-by-its-own-route` | `max_concurrency` over a `detach: true` route | a detached delivery takes its **route's** permit and never the map node's | grammar 8.6 rule 1 and Decision D28 make `max_concurrency` a **node-wide** bound, and Decision D94 says of a detached dispatch that "nothing it does can fail or delay the enclosing flow instance". Both cannot hold of one counter: a slow delivery holding a node-wide permit would keep a *joined* instance from starting, which delays the join, which delays the flow instance. D94 is the more specific rule and the one an author reaches for by name, so the node-wide count is over the instances the map **waits on**, and a detached route is bounded by its own — which rule 1 already requires to be at most the map's. The reading is deliberate and narrow: it changes nothing for a map with no detached route, which is every map that writes state at all |
 //! | `a-dispatch-runs-inside-the-map-nodes-task` | `map` dispatch and `flow:` instantiation | the instances run **in the node's task**, and a subflow is a separate run of its own compiled graph | a `Send` schedules a node of the **parent** graph, and seven of grammar 8.6's own rules are then unstateable. A Send'd task reads the packet as its whole input and writes the **parent's** channels, so a dispatched `flow.*` cannot hold its own channel values (grammar 10.1, 7.6.4 clause 3) and its instances share the caller's `messages`, which grammar 10.4 and Decision D105 make an unwaivable module boundary. `detach: true` is *resolved at dispatch* (D94) and a superstep barrier waits for every task it scheduled. A dispatch of **zero** instances must complete and fire its edges (rule 6), while `goto: []` retires the branch. `max_concurrency` is a per-node bound routes may tighten (D28) and LangGraph's `maxConcurrency` is a run-level config the Pregel runner applies to every task of a superstep. `on_item_error`'s parameterized retry, and the map's own `on_error:` absorbing an exhausted item (rule 10), are policies over an *item* that a node-level `retryPolicy` cannot express — the same mismatch `runtime.runActivity` records for grammar 9. The map's own outgoing edges would be evaluated once per instance, over N different local states, and not at all when N is 0. And LangGraph orders a step's writes by `task.path`, where every `__pregel_pull` sorts before every `__pregel_push`, so a map's writes would land after *every* ordinary node's rather than in the map node's own place in clause 1's node-id order. Index-tagging survives the change: what the map writes is one `runtime.OrderedWrites` per channel, in source-item order, which every emitted reducer unpacks |
 //!
 //! What the row does **not** trade away is grammar 7.6's two properties. P1
@@ -1063,7 +1064,10 @@ fn retry_object(retry: &crate::ir::policy::Retry, indent: &str) -> String {
             policy::milliseconds(&max_backoff.value)
         ));
     }
-    text.push_str(&format!("{inner}jitter: {},\n", retry.jitter.unwrap_or(true)));
+    text.push_str(&format!(
+        "{inner}jitter: {},\n",
+        retry.jitter.unwrap_or(true)
+    ));
     text.push_str(&format!("{indent}}}"));
     text
 }
@@ -1076,7 +1080,10 @@ fn retry_object(retry: &crate::ir::policy::Retry, indent: &str) -> String {
 fn instance_policy(policy: &Policy) -> String {
     let mut text = String::from("{\n");
     if let Some(retry) = &policy.retry {
-        text.push_str(&format!("        retry: {},\n", retry_object(retry, "        ")));
+        text.push_str(&format!(
+            "        retry: {},\n",
+            retry_object(retry, "        ")
+        ));
     }
     if let Some(timeout) = &policy.timeout {
         text.push_str(&format!(
@@ -1405,7 +1412,7 @@ fn activity(
                 policy
                     .as_ref()
                     .filter(|policy| !policy.is_empty())
-                    .map_or_else(|| "undefined".to_string(), |policy| instance_policy(policy))
+                    .map_or_else(|| "undefined".to_string(), instance_policy)
             ));
             if matches!(context, Some(FlowContext::Inherit)) {
                 // `context: inherit` shares the caller's history with the
@@ -1558,7 +1565,10 @@ fn map_descriptor(
             routes,
             default,
         } => {
-            text.push_str(&format!("  routeBy: {},\n", names::string(route_by.value.as_str())));
+            text.push_str(&format!(
+                "  routeBy: {},\n",
+                names::string(route_by.value.as_str())
+            ));
             let union = item.as_ref().and_then(|item| match &item.form {
                 TypeForm::Union(union) => Some(union),
                 _ => None,
@@ -1690,7 +1700,10 @@ fn dispatch_route(
         text.push_str(&format!("{inner}tag: {},\n", names::string(tag)));
     }
     text.push_str(&format!("{inner}target: {},\n", names::string(&target)));
-    text.push_str(&format!("{inner}maxConcurrency: {},\n", site.max_concurrency));
+    text.push_str(&format!(
+        "{inner}maxConcurrency: {},\n",
+        site.max_concurrency
+    ));
     text.push_str(&format!("{inner}detach: {},\n", site.detach));
     text.push_str(&format!(
         "{inner}itemShape: {},\n",
@@ -1807,11 +1820,7 @@ enum Contract<'ir> {
 }
 
 /// The input contract of one `agent.*`, `tool.*` or `flow.*` target.
-fn target_contract<'ir>(
-    ir: &Ir,
-    surfaces: &[schema::Surface<'ir>],
-    target: &str,
-) -> Contract<'ir> {
+fn target_contract<'ir>(ir: &Ir, surfaces: &[schema::Surface<'ir>], target: &str) -> Contract<'ir> {
     let Some(definition) = ir.definitions.get(target) else {
         return Contract::StringIn;
     };
@@ -1839,7 +1848,11 @@ fn target_contract<'ir>(
 
 /// The canonical path of a dispatch target's result surface.
 fn target_output_path(ir: &Ir, target: &str) -> Option<String> {
-    match ir.definitions.get(target).map(|definition| &definition.body) {
+    match ir
+        .definitions
+        .get(target)
+        .map(|definition| &definition.body)
+    {
         Some(DefinitionBody::Agent(_) | DefinitionBody::Tool(_)) => {
             Some(format!("{target}.output"))
         }
@@ -1875,10 +1888,7 @@ fn map_item_type(
             let crate::ast::common::PathStep::Field(name) = steps.first()? else {
                 return None;
             };
-            (
-                flow.inputs.as_ref()?.field(name.as_str())?.ty.clone(),
-                1,
-            )
+            (flow.inputs.as_ref()?.field(name.as_str())?.ty.clone(), 1)
         }
         id => {
             let producer = flow
@@ -3329,5 +3339,297 @@ flow.f:
 "#
         );
         assert_eq!(ceiling(&self_edge, "flow.f"), 25 + 1 + CEL_BOUNDED_PASSES);
+    }
+
+    // -----------------------------------------------------------------------
+    // Fan-out and subgraph emission (grammar 8.5, 8.6)
+    // -----------------------------------------------------------------------
+
+    /// The composition every fan-out test below is written against: a producer,
+    /// a homogeneous map over its result, and a routed map over a union.
+    const FANNED: &str = r#"
+agent.planner:
+  model: model.m
+  prompt: Plan it.
+  input:
+    goal: { type: string }
+  output:
+    tasks:
+      type: array
+      max_items: 5
+      items:
+        type: object
+        properties:
+          title: { type: string }
+          weight: { type: number }
+    findings:
+      type: array
+      max_items: 5
+      items:
+        discriminator: kind
+        variants:
+          fixable:
+            file: { type: string }
+            note: { type: string }
+          human:
+            summary: { type: string }
+            note: { type: string }
+          stale:
+            note: { type: string }
+
+agent.worker:
+  model: model.m
+  prompt: Work it.
+  input:
+    title: { type: string }
+  output:
+    result: { type: string }
+
+agent.plain:
+  model: model.m
+  prompt: Say it.
+  output:
+    line: { type: string }
+
+flow.f:
+  inputs: { goal: { type: string } }
+  outputs: { draft: { type: string } }
+  nodes:
+    plan:
+      agent: agent.planner
+      input: { goal: "input.goal" }
+    quiet:
+      agent: agent.reviewer
+      input: { goal: "input.goal", draft: "state.draft" }
+    work:
+      map:
+        over: plan.output.tasks
+        as: task
+        node: agent.worker
+        max_concurrency: 3
+        input: { title: "task.title" }
+        writes: { result: notes }
+    route:
+      map:
+        over: plan.output.findings
+        as: finding
+        route_by: kind
+        max_concurrency: 4
+        on_item_error: skip
+        routes:
+          fixable:
+            node: agent.worker
+            max_concurrency: 2
+            input: { title: "finding.file" }
+            writes: { result: notes }
+        default:
+          node: agent.plain
+          detach: true
+          input: "finding.note"
+  edges:
+    - { from: start, to: plan }
+    - { from: plan, to: quiet }
+    - { from: quiet, to: work }
+    - { from: work, to: route }
+    - { from: route, to: end }
+"#;
+
+    /// The chunk of the emitted module that declares one name.
+    fn declaration<'a>(emitted: &'a str, name: &str) -> &'a str {
+        emitted
+            .split(&format!("const {name}"))
+            .nth(1)
+            .unwrap_or_else(|| panic!("`{name}` is not declared:\n{emitted}"))
+            .split("\n};\n")
+            .next()
+            .expect("the declaration closes")
+    }
+
+    /// Grammar 8.6's homogeneous form: one route, the per-item binding over the
+    /// `as:` name, and the effective write map of rule 5.
+    #[test]
+    fn a_homogeneous_map_emits_one_route_with_its_binding_and_its_writes() {
+        let emitted = emit(&format!("{PREAMBLE}{FANNED}"));
+        let map = declaration(&emitted, "flowFNodeWorkMap");
+        assert!(map.contains("as: \"task\","), "{map}");
+        assert!(map.contains("path: \"plan.output.tasks\","), "{map}");
+        assert!(
+            map.contains("producer: \"plan\","),
+            "the node whose result `over` reads is named, so the map can find it \
+             in a later step (grammar 8.6 rule 11):\n{map}"
+        );
+        assert!(map.contains("maxConcurrency: 3,"), "{map}");
+        assert!(
+            map.contains("onItemError: \"fail\","),
+            "the default:\n{map}"
+        );
+        assert!(
+            !map.contains("routeBy:"),
+            "the homogeneous form routes on nothing:\n{map}"
+        );
+        assert!(
+            map.contains(
+                "input: (roots) => ({\n        \"title\": runtime.toJson(runtime.evaluate(\"task.title\", roots)),\n      }),"
+            ),
+            "{map}"
+        );
+        assert!(
+            map.contains("{ field: \"result\", channel: \"notes\", reduce: \"append\" },"),
+            "one element per write, into the reduced channel the remap names:\n{map}"
+        );
+        // The item is bound through its own declared type, so `weight` is the
+        // `double` the schema says rather than whatever its value looks like.
+        assert!(map.contains("\"weight\": \"double\""), "{map}");
+    }
+
+    /// Each route sees **its variant's payload only**, and the catch-all sees
+    /// the discriminator over the unrouted tags plus what every one of them
+    /// declares identically (grammar 8.6 rule 4, Decision D30).
+    #[test]
+    fn a_routed_map_narrows_every_route_to_the_variants_that_reach_it() {
+        let emitted = emit(&format!("{PREAMBLE}{FANNED}"));
+        let map = declaration(&emitted, "flowFNodeRouteMap");
+        assert!(map.contains("routeBy: \"kind\","), "{map}");
+
+        let named = map
+            .split("tag: \"fixable\",")
+            .nth(1)
+            .expect("the named route is emitted")
+            .split("},\n")
+            .next()
+            .expect("it closes");
+        assert!(named.contains("\"file\": \"string\""), "{named}");
+        assert!(
+            !named.contains("\"summary\""),
+            "a named route is not handed another variant's payload:\n{named}"
+        );
+        assert!(
+            named.contains("maxConcurrency: 2,"),
+            "a route may tighten the map's bound (Decision D28):\n{named}"
+        );
+
+        let catch_all = map
+            .split("fallback: {")
+            .nth(1)
+            .expect("the catch-all is emitted");
+        assert!(
+            catch_all.contains("\"kind\": \"string\"")
+                && catch_all.contains("\"note\": \"string\""),
+            "the catch-all sees the discriminator and the field every unrouted \
+             variant declares identically:\n{catch_all}"
+        );
+        assert!(
+            !catch_all.contains("\"file\"") && !catch_all.contains("\"summary\""),
+            "…and nothing only one of them declares:\n{catch_all}"
+        );
+        assert!(catch_all.contains("detach: true,"), "{catch_all}");
+        assert!(
+            catch_all.contains("writes: [],"),
+            "a detached dispatch writes no reduced state, name-based writes \
+             included (grammar 8.6 rule 7):\n{catch_all}"
+        );
+        // The scalar `input:` form, which is how an object item feeds a
+        // string-in agent (grammar 8.6 rule 12, Decision D75).
+        assert!(
+            catch_all.contains(
+                "input: (roots) => runtime.toJson(runtime.evaluate(\"finding.note\", roots)),"
+            ),
+            "{catch_all}"
+        );
+        assert!(map.contains("onItemError: \"skip\","), "{map}");
+    }
+
+    /// Only the node a `map.over` reads keeps its result in `$run`
+    /// (grammar 8.6 rule 11): a node result is arbitrarily large and that
+    /// channel is carried through every superstep.
+    #[test]
+    fn only_the_node_a_map_reads_keeps_its_result() {
+        let emitted = emit(&format!("{PREAMBLE}{FANNED}"));
+        assert!(
+            declaration(&emitted, "flowFNodePlan:").contains("retains: true,"),
+            "the producer both maps read:\n{emitted}"
+        );
+        assert!(
+            !declaration(&emitted, "flowFNodeQuiet:").contains("retains:"),
+            "…and a node nothing reads keeps nothing:\n{emitted}"
+        );
+    }
+
+    /// A `flow:` node binds its subflow's parameters totally, carries the
+    /// instance path grammar 9.4 keys effects from, and hands down its `policy:`
+    /// as grammar 9.3's level 1.
+    #[test]
+    fn a_flow_node_binds_its_subflow_totally_and_hands_down_its_policy() {
+        let emitted = emit(&format!(
+            r#"{PREAMBLE}
+flow.inner:
+  inputs:
+    goal: {{ type: string }}
+    tone: {{ type: string, default: calm }}
+  outputs: {{ draft: {{ type: string }} }}
+  nodes:
+    only: {{ agent: agent.reviewer, input: {{ goal: "input.goal", draft: "state.draft" }} }}
+  edges:
+    - {{ from: start, to: only }}
+    - {{ from: only, to: end }}
+
+flow.f:
+  inputs: {{ goal: {{ type: string }} }}
+  outputs: {{ draft: {{ type: string }} }}
+  nodes:
+    sub:
+      flow: flow.inner
+      input: {{ goal: "input.goal" }}
+      context: inherit
+      policy: {{ timeout: 30s, on_error: skip }}
+    ask:
+      human:
+        input: {{ question: {{ type: string }} }}
+        output: {{ decision: {{ enum: [approve, reject] }} }}
+  edges:
+    - {{ from: start, to: sub }}
+    - {{ from: sub, to: ask }}
+    - {{ from: ask, to: end }}
+"#
+        ));
+        let node = declaration(&emitted, "flowFNodeSub:");
+        assert!(
+            node.contains("\"goal\": runtime.toJson(runtime.evaluate(\"input.goal\", roots)),"),
+            "{node}"
+        );
+        assert!(
+            node.contains("\"tone\": \"calm\","),
+            "a field the site left out carries its own `default:`, and nothing \
+             falls through by name (Decision D68):\n{node}"
+        );
+        assert!(
+            node.contains("path: runtime.instancePath(view, \"sub\"),"),
+            "{node}"
+        );
+        assert!(
+            node.contains("timeoutMs: 30000,") && node.contains("onError: \"skip\","),
+            "the instantiation site's `policy:` is level 1 for the nodes inside:\n{node}"
+        );
+        assert!(
+            node.contains("policy: runtime.instancePolicy(view.run.policy,"),
+            "…laid under whatever already reached this instance, so the \
+             outermost site wins (Decision D79):\n{node}"
+        );
+        assert!(
+            node.contains("history: (view.state[\"messages\"] ?? []) as readonly unknown[],"),
+            "`context: inherit` hands the caller's history to the instance:\n{node}"
+        );
+
+        // Decision D102: a `human` node takes neither `timeout` nor `retry` from
+        // any level, level 1 included.
+        assert!(
+            declaration(&emitted, "flowFNodeAsk:").contains("exempt: true,"),
+            "{emitted}"
+        );
+
+        // The module surface a `flow:` node reaches its target through.
+        let binding = declaration(&emitted, "flowInnerBinding: runtime.SubflowBinding");
+        assert!(binding.contains("address: \"flow.inner\","), "{binding}");
+        assert!(binding.contains("outputs: [\"draft\"],"), "{binding}");
     }
 }

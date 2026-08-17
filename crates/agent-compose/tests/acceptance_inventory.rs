@@ -306,6 +306,16 @@ const CODEGEN: &[Criterion] = &[
                 "a_nested_fan_out_keys_and_isolates_each_instance_by_its_whole_path",
                 Status::Live,
             ),
+            // The same criterion over the *documented* project rather than a
+            // fixture: `examples/triage-fanout` is what PRD 5.6 is written
+            // about, and it reaches further than any fixture — a subgraph, a
+            // `function:` node, three routes including two `tool.*` sinks, a
+            // concurrent branch converging at equal depth, and an inline
+            // `exec:` node after the join.
+            (
+                "the_triage_fanout_example_routes_every_finding_and_joins_them_in_source_order",
+                Status::Live,
+            ),
         ],
     },
     Criterion {
