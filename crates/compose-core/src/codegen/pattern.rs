@@ -70,19 +70,25 @@
 //! `perl-classes-mean-the-ascii-thing-in-both-columns` documents) so the claim
 //! is a test rather than a paragraph.
 //!
-//! Two constructs are where that reasoning stops short of agreement, and both are
-//! declared rather than papered over. Without the `u` flag (see below), `.`
-//! matches one UTF-16 **code unit**, so `^.$` refuses `"😀"` in the emitted Zod
-//! and accepts it in the Rust validator, whose engine matches one **code
-//! point**. And `\b`/`\B` are word boundaries in both engines over *different*
-//! word characters: ECMAScript's are ASCII, and the validating engine's are
-//! Unicode — the one Perl construct the paragraph above does not cover, because
-//! the translation it relies on rewrites `\w` and leaves the boundary alone. So
-//! `\bcat\b` accepts `"caté"` in the emitted Zod and refuses it in the Rust
-//! column. Which column is the deviant one is arguable in both cases —
-//! ECMAScript is what JSON Schema names, so the emitted regex is the literal
-//! reading — but each difference is real and reachable, so they are
-//! `dot-matches-a-code-unit` and `word-boundary-is-unicode-aware` in
+//! Two constructs are where that reasoning stops short of agreement, and each
+//! way they do is declared rather than papered over. `.` is two of those ways,
+//! and they are not one difference: without the `u` flag (see below) it matches one
+//! UTF-16 **code unit**, so `^.$` refuses `"😀"` in the emitted Zod and accepts
+//! it in the Rust validator, whose engine matches one **code point**; and
+//! ECMAScript's `.` excludes every **line terminator** — LF, CR, U+2028, U+2029
+//! — where RE2's and the validating engine's exclude LF alone, so `^.$` refuses
+//! a lone `"\r"` in the emitted Zod and accepts it in the Rust column. No flag
+//! reaches the second: `s` would make `.` match the LF that RE2 excludes too,
+//! which is a different pattern from the one the author wrote. And `\b`/`\B` are
+//! word boundaries in both engines over *different* word characters:
+//! ECMAScript's are ASCII, and the validating engine's are Unicode — the one
+//! Perl construct the paragraph above does not cover, because the translation it
+//! relies on rewrites `\w` and leaves the boundary alone. So `\bcat\b` accepts
+//! `"caté"` in the emitted Zod and refuses it in the Rust column. Which column
+//! is the deviant one is arguable in every case — ECMAScript is what JSON Schema
+//! names, so the emitted regex is the literal reading — but each difference is
+//! real and reachable, so they are `dot-matches-a-code-unit`,
+//! `dot-excludes-a-line-terminator` and `word-boundary-is-unicode-aware` in
 //! [`super::schema`]'s divergence ledger, with `state.glyph` and `state.word` in
 //! the corpus as the documents that decide them.
 //!
@@ -94,8 +100,9 @@
 //! `new RegExp("").toString()` answers, and for the same reason: `//` opens a
 //! comment. No flags are added: `u` mode rejects escapes RE2 accepts, and both
 //! `RegExp.prototype.test` and JSON Schema's `pattern` are unanchored searches,
-//! so the two agree without one — everywhere but `.`, which is the declared
-//! divergence above and the price of keeping the escapes.
+//! so the two agree without one — everywhere but `.`, whose two declared
+//! divergences are above. `u` is the price of keeping the escapes; the line
+//! terminators are not a flag's to fix at all.
 
 use regex_syntax::ast::{
     Assertion, AssertionKind, Ast, ClassBracketed, ClassPerl, ClassSet, ClassSetBinaryOp,

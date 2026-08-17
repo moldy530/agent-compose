@@ -408,10 +408,11 @@ const DIVERGENCES: &[&str] = &[
     "multiple-of-under-a-scaled-tolerance",
     "display-name-is-not-an-addr-spec",
     "leap-second-away-from-midnight",
-    "duration-skips-a-designator",
+    "duration-is-iso-8601-not-rfc-3339",
     "punycode-payload-undecoded",
     "omitted-default-is-the-same-item",
     "dot-matches-a-code-unit",
+    "dot-excludes-a-line-terminator",
     "word-boundary-is-unicode-aware",
 ];
 

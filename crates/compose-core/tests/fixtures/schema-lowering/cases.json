@@ -200,7 +200,7 @@
   {
     "golden": "every-schema-form",
     "surface": "state.lasting",
-    "about": "`format: duration` — an ISO 8601 duration",
+    "about": "`format: duration` — ISO 8601 in the emitted column, and RFC 3339's appendix-A subset of it in the published one",
     "documents": [
       { "why": "a day and two hours", "valid": true, "document": "P1DT2H" },
       { "why": "seconds alone", "valid": true, "document": "PT30S" },
@@ -213,19 +213,34 @@
       { "why": "the designator is required", "valid": false, "document": "1D" },
       { "why": "a time component outside the time part", "valid": false, "document": "P1S" },
       { "why": "English is not ISO 8601", "valid": false, "document": "1 day" },
+      { "why": "a fraction on a component that is not the smallest one is not ISO 8601 either", "valid": false, "document": "P0.5DT1H" },
       {
-        "why": "years and days with the months between them skipped",
+        "why": "years and days with the months between them skipped: RFC 3339's appendix-A productions nest, so it has no spelling for one, and ISO 8601 does",
         "valid": false,
         "zod": true,
-        "divergence": "duration-skips-a-designator",
+        "divergence": "duration-is-iso-8601-not-rfc-3339",
         "document": "P1Y1D"
       },
       {
         "why": "and the same shape in the time part",
         "valid": false,
         "zod": true,
-        "divergence": "duration-skips-a-designator",
+        "divergence": "duration-is-iso-8601-not-rfc-3339",
         "document": "PT1H1S"
+      },
+      {
+        "why": "a decimal fraction on the smallest component: ISO 8601 admits one and RFC 3339's `dur-second = 1*DIGIT \"S\"` does not",
+        "valid": false,
+        "zod": true,
+        "divergence": "duration-is-iso-8601-not-rfc-3339",
+        "document": "PT1.5S"
+      },
+      {
+        "why": "and with ISO 8601's other decimal separator",
+        "valid": false,
+        "zod": true,
+        "divergence": "duration-is-iso-8601-not-rfc-3339",
+        "document": "PT1,5S"
       }
     ]
   },
@@ -418,12 +433,17 @@
   {
     "golden": "every-schema-form",
     "surface": "state.glyph",
-    "about": "`.` in a `pattern`: one code unit to the emitted JavaScript literal, one code point to the engine that reads the published schema",
+    "about": "`.` in a `pattern`: one code unit to the emitted JavaScript literal and one code point to the engine that reads the published schema, and a different set of line terminators excluded by each",
     "documents": [
       { "why": "one character, and the pattern is anchored to exactly one", "valid": true, "document": "a" },
       { "why": "two is not one", "valid": false, "document": "ab" },
       { "why": "and the empty string has none", "valid": false, "document": "" },
+      { "why": "a tab is not a line terminator in either column", "valid": true, "document": "\t" },
       { "why": "one astral character is one code point and two UTF-16 code units, so a flagless `/^.$/` matches only half of it. The `u` flag that would fix it refuses escapes RE2 accepts, which is why `codegen::pattern` does not add one", "valid": true, "zod": false, "divergence": "dot-matches-a-code-unit", "document": "😀" },
+      { "why": "the one line terminator both columns exclude: ECMAScript's `.` stops at `\\n`, and so do RE2's and the validating engine's. It is what makes the three below a difference about *which* terminators rather than about terminators at all", "valid": false, "document": "\n" },
+      { "why": "a carriage return is a line terminator to ECMAScript and an ordinary character to the engine reading the published schema, so the emitted `/^.$/` refuses a document that schema accepts. No flag closes this one: `s` would make `.` match the `\\n` above, which is a different pattern from the one the author wrote", "valid": true, "zod": false, "divergence": "dot-excludes-a-line-terminator", "document": "\r" },
+      { "why": "U+2028 LINE SEPARATOR, the same way — written as an escape because the character itself is invisible here", "valid": true, "zod": false, "divergence": "dot-excludes-a-line-terminator", "document": "\u2028" },
+      { "why": "and U+2029 PARAGRAPH SEPARATOR", "valid": true, "zod": false, "divergence": "dot-excludes-a-line-terminator", "document": "\u2029" },
       { "why": "a pattern is still a string check", "valid": false, "document": 1 }
     ]
   },

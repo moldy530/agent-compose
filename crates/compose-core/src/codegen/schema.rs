@@ -112,8 +112,16 @@
 //! So the reading is named by RFC, and where Zod's constructor reads a different
 //! one the check is written out in [`HELPERS`] (`rfc3339Date`, `rfc3339Time`,
 //! `rfc3339DateTime`, `rfc3986Uri`, `rfc4122Uuid`, `rfc1123Hostname`,
-//! `rfc5321Email`). Three formats keep their constructor because on those three
-//! the two agree: `duration`, `ipv4`, `ipv6`. [`zod_format`] is the whole table.
+//! `rfc5321Email`). Three formats keep their constructor. On `ipv4` and `ipv6`
+//! the two readings coincide. On `duration` they do not quite, and the
+//! constructor is still the right one: `z.iso.duration()` reads the
+//! specification grammar 3.3 *names*, and JSON Schema's keyword reads RFC
+//! 3339's narrower subset of it, so writing the check out would move the
+//! emitted parse away from the grammar rather than towards the schema. That gap
+//! is the ledger's `duration-is-iso-8601-not-rfc-3339` row instead of a helper,
+//! and it is the one direction this section is not about: the emitted parse
+//! accepts what the published schema refuses, never the reverse.
+//! [`zod_format`] is the whole table.
 //!
 //! # The divergence ledger
 //!
@@ -131,11 +139,12 @@
 //! | `multiple-of-under-a-scaled-tolerance` | `multiple_of` | Zod accepts, JSON refuses | the JSON column divides **exactly** — `jsonschema` reads `0.3` as the fraction 3/10 — and `.multipleOf(0.3)` divides in doubles, where `0.9 / 0.3` is `2.9999999999999996` and some tolerance is the only way to call that a multiple. Zod 4.4.3's is relative: `Number.EPSILON * max(\|value / step\|, 1)`, which is what passes `0.9`, and which grows with the quotient until it reaches 0.5 at `0.5 / Number.EPSILON` = 2^51 — past there nothing can fail, so `1e15` is a multiple of `0.3` to the emitted parse and is not one to the JSON column. Note this is a *tolerance* rather than a range: the `type: integer` row below is about a value the language cannot represent, and this is about one it represents exactly. Closing it means a decimal implementation inside every generated module, for quotients no model producing a bounded quantity reaches |
 //! | `display-name-is-not-an-addr-spec` | `format: email` | JSON accepts, Zod refuses | `Name <a@example.test>`. JSON Schema defines `email` as RFC 5321's `Mailbox` rule, which has no display-name form; the Rust column's parser offers one and accepts it. This is the one row where the emitted Zod is the **stricter and more correct** column, so it is recorded rather than widened |
 //! | `leap-second-away-from-midnight` | `format: time`, `format: date-time` | Zod accepts, JSON refuses | `rfc3339Time` admits `:60` wherever the rest parses; the JSON column admits it only where the value normalizes to `23:59:60` UTC. Narrowing the regex to `[0-5]\d` would trade this corner for the opposite one, and neither is reachable from a model emitting a wall-clock time |
-//! | `duration-skips-a-designator` | `format: duration` | Zod accepts, JSON refuses | `P1Y1D`, `PT1H1S`. ISO 8601 admits a skipped designator and RFC 3339's appendix-A ABNF nests them (`dur-year = Y [dur-month]`); grammar 3.3's `duration` is the ISO 8601 one, which is what `z.iso.duration()` reads |
+//! | `duration-is-iso-8601-not-rfc-3339` | `format: duration` | Zod accepts, JSON refuses | grammar 3.3's `duration` is the ISO 8601 one, which is what `z.iso.duration()` reads, and the JSON column reads RFC 3339's appendix-A ABNF, which is a proper subset of it. This row is that whole gap rather than one shape of it: the ABNF's date productions nest (`dur-year = Y [dur-month]`), so a skipped designator has no spelling — `P1Y1D`, `PT1H1S` — and its `dur-second = 1*DIGIT "S"` admits no decimal fraction, where ISO 8601 puts one on the smallest component with either separator — `PT1.5S`, `PT1,5S`. Every document it covers runs the *safe* way round: the emitted parse accepts what the published schema does not, rather than refusing what a model was told to send |
 //! | `punycode-payload-undecoded` | `format: hostname`, `format: email` | Zod accepts, JSON refuses | an `xn--` label whose payload is not decodable punycode. `rfc1123Hostname` checks the label's *shape*; decoding it would be a punycode implementation inside a generated module, for a case a model does not produce |
 //! | `omitted-default-is-the-same-item` | `unique_items` over items carrying a `default:` | JSON accepts, Zod refuses | `[{page: "/"}, {page: "/", via: "direct"}]` where `via` defaults to `"direct"`. The check runs over parsed elements, where the default has been filled in — see the section above for what closing it would cost |
-//! | `dot-matches-a-code-unit` | `pattern:` | JSON accepts, Zod refuses | `^.$` against `"😀"`. The emitted literal carries no `u` flag ([`super::pattern`] says why: `u` mode refuses escapes RE2 accepts), so `.` matches one UTF-16 code unit while the Rust column's engine matches one code point. JSON Schema *defines* `pattern` as ECMA-262, which makes the emitted regex the literal reading and the validating column the loose one; agreeing would take a second regex engine in the compiler, or refusing `.` outright |
-//! | `word-boundary-is-unicode-aware` | `pattern:` | Zod accepts, JSON refuses | `\bcat\b` against `"caté"`. Both engines have `\b` and both call it a word boundary; they disagree about what a word character is. ECMAScript's is ASCII, and the validating column keeps Rust's Unicode one — the translation that makes `\w`, `\d` and `\s` agree (`^\w$` refuses `é` in both) rewrites the *classes* and leaves the boundary alone. Same shape as the row above, and the same reading: ECMA-262 is what JSON Schema names |
+//! | `dot-matches-a-code-unit` | `pattern:` | JSON accepts, Zod refuses | `^.$` against `"😀"`. The emitted literal carries no `u` flag ([`super::pattern`] says why: `u` mode refuses escapes RE2 accepts), so `.` matches one UTF-16 code unit while the Rust column's engine matches one code point. JSON Schema *defines* `pattern` as ECMA-262, which makes the emitted regex the literal reading and the validating column the loose one; agreeing would take a second regex engine in the compiler, or refusing `.` outright. One of two things `.` costs, and the only one a flag would reach — the row below is the other |
+//! | `dot-excludes-a-line-terminator` | `pattern:` | JSON accepts, Zod refuses | `^.$` against `"\r"`, and the same for U+2028 and U+2029. ECMA-262's `.` matches any code point **except a LineTerminator** — LF, CR, LS, PS — while the engine reading the published schema excludes LF alone, which is also what RE2's `.` excludes and therefore what the author wrote. Not the row above's mechanism, and no flag closes it: `s` would make `.` match the LF *both* columns refuse, trading three documents for one pointing the other way, and the alternative is rewriting the pattern's text, which [`super::pattern`] does not do — it copies a pattern verbatim and decides only whether every construct transfers. Same reading as the row above, and the same closing cost |
+//! | `word-boundary-is-unicode-aware` | `pattern:` | Zod accepts, JSON refuses | `\bcat\b` against `"caté"`. Both engines have `\b` and both call it a word boundary; they disagree about what a word character is. ECMAScript's is ASCII, and the validating column keeps Rust's Unicode one — the translation that makes `\w`, `\d` and `\s` agree (`^\w$` refuses `é` in both) rewrites the *classes* and leaves the boundary alone. Same shape as the two `.` rows above, and the same reading: ECMA-262 is what JSON Schema names — though this one points the other way, because here it is the emitted regex that is the looser of the two |
 //!
 //! # Patterns
 //!
@@ -1232,9 +1241,16 @@ fn characters(count: i64) -> String {
 
 /// The check one `format:` lowers to (grammar 3.3).
 ///
-/// Three of the ten are Zod's own constructor, because on those three Zod's
+/// Three of the ten are Zod's own constructor. On `ipv4` and `ipv6`, Zod's
 /// reading and JSON Schema's `format` keyword agree on every document the
-/// conformance corpus can find: `duration`, `ipv4`, `ipv6`.
+/// conformance corpus can find. On `duration` they do not: `z.iso.duration()`
+/// reads ISO 8601, which is what grammar 3.3 means by the word, and the keyword
+/// reads RFC 3339's appendix-A subset of it — so the constructor stays because
+/// writing the check out would narrow the emitted parse below the grammar, and
+/// the difference is a declared divergence
+/// (`duration-is-iso-8601-not-rfc-3339`) rather than a helper. It runs the
+/// direction the seven below are about avoiding: the parse accepts what the
+/// published schema refuses.
 ///
 /// The other seven are written out in [`HELPERS`] instead, because their
 /// constructors read a *different specification* from the one JSON Schema's

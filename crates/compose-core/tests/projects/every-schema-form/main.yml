@@ -64,9 +64,12 @@ state:
   # the degenerate one: `//` is a line comment, so it emits `/(?:)/`.
   digits:    { type: string, pattern: "^\\d{3}-\\d{4}$" }
   anything:  { type: string, pattern: "" }
-  # A `.` is where the two columns cannot agree: the emitted literal carries no
-  # `u` flag, so `.` is one UTF-16 code unit there and one code point in the
-  # validator's engine. Declared as `dot-matches-a-code-unit`.
+  # A `.` is where the two columns cannot agree, in two independent ways. The
+  # emitted literal carries no `u` flag, so `.` is one UTF-16 code unit there and
+  # one code point in the validator's engine (`dot-matches-a-code-unit`); and
+  # ECMAScript's `.` excludes every line terminator where RE2's and the
+  # validator's exclude `\n` alone (`dot-excludes-a-line-terminator`), which no
+  # flag would fix.
   glyph:     { type: string, pattern: "^.$" }
   # `\b` is the other one. Both engines have a word boundary and they disagree
   # about what a word character is at it: ECMAScript's is ASCII, the validating
