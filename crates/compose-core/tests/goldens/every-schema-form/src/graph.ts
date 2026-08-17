@@ -5,20 +5,560 @@
 // is the single source of truth (PRD 5.12); to own this code instead, copy
 // the whole directory out and stop regenerating it.
 //
-// The compiled graph.
+// The compiled graph (PRD 5.3, 5.4, grammar 7, 8, 9).
 //
-// Node functions, routers, bounded-cycle counters, `map` dispatch and subgraphs
-// are assembled onto the state model here. What this module holds today is the
-// builder they are added to, constructed from `./state.ts` so the state model is
-// checked against the pinned LangGraph release rather than merely written for it.
-//
-// The flows this composition declares, which are what will be
-// assembled here:
-//   flow.shape
+// One LangGraph node per flow node, driven by the descriptor beside it: how its
+// input is built (grammar 8.0), the activity it runs (grammar 8), where its
+// output goes (grammar 10.3), and its outgoing edges in declaration order
+// (grammar 7.3). Every node answers a `Command`, so the branch it takes and the
+// state it writes — including the counter a bounded edge spends (grammar 7.4) —
+// land in one write. `./runtime.ts` is what the descriptors drive.
 
-import { StateGraph } from "@langchain/langgraph";
+import { END, START, StateGraph } from "@langchain/langgraph";
 
+import * as runtime from "./runtime.ts";
+import {
+  agentShaperOutput,
+  flowShapeInputs,
+  flowShapeNodeAskOutput,
+  flowShapeNodeNotifyOutput,
+  flowShapeNodeProbeOutput,
+  flowShapeNodeRecallOutput,
+  toolPingInput,
+  toolPingOutput,
+} from "./schemas.ts";
 import { State } from "./state.ts";
+import type { GraphState } from "./state.ts";
+
+// --- Shapes: the declared type an expression reads a value through ---
+/**
+ * Every declared state channel, so `state.count` is an `int` where the
+ * channel says `type: integer` and a `double` where it says `type: number`.
+ */
+const stateShape: runtime.Shape = {
+  properties: {
+    "anything": "string",
+    "at": "string",
+    "at_time": "string",
+    "author": {
+      properties: {
+        "name": "string",
+        "email": "string",
+        "home": "string",
+      },
+    },
+    "authors": { items: {
+        properties: {
+          "name": "string",
+          "rank": "int",
+        },
+      } },
+    "cadence": "double",
+    "digits": "string",
+    "draft": "string",
+    "glyph": "string",
+    "host": "string",
+    "lasting": "string",
+    "latest": "string",
+    "mark": "string",
+    "mood": "string",
+    "notes": { items: "string" },
+    "on_day": "string",
+    "origin": {
+      properties: {
+        "source": { properties: { "kind": "string" }, rest: "any" },
+      },
+    },
+    "ratio": "double",
+    "round": "int",
+    "seen": {
+      properties: {
+        "count": "int",
+      },
+    },
+    "slug": "string",
+    "step": "double",
+    "tags": { items: "string" },
+    "totals": {
+      properties: {
+        "fixed": "int",
+        "skipped": "int",
+      },
+    },
+    "urgent": "bool",
+    "v4": "string",
+    "v6": "string",
+    "visits": { items: {
+        properties: {
+          "page": "string",
+          "via": "string",
+        },
+      } },
+    "where": "string",
+    "which": "string",
+    "who": "string",
+    "word": "string",
+  },
+};
+
+/** `flow.shape` — the `input` root inside it (grammar 7.5). */
+const flowShapeShape: runtime.Shape = {
+  properties: {
+    "goal": "string",
+  },
+};
+
+/** `flow.shape` node `shape` — the `shape.output` root its guards read. */
+const flowShapeNodeShapeShape: runtime.Shape = {
+  properties: {
+    "draft": "string",
+    "findings": { items: { properties: { "kind": "string" }, rest: "any" } },
+    "author": {
+      properties: {
+        "name": "string",
+        "email": "string",
+      },
+    },
+  },
+};
+
+/** `flow.shape` node `ask` — the `ask.output` root its guards read. */
+const flowShapeNodeAskShape: runtime.Shape = {
+  properties: {
+    "decision": "string",
+  },
+};
+
+/** `flow.shape` node `probe` — the `probe.output` root its guards read. */
+const flowShapeNodeProbeShape: runtime.Shape = {
+  properties: {
+    "exit_code": "int",
+    "stdout": "string",
+  },
+};
+
+/** `flow.shape` node `notify` — the `notify.output` root its guards read. */
+const flowShapeNodeNotifyShape: runtime.Shape = {
+  properties: {
+    "status": "int",
+    "body": "string",
+  },
+};
+
+/** `flow.shape` node `recall` — the `recall.output` root its guards read. */
+const flowShapeNodeRecallShape: runtime.Shape = {
+  properties: {
+    "matches": { items: {
+        properties: {
+          "id": "string",
+          "score": "double",
+          "text": "string",
+          "metadata": {
+            properties: {
+              "source": "string",
+              "updated_at": "string",
+            },
+          },
+        },
+      } },
+  },
+};
+
+/**
+ * `provider.p` — an `openai_compatible` connection (grammar 12.1). Every value is read when a node calls it, never at import: a build carries no credential and `./index.ts` is where their presence is checked (PRD 5.9).
+ */
+const providerP: runtime.ProviderBinding = {
+  address: "provider.p",
+  kind: "openai_compatible",
+  get apiKey(): string {
+    return runtime.environmentValue("SHAPES_KEY", "provider.p.api_key");
+  },
+  get baseUrl(): string {
+    return runtime.environmentValue("SHAPES_URL", "provider.p.base_url");
+  },
+};
+
+/** `model.m` — `a-model` on `provider.p` (grammar 12.2). */
+const modelM: runtime.ModelBinding = {
+  address: "model.m",
+  id: "a-model",
+  provider: providerP,
+  settings: {},
+};
+
+/**
+ * `tool.ping` — a subprocess (grammar 6.1). Its arguments are parsed with its own declared `input:` before the implementation sees them, which is the checked signature grammar 8.4 asks for and the model's arguments are held to.
+ */
+async function toolPing(args: unknown, context: runtime.RunContext): Promise<unknown> {
+  const input = toolPingInput.parse(args);
+  return toolPingOutput.parse(
+    await runtime.runExec({
+      command: ["true"],
+      args: [],
+      env: [],
+      expectExit: [0],
+      decoding: { envelope: [], decoded: [], empty: true },
+    }, input, context),
+  );
+}
+
+/**
+ * `agent.shaper` — one LLM call with structured output (PRD 5.2, grammar 5). The schema below is the **published** JSON Schema of grammar 3.8's table, which is the column the conformance corpus proves equal to the parse its answer then faces.
+ */
+const agentShaper: runtime.AgentBinding = {
+  address: "agent.shaper",
+  prompt: "Produce a shape.",
+  model: modelM,
+  output: {
+    name: "shaper_output",
+    description: "The structured output `agent.shaper` must produce.",
+    schema: {
+      "additionalProperties": false,
+      "properties": {
+        "author": {
+          "additionalProperties": false,
+          "properties": {
+            "email": {
+              "format": "email",
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name"
+          ],
+          "type": "object"
+        },
+        "draft": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "findings": {
+          "description": "A union inside a bounded array, the fan-out shape.",
+          "items": {
+            "oneOf": [
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "confidence": {
+                    "maximum": 1,
+                    "minimum": 0,
+                    "type": "number"
+                  },
+                  "file": {
+                    "type": "string"
+                  },
+                  "kind": {
+                    "const": "auto_fixable"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "file",
+                  "confidence"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "kind": {
+                    "const": "needs_human"
+                  },
+                  "severity": {
+                    "enum": [
+                      "low",
+                      "high",
+                      "critical"
+                    ],
+                    "type": "string"
+                  },
+                  "summary": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "summary",
+                  "severity"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          "maxItems": 16,
+          "type": "array"
+        }
+      },
+      "required": [
+        "draft",
+        "findings",
+        "author"
+      ],
+      "type": "object"
+    },
+  },
+  tools: [],
+  maxToolIterations: 8,
+};
+
+// --- flow.shape ---
+
+/** `flow.shape` node `shape` — `agent.shaper` (grammar 8.1). */
+const flowShapeNodeShape: runtime.NodeDescriptor = {
+  flow: "flow.shape",
+  node: "shape",
+  // Grammar 9.3, resolved: `retry` from the built-in, `timeout` from the built-in, `on_error` from the built-in.
+  policy: {
+    onError: "fail",
+  },
+  shapes: { input: flowShapeShape, state: stateShape, output: flowShapeNodeShapeShape },
+  input: (roots, view) => ({
+    "goal": runtime.toJson(runtime.evaluate("input.goal", roots)),
+  }),
+  run: async (input, context, view) => {
+    const answer = await runtime.callAgent(
+      agentShaper,
+      input,
+      runtime.historyTurns(view.state["messages"] as unknown[]),
+      context,
+    );
+    return { output: agentShaperOutput.parse(answer.output), history: answer.history };
+  },
+  writes: [
+    { field: "draft", channel: "draft", reduce: "set" },
+    { field: "author", channel: "author", reduce: "set" },
+  ],
+  edges: [
+    { to: "ask" },
+  ],
+};
+
+/** `flow.shape` node `ask` — a human-in-the-loop pause (grammar 8.7). */
+const flowShapeNodeAsk: runtime.NodeDescriptor = {
+  flow: "flow.shape",
+  node: "ask",
+  // Grammar 9.3, resolved: `retry` from exempt (Decision D102), `timeout` from exempt (Decision D102), `on_error` from the built-in.
+  policy: {
+    onError: "fail",
+  },
+  shapes: { input: flowShapeShape, state: stateShape, output: flowShapeNodeAskShape },
+  input: () => null,
+  run: () => {
+    throw new runtime.Unimplemented("a `human` pause", "`agent-compose serve` (generated Fastify app for http triggers: start/resume/status)");
+  },
+  writes: [],
+  edges: [
+    { to: "probe" },
+  ],
+};
+
+/** `flow.shape` node `probe` — an inline subprocess (grammar 8.2). */
+const flowShapeNodeProbe: runtime.NodeDescriptor = {
+  flow: "flow.shape",
+  node: "probe",
+  // Grammar 9.3, resolved: `retry` from the built-in, `timeout` from the built-in, `on_error` from the built-in.
+  policy: {
+    onError: "fail",
+  },
+  shapes: { input: flowShapeShape, state: stateShape, output: flowShapeNodeProbeShape },
+  input: () => ({}),
+  run: async (input, context) => ({
+    output: flowShapeNodeProbeOutput.parse(
+      await runtime.runExec({
+        command: ["true"],
+        args: [],
+        env: [],
+        expectExit: [0],
+        decoding: { envelope: ["exit_code", "stdout"], decoded: [], empty: false },
+      }, input, context),
+    ),
+  }),
+  writes: [],
+  edges: [
+    { to: "notify" },
+  ],
+};
+
+/** `flow.shape` node `notify` — an inline request (grammar 8.3). */
+const flowShapeNodeNotify: runtime.NodeDescriptor = {
+  flow: "flow.shape",
+  node: "notify",
+  // Grammar 9.3, resolved: `retry` from the built-in, `timeout` from the built-in, `on_error` from the built-in.
+  policy: {
+    onError: "fail",
+  },
+  shapes: { input: flowShapeShape, state: stateShape, output: flowShapeNodeNotifyShape },
+  input: (roots) => ({
+    body: {
+      "latest": runtime.toJson(runtime.evaluate("state.latest", roots)),
+    },
+  }),
+  run: async (input, context) => ({
+    output: flowShapeNodeNotifyOutput.parse(
+      await runtime.runHttp(
+{
+                  method: "POST",
+                  url: ["https://example.test/notify"],
+                  headers: [],
+                  expectStatus: "2xx",
+                  decoding: { envelope: ["status", "body"], decoded: [], empty: false },
+                },
+        input as { query?: Record<string, unknown>; body?: unknown },
+        context,
+      ),
+    ),
+  }),
+  writes: [],
+  edges: [
+    { to: "recall" },
+  ],
+};
+
+/** `flow.shape` node `recall` — a `search` on `store.docs` (grammar 8.8). */
+const flowShapeNodeRecall: runtime.NodeDescriptor = {
+  flow: "flow.shape",
+  node: "recall",
+  // Grammar 9.3, resolved: `retry` from the built-in, `timeout` from the built-in, `on_error` from the built-in.
+  policy: {
+    onError: "fail",
+  },
+  shapes: { input: flowShapeShape, state: stateShape, output: flowShapeNodeRecallShape },
+  input: () => null,
+  run: () => {
+    throw new runtime.Unimplemented("a `search` on `store.docs`", "store-op nodes + synthesized store tools with SQLite/local-disk backends");
+  },
+  writes: [],
+  edges: [
+    { to: END },
+  ],
+};
+
+/** `flow.shape` — its nodes, its `start` edges, and the compiled graph. */
+function flowShape() {
+  return new StateGraph(State)
+    .addNode("shape", (state: GraphState) => runtime.runNode(flowShapeNodeShape, state), {
+      ends: ["ask"],
+    })
+    .addNode("ask", (state: GraphState) => runtime.runNode(flowShapeNodeAsk, state), {
+      ends: ["probe"],
+    })
+    .addNode("probe", (state: GraphState) => runtime.runNode(flowShapeNodeProbe, state), {
+      ends: ["notify"],
+    })
+    .addNode("notify", (state: GraphState) => runtime.runNode(flowShapeNodeNotify, state), {
+      ends: ["recall"],
+    })
+    .addNode("recall", (state: GraphState) => runtime.runNode(flowShapeNodeRecall, state), {
+      ends: [END],
+    })
+    .addEdge(START, "shape")
+    .compile();
+}
+
+/**
+ * `flow.shape`, compiled once. Building it at import is also what checks it: a state model LangGraph refuses, or an edge to a node that is not registered, fails here rather than at the first invocation.
+ */
+const flowShapeGraph = flowShape();
+
+/** One compiled flow: what it takes, what it answers, and how to run it. */
+export interface CompiledFlow {
+  /** Its typed address (grammar 2.2). */
+  readonly address: string;
+  /** The fields its `inputs:` declares (grammar 7.5). */
+  readonly inputs: readonly string[];
+  /** The fields its `outputs:` declares, each read from the channel of that name. */
+  readonly outputs: readonly string[];
+  /** The superstep ceiling a run of it takes by default. */
+  readonly recursionLimit: number;
+  /** Parse an invocation's inputs against the flow's own schema (grammar 13.2). */
+  parse(inputs: unknown): Record<string, unknown>;
+  /** Invoke the compiled graph. */
+  invoke(
+    initial: Record<string, unknown>,
+    options: { recursionLimit: number },
+  ): Promise<GraphState>;
+}
+
+/**
+ * Every flow this composition declares, by address.
+ *
+ * PRD 5.11 makes manual invocation universal — every flow is runnable whether or
+ * not a `manual` trigger names it (Decision D64) — so the registry is every
+ * flow rather than every triggered one.
+ */
+export const flows: Readonly<Record<string, CompiledFlow>> = {
+  "flow.shape": {
+    address: "flow.shape",
+    inputs: ["goal"],
+    outputs: ["draft", "notes"],
+    recursionLimit: 30,
+    parse: (inputs: unknown) => flowShapeInputs.parse(inputs) as Record<string, unknown>,
+    invoke: (initial, options) => flowShapeGraph.invoke(initial, options) as Promise<GraphState>,
+  },
+};
+
+/** What one run produced. */
+export interface FlowRun {
+  /** The flow's `outputs:`, materialized from state at quiescence (grammar 7.6.3). */
+  readonly outputs: Record<string, unknown>;
+  /** Every routing decision the run made, in step order (PRD 5.3). */
+  readonly trace: readonly runtime.TraceEntry[];
+  /** The whole state at quiescence. */
+  readonly state: GraphState;
+}
+
+/**
+ * Run one flow to quiescence and materialize its outputs.
+ *
+ * This is the invocation surface `agent-compose run` and the generated `serve`
+ * app are built on (PRD 5.11's `start`), and what an ejected project calls
+ * directly. The inputs are parsed against the flow's own `inputs:` schema before
+ * anything runs, which is where an invocation that the flow cannot accept is
+ * refused by field name (grammar 13.2).
+ */
+export async function runFlow(
+  address: string,
+  inputs: unknown = {},
+  options: {
+    readonly executionId?: string;
+    readonly sessionKey?: string;
+    readonly recursionLimit?: number;
+  } = {},
+): Promise<FlowRun> {
+  const flow = flows[address];
+  if (flow === undefined) {
+    throw new Error(
+      `\`${address}\` is not a flow of this composition: ${Object.keys(flows).join(", ")}`,
+    );
+  }
+  const parsed = flow.parse(inputs);
+  const state = await flow.invoke(
+    {
+      $run: {
+        ...runtime.emptyRun(),
+        input: parsed,
+        execution: {
+          id: options.executionId ?? `exec_${globalThis.crypto.randomUUID()}`,
+          session_key: options.sessionKey ?? "",
+        },
+      },
+    },
+    { recursionLimit: options.recursionLimit ?? flow.recursionLimit },
+  );
+
+  const outputs: Record<string, unknown> = {};
+  for (const field of flow.outputs) {
+    outputs[field] = runtime.channelValue(
+      state as unknown as Record<string, unknown>,
+      field,
+      `\`${address}\`'s output field \`${field}\``,
+    );
+  }
+  return { outputs, trace: state.$run.trace, state };
+}
 
 /**
  * A new builder over this composition's state model.

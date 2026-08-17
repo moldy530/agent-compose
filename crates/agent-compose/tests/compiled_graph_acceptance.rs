@@ -637,10 +637,8 @@ fn a_tagged_union_output_is_emitted_as_a_discriminated_union_narrowed_per_varian
 /// `build` now emits that state model, and `compose-core`'s
 /// `tests/generated_code_gates.rs` constructs it under the pinned LangGraph on
 /// every `cargo test`. What this test adds is the half only a run can show — that
-/// the declared defaults are what a flow *returns* — so its reason names the
-/// command it waits on rather than the emission that has landed.
+/// the declared defaults are what a flow *returns*.
 #[test]
-#[ignore = "pending: `agent-compose run` must execute the emitted graph"]
 fn state_channels_carry_their_declared_types_and_defaults() {
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue(Script::new(
@@ -648,12 +646,14 @@ fn state_channels_carry_their_declared_types_and_defaults() {
         Outcome::structured(json!({ "verdict": "revise", "feedback": "tighten it" })),
     ));
 
-    let run = harness::run(
+    let Some(run) = harness::invoke(
         "agent-anthropic",
         "flow.review",
         &[("goal", "ship it"), ("draft", "a draft")],
         &provider,
-    );
+    ) else {
+        return;
+    };
     run.succeeded();
 
     // Written by name from the agent's output (grammar 8.0, 10.3), and read back
@@ -680,11 +680,13 @@ fn state_channels_carry_their_declared_types_and_defaults() {
 /// The `z.discriminatedUnion` this needs is emitted, and `compose-core`'s
 /// `tests/generated_code_gates.rs` runs a corpus through it that includes this
 /// very refusal — a tag the union does not declare, rejected by both the emitted
-/// Zod and the JSON Schema the same lowering produces. What is left is the node
-/// function that parses a model's answer with it, which is what makes the
-/// refusal a *run* failure naming the tag.
+/// Zod and the JSON Schema the same lowering produces. An agent node fn now
+/// parses its answer with the emitted schema, which is what turns that refusal
+/// into a run failure; what is left is the *fixture's* first node, a `flow:`
+/// instantiation of `flow.normalize`, so this run cannot reach `classify` until
+/// subgraphs do.
 #[test]
-#[ignore = "pending: an agent node fn must parse its answer with the emitted union schema"]
+#[ignore = "pending: codegen must emit subgraphs"]
 fn a_tagged_union_output_is_narrowed_per_variant_and_a_bad_tag_is_rejected() {
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue_all([
@@ -727,7 +729,6 @@ fn a_tagged_union_output_is_narrowed_per_variant_and_a_bad_tag_is_rejected() {
 /// output tool and leave another one callable, so no single test can assert
 /// both.
 #[test]
-#[ignore = "pending: codegen must emit agent node fns"]
 fn an_agent_node_sends_its_prompt_input_and_output_schema() {
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue(Script::new(
@@ -735,12 +736,14 @@ fn an_agent_node_sends_its_prompt_input_and_output_schema() {
         Outcome::structured(json!({ "verdict": "revise", "feedback": "tighten it" })),
     ));
 
-    let run = harness::run(
+    let Some(run) = harness::invoke(
         "agent-anthropic",
         "flow.review",
         &[("goal", "ship it"), ("draft", "a draft")],
         &provider,
-    );
+    ) else {
+        return;
+    };
     run.succeeded();
 
     let recorded = provider.requests();
@@ -790,7 +793,6 @@ fn an_agent_node_sends_its_prompt_input_and_output_schema() {
 /// codegen bug that no Messages-API test can see, and three of grammar 12.1's
 /// six kinds reach this surface.
 #[test]
-#[ignore = "pending: codegen must emit agent node fns"]
 fn an_agent_node_sends_its_prompt_input_and_output_schema_on_chat_completions() {
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue(Script::new(
@@ -798,12 +800,14 @@ fn an_agent_node_sends_its_prompt_input_and_output_schema_on_chat_completions() 
         Outcome::structured(json!({ "verdict": "revise", "feedback": "tighten it" })),
     ));
 
-    let run = harness::run(
+    let Some(run) = harness::invoke(
         "agent-openai",
         "flow.review",
         &[("goal", "ship it"), ("draft", "a draft")],
         &provider,
-    );
+    ) else {
+        return;
+    };
     run.succeeded();
 
     let recorded = provider.requests();
@@ -865,7 +869,6 @@ fn an_agent_node_sends_its_prompt_input_and_output_schema_on_chat_completions() 
 /// makes the bound a runtime default rather than a declared one, and rewrites
 /// this test's fixture and its first assertion, not its subject.
 #[test]
-#[ignore = "pending: codegen must emit the agent tool loop"]
 fn an_agent_node_bounds_its_tool_loop_at_max_tool_iterations() {
     let provider = MockProvider::start().expect("a loopback port");
     // `agent.researcher` declares `max_tool_iterations: 2`, so a model that only
@@ -878,12 +881,14 @@ fn an_agent_node_bounds_its_tool_loop_at_max_tool_iterations() {
         .times(8),
     );
 
-    let run = harness::run(
+    let Some(run) = harness::invoke(
         "agent-anthropic",
         "flow.research",
         &[("goal", "ship it")],
         &provider,
-    );
+    ) else {
+        return;
+    };
     let failure = run.failed();
     assert!(
         failure.contains("max_tool_iterations") || failure.contains("tool"),
@@ -910,6 +915,145 @@ fn an_agent_node_bounds_its_tool_loop_at_max_tool_iterations() {
     assert_eq!(
         second[2]["content"][0]["type"], "tool_result",
         "the tool's result leads the turn that answers it"
+    );
+}
+
+/// The three deterministic node kinds run, and each reads its result the way its
+/// own surface says (grammar 8.2, 8.3, 8.4, 6.1).
+///
+/// One run over `flow.pipeline`, because the claim is about a graph rather than
+/// about three constructs in isolation: an inline `http:` node whose envelope
+/// `status` and decoded body field arrive together (Decision D56), an inline
+/// `exec:` node whose result *is* the process envelope, and a `function:` node
+/// over a `tool.*` whose single string-typed property takes raw stdout — the
+/// `tool.*`-surface exception of grammar 6.1 that Decision D91 withholds from
+/// inline nodes.
+#[test]
+fn the_deterministic_node_kinds_run_and_decode_their_results() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "verdict": "fast", "note": "a note" })),
+    ));
+
+    let Some(run) = harness::invoke(
+        "activities",
+        "flow.pipeline",
+        &[("goal", "ship it")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    let outputs = run.outputs();
+
+    // The `http:` node reached a real server — the mock's own control plane — and
+    // its result carries both halves: `status` from the response envelope, and
+    // `requests` decoded out of the JSON body.
+    assert_eq!(outputs["status"], json!(200));
+    // The `exec:` node's `stdout` is the envelope field, appended to a reduced
+    // channel one element per write (grammar 10.2, Decision D58).
+    assert_eq!(outputs["checks"], json!(["merged"]));
+    // `publish` wrote last; `check`'s raw-stdout binding is what it overwrote,
+    // and the run visited it.
+    assert_eq!(outputs["report"], "published");
+    assert!(
+        run.visited().contains(&"check".to_string()),
+        "the `function:` node ran: {:?}",
+        run.visited()
+    );
+    assert_eq!(provider.requests().len(), 1, "one agent, one call");
+}
+
+/// Two edges of one fork both fire, and the node they meet at runs **once**
+/// (grammar 7.3 rule 6, 7.6 P1/P2).
+#[test]
+fn a_multicast_fork_fires_every_true_edge_and_the_convergence_runs_once() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "verdict": "fast", "note": "a note" })),
+    ));
+
+    let Some(run) = harness::invoke(
+        "activities",
+        "flow.pipeline",
+        &[("goal", "ship it")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+
+    let plan = run.entries("plan");
+    assert_eq!(
+        plan[0]["routing"]["targets"],
+        json!(["probe", "check"]),
+        "both guards were true, so both edges fired (grammar 7.3 rule 6)"
+    );
+    assert_eq!(
+        plan[0]["routing"]["edges"][2]["taken"],
+        json!(false),
+        "…and the `else:` edge did not, because a guarded sibling was taken"
+    );
+
+    // P2: `merge` is targeted by two edges taken in one step and runs once.
+    let visited = run.visited();
+    assert_eq!(
+        visited.iter().filter(|node| *node == "merge").count(),
+        1,
+        "the convergence ran once: {visited:?}"
+    );
+    // …in the step after both of its predecessors, which is P1: a node's edges
+    // are evaluated only after it has completed.
+    let step = |node: &str| run.entries(node)[0]["step"].as_i64().expect("a step");
+    assert_eq!(
+        step("probe"),
+        step("check"),
+        "the two branches are one step"
+    );
+    assert_eq!(step("merge"), step("probe") + 1);
+}
+
+/// A skipped node writes nothing, and the one thing that changes about its
+/// routing is the value of a guard over its own output (grammar 9.2, D97).
+#[test]
+fn a_skipped_node_routes_through_its_else_edge_and_writes_nothing() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "verdict": "fast", "note": "a note" })),
+    ));
+
+    let Some(run) = harness::invoke(
+        "activities",
+        "flow.pipeline",
+        &[("goal", "ship it")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+
+    // `tally` runs `false`, which exits 1 — outside the default `expect_exit:
+    // [0]` — so the node errors and its declared `on_error: skip` applies.
+    let tally = run.entries("tally");
+    assert_eq!(tally[0]["outcome"], "skipped");
+    assert_eq!(
+        tally[0]["writes"],
+        json!([]),
+        "a skipped node writes nothing (grammar 9.2)"
+    );
+    assert_eq!(
+        tally[0]["routing"]["edges"][0]["value"],
+        json!(false),
+        "its guard reads its own output, which is not there, so it is `false` \
+         rather than an error (Decision D97)"
+    );
+    assert_eq!(tally[0]["routing"]["targets"], json!(["publish"]));
+    assert!(
+        !run.visited().contains(&"rework".to_string()),
+        "the guarded branch was not taken"
     );
 }
 
@@ -957,8 +1101,13 @@ fn a_subgraph_runs_with_explicit_bindings_and_isolated_history() {
 
 /// An edge guard routes on the source node's structured output, deterministically
 /// (PRD 5.3).
+///
+/// The transition is the compiled router's and the value is the model's, which is
+/// PRD G4's whole claim: the same graph, the same guards, and the branch decided
+/// by a field the model filled in. The trace is asserted beside the outputs
+/// because PRD 5.3 asks for routing decisions to *be data* rather than to be
+/// inferred from what happened next.
 #[test]
-#[ignore = "pending: codegen must emit routers with embedded CEL"]
 fn an_edge_guard_routes_on_the_source_nodes_structured_output() {
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue_all([
@@ -966,20 +1115,22 @@ fn an_edge_guard_routes_on_the_source_nodes_structured_output() {
             SONNET,
             Outcome::structured(json!({ "draft": "the first draft" })),
         )
-        .matching("ship it"),
+        .matching("research writer"),
         Script::new(
             SONNET,
             Outcome::structured(json!({ "verdict": "approve", "feedback": "" })),
         )
-        .matching("the first draft"),
+        .matching("meticulous technical reviewer"),
     ]);
 
-    let run = harness::run(
+    let Some(run) = harness::invoke(
         "bounded-cycle",
         "flow.review_loop",
         &[("goal", "ship it")],
         &provider,
-    );
+    ) else {
+        return;
+    };
     run.succeeded();
 
     assert_eq!(
@@ -988,6 +1139,22 @@ fn an_edge_guard_routes_on_the_source_nodes_structured_output() {
         "`approve` takes the `else:` edge to `end`, so the writer never runs again"
     );
     assert_eq!(run.outputs()["draft"], "the first draft");
+    assert_eq!(run.visited(), ["write", "review"]);
+
+    // The decision, as data: the guarded back-edge was evaluated against the
+    // model's own field and came out false, and the `else:` edge fired because no
+    // guarded sibling was taken (grammar 7.3 rules 3 and 4).
+    let review = run.entries("review");
+    let routing = &review[0]["routing"];
+    assert_eq!(routing["targets"], json!(["__end__"]));
+    assert_eq!(
+        routing["edges"][0]["when"],
+        "review.output.verdict == 'revise'"
+    );
+    assert_eq!(routing["edges"][0]["value"], json!(false));
+    assert_eq!(routing["edges"][0]["taken"], json!(false));
+    assert_eq!(routing["edges"][1]["else"], json!(true));
+    assert_eq!(routing["edges"][1]["taken"], json!(true));
 }
 
 /// The JS evaluator generated routers embed agrees with the Rust one the
@@ -996,8 +1163,13 @@ fn an_edge_guard_routes_on_the_source_nodes_structured_output() {
 /// CLAUDE.md makes this a CI gate: two interpreters is a semantic-drift risk, and
 /// the corpus is the mitigation. The Rust side already runs in
 /// `crates/compose-core/tests/cel_conformance.rs`; this is the other half.
+/// The Rust side already runs in `crates/compose-core/tests/cel_conformance.rs`;
+/// this is the other half, over the **same files**, run against the evaluator a
+/// built project embeds (`src/cel.ts`). The driver is committed beside this suite
+/// rather than written inline, because it carries a JSON reader that keeps `1`
+/// and `1.0` apart — the distinction the corpus's int64 cases exist to pin, and
+/// one `JSON.parse` throws away.
 #[test]
-#[ignore = "pending: generated routers must embed a JS CEL evaluator"]
 fn the_generated_cel_evaluator_agrees_with_the_validator_on_the_conformance_corpus() {
     let built = harness::build("bounded-cycle", "local");
     built.succeeded();
@@ -1006,39 +1178,13 @@ fn the_generated_cel_evaluator_agrees_with_the_validator_on_the_conformance_corp
         .parent()
         .expect("crates/")
         .join("compose-core/tests/fixtures/cel-conformance");
-    let driver = built.root().join("cel-conformance.mjs");
-    std::fs::write(
-        &driver,
-        r#"
-import { readdirSync, readFileSync } from "node:fs";
-import { evaluate } from "./cel.js";
-
-const corpus = process.argv[2];
-const divergences = [];
-for (const file of readdirSync(corpus).filter((name) => name.endsWith(".json"))) {
-  for (const testCase of JSON.parse(readFileSync(`${corpus}/${file}`, "utf8"))) {
-    if (testCase.error !== undefined) continue;
-    let actual;
-    try {
-      actual = evaluate(testCase.expression, testCase.input ?? {});
-    } catch (error) {
-      divergences.push({ name: testCase.name, threw: String(error) });
-      continue;
-    }
-    if (JSON.stringify(actual) !== JSON.stringify(testCase.result)) {
-      divergences.push({ name: testCase.name, expected: testCase.result, actual });
-    }
-  }
-}
-process.stdout.write(JSON.stringify(divergences));
-"#,
-    )
-    .expect("the driver is written into the generated project");
+    let driver = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/compiled_graph_acceptance/cel-conformance.mjs");
 
     let output = std::process::Command::new("node")
         .arg(&driver)
+        .arg(built.root())
         .arg(&corpus)
-        .current_dir(built.root())
         .output()
         .expect("node runs the generated evaluator");
     assert!(
@@ -1056,7 +1202,6 @@ process.stdout.write(JSON.stringify(divergences));
 /// A bounded cycle stops at its budget and leaves through the escape edge, rather
 /// than looping (PRD 5.4).
 #[test]
-#[ignore = "pending: codegen must emit the per-cycle iteration counter"]
 fn a_bounded_cycle_leaves_through_its_escape_edge_when_the_budget_is_spent() {
     let provider = MockProvider::start().expect("a loopback port");
     // A model that never approves: only `max_iterations: 3` can end this run.
@@ -1078,12 +1223,14 @@ fn a_bounded_cycle_leaves_through_its_escape_edge_when_the_budget_is_spent() {
         .matching("meticulous technical reviewer"),
     ]);
 
-    let run = harness::run(
+    let Some(run) = harness::invoke(
         "bounded-cycle",
         "flow.review_loop",
         &[("goal", "ship it")],
         &provider,
-    );
+    ) else {
+        return;
+    };
     run.succeeded();
 
     // One write, then three (write, review) passes on the back-edge budget: the
@@ -1094,6 +1241,43 @@ fn a_bounded_cycle_leaves_through_its_escape_edge_when_the_budget_is_spent() {
         "four writer calls and four reviewer calls, then the escape — not a loop"
     );
     assert_eq!(run.outputs()["draft"], "a draft");
+    assert_eq!(
+        run.visited(),
+        [
+            "write", "review", "write", "review", "write", "review", "write", "review"
+        ]
+    );
+
+    // The counter is the observable: it spends one unit per traversal, stops at
+    // the declared budget, and the pass that finds it spent takes the escape
+    // instead (grammar 7.4, Decision D19).
+    let review = run.entries("review");
+    let spent: Vec<Value> = review
+        .iter()
+        .map(|entry| entry["routing"]["edges"][0]["budget"]["used"].clone())
+        .collect();
+    assert_eq!(spent, [json!(1), json!(2), json!(3), json!(3)]);
+    for (index, entry) in review.iter().enumerate() {
+        let last = index == 3;
+        assert_eq!(
+            entry["routing"]["edges"][0]["value"],
+            json!(true),
+            "the model said `revise` on every pass, including the last"
+        );
+        assert_eq!(entry["routing"]["edges"][0]["taken"], json!(!last));
+        assert_eq!(
+            entry["routing"]["targets"],
+            if last {
+                json!(["__end__"])
+            } else {
+                json!(["write"])
+            }
+        );
+    }
+    assert_eq!(
+        review[3]["routing"]["edges"][0]["reason"],
+        "the `max_iterations` budget is spent"
+    );
 }
 
 /// A homogeneous map dispatches one instance per item, bounded by
@@ -1224,26 +1408,31 @@ fn appended_results_are_ordered_by_source_item_index() {
 /// A node retries its model call per its declared policy, and the retries are
 /// visible as repeated calls.
 #[test]
-#[ignore = "pending: codegen must emit retry policy"]
 fn a_node_retries_its_model_call_per_its_declared_policy() {
     let provider = MockProvider::start().expect("a loopback port");
     // `write` declares `retry: { max: 2, backoff: 1s }`: one attempt plus two
     // retries, and the third answer is the one that lands.
     provider.enqueue_all([
-        Script::new(SONNET, Outcome::server_error()).times(2),
-        Script::new(SONNET, Outcome::structured(json!({ "draft": "a draft" }))),
+        Script::new(SONNET, Outcome::server_error())
+            .times(2)
+            .matching("research writer"),
+        Script::new(SONNET, Outcome::structured(json!({ "draft": "a draft" })))
+            .matching("research writer"),
         Script::new(
             SONNET,
             Outcome::structured(json!({ "verdict": "approve", "feedback": "" })),
-        ),
+        )
+        .matching("meticulous technical reviewer"),
     ]);
 
-    let run = harness::run(
+    let Some(run) = harness::invoke(
         "bounded-cycle",
         "flow.review_loop",
         &[("goal", "ship it")],
         &provider,
-    );
+    ) else {
+        return;
+    };
     run.succeeded();
 
     assert_eq!(
@@ -1252,27 +1441,36 @@ fn a_node_retries_its_model_call_per_its_declared_policy() {
         "three attempts at the writer, then the reviewer"
     );
     assert_eq!(run.outputs()["draft"], "a draft");
+    // `write` declares `retry: { max: 2, … }` — one attempt plus two retries —
+    // and the node it feeds took one (grammar 9.1). The trace counts them, so a
+    // retry that silently stopped happening is visible as a number rather than as
+    // a transcript length.
+    assert_eq!(run.entries("write")[0]["attempts"], json!(3));
+    assert_eq!(run.entries("review")[0]["attempts"], json!(1));
 }
 
 /// A node timeout fires on a provider that never answers, and the node's error
 /// policy takes over from there.
 #[test]
-#[ignore = "pending: codegen must emit timeout policy"]
 fn a_node_timeout_fires_and_its_error_policy_takes_over() {
     let provider = MockProvider::start().expect("a loopback port");
     // `review` declares `timeout: 10s`; the scripted provider never answers, and
     // the project's `defaults: { on_error: fail }` is what the run reports.
     provider.enqueue_all([
-        Script::new(SONNET, Outcome::structured(json!({ "draft": "a draft" }))),
-        Script::new(SONNET, Outcome::timeout(Duration::from_secs(30))),
+        Script::new(SONNET, Outcome::structured(json!({ "draft": "a draft" })))
+            .matching("research writer"),
+        Script::new(SONNET, Outcome::timeout(Duration::from_secs(30)))
+            .matching("meticulous technical reviewer"),
     ]);
 
-    let run = harness::run(
+    let Some(run) = harness::invoke(
         "bounded-cycle",
         "flow.review_loop",
         &[("goal", "ship it")],
         &provider,
-    );
+    ) else {
+        return;
+    };
     let failure = run.failed();
     assert!(
         failure.contains("review"),
@@ -1281,6 +1479,42 @@ fn a_node_timeout_fires_and_its_error_policy_takes_over() {
     assert!(
         failure.contains("timeout") || failure.contains("timed out"),
         "…and what happened to it: {failure}"
+    );
+}
+
+/// The same budget, spent on a child process rather than on a provider — and the
+/// `on_error: { fallback: … }` that takes over when it does.
+///
+/// Two things this decides that the model-side twin above cannot. The fallback
+/// **replaces** the node's own edges rather than running beside them (grammar
+/// 9.2, Decision D21), so the target is what runs next and `slow`'s own
+/// `to: end` is not evaluated; and the budget is the *node's* rather than the
+/// provider client's, which is why an `exec:` node with no network in it times
+/// out at all.
+#[test]
+fn a_node_timeout_fires_over_a_child_process_and_its_fallback_takes_over() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let Some(run) = harness::invoke("activities", "flow.deadline", &[], &provider) else {
+        return;
+    };
+    run.succeeded();
+
+    assert_eq!(run.outputs()["report"], "rescued");
+    assert_eq!(run.visited(), ["slow", "rescue"]);
+    let slow = run.entries("slow");
+    assert_eq!(slow[0]["outcome"], "failed");
+    assert_eq!(slow[0]["fallback"], "rescue");
+    assert!(
+        slow[0]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("timed out")),
+        "the trace records what happened to it: {}",
+        slow[0]["error"]
+    );
+    assert!(
+        slow[0]["routing"].is_null(),
+        "a fallback is taken *instead of* the node's own edges: {}",
+        slow[0]
     );
 }
 
@@ -1504,7 +1738,6 @@ fn a_condition_outside_route_on_fails_the_node_instead_of_failing_over() {
 /// started execution hits, before the first model call — which needs a command
 /// that starts one.
 #[test]
-#[ignore = "pending: `agent-compose run` must execute the emitted graph"]
 fn a_missing_env_ref_fails_at_process_start_naming_the_variable() {
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue(Script::new(SONNET, Outcome::text("never reached")));
@@ -1513,12 +1746,14 @@ fn a_missing_env_ref_fails_at_process_start_naming_the_variable() {
         .into_iter()
         .filter(|(name, _)| name != harness::API_KEY)
         .collect();
-    let run = harness::run_with(
+    let Some(run) = harness::invoke_with(
         "agent-anthropic",
         "flow.review",
-        &[("goal", "ship it"), ("draft", "a draft")],
+        &json!({ "goal": "ship it", "draft": "a draft" }),
         &environment,
-    );
+    ) else {
+        return;
+    };
     let failure = run.failed();
 
     assert!(
@@ -1758,44 +1993,50 @@ fn serve_resumes_an_interrupted_execution_against_the_human_nodes_schema() {
 ///   so "constructs its graph" is not a claim this milestone can make until the
 ///   flows are assembled into it.
 #[test]
-#[ignore = "pending: codegen must assemble the flows into `src/graph.ts`"]
 fn every_generated_project_type_checks_and_constructs_its_graph() {
     for name in harness::FIXTURES {
-        let built = harness::build(name, "local");
-        built.succeeded();
-
-        let install = std::process::Command::new("npm")
-            .args(["install", "--no-audit", "--no-fund"])
-            .current_dir(built.root())
-            .output()
-            .expect("npm runs");
+        let Some((project, built)) = harness::build_under_toolchain(name, "gate") else {
+            return;
+        };
         assert!(
-            install.status.success(),
-            "`{name}`'s dependencies did not install: {}",
-            String::from_utf8_lossy(&install.stderr)
+            built.status.success(),
+            "`{name}` did not build:\n{}",
+            String::from_utf8_lossy(&built.stderr)
         );
 
-        let typecheck = std::process::Command::new("npx")
-            .args(["tsc", "--noEmit"])
-            .current_dir(built.root())
-            .output()
-            .expect("tsc runs");
+        let typecheck = std::process::Command::new(
+            project
+                .parent()
+                .and_then(Path::parent)
+                .expect("the toolchain root")
+                .join("node_modules/.bin/tsc"),
+        )
+        .args(["--noEmit", "-p", "."])
+        .current_dir(&project)
+        .output()
+        .expect("tsc runs");
         assert!(
             typecheck.status.success(),
             "`{name}` does not type-check:\n{}",
             String::from_utf8_lossy(&typecheck.stdout)
         );
 
-        // Constructing the graph is a stronger check than compiling it: a state
-        // model LangGraph refuses, or an edge to a node that is not registered,
-        // is a runtime error at build time and a green `tsc` either way.
+        // Constructing every flow's graph is a stronger check than compiling it:
+        // an edge to a node that is not registered, or a node reachable only
+        // through a control-transfer position that `ends` did not declare, is a
+        // runtime error at construction and a green `tsc` either way.
         let construct = std::process::Command::new("node")
             .args([
                 "--input-type=module",
                 "-e",
-                "const graph = await import('./src/graph.ts'); graph.createBuilder().compile();",
+                "const graph = await import('./src/graph.ts');\
+                 graph.createBuilder();\
+                 if (Object.keys(graph.flows).length === 0) process.exit(0);\
+                 for (const flow of Object.values(graph.flows)) {\
+                   if (typeof flow.invoke !== 'function') throw new Error(`${flow.address} has no graph`);\
+                 }",
             ])
-            .current_dir(built.root())
+            .current_dir(&project)
             .output()
             .expect("node runs");
         assert!(

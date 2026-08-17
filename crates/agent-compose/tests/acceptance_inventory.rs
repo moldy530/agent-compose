@@ -98,13 +98,11 @@ const CODEGEN: &[Criterion] = &[
             ),
             (
                 "state_channels_carry_their_declared_types_and_defaults",
-                Status::Pending("pending: `agent-compose run` must execute the emitted graph"),
+                Status::Live,
             ),
             (
                 "a_tagged_union_output_is_narrowed_per_variant_and_a_bad_tag_is_rejected",
-                Status::Pending(
-                    "pending: an agent node fn must parse its answer with the emitted union schema",
-                ),
+                Status::Pending("pending: codegen must emit subgraphs"),
             ),
         ],
     },
@@ -114,35 +112,55 @@ const CODEGEN: &[Criterion] = &[
         tests: &[
             (
                 "an_agent_node_sends_its_prompt_input_and_output_schema",
-                Status::Pending("pending: codegen must emit agent node fns"),
+                Status::Live,
             ),
             // The same criterion on the other HTTP surface. Three of grammar
             // 12.1's six provider kinds reach Chat Completions, so a node fn
             // that only works on Messages is half a node fn.
             (
                 "an_agent_node_sends_its_prompt_input_and_output_schema_on_chat_completions",
-                Status::Pending("pending: codegen must emit agent node fns"),
+                Status::Live,
             ),
             (
                 "an_agent_node_bounds_its_tool_loop_at_max_tool_iterations",
-                Status::Pending("pending: codegen must emit the agent tool loop"),
+                Status::Live,
+            ),
+            // The other three kinds this milestone executes, which are not the
+            // model's: an inline `exec:`, an inline `http:`, and a `function:`
+            // over a `tool.*` (grammar 8.2, 8.3, 8.4).
+            (
+                "the_deterministic_node_kinds_run_and_decode_their_results",
+                Status::Live,
             ),
         ],
     },
     Criterion {
         bullet: Bullet::Codegen,
         phrase: "routers with embedded CEL",
-        tests: &[(
-            "an_edge_guard_routes_on_the_source_nodes_structured_output",
-            Status::Pending("pending: codegen must emit routers with embedded CEL"),
-        )],
+        tests: &[
+            (
+                "an_edge_guard_routes_on_the_source_nodes_structured_output",
+                Status::Live,
+            ),
+            // The two rules of grammar 7.3 an enum guard alone does not reach:
+            // multicast with a per-step join, and what a `skip` changes about
+            // the routing algorithm (rule 6, Decision D97).
+            (
+                "a_multicast_fork_fires_every_true_edge_and_the_convergence_runs_once",
+                Status::Live,
+            ),
+            (
+                "a_skipped_node_routes_through_its_else_edge_and_writes_nothing",
+                Status::Live,
+            ),
+        ],
     },
     Criterion {
         bullet: Bullet::Codegen,
         phrase: "bounded cycles",
         tests: &[(
             "a_bounded_cycle_leaves_through_its_escape_edge_when_the_budget_is_spent",
-            Status::Pending("pending: codegen must emit the per-cycle iteration counter"),
+            Status::Live,
         )],
     },
     Criterion {
@@ -177,11 +195,17 @@ const CODEGEN: &[Criterion] = &[
         tests: &[
             (
                 "a_node_retries_its_model_call_per_its_declared_policy",
-                Status::Pending("pending: codegen must emit retry policy"),
+                Status::Live,
             ),
             (
                 "a_node_timeout_fires_and_its_error_policy_takes_over",
-                Status::Pending("pending: codegen must emit timeout policy"),
+                Status::Live,
+            ),
+            // The same budget over a child process, and the third `on_error`
+            // strategy: a fallback replaces the node's own edges (D21).
+            (
+                "a_node_timeout_fires_over_a_child_process_and_its_fallback_takes_over",
+                Status::Live,
             ),
         ],
     },
@@ -234,7 +258,7 @@ const CODEGEN: &[Criterion] = &[
         phrase: "env-ref presence checks at process start",
         tests: &[(
             "a_missing_env_ref_fails_at_process_start_naming_the_variable",
-            Status::Pending("pending: `agent-compose run` must execute the emitted graph"),
+            Status::Live,
         )],
     },
 ];
@@ -360,7 +384,7 @@ const STRATEGY: &[Criterion] = &[
         // topology yet, so "constructs its graph" is not yet a claim to make.
         tests: &[(
             "every_generated_project_type_checks_and_constructs_its_graph",
-            Status::Pending("pending: codegen must assemble the flows into `src/graph.ts`"),
+            Status::Live,
         )],
     },
     Criterion {
@@ -368,7 +392,7 @@ const STRATEGY: &[Criterion] = &[
         phrase: "shared fixtures (expression + input + expected result) executed against both the Rust validator's interpreter and the JS evaluator embedded in generated code",
         tests: &[(
             "the_generated_cel_evaluator_agrees_with_the_validator_on_the_conformance_corpus",
-            Status::Pending("pending: generated routers must embed a JS CEL evaluator"),
+            Status::Live,
         )],
     },
 ];

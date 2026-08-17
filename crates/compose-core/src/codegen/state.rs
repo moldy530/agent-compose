@@ -121,6 +121,7 @@ pub fn module(ir: &Ir, names: &Names) -> super::GeneratedFile {
     contents.push_str(MODULE_DOC);
     contents
         .push_str("\nimport { Annotation, MessagesAnnotation } from \"@langchain/langgraph\";\n");
+    contents.push_str("\nimport * as runtime from \"./runtime.ts\";\n");
     if !channels.is_empty() {
         contents.push_str("import type { z } from \"zod\";\n\n");
         contents.push_str("import {\n");
@@ -147,6 +148,8 @@ pub fn module(ir: &Ir, names: &Names) -> super::GeneratedFile {
     }
     contents.push_str(&names::doc("  ", &MESSAGES_DOC.map(String::from)));
     contents.push_str("  messages: MessagesAnnotation.spec.messages,\n");
+    contents.push_str(&names::doc("  ", &RUN_DOC.map(String::from)));
+    contents.push_str(RUN_CHANNEL);
     contents.push_str("};\n");
 
     contents.push_str(TAIL);
@@ -170,6 +173,23 @@ const MESSAGES_DOC: [&str; 2] = [
     "The implicit conversation history (grammar 10.4, PRD 5.7 tier 3): append-only,",
     "never declared in `state:`, and isolated across flow boundaries by default.",
 ];
+
+const RUN_DOC: [&str; 8] = [
+    "The compiler's own channel: what the *runtime* needs beside the composition's",
+    "channels and cannot put anywhere else — the flow instance's input object and",
+    "execution identity (the `input` and `execution` roots of grammar 4.1), the",
+    "per-bounded-edge counters grammar 7.4 requires in graph state, the per-node",
+    "traversal ordinals of grammar 9.4, the step number of grammar 7.6, and the",
+    "routing trace PRD 5.3 asks for.",
+    "",
+    "Grammar 2.1's identifier cannot spell `$run`, so no composition collides with it.",
+];
+
+const RUN_CHANNEL: &str = "  \
+$run: Annotation<runtime.RunChannel, Partial<runtime.RunChannel>>({\n    \
+reducer: runtime.mergeRun,\n    \
+default: runtime.emptyRun,\n  \
+}),\n";
 
 const TAIL: &str = r#"
 /** The state schema the graph is built from. */

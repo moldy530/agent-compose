@@ -25,9 +25,18 @@
 //! two implementations are held to the same accept/reject decision and to the
 //! same values, not to one another's wording.
 //!
-//! Plain JSON data files, one loader per implementation: nothing here imports
-//! anything of this crate's, so the corpus stays portable to a runner written
-//! in another language.
+//! Plain JSON data files, one loader per implementation: the **fixtures**
+//! import nothing and describe nothing but data, so the corpus stays portable
+//! to a runner written in another language — `crates/agent-compose/tests/
+//! compiled_graph_acceptance/cel-conformance.mjs` is the second one, over the
+//! evaluator a generated project embeds.
+//!
+//! The runner does reach into this crate for one thing:
+//! [`compose_core::cel::evaluation_context`], the context the Rust column
+//! evaluates under. That decision — which standard overloads this project
+//! supplies where the pinned crate is missing one — belongs to the project
+//! rather than to a test, or the two runs of "the Rust column" in this
+//! repository could be configured differently.
 //!
 //! # What it covers
 //!
@@ -170,7 +179,7 @@ fn every_case_evaluates_to_what_it_declares() {
                 continue;
             }
         };
-        let mut context = Context::default();
+        let mut context = compose_core::cel::evaluation_context();
         if let Json::Object(roots) = &case.input {
             for (name, root) in roots {
                 context.add_variable_from_value(name.clone(), value(root));
@@ -224,17 +233,16 @@ fn every_case_is_named_once() {
 /// `size(string)` is the CEL specification's count of **code points**; `cel`
 /// 0.14.3 returns the count of **bytes**, and a JS evaluator over
 /// `String.prototype.length` would return UTF-16 code units — three answers for
-/// `'👍'` (1, 4, 2). `fixtures/cel-conformance/README.md` records why no corpus
-/// case states it: pinning the specification's answer leaves a red test, and
-/// pinning the crate's institutionalises the defect in the artifact whose whole
-/// job is to keep two implementations honest.
+/// `'👍'` (1, 4, 2). The emitted evaluator spreads the string, so it answers the
+/// specification's; `fixtures/cel-conformance/README.md` records why no corpus
+/// case states the pair, why the `matches` fix does not transfer (a registered
+/// function does not override a built-in), and why the gap is safe to leave —
+/// the compiler never evaluates, so the crate is the corpus's reference column
+/// rather than a runtime.
 ///
-/// A paragraph is not a check, though, and the note has to be *acted on*
-/// before the JS evaluator lands. This test is what makes it impossible to
-/// forget: it pins what the pinned crate does today, so an upstream fix or a
-/// version bump turns it red and sends whoever bumped it back to the README —
-/// where the answer is either a corpus case at last, or a `size` overload this
-/// project supplies.
+/// A paragraph is not a check. This test pins what the pinned crate does today,
+/// so an upstream fix or a version bump turns it red and sends whoever bumped it
+/// back to the README — where the answer is a corpus case at last.
 #[test]
 fn the_size_of_a_non_ascii_string_still_diverges_from_the_specification() {
     let size = |source: &str| {
@@ -254,25 +262,43 @@ fn the_size_of_a_non_ascii_string_still_diverges_from_the_specification() {
     assert_eq!(size("size('abc')"), 3);
 }
 
-/// The second recorded gap, for the same reason and with the same tripwire.
+/// The second recorded gap, **closed** — and pinned here so it stays closed for
+/// the reason it was closed rather than by accident.
 ///
 /// CEL's standard definitions give `matches` two overloads — `s.matches(p)` and
 /// the global `matches(s, p)` — and `cel` 0.14.3 implements only the first. The
 /// compiler's own front-end accepts both, because grammar 4.1 puts the standard
-/// function set on the surface and the specification is what defines it; that
-/// leaves one expression `validate` accepts and the *validator's* evaluator
-/// cannot run, which is a fact worth a red test the day it stops being true.
+/// function set on the surface and the specification is what defines it, which
+/// left one expression `validate` accepts and this project's Rust evaluator
+/// could not run. [`compose_core::cel::evaluation_context`] supplies the missing
+/// overload — the crate's *own* implementation registered under the global name,
+/// so the two spellings cannot answer differently — and `strings.json` now
+/// states both.
+///
+/// Two claims, because either could stop being true on its own: the stock
+/// context still lacks the overload (so the registration is doing work rather
+/// than shadowing something), and the shared context has it.
 #[test]
-fn the_global_spelling_of_matches_is_still_missing_from_the_crate() {
+fn the_global_spelling_of_matches_is_supplied_where_the_crate_lacks_it() {
     let program = Program::compile("matches('a1', '^a[0-9]$')").expect("the expression parses");
     assert!(
         program.execute(&Context::default()).is_err(),
-        "cel 0.14.3 gained the global `matches` overload: state it in strings.json"
+        "cel 0.14.3 gained the global `matches` overload: `evaluation_context` no longer has to \
+         supply it, and the registration can go"
     );
-    // The receiver spelling, which both implementations have, is in the corpus.
+    assert_eq!(
+        program
+            .execute(&compose_core::cel::evaluation_context())
+            .expect("the shared context supplies it"),
+        Value::Bool(true)
+    );
+    // The receiver spelling is the one the crate carries, and it still answers
+    // the same under the shared context.
     let program = Program::compile("'a1'.matches('^a[0-9]$')").expect("the expression parses");
     assert_eq!(
-        program.execute(&Context::default()).expect("it evaluates"),
+        program
+            .execute(&compose_core::cel::evaluation_context())
+            .expect("it evaluates"),
         Value::Bool(true)
     );
 }

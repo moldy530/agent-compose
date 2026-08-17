@@ -2,10 +2,15 @@
 
 Shared fixtures for the two CEL implementations this project ships against: the
 Rust evaluator the compiler links (`cel`, pinned in
-`crates/compose-core/Cargo.toml`) and the JS evaluator M1 embeds in generated
-routers. CLAUDE.md's validation strategy requires both to be run against these
-files, with divergence failing CI; `crates/compose-core/tests/cel_conformance.rs`
-is the Rust runner.
+`crates/compose-core/Cargo.toml`) and the JS evaluator generated routers embed
+(`compose_core::codegen::cel`, emitted as `src/cel.ts`). CLAUDE.md's validation
+strategy requires both to be run against these files, with divergence failing
+CI. Two runners, one corpus:
+
+| runner | column |
+|---|---|
+| `crates/compose-core/tests/cel_conformance.rs` | the pinned `cel` crate, under `compose_core::cel::evaluation_context` |
+| `crates/agent-compose/tests/compiled_graph_acceptance/cel-conformance.mjs` | the evaluator a built project embeds, under the pinned Node |
 
 ## Format
 
@@ -46,27 +51,40 @@ id. The Rust answers are the specification's, so these are ordinary green cases.
 
 ## What is deliberately not here
 
-`size()` over non-ASCII strings. The CEL specification defines `size` on a
-string as its number of **code points**; `cel` 0.14.3 returns its number of
-**bytes** (`size('héllo')` is 6 there, and 5 by the specification — a JS
-evaluator spelling it `[...s].length` would answer 5 too, and one spelling it
-`s.length` would answer 5 here and 2 for `'👍'`). Pinning the specification's
-answer would leave a red test, and pinning the crate's would institutionalise a
-defect in the artifact whose whole job is to keep two implementations honest, so
-the corpus states only ASCII `size()` cases.
+`size()` over non-ASCII strings — the one gap the JS evaluator's arrival did not
+close. The CEL specification defines `size` on a string as its number of **code
+points**; `cel` 0.14.3 returns its number of **bytes** (`size('héllo')` is 6
+there and 5 by the specification; the emitted evaluator spells it
+`[...value].length`, so it answers 5, and 1 for `'👍'` where the crate answers
+4). Pinning the specification's answer would leave a red test, and pinning the
+crate's would institutionalise a defect in the artifact whose whole job is to
+keep two implementations honest, so the corpus states only ASCII `size()` cases
+— where all three answers agree.
 
-This paragraph is not the only record: `cel_conformance.rs`'s
+Three things were tried before settling for that, and the record matters because
+the obvious fix does not work: `Context::add_function("size", …)` does **not**
+override a built-in (the standard set is consulted first), so this project
+cannot supply a conformant `size` the way it supplies the missing `matches`
+below; an upstream fix is not available at the pinned version; and refusing
+`size()` over a string at validate time would refuse `size(state.feedback) > 0`,
+which grammar 4.1 and 7.3.1 both write out as the ordinary shape of a guard.
+
+What makes the gap **safe to leave** is where each evaluator runs: the compiler
+never evaluates an expression (`compose_core::cel` type-checks and stops), so
+the Rust column is the corpus's reference implementation rather than a runtime,
+and the only evaluator a compiled graph ever runs is the emitted one — which
+follows the specification. The row is carried in the divergence ledger in
+`compose_core::codegen::cel`, and
 `the_size_of_a_non_ascii_string_still_diverges_from_the_specification` pins what
-the pinned crate does today, so an upstream fix or a pin bump goes red and sends
-whoever made it back here. It has to be resolved — upstream fix, pin bump, or a
-`size` overload supplied by this project — before the JS evaluator lands.
+the crate does today, so an upstream fix or a pin bump goes red and sends
+whoever made it back here to add the cases.
 
-`matches` in its **global** spelling, for the mirror-image reason. CEL's
-standard definitions give it two overloads, `s.matches(p)` and
-`matches(s, p)`; `cel` 0.14.3 implements only the first, so the corpus states
-only the first. The compiler's expression front-end accepts both — grammar 4.1
-puts the standard function set on the surface, and the specification is what
-defines it — which leaves one expression `validate` accepts and the validator's
-own evaluator cannot run.
-`the_global_spelling_of_matches_is_still_missing_from_the_crate` is that gap's
-tripwire; when it goes red, the case belongs in `strings.json`.
+`matches` in its **global** spelling is the gap that **was** closed. CEL's
+standard definitions give the predicate two overloads, `s.matches(p)` and
+`matches(s, p)`; `cel` 0.14.3 implements only the first, while the compiler's
+front-end accepts both — grammar 4.1 puts the standard function set on the
+surface, and the specification is what defines it — which left one expression
+`validate` accepts and this project's Rust evaluator could not run.
+`compose_core::cel::evaluation_context` now registers the crate's *own*
+implementation under the global name, so the two spellings cannot answer
+differently, and `strings.json` states both.

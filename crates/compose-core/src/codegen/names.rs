@@ -82,7 +82,14 @@ const RESERVED: &[&str] = &[
     "GraphState",
     "GraphStateUpdate",
     // `src/graph.ts`
+    "END",
+    "START",
     "StateGraph",
+    "runtime",
+    "flows",
+    "CompiledFlow",
+    "FlowRun",
+    "runFlow",
     "createBuilder",
     // `src/env.ts`
     "process",
@@ -135,6 +142,24 @@ impl Names {
     #[must_use]
     pub fn ty(&self, path: &str) -> String {
         capitalize(self.value(path))
+    }
+
+    /// Assign a name to a path the schema enumeration does not reach.
+    ///
+    /// `src/graph.ts` declares module-level names of its own — one per provider,
+    /// model, agent and tool binding, one per flow builder, one per node
+    /// descriptor, one per shape — and they share the emitted project's single
+    /// module namespace with the schemas. Declaring them here rather than
+    /// deriving them separately is what makes a collision impossible instead of
+    /// unlikely: [`Names::assign`]'s `_2` suffix is the same mechanism, over one
+    /// table.
+    ///
+    /// Idempotent, so a path declared twice keeps its first name.
+    pub fn declare(&mut self, path: &str) -> &str {
+        if !self.assigned.contains_key(path) {
+            self.assign(path);
+        }
+        self.value(path)
     }
 
     /// Assign one name, disambiguating against everything assigned so far.

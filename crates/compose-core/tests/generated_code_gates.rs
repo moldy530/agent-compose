@@ -227,8 +227,14 @@ fn every_generated_project_constructs_its_state_model() {
             .as_ref()
             .map(|state| state.entries.keys().cloned().collect())
             .unwrap_or_default();
-        // Grammar 10.4: `messages` is implicit, never declared, and always there.
+        // Two channels a composition never declares and every graph has:
+        // grammar 10.4's implicit conversation history, and the compiler's own
+        // `$run` — the flow input, the execution identity, the per-bounded-edge
+        // counters grammar 7.4 puts in graph state, and the routing trace
+        // (see `codegen::state`). Both are named here rather than filtered out,
+        // so a third one appearing is this test's failure rather than nobody's.
         declared.push("messages".to_string());
+        declared.push("$run".to_string());
         assert_eq!(
             channels, declared,
             "`{}`'s state model is not the composition's channel set",
@@ -463,8 +469,25 @@ fn the_emitted_state_model_reduces_the_way_its_policies_say() {
             entry.golden,
             String::from_utf8_lossy(&output.stderr),
         );
-        let answer: Value =
+        let mut answer: Value =
             serde_json::from_slice(&output.stdout).expect("the runner prints the state as JSON");
+        // The compiler's own channel is not what this gate is about: it holds no
+        // reduce policy an author wrote, and its own reducer is decided by
+        // `the_run_channel_folds_concurrent_contributions_deterministically`
+        // in `codegen::runtime`'s corpus. What is asserted here is that it is
+        // *there* and starts empty, which is the one thing a wrong `default:`
+        // would break.
+        let run = answer
+            .as_object_mut()
+            .expect("the state is an object")
+            .remove("$run")
+            .expect("every state model carries the compiler's own channel");
+        assert_eq!(
+            run["step"], 0,
+            "nothing here runs a node, so no step is taken"
+        );
+        assert_eq!(run["trace"], serde_json::json!([]));
+        assert_eq!(run["iterations"], serde_json::json!({}));
         let expected: Value = serde_json::from_str(entry.expected).expect("the row is JSON");
         assert_eq!(
             answer, expected,

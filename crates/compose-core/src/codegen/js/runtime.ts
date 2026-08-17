@@ -1,0 +1,1382 @@
+//
+// What a compiled node does when it runs (PRD 5.5, grammar 8, 9).
+//
+// `./graph.ts` is the composition: one descriptor per node, the guards, the
+// budgets, the wiring. This module is everything those descriptors share — the
+// activity loop, the provider surfaces, the subprocess and HTTP wrappers, and
+// the router. It is byte-identical in every project this compiler release
+// builds, which is what makes a golden diff about the *composition* rather than
+// about the runtime it happens to sit beside.
+//
+// # Temporal discipline (PRD 5.5)
+//
+// The compiled graph is the workflow — deterministic and replayable — and nodes
+// are activities: effectful, retryable, and the only place a clock, a socket or
+// a child process appears. Everything in this module that touches one is behind
+// [`runActivity`], which owns the per-node `retry` / `timeout` / `on_error`
+// contract of grammar 9 and reports failures as `NodeFailure`s naming the node.
+//
+// # Why the policies are not LangGraph's
+//
+// LangGraph 1.4 has `retryPolicy` and `timeout` options on `addNode`, and they
+// are deliberately not used. Its timeout "applies to a single attempt … the
+// timer resets for each retry attempt", while grammar 9.2 bounds **one node
+// execution, all retry attempts included**, and grammar 9.1 says outright that
+// "retry attempts consume the node's `timeout` budget". Those are different
+// contracts, and the one this compiler is held to is the grammar's — so the
+// budget is a deadline this module carries across attempts.
+//
+// # Why the model is called with `fetch`
+//
+// No provider SDK, and no `withStructuredOutput`. Three reasons, in the order
+// they bind:
+//
+//  1. **The schema a model is constrained by has to be the schema its answer is
+//     parsed with.** PRD 5.2 makes structured output load-bearing for routing,
+//     and `codegen::schema`'s *What a provider is handed* records what the
+//     LangChain path does to it: converting the emitted Zod to JSON Schema drops
+//     every check Zod models as a refinement — six of the ten `format:`s, both
+//     length bounds, `unique_items` — so the model would be told less than the
+//     parse then demands of it. This module sends the JSON Schema the compiler
+//     *publishes* (`codegen::schema`'s JSON column), which the conformance
+//     corpus proves accepts exactly what the emitted Zod accepts.
+//  2. **The wire is a contract this project tests.** `crates/mock-provider` is
+//     strict about the request a compiled graph sends; going through an SDK
+//     would put its defaults and its extra keys between codegen and that gate.
+//  3. **One fewer pinned dependency** (PRD 5.12), and no SDK release able to
+//     move the runtime's semantics without moving the compiler's.
+//
+// `fetch` is global from Node 18 and the project's floor is 22.18.
+
+import { spawn } from "node:child_process";
+import process from "node:process";
+
+import { Command } from "@langchain/langgraph";
+
+import { CelError, bind, evaluate, evaluateGuard, toJson } from "./cel.ts";
+import type { CelValue, Roots, Shape } from "./cel.ts";
+
+// ---------------------------------------------------------------------------
+// Failures
+// ---------------------------------------------------------------------------
+
+/** A node error: what grammar 9's `on_error` decides the fate of. */
+export class NodeFailure extends Error {
+  readonly flow: string;
+  readonly node: string;
+  readonly attempts: number;
+
+  constructor(flow: string, node: string, attempts: number, detail: string, cause?: unknown) {
+    super(`${flow} node \`${node}\` failed: ${detail}`);
+    this.name = "NodeFailure";
+    this.flow = flow;
+    this.node = node;
+    this.attempts = attempts;
+    this.cause = cause;
+  }
+}
+
+/** A node whose `timeout:` budget ran out (grammar 9.2). */
+export class NodeTimeout extends Error {
+  constructor(node: string, budgetMs: number, attempts: number) {
+    super(
+      `\`${node}\` timed out: its ${budgetMs}ms budget was spent after ${attempts} attempt(s) (grammar 9.2)`,
+    );
+    this.name = "NodeTimeout";
+  }
+}
+
+/** Grammar 7.3 rule 7: a completed node with no edge to take. */
+export class NoViableRoute extends Error {
+  constructor(flow: string, node: string) {
+    super(
+      `${flow}: no viable route out of \`${node}\` — every outgoing edge was untaken (grammar 7.3 rule 7)`,
+    );
+    this.name = "NoViableRoute";
+  }
+}
+
+/** A construct this compiler release parses, validates, and does not yet run. */
+export class Unimplemented extends Error {
+  constructor(what: string, bullet: string) {
+    super(`${what} is not executed by this compiler release (PRD §7 M1: ${bullet})`);
+    this.name = "Unimplemented";
+  }
+}
+
+/** A provider answered something other than a completion. */
+export class ProviderFailure extends Error {
+  readonly status: number;
+  readonly body: string;
+
+  constructor(model: string, status: number, body: string) {
+    super(`\`${model}\` answered ${status}: ${body.slice(0, 400)}`);
+    this.name = "ProviderFailure";
+    this.status = status;
+    this.body = body;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The environment, read where it is used
+// ---------------------------------------------------------------------------
+
+/**
+ * One `${ENV}` reference, resolved at the moment a node needs it.
+ *
+ * `./index.ts` checks presence at process start (PRD 5.9) and this reads the
+ * value. The read is late on purpose: importing `./graph.ts` builds descriptors
+ * and constructs graphs, which a tool with no credentials — `tsc`, a graph
+ * drawing, the construction gate — must be able to do.
+ */
+export function environmentValue(name: string, site: string): string {
+  const value = process.env[name];
+  if (value === undefined) {
+    throw new Error(`\`${name}\` is not set (referenced by ${site})`);
+  }
+  return value;
+}
+
+/** One part of an interpolable string (grammar 4.3 class 2). */
+export type Interpolation = string | { readonly env: string; readonly site: string };
+
+/** Substitute a class-2 string's references (grammar 4.3). */
+export function interpolate(parts: readonly Interpolation[]): string {
+  return parts
+    .map((part) => (typeof part === "string" ? part : environmentValue(part.env, part.site)))
+    .join("");
+}
+
+// ---------------------------------------------------------------------------
+// Policy: grammar 9
+// ---------------------------------------------------------------------------
+
+/** A resolved `retry:` block (grammar 9.1). */
+export interface RetryPolicy {
+  readonly max: number;
+  readonly backoffMs: number;
+  readonly multiplier: number;
+  readonly maxBackoffMs?: number;
+  readonly jitter: boolean;
+}
+
+/** What `on_error:` does once retries are exhausted (grammar 9.2). */
+export type ErrorStrategy = "fail" | "skip" | { readonly fallback: string };
+
+/** One node's resolved policy — levels 2, 3 and 4 of grammar 9.3's chain. */
+export interface NodePolicy {
+  readonly retry?: RetryPolicy;
+  readonly timeoutMs?: number;
+  readonly onError: ErrorStrategy;
+}
+
+/** What one node execution needs from the world. */
+export interface RunContext {
+  /** The flow instance's execution identity (grammar 4.1's `execution`). */
+  readonly execution: { readonly id: string; readonly session_key: string };
+  /** Aborted when the node's `timeout:` budget runs out. */
+  readonly signal: AbortSignal;
+  /** How this attempt is addressed, for a message. */
+  readonly node: string;
+}
+
+const sleep = (ms: number, signal: AbortSignal): Promise<void> =>
+  new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(signal.reason instanceof Error ? signal.reason : new Error("aborted"));
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal.reason instanceof Error ? signal.reason : new Error("aborted"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+
+/** The delay before attempt `attempt` (1 = the first retry), per grammar 9.1. */
+export function backoffFor(policy: RetryPolicy, attempt: number): number {
+  const raw = policy.backoffMs * policy.multiplier ** (attempt - 1);
+  const capped = policy.maxBackoffMs === undefined ? raw : Math.min(raw, policy.maxBackoffMs);
+  // Full jitter: uniform over [0, capped]. The one nondeterminism in a run, and
+  // it moves *when* an attempt happens, never what it answers.
+  return policy.jitter ? Math.random() * capped : capped;
+}
+
+/**
+ * Run one activity under its node's policy: attempts, backoff, and one deadline
+ * across all of them (grammar 9.1, 9.2).
+ *
+ * Answers the activity's value, or throws — `on_error` is the router's to
+ * apply, because `skip` and `fallback` are routing outcomes rather than values
+ * (grammar 9.2, Decision D97).
+ */
+export async function runActivity<T>(
+  flow: string,
+  node: string,
+  policy: NodePolicy,
+  execution: RunContext["execution"],
+  activity: (context: RunContext) => Promise<T>,
+): Promise<{ value: T; attempts: number }> {
+  const attempts = 1 + (policy.retry?.max ?? 0);
+  const controller = new AbortController();
+  const budget = policy.timeoutMs;
+  let expired = false;
+  const timer =
+    budget === undefined
+      ? undefined
+      : setTimeout(() => {
+          expired = true;
+          controller.abort(new NodeTimeout(node, budget, 0));
+        }, budget);
+
+  try {
+    let last: unknown;
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      if (expired) break;
+      try {
+        const value = await activity({ execution, signal: controller.signal, node });
+        return { value, attempts: attempt };
+      } catch (error) {
+        last = error;
+        if (expired) break;
+        if (attempt === attempts) break;
+        const delay = backoffFor(policy.retry!, attempt);
+        try {
+          await sleep(delay, controller.signal);
+        } catch {
+          break;
+        }
+      }
+    }
+    if (expired) {
+      throw new NodeFailure(
+        flow,
+        node,
+        attempts,
+        new NodeTimeout(node, budget ?? 0, attempts).message,
+        last,
+      );
+    }
+    throw new NodeFailure(flow, node, attempts, describe(last), last);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+function describe(error: unknown): string {
+  if (error instanceof Error) return `${error.name}: ${error.message}`;
+  return String(error);
+}
+
+// ---------------------------------------------------------------------------
+// Providers and models
+// ---------------------------------------------------------------------------
+
+/** The four provider kinds that speak an HTTP surface (grammar 12.1). */
+export type ProviderKind = "anthropic" | "openai" | "openai_compatible" | "azure_openai";
+
+/** A resolved `provider.*` (grammar 12.1). Values are read when a node runs. */
+export interface ProviderBinding {
+  readonly address: string;
+  readonly kind: ProviderKind;
+  readonly apiKey?: string;
+  readonly baseUrl?: string;
+  readonly apiVersion?: string;
+  readonly organization?: string;
+  readonly headers?: Readonly<Record<string, string>>;
+}
+
+/** A resolved `model.*` in its direct form (grammar 12.2). */
+export interface ModelBinding {
+  readonly address: string;
+  readonly id: string;
+  readonly provider: ProviderBinding;
+  readonly settings: Readonly<Record<string, unknown>>;
+}
+
+/** A JSON Schema, as `codegen::schema`'s JSON column publishes it. */
+export type JsonSchema = Readonly<Record<string, unknown>>;
+
+/** One tool as a provider is told about it. */
+export interface ToolSpec {
+  readonly name: string;
+  readonly description: string;
+  readonly schema: JsonSchema;
+}
+
+/** One turn of the conversation, in a shape both surfaces can render. */
+export type Turn =
+  | { readonly role: "user"; readonly text: string }
+  | {
+      readonly role: "assistant";
+      readonly text?: string;
+      readonly toolCalls?: readonly { id: string; name: string; args: unknown }[];
+    }
+  | {
+      readonly role: "tool";
+      readonly results: readonly { id: string; name: string; content: string }[];
+    };
+
+/** What a model answered. */
+export interface ModelAnswer {
+  readonly text: string | null;
+  readonly toolCalls: readonly { id: string; name: string; args: unknown }[];
+  readonly structured: unknown | null;
+  readonly stopReason: string | null;
+}
+
+/**
+ * The `max_tokens` an Anthropic request carries when the model declares none.
+ *
+ * The Messages API requires the key (`WIRE-NOTES` (8)), and grammar 12.2 puts
+ * the knob in `settings:` where an author sets it — so this is the value a
+ * composition that did not is given, not a policy.
+ */
+const ANTHROPIC_MAX_TOKENS = 4096;
+
+/** Whether OpenAI's structured-output decoder can be asked to close this schema. */
+function strictable(schema: unknown): boolean {
+  if (typeof schema !== "object" || schema === null) return true;
+  const object = schema as Record<string, unknown>;
+  if (object["type"] === "object") {
+    if (object["additionalProperties"] !== false) return false;
+    const properties = (object["properties"] ?? {}) as Record<string, unknown>;
+    const required = (object["required"] ?? []) as unknown[];
+    for (const name of Object.keys(properties)) {
+      if (!required.includes(name)) return false;
+    }
+  }
+  for (const value of Object.values(object)) {
+    if (Array.isArray(value)) {
+      if (!value.every(strictable)) return false;
+    } else if (!strictable(value)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function baseUrl(provider: ProviderBinding): string {
+  if (provider.baseUrl !== undefined) return provider.baseUrl.replace(/\/+$/, "");
+  if (provider.kind === "anthropic") return "https://api.anthropic.com";
+  if (provider.kind === "openai") return "https://api.openai.com";
+  throw new Error(
+    `\`${provider.address}\` is \`kind: ${provider.kind}\`, which has no default endpoint: declare \`base_url:\``,
+  );
+}
+
+async function send(
+  model: ModelBinding,
+  url: string,
+  headers: Record<string, string>,
+  body: unknown,
+  signal: AbortSignal,
+): Promise<Record<string, unknown>> {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...headers, ...(model.provider.headers ?? {}) },
+    body: JSON.stringify(body),
+    signal,
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    throw new ProviderFailure(model.address, response.status, text);
+  }
+  return JSON.parse(text) as Record<string, unknown>;
+}
+
+/** One model call, rendered for whichever surface the provider kind reaches. */
+export async function callModel(
+  model: ModelBinding,
+  request: {
+    readonly system: string;
+    readonly turns: readonly Turn[];
+    readonly tools: readonly ToolSpec[];
+    readonly pinned?: ToolSpec;
+  },
+  signal: AbortSignal,
+): Promise<ModelAnswer> {
+  return model.provider.kind === "anthropic"
+    ? await callMessages(model, request, signal)
+    : await callChatCompletions(model, request, signal);
+}
+
+async function callMessages(
+  model: ModelBinding,
+  request: {
+    readonly system: string;
+    readonly turns: readonly Turn[];
+    readonly tools: readonly ToolSpec[];
+    readonly pinned?: ToolSpec;
+  },
+  signal: AbortSignal,
+): Promise<ModelAnswer> {
+  const settings = { ...model.settings };
+  const maxTokens = settings["max_tokens"] ?? ANTHROPIC_MAX_TOKENS;
+  delete settings["max_tokens"];
+
+  const messages = request.turns.map((turn) => {
+    if (turn.role === "user") return { role: "user", content: turn.text };
+    if (turn.role === "tool") {
+      return {
+        role: "user",
+        content: turn.results.map((result) => ({
+          type: "tool_result",
+          tool_use_id: result.id,
+          content: result.content,
+        })),
+      };
+    }
+    const content: unknown[] = [];
+    if (turn.text !== undefined && turn.text !== "") content.push({ type: "text", text: turn.text });
+    for (const call of turn.toolCalls ?? []) {
+      content.push({ type: "tool_use", id: call.id, name: call.name, input: call.args });
+    }
+    return { role: "assistant", content };
+  });
+
+  const offered = [...request.tools, ...(request.pinned === undefined ? [] : [request.pinned])];
+  const body: Record<string, unknown> = {
+    model: model.id,
+    max_tokens: maxTokens,
+    system: request.system,
+    messages,
+    ...settings,
+  };
+  if (offered.length > 0) {
+    body["tools"] = offered.map((tool) => ({
+      name: tool.name,
+      description: tool.description,
+      input_schema: tool.schema,
+    }));
+  }
+  if (request.pinned !== undefined) {
+    body["tool_choice"] = { type: "tool", name: request.pinned.name };
+  }
+
+  const answer = await send(
+    model,
+    `${baseUrl(model.provider)}/v1/messages`,
+    {
+      "x-api-key": model.provider.apiKey ?? "",
+      "anthropic-version": "2023-06-01",
+    },
+    body,
+    signal,
+  );
+
+  const blocks = (answer["content"] ?? []) as { type: string; [key: string]: unknown }[];
+  const texts = blocks.filter((block) => block.type === "text").map((block) => block["text"]);
+  const uses = blocks.filter((block) => block.type === "tool_use");
+  const pinnedUse =
+    request.pinned === undefined
+      ? undefined
+      : uses.find((use) => use["name"] === request.pinned!.name);
+  return {
+    text: texts.length > 0 ? texts.join("") : null,
+    toolCalls: uses
+      .filter((use) => use !== pinnedUse)
+      .map((use) => ({
+        id: String(use["id"]),
+        name: String(use["name"]),
+        args: use["input"],
+      })),
+    structured: pinnedUse === undefined ? null : (pinnedUse["input"] ?? null),
+    stopReason: (answer["stop_reason"] as string | null) ?? null,
+  };
+}
+
+async function callChatCompletions(
+  model: ModelBinding,
+  request: {
+    readonly system: string;
+    readonly turns: readonly Turn[];
+    readonly tools: readonly ToolSpec[];
+    readonly pinned?: ToolSpec;
+  },
+  signal: AbortSignal,
+): Promise<ModelAnswer> {
+  const messages: Record<string, unknown>[] = [{ role: "system", content: request.system }];
+  for (const turn of request.turns) {
+    if (turn.role === "user") {
+      messages.push({ role: "user", content: turn.text });
+      continue;
+    }
+    if (turn.role === "tool") {
+      for (const result of turn.results) {
+        messages.push({ role: "tool", tool_call_id: result.id, content: result.content });
+      }
+      continue;
+    }
+    const message: Record<string, unknown> = { role: "assistant", content: turn.text ?? null };
+    if (turn.toolCalls !== undefined && turn.toolCalls.length > 0) {
+      message["tool_calls"] = turn.toolCalls.map((call) => ({
+        id: call.id,
+        type: "function",
+        function: { name: call.name, arguments: JSON.stringify(call.args) },
+      }));
+    }
+    messages.push(message);
+  }
+
+  const body: Record<string, unknown> = { model: model.id, messages, ...model.settings };
+  if (request.tools.length > 0) {
+    body["tools"] = request.tools.map((tool) => ({
+      type: "function",
+      function: { name: tool.name, description: tool.description, parameters: tool.schema },
+    }));
+  }
+  if (request.pinned !== undefined) {
+    // `response_format` rather than a forced function: the schema shapes the
+    // content and leaves the request's own `tools` callable, which is what an
+    // agent whose loop has just ended still has on offer (WIRE-NOTES (3)).
+    body["response_format"] = {
+      type: "json_schema",
+      json_schema: {
+        name: request.pinned.name,
+        strict: strictable(request.pinned.schema),
+        schema: request.pinned.schema,
+      },
+    };
+  }
+
+  const provider = model.provider;
+  const headers: Record<string, string> = {};
+  if (provider.kind === "azure_openai") {
+    headers["api-key"] = provider.apiKey ?? "";
+  } else {
+    headers["authorization"] = `Bearer ${provider.apiKey ?? ""}`;
+    if (provider.organization !== undefined) {
+      headers["openai-organization"] = provider.organization;
+    }
+  }
+  const query =
+    provider.kind === "azure_openai" && provider.apiVersion !== undefined
+      ? `?api-version=${encodeURIComponent(provider.apiVersion)}`
+      : "";
+  const path = provider.kind === "azure_openai" ? "/openai/v1/chat/completions" : "/v1/chat/completions";
+
+  const answer = await send(model, `${baseUrl(provider)}${path}${query}`, headers, body, signal);
+  const choice = ((answer["choices"] ?? []) as Record<string, unknown>[])[0] ?? {};
+  const message = (choice["message"] ?? {}) as Record<string, unknown>;
+  const content = (message["content"] ?? null) as string | null;
+  const calls = ((message["tool_calls"] ?? []) as Record<string, unknown>[]).map((call) => {
+    const fn = (call["function"] ?? {}) as Record<string, unknown>;
+    return {
+      id: String(call["id"]),
+      name: String(fn["name"]),
+      args: JSON.parse(String(fn["arguments"] ?? "{}")) as unknown,
+    };
+  });
+  return {
+    text: content,
+    toolCalls: request.pinned === undefined ? calls : [],
+    structured:
+      request.pinned === undefined || content === null ? null : (JSON.parse(content) as unknown),
+    stopReason: (choice["finish_reason"] as string | null) ?? null,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Agents: the intra-agent tool loop (grammar 5, PRD §9.14)
+// ---------------------------------------------------------------------------
+
+/** One tool an agent may call, and how the graph runs it. */
+export interface AgentTool extends ToolSpec {
+  readonly address: string;
+  invoke(args: unknown, context: RunContext): Promise<unknown>;
+}
+
+/** Everything a compiled `agent:` node needs (grammar 5, 8.1). */
+export interface AgentBinding {
+  readonly address: string;
+  readonly prompt: string;
+  readonly model: ModelBinding;
+  readonly output: ToolSpec;
+  readonly tools: readonly AgentTool[];
+  readonly maxToolIterations: number;
+}
+
+/**
+ * One agent node: the tool loop, then the pinned structured-output call.
+ *
+ * Two shapes, and which one runs is decided by the agent's own `tools:` list:
+ *
+ *  * **No tools** — one call, the output schema offered as the single tool and
+ *    pinned by name. A pinned choice is a promise that the pinned tool is what
+ *    gets called, which is exactly the ask PRD 5.2 makes.
+ *  * **With tools** — the loop first, on calls that offer the agent's tools and
+ *    pin **nothing** (a pinned choice would make the loop unreachable), and the
+ *    pinned call is what ends it. The loop is bounded by `max_tool_iterations`
+ *    (Decision D51, PRD §9.14): the bound counts model calls in the loop, and
+ *    spending it is a node error rather than a silent stop, because a model that
+ *    only ever asks for tools has not answered.
+ *
+ * The final call still offers the agent's tools beside the pinned one: the
+ * history it carries holds `tool_use`/`tool_result` blocks, and both surfaces
+ * refuse a request that carries those without declaring the tools they name.
+ */
+export async function callAgent(
+  agent: AgentBinding,
+  input: unknown,
+  history: readonly Turn[],
+  context: RunContext,
+): Promise<{ output: unknown; history: MessageLike[] }> {
+  const rendered = typeof input === "string" ? input : JSON.stringify(input);
+  const turn: Turn = { role: "user", text: rendered };
+  const turns: Turn[] = [...history, turn];
+
+  if (agent.tools.length > 0) {
+    let iterations = 0;
+    for (;;) {
+      if (iterations >= agent.maxToolIterations) {
+        throw new Error(
+          `\`${agent.address}\` reached its \`max_tool_iterations\` bound of ${agent.maxToolIterations} without answering (Decision D51)`,
+        );
+      }
+      iterations += 1;
+      const answer = await callModel(
+        agent.model,
+        { system: agent.prompt, turns, tools: agent.tools },
+        context.signal,
+      );
+      if (answer.toolCalls.length === 0) {
+        turns.push({ role: "assistant", text: answer.text ?? "" });
+        break;
+      }
+      turns.push({ role: "assistant", text: answer.text ?? "", toolCalls: answer.toolCalls });
+
+      const results: { id: string; name: string; content: string }[] = [];
+      for (const call of answer.toolCalls) {
+        const tool = agent.tools.find((candidate) => candidate.name === call.name);
+        if (tool === undefined) {
+          throw new Error(
+            `\`${agent.address}\` was answered with a call to \`${call.name}\`, which is not one of its tools`,
+          );
+        }
+        const result = await tool.invoke(call.args, context);
+        results.push({ id: call.id, name: call.name, content: JSON.stringify(result) });
+      }
+      turns.push({ role: "tool", results });
+    }
+  }
+
+  const final = await callModel(
+    agent.model,
+    { system: agent.prompt, turns, tools: agent.tools, pinned: agent.output },
+    context.signal,
+  );
+  if (final.structured === null) {
+    throw new Error(
+      `\`${agent.address}\` asked for \`${agent.output.name}\` and the answer carried no structured output`,
+    );
+  }
+  return {
+    output: final.structured,
+    history: [
+      { role: "user", content: rendered },
+      { role: "assistant", content: JSON.stringify(final.structured) },
+    ],
+  };
+}
+
+/**
+ * What one agent node contributes to the shared history channel: its rendered
+ * input, and its structured answer (grammar 10.4, PRD 5.7 tier 3).
+ *
+ * The intra-agent tool loop's own turns are **not** among them, and the reason
+ * is a property of the surface rather than a preference: an assistant turn
+ * carrying `tool_use` blocks is only well formed when the very next turn answers
+ * every one of them, so a history that kept the loop's turns and was then
+ * appended to by the *next* node would hand a provider a conversation it
+ * refuses. The loop is the agent's own business — the trace records what it
+ * called (PRD 5.3) — and what crosses into the shared channel is the exchange:
+ * one user turn in, one assistant turn out, strictly alternating however many
+ * agent nodes a flow instance runs.
+ */
+export type MessageLike = { readonly role: "user" | "assistant"; readonly content: string };
+
+/** The shared history channel as an agent call reads it. */
+export function historyTurns(messages: readonly unknown[]): Turn[] {
+  return messages.map((message) => {
+    const held = message as { role?: string; content?: unknown; getType?: () => string };
+    const role = typeof held.getType === "function" ? held.getType() : (held.role ?? "user");
+    const text = typeof held.content === "string" ? held.content : JSON.stringify(held.content);
+    return role === "ai" || role === "assistant"
+      ? ({ role: "assistant", text } as const)
+      : ({ role: "user", text } as const);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// `exec` and `http` (grammar 6.1, 8.2, 8.3)
+// ---------------------------------------------------------------------------
+
+/** How a result is read out of a process or a response (grammar 8.2, 8.3). */
+export interface Decoding {
+  /** Envelope fields the surface binds directly, by name. */
+  readonly envelope: readonly string[];
+  /** Fields decoded from the payload. */
+  readonly decoded: readonly string[];
+  /**
+   * The single string property that takes the raw stream whole — the
+   * `tool.*`-surface exception of grammar 6.1, absent on inline nodes (D91).
+   */
+  readonly raw?: string;
+  /** No result at all: nothing is decoded (grammar 6.1's `output: {}`). */
+  readonly empty: boolean;
+}
+
+/** A resolved `exec:` block. */
+export interface ExecBinding {
+  readonly command: readonly Interpolation[];
+  readonly args: readonly (readonly Interpolation[])[];
+  readonly cwd?: readonly Interpolation[];
+  readonly env: readonly { readonly name: string; readonly value: readonly Interpolation[] }[];
+  readonly expectExit: readonly number[];
+  readonly decoding: Decoding;
+}
+
+/** The environment-variable spelling of an input field (grammar 6.1). */
+export function environmentName(field: string): string {
+  return field.toUpperCase();
+}
+
+/** Run one `exec:` binding (grammar 6.1, 8.2). */
+export async function runExec(
+  binding: ExecBinding,
+  input: unknown,
+  context: RunContext,
+): Promise<unknown> {
+  const environment: Record<string, string> = { ...(process.env as Record<string, string>) };
+  let stdin: string | undefined;
+  if (typeof input === "string") {
+    stdin = input;
+  } else if (input !== null && typeof input === "object") {
+    for (const [field, value] of Object.entries(input as Record<string, unknown>)) {
+      environment[environmentName(field)] =
+        typeof value === "string" ? value : JSON.stringify(value);
+    }
+  }
+  for (const entry of binding.env) {
+    environment[entry.name] = interpolate(entry.value);
+  }
+
+  const command = interpolate(binding.command);
+  const args = binding.args.map((argument) => interpolate(argument));
+  const result = await new Promise<{ code: number; stdout: string; stderr: string }>(
+    (resolve, reject) => {
+      const child = spawn(command, args, {
+        cwd: binding.cwd === undefined ? undefined : interpolate(binding.cwd),
+        env: environment,
+        signal: context.signal,
+      });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (chunk: Buffer) => {
+        stdout += chunk.toString();
+      });
+      child.stderr.on("data", (chunk: Buffer) => {
+        stderr += chunk.toString();
+      });
+      child.on("error", reject);
+      child.on("close", (code) => resolve({ code: code ?? -1, stdout, stderr }));
+      if (stdin !== undefined) {
+        child.stdin.end(stdin);
+      } else {
+        child.stdin.end();
+      }
+    },
+  );
+
+  if (!binding.expectExit.includes(result.code)) {
+    throw new Error(
+      `\`${command}\` exited ${result.code}, which is outside \`expect_exit: [${binding.expectExit.join(", ")}]\`${result.stderr === "" ? "" : `: ${result.stderr.trim()}`}`,
+    );
+  }
+
+  return decode(binding.decoding, result.stdout, {
+    exit_code: result.code,
+    stdout: result.stdout,
+    stderr: result.stderr,
+  });
+}
+
+/** A resolved `http:` block. */
+export interface HttpBinding {
+  readonly method: string;
+  readonly url: readonly Interpolation[];
+  readonly headers: readonly { readonly name: string; readonly value: readonly Interpolation[] }[];
+  readonly expectStatus: readonly number[] | "2xx";
+  readonly decoding: Decoding;
+}
+
+/** Run one `http:` binding (grammar 6.1, 8.3). */
+export async function runHttp(
+  binding: HttpBinding,
+  request: { readonly query?: Record<string, unknown>; readonly body?: unknown },
+  context: RunContext,
+): Promise<unknown> {
+  const url = new URL(interpolate(binding.url));
+  for (const [name, value] of Object.entries(request.query ?? {})) {
+    url.searchParams.set(name, typeof value === "string" ? value : JSON.stringify(value));
+  }
+  const headers: Record<string, string> = {};
+  for (const header of binding.headers) {
+    headers[header.name] = interpolate(header.value);
+  }
+  const sendsBody = request.body !== undefined && !["GET", "HEAD"].includes(binding.method);
+  if (sendsBody) headers["content-type"] = "application/json";
+
+  const response = await fetch(url, {
+    method: binding.method,
+    headers,
+    body: sendsBody ? JSON.stringify(request.body) : undefined,
+    signal: context.signal,
+  });
+  const text = await response.text();
+  const accepted =
+    binding.expectStatus === "2xx"
+      ? response.status >= 200 && response.status < 300
+      : binding.expectStatus.includes(response.status);
+  if (!accepted) {
+    throw new Error(
+      `\`${url}\` answered ${response.status}, which is outside ${
+        binding.expectStatus === "2xx" ? "the 2xx range" : `\`expect_status: [${binding.expectStatus.join(", ")}]\``
+      }: ${text.slice(0, 200)}`,
+    );
+  }
+  return decode(binding.decoding, text, { status: response.status, body: text });
+}
+
+/** Read a result out of a raw stream and an envelope (grammar 8.2, 8.3, 6.1). */
+function decode(
+  decoding: Decoding,
+  raw: string,
+  envelope: Readonly<Record<string, unknown>>,
+): unknown {
+  if (decoding.empty) return {};
+  if (decoding.raw !== undefined) return { [decoding.raw]: raw.trim() };
+
+  const result: Record<string, unknown> = {};
+  for (const field of decoding.envelope) {
+    result[field] = envelope[field];
+  }
+  if (decoding.decoded.length === 0) return result;
+
+  let payload: unknown;
+  try {
+    payload = JSON.parse(raw) as unknown;
+  } catch (error) {
+    throw new Error(`the result is not JSON: ${describe(error)}`);
+  }
+  if (payload === null || typeof payload !== "object") {
+    throw new Error(`the result decoded to a ${typeof payload}, not an object`);
+  }
+  for (const field of decoding.decoded) {
+    result[field] = (payload as Record<string, unknown>)[field];
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// The host function registry (grammar 6.1's escape hatch)
+// ---------------------------------------------------------------------------
+
+/** What a host-registered function is: arguments in, a result out. */
+export type HostFunction = (args: unknown, context: RunContext) => unknown | Promise<unknown>;
+
+const REGISTRY = new Map<string, HostFunction>();
+
+/**
+ * Register the implementation of a `function:` tool binding (grammar 6.1).
+ *
+ * The escape hatch, and the one construct that breaks spec portability — a
+ * composition using it needs this call to have happened before the graph runs.
+ * See the generated `README.md`.
+ */
+export function registerFunction(name: string, implementation: HostFunction): void {
+  REGISTRY.set(name, implementation);
+}
+
+/** Call a host-registered function, or say which registration is missing. */
+export async function callFunction(
+  name: string,
+  args: unknown,
+  context: RunContext,
+): Promise<unknown> {
+  const implementation = REGISTRY.get(name);
+  if (implementation === undefined) {
+    throw new Error(
+      `no host function is registered as \`${name}\`: call \`registerFunction(${JSON.stringify(name)}, …)\` before running the graph`,
+    );
+  }
+  return await implementation(args, context);
+}
+
+// ---------------------------------------------------------------------------
+// The router (grammar 7.3, 7.4, 7.6)
+// ---------------------------------------------------------------------------
+
+/** One outgoing edge, in the declaration order grammar 7.3 evaluates them in. */
+export interface EdgeDescriptor {
+  /** The target node id, or `"__end__"`. */
+  readonly to: string;
+  /** The `when:` guard, as CEL source. */
+  readonly when?: string;
+  /** Whether the guard reads the source node's own output (Decision D97). */
+  readonly readsOutput?: boolean;
+  /** `else: true`. */
+  readonly otherwise?: boolean;
+  /** The `max_iterations` budget, and the counter it spends (grammar 7.4). */
+  readonly budget?: { readonly key: string; readonly max: number };
+}
+
+/** What one edge did, as the trace records it (PRD 5.3). */
+export interface EdgeDecision {
+  readonly to: string;
+  readonly when?: string;
+  readonly else?: true;
+  readonly value?: boolean;
+  readonly budget?: { readonly key: string; readonly used: number; readonly max: number };
+  readonly taken: boolean;
+  readonly reason?: string;
+}
+
+/** One node's whole routing decision. */
+export interface RoutingDecision {
+  readonly edges: EdgeDecision[];
+  readonly targets: string[];
+  readonly counters: Record<string, number>;
+}
+
+/**
+ * Evaluate a node's outgoing edges (grammar 7.3, 7.4, Decision D97).
+ *
+ * Declaration order, multicast, `else:` suppressed by a **taken** guarded
+ * sibling, and an exhausted budget untakeable whatever its guard says. A
+ * `skip`ped node changes exactly one thing: a guard that references its output
+ * is `false` without being evaluated, while a guard over `input`/`state`/
+ * `execution` is evaluated normally.
+ */
+export function route(
+  flow: string,
+  node: string,
+  edges: readonly EdgeDescriptor[],
+  roots: Roots,
+  counters: Readonly<Record<string, number>>,
+  skipped: boolean,
+): RoutingDecision {
+  const decisions: EdgeDecision[] = [];
+  const targets: string[] = [];
+  const spent: Record<string, number> = {};
+  let guardedTaken = false;
+
+  for (const edge of edges) {
+    if (edge.otherwise === true) continue;
+    if (edge.when === undefined) {
+      decisions.push({ to: edge.to, taken: true, reason: "unconditional" });
+      if (!targets.includes(edge.to)) targets.push(edge.to);
+      continue;
+    }
+
+    let value: boolean;
+    if (skipped && edge.readsOutput === true) {
+      value = false;
+    } else {
+      try {
+        value = evaluateGuard(edge.when, roots);
+      } catch (error) {
+        throw new Error(
+          `${flow} node \`${node}\`: the guard \`${edge.when}\` could not be evaluated: ${describe(error)}`,
+        );
+      }
+    }
+
+    if (!value) {
+      decisions.push({ to: edge.to, when: edge.when, value, taken: false });
+      continue;
+    }
+    if (edge.budget !== undefined) {
+      const used = counters[edge.budget.key] ?? 0;
+      if (used >= edge.budget.max) {
+        decisions.push({
+          to: edge.to,
+          when: edge.when,
+          value,
+          budget: { key: edge.budget.key, used, max: edge.budget.max },
+          taken: false,
+          reason: "the `max_iterations` budget is spent",
+        });
+        continue;
+      }
+      spent[edge.budget.key] = used + 1;
+      decisions.push({
+        to: edge.to,
+        when: edge.when,
+        value,
+        budget: { key: edge.budget.key, used: used + 1, max: edge.budget.max },
+        taken: true,
+      });
+    } else {
+      decisions.push({ to: edge.to, when: edge.when, value, taken: true });
+    }
+    guardedTaken = true;
+    if (!targets.includes(edge.to)) targets.push(edge.to);
+  }
+
+  for (const edge of edges) {
+    if (edge.otherwise !== true) continue;
+    if (guardedTaken) {
+      decisions.push({
+        to: edge.to,
+        else: true,
+        taken: false,
+        reason: "a guarded sibling was taken",
+      });
+      continue;
+    }
+    decisions.push({ to: edge.to, else: true, taken: true });
+    if (!targets.includes(edge.to)) targets.push(edge.to);
+  }
+
+  if (targets.length === 0) {
+    throw new NoViableRoute(flow, node);
+  }
+  // Declaration order is what the trace records; the targets are ordered by it
+  // too, so a multicast reads the way the file does.
+  decisions.sort(
+    (left, right) =>
+      edges.findIndex((edge) => edge.to === left.to && edge.when === left.when) -
+      edges.findIndex((edge) => edge.to === right.to && edge.when === right.when),
+  );
+  return { edges: decisions, targets, counters: spent };
+}
+
+// ---------------------------------------------------------------------------
+// The run channel: what the compiler keeps beside a composition's own state
+// ---------------------------------------------------------------------------
+
+/** One entry of the routing trace (PRD 5.3: routing decisions are data). */
+export interface TraceEntry {
+  readonly step: number;
+  readonly flow: string;
+  readonly node: string;
+  readonly traversal: number;
+  readonly outcome: "completed" | "skipped" | "failed";
+  readonly attempts: number;
+  readonly writes?: readonly string[];
+  readonly routing?: RoutingDecision;
+  readonly error?: string;
+  readonly fallback?: string;
+}
+
+/**
+ * The compiler's own state channel.
+ *
+ * A composition's `state:` channels are the author's (grammar 10); this is what
+ * the *runtime* needs beside them and cannot put anywhere else: the flow
+ * instance's input object and execution identity, which every CEL surface reads
+ * as `input` and `execution`; the per-bounded-edge counters grammar 7.4 requires
+ * in graph state; the per-node traversal ordinals of grammar 9.4; the step
+ * number of grammar 7.6; and the routing trace PRD 5.3 asks for.
+ *
+ * It is named `$run` because grammar 2.1's identifier cannot spell it, so no
+ * composition can collide with it.
+ */
+export interface RunChannel {
+  readonly step: number;
+  readonly input: Readonly<Record<string, unknown>>;
+  readonly execution: { readonly id: string; readonly session_key: string };
+  readonly iterations: Readonly<Record<string, number>>;
+  readonly traversals: Readonly<Record<string, number>>;
+  readonly trace: readonly TraceEntry[];
+}
+
+/** The empty run channel a flow instance starts at. */
+export function emptyRun(): RunChannel {
+  return {
+    step: 0,
+    input: {},
+    execution: { id: "", session_key: "" },
+    iterations: {},
+    traversals: {},
+    trace: [],
+  };
+}
+
+/**
+ * Fold one node's contribution into the run channel.
+ *
+ * Concurrent nodes in one step each supply a partial update, and every field
+ * merges in a way that does not depend on which of them the reducer sees first:
+ * `step` takes the larger, the two counter maps merge key-wise (a node only ever
+ * writes its own keys), and the trace is concatenated and then ordered by
+ * `(step, node)` — the canonical write order of grammar 7.6.4, read for the one
+ * channel whose order is otherwise the scheduler's.
+ */
+export function mergeRun(left: RunChannel, right: Partial<RunChannel>): RunChannel {
+  const trace = [...left.trace, ...(right.trace ?? [])];
+  trace.sort((a, b) => a.step - b.step || (a.node < b.node ? -1 : a.node > b.node ? 1 : 0));
+  return {
+    step: Math.max(left.step, right.step ?? 0),
+    input: right.input ?? left.input,
+    execution: right.execution ?? left.execution,
+    iterations: { ...left.iterations, ...(right.iterations ?? {}) },
+    traversals: { ...left.traversals, ...(right.traversals ?? {}) },
+    trace,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Reading and writing a composition's own channels (grammar 8.0, 10)
+// ---------------------------------------------------------------------------
+
+/** How a write reaches its channel, which decides what one write supplies. */
+export type Reduce = "set" | "append" | "merge";
+
+/** One field of a node's output, and where it goes (grammar 8.0's write map). */
+export interface WriteDescriptor {
+  readonly field: string;
+  readonly channel: string;
+  readonly reduce: Reduce;
+}
+
+/** Read a state channel by name, failing the way Decision D78 says (grammar 10.1). */
+export function channelValue(
+  state: Readonly<Record<string, unknown>>,
+  channel: string,
+  reader: string,
+): unknown {
+  const value = state[channel];
+  if (value === undefined) {
+    throw new Error(
+      `the state channel \`${channel}\` is unset and ${reader} reads it (grammar 10.1, Decision D78)`,
+    );
+  }
+  return value;
+}
+
+/** Read one field of the enclosing flow's input object (grammar 8.0 step 3). */
+export function flowInput(run: RunChannel, field: string, reader: string): unknown {
+  const value = run.input[field];
+  if (value === undefined) {
+    throw new Error(`the flow input \`${field}\` is absent and ${reader} reads it`);
+  }
+  return value;
+}
+
+/** The value a channel holds once this write has landed, for a guard to read. */
+export function applyWrite(previous: unknown, value: unknown, reduce: Reduce): unknown {
+  if (reduce === "append") return [...((previous as unknown[]) ?? []), value];
+  if (reduce === "merge") {
+    return { ...((previous as Record<string, unknown>) ?? {}), ...(value as Record<string, unknown>) };
+  }
+  return value;
+}
+
+// ---------------------------------------------------------------------------
+// One node execution, end to end
+// ---------------------------------------------------------------------------
+
+/** The graph state a node reads: the composition's channels, plus `$run`. */
+export type GraphStateLike = Readonly<Record<string, unknown>> & { readonly $run: RunChannel };
+
+/** What a node sees before it runs. */
+export interface NodeView {
+  /** Every channel, as of the start of this step. */
+  readonly state: Readonly<Record<string, unknown>>;
+  /** The compiler's own channel. */
+  readonly run: RunChannel;
+}
+
+/** Everything `./graph.ts` says about one node (grammar 7.1, 8, 9). */
+export interface NodeDescriptor {
+  readonly flow: string;
+  readonly node: string;
+  readonly policy: NodePolicy;
+  /** The shapes the roots of this node's expressions are read through. */
+  readonly shapes: {
+    readonly input: Shape;
+    readonly state: Shape;
+    readonly output: Shape;
+  };
+  /**
+   * Build the input the activity is given (grammar 8.0).
+   *
+   * `roots` carries `input`, `state` and `execution` — the three a node's
+   * configuration may read (Decision D42: node outputs are readable only from
+   * edge guards and `map.over`) — and `view` is what a name-based read resolves
+   * against, where no expression stands between the two declarations.
+   */
+  input(roots: Roots, view: NodeView): unknown;
+  /**
+   * Run the activity and parse its answer with the emitted schema.
+   *
+   * The parse is inside, so a nonconforming answer is a node error the node's
+   * own `retry:` policy can ask again about (PRD 5.2: the answer is rejected
+   * before any edge is evaluated).
+   */
+  run(
+    input: unknown,
+    context: RunContext,
+    view: NodeView,
+  ): Promise<{ output: unknown; history?: readonly MessageLike[] }>;
+  readonly writes: readonly WriteDescriptor[];
+  readonly edges: readonly EdgeDescriptor[];
+}
+
+/** The `execution` root, bound for an expression (grammar 4.1). */
+const EXECUTION_SHAPE = {
+  properties: { id: "string", session_key: "string" },
+} as const;
+
+/**
+ * Run one node: its input, its activity, its writes, and its routing decision —
+ * in one LangGraph task, which is what makes grammar 7.6's P1 (a node's edges
+ * are evaluated only after it has completed) structural rather than asserted.
+ *
+ * The answer is a `Command`: LangGraph's one primitive that carries a state
+ * update **and** the control transfer together, so the counter a bounded edge
+ * spends (grammar 7.4) and the branch it spends it on land in the same write.
+ *
+ * **What a guard sees.** The state as of the start of this step, with this
+ * node's own writes applied through their channels' reduce policies. Grammar
+ * 7.6 evaluates a step's edges after *every* node of the step has written, so a
+ * guard here does not see a concurrent sibling's writes — the one place this
+ * shaping is narrower than the model it implements, and it is reachable only
+ * from a fork whose branches write a channel the other branch's guard reads.
+ */
+export async function runNode(
+  descriptor: NodeDescriptor,
+  state: GraphStateLike,
+): Promise<Command> {
+  const run = state.$run;
+  const step = run.step + 1;
+  const traversal = run.traversals[descriptor.node] ?? 0;
+  const view: NodeView = { state, run };
+
+  const base: Partial<RunChannel> = {
+    step,
+    traversals: { [descriptor.node]: traversal + 1 },
+  };
+
+  let output: unknown;
+  let history: readonly MessageLike[] | undefined;
+  let attempts = 0;
+  let skipped = false;
+  let failure: NodeFailure | undefined;
+
+  // The roots a node's *configuration* reads: no `<node>.output` among them,
+  // because a node never reads another's output (Decision D42).
+  const configuration: Roots = {
+    input: bindRoot(run.input, descriptor.shapes.input),
+    state: bindRoot(state, descriptor.shapes.state),
+    execution: bindRoot(run.execution, EXECUTION_SHAPE),
+  };
+
+  try {
+    const input = descriptor.input(configuration, view);
+    const answer = await runActivity(
+      descriptor.flow,
+      descriptor.node,
+      descriptor.policy,
+      run.execution,
+      (context) => descriptor.run(input, context, view),
+    );
+    attempts = answer.attempts;
+    output = answer.value.output;
+    history = answer.value.history;
+  } catch (error) {
+    const strategy = descriptor.policy.onError;
+    failure = error instanceof NodeFailure ? error : undefined;
+    attempts = failure?.attempts ?? 1;
+    if (strategy === "fail") throw error;
+    if (typeof strategy === "object") {
+      // The node's own outgoing edges are not evaluated: the fallback target is
+      // scheduled instead (grammar 9.2, Decision D21).
+      const entry: TraceEntry = {
+        step,
+        flow: descriptor.flow,
+        node: descriptor.node,
+        traversal,
+        outcome: "failed",
+        attempts,
+        error: describe(error),
+        fallback: strategy.fallback,
+      };
+      return new Command({
+        update: { $run: { ...base, trace: [entry] } },
+        goto: [strategy.fallback],
+      });
+    }
+    skipped = true;
+  }
+
+  const update: Record<string, unknown> = {};
+  const localState: Record<string, unknown> = { ...state };
+  const written: string[] = [];
+  if (!skipped) {
+    const fields = (output ?? {}) as Record<string, unknown>;
+    for (const write of descriptor.writes) {
+      const value = fields[write.field];
+      // A field the result does not carry performs no write (Decision D110).
+      if (value === undefined) continue;
+      update[write.channel] = value;
+      localState[write.channel] = applyWrite(state[write.channel], value, write.reduce);
+      written.push(write.channel);
+    }
+    if (history !== undefined && history.length > 0) {
+      update["messages"] = history;
+    }
+  }
+
+  const roots: Roots = {
+    ...configuration,
+    state: bindRoot(localState, descriptor.shapes.state),
+    [descriptor.node]: skipped
+      ? undefined
+      : bindRoot({ output }, { properties: { output: descriptor.shapes.output } }),
+  };
+  const routing = route(
+    descriptor.flow,
+    descriptor.node,
+    descriptor.edges,
+    roots,
+    run.iterations,
+    skipped,
+  );
+
+  const entry: TraceEntry = {
+    step,
+    flow: descriptor.flow,
+    node: descriptor.node,
+    traversal,
+    outcome: skipped ? "skipped" : "completed",
+    attempts,
+    writes: written,
+    routing,
+    ...(failure === undefined ? {} : { error: failure.message }),
+  };
+  update["$run"] = { ...base, iterations: routing.counters, trace: [entry] };
+  return new Command({ update, goto: routing.targets });
+}
+
+function bindRoot(value: unknown, shape: Shape): CelValue {
+  const bound = bind(value, shape);
+  if (bound === undefined) {
+    throw new CelError("a root is absent");
+  }
+  return bound;
+}
+
+// ---------------------------------------------------------------------------
+// Evaluating an expression at a node
+// ---------------------------------------------------------------------------
+
+export type { CelValue, Roots, Shape };
+export { CelError, bind, evaluate, evaluateGuard, toJson };

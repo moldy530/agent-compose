@@ -93,11 +93,14 @@
 //! module they will land in and the state model they will build on; what it does
 //! not do is pretend to a topology it cannot execute.
 
+pub mod cel;
 pub mod env;
 pub mod graph;
 pub mod names;
 pub mod pattern;
+pub mod policy;
 pub mod project;
+pub mod runtime;
 pub mod schema;
 pub mod state;
 
@@ -181,7 +184,8 @@ impl GeneratedProject {
 /// only on a clean report (PRD §7 M1).
 #[must_use]
 pub fn emit(ir: &Ir) -> GeneratedProject {
-    let names = names::Names::of(ir);
+    let mut names = names::Names::of(ir);
+    graph::declare(&mut names, ir);
     let environment = env::References::of(ir);
 
     GeneratedProject::new(vec![
@@ -189,10 +193,12 @@ pub fn emit(ir: &Ir) -> GeneratedProject {
         project::tsconfig_json(ir),
         project::readme(ir),
         project::gitignore(ir),
+        cel::module(ir),
         env::module(ir, &environment),
+        runtime::module(ir),
         schema::module(ir, &names),
         state::module(ir, &names),
-        graph::module(ir),
+        graph::module(ir, &names),
         project::index(ir),
     ])
 }
@@ -745,9 +751,11 @@ flow.f:
                 ".gitignore",
                 "README.md",
                 "package.json",
+                "src/cel.ts",
                 "src/env.ts",
                 "src/graph.ts",
                 "src/index.ts",
+                "src/runtime.ts",
                 "src/schemas.ts",
                 "src/state.ts",
                 "tsconfig.json",

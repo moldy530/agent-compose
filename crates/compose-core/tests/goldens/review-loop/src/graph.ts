@@ -5,20 +5,447 @@
 // is the single source of truth (PRD 5.12); to own this code instead, copy
 // the whole directory out and stop regenerating it.
 //
-// The compiled graph.
+// The compiled graph (PRD 5.3, 5.4, grammar 7, 8, 9).
 //
-// Node functions, routers, bounded-cycle counters, `map` dispatch and subgraphs
-// are assembled onto the state model here. What this module holds today is the
-// builder they are added to, constructed from `./state.ts` so the state model is
-// checked against the pinned LangGraph release rather than merely written for it.
-//
-// The flows this composition declares, which are what will be
-// assembled here:
-//   flow.review_loop
+// One LangGraph node per flow node, driven by the descriptor beside it: how its
+// input is built (grammar 8.0), the activity it runs (grammar 8), where its
+// output goes (grammar 10.3), and its outgoing edges in declaration order
+// (grammar 7.3). Every node answers a `Command`, so the branch it takes and the
+// state it writes — including the counter a bounded edge spends (grammar 7.4) —
+// land in one write. `./runtime.ts` is what the descriptors drive.
 
-import { StateGraph } from "@langchain/langgraph";
+import { END, START, StateGraph } from "@langchain/langgraph";
 
+import * as runtime from "./runtime.ts";
+import {
+  agentResearcherOutput,
+  agentReviewerOutput,
+  flowReviewLoopInputs,
+  toolWebSearchInput,
+  toolWebSearchOutput,
+} from "./schemas.ts";
 import { State } from "./state.ts";
+import type { GraphState } from "./state.ts";
+
+// --- Shapes: the declared type an expression reads a value through ---
+/**
+ * Every declared state channel, so `state.count` is an `int` where the
+ * channel says `type: integer` and a `double` where it says `type: number`.
+ */
+const stateShape: runtime.Shape = {
+  properties: {
+    "draft": "string",
+    "feedback": "string",
+  },
+};
+
+/** `flow.review_loop` — the `input` root inside it (grammar 7.5). */
+const flowReviewLoopShape: runtime.Shape = {
+  properties: {
+    "goal": "string",
+  },
+};
+
+/** `flow.review_loop` node `write` — the `write.output` root its guards read. */
+const flowReviewLoopNodeWriteShape: runtime.Shape = {
+  properties: {
+    "draft": "string",
+  },
+};
+
+/**
+ * `flow.review_loop` node `review` — the `review.output` root its guards read.
+ */
+const flowReviewLoopNodeReviewShape: runtime.Shape = {
+  properties: {
+    "verdict": "string",
+    "feedback": "string",
+  },
+};
+
+/**
+ * `provider.anthropic` — an `anthropic` connection (grammar 12.1). Every value is read when a node calls it, never at import: a build carries no credential and `./index.ts` is where their presence is checked (PRD 5.9).
+ */
+const providerAnthropic: runtime.ProviderBinding = {
+  address: "provider.anthropic",
+  kind: "anthropic",
+  get apiKey(): string {
+    return runtime.environmentValue("ANTHROPIC_API_KEY", "provider.anthropic.api_key");
+  },
+};
+
+/**
+ * `model.default` — `claude-sonnet-4-6` on `provider.anthropic` (grammar 12.2). This is `model.smart`, the first member of the route `model.default` declares: failover is not executed by this compiler release (PRD §7 M1: model routing with trace-recorded failover), so a condition in `route_on:` fails the node rather than moving to the next member.
+ */
+const modelDefault: runtime.ModelBinding = {
+  address: "model.default",
+  id: "claude-sonnet-4-6",
+  provider: providerAnthropic,
+  settings: {
+    "max_tokens": 8000,
+    "thinking": { "budget_tokens": 4000 },
+  },
+};
+
+/** `model.fast` — `claude-haiku-4-5` on `provider.anthropic` (grammar 12.2). */
+const modelFast: runtime.ModelBinding = {
+  address: "model.fast",
+  id: "claude-haiku-4-5",
+  provider: providerAnthropic,
+  settings: {
+    "temperature": 0.2,
+  },
+};
+
+/**
+ * `model.smart` — `claude-sonnet-4-6` on `provider.anthropic` (grammar 12.2).
+ */
+const modelSmart: runtime.ModelBinding = {
+  address: "model.smart",
+  id: "claude-sonnet-4-6",
+  provider: providerAnthropic,
+  settings: {
+    "max_tokens": 8000,
+    "thinking": { "budget_tokens": 4000 },
+  },
+};
+
+/**
+ * `tool.web_search` — an HTTP request (grammar 6.1). Its arguments are parsed with its own declared `input:` before the implementation sees them, which is the checked signature grammar 8.4 asks for and the model's arguments are held to.
+ */
+async function toolWebSearch(args: unknown, context: runtime.RunContext): Promise<unknown> {
+  const input = toolWebSearchInput.parse(args);
+  const roots = { input: runtime.bind(input, {
+    properties: {
+      "query": "string",
+      "max_results": "int",
+    },
+  }) };
+  return toolWebSearchOutput.parse(
+    await runtime.runHttp({
+      method: "GET",
+      url: ["https://", { env: "SEARCH_HOST", site: "tool.web_search.http.url" }, "/v1/search"],
+      headers: [
+        { name: "authorization", value: ["Bearer ", { env: "SEARCH_API_KEY", site: "tool.web_search.http.headers.authorization" }] },
+      ],
+      expectStatus: [200],
+      decoding: { envelope: [], decoded: ["results"], empty: false },
+    }, {
+      query: {
+        "q": runtime.toJson(runtime.evaluate("input.query", roots)),
+        "n": runtime.toJson(runtime.evaluate("input.max_results", roots)),
+      },
+    }, context),
+  );
+}
+
+/**
+ * `agent.researcher` — one LLM call with structured output (PRD 5.2, grammar 5). The schema below is the **published** JSON Schema of grammar 3.8's table, which is the column the conformance corpus proves equal to the parse its answer then faces.
+ */
+const agentResearcher: runtime.AgentBinding = {
+  address: "agent.researcher",
+  prompt: "You are a research writer. Produce a single self-contained draft that\nsatisfies the goal.\n\nIf feedback from a previous review is present, treat every point in it as a\nrequired change and rewrite the draft accordingly. Never return an unchanged\ndraft when feedback is present.\n",
+  model: modelDefault,
+  output: {
+    name: "researcher_output",
+    description: "The structured output `agent.researcher` must produce.",
+    schema: {
+      "additionalProperties": false,
+      "properties": {
+        "draft": {
+          "description": "The complete draft, in Markdown.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "draft"
+      ],
+      "type": "object"
+    },
+  },
+  tools: [
+    {
+      name: "web_search",
+      address: "tool.web_search",
+      description: "Search the public web and return ranked result snippets.",
+      schema: {
+        "additionalProperties": false,
+        "properties": {
+          "max_results": {
+            "default": 5,
+            "description": "How many results to return.",
+            "maximum": 10,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "query": {
+            "description": "The search query.",
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      invoke: toolWebSearch,
+    },
+  ],
+  maxToolIterations: 8,
+};
+
+/**
+ * `agent.reviewer` — one LLM call with structured output (PRD 5.2, grammar 5). The schema below is the **published** JSON Schema of grammar 3.8's table, which is the column the conformance corpus proves equal to the parse its answer then faces.
+ */
+const agentReviewer: runtime.AgentBinding = {
+  address: "agent.reviewer",
+  prompt: "You are a meticulous technical reviewer.\n\nApprove only when the draft fully satisfies the goal, is internally\nconsistent, and contains no unsupported claims. Otherwise ask for a\nrevision and list every required change explicitly.\n",
+  model: modelSmart,
+  output: {
+    name: "reviewer_output",
+    description: "The structured output `agent.reviewer` must produce.",
+    schema: {
+      "additionalProperties": false,
+      "properties": {
+        "feedback": {
+          "description": "Required changes, empty when approving.",
+          "type": "string"
+        },
+        "verdict": {
+          "description": "approve ends the loop; revise sends the draft back to the writer.",
+          "enum": [
+            "approve",
+            "revise"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "verdict",
+        "feedback"
+      ],
+      "type": "object"
+    },
+  },
+  tools: [
+    {
+      name: "web_search",
+      address: "tool.web_search",
+      description: "Search the public web and return ranked result snippets.",
+      schema: {
+        "additionalProperties": false,
+        "properties": {
+          "max_results": {
+            "default": 5,
+            "description": "How many results to return.",
+            "maximum": 10,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "query": {
+            "description": "The search query.",
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      invoke: toolWebSearch,
+    },
+  ],
+  maxToolIterations: 4,
+};
+
+// --- flow.review_loop ---
+
+/** `flow.review_loop` node `write` — `agent.researcher` (grammar 8.1). */
+const flowReviewLoopNodeWrite: runtime.NodeDescriptor = {
+  flow: "flow.review_loop",
+  node: "write",
+  // Grammar 9.3, resolved: `retry` from the node, `timeout` from `defaults:`, `on_error` from `defaults:`.
+  policy: {
+    retry: {
+      max: 2,
+      backoffMs: 5000,
+      multiplier: 2,
+      jitter: true,
+    },
+    timeoutMs: 120000,
+    onError: "fail",
+  },
+  shapes: { input: flowReviewLoopShape, state: stateShape, output: flowReviewLoopNodeWriteShape },
+  input: (roots, view) => ({
+    "goal": runtime.toJson(runtime.evaluate("input.goal", roots)),
+    "feedback": runtime.toJson(runtime.evaluate("state.feedback", roots)),
+  }),
+  run: async (input, context, view) => {
+    const answer = await runtime.callAgent(
+      agentResearcher,
+      input,
+      runtime.historyTurns(view.state["messages"] as unknown[]),
+      context,
+    );
+    return { output: agentResearcherOutput.parse(answer.output), history: answer.history };
+  },
+  writes: [
+    { field: "draft", channel: "draft", reduce: "set" },
+  ],
+  edges: [
+    { to: "review" },
+  ],
+};
+
+/** `flow.review_loop` node `review` — `agent.reviewer` (grammar 8.1). */
+const flowReviewLoopNodeReview: runtime.NodeDescriptor = {
+  flow: "flow.review_loop",
+  node: "review",
+  // Grammar 9.3, resolved: `retry` from the built-in, `timeout` from the node, `on_error` from the node.
+  policy: {
+    timeoutMs: 90000,
+    onError: { fallback: "__end__" },
+  },
+  shapes: { input: flowReviewLoopShape, state: stateShape, output: flowReviewLoopNodeReviewShape },
+  input: (roots, view) => ({
+    "goal": runtime.toJson(runtime.evaluate("input.goal", roots)),
+    "draft": runtime.toJson(runtime.evaluate("state.draft", roots)),
+  }),
+  run: async (input, context, view) => {
+    const answer = await runtime.callAgent(
+      agentReviewer,
+      input,
+      runtime.historyTurns(view.state["messages"] as unknown[]),
+      context,
+    );
+    return { output: agentReviewerOutput.parse(answer.output), history: answer.history };
+  },
+  writes: [
+    { field: "feedback", channel: "feedback", reduce: "set" },
+  ],
+  edges: [
+    { to: "write", when: "review.output.verdict == 'revise'", readsOutput: true, budget: { key: "flow.review_loop#2", max: 3 } },
+    { to: END, otherwise: true },
+  ],
+};
+
+/** `flow.review_loop` — its nodes, its `start` edges, and the compiled graph. */
+function flowReviewLoop() {
+  return new StateGraph(State)
+    .addNode("write", (state: GraphState) => runtime.runNode(flowReviewLoopNodeWrite, state), {
+      ends: ["review"],
+    })
+    .addNode("review", (state: GraphState) => runtime.runNode(flowReviewLoopNodeReview, state), {
+      ends: ["write", END],
+    })
+    .addEdge(START, "write")
+    .compile();
+}
+
+/**
+ * `flow.review_loop`, compiled once. Building it at import is also what checks it: a state model LangGraph refuses, or an edge to a node that is not registered, fails here rather than at the first invocation.
+ */
+const flowReviewLoopGraph = flowReviewLoop();
+
+/** One compiled flow: what it takes, what it answers, and how to run it. */
+export interface CompiledFlow {
+  /** Its typed address (grammar 2.2). */
+  readonly address: string;
+  /** The fields its `inputs:` declares (grammar 7.5). */
+  readonly inputs: readonly string[];
+  /** The fields its `outputs:` declares, each read from the channel of that name. */
+  readonly outputs: readonly string[];
+  /** The superstep ceiling a run of it takes by default. */
+  readonly recursionLimit: number;
+  /** Parse an invocation's inputs against the flow's own schema (grammar 13.2). */
+  parse(inputs: unknown): Record<string, unknown>;
+  /** Invoke the compiled graph. */
+  invoke(
+    initial: Record<string, unknown>,
+    options: { recursionLimit: number },
+  ): Promise<GraphState>;
+}
+
+/**
+ * Every flow this composition declares, by address.
+ *
+ * PRD 5.11 makes manual invocation universal — every flow is runnable whether or
+ * not a `manual` trigger names it (Decision D64) — so the registry is every
+ * flow rather than every triggered one.
+ */
+export const flows: Readonly<Record<string, CompiledFlow>> = {
+  "flow.review_loop": {
+    address: "flow.review_loop",
+    inputs: ["goal"],
+    outputs: ["draft"],
+    recursionLimit: 33,
+    parse: (inputs: unknown) => flowReviewLoopInputs.parse(inputs) as Record<string, unknown>,
+    invoke: (initial, options) => flowReviewLoopGraph.invoke(initial, options) as Promise<GraphState>,
+  },
+};
+
+/** What one run produced. */
+export interface FlowRun {
+  /** The flow's `outputs:`, materialized from state at quiescence (grammar 7.6.3). */
+  readonly outputs: Record<string, unknown>;
+  /** Every routing decision the run made, in step order (PRD 5.3). */
+  readonly trace: readonly runtime.TraceEntry[];
+  /** The whole state at quiescence. */
+  readonly state: GraphState;
+}
+
+/**
+ * Run one flow to quiescence and materialize its outputs.
+ *
+ * This is the invocation surface `agent-compose run` and the generated `serve`
+ * app are built on (PRD 5.11's `start`), and what an ejected project calls
+ * directly. The inputs are parsed against the flow's own `inputs:` schema before
+ * anything runs, which is where an invocation that the flow cannot accept is
+ * refused by field name (grammar 13.2).
+ */
+export async function runFlow(
+  address: string,
+  inputs: unknown = {},
+  options: {
+    readonly executionId?: string;
+    readonly sessionKey?: string;
+    readonly recursionLimit?: number;
+  } = {},
+): Promise<FlowRun> {
+  const flow = flows[address];
+  if (flow === undefined) {
+    throw new Error(
+      `\`${address}\` is not a flow of this composition: ${Object.keys(flows).join(", ")}`,
+    );
+  }
+  const parsed = flow.parse(inputs);
+  const state = await flow.invoke(
+    {
+      $run: {
+        ...runtime.emptyRun(),
+        input: parsed,
+        execution: {
+          id: options.executionId ?? `exec_${globalThis.crypto.randomUUID()}`,
+          session_key: options.sessionKey ?? "",
+        },
+      },
+    },
+    { recursionLimit: options.recursionLimit ?? flow.recursionLimit },
+  );
+
+  const outputs: Record<string, unknown> = {};
+  for (const field of flow.outputs) {
+    outputs[field] = runtime.channelValue(
+      state as unknown as Record<string, unknown>,
+      field,
+      `\`${address}\`'s output field \`${field}\``,
+    );
+  }
+  return { outputs, trace: state.$run.trace, state };
+}
 
 /**
  * A new builder over this composition's state model.

@@ -16,19 +16,31 @@
 //! can get wrong in ways an output assertion cannot see, and the mock refuses
 //! anything a real provider would refuse (see `crates/mock-provider`).
 //!
-//! # Which of these commands exist
+//! # Two ways to run a compiled graph, and why there are two
 //!
-//! `build`, `run`, and `serve` are M1's own deliverables (PRD §7 M1), and they
-//! land one at a time. **`build` exists**: [`build`] shells out to it and the
-//! tests that call it run. `run` and `serve` do not yet, so [`run`] and
-//! [`serve`] still fail with clap's "unrecognized subcommand" and every test
-//! calling them is `#[ignore]`d with the reason naming what must land first.
+//! A criterion about **what a compiled graph does** and a criterion about **what
+//! a command does** are different claims, and this harness keeps them apart:
 //!
-//! Every helper below shells out to the **real** CLI either way — there are no
-//! stubs here, deliberately: un-ignoring is the definition of done, and a
-//! harness of stubs would let a test pass against a stub. This paragraph is part
-//! of that contract, so a PR that lands `run` or `serve` edits it in the same
-//! commit that un-ignores their tests.
+//! * [`invoke`] builds the fixture and runs its graph through **Node**, calling
+//!   the emitted project's own `runFlow` — the invocation surface PRD 5.11's
+//!   `start` is built on. Everything about node functions, routers, cycles and
+//!   policy is decided this way, because that is where those criteria live: they
+//!   are properties of the emitted TypeScript, and a CLI that has not been
+//!   written yet is not what makes them true or false.
+//! * [`run`] shells out to `agent-compose run`, which is its own M1 deliverable
+//!   (PRD §7 M1's second bullet). Exactly one test uses it —
+//!   `run_executes_a_manual_trigger_and_prints_the_flow_outputs` — and it is
+//!   `#[ignore]`d until that command exists, which is what keeps "the CLI works"
+//!   an honest claim rather than one the graph tests answer on its behalf.
+//!
+//! `serve` is the same shape as `run`: not written yet, `#[ignore]`d, and shelled
+//! out to for real when it is.
+//!
+//! Every helper below reaches the **real** compiler and the **real** emitted
+//! project — there are no stubs here, deliberately: un-ignoring is the
+//! definition of done, and a harness of stubs would let a test pass against a
+//! stub. This paragraph is part of that contract, so a PR that lands `run` or
+//! `serve` edits it in the same commit that un-ignores their tests.
 //!
 //! # Interface assumptions
 //!
@@ -38,14 +50,31 @@
 //! | call | command |
 //! |---|---|
 //! | [`build`] | `agent-compose build <entrypoint> --target <name> --out <dir>` |
+//! | [`invoke`] | `node <driver> <project> <flow> <inputs.json> <trace.json>`, over the emitted `runFlow` |
 //! | [`run`] | `agent-compose run <entrypoint> <flow> --input k=v … [--session <key>]` |
 //! | [`serve`] | `agent-compose serve <entrypoint> --port 0`, announcing its address on stdout |
 //!
-//! [`run`] is assumed to print the flow's outputs as one JSON object on stdout
+//! Both invocation forms print the flow's outputs as one JSON object on stdout
 //! (PRD 5.11's `run` is a CLI verb over a flow's declared output schema, so a
 //! JSON object is the only shape that survives the schema's own types), and
-//! `serve` to print its bound address the way `mock-provider` does, because a
-//! test that has to guess a port cannot run in parallel with another one.
+//! `serve` prints its bound address the way `mock-provider` does, because a test
+//! that has to guess a port cannot run in parallel with another one.
+//!
+//! # The Node toolchain
+//!
+//! [`invoke`] needs the pinned dependency set installed. It reuses
+//! `compose-core`'s committed toolchain fixture — the same `package.json` and
+//! `package-lock.json` `tests/generated_code_gates.rs` installs, which
+//! `the_toolchain_fixture_pins_what_the_emitter_pins` holds to the emitter's own
+//! pins — and builds each fixture into a directory beneath it, so Node resolves
+//! `node_modules` by walking up. One `npm ci` per test binary serves every
+//! fixture, because the emitted dependency set is a compiler constant rather
+//! than a per-project one.
+//!
+//! **In CI a missing toolchain fails; on a developer machine it skips**, which is
+//! the rule `tests/generated_code_gates.rs` already follows and for the same
+//! reason: CI is where "the suite is green" has to mean "the compiled graph
+//! ran".
 
 #![allow(
     dead_code,
@@ -57,6 +86,7 @@
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
@@ -70,6 +100,7 @@ use serde_json::Value;
 /// over each one, so an ignored test is never waiting on a project that stopped
 /// being a valid composition.
 pub const FIXTURES: &[&str] = &[
+    "activities",
     "agent-anthropic",
     "agent-openai",
     "bounded-cycle",
@@ -84,9 +115,14 @@ pub const BASE_URL: &str = "MOCK_BASE_URL";
 /// The `${MOCK_API_KEY}` they send. Any non-empty value: the harness needs no
 /// API keys, but a request still has to carry the header a client sends.
 pub const API_KEY: &str = "MOCK_API_KEY";
-/// The one non-provider env ref a fixture declares (`http-trigger`'s `escalate`
-/// node), supplied so a run is not stopped by an unrelated presence check.
+/// The directory of ordinary commands an `exec:` fixture reaches
+/// (`http-trigger`'s `escalate` node, `activities`' `false` and `sleep`),
+/// supplied so a run is not stopped by an unrelated presence check.
 pub const OPS_BIN: &str = "OPS_BIN";
+/// The HTTP server an `http:` fixture node reaches (`activities`' `probe`). The
+/// harness points it at the mock provider, whose control plane answers `GET
+/// /_mock/state` with JSON — a real round trip over a server the test owns.
+pub const OPS_URL: &str = "OPS_URL";
 
 /// The compiler under test.
 fn agent_compose() -> Command {
@@ -119,6 +155,7 @@ pub fn environment(provider: &MockProvider) -> Vec<(String, String)> {
         (BASE_URL.to_string(), provider.base_url()),
         (API_KEY.to_string(), "mock-provider-key".to_string()),
         (OPS_BIN.to_string(), "/bin".to_string()),
+        (OPS_URL.to_string(), provider.base_url()),
     ]
 }
 
@@ -277,6 +314,218 @@ impl Run {
             String::from_utf8_lossy(&self.output.stdout)
         );
         self.stderr()
+    }
+}
+
+/// Where the pinned Node toolchain and the fixtures built against it live.
+///
+/// `compose-core`'s committed fixture, reused rather than copied: one
+/// `package.json`, one `package-lock.json`, and one assertion
+/// (`the_toolchain_fixture_pins_what_the_emitter_pins`) keeping them equal to
+/// what `build` emits.
+fn toolchain() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crates/")
+        .join("compose-core/tests/toolchain")
+}
+
+/// Whether a missing Node toolchain fails the run rather than skipping it.
+fn node_required() -> bool {
+    std::env::var_os("CI").is_some_and(|value| !value.is_empty())
+}
+
+/// The installed toolchain, or `None` when Node is absent and this is not CI.
+fn installed() -> Option<&'static Path> {
+    static TOOLCHAIN: OnceLock<Option<PathBuf>> = OnceLock::new();
+    TOOLCHAIN
+        .get_or_init(|| {
+            let runs = |program: &str| {
+                Command::new(program)
+                    .arg("--version")
+                    .output()
+                    .is_ok_and(|output| output.status.success())
+            };
+            if !runs("node") || !runs("npm") {
+                assert!(
+                    !node_required(),
+                    "`node` and `npm` are required: the acceptance suite runs compiled graphs \
+                     (PRD §7 M1). CI installs them; see .github/workflows/ci.yml."
+                );
+                eprintln!(
+                    "warning: skipping the compiled-graph runs — `node`/`npm` are not on PATH. \
+                     They are required in CI (`CI` is set there) and this run is not CI."
+                );
+                return None;
+            }
+            let root = toolchain();
+            let install = Command::new("npm")
+                .args(["ci", "--no-audit", "--no-fund"])
+                .current_dir(&root)
+                .output()
+                .expect("npm runs");
+            assert!(
+                install.status.success(),
+                "the pinned toolchain did not install:\n{}\n{}",
+                String::from_utf8_lossy(&install.stdout),
+                String::from_utf8_lossy(&install.stderr),
+            );
+            Some(root)
+        })
+        .as_deref()
+}
+
+/// The driver [`invoke`] runs: it imports the emitted project and calls its own
+/// `runFlow`, which is the surface `run` and `serve` will be built on.
+fn driver() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/compiled_graph_acceptance/invoke-flow.mjs")
+}
+
+/// Build a fixture beneath the installed toolchain, so `node_modules` resolves.
+///
+/// Each call gets its own directory: cargo runs the tests of one binary on
+/// parallel threads, and two of them writing one project would race.
+pub fn build_under_toolchain(name: &str, purpose: &str) -> Option<(PathBuf, Output)> {
+    let root = installed()?;
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let out = root.join("projects").join(format!(
+        "acceptance-{purpose}-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&out);
+    let output = agent_compose()
+        .arg("build")
+        .arg(fixture(name))
+        .args(["--target", "local"])
+        .arg("--out")
+        .arg(&out)
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("the command runs");
+    Some((out, output))
+}
+
+/// Run one flow of a built fixture, through Node, against the mock provider.
+///
+/// This is the invocation half of every codegen criterion: the graph is the
+/// emitted one, the provider is the scripted one, and what comes back is the
+/// flow's own `outputs:` plus the routing trace the run recorded (PRD 5.3).
+///
+/// Answers `None` when the Node toolchain is absent and this is not CI, which is
+/// the same skip `tests/generated_code_gates.rs` takes; a test that gets `None`
+/// has nothing to assert and returns.
+pub fn invoke(
+    name: &str,
+    flow: &str,
+    inputs: &[(&str, &str)],
+    provider: &MockProvider,
+) -> Option<Invocation> {
+    let object: Value = Value::Object(
+        inputs
+            .iter()
+            .map(|(field, value)| ((*field).to_string(), Value::String((*value).to_string())))
+            .collect(),
+    );
+    invoke_with(name, flow, &object, &environment(provider))
+}
+
+/// The same, with the inputs as JSON and the environment given explicitly.
+pub fn invoke_with(
+    name: &str,
+    flow: &str,
+    inputs: &Value,
+    environment: &[(String, String)],
+) -> Option<Invocation> {
+    let (project, built) = build_under_toolchain(name, "invoke")?;
+    assert!(
+        built.status.success(),
+        "the fixture `{name}` did not build:\n{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+
+    let inputs_path = project.join("invoke-inputs.json");
+    std::fs::write(
+        &inputs_path,
+        serde_json::to_string(inputs).expect("the inputs serialize"),
+    )
+    .expect("the project directory is writable");
+    let trace_path = project.join("invoke-trace.json");
+
+    let mut command = Command::new("node");
+    command
+        .arg(driver())
+        .arg(&project)
+        .arg(flow)
+        .arg(&inputs_path)
+        .arg(&trace_path);
+    seal(&mut command, environment);
+    let output = command.output().expect("node runs");
+    Some(Invocation {
+        run: Run { output },
+        trace: trace_path,
+        project,
+    })
+}
+
+/// What one compiled-graph run produced.
+pub struct Invocation {
+    /// Its stdout, stderr and status, read exactly as a `run`'s are.
+    pub run: Run,
+    /// Where the driver wrote the routing trace.
+    trace: PathBuf,
+    /// The built project it ran out of.
+    pub project: PathBuf,
+}
+
+impl Invocation {
+    /// The flow's outputs, as the run printed them.
+    pub fn outputs(&self) -> Value {
+        self.run.outputs()
+    }
+
+    /// Assert the run succeeded.
+    pub fn succeeded(&self) -> &Self {
+        self.run.succeeded();
+        self
+    }
+
+    /// Assert the run failed, and answer with what it said.
+    pub fn failed(&self) -> String {
+        self.run.failed()
+    }
+
+    /// Everything the run said on stderr.
+    pub fn stderr(&self) -> String {
+        self.run.stderr()
+    }
+
+    /// Every routing decision the run recorded, in step order (PRD 5.3).
+    pub fn trace(&self) -> Vec<Value> {
+        let text = std::fs::read_to_string(&self.trace).unwrap_or_else(|error| {
+            panic!(
+                "the run wrote no trace ({error})\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&self.run.output.stdout),
+                self.stderr()
+            )
+        });
+        serde_json::from_str(&text).expect("the trace is a JSON array")
+    }
+
+    /// The nodes the run entered, in the order the trace records them.
+    pub fn visited(&self) -> Vec<String> {
+        self.trace()
+            .iter()
+            .map(|entry| entry["node"].as_str().expect("a node id").to_string())
+            .collect()
+    }
+
+    /// One node's trace entries, in step order.
+    pub fn entries(&self, node: &str) -> Vec<Value> {
+        self.trace()
+            .into_iter()
+            .filter(|entry| entry["node"] == node)
+            .collect()
     }
 }
 

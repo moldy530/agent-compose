@@ -103,7 +103,7 @@ fn build_writes_the_project_layout_where_out_points() {
     assert_eq!(code(&output), 0, "{}", stderr(&output));
     assert_eq!(stdout(&output), "", "human output goes to stderr");
     assert!(
-        stderr(&output).contains("wrote 9 files"),
+        stderr(&output).contains("wrote 11 files"),
         "{}",
         stderr(&output)
     );
@@ -113,9 +113,11 @@ fn build_writes_the_project_layout_where_out_points() {
             ".gitignore",
             "README.md",
             "package.json",
+            "src/cel.ts",
             "src/env.ts",
             "src/graph.ts",
             "src/index.ts",
+            "src/runtime.ts",
             "src/schemas.ts",
             "src/state.ts",
             "tsconfig.json",
@@ -161,7 +163,7 @@ fn build_emits_with_every_environment_reference_unset() {
     let output = command.output().expect("the command runs");
     assert_eq!(code(&output), 0, "{}", stderr(&output));
     assert!(
-        stderr(&output).contains("wrote 9 files"),
+        stderr(&output).contains("wrote 11 files"),
         "{}",
         stderr(&output)
     );

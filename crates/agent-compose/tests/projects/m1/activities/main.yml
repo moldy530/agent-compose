@@ -1,0 +1,223 @@
+# M1 acceptance fixture: the deterministic node kinds, multicast, and the two
+# error strategies that are routing outcomes.
+#
+# Every other fixture is about the model. This one is about everything a compiled
+# graph does *around* it, and each flow is one claim:
+#
+#   * `flow.pipeline` — a fork whose two guards are not provably exclusive, so
+#     both edges fire and the node they meet at runs **once** (grammar 7.3 rule 6,
+#     7.6 P2). On the way it runs the three deterministic kinds: an inline `http:`
+#     node whose envelope `status` and decoded body field come back together
+#     (grammar 8.3), an inline `exec:` node whose result is the process envelope
+#     (grammar 8.2), and a `function:` node over a `tool.*` whose single
+#     string-typed property takes raw stdout (grammar 6.1). It ends on a node
+#     declaring `on_error: skip`, whose guard-over-its-own-output goes false while
+#     its `else:` sibling fires — Decision D97, which is the one thing a skip
+#     changes about routing.
+#   * `flow.deadline` — a node whose `timeout:` runs out while a child process
+#     sleeps, and whose `on_error: { fallback: … }` schedules another node instead
+#     of evaluating its own edges (grammar 9.2, Decision D21).
+#
+# The environment is the harness's: `${OPS_URL}` is an HTTP server the test
+# controls and `${OPS_BIN}` a directory of ordinary commands, so nothing here
+# needs infrastructure to run in CI.
+version: "0.1"
+
+defaults:
+  timeout: 30s
+  on_error: fail
+
+state:
+  note:
+    description: The planner's note, written by name from its output.
+    type: string
+    default: ""
+  report:
+    description: What the run produced; written by whichever branch got there.
+    type: string
+    default: ""
+  status:
+    description: The status the probe saw.
+    type: integer
+    default: 0
+  checks:
+    description: One element per completed check (grammar 10.2's `append`).
+    type: array
+    max_items: 8
+    items: { type: string }
+    reduce: append
+
+provider.mock:
+  kind: anthropic
+  api_key: ${MOCK_API_KEY}
+  base_url: ${MOCK_BASE_URL}
+
+model.smart:
+  provider: provider.mock
+  id: claude-sonnet-4-6
+  settings:
+    max_tokens: 4096
+
+agent.planner:
+  description: Decides how much work the goal needs.
+  model: model.smart
+  prompt: |
+    Plan the work. Answer `fast` when a probe is enough and `thorough` when it
+    is not, and write one note either way.
+  input:
+    goal:
+      type: string
+  output:
+    verdict:
+      enum: [fast, thorough]
+    note:
+      type: string
+
+tool.echo:
+  description: Echo one line of text back.
+  input:
+    text:
+      type: string
+      min_length: 1
+  output:
+    snippet:
+      description: The echoed text; one string property, so raw stdout binds to it.
+      type: string
+  exec:
+    command: printf
+    args: ["%s", "echoed"]
+
+flow.pipeline:
+  description: Fan out over two checks, join them, and finish.
+  inputs:
+    goal:
+      type: string
+      min_length: 1
+  outputs:
+    report:
+      type: string
+    status:
+      type: integer
+    checks:
+      type: array
+      max_items: 8
+      items: { type: string }
+  nodes:
+    plan:
+      agent: agent.planner
+      input:
+        goal: "input.goal"
+
+    # An inline `http:` node: `status` is the response envelope and `requests` is
+    # decoded out of the JSON body (grammar 8.3, Decision D56).
+    probe:
+      http:
+        method: GET
+        url: "${OPS_URL}/_mock/state"
+        output:
+          status: { type: integer }
+          requests: { type: integer }
+      writes:
+        status: status
+
+    # A `function:` node: the arguments are checked field-by-field against the
+    # tool's declared `input` (grammar 8.4), and the tool's own result schema is
+    # what decodes stdout.
+    check:
+      function: tool.echo
+      input:
+        text: "state.note"
+      writes:
+        snippet: report
+
+    # The convergence: reached by both branches of the fork, and run once
+    # (grammar 7.6 P2).
+    merge:
+      exec:
+        command: printf
+        args: ["%s", "merged"]
+        output:
+          stdout: { type: string }
+      writes:
+        stdout: checks
+
+    # `on_error: skip` — the command exits 1, which is outside the default
+    # `expect_exit: [0]`, so the node produces no output and writes nothing.
+    tally:
+      exec:
+        command: "${OPS_BIN}/false"
+        output:
+          exit_code: { type: integer }
+      on_error: skip
+
+    publish:
+      exec:
+        command: printf
+        args: ["%s", "published"]
+        output:
+          stdout: { type: string }
+      writes:
+        stdout: report
+
+    # The branch a skip does **not** take. It appends rather than setting
+    # `report`, because the conservative concurrency analysis (grammar 7.6.1)
+    # reads it and `publish` as concurrent — they are reached through the two
+    # edges of the fork's co-takeable pair and neither reaches the other — and an
+    # unreduced channel with two such writers is a compile error (grammar 10.2).
+    rework:
+      exec:
+        command: printf
+        args: ["%s", "reworked"]
+        output:
+          stdout: { type: string }
+      writes:
+        stdout: checks
+
+  edges:
+    - { from: start, to: plan }
+    # Two guards the validator cannot prove exclusive — the first reads an enum
+    # field, the second a string one — so `plan` is a fork and both fire when
+    # both are true (grammar 7.6.1 rule 2).
+    - { from: plan, to: probe, when: "plan.output.verdict == 'fast'" }
+    - { from: plan, to: check, when: "plan.output.note != ''" }
+    # The `else:` escape: exhaustiveness clause 1, and what fires when neither
+    # guard does.
+    - { from: plan, to: merge, else: true }
+    - { from: probe, to: merge }
+    - { from: check, to: merge }
+    - { from: merge, to: tally }
+    # A skipped node's guard over its own output is `false` (Decision D97), and
+    # the `else:` edge §7.6.3 rule 3 requires is what fires instead.
+    - { from: tally, to: rework, when: "tally.output.exit_code == 1" }
+    - { from: tally, to: publish, else: true }
+    - { from: publish, to: end }
+    - { from: rework, to: end }
+
+flow.deadline:
+  description: A node that runs out of time, and the fallback that takes over.
+  outputs:
+    report:
+      type: string
+  nodes:
+    slow:
+      exec:
+        command: "${OPS_BIN}/sleep"
+        args: ["30"]
+        output:
+          exit_code: { type: integer }
+      timeout: 300ms
+      on_error: { fallback: rescue }
+
+    rescue:
+      exec:
+        command: printf
+        args: ["%s", "rescued"]
+        output:
+          stdout: { type: string }
+      writes:
+        stdout: report
+
+  edges:
+    - { from: start, to: slow }
+    - { from: slow, to: end }
+    - { from: rescue, to: end }

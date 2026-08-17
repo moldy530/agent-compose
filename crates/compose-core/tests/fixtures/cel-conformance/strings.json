@@ -55,6 +55,16 @@
     "result": false
   },
   {
+    "name": "matches-in-its-global-spelling",
+    "expression": "matches('a1', '^a[0-9]$')",
+    "result": true
+  },
+  {
+    "name": "matches-in-its-global-spelling-is-false-when-it-does-not",
+    "expression": "matches('ab', '^a[0-9]$')",
+    "result": false
+  },
+  {
     "name": "a-single-quoted-escape",
     "expression": "'it\\'s'",
     "result": "it's"
@@ -75,6 +85,12 @@
     "name": "an-enum-valued-field-compares-as-a-string",
     "expression": "review.output.verdict == 'revise'",
     "input": { "review": { "output": { "verdict": "revise" } } },
+    "result": true
+  },
+  {
+    "name": "a-string-predicate-over-a-node-output-field",
+    "expression": "write.output.draft.startsWith('# ')",
+    "input": { "write": { "output": { "draft": "# a heading" } } },
     "result": true
   }
 ]

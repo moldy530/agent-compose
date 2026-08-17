@@ -83,6 +83,42 @@ use std::sync::Arc;
 use ::cel::Program;
 use ::cel::common::ast::{Expr, IdedExpr, LiteralValue};
 
+/// The evaluation context this project's **Rust** column runs under.
+///
+/// Nothing in the compiler evaluates an expression (see *What is checked here,
+/// and what is not*), so the only consumer of this is the conformance corpus —
+/// which is precisely why it exists: the corpus is evidence that two
+/// implementations agree, and evidence is worthless if one of the two is
+/// configured differently from run to run. One context, built here, used by
+/// `tests/cel_conformance.rs` and by anything that later needs to evaluate.
+///
+/// It is [`Context::default`] plus **one standard overload the pinned crate
+/// does not carry**: `matches` in its global spelling. CEL's standard
+/// definitions give the predicate two overloads — `s.matches(p)` and
+/// `matches(s, p)` — grammar 4.1 puts the standard function set on the surface,
+/// and the compiler's front-end accepts both (the arity table below); `cel`
+/// 0.14.3 implements only the receiver form, which left one expression
+/// `validate` accepts and this project's own evaluator could not run. The
+/// registration is the crate's own implementation under the second name, so the
+/// two spellings cannot answer differently.
+///
+/// The **other** recorded gap is not closed here, because it cannot be: `size`
+/// over a string counts bytes in `cel` 0.14.3 and code points in the
+/// specification, and `add_function` does not override a built-in — the
+/// registry is consulted after the standard set. See
+/// `tests/fixtures/cel-conformance/README.md` for what follows from that, and
+/// `codegen::cel` for the ledger row.
+///
+/// # Panics
+///
+/// Never. The registration is infallible.
+#[must_use]
+pub fn evaluation_context() -> ::cel::Context<'static> {
+    let mut context = ::cel::Context::default();
+    context.add_function("matches", ::cel::functions::matches);
+    context
+}
+
 use crate::diag::DiagnosticCode;
 use crate::parse::reader::{list, suggest};
 
