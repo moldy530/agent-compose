@@ -201,11 +201,19 @@ pub fn emit(ir: &Ir) -> GeneratedProject {
 ///
 /// [`emit`] is total: it answers a project for every artifact, and it has no
 /// span to report against anyway. But not every legal composition *has* a
-/// TypeScript project — `pattern:` is RE2 (Decision D12) and RE2 is not a subset
-/// of ECMAScript, so a pattern the validator blessed can be one no JavaScript
-/// regular expression can hold (see [`pattern`]). Emitting it anyway produces a
-/// `src/schemas.ts` that fails to parse: not a wrong schema, an unloadable
-/// module, and `build` exiting `0` over it.
+/// TypeScript project. Two things it cannot hold:
+///
+/// * **A `pattern:` no JavaScript regular expression can hold.** `pattern:` is
+///   RE2 (Decision D12) and RE2 is not a subset of ECMAScript (see [`pattern`]).
+///   Emitting it anyway produces a `src/schemas.ts` that fails to parse: not a
+///   wrong schema, an unloadable module, and `build` exiting `0` over it.
+/// * **A state channel named after a property every JavaScript object carries.**
+///   `constructor` is a legal grammar 2.1 identifier and grammar 2.5 reserves
+///   only the seven roots, so the validator accepts it — and the emitted
+///   `channels` object is read by `StateGraph` with a plain property lookup, so
+///   the graph cannot be constructed (see [`state::INHERITED_PROPERTY_NAMES`]).
+///   That project type-checks and loads; it fails at `new StateGraph(State)`,
+///   which is past every gate a build has.
 ///
 /// So this is the pass between the validator and the emitter. It is the same
 /// shape as the validator — an [`Ir`] in, [`Diagnostic`]s out, spans included —
@@ -224,6 +232,30 @@ pub fn emit(ir: &Ir) -> GeneratedProject {
 #[must_use]
 pub fn diagnostics(ir: &Ir) -> Vec<Diagnostic> {
     let mut found = crate::diag::Diagnostics::new();
+    for (_, channel) in schema::channels(ir) {
+        let name = channel.name.value.as_str();
+        if !state::inherited_property_name(name) {
+            continue;
+        }
+        found.push(
+            Diagnostic::error(
+                DiagnosticCode::InvalidValue,
+                channel.name.span.clone(),
+                format!(
+                    "a state channel named `{name}` is one this target cannot hold: LangGraph \
+                     keeps its channels in a plain object and asks it for `{name}` before \
+                     installing the channel, which every JavaScript object answers from \
+                     `Object.prototype` — so the graph fails to construct before a node runs"
+                ),
+            )
+            .with_help(format!(
+                "rename the channel — grammar 10.3 wires a write by the channel's own name, so \
+                 `{name}` is the key the emitted state model has to use and there is no second \
+                 spelling of it"
+            )),
+        );
+    }
+
     let mut reported: std::collections::BTreeSet<(String, usize, usize, String)> =
         std::collections::BTreeSet::new();
     for surface in schema::surfaces(ir) {
@@ -421,6 +453,86 @@ flow.f:
     #[test]
     fn the_worked_shapes_have_nothing_the_target_cannot_express() {
         assert_eq!(diagnostics(&ir_of(test_support::EVERY_FORM)), []);
+    }
+
+    /// A channel named after a property every JavaScript object carries is
+    /// refused, and the names that merely *look* like it are not.
+    ///
+    /// `constructor` validates, emits a project that type-checks and loads, and
+    /// then fails at `new StateGraph(State)` — past every gate a build has, which
+    /// is why the refusal is here rather than left to a runtime nobody runs at
+    /// build time. The three neighbours are the over-refusal guard: a check that
+    /// matched on a prefix, or on "looks like a JavaScript thing", would take
+    /// them too.
+    #[test]
+    fn a_channel_named_after_a_property_every_object_carries_is_refused() {
+        let ir = ir_of(
+            r#"version: "0.1"
+
+state:
+  construct: { type: string }
+  constructors: { type: string }
+  constructor_name: { type: string }
+  constructor: { type: string, default: "ctor" }
+"#,
+        );
+        let reported = diagnostics(&ir);
+        assert_eq!(reported.len(), 1, "{reported:#?}");
+        assert!(reported[0].is_error());
+        assert!(
+            reported[0].message.contains("`constructor`"),
+            "{:?}",
+            reported[0].message
+        );
+        assert!(
+            reported[0]
+                .message
+                .contains("every JavaScript object answers from `Object.prototype`"),
+            "the message says why, not just that: {:?}",
+            reported[0].message
+        );
+        assert!(
+            reported[0]
+                .help
+                .as_ref()
+                .is_some_and(|help| help.contains("rename the channel")),
+            "{:?}",
+            reported[0].help
+        );
+
+        // The span is the channel's own name, on its own line, rather than the
+        // whole `state:` section: the reader has to be pointed at the key they
+        // have to change.
+        assert_eq!(
+            (
+                reported[0].span.start.line,
+                reported[0].span.start.column,
+                reported[0].span.bytes.len()
+            ),
+            (7, 3, "constructor".len()),
+        );
+    }
+
+    /// Grammar 2.1's identifier admits exactly one of the inherited property
+    /// names, so `constructor` is the whole of what this check can ever report —
+    /// which is why it is the only name the corpus and the fixtures carry.
+    #[test]
+    fn constructor_is_the_only_inherited_property_name_a_channel_can_be_called() {
+        let reachable: Vec<&str> = state::INHERITED_PROPERTY_NAMES
+            .iter()
+            .copied()
+            // Grammar 2.1: `lower , { lower | digit | "_" }`.
+            .filter(|name| {
+                let mut characters = name.chars();
+                characters
+                    .next()
+                    .is_some_and(|first| first.is_ascii_lowercase())
+                    && characters.all(|rest| {
+                        rest.is_ascii_lowercase() || rest.is_ascii_digit() || rest == '_'
+                    })
+            })
+            .collect();
+        assert_eq!(reachable, ["constructor"]);
     }
 
     #[test]

@@ -1,9 +1,10 @@
 //! The generated-code checks of CLAUDE.md's *Validation strategy*, run against
 //! the **real** pinned JavaScript toolchain.
 //!
-//! Six gates. The first four are in increasing strength, each one existing
-//! because the one above it passes on code the one below it catches; the last two
-//! are about the schemas rather than the graph:
+//! Seven gates. The first four are in increasing strength, each one existing
+//! because the one above it passes on code the one below it catches; the next two
+//! are about the schemas rather than the graph; the last is about a composition
+//! that has no generated project at all:
 //!
 //! 1. **`tsc --noEmit`** — every golden project type-checks under its own strict
 //!    `tsconfig.json`, against installed `@langchain/langgraph`, `@langchain/core`
@@ -43,6 +44,15 @@
 //!    parse that follows it — see `codegen::schema`'s *What a provider is handed*.
 //!    Gate 5 is what makes the two columns agree; this is what says which of them
 //!    a model actually sees.
+//! 7. **The refusal's evidence** — `compose_core::codegen::diagnostics` refuses to
+//!    build a composition whose `state:` names a channel after a property every
+//!    JavaScript object carries (`constructor`). That refusal is an
+//!    over-refusal until something shows the runtime really cannot take the
+//!    name, and no golden can show it, because the compiler will not emit one.
+//!    So this gate builds the channel table itself and makes LangGraph fail on
+//!    it — and asks Node for `Object.getOwnPropertyNames(Object.prototype)`, so
+//!    the Rust-side list is checked against the object model rather than against
+//!    a memory of it.
 //!
 //! # The toolchain fixture
 //!
@@ -460,6 +470,72 @@ fn the_emitted_state_model_reduces_the_way_its_policies_say() {
             entry.golden
         );
     }
+}
+
+/// Gate 7: the channel names the compiler refuses are names LangGraph refuses.
+///
+/// `codegen::state::INHERITED_PROPERTY_NAMES` is why `agent-compose build`
+/// rejects a composition declaring `state:\n  constructor: …`, which the
+/// validator accepts and which produces a project that type-checks, loads, and
+/// dies at `new StateGraph(State)`. Every other gate here runs over a golden;
+/// this one cannot, because the emitter refuses to produce the project — so the
+/// channel table is built directly and LangGraph is asked.
+///
+/// Two claims, both of them things that could quietly stop being true:
+///
+/// * the list is the object model's own — `Object.getOwnPropertyNames(
+///   Object.prototype)` under the pinned Node, not a transcription of it;
+/// * every name on it really breaks construction under the pinned LangGraph, and
+///   two ordinary names do not. A release that fixed the lookup would fail here,
+///   which is the signal to drop the refusal rather than keep it out of habit.
+#[test]
+fn a_channel_named_after_an_inherited_property_cannot_be_built_at_all() {
+    let Some(root) = installed() else {
+        return;
+    };
+
+    let refused = compose_core::codegen::state::INHERITED_PROPERTY_NAMES;
+    // Two names a check matching on shape rather than on membership would take
+    // with it: one ordinary channel name, and the near-miss the fixtures use.
+    let controls = ["draft", "constructors"];
+    let probed: Vec<&str> = refused.iter().copied().chain(controls).collect();
+
+    let output = Command::new("node")
+        .arg(root.join("inherited-channel-names.mjs"))
+        .arg(serde_json::to_string(&probed).expect("the names serialize"))
+        .output()
+        .expect("node runs");
+    assert!(
+        output.status.success(),
+        "the inherited-name runner failed:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let answer: Value =
+        serde_json::from_slice(&output.stdout).expect("the runner prints one JSON object");
+
+    let inherited: Vec<&str> = answer["inherited"]
+        .as_array()
+        .expect("`inherited` is an array")
+        .iter()
+        .map(|name| name.as_str().expect("a name is a string"))
+        .collect();
+    assert_eq!(
+        inherited, refused,
+        "`INHERITED_PROPERTY_NAMES` is not `Object.getOwnPropertyNames(Object.prototype)` under \
+         the pinned Node; the refusal is over or under what the object model actually carries"
+    );
+
+    let rejected: Vec<&str> = answer["rejected"]
+        .as_array()
+        .expect("`rejected` is an array")
+        .iter()
+        .map(|name| name.as_str().expect("a name is a string"))
+        .collect();
+    assert_eq!(
+        rejected, refused,
+        "the names `build` refuses are not the names LangGraph refuses; the controls {controls:?} \
+         must construct and every inherited name must not"
+    );
 }
 
 /// Gate 2c: loading the project is what checks its environment (PRD 5.9).

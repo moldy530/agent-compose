@@ -460,6 +460,74 @@ fn a_pattern_javascript_cannot_express_refuses_the_build_but_not_validation() {
     );
 }
 
+/// A channel name the target cannot hold refuses the emission, and `validate` is
+/// untouched by it.
+///
+/// The bug this pins is the quietest one the emitter had: `state:` may declare a
+/// channel called `constructor` — a legal grammar 2.1 identifier, and grammar 2.5
+/// reserves only the seven roots — and the project that comes out validates,
+/// builds, type-checks under the pinned `tsc`, and loads under Node. It fails at
+/// `new StateGraph(State)`, because LangGraph asks its channel table for
+/// `constructor` and `Object.prototype` answers. Nothing a build runs would ever
+/// have seen it.
+#[test]
+fn a_channel_name_the_target_cannot_hold_refuses_the_build_but_not_validation() {
+    let projects = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/projects");
+    let out = scratch("channel-name");
+
+    let validated = Command::cargo_bin("agent-compose")
+        .expect("the binary under test is built")
+        .current_dir(&projects)
+        .env("NO_COLOR", "1")
+        .args(["validate", "one-unrepresentable-channel-name/main.yml"])
+        .output()
+        .expect("the command runs");
+    assert_eq!(
+        code(&validated),
+        0,
+        "the composition is valid; `constructor` is a legal identifier: {}",
+        stderr(&validated)
+    );
+
+    let built = Command::cargo_bin("agent-compose")
+        .expect("the binary under test is built")
+        .current_dir(&projects)
+        .env("NO_COLOR", "1")
+        .args([
+            "build",
+            "one-unrepresentable-channel-name/main.yml",
+            "--out",
+        ])
+        .arg(&out)
+        .output()
+        .expect("the command runs");
+
+    assert_eq!(code(&built), 1, "{}", stderr(&built));
+    let report = stderr(&built);
+    for expected in [
+        "a state channel named `constructor`",
+        "Object.prototype",
+        "rename the channel",
+        // The span is the key itself, on its own line.
+        "main.yml:19:3",
+        "is valid and cannot be compiled for `local`: 1 error",
+    ] {
+        assert!(
+            report.contains(expected),
+            "the report does not carry `{expected}`:\n{report}"
+        );
+    }
+    assert!(
+        !report.contains("`construct`") && !report.contains("`constructors`"),
+        "the neighbours in the same section are not reported:\n{report}"
+    );
+    assert_eq!(
+        files_under(&out),
+        Vec::<String>::new(),
+        "a composition this target cannot express produces no project"
+    );
+}
+
 /// An entrypoint that is not a readable file is the command's own precondition,
 /// not the composition's problem: exit `2`, no report.
 #[test]

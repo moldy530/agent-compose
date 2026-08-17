@@ -35,6 +35,28 @@
 //!   type system; a total type here would be a lie the compiler tells about a
 //!   value the runtime may not have.
 //!
+//! # One name the channel table cannot hold
+//!
+//! The emitted `channels` is a plain object literal keyed by the channel's own
+//! name, and LangGraph reads it with a plain property lookup — `StateGraph`'s
+//! `_addSchema` asks `this.channels[key] !== undefined` before installing a
+//! channel, over a `this.channels` that is itself `{}`. A key every JavaScript
+//! object already answers therefore reads as *already installed*, and the next
+//! line calls `.equals(…)` on whatever `Object.prototype` handed back:
+//!
+//! ```text
+//! TypeError: this.channels[key].equals is not a function
+//!     at StateGraph._addSchema (@langchain/langgraph/dist/graph/state.js:333)
+//! ```
+//!
+//! Those names are [`INHERITED_PROPERTY_NAMES`], and grammar 2.5 reserves none
+//! of them — `constructor` is a channel name the validator is right to accept
+//! and this target cannot express, so [`super::diagnostics`] refuses the build
+//! rather than emitting a project that type-checks, loads, and cannot construct
+//! its own graph. Renaming is the only fix available here: grammar 10.3 wires a
+//! write by the channel's own name, so the emitter has no second spelling to
+//! reach for.
+//!
 //! # Ordering
 //!
 //! A reducer sees writes one at a time and can only be as ordered as the caller.
@@ -52,6 +74,44 @@ use crate::ir::schema::TypeForm;
 
 use super::names::{self, Names};
 use super::schema;
+
+/// Every property name a JavaScript object carries without being given one:
+/// the own properties of `Object.prototype`, sorted.
+///
+/// A channel whose name is one of these cannot be a key of the emitted
+/// `channels` object [`module`] emits — see the module docs for the mechanism, and
+/// [`super::diagnostics`] for the refusal. The whole list is here rather than
+/// only the reachable part of it, because the rule is prototype lookup rather
+/// than spelling; grammar 2.1's identifier (`lower , { lower | digit | "_" }`)
+/// admits exactly one of them, `constructor`, which is why that is the one
+/// every test names.
+///
+/// `tests/generated_code_gates.rs`'
+/// `a_channel_named_after_an_inherited_property_cannot_be_built_at_all` is what
+/// keeps this list honest: it asks the pinned Node for
+/// `Object.getOwnPropertyNames(Object.prototype)` and then makes LangGraph fail
+/// on each one, so a list that grew stale — or a LangGraph release that stopped
+/// caring — is a red test rather than a silent over-refusal.
+pub const INHERITED_PROPERTY_NAMES: &[&str] = &[
+    "__defineGetter__",
+    "__defineSetter__",
+    "__lookupGetter__",
+    "__lookupSetter__",
+    "__proto__",
+    "constructor",
+    "hasOwnProperty",
+    "isPrototypeOf",
+    "propertyIsEnumerable",
+    "toLocaleString",
+    "toString",
+    "valueOf",
+];
+
+/// Whether every JavaScript object already answers to this name.
+#[must_use]
+pub fn inherited_property_name(name: &str) -> bool {
+    INHERITED_PROPERTY_NAMES.contains(&name)
+}
 
 /// `src/state.ts`.
 #[must_use]
