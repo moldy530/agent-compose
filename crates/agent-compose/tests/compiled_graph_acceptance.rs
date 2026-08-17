@@ -4407,9 +4407,10 @@ fn serve_resumes_an_interrupted_execution_against_the_human_nodes_schema() {
 /// interface assumptions the harness header says a codegen PR may fix here:
 ///
 /// * the module is `src/graph.ts`, not `./graph.js`. The emitted project has **no
-///   build step** — Node has stripped types natively since 22.18, so the
-///   TypeScript in `src/` is what runs — and a `.js` at the root would have had
-///   to come from a `tsc` emit `--noEmit` never performs. See the generated
+///   build step** — Bun, which PRD §9.18 makes the default runtime and which is
+///   what this test launches, runs the TypeScript in `src/` as it is written, and
+///   so does the Node fallback since 22.18 — and a `.js` at the root would have
+///   had to come from a `tsc` emit `--noEmit` never performs. See the generated
 ///   `README.md`, which documents the layout.
 /// * the reason names what is actually missing. `build` exists, the pinned
 ///   toolchain exists, and `compose-core`'s `tests/generated_code_gates.rs`

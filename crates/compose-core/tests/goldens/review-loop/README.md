@@ -87,7 +87,7 @@ Node **>=22.18.0** is a supported fallback, and nothing here is written for one
 runtime: no emitted module reaches for a `Bun` global or a `bun:` import, which
 is a gate on the compiler rather than a promise in a README. 22.18 is the floor
 because that is where Node stopped flagging type stripping, and it is what
-`engines.node` above declares:
+`engines.node` in `package.json` declares:
 
 ```sh
 npm install          # or: pnpm install
