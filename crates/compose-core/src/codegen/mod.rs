@@ -214,9 +214,18 @@ pub fn emit(ir: &Ir) -> GeneratedProject {
 /// `validate` answers "is this composition well formed", which does not depend
 /// on which target it is later compiled for, and this answers "can *this* target
 /// express it".
+///
+/// **One declaration, one diagnostic.** A type node is reachable from more than
+/// one surface — a store's `value_schema` is a schema in its own right *and* is
+/// embedded in the row every `get` on that store derives (grammar 11.4), so a
+/// composition with three such nodes reaches one `pattern:` four times. The
+/// subject of the message is the declaration, and repeating it once per use
+/// would be three copies of one problem with one span (PRD G3).
 #[must_use]
 pub fn diagnostics(ir: &Ir) -> Vec<Diagnostic> {
     let mut found = crate::diag::Diagnostics::new();
+    let mut reported: std::collections::BTreeSet<(String, usize, usize, String)> =
+        std::collections::BTreeSet::new();
     for surface in schema::surfaces(ir) {
         surface.walk(&mut |ty| {
             let TypeForm::Scalar(scalar) = &ty.form else {
@@ -225,6 +234,17 @@ pub fn diagnostics(ir: &Ir) -> Vec<Diagnostic> {
             let Some(source) = &scalar.pattern else {
                 return;
             };
+            // The span identifies the declaration: a synthesized copy of a
+            // field map keeps the spans of the text it was copied from.
+            let declaration = (
+                ty.span.source.as_str().to_string(),
+                ty.span.bytes.start,
+                ty.span.bytes.end,
+                source.clone(),
+            );
+            if !reported.insert(declaration) {
+                return;
+            }
             if let Err(unsupported) = pattern::javascript(source) {
                 found.push(
                     Diagnostic::error(
@@ -332,6 +352,68 @@ state:
             reported[0].span.bytes.start < reported[1].span.bytes.start,
             "the report is in source order"
         );
+    }
+
+    /// A declaration two surfaces reach is reported once.
+    ///
+    /// A `kv` `get` derives `{value, found}` with the store's own `value_schema`
+    /// inside it (grammar 11.4), so the pattern below is walked three times —
+    /// once as `store.s.value_schema` and once per node — and the reader is told
+    /// about it once, against the span where it is written.
+    #[test]
+    fn a_pattern_reached_by_more_than_one_surface_is_reported_once() {
+        let ir = ir_of(
+            r#"version: "0.1"
+
+store.s:
+  kind: kv
+  scope: global
+  description: Holds a slug.
+  value_schema:
+    slug: { type: string, pattern: "(?i)^abc$" }
+
+flow.f:
+  outputs: {}
+  nodes:
+    look: { store: store.s, op: get, key: "'k'" }
+    again: { store: store.s, op: get, key: "'j'" }
+  edges:
+    - { from: start, to: look }
+    - { from: look, to: again }
+    - { from: again, to: end }
+"#,
+        );
+        // The surfaces that hold it, so a change to either half of the claim
+        // shows up here rather than in the count alone.
+        let surfaces = schema::surfaces(&ir);
+        let holders: Vec<&str> = surfaces
+            .iter()
+            .filter(|surface| {
+                let mut holds = false;
+                surface.walk(&mut |ty| {
+                    if let TypeForm::Scalar(scalar) = &ty.form
+                        && scalar.pattern.is_some()
+                    {
+                        holds = true;
+                    }
+                });
+                holds
+            })
+            .map(|surface| surface.path.as_str())
+            .collect();
+        assert_eq!(
+            holders,
+            [
+                "flow.f.node.look.output",
+                "flow.f.node.again.output",
+                "store.s.value_schema",
+            ],
+            "the pattern is reachable from three surfaces"
+        );
+
+        let reported = diagnostics(&ir);
+        assert_eq!(reported.len(), 1, "{reported:#?}");
+        assert!(reported[0].message.contains("inline"));
     }
 
     /// Every `pattern:` in a composition the rest of the suite compiles is one

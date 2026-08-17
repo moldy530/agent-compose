@@ -336,12 +336,43 @@ struct Document {
     #[serde(default)]
     divergence: Option<String>,
     document: Value,
+    #[serde(default)]
+    as_written: Option<String>,
 }
 
 impl Document {
     /// The verdict the emitted Zod must reach.
     fn zod_verdict(&self) -> bool {
         self.zod.unwrap_or(self.valid)
+    }
+
+    /// The exact JSON text the Zod column is handed.
+    ///
+    /// `serde_json` reads an object into a `BTreeMap`, so a document written in
+    /// the corpus arrives here with its keys **sorted** and the order they were
+    /// written in is gone. Object key order is not supposed to matter — JSON
+    /// Schema compares instances — but "not supposed to" is the thing a corpus
+    /// exists to check, and it cannot check it through a representation that
+    /// has already normalized it. So a case that is about key order writes the
+    /// document out a second time as `as_written`, which is passed through
+    /// verbatim for `JSON.parse` to read in that order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `as_written` is not JSON, or is JSON denoting a different
+    /// value than `document` — the two are one document and a case where they
+    /// disagree would test something nobody wrote down.
+    fn text(&self) -> String {
+        let Some(written) = &self.as_written else {
+            return serde_json::to_string(&self.document).expect("a document serializes");
+        };
+        let parsed: Value = serde_json::from_str(written)
+            .unwrap_or_else(|error| panic!("`as_written` is not JSON: {written} ({error})"));
+        assert_eq!(
+            parsed, self.document,
+            "`as_written` and `document` are the same document written twice"
+        );
+        written.clone()
     }
 }
 
@@ -556,6 +587,33 @@ fn every_divergence_between_the_two_columns_is_declared_and_exercised() {
     );
 }
 
+/// The corpus's key-order mechanism is used, and says the same thing twice.
+///
+/// [`Document::text`] asserts that a document's two spellings denote one value,
+/// so walking the corpus is what checks it; and a mechanism no case uses is one
+/// that could stop working without a failure, so at least one document has to
+/// carry `as_written`. Today that is `state.authors`' key-order pair, which is
+/// the only place object key order is the subject rather than an accident.
+///
+/// Runs without a toolchain: it is about the corpus, not about either column.
+#[test]
+fn a_document_written_out_twice_says_the_same_thing_both_times() {
+    let cases = corpus();
+    let mut written = 0usize;
+    for case in &cases {
+        for document in &case.documents {
+            let _ = document.text();
+            if document.as_written.is_some() {
+                written += 1;
+            }
+        }
+    }
+    assert!(
+        written > 0,
+        "no case writes a document out as text, so nothing pins a rule about key order"
+    );
+}
+
 /// Gate 3: each column of grammar 3.8's table answers what the corpus says it
 /// does — and where they differ, that the difference is the declared one.
 #[test]
@@ -574,7 +632,7 @@ fn the_emitted_zod_agrees_with_the_json_schema_lowering() {
             .iter()
             .find(|surface| surface.path == case.surface)
             .unwrap_or_else(|| panic!("`{}` declares no `{}`", case.golden, case.surface));
-        let schema = match surface.body {
+        let schema = match &surface.body {
             compose_core::codegen::schema::Body::Fields(fields) => {
                 compose_core::codegen::schema::json_field_map(fields)
             }
@@ -638,10 +696,13 @@ fn the_emitted_zod_agrees_with_the_json_schema_lowering() {
                 let case = &cases[*index];
                 serde_json::json!({
                     "export": names.value(&case.surface),
+                    // JSON *text* rather than values: the runner parses each one
+                    // itself, so the key order a case wrote survives to the Zod
+                    // column. See `Document::text`.
                     "documents": case
                         .documents
                         .iter()
-                        .map(|document| document.document.clone())
+                        .map(Document::text)
                         .collect::<Vec<_>>(),
                 })
             })

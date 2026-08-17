@@ -19,6 +19,7 @@ import {
   stateAt,
   stateAtTime,
   stateAuthor,
+  stateAuthors,
   stateDigits,
   stateDraft,
   stateHost,
@@ -68,6 +69,11 @@ export const channels = {
    * Starts **unset**: reading it before its first write fails the execution (Decision D78).
    */
   author: Annotation<z.infer<typeof stateAuthor>>,
+  /**
+   * Unreduced: single-writer, and a write supplies the whole value.
+   * Starts **unset**: reading it before its first write fails the execution (Decision D78).
+   */
+  authors: Annotation<z.infer<typeof stateAuthors>>,
   /**
    * Unreduced: single-writer, and a write supplies the whole value.
    * Starts **unset**: reading it before its first write fails the execution (Decision D78).

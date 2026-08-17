@@ -24,13 +24,33 @@
 //! | `exclusive_minimum` | `exclusiveMinimum` | `.gt(…)` | Zod spells the exclusive bounds `gt`/`lt` |
 //! | `multiple_of` | `multipleOf` | `.multipleOf(…)` | |
 //! | `min_items` | `minItems` | `.min(…)` | |
-//! | `unique_items` | `uniqueItems` | `.refine(uniqueItems, …)` | Zod has no built-in; the emitted helper compares JSON encodings |
+//! | `unique_items` | `uniqueItems` | `.refine(uniqueItems, …)` | Zod has no built-in; the emitted helper compares JSON encodings, which is not what `uniqueItems` means but is what it *decides* here — see below |
 //! | `optional: [b]` **and** `default:` on `b` | `b` omitted from `required` | `.default(v)` alone | grammar 3.6 makes a defaulted property implicitly optional, and `.default(v).optional()` would answer `undefined` for an omitted property instead of the default — the one composition where the two orderings differ |
 //!
 //! Two spellings are the table's own and are kept verbatim even where Zod offers
 //! a newer one: a closed object is `z.object({…}).strict()` (not
 //! `z.strictObject`), and an integer is `z.number().int()` (not `z.int()`). The
 //! grammar is normative and both pairs denote the same schema.
+//!
+//! # `unique_items`, and the one row that leans on its surroundings
+//!
+//! JSON Schema's `uniqueItems` compares **instances**: two objects are one item
+//! when they carry the same keys with equal values, whatever order those keys
+//! were written in. The emitted `uniqueItems` compares `JSON.stringify`
+//! encodings, and an object's encoding follows its key order — a different rule,
+//! which on raw input answers differently (`[{a: 1, b: 2}, {b: 2, a: 1}]` is
+//! unique to the encoding rule and a duplicate to JSON Schema's).
+//!
+//! It is nevertheless the same *decision* in the position it is emitted into,
+//! and for a reason worth stating because nothing about the helper says it:
+//! `.refine` runs over the array's already-**parsed** elements, and
+//! `z.object({…}).strict()` rebuilds each object in the order its own shape
+//! declares. Two equal instances therefore reach the helper with identical
+//! encodings. `state.authors` in the corpus pins that decision from raw text
+//! (`as_written`, so the key order a document was written in survives the
+//! corpus's own round trip), which is what would fail if a pinned Zod release
+//! ever stopped normalizing — the alternative, a canonicalizing helper in every
+//! generated project, would be a rule no gate could tell apart from this one.
 //!
 //! # `format:`, and why six of the ten are written out
 //!
@@ -75,9 +95,12 @@
 //! syntax — [`super::pattern`] is the module that decides what transfers, and
 //! [`super::diagnostics`] is what refuses a `build` whose patterns do not.
 
+use std::borrow::Cow;
+
 use serde_json::{Map, Value, json};
 
 use crate::ast::schema::{Number, ScalarKind, StringFormat};
+use crate::check::model;
 use crate::ir::definition::DefinitionBody;
 use crate::ir::flow::NodeKind;
 use crate::ir::schema::{ArrayType, EnumType, FieldMap, ObjectType, Scalar, TypeForm, TypeNode};
@@ -99,10 +122,16 @@ pub struct Surface<'ir> {
 
 /// A schema is either a declaration surface's field map or a single type node —
 /// a state channel is the only one of the second kind (grammar 10.1).
-#[derive(Clone, Copy, Debug)]
+///
+/// The field map is a [`Cow`] because some of them are written nowhere: an
+/// inline `exec:`/`http:` node that declares no `output:` has a **kind default**
+/// as its result schema (grammar 8.2, 8.3), and a `store:` op node has a
+/// **derived** one (grammar 11.4). Both are synthesized rather than parsed. See
+/// [`surfaces`].
+#[derive(Clone, Debug)]
 pub enum Body<'ir> {
     /// A field map: a closed object (grammar 3.1).
-    Fields(&'ir FieldMap),
+    Fields(Cow<'ir, FieldMap>),
     /// One type node, which is what a channel declares.
     Type(&'ir TypeNode),
 }
@@ -117,6 +146,23 @@ pub enum Body<'ir> {
 /// This function is the single enumeration of "every schema there is": the name
 /// registry, the emitted module, and the conformance corpus all walk it, so a
 /// surface added to the grammar reaches all three at once or none.
+///
+/// "Every schema there is" includes the ones nobody writes. Three node kinds
+/// have a result schema that appears nowhere in the source text:
+///
+/// * an inline `exec:` node with no `output:` — grammar 8.2's
+///   `{exit_code, stdout}`;
+/// * an inline `http:` node with no `output:` — grammar 8.3's `{status, body}`;
+/// * a `store:` op node, whose result is *derived* from the op and the store it
+///   names — grammar 11.4's catalogue (Decision D34).
+///
+/// The validator already resolves all three (`check::Context::node_output`),
+/// which is why an edge guard over such a node is type-checked at all. Omitting
+/// them here would leave a node with a checked result surface and no emitted
+/// schema, no export name and no conformance case, and the node-fn PR would find
+/// nothing to parse the node's answer with. Each shape is taken from
+/// [`crate::check::model`] rather than restated, because two spellings of one
+/// grammar rule is exactly the drift this function exists to prevent.
 #[must_use]
 pub fn surfaces(ir: &Ir) -> Vec<Surface<'_>> {
     let mut surfaces = Vec::new();
@@ -127,7 +173,7 @@ pub fn surfaces(ir: &Ir) -> Vec<Surface<'_>> {
                     surfaces.push(Surface {
                         path: format!("{address}.input"),
                         about: format!("`{address}` — its declared input (grammar 5.3)."),
-                        body: Body::Fields(input),
+                        body: borrowed(input),
                     });
                 }
                 surfaces.push(Surface {
@@ -136,19 +182,19 @@ pub fn surfaces(ir: &Ir) -> Vec<Surface<'_>> {
                         "`{address}` — the structured output the model is constrained to, and \
                          what routing reads (PRD 5.2, 5.3)."
                     ),
-                    body: Body::Fields(&agent.output),
+                    body: borrowed(&agent.output),
                 });
             }
             DefinitionBody::Tool(tool) => {
                 surfaces.push(Surface {
                     path: format!("{address}.input"),
                     about: format!("`{address}` — its parameters (grammar 6)."),
-                    body: Body::Fields(&tool.input),
+                    body: borrowed(&tool.input),
                 });
                 surfaces.push(Surface {
                     path: format!("{address}.output"),
                     about: format!("`{address}` — its result (grammar 6)."),
-                    body: Body::Fields(&tool.output),
+                    body: borrowed(&tool.output),
                 });
             }
             DefinitionBody::Flow(flow) => {
@@ -156,7 +202,7 @@ pub fn surfaces(ir: &Ir) -> Vec<Surface<'_>> {
                     surfaces.push(Surface {
                         path: format!("{address}.inputs"),
                         about: format!("`{address}` — the module's parameters (grammar 7.5)."),
-                        body: Body::Fields(inputs),
+                        body: borrowed(inputs),
                     });
                 }
                 surfaces.push(Surface {
@@ -165,7 +211,7 @@ pub fn surfaces(ir: &Ir) -> Vec<Surface<'_>> {
                         "`{address}` — the module's result, materialized from the state channels \
                          of the same names at quiescence (grammar 7.5, 7.6.3)."
                     ),
-                    body: Body::Fields(&flow.outputs),
+                    body: borrowed(&flow.outputs),
                 });
                 for node in &flow.nodes {
                     let id = node.id.value.as_str();
@@ -177,7 +223,7 @@ pub fn surfaces(ir: &Ir) -> Vec<Surface<'_>> {
                                     "`{address}` node `{id}` — what the human is shown \
                                      (grammar 8.7)."
                                 ),
-                                body: Body::Fields(&human.input),
+                                body: borrowed(&human.input),
                             });
                             surfaces.push(Surface {
                                 path: format!("{address}.node.{id}.output"),
@@ -185,38 +231,72 @@ pub fn surfaces(ir: &Ir) -> Vec<Surface<'_>> {
                                     "`{address}` node `{id}` — what the human returns, routable \
                                      like any structured output (grammar 8.7)."
                                 ),
-                                body: Body::Fields(&human.output),
+                                body: borrowed(&human.output),
                             });
                         }
                         NodeKind::Exec { exec } => {
-                            if let Some(output) = &exec.output {
-                                surfaces.push(Surface {
-                                    path: format!("{address}.node.{id}.output"),
-                                    about: format!(
-                                        "`{address}` node `{id}` — what the subprocess produces \
-                                         (grammar 8.2)."
-                                    ),
-                                    body: Body::Fields(output),
-                                });
-                            }
+                            surfaces.push(Surface {
+                                path: format!("{address}.node.{id}.output"),
+                                about: format!(
+                                    "`{address}` node `{id}` — what the subprocess produces \
+                                     (grammar 8.2){}.",
+                                    default_note(exec.output.is_none())
+                                ),
+                                body: exec.output.as_ref().map_or_else(
+                                    || owned(model::exec_default_output(&exec.span)),
+                                    borrowed,
+                                ),
+                            });
                         }
                         NodeKind::Http { http } => {
-                            if let Some(output) = &http.output {
+                            surfaces.push(Surface {
+                                path: format!("{address}.node.{id}.output"),
+                                about: format!(
+                                    "`{address}` node `{id}` — what the response decodes to \
+                                     (grammar 8.3){}.",
+                                    default_note(http.output.is_none())
+                                ),
+                                body: http.output.as_ref().map_or_else(
+                                    || owned(model::http_default_output(&http.span)),
+                                    borrowed,
+                                ),
+                            });
+                        }
+                        NodeKind::Store { store, op, params } => {
+                            // Grammar 11.4's row, derived from the op and the
+                            // store it names — a shape that exists nowhere in
+                            // the source text, like the two kind defaults
+                            // above. A `store:` whose address did not resolve
+                            // has no row to derive, and the resolver has
+                            // already said so, which is the one case with no
+                            // surface at all.
+                            if let Some(definition) = ir.definitions.get(&store.value.to_string())
+                                && let DefinitionBody::Store(definition) = &definition.body
+                            {
                                 surfaces.push(Surface {
                                     path: format!("{address}.node.{id}.output"),
                                     about: format!(
-                                        "`{address}` node `{id}` — what the response decodes to \
-                                         (grammar 8.3)."
+                                        "`{address}` node `{id}` — what the `{}` of \
+                                         `{}` answers, derived from the op and the store \
+                                         (grammar 11.4, Decision D34).",
+                                        op.as_str(),
+                                        store.value
                                     ),
-                                    body: Body::Fields(output),
+                                    body: owned(model::store_output(
+                                        definition.kind,
+                                        *op,
+                                        definition.value_schema.as_ref(),
+                                        definition.metadata_schema.as_ref(),
+                                        params.top_k.or(params.limit),
+                                        &node.span,
+                                    )),
                                 });
                             }
                         }
                         NodeKind::Agent { .. }
                         | NodeKind::Function { .. }
                         | NodeKind::Flow { .. }
-                        | NodeKind::Map { .. }
-                        | NodeKind::Store { .. } => {}
+                        | NodeKind::Map { .. } => {}
                     }
                 }
             }
@@ -225,7 +305,7 @@ pub fn surfaces(ir: &Ir) -> Vec<Surface<'_>> {
                     surfaces.push(Surface {
                         path: format!("{address}.value_schema"),
                         about: format!("`{address}` — the value it stores (grammar 11.1)."),
-                        body: Body::Fields(value),
+                        body: borrowed(value),
                     });
                 }
                 if let Some(metadata) = &store.metadata_schema {
@@ -234,7 +314,7 @@ pub fn surfaces(ir: &Ir) -> Vec<Surface<'_>> {
                         about: format!(
                             "`{address}` — the metadata a match carries (grammar 11.1)."
                         ),
-                        body: Body::Fields(metadata),
+                        body: borrowed(metadata),
                     });
                 }
             }
@@ -253,6 +333,31 @@ pub fn surfaces(ir: &Ir) -> Vec<Surface<'_>> {
     }
 
     surfaces
+}
+
+/// A field map the composition wrote, as a [`Body`].
+///
+/// Every surface the source text spells out is one of these; the helper exists
+/// so the borrow is written once instead of at each of a dozen push sites.
+fn borrowed(fields: &FieldMap) -> Body<'_> {
+    Body::Fields(Cow::Borrowed(fields))
+}
+
+/// A field map the *grammar* supplies where the composition wrote none — an
+/// inline node's kind default (grammar 8.2, 8.3) or a store op's derived row
+/// (grammar 11.4).
+fn owned(fields: FieldMap) -> Body<'static> {
+    Body::Fields(Cow::Owned(fields))
+}
+
+/// The clause the doc comment of an inline node's result schema carries when the
+/// schema is the kind default rather than one the node declared.
+fn default_note(defaulted: bool) -> &'static str {
+    if defaulted {
+        ", which it does not declare, so this is the kind default"
+    } else {
+        ""
+    }
 }
 
 /// Every state channel, in channel-name order, paired with its canonical path.
@@ -299,7 +404,7 @@ pub fn module(ir: &Ir, names: &Names) -> super::GeneratedFile {
         let ty = names.ty(&surface.path);
         contents.push('\n');
         contents.push_str(&names::doc("", std::slice::from_ref(&surface.about)));
-        let expression = match surface.body {
+        let expression = match &surface.body {
             Body::Fields(fields) => field_map(fields, ""),
             Body::Type(node) => type_node(node, ""),
         };
@@ -373,8 +478,19 @@ const HELPERS: &[Helper] = &[
         name: "uniqueItems",
         source: r#"
 /**
- * `unique_items: true` (grammar 3.5). Zod has no built-in, and JSON encodings
- * are what JSON Schema's `uniqueItems` compares, so that is what this compares.
+ * `unique_items: true` (grammar 3.5). Zod has no built-in.
+ *
+ * JSON Schema's `uniqueItems` compares *instances*: two objects are one item
+ * when they carry the same keys with equal values, in whatever order those keys
+ * were written. `JSON.stringify` compares encodings, and an object's encoding
+ * follows its key order — so the two are not the same rule in general.
+ *
+ * They are the same rule **here**. `.refine` runs over the array's already
+ * *parsed* elements, and `z.object({…}).strict()` rebuilds every object in the
+ * order its own shape declares, so two equal instances have identical encodings
+ * by the time this is called. That is a fact about where this is used, which is
+ * why it is not exported: applied to raw input, it would call
+ * `[{a: 1, b: 2}, {b: 2, a: 1}]` unique and JSON Schema would not.
  */
 const uniqueItems = (items: readonly unknown[]): boolean =>
   new Set(items.map((item) => JSON.stringify(item))).size === items.length;
@@ -538,6 +654,16 @@ const rfc5321Email = (value: string): boolean => {
     },
 ];
 
+/// Every name [`module`] can declare besides the schemas themselves.
+///
+/// [`super::names`]'s reserved list is checked against this, so a helper added
+/// to [`HELPERS`] cannot be left out of the namespace the registry
+/// disambiguates against.
+#[cfg(test)]
+pub(super) fn helper_names() -> impl Iterator<Item = &'static str> {
+    HELPERS.iter().map(|helper| helper.name)
+}
+
 impl Surface<'_> {
     /// Visit every type node inside this surface, outermost first.
     ///
@@ -545,7 +671,7 @@ impl Surface<'_> {
     /// reach the nested ones too, and the only enumeration of "every type node
     /// there is" should be the one [`surfaces`] already fixes.
     pub fn walk(&self, visit: &mut dyn FnMut(&TypeNode)) {
-        match self.body {
+        match &self.body {
             Body::Fields(fields) => {
                 for field in &fields.fields {
                     walk(&field.ty, visit);
@@ -557,7 +683,7 @@ impl Surface<'_> {
 
     /// Whether any type node anywhere inside this surface satisfies `predicate`.
     fn declares(&self, predicate: &dyn Fn(&TypeNode) -> bool) -> bool {
-        match self.body {
+        match &self.body {
             Body::Fields(fields) => fields
                 .fields
                 .iter()
@@ -1036,7 +1162,7 @@ mod tests {
                     surfaces.iter().map(|s| s.path.as_str()).collect::<Vec<_>>()
                 )
             });
-        match surface.body {
+        match &surface.body {
             Body::Fields(fields) => field_map(fields, ""),
             Body::Type(ty) => type_node(ty, ""),
         }
@@ -1299,7 +1425,7 @@ model.m:\n  provider: provider.p\n  id: some-model\n";
             "{CHANNEL}  a:\n    type: object\n    properties:\n      name: {{ type: string, min_length: 1 }}\n      email: {{ type: string, format: email }}\n    optional: [email]\n"
         ));
         let surfaces = surfaces(&ir);
-        let Body::Type(ty) = surfaces[0].body else {
+        let Body::Type(ty) = &surfaces[0].body else {
             panic!("a channel is a type node");
         };
         assert_eq!(
@@ -1328,7 +1454,7 @@ model.m:\n  provider: provider.p\n  id: some-model\n";
             .iter()
             .find(|surface| surface.path == "agent.triage.output")
             .expect("the agent declares an output");
-        let Body::Fields(fields) = surface.body else {
+        let Body::Fields(fields) = &surface.body else {
             panic!("an output is a field map");
         };
         assert_eq!(
@@ -1368,7 +1494,7 @@ model.m:\n  provider: provider.p\n  id: some-model\n\
 agent.a:\n  model: model.m\n  prompt: p\n  input: { goal: { type: string } }\n  output: { verdict: { enum: [ok] } }\n\
 tool.t:\n  description: A tool.\n  input: {}\n  output: {}\n  exec: { command: \"true\" }\n\
 store.s:\n  kind: kv\n  scope: execution\n  value_schema: { v: { type: string } }\n\
-flow.f:\n  outputs: { draft: { type: string } }\n  nodes:\n    a: { agent: agent.a, input: { goal: \"'x'\" } }\n    ask:\n      human:\n        input: { q: { type: string } }\n        output: { answer: { type: string } }\n  edges:\n    - { from: start, to: a }\n    - { from: a, to: ask }\n    - { from: ask, to: end }\n";
+flow.f:\n  outputs: { draft: { type: string } }\n  nodes:\n    a: { agent: agent.a, input: { goal: \"'x'\" } }\n    ask:\n      human:\n        input: { q: { type: string } }\n        output: { answer: { type: string } }\n    probe: { exec: { command: \"true\" } }\n    ping: { http: { method: GET, url: \"https://example.test\" } }\n    keep: { store: store.s, op: set, key: \"'k'\", value: { v: \"'x'\" } }\n  edges:\n    - { from: start, to: a }\n    - { from: a, to: ask }\n    - { from: ask, to: probe }\n    - { from: probe, to: ping }\n    - { from: ping, to: keep }\n    - { from: keep, to: end }\n";
         let ir = ir_of(source);
         assert_eq!(
             surfaces(&ir)
@@ -1381,11 +1507,64 @@ flow.f:\n  outputs: { draft: { type: string } }\n  nodes:\n    a: { agent: agent
                 "flow.f.outputs",
                 "flow.f.node.ask.input",
                 "flow.f.node.ask.output",
+                // None of the three writes an `output:`, and all three are
+                // here anyway: a kind default and a derived store row are the
+                // node's result schema, not the absence of one.
+                "flow.f.node.probe.output",
+                "flow.f.node.ping.output",
+                "flow.f.node.keep.output",
                 "store.s.value_schema",
                 "tool.t.input",
                 "tool.t.output",
                 "state.draft",
             ]
         );
+    }
+
+    /// An inline node with no `output:` has the **kind default** as its result
+    /// schema (grammar 8.2, 8.3), and the emitter writes it.
+    ///
+    /// The validator already resolves the same default (`check::model`), so a
+    /// composition can guard an edge on `probe.output.exit_code` while the
+    /// emitted module holds no schema and no export name for it. The two
+    /// defaults are asserted field by field here rather than only through the
+    /// goldens, because a change to either one is a change to what a node's
+    /// answer is parsed with.
+    #[test]
+    fn an_inline_node_with_no_output_gets_its_kind_default_schema() {
+        let source = "version: \"0.1\"\n\
+flow.f:\n  outputs: {}\n  nodes:\n    probe: { exec: { command: \"true\" } }\n    ping: { http: { method: GET, url: \"https://example.test\" } }\n  edges:\n    - { from: start, to: probe }\n    - { from: probe, to: ping }\n    - { from: ping, to: end }\n";
+        assert_eq!(
+            schema_of(source, "flow.f.node.probe.output"),
+            "z.object({\n  exit_code: z.number().int(),\n  stdout: z.string(),\n}).strict()"
+        );
+        assert_eq!(
+            schema_of(source, "flow.f.node.ping.output"),
+            "z.object({\n  status: z.number().int(),\n  body: z.string(),\n}).strict()"
+        );
+
+        // And the doc comment says the schema is a default rather than
+        // something the node was read as declaring.
+        let ir = ir_of(source);
+        let module = crate::codegen::schema::module(&ir, &Names::of(&ir)).contents;
+        assert!(
+            module.contains("which it does not declare, so this is the kind default"),
+            "{module}"
+        );
+    }
+
+    /// A node that writes the default out by hand is the same schema, and is
+    /// **not** described as a default — the control for the test above.
+    #[test]
+    fn a_declared_output_is_emitted_as_declared() {
+        let source = "version: \"0.1\"\n\
+flow.f:\n  outputs: {}\n  nodes:\n    probe:\n      exec:\n        command: \"true\"\n        output:\n          exit_code: { type: integer }\n          stdout: { type: string }\n  edges:\n    - { from: start, to: probe }\n    - { from: probe, to: end }\n";
+        assert_eq!(
+            schema_of(source, "flow.f.node.probe.output"),
+            "z.object({\n  exit_code: z.number().int(),\n  stdout: z.string(),\n}).strict()"
+        );
+        let ir = ir_of(source);
+        let module = crate::codegen::schema::module(&ir, &Names::of(&ir)).contents;
+        assert!(!module.contains("kind default"), "{module}");
     }
 }

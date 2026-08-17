@@ -59,10 +59,19 @@ pub struct Names {
 /// up front costs nothing and turns a rare, confusing `tsc` failure into a `_2`
 /// suffix nobody has to think about.
 const RESERVED: &[&str] = &[
-    // `src/schemas.ts`
+    // `src/schemas.ts`: the import, and every helper of
+    // `codegen::schema::HELPERS`. The list is the whole table rather than the
+    // helpers that looked likely to collide — `the_reserved_list_holds_every_
+    // emitted_helper` keeps the two in step, so a helper added there cannot be
+    // forgotten here.
     "z",
     "uniqueItems",
+    "rfc1123Hostname",
+    "rfc3339Date",
     "rfc3339Time",
+    "rfc3339DateTime",
+    "rfc3986Uri",
+    "rfc5321Email",
     // `src/state.ts`
     "Annotation",
     "MessagesAnnotation",
@@ -403,5 +412,24 @@ mod tests {
         let rendered = doc("", &[long]);
         assert!(rendered.starts_with("/**\n * "));
         assert!(rendered.ends_with(" */\n"));
+    }
+
+    /// Every helper `src/schemas.ts` can declare is reserved.
+    ///
+    /// A generated schema taking a helper's name would shadow it, and a module
+    /// that calls a `const` holding a Zod schema fails at run time rather than
+    /// at `tsc`. No canonical path camel-cases to one of these today — every
+    /// path opens with a namespace segment — but the reserved list is what
+    /// makes that a decision rather than a coincidence, and a list that held
+    /// only some of the helpers would be neither.
+    #[test]
+    fn the_reserved_list_holds_every_emitted_helper() {
+        for helper in crate::codegen::schema::helper_names() {
+            assert!(
+                RESERVED.contains(&helper),
+                "`{helper}` is declared in `src/schemas.ts` and is not reserved, \
+                 so a schema could be assigned its name"
+            );
+        }
     }
 }

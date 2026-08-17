@@ -8,8 +8,14 @@
 //
 // Usage: node zod-conformance.mjs <cases.json> <generated project directory>
 //
-// Input:  [{ "export": "agentReviewerOutput", "documents": [ … ] }, … ]
+// Input:  [{ "export": "agentReviewerOutput", "documents": ["{\"a\":1}", …] }, …]
 // Output: [[true, false, …], …] — one array of verdicts per case, in order.
+//
+// Each document arrives as JSON *text* and is parsed here rather than being
+// handed over as a value. `JSON.parse` keeps an object's keys in the order the
+// text wrote them, which is what lets the corpus state a case about key order at
+// all — the Rust side reads objects into a sorted map and would otherwise have
+// normalized it away before either column saw the document.
 
 import { readFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
@@ -29,7 +35,7 @@ const verdicts = cases.map((entry) => {
   if (schema === undefined) {
     throw new Error(`the emitted module exports no \`${entry.export}\``);
   }
-  return entry.documents.map((document) => schema.safeParse(document).success);
+  return entry.documents.map((text) => schema.safeParse(JSON.parse(text)).success);
 });
 
 process.stdout.write(JSON.stringify(verdicts));

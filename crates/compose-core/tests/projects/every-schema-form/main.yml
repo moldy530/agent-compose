@@ -74,6 +74,20 @@ state:
     max_items: 8
     unique_items: true
     items: { type: string }
+  # `unique_items` over something other than a scalar. JSON Schema's
+  # `uniqueItems` compares *instances*, so two objects carrying the same
+  # properties are one item however their keys were ordered — which is a
+  # different rule from "different JSON text" and the one the emitted helper
+  # has to implement.
+  authors:
+    type: array
+    max_items: 4
+    unique_items: true
+    items:
+      type: object
+      properties:
+        name: { type: string }
+        rank: { type: integer }
   author:
     type: object
     properties:
@@ -179,7 +193,34 @@ flow.shape:
           draft: { type: string }
         output:
           decision: { enum: [approve, reject] }
+    # Two inline nodes that declare no `output:`. That is not "no result
+    # schema": it is the kind default — `{exit_code, stdout}` for `exec:`
+    # (grammar 8.2) and `{status, body}` for `http:` (grammar 8.3) — which the
+    # validator resolves and the emitter therefore has to emit. Nothing in
+    # `examples/` reaches this shape: every inline node there writes `output:`
+    # out.
+    probe:
+      exec:
+        command: "true"
+    notify:
+      http:
+        method: POST
+        url: "https://example.test/notify"
+        body:
+          latest: "state.latest"
+    # A store op's result is derived from the op and the store rather than
+    # written anywhere (grammar 11.4, Decision D34), and `search` is the richest
+    # row: an array of matches bounded by this node's own `top_k`, each carrying
+    # the store's `metadata_schema` inline.
+    recall:
+      store: store.docs
+      op: search
+      query: "state.latest"
+      top_k: 3
   edges:
     - { from: start, to: shape }
     - { from: shape, to: ask }
-    - { from: ask, to: end }
+    - { from: ask, to: probe }
+    - { from: probe, to: notify }
+    - { from: notify, to: recall }
+    - { from: recall, to: end }

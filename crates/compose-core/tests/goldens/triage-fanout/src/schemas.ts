@@ -161,12 +161,29 @@ export const flowTriageNodeAnnounceOutput = z.object({
 }).strict();
 export type FlowTriageNodeAnnounceOutput = z.infer<typeof flowTriageNodeAnnounceOutput>;
 
+/**
+ * `flow.triage` node `announce_failed` — what the subprocess produces (grammar 8.2), which it does not declare, so this is the kind default.
+ */
+export const flowTriageNodeAnnounceFailedOutput = z.object({
+  exit_code: z.number().int(),
+  stdout: z.string(),
+}).strict();
+export type FlowTriageNodeAnnounceFailedOutput = z.infer<typeof flowTriageNodeAnnounceFailedOutput>;
+
 /** `flow.triage` node `verify` — what the subprocess produces (grammar 8.2). */
 export const flowTriageNodeVerifyOutput = z.object({
   exit_code: z.number().int(),
   stdout: z.string(),
 }).strict();
 export type FlowTriageNodeVerifyOutput = z.infer<typeof flowTriageNodeVerifyOutput>;
+
+/**
+ * `flow.triage` node `remember` — what the `set` of `store.triage_memory` answers, derived from the op and the store (grammar 11.4, Decision D34).
+ */
+export const flowTriageNodeRememberOutput = z.object({
+  key: z.string(),
+}).strict();
+export type FlowTriageNodeRememberOutput = z.infer<typeof flowTriageNodeRememberOutput>;
 
 /** `flow.triage` node `approve` — what the human is shown (grammar 8.7). */
 export const flowTriageNodeApproveInput = z.object({

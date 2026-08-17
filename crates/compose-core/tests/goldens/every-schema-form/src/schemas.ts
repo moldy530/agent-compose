@@ -13,8 +13,19 @@
 import { z } from "zod";
 
 /**
- * `unique_items: true` (grammar 3.5). Zod has no built-in, and JSON encodings
- * are what JSON Schema's `uniqueItems` compares, so that is what this compares.
+ * `unique_items: true` (grammar 3.5). Zod has no built-in.
+ *
+ * JSON Schema's `uniqueItems` compares *instances*: two objects are one item
+ * when they carry the same keys with equal values, in whatever order those keys
+ * were written. `JSON.stringify` compares encodings, and an object's encoding
+ * follows its key order — so the two are not the same rule in general.
+ *
+ * They are the same rule **here**. `.refine` runs over the array's already
+ * *parsed* elements, and `z.object({…}).strict()` rebuilds every object in the
+ * order its own shape declares, so two equal instances have identical encodings
+ * by the time this is called. That is a fact about where this is used, which is
+ * why it is not exported: applied to raw input, it would call
+ * `[{a: 1, b: 2}, {b: 2, a: 1}]` unique and JSON Schema would not.
  */
 const uniqueItems = (items: readonly unknown[]): boolean =>
   new Set(items.map((item) => JSON.stringify(item))).size === items.length;
@@ -192,6 +203,40 @@ export const flowShapeNodeAskOutput = z.object({
 }).strict();
 export type FlowShapeNodeAskOutput = z.infer<typeof flowShapeNodeAskOutput>;
 
+/**
+ * `flow.shape` node `probe` — what the subprocess produces (grammar 8.2), which it does not declare, so this is the kind default.
+ */
+export const flowShapeNodeProbeOutput = z.object({
+  exit_code: z.number().int(),
+  stdout: z.string(),
+}).strict();
+export type FlowShapeNodeProbeOutput = z.infer<typeof flowShapeNodeProbeOutput>;
+
+/**
+ * `flow.shape` node `notify` — what the response decodes to (grammar 8.3), which it does not declare, so this is the kind default.
+ */
+export const flowShapeNodeNotifyOutput = z.object({
+  status: z.number().int(),
+  body: z.string(),
+}).strict();
+export type FlowShapeNodeNotifyOutput = z.infer<typeof flowShapeNodeNotifyOutput>;
+
+/**
+ * `flow.shape` node `recall` — what the `search` of `store.docs` answers, derived from the op and the store (grammar 11.4, Decision D34).
+ */
+export const flowShapeNodeRecallOutput = z.object({
+  matches: z.array(z.object({
+    id: z.string(),
+    score: z.number(),
+    text: z.string(),
+    metadata: z.object({
+      source: z.string(),
+      updated_at: z.string().refine(rfc3339DateTime, { message: "expected an RFC 3339 date-time" }),
+    }).strict(),
+  }).strict()).max(3),
+}).strict();
+export type FlowShapeNodeRecallOutput = z.infer<typeof flowShapeNodeRecallOutput>;
+
 /** `store.docs` — the metadata a match carries (grammar 11.1). */
 export const storeDocsMetadataSchema = z.object({
   source: z.string(),
@@ -233,6 +278,13 @@ export const stateAuthor = z.object({
   home: z.string().regex(rfc3986Uri).optional(),
 }).strict();
 export type StateAuthor = z.infer<typeof stateAuthor>;
+
+/** State channel `authors` — its declared type (grammar 10.1). */
+export const stateAuthors = z.array(z.object({
+  name: z.string(),
+  rank: z.number().int(),
+}).strict()).max(4).refine(uniqueItems, { message: "expected unique items" });
+export type StateAuthors = z.infer<typeof stateAuthors>;
 
 /** State channel `digits` — its declared type (grammar 10.1). */
 export const stateDigits = z.string().regex(/^\d{3}-\d{4}$/);
