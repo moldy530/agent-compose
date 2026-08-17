@@ -304,6 +304,10 @@ export const stateAuthors = z.array(z.object({
 }).strict()).max(4).refine(uniqueItems, { message: "expected unique items" });
 export type StateAuthors = z.infer<typeof stateAuthors>;
 
+/** State channel `cadence` — its declared type (grammar 10.1). */
+export const stateCadence = z.number().multipleOf(0.3);
+export type StateCadence = z.infer<typeof stateCadence>;
+
 /** State channel `digits` — its declared type (grammar 10.1). */
 export const stateDigits = z.string().regex(/^\d{3}-\d{4}$/);
 export type StateDigits = z.infer<typeof stateDigits>;

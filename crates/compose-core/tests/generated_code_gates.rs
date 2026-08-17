@@ -405,6 +405,7 @@ impl Document {
 /// the second is a difference nobody agreed to.
 const DIVERGENCES: &[&str] = &[
     "integer-beyond-the-safe-range",
+    "multiple-of-under-a-scaled-tolerance",
     "display-name-is-not-an-addr-spec",
     "leap-second-away-from-midnight",
     "duration-skips-a-designator",

@@ -75,6 +75,14 @@ state:
   mark:      { type: string, min_length: 2, max_length: 4 }
   ratio:     { type: number, exclusive_minimum: 0, exclusive_maximum: 1 }
   step:      { type: number, minimum: -1.5, maximum: 1.5, multiple_of: 0.5 }
+  # `multiple_of` on a step binary floating point cannot hold, with no bound to
+  # keep the quotient small. `step` above is exact in both columns twice over —
+  # 0.5 is a power of two and `maximum: 1.5` caps the quotient at 3 — so it
+  # cannot reach the place the two columns divide: the JSON column divides
+  # exactly (`0.3` is 3/10) and `.multipleOf(0.3)` divides in doubles and admits
+  # a tolerance that scales with the quotient. Declared as
+  # `multiple-of-under-a-scaled-tolerance`.
+  cadence:   { type: number, multiple_of: 0.3 }
   urgent:    { type: boolean, default: false }
   mood:      { enum: [calm, brisk], default: calm }
   tags:

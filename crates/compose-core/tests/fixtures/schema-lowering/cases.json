@@ -505,6 +505,27 @@
   },
   {
     "golden": "every-schema-form",
+    "surface": "state.cadence",
+    "about": "`multiple_of` on a step no double holds exactly, and unbounded — where the two columns divide differently (grammar 3.3)",
+    "documents": [
+      { "why": "zero is a multiple of everything", "valid": true, "document": 0 },
+      { "why": "the step itself", "valid": true, "document": 0.3 },
+      { "why": "three of them: `0.9 / 0.3` is `2.9999999999999996` in doubles, which both columns still call a multiple", "valid": true, "document": 0.9 },
+      { "why": "a large multiple that is still exact enough to divide", "valid": true, "document": 100.2 },
+      { "why": "half a step off", "valid": false, "document": 0.5 },
+      { "why": "and a whole unit off", "valid": false, "document": 1 },
+      { "why": "a large value whose quotient is still precise enough to fail", "valid": false, "document": 1e14 },
+      {
+        "why": "past a quotient of 2^51 the emitted tolerance covers a whole step, so nothing can fail there",
+        "valid": false,
+        "zod": true,
+        "divergence": "multiple-of-under-a-scaled-tolerance",
+        "document": 1e15
+      }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
     "surface": "state.origin",
     "about": "a discriminated union in the property position rather than as `items:` (grammar 3.7)",
     "documents": [
