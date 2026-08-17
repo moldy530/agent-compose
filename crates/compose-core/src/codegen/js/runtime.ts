@@ -235,8 +235,13 @@ export async function runActivity<T>(
 
   try {
     let last: unknown;
+    // What the node *did*, not what its policy allowed: a budget that ran out
+    // during the second of three attempts made two, and a trace that reported
+    // three would describe a run that did not happen.
+    let made = 0;
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
       if (expired) break;
+      made = attempt;
       try {
         const value = await activity({ execution, signal: controller.signal, node });
         return { value, attempts: attempt };
@@ -256,12 +261,12 @@ export async function runActivity<T>(
       throw new NodeFailure(
         flow,
         node,
-        attempts,
-        new NodeTimeout(node, budget ?? 0, attempts).message,
+        made,
+        new NodeTimeout(node, budget ?? 0, made).message,
         last,
       );
     }
-    throw new NodeFailure(flow, node, attempts, describe(last), last);
+    throw new NodeFailure(flow, node, made, describe(last), last);
   } finally {
     if (timer !== undefined) clearTimeout(timer);
   }

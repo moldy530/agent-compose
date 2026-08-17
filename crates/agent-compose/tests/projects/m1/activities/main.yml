@@ -270,6 +270,12 @@ flow.deadline:
         args: ["30"]
         output:
           exit_code: { type: integer }
+      # The budget bounds **one node execution, all retry attempts included**
+      # (grammar 9.1: "retry attempts consume the node's `timeout` budget"), so
+      # these three retries never happen — the first attempt spends the whole
+      # 300ms on its own. The trace has to say so: what the node *did*, not what
+      # its policy allowed.
+      retry: { max: 3, backoff: 50ms }
       timeout: 300ms
       on_error: { fallback: rescue }
 

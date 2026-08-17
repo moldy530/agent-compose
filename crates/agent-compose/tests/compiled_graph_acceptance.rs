@@ -1556,12 +1556,13 @@ fn a_node_timeout_fires_and_its_error_policy_takes_over() {
 /// The same budget, spent on a child process rather than on a provider — and the
 /// `on_error: { fallback: … }` that takes over when it does.
 ///
-/// Two things this decides that the model-side twin above cannot. The fallback
+/// Three things this decides that the model-side twin above cannot. The fallback
 /// **replaces** the node's own edges rather than running beside them (grammar
 /// 9.2, Decision D21), so the target is what runs next and `slow`'s own
-/// `to: end` is not evaluated; and the budget is the *node's* rather than the
+/// `to: end` is not evaluated; the budget is the *node's* rather than the
 /// provider client's, which is why an `exec:` node with no network in it times
-/// out at all.
+/// out at all; and the budget is spent across attempts rather than per attempt
+/// (grammar 9.1), which the trace's `attempts` is what makes observable.
 #[test]
 fn a_node_timeout_fires_over_a_child_process_and_its_fallback_takes_over() {
     let provider = MockProvider::start().expect("a loopback port");
@@ -1587,6 +1588,11 @@ fn a_node_timeout_fires_over_a_child_process_and_its_fallback_takes_over() {
         "a fallback is taken *instead of* the node's own edges: {}",
         slow[0]
     );
+    // `slow` declares `retry: { max: 3 }` — four attempts allowed — and made
+    // one: the first spent the whole 300ms budget, and grammar 9.1 spends that
+    // budget across attempts rather than resetting it per attempt. A trace that
+    // reported 4 here would be describing three sleeps that never ran.
+    assert_eq!(slow[0]["attempts"], json!(1));
 }
 
 /// A store-op node reads and writes the local backend, with no infrastructure
