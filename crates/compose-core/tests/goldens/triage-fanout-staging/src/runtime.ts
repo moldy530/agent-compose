@@ -387,6 +387,33 @@ export interface RunContext {
   readonly signal: AbortSignal;
   /** How this attempt is addressed, for a message. */
   readonly node: string;
+  /**
+   * The idempotency key this effect carries to its receiver (grammar 9.4).
+   *
+   * Present at exactly one kind of call: a **detached** `map` dispatch to a
+   * `tool.*` — the sink of PRD 5.6, whose outcome is never observed and whose
+   * delivery is therefore at-least-once. Every other call leaves it absent,
+   * because grammar 9.4 fixes the carriers at two ("a detached `map` dispatch
+   * and a store write") and a key on a call that is not one of them would be a
+   * key a receiver dedupes on for effects that are *meant* to repeat.
+   *
+   * How it goes out is the binding's, and see [`runHttp`] and [`runExec`] for
+   * which slot each uses.
+   */
+  readonly idempotencyKey?: string;
+}
+
+/**
+ * The context a **detached** dispatch runs its sink under: this node's, plus
+ * the key grammar 8.6 rule 7 says the dispatch receives.
+ *
+ * Emitted at the dispatch site rather than applied to every scoped context in
+ * [`runMap`], because which dispatches carry a key is a property of the *route*
+ * and its target, and a compiled `graph.ts` is where a reader should be able to
+ * see which of its deliveries is keyed.
+ */
+export function delivering(context: RunContext, site: DispatchSite): RunContext {
+  return { ...context, idempotencyKey: site.idempotencyKey };
 }
 
 const sleep = (ms: number, signal: AbortSignal): Promise<void> =>
@@ -1177,6 +1204,21 @@ export function environmentName(field: string): string {
   return field.toUpperCase();
 }
 
+/**
+ * The variable a subprocess sink reads its idempotency key out of (grammar 9.4).
+ *
+ * The environment rather than the argument vector: `args:` is the author's exact
+ * command line and a runtime that appended to it would be changing the program's
+ * arguments — while the environment is the out-of-band channel a process already
+ * has. The prefix is what keeps it clear of [`environmentName`], which spells an
+ * input field by upper-casing it, so a tool with a field called
+ * `idempotency_key` still names its own variable and not this one.
+ */
+export const IDEMPOTENCY_ENV = "AGENT_COMPOSE_IDEMPOTENCY_KEY";
+
+/** The header an HTTP sink reads its idempotency key out of (grammar 9.4). */
+export const IDEMPOTENCY_HEADER = "idempotency-key";
+
 /** Run one `exec:` binding (grammar 6.1, 8.2). */
 export async function runExec(
   binding: ExecBinding,
@@ -1192,6 +1234,14 @@ export async function runExec(
       environment[environmentName(field)] =
         typeof value === "string" ? value : JSON.stringify(value);
     }
+  }
+  // The key a detached delivery carries, where this call is one (grammar 8.6
+  // rule 7, 9.4). Under the declared `env:` for the same reason a declared
+  // header sits under the runtime's media type: what the binding wrote out is
+  // the author's statement about this process's environment, and an automatic
+  // addition that overwrote it would break a sink using its own scheme.
+  if (context.idempotencyKey !== undefined) {
+    environment[IDEMPOTENCY_ENV] = context.idempotencyKey;
   }
   for (const entry of binding.env) {
     environment[entry.name] = interpolate(entry.value);
@@ -1284,9 +1334,21 @@ export async function runHttp(
   // The body this runtime composes is JSON, so `application/json` is the media
   // type a binding that said nothing gets — and a binding that *did* say
   // something replaces it rather than adding to it. See [`headerSet`].
-  const headers = sendsBody
-    ? headerSet({ "content-type": "application/json" }, declared)
-    : headerSet(declared);
+  //
+  // The idempotency key rides in the same layering, one layer down from the
+  // binding's own headers (grammar 8.6 rule 7, 9.4). A **header** rather than a
+  // body field: the body of a `tool.*` request is the object its declared
+  // `input:` parsed, so a field injected into it would be a property the tool's
+  // own contract does not declare — and could collide with one it does. A
+  // header is out of band, and `Idempotency-Key` is the name sinks already
+  // dedupe on.
+  const headers = headerSet(
+    sendsBody ? { "content-type": "application/json" } : undefined,
+    context.idempotencyKey === undefined
+      ? undefined
+      : { [IDEMPOTENCY_HEADER]: context.idempotencyKey },
+    declared,
+  );
 
   const response = await fetch(url, {
     method: binding.method,
@@ -1604,11 +1666,13 @@ export interface DispatchRecord {
   /**
    * The key this dispatch's effect site derives (grammar 9.4).
    *
-   * A **detached** delivery carries it on the wire, which is what makes
-   * at-least-once delivery a defensible trade rather than a lost message. It is
-   * recorded for every dispatch because it is the same derivation either way,
-   * and because it is the one place the flattened instance path of a nested
-   * fan-out is observable at all.
+   * A **detached** delivery carries it to its sink — as the `Idempotency-Key`
+   * header of an `http:` binding, as `AGENT_COMPOSE_IDEMPOTENCY_KEY` in an
+   * `exec:` binding's environment, and on the `RunContext` a `function:` binding
+   * is handed — which is what makes at-least-once delivery a defensible trade
+   * rather than a lost message (PRD 5.6). It is recorded for every dispatch
+   * because it is the same derivation either way, and because it is the one
+   * place the flattened instance path of a nested fan-out is observable at all.
    */
   readonly idempotencyKey: string;
   /** The instance's own trace, when the target was a `flow.*`. */
@@ -2222,7 +2286,8 @@ export interface DispatchSite {
    *
    * Derived for every dispatch rather than only the detached ones: it costs a
    * `join` and it is what a `store` write inside a dispatched `flow.*` will need
-   * from the same site.
+   * from the same site. What *delivers* it is [`delivering`], at the one kind of
+   * dispatch grammar 9.4 names as a carrier.
    */
   readonly idempotencyKey: string;
 }

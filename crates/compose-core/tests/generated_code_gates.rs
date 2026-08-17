@@ -772,6 +772,34 @@ fn the_fan_out_runtime_bounds_orders_and_resolves_every_dispatch() {
         })
     );
 
+    // PRD 5.6's replay interaction, on the wire: what a **detached** delivery
+    // hands its sink, in each of the two forms a `tool.*` can be reached by. The
+    // joined dispatch beside it carries nothing, because grammar 9.4 fixes the
+    // carriers at two and a joined instance is neither; and a binding that
+    // declares the name itself wins, as it does for `content-type`.
+    assert_eq!(
+        observed["deliveredHeaders"],
+        serde_json::json!(["exec_gate/fan/0/1", null, "mine"])
+    );
+    assert_eq!(
+        observed["deliveredEnv"],
+        serde_json::json!({
+            "detached": "exec_gate/fan/0/1",
+            "joined": "",
+            "declared": "mine",
+        })
+    );
+
+    // The number the `a-detached-dispatch-is-bounded-by-its-own-route` row in
+    // `codegen::graph`'s ledger really produces: a detached delivery takes its
+    // route's permit and never the node's, so the two bounds add up. Pinned so
+    // that a change to the reading — or the PRD settling which of grammar 8.6
+    // rule 1 and Decision D94 is normative — is a deliberate edit here.
+    assert_eq!(
+        observed["detachedBound"],
+        serde_json::json!({ "declared": 2, "peak": 4 })
+    );
+
     // Grammar 9.3 level 1: the outermost instantiation site wins a field
     // (Decision D79), an absent one is filled in from the inner site, and a
     // `human` node takes neither `timeout` nor `retry` from it (Decision D102).

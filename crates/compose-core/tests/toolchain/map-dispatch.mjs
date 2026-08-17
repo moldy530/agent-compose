@@ -358,6 +358,104 @@ const observed = {};
   observed.batched = await graph.invoke({});
 }
 
+// --- What a detached delivery carries to its sink (grammar 9.4, PRD 5.6) ----
+//
+// The key is derived for every dispatch and recorded in the trace either way, so
+// nothing about a run says whether it was ever *delivered*. These are the two
+// wire forms a sink can be reached by.
+{
+  const site = { execution: { id: "exec_gate", session_key: "" }, path: ["fan/0/1"], idempotencyKey: "exec_gate/fan/0/1" };
+  const keyed = runtime.delivering(context, site);
+
+  const sent = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    sent.push({ url: String(url), headers: init.headers, body: init.body });
+    return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+  };
+  try {
+    const binding = {
+      method: "POST",
+      url: ["https://sink.invalid/v1/enqueue"],
+      headers: [],
+      expectStatus: "2xx",
+      decoding: { envelope: [], decoded: [], empty: true },
+    };
+    await runtime.runHttp(binding, { body: { text: "a1" } }, keyed);
+    // …and the same request from a dispatch that is *not* detached.
+    await runtime.runHttp(binding, { body: { text: "a1" } }, context);
+    // A header the binding declares itself is the author's statement about this
+    // wire, so it wins — the rule the emitted `content-type` already follows.
+    await runtime.runHttp(
+      { ...binding, headers: [{ name: "Idempotency-Key", value: ["mine"] }] },
+      { body: { text: "a1" } },
+      keyed,
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  observed.deliveredHeaders = sent.map((one) => one.headers["idempotency-key"] ?? one.headers["Idempotency-Key"] ?? null);
+
+  // The subprocess form: the environment, because `args:` is the author's own
+  // command line.
+  const exec = {
+    command: ["sh"],
+    args: [["-c"], ["printf '%s' \"${AGENT_COMPOSE_IDEMPOTENCY_KEY-}\""]],
+    env: [],
+    expectExit: [0],
+    decoding: { envelope: [], decoded: [], raw: "out", empty: false },
+  };
+  observed.deliveredEnv = {
+    detached: (await runtime.runExec(exec, {}, keyed)).out,
+    joined: (await runtime.runExec(exec, {}, context)).out,
+    declared: (
+      await runtime.runExec(
+        { ...exec, env: [{ name: runtime.IDEMPOTENCY_ENV, value: ["mine"] }] },
+        {},
+        keyed,
+      )
+    ).out,
+  };
+}
+
+// --- The node-wide bound, and what a detached delivery does to it -----------
+//
+// Pinned rather than asserted as correct: grammar 8.6 rule 1 makes
+// `max_concurrency` node-wide and Decision D94 says a detached dispatch may not
+// delay the flow instance, and the two cannot both hold of one counter. See the
+// `a-detached-dispatch-is-bounded-by-its-own-route` row in `codegen::graph`'s
+// ledger — this is the number that row's reading really produces.
+{
+  let live = 0;
+  let peak = 0;
+  const watched = async () => {
+    live += 1;
+    peak = Math.max(peak, live);
+    await sleep(40);
+    live -= 1;
+    return { output: {} };
+  };
+  const map = descriptor({
+    maxConcurrency: 2,
+    routeBy: "kind",
+    routes: [route({ tag: "joined", run: watched })],
+    fallback: route({
+      tag: "default",
+      detach: true,
+      target: "tool.sink",
+      maxConcurrency: 2,
+      writes: [],
+      run: watched,
+    }),
+  });
+  const items = [0, 1, 2, 3, 4, 5].map((at) => ({ at, kind: at % 2 === 0 ? "joined" : "away" }));
+  await runtime.runMap(map, runtime.mapPlan(map, viewOf(items)), context);
+  // The detached deliveries are still in flight when the join returns, which is
+  // the whole point of them — so the peak is read after they have finished.
+  await sleep(200);
+  observed.detachedBound = { declared: 2, peak };
+}
+
 // --- Grammar 9.3 level 1, and D79's outermost-wins --------------------------
 {
   observed.policy = {

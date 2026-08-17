@@ -2969,6 +2969,112 @@ fn a_merge_and_an_undefaulted_last_wins_channel_take_the_highest_indexed_write()
     assert!(provider.snapshot().is_drained());
 }
 
+/// A map inside a bounded cycle dispatches once per traversal, and the two
+/// traversals' detached deliveries carry **different** idempotency keys —
+/// grammar 9.4's traversal ordinal, and the first of the two properties it
+/// exists for ("distinct effects get distinct keys").
+///
+/// The keys are asserted where they land rather than only where they are
+/// derived: the sink is an `exec:` tool, and what it reports is the environment
+/// it was run with. Without the delivery half, a compiler could derive a perfect
+/// key, record it in the trace, and send a sink nothing to dedupe on — which is
+/// exactly the shape PRD 5.6 settles ("passed to the sink automatically, and
+/// sinks are documented to dedupe on it").
+#[test]
+fn each_traversal_of_a_map_delivers_its_detached_sink_a_key_of_its_own() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let sweep = |file: &str| {
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({
+                "findings": [
+                    { "kind": "auto_fixable", "file": file, "hint": "rename it" },
+                    { "kind": "needs_human", "summary": format!("look at {file}"), "severity": "high" },
+                ],
+            })),
+        )
+    };
+    provider.enqueue_all([
+        sweep("a.rs"),
+        Script::new(HAIKU, Outcome::structured(json!({ "patch": "patch-a" }))).matching("a.rs"),
+        sweep("b.rs"),
+        Script::new(HAIKU, Outcome::structured(json!({ "patch": "patch-b" }))).matching("b.rs"),
+    ]);
+
+    let scratch = harness::Scratch::new("audit");
+    let log = scratch.path().join("audit.log");
+    harness::shim(
+        scratch.path(),
+        "record-audit",
+        // What the sink was handed, one line per delivery: the grammar 9.4 key,
+        // out of the environment the runtime put it in.
+        "printf '%s\\n' \"$AGENT_COMPOSE_IDEMPOTENCY_KEY\" >> \"$AUDIT_LOG\"\nprintf 'logged'\n",
+    );
+
+    let mut environment = harness::environment(&provider);
+    environment.push(("AUDIT_LOG".to_string(), log.display().to_string()));
+    environment.push((
+        "PATH".to_string(),
+        format!(
+            "{}:{}",
+            scratch.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        ),
+    ));
+
+    let Some(run) = harness::invoke_with(
+        "fanout",
+        "flow.recheck",
+        &json!({ "report": "the build is red" }),
+        &environment,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(
+        run.outputs()["drafts"],
+        json!(["patch-a", "patch-b"]),
+        "one pass of the cycle appended each patch"
+    );
+
+    // Two traversals of one node, and the ordinal is what tells them apart.
+    let passes = run.entries("fan");
+    assert_eq!(passes.len(), 2, "the cycle ran the map twice");
+    let keys: Vec<String> = passes
+        .iter()
+        .map(|entry| {
+            entry["dispatches"][1]["idempotencyKey"]
+                .as_str()
+                .unwrap_or_else(|| panic!("the detached dispatch carries a key: {entry}"))
+                .to_string()
+        })
+        .collect();
+    assert!(
+        keys[0].ends_with("/fan/0/1") && keys[1].ends_with("/fan/1/1"),
+        "the traversal ordinal is the component that distinguishes them: {keys:?}"
+    );
+    assert_eq!(
+        passes[0]["dispatches"][1]["outcome"],
+        json!("detached"),
+        "the sink route is fire-and-forget: {}",
+        passes[0]
+    );
+
+    // …and what the sink was actually sent. The deliveries are not waited on, so
+    // the run reached quiescence without them — but a `spawn`ed child keeps the
+    // process alive, so both have landed by the time it exits.
+    let delivered: Vec<String> = std::fs::read_to_string(&log)
+        .expect("the detached sink ran and wrote what it was handed")
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        delivered, keys,
+        "each delivery carried its own dispatch's key, which is what a sink \
+         dedupes on (PRD 5.6, grammar 9.4)"
+    );
+}
+
 /// `context: inherit` shares the caller's conversation with the instance in both
 /// directions, and the instantiation site's `policy:` is level 1 for the nodes
 /// inside it (grammar 8.5, 9.3, 10.4).

@@ -325,6 +325,13 @@ const CODEGEN: &[Criterion] = &[
                 "a_merge_and_an_undefaulted_last_wins_channel_take_the_highest_indexed_write",
                 Status::Live,
             ),
+            // The traversal ordinal of grammar 9.4, in a run rather than in a
+            // derivation: one map node inside a bounded cycle, and a detached
+            // sink that reports which key each of its two deliveries carried.
+            (
+                "each_traversal_of_a_map_delivers_its_detached_sink_a_key_of_its_own",
+                Status::Live,
+            ),
         ],
     },
     Criterion {

@@ -27,6 +27,9 @@
 #     untouched, which grammar 8.6 rule 5 gives their own sentence: a `merge`
 #     channel written by several instances, and a `last_wins` channel that
 #     declares **no** `default:` and so starts unset (Decision D78);
+#   * `flow.recheck` — a map inside a **bounded cycle** with a detached sink, so
+#     one node dispatches twice in one flow instance and grammar 9.4's traversal
+#     ordinal is what keeps the two deliveries' keys apart.
 version: "0.1"
 
 state:
@@ -314,6 +317,20 @@ tool.review_queue:
     command: printf
     args: ["queued"]
 
+# The sink of a **detached** route: it never reports back, so the only thing that
+# makes a repeated delivery safe is the key it is handed — which grammar 9.4
+# derives and PRD 5.6 says is "passed to the sink automatically". Its `output:`
+# field is deliberately not the name of any channel, because a detached dispatch
+# may write no reduced state, name-based writes included (rule 7).
+tool.audit_log:
+  description: Append one line to an audit log, deduped on the idempotency key it is sent.
+  input:
+    line: { type: string }
+  output:
+    receipt: { type: string }
+  exec:
+    command: record-audit
+    args: []
 
 flow.normalize:
   description: Normalize a raw report.
@@ -588,6 +605,54 @@ flow.tally:
     - { from: start, to: plan }
     - { from: plan, to: score }
     - { from: score, to: end }
+
+flow.recheck:
+  description: Sweep a report repeatedly, fanning out on each pass, auditing what a human must see.
+  inputs:
+    report:
+      type: string
+      min_length: 1
+  outputs:
+    drafts:
+      type: array
+      max_items: 40
+      items: { type: string }
+  nodes:
+    sweep:
+      agent: agent.triage
+      input:
+        report: "input.report"
+
+    # The same map node dispatches once per traversal of the cycle. Grammar 9.4
+    # puts the traversal ordinal in the frame precisely for this: without it both
+    # passes' detached deliveries would derive one key, and a sink deduping on it
+    # would drop the second — losing the message the design exists to keep.
+    fan:
+      map:
+        over: sweep.output.findings
+        as: finding
+        route_by: kind
+        max_concurrency: 2
+        routes:
+          auto_fixable:
+            node: agent.fixer
+            input:
+              file: "finding.file"
+              hint: "finding.hint"
+            writes:
+              patch: drafts
+          needs_human:
+            node: tool.audit_log
+            detach: true
+            input:
+              line: "finding.summary"
+  edges:
+    - { from: start, to: sweep }
+    - { from: sweep, to: fan }
+    # The map's own writes are in state by the time its edges are evaluated
+    # (grammar 7.6 P1), so the guard counts what this pass appended.
+    - { from: fan, to: sweep, when: "size(state.drafts) < 2", max_iterations: 2 }
+    - { from: fan, to: end, else: true }
 
 flow.continue:
   description: Open a conversation and hand it to a subflow that continues it.

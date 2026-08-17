@@ -72,7 +72,8 @@
 //!
 //! | id | where | which way | why it is left |
 //! |---|---|---|---|
-//! | `a-detached-dispatch-is-bounded-by-its-own-route` | `max_concurrency` over a `detach: true` route | a detached delivery takes its **route's** permit and never the map node's | grammar 8.6 rule 1 and Decision D28 make `max_concurrency` a **node-wide** bound, and Decision D94 says of a detached dispatch that "nothing it does can fail or delay the enclosing flow instance". Both cannot hold of one counter: a slow delivery holding a node-wide permit would keep a *joined* instance from starting, which delays the join, which delays the flow instance. D94 is the more specific rule and the one an author reaches for by name, so the node-wide count is over the instances the map **waits on**, and a detached route is bounded by its own — which rule 1 already requires to be at most the map's. The reading is deliberate and narrow: it changes nothing for a map with no detached route, which is every map that writes state at all |
+//! | `a-detached-dispatch-is-bounded-by-its-own-route` | `max_concurrency` over a `detach: true` route | a detached delivery takes its **route's** permit and never the map node's, so a map declaring `max_concurrency: n` beside a detached route bounded at `m` can have `n + m` calls in flight | grammar 8.6 rule 1 and Decision D28 make `max_concurrency` a **node-wide** bound, and Decision D94 says of a detached dispatch that "nothing it does can fail or delay the enclosing flow instance". Both cannot hold of one counter: a slow delivery holding a node-wide permit would keep a *joined* instance from starting, which delays the join, which delays the flow instance. D94 is the more specific rule and the one an author reaches for by name, so the node-wide count is over the instances the map **waits on**, and a detached route is bounded by its own — which rule 1 already requires to be at most the map's. The reading is deliberate and narrow: it changes nothing for a map with no detached route, which is every map that writes state at all. The two sentences do genuinely conflict, and which of them is normative is the PRD's to settle — either the node-wide count is over joined instances only, or a detached delivery waits for a node permit and D94 gives way; meanwhile `observed.detachedBound` in `tests/toolchain/map-dispatch.mjs` pins the number this compiler really produces, so a change to it is deliberate |
+//! | `a-detached-dispatch-delivers-its-key-out-of-band` | how the idempotency key of grammar 9.4 reaches a sink | as an `Idempotency-Key` **header** on an `http:` binding, as `AGENT_COMPOSE_IDEMPOTENCY_KEY` in an `exec:` binding's environment, and on the `RunContext` a `function:` binding is handed — in each case *under* whatever the binding declared itself | PRD 5.6 settles the replay interaction as "an `idempotency_key` … is passed to the sink automatically, and sinks are documented to dedupe on it", and grammar 9.4 with Decision D104 fixes the **string** — "what makes two implementations agree on the string a sink sees" — without fixing the channel it travels on. Something has to be chosen, or the key is derived, recorded in the trace, and never delivered, which is the one failure the design exists to prevent. Out of band in each case, because the in-band slot belongs to the composition: a `tool.*`'s request body is the object its declared `input:` parsed and an `exec:` binding's `args:` is the author's command line, so writing the key into either would put a field or an argument there that the tool's own contract does not declare — and could collide with one it does. `Idempotency-Key` is the name sinks already dedupe on. Layering it *under* the binding's own `headers:`/`env:` means an author who spells that name is configuring their own wire rather than being overwritten, which is the rule the emitted `content-type` already follows |
 //! | `a-dispatch-runs-inside-the-map-nodes-task` | `map` dispatch and `flow:` instantiation | the instances run **in the node's task**, and a subflow is a separate run of its own compiled graph | a `Send` schedules a node of the **parent** graph, and seven of grammar 8.6's own rules are then unstateable. A Send'd task reads the packet as its whole input and writes the **parent's** channels, so a dispatched `flow.*` cannot hold its own channel values (grammar 10.1, 7.6.4 clause 3) and its instances share the caller's `messages`, which grammar 10.4 and Decision D105 make an unwaivable module boundary. `detach: true` is *resolved at dispatch* (D94) and a superstep barrier waits for every task it scheduled. A dispatch of **zero** instances must complete and fire its edges (rule 6), while `goto: []` retires the branch. `max_concurrency` is a per-node bound routes may tighten (D28) and LangGraph's `maxConcurrency` is a run-level config the Pregel runner applies to every task of a superstep. `on_item_error`'s parameterized retry, and the map's own `on_error:` absorbing an exhausted item (rule 10), are policies over an *item* that a node-level `retryPolicy` cannot express — the same mismatch `runtime.runActivity` records for grammar 9. The map's own outgoing edges would be evaluated once per instance, over N different local states, and not at all when N is 0. And LangGraph orders a step's writes by `task.path`, where every `__pregel_pull` sorts before every `__pregel_push`, so a map's writes would land after *every* ordinary node's rather than in the map node's own place in clause 1's node-id order. Index-tagging survives the change: what the map writes is one `runtime.OrderedWrites` per channel, in source-item order, which every emitted reducer unpacks |
 //!
 //! What the row does **not** trade away is grammar 7.6's two properties. P1
@@ -1736,7 +1737,14 @@ fn dispatch_route(
         ),
     });
 
-    text.push_str(&dispatch_run(ir, names, imported, &target, &inner));
+    text.push_str(&dispatch_run(
+        ir,
+        names,
+        imported,
+        &target,
+        site.detach,
+        &inner,
+    ));
     text.push_str(&if site.detach {
         // A detached dispatch MUST NOT write reduced state and MUST NOT declare
         // `writes:` (grammar 8.6 rule 7, Decisions D31, D94) — including the
@@ -1759,11 +1767,23 @@ fn dispatch_route(
 
 /// How one dispatched instance is run: an agent call, a tool invocation, or a
 /// subflow instantiation (grammar 8.6, and the target's own section).
+///
+/// `detach` decides one thing here: whether the call is handed the idempotency
+/// key of grammar 9.4. It goes to a **`tool.*`** and to nothing else, because
+/// that is the construct PRD 5.6's sentence is about — "an `idempotency_key` …
+/// is passed to the sink automatically, and sinks are documented to dedupe on
+/// it" — and grammar 9.4 fixes the carriers at two, of which this is one. The
+/// other two targets are left alone deliberately: an `agent.*` has no delivery
+/// slot on the provider wire, and keying it would key the tool calls its own
+/// loop makes — distinct effects that are *meant* to repeat; a `flow.*` is
+/// handed the dispatch site itself, so an effect inside the instance derives its
+/// own key from the instance path rather than reusing the boundary's.
 fn dispatch_run(
     ir: &Ir,
     names: &Names,
     imported: &mut Vec<String>,
     target: &str,
+    detach: bool,
     indent: &str,
 ) -> String {
     let Some(definition) = ir.definitions.get(target) else {
@@ -1786,6 +1806,13 @@ fn dispatch_run(
                 subject = names::string(&format!("the answer of `{target}`"))
             )
         }
+        // The sink of a detached dispatch, handed the key it delivers.
+        DefinitionBody::Tool(_) if detach => format!(
+            "{indent}run: async (input, context, site) => ({{\n{indent}  \
+             output: await {}(input, runtime.delivering(context, site)),\n{indent}\
+             }}),\n",
+            names.value(target)
+        ),
         DefinitionBody::Tool(_) => format!(
             "{indent}run: async (input, context) => ({{ output: await {}(input, context) }}),\n",
             names.value(target)
