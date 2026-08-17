@@ -1,0 +1,203 @@
+[
+  {
+    "name": "an-octal-escape-names-a-control-character",
+    "expression": "'\\011'",
+    "result": "\t"
+  },
+  {
+    "name": "an-octal-escape-names-a-printable-character",
+    "expression": "'\\043'",
+    "result": "#"
+  },
+  {
+    "name": "an-octal-escape-names-a-letter",
+    "expression": "'\\101'",
+    "result": "A"
+  },
+  {
+    "name": "the-lowest-octal-escape",
+    "expression": "'\\000'",
+    "result": "\u0000"
+  },
+  {
+    "name": "the-highest-octal-escape",
+    "expression": "'\\377'",
+    "result": "ÿ"
+  },
+  {
+    "name": "an-octal-escape-is-the-character-it-names",
+    "expression": "'\\011' == '\\t'",
+    "result": true
+  },
+  {
+    "name": "an-octal-escape-inside-a-longer-literal",
+    "expression": "'a\\011b'",
+    "result": "a\tb"
+  },
+  {
+    "name": "a-guard-comparing-a-channel-to-an-octal-escape",
+    "expression": "state.sep == '\\011'",
+    "input": { "state": { "sep": "\t" } },
+    "result": true
+  },
+  {
+    "name": "an-alert-escape",
+    "expression": "'\\a'",
+    "result": "\u0007"
+  },
+  {
+    "name": "a-backspace-escape",
+    "expression": "'\\b'",
+    "result": "\b"
+  },
+  {
+    "name": "a-form-feed-escape",
+    "expression": "'\\f'",
+    "result": "\f"
+  },
+  {
+    "name": "a-vertical-tab-escape",
+    "expression": "'\\v'",
+    "result": "\u000b"
+  },
+  {
+    "name": "a-newline-escape",
+    "expression": "'\\n'",
+    "result": "\n"
+  },
+  {
+    "name": "a-carriage-return-escape",
+    "expression": "'\\r'",
+    "result": "\r"
+  },
+  {
+    "name": "a-question-mark-escape",
+    "expression": "'\\?'",
+    "result": "?"
+  },
+  {
+    "name": "a-backtick-escape",
+    "expression": "'\\`'",
+    "result": "`"
+  },
+  {
+    "name": "a-backslash-escape",
+    "expression": "'\\\\'",
+    "result": "\\"
+  },
+  {
+    "name": "a-quote-escaped-inside-its-own-literal",
+    "expression": "'\\''",
+    "result": "'"
+  },
+  {
+    "name": "a-double-quote-escaped-inside-its-own-literal",
+    "expression": "\"\\\"\"",
+    "result": "\""
+  },
+  {
+    "name": "a-hexadecimal-escape",
+    "expression": "'\\x41'",
+    "result": "A"
+  },
+  {
+    "name": "a-hexadecimal-escape-past-ascii",
+    "expression": "'\\xff'",
+    "result": "ÿ"
+  },
+  {
+    "name": "a-short-unicode-escape",
+    "expression": "'\\u0041'",
+    "result": "A"
+  },
+  {
+    "name": "a-short-unicode-escape-past-the-basic-latin-block",
+    "expression": "'\\u00e9'",
+    "result": "é"
+  },
+  {
+    "name": "a-long-unicode-escape",
+    "expression": "'\\U0001F600'",
+    "result": "😀"
+  },
+  {
+    "name": "a-raw-string-keeps-its-backslashes",
+    "expression": "r'\\d+'",
+    "result": "\\d+"
+  },
+  {
+    "name": "a-raw-string-is-not-a-line-of-escapes",
+    "expression": "size(r'\\t')",
+    "result": 2
+  },
+  {
+    "name": "an-escape-a-string-predicate-searches-for",
+    "expression": "'a\\tb'.contains('\\011')",
+    "result": true
+  },
+  {
+    "name": "a-hexadecimal-escape-is-one-byte-in-a-bytes-literal",
+    "expression": "size(b'\\xff')",
+    "result": 1
+  },
+  {
+    "name": "an-octal-escape-is-one-byte-in-a-bytes-literal",
+    "expression": "size(b'\\377')",
+    "result": 1
+  },
+  {
+    "name": "the-two-byte-spellings-name-the-same-byte",
+    "expression": "b'\\xff' == b'\\377'",
+    "result": true
+  },
+  {
+    "name": "a-bytes-literal-holds-the-utf-8-of-its-characters",
+    "expression": "size(b'👍')",
+    "result": 4
+  },
+  {
+    "name": "an-ascii-bytes-literal-is-one-byte-per-character",
+    "expression": "size(b'abc')",
+    "result": 3
+  },
+  {
+    "name": "there-is-no-single-digit-null-escape",
+    "expression": "'\\0'",
+    "error": true
+  },
+  {
+    "name": "there-is-no-two-digit-octal-escape",
+    "expression": "'\\00'",
+    "error": true
+  },
+  {
+    "name": "an-octal-escape-past-a-byte-is-not-one",
+    "expression": "'\\400'",
+    "error": true
+  },
+  {
+    "name": "an-unknown-escape-letter-is-refused",
+    "expression": "'\\z'",
+    "error": true
+  },
+  {
+    "name": "a-short-unicode-escape-wants-four-digits",
+    "expression": "'\\u041'",
+    "error": true
+  },
+  {
+    "name": "a-unicode-escape-naming-a-surrogate-is-refused",
+    "expression": "'\\ud800'",
+    "error": true
+  },
+  {
+    "name": "a-unicode-escape-past-the-last-code-point-is-refused",
+    "expression": "'\\U0011FFFF'",
+    "error": true
+  },
+  {
+    "name": "an-uppercase-hexadecimal-escape-is-not-an-escape",
+    "expression": "'\\X41'",
+    "error": true
+  }
+]

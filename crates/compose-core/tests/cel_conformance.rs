@@ -20,10 +20,17 @@
 //! }
 //! ```
 //!
-//! A case that must *fail* to evaluate writes `"error": true` instead of
-//! `"result"`. What is pinned is that evaluation fails, never the message: the
-//! two implementations are held to the same accept/reject decision and to the
-//! same values, not to one another's wording.
+//! A case that must *fail* writes `"error": true` instead of `"result"`. What
+//! is pinned is that the expression produces no value, never the message or the
+//! stage: the two implementations are held to the same accept/reject decision
+//! and to the same values, not to one another's wording. **Refusing to parse
+//! counts** — `'\0'` is an escape neither CEL nor either implementation has, and
+//! the Rust column reports that from `Program::compile` where the JS column
+//! reports it from its own lexer. Pinning only the *evaluation* errors would
+//! leave every lexical rule unstatable in the artifact whose job is to keep the
+//! two readings together, which is how the escape table came to disagree.
+//! A case declaring `"result"` still has to parse: there, a compile failure is
+//! a divergence like any other.
 //!
 //! Plain JSON data files, one loader per implementation: the **fixtures**
 //! import nothing and describe nothing but data, so the corpus stays portable
@@ -174,8 +181,13 @@ fn every_case_evaluates_to_what_it_declares() {
         let label = format!("{}: {}", case.file, case.name);
         let program = match Program::compile(&case.expression) {
             Ok(program) => program,
+            // A refusal is a refusal: a case that declares `error: true` is
+            // satisfied by one, and only a case expecting a value is failed by
+            // it. See the module comment.
             Err(error) => {
-                failures.push(format!("{label}\n  does not parse: {error}"));
+                if case.expected.is_some() {
+                    failures.push(format!("{label}\n  does not parse: {error}"));
+                }
                 continue;
             }
         };
@@ -361,6 +373,43 @@ fn the_unicode_aware_constructs_of_a_matches_pattern_still_read_differently() {
     // ASCII, with the classes written out, is where the two agree — which is
     // what the corpus states and what the property harness generates.
     assert!(answer("'a1'.matches('^[a-z][0-9]$')"));
+}
+
+/// The fourth recorded gap, and the only one the **escape table** has left:
+/// a quote escaped inside the *other* quote's literal.
+///
+/// CEL's escape table admits `\"` and `\'` in either kind of literal and gives
+/// each one meaning — the quote. `cel` 0.14.3 keeps the backslash for the
+/// redundant spelling (`parse_quoted_string` sets `push_escape_character` when
+/// the escaped quote is not the literal's own), so `'\"'` is **two** characters
+/// there and one by the specification. The emitted evaluator reads the
+/// specification's, which is the same choice `size-of-a-string-counts-code-points`
+/// records and for the same reason: the compiler never evaluates, so the crate
+/// is the corpus's reference column rather than a runtime.
+///
+/// No corpus case can state it — a case is forbidden to record a disagreement —
+/// so `escapes.json` states the two *non*-redundant spellings, where the columns
+/// agree, and the divergence is pinned here and carried as
+/// `a-cross-quote-escape-keeps-its-backslash` in `codegen::cel`'s ledger.
+#[test]
+fn a_quote_escaped_inside_the_other_quotes_literal_still_keeps_its_backslash() {
+    let text = |source: &str| {
+        let program = Program::compile(source).expect("the expression parses");
+        match program
+            .execute(&compose_core::cel::evaluation_context())
+            .expect("the expression evaluates")
+        {
+            Value::String(text) => text.to_string(),
+            other => panic!("`{source}` is not a string: {other:?}"),
+        }
+    };
+    // The emitted evaluator answers `"` and `'`: one character each.
+    assert_eq!(text(r#"'\"'"#), "\\\"", "cel 0.14.3 kept the backslash");
+    assert_eq!(text(r#""\'""#), "\\'", "cel 0.14.3 kept the backslash");
+    // A quote escaped inside its **own** literal is where the two agree, which
+    // is what `escapes.json` states.
+    assert_eq!(text(r"'\''"), "'");
+    assert_eq!(text(r#""\"""#), "\"");
 }
 
 /// The corpus is the artifact, not this test: it has to be substantial enough

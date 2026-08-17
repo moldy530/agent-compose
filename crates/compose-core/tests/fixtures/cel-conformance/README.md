@@ -35,10 +35,13 @@ runner in another language needs no port of anything.
 - `result` — the expected value, as JSON. **Numeric types are distinguished as
   CEL distinguishes them**: `1` is an `int` and `1.0` a `double`, and a case
   that mixes them is an error rather than a coercion.
-- `error: true` — instead of `result`, for a case that must fail to evaluate.
-  What is pinned is *that* it fails, never the message: the implementations are
-  held to the same accept/reject decision and to the same values, not to each
-  other's wording.
+- `error: true` — instead of `result`, for a case that must produce no value.
+  What is pinned is *that* it fails, never the message or the stage: the
+  implementations are held to the same accept/reject decision and to the same
+  values, not to each other's wording. **Refusing to parse counts** — `'\0'` is
+  an escape neither CEL nor either implementation has, and the Rust column
+  reports it from `Program::compile` where the JS column reports it from its own
+  lexer. A case declaring `result` still has to parse in both.
 
 ## What the corpus deliberately covers
 
@@ -48,6 +51,18 @@ pins a literal, an addition, and an inequality either side of that boundary,
 plus the overflow at `int64`'s own edge, so an evaluator that reaches for
 `number` instead of `BigInt` fails here rather than silently rounding somebody's
 id. The Rust answers are the specification's, so these are ordinary green cases.
+
+**The escape table.** `escapes.json` states every escape CEL's *Lexis* admits —
+the octal `\OOO` (three digits, the first `0`–`3`), `\a`, `\?`, the backtick,
+`\xHH`, `\uHHHH`, `\UHHHHHHHH`, the named control characters, a raw string's
+un-read backslashes — and the refusals beside them: `'\0'`, `'\00'`, `'\400'`,
+`'\z'`, `'\u041'`, `'\X41'`, a lone surrogate, a code point past `U+10FFFF`. A
+lexer is where two readings of one language diverge over an ordinary literal
+rather than over an exotic construct: `'\011'` is a tab to both engines or it is
+`\0` followed by `11` to one of them, and a guard comparing a channel to it then
+answers differently in the validator and in the router the validator admitted.
+Bytes literals are stated through `size()` and equality, because a `bytes` value
+has no JSON form for a `result` to spell.
 
 ## What is deliberately not here
 
@@ -123,3 +138,17 @@ surface, and the specification is what defines it — which left one expression
 `compose_core::cel::evaluation_context` now registers the crate's *own*
 implementation under the global name, so the two spellings cannot answer
 differently, and `strings.json` states both.
+
+**A quote escaped inside the other quote's literal** — the one row the escape
+table leaves behind. CEL admits `\"` and `\'` in either kind of literal and gives
+each one meaning, the quote; `cel` 0.14.3 keeps the backslash for the redundant
+spelling, so `'\"'` is two characters there and one by the specification. The
+emitted evaluator reads the specification's, which is the same call `size()`
+above gets and for the same reason — the compiler never evaluates. `escapes.json`
+states the two spellings where a quote is escaped inside its *own* literal, where
+the columns agree, and
+`a_quote_escaped_inside_the_other_quotes_literal_still_keeps_its_backslash` pins
+the crate's answers. Where the crate refuses what the specification admits — a
+`\n` inside `b'…'`, which its `parse_bytes` has no arm for — nothing reaches a
+router either way: every expression is compiled with the crate before a project
+is emitted, so the crate's refusal is the compiler's.

@@ -374,6 +374,56 @@ function readNumber(source: string, at: number): { token: Token; next: number } 
   return { token: { kind: "int", value: BigInt(text), at: start }, next: end };
 }
 
+/**
+ * The code point an `\xHH`, `\uHHHH`, `\UHHHHHHHH` or `\OOO` escape names.
+ *
+ * The digits are checked before they are read, rather than handed to
+ * `Number.parseInt` and trusted: `parseInt` stops at the first character it
+ * cannot read and answers `NaN` for none at all, so `'\uZZZZ'` would become a
+ * silent NUL where the compiler's front-end refuses the literal outright. The
+ * surrogate range and everything past `U+10FFFF` are refused for the same
+ * reason — `String.fromCodePoint` would answer a lone surrogate for the first
+ * and throw a bare `RangeError` for the second.
+ */
+function escapedCode(
+  source: string,
+  at: number,
+  count: number,
+  radix: 8 | 16,
+  label: string,
+): number {
+  const digits = source.slice(at, at + count);
+  const legal = radix === 16 ? /^[0-9a-fA-F]+$/ : /^[0-7]+$/;
+  if (digits.length !== count || !legal.test(digits)) {
+    throw new CelError(
+      `the escape \`\\${label}\` wants ${count} ${radix === 16 ? "hexadecimal" : "octal"} digits`,
+    );
+  }
+  const code = Number.parseInt(digits, radix);
+  if (code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) {
+    throw new CelError(
+      `the escape \`\\${label}\` names U+${code.toString(16).toUpperCase()}, which is not a Unicode code point`,
+    );
+  }
+  return code;
+}
+
+/**
+ * One string or bytes literal (CEL's *Lexis*, grammar 4.1).
+ *
+ * The escape table is the specification's, which is the same table the pinned
+ * `cel` crate implements: `\a \b \f \n \r \t \v \\ \' \" \` \?`, `\xHH`,
+ * `\uHHHH`, `\UHHHHHHHH`, and `\OOO` — **three** octal digits whose first is
+ * `0`–`3`. There is no `\0`, and no escape may be invented here: an evaluator
+ * that reads one the compiler's front-end refuses is drift pointing the other
+ * way, and one that reads `'\011'` as anything but a tab answers a guard
+ * differently from the validator that admitted it.
+ *
+ * A `b'…'` literal accumulates **bytes** rather than the UTF-8 of a string:
+ * `\xFF` and `\377` are the byte `0xFF` there, where encoding the code point
+ * `U+00FF` would have produced two. `\u`/`\U` name code points and so are
+ * refused inside one, as the specification refuses them.
+ */
 function readString(source: string, at: number): { token: Token; next: number } | undefined {
   let cursor = at;
   let bytes = false;
@@ -393,11 +443,31 @@ function readString(source: string, at: number): { token: Token; next: number } 
   cursor += terminator.length;
 
   let text = "";
+  const octets: number[] = [];
+  // What a piece of the literal contributes: a byte sequence inside `b'…'`, the
+  // characters themselves otherwise.
+  const push = (value: string) => {
+    if (bytes) {
+      for (const octet of new TextEncoder().encode(value)) octets.push(octet);
+    } else {
+      text += value;
+    }
+  };
+  // A `\xHH` or `\OOO` escape, which is one **byte** inside `b'…'` and the code
+  // point of the same value in a string. Both spellings top out at 255.
+  const pushCode = (code: number) => {
+    if (bytes) {
+      octets.push(code);
+    } else {
+      text += String.fromCodePoint(code);
+    }
+  };
+
   while (cursor < source.length) {
     if (source.startsWith(terminator, cursor)) {
       cursor += terminator.length;
       const token: Token = bytes
-        ? { kind: "bytes", value: new TextEncoder().encode(text), at }
+        ? { kind: "bytes", value: Uint8Array.from(octets), at }
         : { kind: "string", value: text, at };
       return { token, next: cursor };
     }
@@ -406,45 +476,57 @@ function readString(source: string, at: number): { token: Token; next: number } 
       const escaped = source[cursor + 1];
       cursor += 2;
       switch (escaped) {
-        case "n":
-          text += "\n";
-          break;
-        case "r":
-          text += "\r";
-          break;
-        case "t":
-          text += "\t";
+        case "a":
+          push("\u0007");
           break;
         case "b":
-          text += "\b";
+          push("\b");
           break;
         case "f":
-          text += "\f";
+          push("\f");
+          break;
+        case "n":
+          push("\n");
+          break;
+        case "r":
+          push("\r");
+          break;
+        case "t":
+          push("\t");
           break;
         case "v":
-          text += "\v";
-          break;
-        case "0":
-          text += "\0";
+          push("\v");
           break;
         case "\\":
         case "'":
         case '"':
         case "`":
-          text += escaped;
+        case "?":
+          push(escaped);
           break;
-        case "u": {
-          text += String.fromCodePoint(Number.parseInt(source.slice(cursor, cursor + 4), 16));
-          cursor += 4;
-          break;
-        }
+        case "u":
         case "U": {
-          text += String.fromCodePoint(Number.parseInt(source.slice(cursor, cursor + 8), 16));
-          cursor += 8;
+          const count = escaped === "u" ? 4 : 8;
+          if (bytes) {
+            throw new CelError(`\`\\${escaped}\` names a code point, which a bytes literal has no`);
+          }
+          text += String.fromCodePoint(escapedCode(source, cursor, count, 16, escaped));
+          cursor += count;
           break;
         }
         case "x": {
-          text += String.fromCharCode(Number.parseInt(source.slice(cursor, cursor + 2), 16));
+          pushCode(escapedCode(source, cursor, 2, 16, "x"));
+          cursor += 2;
+          break;
+        }
+        // `\OOO`: three octal digits whose first is `0`–`3`, so the value is a
+        // byte. The leading digit was consumed with the backslash, so the escape
+        // is re-read from where it began.
+        case "0":
+        case "1":
+        case "2":
+        case "3": {
+          pushCode(escapedCode(source, cursor - 1, 3, 8, "OOO"));
           cursor += 2;
           break;
         }
@@ -456,8 +538,12 @@ function readString(source: string, at: number): { token: Token; next: number } 
     if (!triple && (character === "\n" || character === "\r")) {
       throw new CelError("a single-quoted string does not survive a line break");
     }
-    text += character;
-    cursor += 1;
+    // A whole code point, not a UTF-16 unit: a surrogate half handed to
+    // `TextEncoder` on its own encodes as U+FFFD, so `b'👍'` would be four
+    // replacement bytes rather than the four the character is made of.
+    const point = String.fromCodePoint(source.codePointAt(cursor)!);
+    push(point);
+    cursor += point.length;
   }
   throw new CelError("an unterminated string literal");
 }
