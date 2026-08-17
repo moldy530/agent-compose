@@ -223,12 +223,18 @@ const CODEGEN: &[Criterion] = &[
             ),
         ],
     },
+    // The emission has landed: the built project reads its `${ENV}` references
+    // when it is loaded and refuses to start without them, and `compose-core`'s
+    // `the_generated_project_checks_its_environment_when_it_is_loaded` decides
+    // that on every `cargo test` against a real `node src/index.ts`. The row is
+    // still pending because this file's test asserts it of a *run*, and the
+    // reason says the command it waits on rather than the feature it has.
     Criterion {
         bullet: Bullet::Codegen,
         phrase: "env-ref presence checks at process start",
         tests: &[(
             "a_missing_env_ref_fails_at_process_start_naming_the_variable",
-            Status::Pending("pending: generated code must check env-ref presence at process start"),
+            Status::Pending("pending: `agent-compose run` must execute the emitted graph"),
         )],
     },
 ];

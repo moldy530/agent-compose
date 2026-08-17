@@ -1496,8 +1496,15 @@ fn a_condition_outside_route_on_fails_the_node_instead_of_failing_over() {
 /// A missing env ref fails at process start, naming the variable — never at the
 /// first model call, and never with a key baked into the generated code
 /// (PRD 5.9).
+///
+/// The emitted `src/env.ts` already does this, and
+/// `compose-core`'s `the_generated_project_checks_its_environment_when_it_is_loaded`
+/// decides it on every `cargo test` by loading a built project with the
+/// variables removed. What this one adds is the *run*: that the check is what a
+/// started execution hits, before the first model call — which needs a command
+/// that starts one.
 #[test]
-#[ignore = "pending: generated code must check env-ref presence at process start"]
+#[ignore = "pending: `agent-compose run` must execute the emitted graph"]
 fn a_missing_env_ref_fails_at_process_start_naming_the_variable() {
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue(Script::new(SONNET, Outcome::text("never reached")));
