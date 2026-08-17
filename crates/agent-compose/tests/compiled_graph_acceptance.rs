@@ -1086,6 +1086,226 @@ fn a_guarded_start_edge_decides_the_first_step() {
     }
 }
 
+/// An inline node's parameters reach the process and the wire the way grammar
+/// 8.2 and 8.3 say, including the two widenings that turn a failure into data.
+///
+/// Four claims one run decides, each of which a regression would ship green
+/// because the shapes are all *probed* elsewhere and none was asserted:
+///
+/// 1. **`input:` → environment** (grammar 8.2). The bindings are the object
+///    handed to the child as environment variables, upper-snake-cased on the
+///    way in, and the block's own `env:` writes into that same environment. The
+///    child prints both, so a wrong spelling is a wrong string rather than a
+///    silent empty one.
+/// 2. **scalar `input:` → stdin** (grammar 8.0's table, Decision D88). `cat`
+///    prints what was written there and nothing else.
+/// 3. **widened `expect_exit`** (Decision D84). `false` exits 1, which the
+///    default `[0]` makes a node error; widened, it completes and its
+///    `exit_code` is what an edge guard routes on.
+/// 4. **widened `expect_status`** (D84 again, on the response side). The mock
+///    404s an unrouted path, which the default (any 2xx) makes a node error;
+///    widened, it is a status the node records.
+#[test]
+fn an_inline_nodes_parameters_reach_the_process_and_the_wire() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let Some(run) = harness::invoke(
+        "activities",
+        "flow.plumbing",
+        &[("goal", "ship-it")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    let outputs = run.outputs();
+
+    // 1: `goal:` arrived as `$GOAL`, and the block's `env:` as `$SUFFIX`.
+    assert_eq!(
+        outputs["report"], "ship-it/from-env",
+        "an `input:` binding is upper-snake-cased into the child's environment, \
+         beside the block's own `env:` (grammar 8.2)"
+    );
+    // 2: the scalar binding was the child's stdin, and nothing else was.
+    assert_eq!(
+        outputs["checks"],
+        json!(["ship-it/from-stdin"]),
+        "a scalar `input:` goes on stdin (Decision D88)"
+    );
+    // 3: the run reached `absent` at all, which only the widened `expect_exit`
+    // allows — under the default, `tolerated` is a node error and `on_error:
+    // fail` aborts before any of this.
+    let tolerated = run.entries("tolerated");
+    assert_eq!(tolerated[0]["outcome"], "completed");
+    assert_eq!(
+        tolerated[0]["routing"]["edges"][0]["value"],
+        json!(true),
+        "`exit_code == 1` is routable data because `expect_exit` was widened \
+         (grammar 8.2, Decision D84)"
+    );
+    assert_eq!(tolerated[0]["routing"]["targets"], json!(["absent"]));
+    // 4: a 404 recorded rather than raised.
+    assert_eq!(
+        outputs["status"],
+        json!(404),
+        "a status inside a widened `expect_status` completes the node (grammar 8.3)"
+    );
+    assert_eq!(run.entries("absent")[0]["outcome"], "completed");
+}
+
+/// A guard sees its own node's writes and **not** a concurrent sibling's.
+///
+/// Grammar 7.6 says both of these and they are in tension: P1 is per node ("a
+/// node's outgoing edges are evaluated only after **that node** has completed"),
+/// while the *Steps* paragraph above it evaluates a step's edges after every
+/// node of the step has written. Routing here is part of the node's own task,
+/// which is P1's reading, so `bravo`'s guard over `state.beacon` is `false`
+/// while `alpha` — running in the same step — is writing `lit` to it.
+///
+/// This test **pins that reading** rather than endorsing it: it is a reachable
+/// routing choice, and a document that does not say which answer is right is
+/// what makes it a choice. See `codegen::graph`'s note beside the emitted
+/// router; the clarification request goes to the grammar's owner.
+///
+/// The second guard is the half that has to keep working either way: a node's
+/// own writes **are** visible to its own guards, through their channels' reduce
+/// policies.
+#[test]
+fn a_guard_sees_its_own_writes_and_not_a_concurrent_siblings() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let Some(run) = harness::invoke_with(
+        "activities",
+        "flow.visibility",
+        &json!({}),
+        &harness::environment(&provider),
+    ) else {
+        return;
+    };
+    run.succeeded();
+
+    // Both branches ran, in one step: that is what makes the question askable.
+    let step = |node: &str| run.entries(node)[0]["step"].as_i64().expect("a step");
+    assert_eq!(
+        step("alpha"),
+        step("bravo"),
+        "the fork's branches are one step"
+    );
+
+    let bravo = run.entries("bravo");
+    let edges = &bravo[0]["routing"]["edges"];
+    assert_eq!(
+        edges[0]["value"],
+        json!(false),
+        "`alpha` wrote `beacon` in this same step and `bravo`'s guard does not \
+         see it (grammar 7.6 P1, read per node)"
+    );
+    assert_eq!(
+        edges[1]["value"],
+        json!(true),
+        "`bravo`'s own write is visible to `bravo`'s own guard"
+    );
+    assert_eq!(bravo[0]["routing"]["targets"], json!(["mine"]));
+    assert_eq!(
+        run.outputs()["checks"],
+        json!(["mine"]),
+        "only the own-write branch ran"
+    );
+    // …and `alpha` really did write it, so the `false` above is about *when* the
+    // write is visible rather than about whether it happened.
+    assert_eq!(run.entries("alpha")[0]["writes"], json!(["beacon"]));
+}
+
+/// Concurrent writers of one `append` channel land in ascending node-id order,
+/// whatever order they complete or are declared in (grammar 7.6.4 clause 1).
+///
+/// The ordering is inherited from the scheduler rather than imposed by anything
+/// this compiler emits, which is exactly why it needs an assertion: a pinned
+/// LangGraph bump that changed task ordering would silently reorder every
+/// `append` channel a fork writes, with a green suite.
+///
+/// The fixture makes all three orders disagree. `alpha` sorts **first** by node
+/// id, is declared **last** among the fork's edges, and finishes **last**
+/// (it sleeps 300ms); `zulu` sorts last, is declared first, and finishes first.
+/// Only clause 1 puts `alpha` at the head of the result.
+#[test]
+fn concurrent_writers_append_in_node_id_order_not_completion_order() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let Some(run) = harness::invoke_with(
+        "activities",
+        "flow.ordering",
+        &json!({}),
+        &harness::environment(&provider),
+    ) else {
+        return;
+    };
+    run.succeeded();
+    let step = |node: &str| run.entries(node)[0]["step"].as_i64().expect("a step");
+    assert_eq!(step("alpha"), step("zulu"), "both writers are one step");
+    assert_eq!(
+        run.outputs()["checks"],
+        json!(["alpha", "zulu"]),
+        "writers are ordered by ascending node id (grammar 7.6.4 clause 1), not \
+         by the order they completed or were declared in"
+    );
+}
+
+/// Reading a channel nothing has written fails the **execution**, and no
+/// `on_error:` strategy absorbs it (grammar 10.1, Decisions D78, D97, D110).
+///
+/// The two outcomes are distinct and D97 says so outright: `skip` exists to
+/// continue past a *node's* failure, and choosing `false` for a guard over a
+/// skipped node's output is what keeps it from being a synonym for `fail`. An
+/// unset-channel read is not a node's failure at all — no attempt was made, the
+/// activity never ran — so a `skip` that swallowed it would turn "fails the
+/// execution naming the channel and the reader" into a silent continue, and a
+/// `fallback:` would turn it into a route.
+///
+/// Both spellings of the read, because they take different paths through the
+/// emitted node function: `flow.unset` resolves the tool's argument **by name**
+/// from the channel of the same name (grammar 8.0 step 2), and
+/// `flow.unset_expression` writes the read out as CEL.
+#[test]
+fn reading_an_unset_channel_fails_the_run_whatever_the_error_policy_says() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let environment = harness::environment(&provider);
+
+    let Some(skipped) = harness::invoke_with("activities", "flow.unset", &json!({}), &environment)
+    else {
+        return;
+    };
+    let failure = skipped.failed();
+    assert!(
+        failure.contains("`pending`"),
+        "the failure names the channel (grammar 10.1): {failure}"
+    );
+    assert!(
+        failure.contains("is unset") && failure.contains("reads it"),
+        "…and the reader: {failure}"
+    );
+    assert!(
+        !skipped.visited().contains(&"after".to_string()),
+        "`on_error: skip` did not continue past it: {:?}",
+        skipped.visited()
+    );
+
+    let bound = harness::invoke_with(
+        "activities",
+        "flow.unset_expression",
+        &json!({}),
+        &environment,
+    )
+    .expect("the toolchain was there a moment ago");
+    let failure = bound.failed();
+    assert!(
+        failure.contains("pending"),
+        "the expression's failure names what it could not read: {failure}"
+    );
+    assert!(
+        !bound.visited().contains(&"rescue".to_string()),
+        "a `fallback:` did not route around it either: {:?}",
+        bound.visited()
+    );
+}
+
 /// A skipped node writes nothing, and the one thing that changes about its
 /// routing is the value of a guard over its own output (grammar 9.2, D97).
 #[test]
@@ -1269,6 +1489,185 @@ fn the_generated_cel_evaluator_agrees_with_the_validator_on_the_conformance_corp
         "the two CEL implementations must not diverge (CLAUDE.md)"
     );
 }
+
+/// `examples/review-loop` — the documented project, compiled and **run**.
+///
+/// Every other test here runs a fixture, and a fixture is written for the test.
+/// This one runs what a reader is shown: the same files `compose-core`'s golden
+/// corpus is emitted from, so the bytes under test are the committed golden's.
+/// Two things it carries that no fixture does:
+///
+/// * `agent.researcher` declares `tools:` **inside the cycle**, so every pass of
+///   the loop is a tool-loop call followed by the pinned structured one — the
+///   interaction between grammar 7.4's budget and grammar 5's intra-agent loop,
+///   which the `bounded-cycle` fixture's tool-less agents cannot reach;
+/// * it binds `model.default`, which is a `route:`. Failover is a later bullet
+///   (PRD §7 M1), and codegen binds the route's **first member** statically with
+///   a note saying so, which is what makes the example runnable today: the run
+///   below reaches `model.smart`'s `claude-sonnet-4-6`, and the day failover
+///   lands this is the test that says the binding still resolves.
+///
+/// **Why a preamble.** The example's `provider.anthropic` declares no
+/// `base_url:` — it is written to talk to Anthropic, which is the point of an
+/// example — so the harness redirects egress in the host module the driver
+/// imports before the graph. Nothing about the composition or the emitted
+/// project differs; a fixture parameterises its `base_url:` instead, which is
+/// why the fixtures exist and why this is the one test that needs the preamble.
+#[test]
+fn the_review_loop_example_runs_its_cycle_against_the_mock_provider() {
+    let provider = MockProvider::start().expect("a loopback port");
+
+    // `revise`, `revise`, `approve` — three passes of the cycle, inside a
+    // `max_iterations: 3` budget that therefore never runs out.
+    //
+    // Both agents bind `claude-sonnet-4-6` (the reviewer directly, the writer
+    // through `model.default`'s first member), so one queue serves both and each
+    // entry says which agent's prompt it answers. Within one agent the entries
+    // are consumed in order, which is the alternation an agent *with* tools
+    // makes: a loop call offering the tools and pinning nothing, answered with
+    // text, then the pinned call answered with structured output.
+    let writer = "a research writer";
+    let reviewer = "meticulous technical reviewer";
+    let mut scripts = Vec::new();
+    for (pass, verdict) in [(1, "revise"), (2, "revise"), (3, "approve")] {
+        scripts.push(Script::new(SONNET, Outcome::text("searching")).matching(writer));
+        scripts.push(
+            Script::new(
+                SONNET,
+                Outcome::structured(json!({ "draft": format!("# draft {pass}") })),
+            )
+            .matching(writer),
+        );
+        scripts.push(Script::new(SONNET, Outcome::text("reading")).matching(reviewer));
+        scripts.push(
+            Script::new(
+                SONNET,
+                Outcome::structured(json!({
+                    "verdict": verdict,
+                    "feedback": if verdict == "approve" { "" } else { "tighten it" },
+                })),
+            )
+            .matching(reviewer),
+        );
+    }
+    provider.enqueue_all(scripts);
+
+    let mut environment = harness::environment(&provider);
+    for (name, value) in [
+        ("ANTHROPIC_API_KEY", "mock-provider-key"),
+        ("SEARCH_API_KEY", "mock-provider-key"),
+        ("SEARCH_HOST", "search.invalid"),
+    ] {
+        environment.push((name.to_string(), value.to_string()));
+    }
+
+    let Some(run) = harness::invoke_entrypoint(
+        &harness::example("review-loop"),
+        "examples/review-loop",
+        "flow.review_loop",
+        &json!({ "goal": "explain the compiler" }),
+        &environment,
+        Some(REDIRECT_TO_MOCK),
+    ) else {
+        return;
+    };
+    run.succeeded();
+
+    assert_eq!(
+        run.visited(),
+        ["write", "review", "write", "review", "write", "review"],
+        "two `revise` passes over the back edge, then the `approve` that leaves \
+         through the `else:` escape"
+    );
+    assert_eq!(
+        run.outputs()["draft"],
+        "# draft 3",
+        "the flow returns the `draft` channel as it stood at quiescence \
+         (grammar 7.5)"
+    );
+
+    let recorded = provider.requests();
+    assert_eq!(
+        recorded.len(),
+        12,
+        "six agent invocations, each a tool-loop call and a pinned one"
+    );
+    assert!(recorded.iter().all(RecordedRequest::is_valid));
+    assert!(
+        recorded
+            .iter()
+            .all(|call| call.tools.contains(&"web_search".to_string())),
+        "`tool.web_search` is attached to both agents and reaches every call: {:?}",
+        recorded.iter().map(|call| &call.tools).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        recorded[0].structured_output, None,
+        "a tool loop's first call pins nothing"
+    );
+    assert!(
+        recorded[1].structured_output.is_some(),
+        "…and the call that ends it pins the output schema (PRD 5.2)"
+    );
+    assert!(
+        recorded.iter().all(|call| call.model == SONNET),
+        "`model.default` binds its route's first member, `model.smart` (PRD §7 M1)"
+    );
+
+    // The back edge's budget was spent twice and never exhausted: what ended the
+    // loop was the model's `approve`, not `max_iterations: 3`. The third pass
+    // records no budget at all — a guard that came out false spends nothing —
+    // which is what tells this run apart from `bounded-cycle`'s, where the
+    // budget is what stops it.
+    let review: Vec<Value> = run
+        .entries("review")
+        .iter()
+        .map(|entry| entry["routing"]["edges"][0].clone())
+        .collect();
+    assert_eq!(
+        review
+            .iter()
+            .map(|edge| edge["value"].clone())
+            .collect::<Vec<_>>(),
+        [json!(true), json!(true), json!(false)],
+        "two `revise` verdicts, then the `approve`"
+    );
+    assert_eq!(
+        review
+            .iter()
+            .map(|edge| edge["budget"]["used"].clone())
+            .collect::<Vec<_>>(),
+        [json!(1), json!(2), Value::Null],
+    );
+    assert_eq!(
+        run.entries("review")[2]["routing"]["targets"],
+        json!(["__end__"]),
+        "the `else:` escape is what leaves the cycle on `approve` (grammar 7.4)"
+    );
+    assert!(provider.snapshot().is_drained(), "every script was served");
+}
+
+/// The host preamble that points `examples/review-loop` at the mock.
+///
+/// The example names no `base_url:`, so the emitted client resolves
+/// `https://api.anthropic.com` — see the test above for why that is right and
+/// why the redirect belongs here rather than in the composition. It rewrites the
+/// host and nothing else: the request a compiled graph sends is still the one
+/// the mock validates, over a real socket.
+const REDIRECT_TO_MOCK: &str = r#"import process from "node:process";
+
+const upstream = "https://api.anthropic.com";
+const mock = process.env["MOCK_BASE_URL"].replace(/\/+$/, "");
+const inner = globalThis.fetch;
+globalThis.fetch = (resource, init) => {
+  const url =
+    typeof resource === "string"
+      ? resource
+      : resource instanceof URL
+        ? resource.href
+        : resource.url;
+  return inner(url.startsWith(upstream) ? mock + url.slice(upstream.length) : url, init);
+};
+"#;
 
 /// A bounded cycle stops at its budget and leaves through the escape edge, rather
 /// than looping (PRD 5.4).

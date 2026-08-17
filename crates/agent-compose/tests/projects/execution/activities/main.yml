@@ -17,6 +17,21 @@
 #   * `flow.deadline` — a node whose `timeout:` runs out while a child process
 #     sleeps, and whose `on_error: { fallback: … }` schedules another node instead
 #     of evaluating its own edges (grammar 9.2, Decision D21).
+#   * `flow.plumbing` — how an inline node's parameters reach the process and the
+#     wire: `input:` bindings arriving as upper-snake-cased environment variables
+#     beside the block's own `env:`, a scalar `input:` arriving on stdin, and the
+#     two widened accepted-outcome lists that turn a failure into routable data
+#     (grammar 8.2, 8.3, Decisions D84, D88).
+#   * `flow.visibility` — what a guard sees when a fork's two branches run in one
+#     step: its own node's writes, and **not** a concurrent sibling's
+#     (grammar 7.6 P1, read per node).
+#   * `flow.ordering` — two concurrent writers of one `append` channel whose node
+#     ids run opposite to both their completion order and their declaration
+#     order, so only grammar 7.6.4 clause 1 explains the result.
+#   * `flow.unset` and `flow.unset_expression` — reading a channel nothing has
+#     written fails the **execution**, naming the channel and the reader, and
+#     neither `on_error: skip` nor a `fallback:` absorbs it: those are strategies
+#     over a node's own error (grammar 10.1, 9.2, Decisions D78, D97, D110).
 #
 # The environment is the harness's: `${OPS_URL}` is an HTTP server the test
 # controls and `${OPS_BIN}` a directory of ordinary commands, so nothing here
@@ -46,6 +61,20 @@ state:
     max_items: 8
     items: { type: string }
     reduce: append
+  beacon:
+    description: Written by one branch of a fork; read by the other branch's guard.
+    type: string
+    default: ""
+  witness:
+    description: Written by the node whose own guard then reads it.
+    type: string
+    default: ""
+  pending:
+    description: >-
+      No `default:`, and nothing writes it — so it is **unset**, and reading it
+      fails the execution naming the channel and the reader (grammar 10.1,
+      Decision D78). The one channel here that exists to be unreadable.
+    type: string
 
 provider.mock:
   kind: anthropic
@@ -101,6 +130,21 @@ tool.rank:
   # of what "breaks spec portability" costs, made observable.
   function:
     name: rank_candidates
+
+tool.pending_reader:
+  description: Takes one argument, whose name is the unset channel's.
+  input:
+    # No binding names this at the node, so grammar 8.0 step 2 resolves it from
+    # the state channel of the same name — which is unset.
+    pending:
+      type: string
+  output:
+    seen:
+      description: One string property, so raw stdout binds to it.
+      type: string
+  exec:
+    command: printf
+    args: ["%s", "seen"]
 
 flow.pipeline:
   description: Fan out over two checks, join them, and finish.
@@ -291,4 +335,266 @@ flow.deadline:
   edges:
     - { from: start, to: slow }
     - { from: slow, to: end }
+    - { from: rescue, to: end }
+
+flow.plumbing:
+  description: How an inline node's parameters reach the process and the wire.
+  inputs:
+    goal:
+      type: string
+      min_length: 1
+  outputs:
+    report:
+      type: string
+    status:
+      type: integer
+    checks:
+      type: array
+      max_items: 8
+      items: { type: string }
+  nodes:
+    # Grammar 8.2: the node-level `input:` bindings are the object passed to the
+    # child **as environment variables**, upper-snake-cased on the way in — so
+    # `goal:` arrives as `$GOAL`. The block's own `env:` writes into that same
+    # environment, and a key equal to a binding's upper-snake-cased name would be
+    # the collision Decision D66 refuses; `SUFFIX` is not one.
+    environ:
+      exec:
+        command: "${OPS_BIN}/sh"
+        args: ["-c", 'printf "%s/%s" "$GOAL" "$SUFFIX"']
+        env:
+          SUFFIX: "from-env"
+        output:
+          stdout: { type: string }
+      input:
+        goal: "input.goal"
+      writes:
+        stdout: report
+
+    # The other `input:` form on the one node kind that has a destination for an
+    # unnamed value: a scalar binding goes on the child's **stdin** (grammar 8.0's
+    # table, Decision D88). `cat` is how a test reads what was written there.
+    piped:
+      exec:
+        command: "${OPS_BIN}/cat"
+        output:
+          stdout: { type: string }
+      input: "input.goal + '/from-stdin'"
+      writes:
+        stdout: checks
+
+    # Widened `expect_exit`: `false` exits 1, which the default `[0]` makes a node
+    # error and this makes an accepted outcome. Declaring `exit_code:` is the
+    # *decoding* choice and never turns a failure into data on its own — widening
+    # is what does (grammar 8.2, Decision D84) — so the guard below routes on a
+    # status a run under the default would never reach.
+    tolerated:
+      exec:
+        command: "${OPS_BIN}/false"
+        expect_exit: [0, 1]
+        output:
+          exit_code: { type: integer }
+          stdout: { type: string }
+
+    # The same widening on the response side: this route does not exist, the mock
+    # answers 404, and the default (any 2xx) would make it a node error
+    # (grammar 8.3, Decision D84).
+    absent:
+      http:
+        method: GET
+        url: "${OPS_URL}/_mock/no-such-route"
+        expect_status: [200, 404]
+        output:
+          status: { type: integer }
+      writes:
+        status: status
+
+  edges:
+    - { from: start, to: environ }
+    - { from: environ, to: piped }
+    - { from: piped, to: tolerated }
+    # Routable data, not a node error: under the default `expect_exit` the run
+    # would have aborted at `tolerated` instead of arriving here.
+    - { from: tolerated, to: absent, when: "tolerated.output.exit_code == 1" }
+    - { from: tolerated, to: end, else: true }
+    - { from: absent, to: end }
+
+flow.visibility:
+  description: What a guard sees of the step it was evaluated in.
+  outputs:
+    report:
+      type: string
+    checks:
+      type: array
+      max_items: 8
+      items: { type: string }
+  nodes:
+    # Two unconditional edges leave `fork`, so both branches run in one step
+    # (grammar 7.3 rule 6) and `alpha` and `bravo` are concurrent (7.6.1).
+    fork:
+      exec:
+        command: printf
+        args: ["%s", "forked"]
+        output:
+          stdout: { type: string }
+      writes:
+        stdout: report
+
+    alpha:
+      exec:
+        command: printf
+        args: ["%s", "lit"]
+        output:
+          stdout: { type: string }
+      writes:
+        stdout: beacon
+
+    bravo:
+      exec:
+        command: printf
+        args: ["%s", "bravo"]
+        output:
+          stdout: { type: string }
+      writes:
+        stdout: witness
+
+    # Both are reached from `bravo`'s own fork, so the conservative analysis
+    # calls them concurrent (grammar 7.6.1) — hence the reduced channel, even
+    # though only one of the two guards can be true.
+    sibling:
+      exec:
+        command: printf
+        args: ["%s", "sibling"]
+        output:
+          stdout: { type: string }
+      writes:
+        stdout: checks
+
+    mine:
+      exec:
+        command: printf
+        args: ["%s", "mine"]
+        output:
+          stdout: { type: string }
+      writes:
+        stdout: checks
+
+  edges:
+    - { from: start, to: fork }
+    - { from: fork, to: alpha }
+    - { from: fork, to: bravo }
+    - { from: alpha, to: end }
+    # `alpha` writes `beacon` in this same step, and this guard does not see it:
+    # grammar 7.6's P1 is per node, and routing is part of `bravo`'s own task.
+    - { from: bravo, to: sibling, when: "state.beacon == 'lit'" }
+    # `bravo`'s own write **is** visible, through its channel's reduce policy —
+    # the half of the same rule that has to keep working.
+    - { from: bravo, to: mine, when: "state.witness == 'bravo'" }
+    - { from: bravo, to: end, else: true }
+    - { from: sibling, to: end }
+    - { from: mine, to: end }
+
+flow.ordering:
+  description: One `append` channel, two concurrent writers, one canonical order.
+  outputs:
+    checks:
+      type: array
+      max_items: 8
+      items: { type: string }
+  nodes:
+    # `alpha` sorts first by node id and finishes last; `zulu` sorts last and
+    # finishes first, and its edge is declared first. Only grammar 7.6.4 clause 1
+    # — writers ordered by ascending node id — puts `alpha` first in the result.
+    split:
+      exec:
+        command: printf
+        args: ["%s", "split"]
+        output:
+          stdout: { type: string }
+
+    alpha:
+      exec:
+        command: "${OPS_BIN}/sh"
+        args: ["-c", 'sleep 0.3; printf "%s" alpha']
+        output:
+          stdout: { type: string }
+      writes:
+        stdout: checks
+
+    zulu:
+      exec:
+        command: printf
+        args: ["%s", "zulu"]
+        output:
+          stdout: { type: string }
+      writes:
+        stdout: checks
+
+  edges:
+    - { from: start, to: split }
+    - { from: split, to: zulu }
+    - { from: split, to: alpha }
+    - { from: alpha, to: end }
+    - { from: zulu, to: end }
+
+flow.unset:
+  description: A name-based read of a channel nothing has written.
+  outputs:
+    report:
+      type: string
+  nodes:
+    # No `input:` here: grammar 8.0 step 2 resolves the tool's `pending` argument
+    # from the state channel of the same name, and that channel is unset. The
+    # `on_error: skip` is the point — a strategy over the node's *own* error does
+    # not absorb an execution failure (grammar 10.1, Decision D78).
+    named:
+      function: tool.pending_reader
+      writes:
+        seen: report
+      on_error: skip
+
+    after:
+      exec:
+        command: printf
+        args: ["%s", "after"]
+        output:
+          stdout: { type: string }
+      writes:
+        stdout: report
+
+  edges:
+    - { from: start, to: named }
+    - { from: named, to: after }
+    - { from: after, to: end }
+
+flow.unset_expression:
+  description: The same read written as an expression, under a fallback.
+  outputs:
+    report:
+      type: string
+  nodes:
+    bound:
+      exec:
+        command: printf
+        args: ["%s", "bound"]
+        output:
+          stdout: { type: string }
+      input:
+        pending: "state.pending"
+      writes:
+        stdout: report
+      on_error: { fallback: rescue }
+
+    rescue:
+      exec:
+        command: printf
+        args: ["%s", "rescued"]
+        output:
+          stdout: { type: string }
+      writes:
+        stdout: report
+
+  edges:
+    - { from: start, to: bound }
+    - { from: bound, to: end }
     - { from: rescue, to: end }

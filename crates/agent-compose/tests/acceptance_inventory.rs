@@ -96,6 +96,13 @@ const CODEGEN: &[Criterion] = &[
                 "a_tagged_union_output_is_emitted_as_a_discriminated_union_narrowed_per_variant",
                 Status::Live,
             ),
+            // What a reducer is *called in*: concurrent writers of one step land
+            // in ascending node-id order, which grammar 7.6.4 clause 1 fixes and
+            // the scheduler supplies.
+            (
+                "concurrent_writers_append_in_node_id_order_not_completion_order",
+                Status::Live,
+            ),
             (
                 "state_channels_carry_their_declared_types_and_defaults",
                 Status::Live,
@@ -137,6 +144,14 @@ const CODEGEN: &[Criterion] = &[
                 "a_host_registered_function_runs_and_an_unregistered_one_says_so",
                 Status::Live,
             ),
+            // How those two inline kinds are *parameterised*: `input:` bindings
+            // as the child's environment, a scalar one on its stdin, and the two
+            // widened accepted-outcome lists that make a failure routable data
+            // (grammar 8.2, 8.3, Decisions D84, D88).
+            (
+                "an_inline_nodes_parameters_reach_the_process_and_the_wire",
+                Status::Live,
+            ),
         ],
     },
     Criterion {
@@ -161,15 +176,32 @@ const CODEGEN: &[Criterion] = &[
             // A guard on an edge leaving `start`, which grammar 7.2 admits and
             // which has no node to be evaluated at.
             ("a_guarded_start_edge_decides_the_first_step", Status::Live),
+            // *When* a guard is evaluated, which decides what it can see: its own
+            // node's writes and not a concurrent sibling's (grammar 7.6 P1, read
+            // per node — see `codegen::graph`'s ledger row).
+            (
+                "a_guard_sees_its_own_writes_and_not_a_concurrent_siblings",
+                Status::Live,
+            ),
         ],
     },
     Criterion {
         bullet: Bullet::Codegen,
         phrase: "bounded cycles",
-        tests: &[(
-            "a_bounded_cycle_leaves_through_its_escape_edge_when_the_budget_is_spent",
-            Status::Live,
-        )],
+        tests: &[
+            (
+                "a_bounded_cycle_leaves_through_its_escape_edge_when_the_budget_is_spent",
+                Status::Live,
+            ),
+            // The same cycle in the *documented* project rather than a fixture,
+            // with an agent carrying `tools:` inside the loop and a `model.*`
+            // route bound to its first member — the two things `bounded-cycle`
+            // cannot reach.
+            (
+                "the_review_loop_example_runs_its_cycle_against_the_mock_provider",
+                Status::Live,
+            ),
+        ],
     },
     Criterion {
         bullet: Bullet::Codegen,
@@ -213,6 +245,13 @@ const CODEGEN: &[Criterion] = &[
             // strategy: a fallback replaces the node's own edges (D21).
             (
                 "a_node_timeout_fires_over_a_child_process_and_its_fallback_takes_over",
+                Status::Live,
+            ),
+            // The criterion's boundary: which errors a policy governs at all.
+            // An unset-channel read fails the *execution* (grammar 10.1, D78),
+            // and neither `skip` nor a `fallback:` absorbs it.
+            (
+                "reading_an_unset_channel_fails_the_run_whatever_the_error_policy_says",
                 Status::Live,
             ),
         ],
@@ -751,7 +790,7 @@ fn every_bullet_contributes_criteria() {
 /// Every acceptance fixture the suite names is a project on disk.
 #[test]
 fn every_acceptance_fixture_exists() {
-    let projects = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/projects/m1");
+    let projects = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/projects/execution");
     let mut found: Vec<String> = fs::read_dir(&projects)
         .expect("the acceptance fixture corpus exists")
         .filter_map(|entry| entry.ok())

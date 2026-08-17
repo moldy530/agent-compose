@@ -129,12 +129,19 @@ fn agent_compose() -> Command {
     Command::new(env!("CARGO_BIN_EXE_agent-compose"))
 }
 
+/// Where the acceptance fixture projects live.
+///
+/// Named for what they are — compositions this suite **executes** — rather than
+/// for the milestone that introduced them (CLAUDE.md). The `one-*` projects
+/// beside this directory are the other half of `tests/projects/`: compositions
+/// the compiler is expected to *refuse*.
+pub fn projects() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/projects/execution")
+}
+
 /// The entrypoint of one acceptance fixture.
 pub fn fixture(name: &str) -> PathBuf {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/projects/m1")
-        .join(name)
-        .join("main.yml");
+    let path = projects().join(name).join("main.yml");
     assert!(
         path.is_file(),
         "the acceptance fixture `{name}` is missing: {}",
@@ -381,11 +388,38 @@ fn driver() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/compiled_graph_acceptance/invoke-flow.mjs")
 }
 
+/// The entrypoint of one worked example under `examples/`.
+///
+/// The examples are not fixtures — they are the documented projects, and
+/// `compose-core`'s golden corpus is built from these very files — so running one
+/// is the only way an acceptance test speaks about what a reader is shown.
+pub fn example(name: &str) -> PathBuf {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crates/")
+        .parent()
+        .expect("the repository root")
+        .join("examples")
+        .join(name)
+        .join("main.yml");
+    assert!(
+        path.is_file(),
+        "the example `{name}` is missing: {}",
+        path.display()
+    );
+    path
+}
+
 /// Build a fixture beneath the installed toolchain, so `node_modules` resolves.
+pub fn build_under_toolchain(name: &str, purpose: &str) -> Option<(PathBuf, Output)> {
+    build_entrypoint(&fixture(name), purpose)
+}
+
+/// The same, for any composition on disk — a fixture, or a worked [`example`].
 ///
 /// Each call gets its own directory: cargo runs the tests of one binary on
 /// parallel threads, and two of them writing one project would race.
-pub fn build_under_toolchain(name: &str, purpose: &str) -> Option<(PathBuf, Output)> {
+pub fn build_entrypoint(entrypoint: &Path, purpose: &str) -> Option<(PathBuf, Output)> {
     let root = installed()?;
     static NEXT: AtomicU32 = AtomicU32::new(0);
     let out = root.join("projects").join(format!(
@@ -396,7 +430,7 @@ pub fn build_under_toolchain(name: &str, purpose: &str) -> Option<(PathBuf, Outp
     let _ = std::fs::remove_dir_all(&out);
     let output = agent_compose()
         .arg("build")
-        .arg(fixture(name))
+        .arg(entrypoint)
         .args(["--target", "local"])
         .arg("--out")
         .arg(&out)
@@ -440,12 +474,15 @@ pub fn invoke_with(
     invoke_hosted(name, flow, inputs, environment, None)
 }
 
-/// The same again, with the host half of grammar 6.1's `function:` escape hatch.
+/// The same again, with the **host preamble** — a module the driver imports
+/// before the graph.
 ///
-/// `host` is a module the driver imports **before** the graph — which is where a
-/// real host registers its implementations, and the only way a composition using
-/// the escape hatch runs at all. `None` is what a test that wants the
-/// unregistered failure passes.
+/// It is where a real host does whatever has to happen before the composition
+/// loads. Two tests use it, for the two such things this suite has: registering
+/// the implementation of a `function:` binding, which is the only way a
+/// composition using grammar 6.1's escape hatch runs at all, and redirecting a
+/// provider whose `base_url:` the composition does not parameterise. `None` is
+/// what a test that wants the unregistered failure passes.
 pub fn invoke_hosted(
     name: &str,
     flow: &str,
@@ -453,14 +490,26 @@ pub fn invoke_hosted(
     environment: &[(String, String)],
     host: Option<&str>,
 ) -> Option<Invocation> {
-    let (project, built) = build_under_toolchain(name, "invoke")?;
+    invoke_entrypoint(&fixture(name), name, flow, inputs, environment, host)
+}
+
+/// The same, for any composition on disk — a fixture, or a worked [`example`].
+pub fn invoke_entrypoint(
+    entrypoint: &Path,
+    label: &str,
+    flow: &str,
+    inputs: &Value,
+    environment: &[(String, String)],
+    host: Option<&str>,
+) -> Option<Invocation> {
+    let (project, built) = build_entrypoint(entrypoint, "invoke")?;
     if let Some(source) = host {
         std::fs::write(project.join("host-functions.mjs"), source)
             .expect("the project directory is writable");
     }
     assert!(
         built.status.success(),
-        "the fixture `{name}` did not build:\n{}",
+        "the composition `{label}` did not build:\n{}",
         String::from_utf8_lossy(&built.stderr)
     );
 

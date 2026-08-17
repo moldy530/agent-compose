@@ -27,10 +27,12 @@ if (project === undefined || flow === undefined || inputsPath === undefined) {
 
 const inputs = JSON.parse(readFileSync(inputsPath, "utf8"));
 
-// The host half of grammar 6.1's `function:` escape hatch. A project using one
-// does not run until an implementation is registered, and this is where a host
-// would do it — before the graph runs, from a module of its own. A test that
-// wants the *unregistered* failure simply does not write this file.
+// The host's preamble: whatever a host does before the composition loads, from
+// a module of its own. Two things in this suite — registering the implementation
+// of a grammar 6.1 `function:` binding, without which a project using the escape
+// hatch does not run at all, and redirecting egress for a composition whose
+// provider does not parameterise its `base_url:`. A test that wants the
+// *unregistered* failure simply does not write this file.
 const host = path.resolve(project, "host-functions.mjs");
 if (existsSync(host)) await import(pathToFileURL(host).href);
 
