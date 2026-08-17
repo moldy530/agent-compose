@@ -430,6 +430,13 @@ pub enum MatchesPattern {
 #[must_use]
 pub fn matches_patterns(source: &str) -> Vec<MatchesPattern> {
     let mut found = Vec::new();
+    // A call is spelled with its name, so an expression whose text does not
+    // carry it has none — and that is nearly every expression a composition
+    // writes. Deciding it without a parse keeps the target check's cost
+    // proportional to the `matches()` a spec actually has.
+    if !source.contains("matches") {
+        return found;
+    }
     // The same two bounds [`analyze`] refuses past, for the same reason: this
     // walk recurses once per level too, and an expression it would exhaust the
     // stack on is one the validator has already reported.
