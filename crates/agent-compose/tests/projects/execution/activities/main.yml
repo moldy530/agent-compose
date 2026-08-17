@@ -32,6 +32,11 @@
 #     written fails the **execution**, naming the channel and the reader, and
 #     neither `on_error: skip` nor a `fallback:` absorbs it: those are strategies
 #     over a node's own error (grammar 10.1, 9.2, Decisions D78, D97, D110).
+#   * `flow.dead_end` — a completed node whose every outgoing edge is untaken,
+#     which is grammar 7.3 rule 7's failure. It is also the flow that fails
+#     *after* a step has landed, which is what makes the trace of a failed run
+#     assertable: what the first node wrote and routed is recorded, and so is the
+#     guard that answered `false` at the node the run stopped at (PRD 5.3).
 #
 # The environment is the harness's: `${OPS_URL}` is an HTTP server the test
 # controls and `${OPS_BIN}` a directory of ordinary commands, so nothing here
@@ -566,6 +571,40 @@ flow.unset:
     - { from: start, to: named }
     - { from: named, to: after }
     - { from: after, to: end }
+
+flow.dead_end:
+  description: A node whose only outgoing edge is a guard that answers false.
+  outputs:
+    checks:
+      type: array
+      max_items: 8
+      items: { type: string }
+  nodes:
+    # Runs, writes, routes on — the step whose record a failed run must keep.
+    pre:
+      exec:
+        command: printf
+        args: ["%s", "pre"]
+        output:
+          stdout: { type: string }
+      writes:
+        stdout: checks
+
+    # Completes too, and then has nowhere to go: its one edge reads its own
+    # output and the value is never `never` (grammar 7.3 rule 7).
+    head:
+      exec:
+        command: printf
+        args: ["%s", "head"]
+        output:
+          stdout: { type: string }
+      writes:
+        stdout: checks
+
+  edges:
+    - { from: start, to: pre }
+    - { from: pre, to: head }
+    - { from: head, to: end, when: "head.output.stdout == 'never'" }
 
 flow.unset_expression:
   description: The same read written as an expression, under a fallback.

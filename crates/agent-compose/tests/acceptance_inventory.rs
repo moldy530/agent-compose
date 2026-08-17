@@ -183,6 +183,13 @@ const CODEGEN: &[Criterion] = &[
                 "a_guard_sees_its_own_writes_and_not_a_concurrent_siblings",
                 Status::Live,
             ),
+            // Where a routing decision *goes*: the trace PRD 5.3 asks for,
+            // including on the runs that fail — and the router's own failure,
+            // grammar 7.3 rule 7, which no static check can reach.
+            (
+                "a_failed_runs_trace_holds_what_landed_and_the_node_it_stopped_at",
+                Status::Live,
+            ),
         ],
     },
     Criterion {

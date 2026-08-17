@@ -85,6 +85,7 @@ const RESERVED: &[&str] = &[
     "END",
     "START",
     "StateGraph",
+    "isInterrupted",
     "runtime",
     "flows",
     "CompiledFlow",

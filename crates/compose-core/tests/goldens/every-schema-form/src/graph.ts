@@ -14,7 +14,7 @@
 // state it writes — including the counter a bounded edge spends (grammar 7.4) —
 // land in one write. `./runtime.ts` is what the descriptors drive.
 
-import { END, START, StateGraph } from "@langchain/langgraph";
+import { END, START, StateGraph, isInterrupted } from "@langchain/langgraph";
 
 import * as runtime from "./runtime.ts";
 import {
@@ -497,11 +497,20 @@ export interface CompiledFlow {
   readonly recursionLimit: number;
   /** Parse an invocation's inputs against the flow's own schema (grammar 13.2). */
   parse(inputs: unknown): Record<string, unknown>;
-  /** Invoke the compiled graph. */
-  invoke(
+  /**
+   * Invoke the compiled graph, answering with the state after each superstep.
+   *
+   * A stream rather than a plain invocation because of what a **failure** must
+   * leave behind. LangGraph's `invoke` is this stream with the last value kept,
+   * and an error thrown out of it discards the state it was keeping — the
+   * routing trace of PRD 5.3 with it, since nothing here is checkpointed. Taking
+   * the supersteps one at a time keeps every one that did complete, which is
+   * what `runFlow` reports the failure with.
+   */
+  stream(
     initial: Record<string, unknown>,
     options: { recursionLimit: number },
-  ): Promise<GraphState>;
+  ): Promise<AsyncIterable<GraphState>>;
 }
 
 /**
@@ -518,7 +527,12 @@ export const flows: Readonly<Record<string, CompiledFlow>> = {
     outputs: ["draft", "notes"],
     recursionLimit: 30,
     parse: (inputs: unknown) => flowShapeInputs.parse(inputs) as Record<string, unknown>,
-    invoke: (initial, options) => flowShapeGraph.invoke(initial, options) as Promise<GraphState>,
+    stream: (initial, options) =>
+      flowShapeGraph.stream(initial, {
+        ...options,
+        streamMode: "values",
+        outputKeys: flowShapeGraph.outputChannels,
+      }) as unknown as Promise<AsyncIterable<GraphState>>,
   },
 };
 
@@ -540,6 +554,10 @@ export interface FlowRun {
  * directly. The inputs are parsed against the flow's own `inputs:` schema before
  * anything runs, which is where an invocation that the flow cannot accept is
  * refused by field name (grammar 13.2).
+ *
+ * A run that does not reach quiescence raises `runtime.FlowFailure`, which
+ * carries the trace it did make and the original error as its `cause` — see
+ * `CompiledFlow.stream` for why the run is streamed to keep it.
  */
 export async function runFlow(
   address: string,
@@ -557,19 +575,37 @@ export async function runFlow(
     );
   }
   const parsed = flow.parse(inputs);
-  const state = await flow.invoke(
-    {
-      $run: {
-        ...runtime.emptyRun(),
-        input: parsed,
-        execution: {
-          id: options.executionId ?? `exec_${globalThis.crypto.randomUUID()}`,
-          session_key: options.sessionKey ?? "",
+  let state: GraphState | undefined;
+  try {
+    const supersteps = await flow.stream(
+      {
+        $run: {
+          ...runtime.emptyRun(),
+          input: parsed,
+          execution: {
+            id: options.executionId ?? `exec_${globalThis.crypto.randomUUID()}`,
+            session_key: options.sessionKey ?? "",
+          },
         },
       },
-    },
-    { recursionLimit: options.recursionLimit ?? flow.recursionLimit },
-  );
+      { recursionLimit: options.recursionLimit ?? flow.recursionLimit },
+    );
+    for await (const superstep of supersteps) {
+      // What LangGraph's own `invoke` keeps: the last chunk that is a state.
+      // An interrupt is announced as a chunk of its own rather than as one, and
+      // reading it as state would lose the run's — `human:` nodes are the
+      // construct that raises one, and resuming them is a later bullet (PRD §7).
+      if (!isInterrupted(superstep)) state = superstep;
+    }
+  } catch (error) {
+    throw new runtime.FlowFailure(address, runtime.failedTrace(state, error), error);
+  }
+  if (state === undefined) {
+    // Unreachable: `streamMode: "values"` emits the state the run started from
+    // before any node has run. A run with no state at all is still not one this
+    // function can answer for, and saying so beats reading `undefined` as empty.
+    throw new Error(`\`${address}\` produced no state`);
+  }
 
   const outputs: Record<string, unknown> = {};
   for (const field of flow.outputs) {

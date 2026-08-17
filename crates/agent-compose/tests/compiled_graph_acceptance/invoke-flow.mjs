@@ -11,6 +11,11 @@
 // with a variable missing fails at process start naming it, exactly as a real
 // invocation would (PRD 5.9).
 //
+// A run that fails writes its trace too: `runFlow` raises a `FlowFailure`
+// carrying every routing decision the run made before it stopped (PRD 5.3), and
+// a driver that dropped it would make a failed run's trace unreadable from a
+// test — the runs whose trace a test most wants to assert about.
+//
 // Usage: node invoke-flow.mjs <project> <flow> <inputs.json> <trace.json>
 // Output: the flow's outputs as one JSON object on stdout; the trace is written
 // to <trace.json>, so stdout stays exactly what `agent-compose run` prints.
@@ -42,7 +47,10 @@ let run;
 try {
   run = await runFlow(flow, inputs);
 } catch (error) {
-  if (tracePath !== undefined) writeFileSync(tracePath, "[]");
+  if (tracePath !== undefined) {
+    const trace = Array.isArray(error?.trace) ? error.trace : [];
+    writeFileSync(tracePath, JSON.stringify(trace, null, 1));
+  }
   // The message and its cause chain, which is what a failing test reads.
   process.stderr.write(`${error?.stack ?? String(error)}\n`);
   for (let cause = error?.cause; cause !== undefined; cause = cause?.cause) {

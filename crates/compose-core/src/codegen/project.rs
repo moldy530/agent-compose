@@ -230,6 +230,10 @@ PRD 5.3 asks for: one entry per node execution, carrying the guards that were
 evaluated, what they answered, which edges were taken, and the state of any
 `max_iterations` budget they spent.
 
+A run that does not reach quiescence throws a `FlowFailure`, and it carries that
+same record: `.trace` holds every step that completed plus one final entry for
+the node the run stopped at, and `.cause` is the error itself.
+
 `src/index.ts` calls `readEnvironment()` at module scope, so loading this project
 is what checks its environment: a missing variable throws before anything runs,
 naming every variable that is missing rather than the first (PRD 5.9, grammar

@@ -1263,6 +1263,13 @@ fn concurrent_writers_append_in_node_id_order_not_completion_order() {
 /// emitted node function: `flow.unset` resolves the tool's argument **by name**
 /// from the channel of the same name (grammar 8.0 step 2), and
 /// `flow.unset_expression` writes the read out as CEL.
+///
+/// Each half asserts on the trace rather than on the absence of one. A failed
+/// run's trace holds the node it stopped at (PRD 5.3, see
+/// `a_failed_runs_trace_holds_what_landed_and_the_node_it_stopped_at`), so
+/// "`skip` did not swallow this" is the *presence* of a `failed` entry for the
+/// reader — which a run that had continued past it could not produce, and which
+/// an empty trace would not have distinguished from any other failure.
 #[test]
 fn reading_an_unset_channel_fails_the_run_whatever_the_error_policy_says() {
     let provider = MockProvider::start().expect("a loopback port");
@@ -1281,9 +1288,28 @@ fn reading_an_unset_channel_fails_the_run_whatever_the_error_policy_says() {
         failure.contains("is unset") && failure.contains("reads it"),
         "…and the reader: {failure}"
     );
+    let named = skipped.entries("named");
+    assert_eq!(
+        named.len(),
+        1,
+        "the reader is in the trace once: {:?}",
+        skipped.trace()
+    );
+    assert_eq!(
+        named[0]["outcome"], "failed",
+        "`on_error: skip` did not turn the execution failure into a skip: {}",
+        named[0]
+    );
+    assert!(
+        named[0]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("`pending`")),
+        "…and the entry says what stopped it: {}",
+        named[0]
+    );
     assert!(
         !skipped.visited().contains(&"after".to_string()),
-        "`on_error: skip` did not continue past it: {:?}",
+        "…so nothing continued past it: {:?}",
         skipped.visited()
     );
 
@@ -1299,10 +1325,95 @@ fn reading_an_unset_channel_fails_the_run_whatever_the_error_policy_says() {
         failure.contains("pending"),
         "the expression's failure names what it could not read: {failure}"
     );
+    let read = bound.entries("bound");
+    assert_eq!(
+        read.len(),
+        1,
+        "the reader is in the trace once: {:?}",
+        bound.trace()
+    );
+    assert_eq!(read[0]["outcome"], "failed", "{}", read[0]);
+    assert_eq!(
+        read[0]["fallback"],
+        Value::Null,
+        "a `fallback:` did not route around it either — the entry names none, \
+         and a fallback that had been taken would: {}",
+        read[0]
+    );
     assert!(
         !bound.visited().contains(&"rescue".to_string()),
-        "a `fallback:` did not route around it either: {:?}",
+        "…and the fallback target never ran: {:?}",
         bound.visited()
+    );
+}
+
+/// A run that fails still reports every routing decision it made (PRD 5.3).
+///
+/// The trace is the record of what a run did, and the runs it is most wanted for
+/// are the ones that did not finish. Nothing is checkpointed, so a graph
+/// invocation that throws takes the state — and the trace inside it — with it;
+/// what makes this assertable is that `runFlow` streams the run and keeps each
+/// superstep, and that a node which throws hands its own entry to the failure.
+///
+/// `flow.dead_end` is the shape that decides both halves at once: `pre` runs,
+/// writes and routes (the landed half), and `head` completes and then finds
+/// every outgoing edge untaken — grammar 7.3 rule 7, which is a run-time failure
+/// no static check can reach, and whose entry has to carry the guard values or
+/// nothing says why the run stopped.
+#[test]
+fn a_failed_runs_trace_holds_what_landed_and_the_node_it_stopped_at() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let Some(run) = harness::invoke_with(
+        "activities",
+        "flow.dead_end",
+        &json!({}),
+        &harness::environment(&provider),
+    ) else {
+        return;
+    };
+    let failure = run.failed();
+    assert!(
+        failure.contains("no viable route out of `head`"),
+        "the run says which node had nowhere to go (grammar 7.3 rule 7): {failure}"
+    );
+
+    assert_eq!(
+        run.visited(),
+        ["pre", "head"],
+        "both steps are in the trace: the one that landed, and the one that \
+         stopped the run"
+    );
+    let pre = run.entries("pre");
+    assert_eq!(pre[0]["outcome"], "completed");
+    assert_eq!(
+        pre[0]["writes"],
+        json!(["checks"]),
+        "what the landed step wrote survives the failure: {}",
+        pre[0]
+    );
+    assert_eq!(pre[0]["routing"]["targets"], json!(["head"]));
+
+    let head = run.entries("head");
+    assert_eq!(head[0]["outcome"], "failed");
+    assert_eq!(
+        head[0]["routing"]["edges"][0]["value"],
+        json!(false),
+        "the guard that answered `false` is what explains the failure, so the \
+         entry carries the decision rather than only the error: {}",
+        head[0]
+    );
+    assert_eq!(
+        head[0]["routing"]["targets"],
+        json!([]),
+        "…with no target, which is the failure itself: {}",
+        head[0]
+    );
+    assert_eq!(
+        head[0]["writes"],
+        Value::Null,
+        "the superstep a run dies in lands nothing, so its entry claims no \
+         writes: {}",
+        head[0]
     );
 }
 
@@ -1958,6 +2069,25 @@ fn a_node_timeout_fires_and_its_error_policy_takes_over() {
         failure.contains("after 1 attempt(s)") && !failure.contains("after 0 attempt(s)"),
         "the message and the cause count the same attempts: {failure}"
     );
+
+    // And the trace says the same thing the message does: `on_error: fail` ends
+    // the run *at* this node, so the node it ended at is the trace's last entry
+    // — with the attempts it made, counted once more (PRD 5.3).
+    let review = run.entries("review");
+    assert_eq!(
+        review.len(),
+        1,
+        "the node that timed out is in the trace: {:?}",
+        run.trace()
+    );
+    assert_eq!(review[0]["outcome"], "failed", "{}", review[0]);
+    assert_eq!(review[0]["attempts"], 1, "{}", review[0]);
+    assert_eq!(
+        run.visited().last().map(String::as_str),
+        Some("review"),
+        "…and it is where the run stopped: {:?}",
+        run.visited()
+    );
 }
 
 /// The same budget, spent on a child process rather than on a provider — and the
@@ -2527,7 +2657,7 @@ fn every_generated_project_type_checks_and_constructs_its_graph() {
                  graph.createBuilder();\
                  if (Object.keys(graph.flows).length === 0) process.exit(0);\
                  for (const flow of Object.values(graph.flows)) {\
-                   if (typeof flow.invoke !== 'function') throw new Error(`${flow.address} has no graph`);\
+                   if (typeof flow.stream !== 'function') throw new Error(`${flow.address} has no graph`);\
                  }",
             ])
             .current_dir(&project)

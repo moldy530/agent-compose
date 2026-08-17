@@ -94,11 +94,22 @@ export class NodeTimeout extends Error {
 
 /** Grammar 7.3 rule 7: a completed node with no edge to take. */
 export class NoViableRoute extends Error {
-  constructor(flow: string, node: string) {
+  /**
+   * What each outgoing edge answered, in declaration order.
+   *
+   * The reason the error carries them: they are the routing decision PRD 5.3
+   * asks a trace to hold, and the run that this error ends is exactly the run
+   * whose trace never got to record them. [`runNode`] puts them on the entry it
+   * hands the failure, so "which guard answered what" survives an abort.
+   */
+  readonly decisions: readonly EdgeDecision[];
+
+  constructor(flow: string, node: string, decisions: readonly EdgeDecision[]) {
     super(
       `${flow}: no viable route out of \`${node}\` — every outgoing edge was untaken (grammar 7.3 rule 7)`,
     );
     this.name = "NoViableRoute";
+    this.decisions = decisions;
   }
 }
 
@@ -1059,23 +1070,45 @@ export function route(
   }
 
   if (targets.length === 0) {
-    throw new NoViableRoute(flow, node);
+    // Ordered the way a returned decision is (below), because the trace entry
+    // this ends up on is read the same way whether the run survived it or not.
+    throw new NoViableRoute(flow, node, ordered(decisions, edges));
   }
-  // Declaration order is what the trace records; the targets are ordered by it
-  // too, so a multicast reads the way the file does.
+  return { edges: ordered(decisions, edges), targets, counters: spent };
+}
+
+/**
+ * The decisions in declaration order.
+ *
+ * Declaration order is what the trace records; the targets are ordered by it
+ * too, so a multicast reads the way the file does.
+ */
+function ordered(
+  decisions: EdgeDecision[],
+  edges: readonly EdgeDescriptor[],
+): EdgeDecision[] {
   decisions.sort(
     (left, right) =>
       edges.findIndex((edge) => edge.to === left.to && edge.when === left.when) -
       edges.findIndex((edge) => edge.to === right.to && edge.when === right.when),
   );
-  return { edges: decisions, targets, counters: spent };
+  return decisions;
 }
 
 // ---------------------------------------------------------------------------
 // The run channel: what the compiler keeps beside a composition's own state
 // ---------------------------------------------------------------------------
 
-/** One entry of the routing trace (PRD 5.3: routing decisions are data). */
+/**
+ * One entry of the routing trace (PRD 5.3: routing decisions are data).
+ *
+ * A run that **fails** carries one final entry too: the node it aborted at,
+ * with `outcome: "failed"` and an `error` saying what stopped it. That entry
+ * records no `writes`, because the superstep a run dies in lands none of them —
+ * every task's update in that step is discarded — and it carries `routing` only
+ * when the routing decision is what failed ([`NoViableRoute`]), where the guard
+ * values are the whole explanation. See [`abortedEntry`].
+ */
 export interface TraceEntry {
   readonly step: number;
   readonly flow: string;
@@ -1087,6 +1120,77 @@ export interface TraceEntry {
   readonly routing?: RoutingDecision;
   readonly error?: string;
   readonly fallback?: string;
+}
+
+/**
+ * Where a node hands its own trace entry to the failure that ends the run.
+ *
+ * A node that throws returns no `Command`, so the entry it had reached has
+ * nowhere to be written: LangGraph discards the whole superstep. Carrying it on
+ * the error is what gets it to [`runFlow`], which appends it to the trace it
+ * recovered. `Symbol.for` rather than a field name so that nothing a
+ * composition can spell collides with it, and non-enumerable so an error that
+ * carries one still logs and serializes the way the same error without one does.
+ */
+const ABORTED = Symbol.for("agent-compose.abortedEntry");
+
+/** Carry `entry` on `error`, and answer with the error unchanged otherwise. */
+export function carryEntry<E>(error: E, entry: TraceEntry): E {
+  if (typeof error === "object" && error !== null && Object.isExtensible(error)) {
+    Object.defineProperty(error, ABORTED, { value: entry, enumerable: false, configurable: true });
+  }
+  return error;
+}
+
+/** The entry of the node this error aborted, if it came from one. */
+export function abortedEntry(error: unknown): TraceEntry | undefined {
+  if (typeof error !== "object" || error === null) return undefined;
+  const held = (error as Record<symbol, unknown>)[ABORTED];
+  return held === undefined ? undefined : (held as TraceEntry);
+}
+
+/**
+ * A run that did not reach quiescence, and the trace it made before it stopped.
+ *
+ * PRD 5.3 asks that routing decisions appear in traces as data, and a failed run
+ * is where a trace is wanted most: it is the record of which guards answered
+ * what, which budgets were spent and how many attempts each node made on the way
+ * to whatever went wrong. The graph's state — `$run` included — does not survive
+ * an `invoke` that throws, so [`runFlow`] streams the run instead, keeps the last
+ * state each superstep produced, and raises this in place of the error the graph
+ * threw. The original is the `cause`, so a report that prints the chain says
+ * exactly what it said before.
+ */
+export class FlowFailure extends Error {
+  /** The flow that was running. */
+  readonly flow: string;
+  /** What landed, plus the entry of the node the run aborted at. */
+  readonly trace: readonly TraceEntry[];
+
+  constructor(flow: string, trace: readonly TraceEntry[], cause: unknown) {
+    super(`\`${flow}\` did not run to quiescence: ${describe(cause)}`);
+    this.name = "FlowFailure";
+    this.flow = flow;
+    this.trace = trace;
+    this.cause = cause;
+  }
+}
+
+/**
+ * The trace a failed run carries: every entry that landed, then the aborting
+ * node's own.
+ *
+ * `state` is the last one a superstep produced, which is the last one whose
+ * writes were committed — so its `$run` holds exactly the entries of the steps
+ * that completed. The aborting node's entry is appended rather than merged
+ * because it never reached the reducer, and it belongs last for the same reason:
+ * it is the step the recovered ones stopped short of.
+ */
+export function failedTrace(state: unknown, error: unknown): readonly TraceEntry[] {
+  const held = (state as { $run?: RunChannel } | undefined)?.$run;
+  const landed = held?.trace ?? [];
+  const aborted = abortedEntry(error);
+  return aborted === undefined ? landed : [...landed, aborted];
 }
 
 /**
@@ -1275,6 +1379,12 @@ const EXECUTION_SHAPE = {
  * so the input is built **outside** the policy-governed `try`: an expression
  * that cannot be evaluated propagates, and only what the activity did reaches
  * the `catch`.
+ *
+ * **What a failure leaves behind.** Every way out of here that throws carries
+ * this node's own trace entry on the error ([`carryEntry`]), because a thrown
+ * task returns no `Command` and LangGraph discards the superstep it was in —
+ * so without that, the one node a reader of a failed run most wants to see is
+ * the one node the trace could never hold (PRD 5.3).
  */
 export async function runNode(
   descriptor: NodeDescriptor,
@@ -1304,8 +1414,26 @@ export async function runNode(
     execution: bindRoot(run.execution, EXECUTION_SHAPE),
   };
 
+  /** This node's entry, for a failure that leaves nothing else behind. */
+  const aborted = (error: unknown, made: number, routing?: RoutingDecision): TraceEntry => ({
+    step,
+    flow: descriptor.flow,
+    node: descriptor.node,
+    traversal,
+    outcome: "failed",
+    attempts: made,
+    ...(routing === undefined ? {} : { routing }),
+    error: describe(error),
+  });
+
   // Outside the `try` on purpose — see *Which errors `on_error` governs* above.
-  const input = descriptor.input(configuration, view);
+  let input: unknown;
+  try {
+    input = descriptor.input(configuration, view);
+  } catch (error) {
+    // No attempt was made: the node never ran, so `0` is what it made.
+    throw carryEntry(error, aborted(error, 0));
+  }
 
   try {
     const answer = await runActivity(
@@ -1325,7 +1453,7 @@ export async function runNode(
     // carrying the attempts it *made*, so the fallback is for an error that
     // reached here without one being made at all — and `0` is what that is.
     attempts = failure?.attempts ?? 0;
-    if (strategy === "fail") throw error;
+    if (strategy === "fail") throw carryEntry(error, aborted(error, attempts));
     if (typeof strategy === "object") {
       // The node's own outgoing edges are not evaluated: the fallback target is
       // scheduled instead (grammar 9.2, Decision D21).
@@ -1365,21 +1493,38 @@ export async function runNode(
     }
   }
 
-  const roots: Roots = {
-    ...configuration,
-    state: bindRoot(localState, descriptor.shapes.state),
-    [descriptor.node]: skipped
-      ? undefined
-      : bindRoot({ output }, { properties: { output: descriptor.shapes.output } }),
-  };
-  const routing = route(
-    descriptor.flow,
-    descriptor.node,
-    descriptor.edges,
-    roots,
-    run.iterations,
-    skipped,
-  );
+  let routing: RoutingDecision;
+  try {
+    const roots: Roots = {
+      ...configuration,
+      state: bindRoot(localState, descriptor.shapes.state),
+      [descriptor.node]: skipped
+        ? undefined
+        : bindRoot({ output }, { properties: { output: descriptor.shapes.output } }),
+    };
+    routing = route(
+      descriptor.flow,
+      descriptor.node,
+      descriptor.edges,
+      roots,
+      run.iterations,
+      skipped,
+    );
+  } catch (error) {
+    // A route that could not be decided is still a routing decision, and the
+    // guard values are the whole of it — so a `NoViableRoute` hands them on
+    // (PRD 5.3). `targets` is empty because that is what went wrong.
+    throw carryEntry(
+      error,
+      aborted(
+        error,
+        attempts,
+        error instanceof NoViableRoute
+          ? { edges: [...error.decisions], targets: [], counters: {} }
+          : undefined,
+      ),
+    );
+  }
 
   const entry: TraceEntry = {
     step,

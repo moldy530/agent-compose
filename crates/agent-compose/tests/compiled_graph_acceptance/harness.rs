@@ -576,6 +576,13 @@ impl Invocation {
     }
 
     /// Every routing decision the run recorded, in step order (PRD 5.3).
+    ///
+    /// A **failed** run has one too: `runFlow` raises a `FlowFailure` carrying
+    /// the steps that completed plus the entry of the node it stopped at, and
+    /// the driver writes that. So a negative assertion about a failing run — "it
+    /// did not continue past the node that failed" — is decided by what is in
+    /// the trace rather than by its being empty, which would hold whatever the
+    /// run had done.
     pub fn trace(&self) -> Vec<Value> {
         let text = std::fs::read_to_string(&self.trace).unwrap_or_else(|error| {
             panic!(
