@@ -22,9 +22,10 @@
 //! command CI runs.
 //!
 //! Node ≥ 22.18 stays a **supported fallback**, and it is machine-checked rather
-//! than asserted — see gate 13 of `tests/generated_code_gates.rs`, which installs
-//! a golden with npm and type-checks, constructs and runs it under Node. That is
-//! the one place `node` and `npm` are still required, and the reason
+//! than asserted — see gates 13 and 15 of `tests/generated_code_gates.rs`: gate
+//! 13 installs a golden with npm and type-checks, constructs and runs it under
+//! Node, and gate 15 answers both shared corpora under that same install. Those
+//! two are the only places `node` and `npm` are still required, and the reason
 //! [`runs`] and [`required`] live here beside the Bun half. The Node half also
 //! reads `node --version` and holds it to the `engines.node` floor before
 //! deciding anything, because a Node below it cannot run a `.ts` file at all —

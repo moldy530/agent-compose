@@ -153,7 +153,12 @@
 //! wrote. The copies gates 13 and 15 run under Node go under
 //! `tests/toolchain/node-fallback/projects/` instead, beside an npm-installed
 //! `node_modules/` of their own: resolution takes the nearest one walking up, so
-//! the Node gates reach what npm installed and never what Bun did.
+//! the Node gates reach what npm installed and never what Bun did. The
+//! **runners** those two gates spawn are staged into `node-fallback/` for the
+//! same reason — a runner's own bare imports resolve from the directory it is
+//! spawned out of, which for a runner left in `tests/toolchain/` is the tree
+//! `bun install` writes. [`every_runner_node_spawns_resolves_the_npm_install`] is
+//! what holds that.
 //!
 //! # When a runtime is missing
 //!
@@ -185,8 +190,8 @@ use toolchain::{bun, installed, required, runner, runs};
 /// rather than a no-op load.
 const NODE_FALLBACK_GOLDEN: &str = "triage-fanout";
 
-/// The npm-installed toolchain gate 13 uses, or `None` when Node is absent and
-/// this is not CI.
+/// The npm-installed toolchain gates 13 and 15 use, or `None` when Node is
+/// absent and this is not CI.
 ///
 /// A directory of its own beneath the fixture, holding a copy of the committed
 /// manifest and `package-lock.json` and an npm-installed `node_modules/`. Two
@@ -196,6 +201,17 @@ const NODE_FALLBACK_GOLDEN: &str = "triage-fanout";
 /// without Bun would use. Module resolution takes the nearest `node_modules/`
 /// walking up, so a project staged inside this directory reaches this install and
 /// never the Bun one above it.
+///
+/// The fixture's **runners** are staged here too, and for the same rule read one
+/// level out: Node resolves a module's bare specifiers from that module's own
+/// directory, not from the directory of whatever it went on to import. A runner
+/// spawned out of `tests/toolchain/` would therefore take its own
+/// `@langchain/langgraph` from the tree `bun install` writes *there* — so the
+/// gate whose subject is the npm install would be reducing a state model with a
+/// `StateGraph` that came from Bun's, and on a machine with npm and no Bun it
+/// would not resolve at all. Copying the runners in puts their imports on the
+/// same walk-up as the staged project's, which is what makes "never what Bun
+/// did" true of the whole process rather than of the project alone.
 fn node_fallback() -> Option<&'static Path> {
     static FALLBACK: OnceLock<Option<PathBuf>> = OnceLock::new();
     FALLBACK
@@ -204,13 +220,13 @@ fn node_fallback() -> Option<&'static Path> {
                 assert!(
                     !required(),
                     "the Node fallback cannot be checked here: {blocker}. PRD §9.18 keeps \
-                     Node {engine} a supported fallback for every generated project, and gate 13 \
-                     is the only thing that checks it. CI installs it; see \
+                     Node {engine} a supported fallback for every generated project, and gates \
+                     13 and 15 are the only things that check it. CI installs it; see \
                      .github/workflows/ci.yml.",
                     engine = compose_core::codegen::project::NODE_ENGINE,
                 );
                 eprintln!(
-                    "warning: skipping the Node-fallback gate — {blocker}. A Node satisfying \
+                    "warning: skipping the Node-fallback gates — {blocker}. A Node satisfying \
                      `{engine}` is required in CI (`CI` is set there) and this run is not CI.",
                     engine = compose_core::codegen::project::NODE_ENGINE,
                 );
@@ -219,9 +235,13 @@ fn node_fallback() -> Option<&'static Path> {
             let source = toolchain::root();
             let root = source.join("node-fallback");
             fs::create_dir_all(&root).expect("the scratch area is writable");
-            for manifest in ["package.json", "package-lock.json"] {
-                fs::copy(source.join(manifest), root.join(manifest))
-                    .expect("the committed manifest is readable");
+            for name in ["package.json", "package-lock.json"]
+                .into_iter()
+                .map(str::to_string)
+                .chain(runners(&source))
+            {
+                fs::copy(source.join(&name), root.join(&name))
+                    .expect("the committed fixture is readable");
             }
             let install = Command::new("npm")
                 .args(["ci", "--no-audit", "--no-fund"])
@@ -237,6 +257,26 @@ fn node_fallback() -> Option<&'static Path> {
             Some(root)
         })
         .as_deref()
+}
+
+/// The runner scripts a directory holds, by file name, sorted.
+///
+/// Read from the directory rather than listed here, so a runner added to the
+/// fixture is staged into the npm install without anyone having remembered to
+/// come back — which is the omission
+/// [`every_runner_node_spawns_resolves_the_npm_install`] would otherwise be
+/// catching after the fact.
+fn runners(directory: &Path) -> Vec<String> {
+    let mut names = Vec::new();
+    for entry in fs::read_dir(directory).expect("the directory is readable") {
+        let name = entry.expect("the directory is readable").file_name();
+        let name = name.to_str().expect("the fixture's file names are UTF-8");
+        if name.ends_with(".mjs") {
+            names.push(name.to_string());
+        }
+    }
+    names.sort();
+    names
 }
 
 /// Why gate 13 cannot run here, or `None` when it can.
@@ -2116,8 +2156,7 @@ fn a_generated_project_installs_type_checks_and_runs_under_the_node_fallback() {
         String::from_utf8_lossy(&typecheck.stderr),
     );
 
-    let construct = Command::new("node")
-        .arg(toolchain::root().join("state-channels.mjs"))
+    let construct = node_command("state-channels.mjs")
         .arg(&project)
         .output()
         .expect("node runs");
@@ -2136,8 +2175,7 @@ fn a_generated_project_installs_type_checks_and_runs_under_the_node_fallback() {
         .expect("the fallback golden has a reduction row");
     let writes = project.join("state-writes.json");
     fs::write(&writes, entry.writes).expect("the scratch area is writable");
-    let reduced = Command::new("node")
-        .arg(toolchain::root().join("state-reduction.mjs"))
+    let reduced = node_command("state-reduction.mjs")
         .arg(&project)
         .arg(&writes)
         .output()
@@ -2197,8 +2235,7 @@ fn a_generated_project_installs_type_checks_and_runs_under_the_node_fallback() {
         .copied()
         .chain(["draft", "constructors"])
         .collect();
-    let probe = Command::new("node")
-        .arg(toolchain::root().join("inherited-channel-names.mjs"))
+    let probe = node_command("inherited-channel-names.mjs")
         .arg(serde_json::to_string(&probed).expect("the names serialize"))
         .output()
         .expect("node runs");
@@ -2222,15 +2259,133 @@ fn a_generated_project_installs_type_checks_and_runs_under_the_node_fallback() {
     );
 }
 
-/// A `node` command that runs one of the fixture's runners.
+/// A `node` command that runs one of the fixture's runners, from the copy staged
+/// inside the npm install.
 ///
 /// The Node counterpart of [`runner`], and the reason it takes the same argument
 /// in the same order: a gate that re-runs a corpus under the fallback engine
 /// differs from the Bun one in this function and nowhere else.
+///
+/// The **staged** copy and not the committed one, for the reason [`node_fallback`]
+/// gives: a runner carries bare imports of its own, and Node resolves those from
+/// the directory the runner is in. Spawning `tests/toolchain/state-reduction.mjs`
+/// would hand the Node gate a `StateGraph` out of Bun's `node_modules/` — or, on
+/// a machine that has npm and no Bun, `ERR_MODULE_NOT_FOUND` for a package the
+/// fixture pins and npm installed.
+///
+/// # Panics
+///
+/// Panics when the npm install is absent, so call it only after [`node_fallback`]
+/// has answered `Some` — every caller already has to, since it is what stages the
+/// runner this spawns.
 fn node_command(script: &str) -> Command {
+    let root = node_fallback().expect("the npm toolchain installed, so the runners are staged");
     let mut command = Command::new("node");
-    command.arg(toolchain::root().join(script));
+    command.arg(root.join(script));
     command
+}
+
+/// Every runner Node spawns lives inside the npm install, and its own imports
+/// resolve there.
+///
+/// The bug this is written against is silent on the machine most likely to be
+/// running it. Node resolves a module's bare specifiers from *that module's*
+/// directory, so a runner spawned out of `tests/toolchain/` reads
+/// `@langchain/langgraph` from the tree `bun install` writes there — and gates 13
+/// and 15 stay green on a developer machine with both runtimes while the state
+/// model they reduce is driven by a `StateGraph` from Bun's tree over
+/// `Annotation`s from npm's, two copies of one package in one process and no
+/// reading of the npm install by the runner at all. The same code on a machine
+/// with npm and no Bun — precisely the reader the fallback is promised to — dies
+/// with `ERR_MODULE_NOT_FOUND` for a package the fixture pins and npm installed;
+/// on a cold CI checkout it is a race against whichever test calls
+/// `installed()` first. None of that is visible from a gate's own assertions, so
+/// the property is asserted here instead of being left to be noticed.
+///
+/// Three parts, because the invariant needs all three: the npm install holds a
+/// byte-identical copy of every committed runner, [`node_command`] spawns *that*
+/// copy, and the pinned packages those runners name really do resolve inside the
+/// install — asked of `node` itself, because the resolution rule is the runtime's
+/// and a suite that restated it would be checking its own restatement.
+///
+/// Only the **pinned** specifiers are probed. [`imports`] is deliberately a
+/// text scan rather than a parser — it reads a runner's prose too, and
+/// `state-reduction.mjs` explains a reducer with the words `differs from
+/// "assign"` — so "everything that is not relative or `node:`" is not the set
+/// that has to resolve. The set that has to is the one `package.json` pins.
+#[test]
+fn every_runner_node_spawns_resolves_the_npm_install() {
+    let Some(root) = node_fallback() else {
+        return;
+    };
+    let fixture = toolchain::root();
+    let committed = runners(&fixture);
+    assert!(!committed.is_empty(), "the fixture commits no runners");
+    assert_eq!(
+        runners(root),
+        committed,
+        "the npm install does not hold every committed runner, and one spawned from anywhere \
+         else resolves its own imports in the Bun install beside it"
+    );
+
+    let mut named: BTreeSet<String> = BTreeSet::new();
+    for name in &committed {
+        let staged = fs::read(root.join(name)).expect("the staged runner is readable");
+        assert_eq!(
+            staged,
+            fs::read(fixture.join(name)).expect("the committed runner is readable"),
+            "`{name}` in the npm install is not the committed runner"
+        );
+
+        let spawned = node_command(name);
+        let arguments: Vec<&std::ffi::OsStr> = spawned.get_args().collect();
+        let expected = root.join(name);
+        assert_eq!(
+            arguments,
+            [expected.as_os_str()],
+            "`node_command` does not spawn the copy of `{name}` staged in the npm install"
+        );
+
+        let source = String::from_utf8(staged).expect("a runner is UTF-8");
+        named.extend(
+            imports(&source)
+                .into_iter()
+                .filter(|specifier| pinned(specifier)),
+        );
+    }
+    assert!(
+        named.contains("@langchain/langgraph"),
+        "no runner names a pinned package, so this gate asserts nothing — the scan or the \
+         fixture moved: {named:?}"
+    );
+
+    for specifier in &named {
+        // `--input-type=module -e` resolves against the working directory, which
+        // is where the runners now are — the same walk-up they get.
+        let script = format!(
+            "import {{ fileURLToPath }} from \"node:url\";\n\
+             process.stdout.write(fileURLToPath(import.meta.resolve({specifier:?})));"
+        );
+        let resolve = Command::new("node")
+            .args(["--input-type=module", "-e", script.as_str()])
+            .current_dir(root)
+            .output()
+            .expect("node runs");
+        assert!(
+            resolve.status.success(),
+            "`{specifier}`, which a staged runner imports, does not resolve in the npm \
+             install:\n{}",
+            String::from_utf8_lossy(&resolve.stderr),
+        );
+        let resolved = PathBuf::from(String::from_utf8_lossy(&resolve.stdout).into_owned());
+        assert!(
+            resolved.starts_with(root.join("node_modules")),
+            "a staged runner's `{specifier}` resolves to `{}`, which is outside the npm install \
+             at `{}` — under a `node_modules/` some other install wrote",
+            resolved.display(),
+            root.display(),
+        );
+    }
 }
 
 /// One of the fixture's runners, under Node, over a project staged in the npm
@@ -2400,6 +2555,17 @@ fn portable(specifier: &str) -> bool {
     if let Some(builtin) = specifier.strip_prefix("node:") {
         return !builtin.is_empty();
     }
+    pinned(specifier)
+}
+
+/// Whether a specifier names a pinned package, or a subpath of one.
+///
+/// The half of [`portable`] that is about `node_modules/` rather than about the
+/// runtime, split out because
+/// [`every_runner_node_spawns_resolves_the_npm_install`] wants exactly it: the
+/// specifiers that have to be *installed* to resolve, as opposed to the ones a
+/// runtime answers on its own.
+fn pinned(specifier: &str) -> bool {
     compose_core::codegen::project::PINS
         .iter()
         .chain(compose_core::codegen::project::DEV_PINS)
