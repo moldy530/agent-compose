@@ -555,13 +555,14 @@ fn the_state_model_carries_every_channels_type_default_and_reduce_policy() {
     // channel starts at the policy's identity element rather than unset.
     assert!(
         state.contains(
-            "notes: Annotation<z.infer<typeof stateNotes>, z.infer<typeof stateNotes>[number]>({"
+            "notes: Annotation<z.infer<typeof stateNotes>, runtime.Written<z.infer<typeof stateNotes>[number]>>({"
         ),
-        "an `append` channel takes one element per write:\n{state}"
+        "an `append` channel takes one element per write — or a `map` node's whole \
+         ordered batch of them (grammar 7.6.4 clause 2):\n{state}"
     );
     assert!(
-        state.contains("reducer: (left, right) => left.concat([right]),"),
-        "and appends it in write order:\n{state}"
+        state.contains("reducer: (left, right) => runtime.appendReduce(left, right),"),
+        "and appends in write order:\n{state}"
     );
     assert!(
         state.contains("default: () => [],"),
@@ -684,13 +685,11 @@ fn state_channels_carry_their_declared_types_and_defaults() {
 /// The `z.discriminatedUnion` this needs is emitted, and `compose-core`'s
 /// `tests/generated_code_gates.rs` runs a corpus through it that includes this
 /// very refusal — a tag the union does not declare, rejected by both the emitted
-/// Zod and the JSON Schema the same lowering produces. An agent node fn now
-/// parses its answer with the emitted schema, which is what turns that refusal
-/// into a run failure; what is left is the *fixture's* first node, a `flow:`
-/// instantiation of `flow.normalize`, so this run cannot reach `classify` until
-/// subgraphs do.
+/// Zod and the JSON Schema the same lowering produces. An agent node fn parses
+/// its answer with the emitted schema, which is what turns that refusal into a
+/// run failure — reached here through the fixture's first node, a `flow:`
+/// instantiation of `flow.normalize`, so the subgraph is on the path too.
 #[test]
-#[ignore = "pending: codegen must emit subgraphs"]
 fn a_tagged_union_output_is_narrowed_per_variant_and_a_bad_tag_is_rejected() {
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue_all([
@@ -706,12 +705,14 @@ fn a_tagged_union_output_is_narrowed_per_variant_and_a_bad_tag_is_rejected() {
         ),
     ]);
 
-    let run = harness::run(
+    let Some(run) = harness::invoke(
         "fanout",
         "flow.triage",
         &[("report", "a report")],
         &provider,
-    );
+    ) else {
+        return;
+    };
     let failure = run.failed();
     assert!(
         failure.contains("unheard_of"),
@@ -2000,7 +2001,6 @@ fn a_skipped_node_routes_through_its_else_edge_and_writes_nothing() {
 /// A subgraph runs with explicit bindings in, name-based outputs back, and a
 /// conversation history of its own.
 #[test]
-#[ignore = "pending: codegen must emit subgraphs"]
 fn a_subgraph_runs_with_explicit_bindings_and_isolated_history() {
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue_all([
@@ -2012,12 +2012,14 @@ fn a_subgraph_runs_with_explicit_bindings_and_isolated_history() {
         Script::new(SONNET, Outcome::structured(json!({ "findings": [] }))),
     ]);
 
-    let run = harness::run(
+    let Some(run) = harness::invoke(
         "fanout",
         "flow.triage",
         &[("report", "a raw report")],
         &provider,
-    );
+    ) else {
+        return;
+    };
     run.succeeded();
 
     let recorded = provider.requests();
@@ -2504,7 +2506,6 @@ fn a_run_that_reaches_the_superstep_ceiling_says_which_bound_was_missing() {
 /// A homogeneous map dispatches one instance per item, bounded by
 /// `max_concurrency`, and joins before the downstream edge fires.
 #[test]
-#[ignore = "pending: codegen must emit `map` as LangGraph `Send`"]
 fn a_homogeneous_map_dispatches_one_instance_per_item() {
     let provider = MockProvider::start().expect("a loopback port");
     let tasks: Vec<Value> = (0..3)
@@ -2524,7 +2525,10 @@ fn a_homogeneous_map_dispatches_one_instance_per_item() {
         );
     }
 
-    let run = harness::run("fanout", "flow.spread", &[("goal", "ship it")], &provider);
+    let Some(run) = harness::invoke("fanout", "flow.spread", &[("goal", "ship it")], &provider)
+    else {
+        return;
+    };
     run.succeeded();
 
     assert_eq!(
@@ -2543,7 +2547,6 @@ fn a_homogeneous_map_dispatches_one_instance_per_item() {
 /// A discriminator-routed map sends each item to its own route, narrowed to that
 /// variant's payload (PRD 5.6).
 #[test]
-#[ignore = "pending: codegen must emit discriminator-routed `map` dispatch"]
 fn a_routed_map_sends_each_variant_to_its_own_route() {
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue_all([
@@ -2566,12 +2569,14 @@ fn a_routed_map_sends_each_variant_to_its_own_route() {
             .matching("unclear"),
     ]);
 
-    let run = harness::run(
+    let Some(run) = harness::invoke(
         "fanout",
         "flow.triage",
         &[("report", "a raw report")],
         &provider,
-    );
+    ) else {
+        return;
+    };
     run.succeeded();
 
     let outputs = run.outputs();
@@ -2593,7 +2598,6 @@ fn a_routed_map_sends_each_variant_to_its_own_route() {
 /// Appended results are ordered by source-item index, whatever order the
 /// instances complete in (PRD 5.6's replay guarantee).
 #[test]
-#[ignore = "pending: codegen must emit index-tagged reducers"]
 fn appended_results_are_ordered_by_source_item_index() {
     let provider = MockProvider::start().expect("a loopback port");
     let tasks: Vec<Value> = (0..3)
@@ -2616,7 +2620,10 @@ fn appended_results_are_ordered_by_source_item_index() {
         );
     }
 
-    let run = harness::run("fanout", "flow.spread", &[("goal", "ship it")], &provider);
+    let Some(run) = harness::invoke("fanout", "flow.spread", &[("goal", "ship it")], &provider)
+    else {
+        return;
+    };
     run.succeeded();
 
     assert_eq!(
@@ -2624,6 +2631,336 @@ fn appended_results_are_ordered_by_source_item_index() {
         json!(["done-0", "done-1", "done-2"]),
         "appended values are reordered by source-item index before the join"
     );
+
+    // The record of the fan-out itself: one entry per source item, in index
+    // order, whatever order they finished in (PRD 5.6, 5.3).
+    let dispatched = run.entries("work")[0]["dispatches"].clone();
+    assert_eq!(
+        dispatched
+            .as_array()
+            .expect("a `map` node's trace entry records its dispatches")
+            .iter()
+            .map(|record| (record["index"].clone(), record["outcome"].clone()))
+            .collect::<Vec<_>>(),
+        (0..3)
+            .map(|index| (json!(index), json!("completed")))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// The catch-all takes the variants nothing routes, a sink route is joined like
+/// any other, a detached one is resolved at dispatch, and a failed item is
+/// skipped (grammar 8.6 rules 4, 6, 7, 10).
+///
+/// Four items, one per rule, and the whole claim rests on the run **succeeding**:
+/// the `duplicate` item is dispatched to an agent whose call is deliberately
+/// *unscripted*, so a join that waited on it would fail the map node and take the
+/// run with it. That it does not is what "resolved at dispatch" means (Decision
+/// D94) — the map completed, its outgoing edge fired, and the delivery's outcome
+/// was never observed.
+#[test]
+fn a_sink_route_is_joined_and_a_detached_one_is_resolved_at_dispatch() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({
+                "findings": [
+                    { "kind": "auto_fixable", "file": "a.rs", "hint": "rename it" },
+                    { "kind": "needs_human", "summary": "unclear", "severity": "high" },
+                    { "kind": "duplicate", "of": "issue-7" },
+                    { "kind": "auto_fixable", "file": "b.rs", "hint": "widen it" },
+                ],
+            })),
+        ),
+        Script::new(HAIKU, Outcome::structured(json!({ "patch": "patch-a" }))).matching("a.rs"),
+        // `min_length: 1` on `agent.fixer`'s `patch` refuses this, so item 3
+        // fails — and `on_item_error: skip` drops it rather than the fan-out.
+        Script::new(HAIKU, Outcome::structured(json!({ "patch": "" }))).matching("b.rs"),
+    ]);
+
+    let Some(run) = harness::invoke(
+        "fanout",
+        "flow.sort",
+        &[("report", "the build is red")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+
+    let outputs = run.outputs();
+    assert_eq!(
+        outputs["drafts"],
+        json!(["patch-a"]),
+        "the skipped item contributed nothing, and the one that landed did"
+    );
+    assert_eq!(
+        outputs["tickets"],
+        json!(["queued"]),
+        "the sink route ran and was waited on: its result is in state"
+    );
+
+    let dispatched = run.entries("route")[0]["dispatches"].clone();
+    let records = dispatched
+        .as_array()
+        .expect("the map records what it dispatched");
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| (
+                record["index"].as_u64().expect("an index"),
+                record["route"].as_str().expect("a route").to_string(),
+                record["outcome"].as_str().expect("an outcome").to_string(),
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (0, "auto_fixable".to_string(), "completed".to_string()),
+            (1, "needs_human".to_string(), "completed".to_string()),
+            (2, "default".to_string(), "detached".to_string()),
+            (3, "auto_fixable".to_string(), "skipped".to_string()),
+        ],
+        "every item is accounted for, in source-item order: {dispatched}"
+    );
+    assert_eq!(
+        records[2]["attempts"],
+        json!(0),
+        "a detached dispatch has no observed outcome, so `on_item_error` never \
+         applied to it (grammar 8.6 rule 7)"
+    );
+    assert!(
+        records[3]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("agent.fixer")),
+        "the skipped item says what was wrong with it: {}",
+        records[3]
+    );
+
+    // Grammar 9.4's form, for the one dispatch that delivers without observing
+    // an outcome: the execution id, then this dispatch's flattened instance
+    // path. `route` is at the root instance, so its frame is the whole path.
+    let execution = run.trace()[0]["step"].clone();
+    assert_eq!(execution, json!(1), "the trace opens at step 1");
+    let key = records[2]["idempotencyKey"]
+        .as_str()
+        .expect("a detached dispatch carries its key")
+        .to_string();
+    assert!(
+        key.ends_with("/route/0/2"),
+        "the key is `<execution id>/<node>/<traversal>/<item index>`: {key}"
+    );
+    assert!(
+        key.starts_with("exec_"),
+        "…opening with the execution's own id: {key}"
+    );
+    for record in records {
+        assert!(
+            record["idempotencyKey"].as_str().is_some_and(|held| held
+                .ends_with(&format!("/route/0/{}", record["index"].as_u64().expect("an index")))),
+            "every dispatch derives its own key: {record}"
+        );
+    }
+}
+
+/// A map whose target is a `flow.*` that itself fans out: two frames of instance
+/// path, an inner index of its own, and channel values that stay inside their
+/// instance (grammar 8.6, 9.4, 10.1).
+#[test]
+fn a_nested_fan_out_keys_and_isolates_each_instance_by_its_whole_path() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({
+                "tasks": [{ "steps": ["alpha", "beta"] }, { "steps": ["gamma"] }],
+            })),
+        ),
+        // Every outcome is narrowed by the one item it answers, because the six
+        // calls share two model ids and reach the server in scheduler order.
+        Script::new(HAIKU, Outcome::structured(json!({ "part": "made-alpha" }))).matching("alpha"),
+        Script::new(HAIKU, Outcome::structured(json!({ "part": "made-beta" }))).matching("beta"),
+        Script::new(HAIKU, Outcome::structured(json!({ "part": "made-gamma" }))).matching("gamma"),
+        Script::new(HAIKU, Outcome::structured(json!({ "line": "line-0" })))
+            .matching("made-alpha"),
+        Script::new(HAIKU, Outcome::structured(json!({ "line": "line-1" })))
+            .matching("made-gamma"),
+    ]);
+
+    let Some(run) = harness::invoke("fanout", "flow.nested", &[("goal", "ship it")], &provider)
+    else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(
+        run.outputs()["rolled"],
+        json!(["line-0", "line-1"]),
+        "each instance's `outputs:` crossed back in source-item order"
+    );
+
+    // Instance-local channel values (grammar 10.1): each `flow.subtask` instance
+    // appended to *its own* `parts`, so the second one rolled up one part rather
+    // than three. Nothing else in this run can produce that.
+    let turns: Vec<String> = provider
+        .requests()
+        .iter()
+        .filter_map(|request| {
+            request.body()["messages"][0]["content"]
+                .as_str()
+                .map(str::to_string)
+        })
+        .collect();
+    assert!(
+        turns.contains(&"{\"parts\":[\"made-alpha\",\"made-beta\"]}".to_string()),
+        "the first instance rolled up both of its own parts, in index order: {turns:?}"
+    );
+    assert!(
+        turns.contains(&"{\"parts\":[\"made-gamma\"]}".to_string()),
+        "…and the second saw only its own: {turns:?}"
+    );
+
+    // `execution.item_index` is the **innermost** map's (grammar 4.1): the
+    // second step of the first task is at index 1, and the only step of the
+    // second task is back at 0.
+    assert!(
+        turns.contains(&"{\"step\":\"beta\",\"at\":1}".to_string()),
+        "the second step of the first task is at index 1: {turns:?}"
+    );
+    assert!(
+        turns.contains(&"{\"step\":\"gamma\",\"at\":0}".to_string()),
+        "…and the only step of the second task is back at 0, because the index \
+         names the innermost dispatch and nothing above it: {turns:?}"
+    );
+
+    // Grammar 9.4's nesting, as the keys the two levels derive: the outer map's
+    // frame, then the inner one's, joined from the root instance down.
+    let outer = run.entries("work")[0]["dispatches"].clone();
+    let outer = outer.as_array().expect("the outer map dispatched");
+    let second = outer[1]["idempotencyKey"]
+        .as_str()
+        .expect("a key")
+        .to_string();
+    assert!(
+        second.ends_with("/work/0/1"),
+        "the outer dispatch's frame is its own node, traversal and index: {second}"
+    );
+    let inner = outer[1]["inner"]
+        .as_array()
+        .expect("a dispatched `flow.*` carries its instance's trace")
+        .iter()
+        .find(|entry| entry["node"] == "steps")
+        .expect("the instance ran its own map")
+        .clone();
+    let nested = inner["dispatches"][0]["idempotencyKey"]
+        .as_str()
+        .expect("a key")
+        .to_string();
+    assert_eq!(
+        nested,
+        format!("{second}/steps/0/0"),
+        "the inner dispatch's key is the outer path with its own frame appended \
+         — the flattened instance path of grammar 9.4"
+    );
+}
+
+/// A fan-out over an empty array completes immediately, writes nothing, and its
+/// outgoing edge fires exactly as if every instance had finished (rule 6).
+#[test]
+fn an_empty_fan_out_completes_and_its_downstream_edge_still_fires() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "tasks": [] })),
+    ));
+
+    let Some(run) = harness::invoke("fanout", "flow.nested", &[("goal", "ship it")], &provider)
+    else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(
+        run.outputs()["rolled"],
+        json!([]),
+        "the `append` channel is still at its identity element (grammar 10.1)"
+    );
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "the planner, and nothing dispatched"
+    );
+
+    let work = run.entries("work");
+    assert_eq!(work.len(), 1, "the map node ran");
+    assert_eq!(work[0]["dispatches"], json!([]));
+    assert_eq!(
+        work[0]["routing"]["targets"],
+        json!(["__end__"]),
+        "and its outgoing edge fired: a zero-instance dispatch is a completion"
+    );
+}
+
+/// `context: inherit` shares the caller's conversation with the instance in both
+/// directions, and the instantiation site's `policy:` is level 1 for the nodes
+/// inside it (grammar 8.5, 9.3, 10.4).
+#[test]
+fn a_subflow_inherits_the_callers_history_and_takes_its_instantiation_policy() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(SONNET, Outcome::structured(json!({ "findings": [] }))),
+        // `flow.normalize`'s `clean` declares no `retry:` of its own. The one it
+        // gets is the `again` node's `policy:`, which is level 1 for every node
+        // inside the instance — so this failure is retried rather than fatal.
+        Script::new(HAIKU, Outcome::rate_limit()).matching("a raw report"),
+        Script::new(
+            HAIKU,
+            Outcome::structured(json!({ "normalized": "a clean report" })),
+        )
+        .matching("a raw report"),
+        Script::new(HAIKU, Outcome::structured(json!({ "line": "closed" })))
+            .matching("Roll the parts"),
+    ]);
+
+    let Some(run) = harness::invoke(
+        "fanout",
+        "flow.continue",
+        &[("report", "a raw report")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(run.outputs()["normalized"], "a clean report");
+
+    let recorded = provider.requests();
+    assert_eq!(
+        recorded.len(),
+        4,
+        "the opener, two attempts at the subflow's node, and the closer"
+    );
+    assert!(recorded.iter().all(RecordedRequest::is_valid));
+    assert_eq!(
+        recorded[1].body()["messages"].as_array().map(Vec::len),
+        Some(3),
+        "the instance's own node sees the caller's exchange plus its own turn: {}",
+        recorded[1].body()["messages"]
+    );
+    assert_eq!(
+        recorded[3].body()["messages"].as_array().map(Vec::len),
+        Some(5),
+        "…and what the instance said came back, so the caller's next node sees \
+         both exchanges: {}",
+        recorded[3].body()["messages"]
+    );
+    assert_eq!(
+        run.entries("again")[0]["inner"]
+            .as_array()
+            .expect("the instance's own trace")
+            .iter()
+            .map(|entry| entry["node"].clone())
+            .collect::<Vec<_>>(),
+        [json!("clean")],
+        "the instance's routing record is nested under the node that ran it"
+    );
+    assert!(provider.snapshot().is_drained());
 }
 
 /// A node retries its model call per its declared policy, and the retries are

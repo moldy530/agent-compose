@@ -10,18 +10,25 @@
 //!
 //! # The four levels (grammar 9.3)
 //!
-//! | level | source | in this compiler release |
+//! | level | source | where it is applied |
 //! |---|---|---|
-//! | 1 | the instantiating `flow:` node's `policy:` | **not applied**: subgraph instantiation is a later M1 bullet, so no flow instance has an instantiation site yet |
-//! | 2 | the node's own `retry`/`timeout`/`on_error` | applied |
-//! | 3 | the composition's `defaults:` | applied |
-//! | 4 | built-in: no retry, no timeout, `on_error: fail` | applied |
+//! | 1 | the instantiating `flow:` node's `policy:` | **at run time**, by `runtime.effectivePolicy` over the instance's own `$run.policy` |
+//! | 2 | the node's own `retry`/`timeout`/`on_error` | here |
+//! | 3 | the composition's `defaults:` | here |
+//! | 4 | built-in: no retry, no timeout, `on_error: fail` | here |
 //!
-//! Level 1 is named rather than silently skipped because its absence is a
-//! property of *this release*, not of the chain: the level exists in the
-//! grammar, a `flow:` node carrying `policy:` validates today, and the PR that
-//! executes subgraphs adds it here rather than discovering that the chain was
-//! written as three levels.
+//! **Level 1 is not this module's**, and that is a property of the level rather
+//! than a gap. It belongs to the *instantiation site*, and one flow may be
+//! instantiated from several: `flow.review_loop` under `policy: { timeout: 30s }`
+//! at one `flow:` node and under nothing at another compiles to one set of node
+//! descriptors either way. So [`super::graph`] emits the override as data on the
+//! instantiating node, the instance carries it in `$run`, and the runtime lays it
+//! over the [`Resolved`] levels below — winning per field, and withheld from a
+//! `human` node's `timeout` and `retry` exactly as level 3 is (Decision D102).
+//! When two instantiation sites in a nesting chain set one field, the
+//! **outermost** wins (`runtime.instancePolicy`, Decision D79), and a `map`
+//! contributes no level 1 at all: it has no `policy:` key, so a dispatched
+//! subflow's nodes see level 2 downward (grammar 8.6 rule 10).
 //!
 //! # The `human` exemption (Decision D102)
 //!

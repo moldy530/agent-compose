@@ -1,4 +1,4 @@
-# M1 acceptance fixture: both fan-out forms, index-tagged reducers, a subgraph.
+# M1 acceptance fixture: both fan-out forms, index-tagged reducers, subgraphs.
 #
 # `flow.spread` is the homogeneous form — one target for every item — and
 # `flow.triage` is the discriminator-routed one, where the item is a tagged union
@@ -12,6 +12,17 @@
 # `flow.triage` also instantiates `flow.normalize` through a plain `flow:` node,
 # so the subgraph path — explicit bindings in, name-based outputs back, isolated
 # conversation history — is exercised by the same project.
+#
+# Three more flows carry the rest of grammar 8.6 and 8.5:
+#
+#   * `flow.sort` — a `default:` catch-all, a per-route `max_concurrency` that
+#     tightens the map's, a `tool.*` sink route waited on like any other, a
+#     `detach: true` route resolved at dispatch, and `on_item_error: skip`;
+#   * `flow.nested` — a map whose target is a `flow.*` that itself fans out, so
+#     one dispatch is two instance-path frames deep and `execution.item_index`
+#     names the innermost map (grammar 4.1, 9.4);
+#   * `flow.continue` — `context: inherit`, and an instantiation-site `policy:`
+#     that is grammar 9.3's level 1 for the nodes inside the instance.
 version: "0.1"
 
 state:
@@ -27,6 +38,26 @@ state:
     reduce: append
   tickets:
     description: The sink route's results, in source-item order.
+    type: array
+    max_items: 40
+    items: { type: string }
+    reduce: append
+
+  # Written only *inside* a dispatched `flow.subtask` instance, whose channel
+  # values are its own (grammar 10.1): each instance appends its own steps here
+  # and nothing crosses the boundary but that instance's `outputs:`.
+  parts:
+    description: One element per step of one task, inside that task's instance.
+    type: array
+    max_items: 8
+    items: { type: string }
+    reduce: append
+  line:
+    description: What one nested instance rolled its parts up into.
+    type: string
+    default: ""
+  rolled:
+    description: One element per nested instance, in source-item order.
     type: array
     max_items: 40
     items: { type: string }
@@ -141,6 +172,106 @@ agent.escalator:
       type: string
       min_length: 1
 
+# A string-in agent (Decision D14): no `input:`, so a dispatch binds its single
+# unnamed value with the **scalar** `input:` form (grammar 8.6 rule 12, D75).
+# Its output field is deliberately not the name of any channel, because the
+# detached route that dispatches it may write no reduced state — name-based
+# writes included (grammar 8.6 rule 7).
+agent.summarizer:
+  description: Summarizes one finding in a line.
+  model: model.fast
+  prompt: |
+    Write one line about the finding you are given.
+  output:
+    text:
+      type: string
+      min_length: 1
+
+agent.sorter:
+  description: Sorts findings into three kinds, one of which nothing routes.
+  model: model.smart
+  prompt: |
+    Tag each finding `auto_fixable`, `needs_human`, or `duplicate`.
+  input:
+    report: { type: string }
+  output:
+    findings:
+      type: array
+      max_items: 20
+      items:
+        discriminator: kind
+        variants:
+          auto_fixable:
+            file: { type: string }
+            hint: { type: string }
+          needs_human:
+            summary: { type: string }
+            severity: { enum: [low, high] }
+          duplicate:
+            of: { type: string }
+
+agent.splitter:
+  description: Splits a goal into tasks, each of which is a list of steps.
+  model: model.smart
+  prompt: |
+    Split the goal into tasks, and each task into steps.
+  input:
+    goal: { type: string }
+  output:
+    tasks:
+      type: array
+      max_items: 6
+      items:
+        type: object
+        properties:
+          steps:
+            type: array
+            max_items: 4
+            items: { type: string }
+
+agent.stepper:
+  description: Carries out one step of one task.
+  model: model.fast
+  prompt: |
+    Carry out the step you are given.
+  input:
+    step: { type: string }
+    at: { type: integer }
+  output:
+    part:
+      type: string
+      min_length: 1
+
+agent.roller:
+  description: Rolls one task's parts into a line.
+  model: model.fast
+  prompt: |
+    Roll the parts into one line.
+  input:
+    parts:
+      type: array
+      max_items: 8
+      items: { type: string }
+  output:
+    line:
+      type: string
+      min_length: 1
+
+# A sink route's target: a queue reached deterministically, waited on by the join
+# like any other route (PRD 5.6 — `detach: true` is the only opt-out). Its
+# `output:` declares exactly one string property, so grammar 6.1's `tool.*`
+# exception takes trimmed stdout whole.
+tool.review_queue:
+  description: Enqueue a finding for a human to look at.
+  input:
+    summary: { type: string }
+    severity: { enum: [low, high] }
+  output:
+    ticket: { type: string }
+  exec:
+    command: printf
+    args: ["queued"]
+
 flow.normalize:
   description: Normalize a raw report.
   inputs:
@@ -249,3 +380,166 @@ flow.triage:
     - { from: prepare, to: classify }
     - { from: classify, to: dispatch }
     - { from: dispatch, to: end }
+
+flow.sort:
+  description: Route three variants, one of them detached and one a sink.
+  inputs:
+    report:
+      type: string
+      min_length: 1
+  outputs:
+    drafts:
+      type: array
+      max_items: 40
+      items: { type: string }
+    tickets:
+      type: array
+      max_items: 40
+      items: { type: string }
+  nodes:
+    sort:
+      agent: agent.sorter
+      input:
+        report: "input.report"
+
+    route:
+      map:
+        over: sort.output.findings
+        as: finding
+        route_by: kind
+        max_concurrency: 4
+        # A failed item is dropped and the fan-out carries on; the map node's own
+        # `on_error:` is what would absorb a `fail` (grammar 8.6 rule 10).
+        on_item_error: skip
+        routes:
+          # A route may only **tighten** the map's bound (Decision D28).
+          auto_fixable:
+            node: agent.fixer
+            max_concurrency: 1
+            input:
+              file: "finding.file"
+              hint: "finding.hint"
+            writes:
+              patch: drafts
+          # A sink route, waited on by the join like any other (PRD 5.6).
+          needs_human:
+            node: tool.review_queue
+            input:
+              summary: "finding.summary"
+              severity: "finding.severity"
+            writes:
+              ticket: tickets
+        # The catch-all sees the **unrouted** variants — here just `duplicate`,
+        # which is why `finding.of` type-checks (grammar 8.6 rule 4, D30). It is
+        # detached, so it is resolved at dispatch, is never waited on, and may
+        # write no reduced state (rule 7, D94).
+        default:
+          node: agent.summarizer
+          detach: true
+          input: "finding.of"
+  edges:
+    - { from: start, to: sort }
+    - { from: sort, to: route }
+    - { from: route, to: end }
+
+flow.subtask:
+  description: Work one task by fanning out over its own steps.
+  inputs:
+    steps:
+      type: array
+      max_items: 4
+      items: { type: string }
+  outputs:
+    line: { type: string }
+  nodes:
+    # `execution.item_index` is this map's own index, and nothing else's: it
+    # names the **innermost** enclosing dispatch (grammar 4.1).
+    steps:
+      map:
+        over: input.steps
+        as: step
+        node: agent.stepper
+        max_concurrency: 2
+        input:
+          step: "step"
+          at: "execution.item_index"
+        writes:
+          part: parts
+    roll:
+      agent: agent.roller
+      input:
+        parts: "state.parts"
+  edges:
+    - { from: start, to: steps }
+    - { from: steps, to: roll }
+    - { from: roll, to: end }
+
+flow.nested:
+  description: Fan out over tasks, each of which fans out over its own steps.
+  inputs:
+    goal:
+      type: string
+      min_length: 1
+  outputs:
+    rolled:
+      type: array
+      max_items: 40
+      items: { type: string }
+  nodes:
+    plan:
+      agent: agent.splitter
+      input:
+        goal: "input.goal"
+
+    # No `input:` at all: the whole item is the instance's input, which is legal
+    # exactly because the item's own type is schema-compatible with what
+    # `flow.subtask` declares (grammar 8.6 rule 12).
+    work:
+      map:
+        over: plan.output.tasks
+        as: task
+        node: flow.subtask
+        max_concurrency: 2
+        writes:
+          line: rolled
+  edges:
+    - { from: start, to: plan }
+    - { from: plan, to: work }
+    - { from: work, to: end }
+
+flow.continue:
+  description: Open a conversation and hand it to a subflow that continues it.
+  inputs:
+    report:
+      type: string
+      min_length: 1
+  outputs:
+    normalized: { type: string }
+  nodes:
+    open:
+      agent: agent.triage
+      input:
+        report: "input.report"
+
+    # `context: inherit` shares this instance's history with the subflow, and
+    # `policy:` is grammar 9.3 **level 1** for every node inside it — which is
+    # where `flow.normalize`'s `clean` gets a retry it does not declare.
+    again:
+      flow: flow.normalize
+      input:
+        report: "input.report"
+      context: inherit
+      policy:
+        retry: { max: 1, backoff: 1s }
+
+    # Reads the channel `messages` nobody declares: what the instance said is in
+    # the caller's history now, so this request carries both exchanges.
+    close:
+      agent: agent.roller
+      input:
+        parts: "state.parts"
+  edges:
+    - { from: start, to: open }
+    - { from: open, to: again }
+    - { from: again, to: close }
+    - { from: close, to: end }

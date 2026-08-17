@@ -55,33 +55,61 @@
 //! else for a node to do there. It costs one superstep, which shifts every step
 //! number in the trace by one and changes nothing about what runs.
 //!
+//! # Where a fan-out and a subgraph run, and why not `Send`
+//!
+//! A `map` dispatches its instances **inside the map node's own task**
+//! (`runtime.runMap`), and a `flow:` node instantiates its subflow as a
+//! **separate run of a separate compiled graph** (`runtime.runSubflow`). PRD 5.6
+//! sketches the other shaping — "the compiled router emits `Send(routes[…],
+//! item)` per item onto LangGraph's `Send` API; reducer channels get standard
+//! LangGraph reducers; superstep semantics provide the join" — and grammar 7.6's
+//! codegen note is what leaves the choice open: it states P1 and P2 as
+//! properties "so codegen keeps its choice of shaping — a conditional edge
+//! emitting `Send`s, a deferred join node — which is M1's call". This is that
+//! call, and the ledger row below is why, because it is a difference from the
+//! PRD's own sentence and so is a thing a reader signs off on rather than
+//! re-derives.
+//!
+//! | id | where | which way | why it is left |
+//! |---|---|---|---|
+//! | `a-dispatch-runs-inside-the-map-nodes-task` | `map` dispatch and `flow:` instantiation | the instances run **in the node's task**, and a subflow is a separate run of its own compiled graph | a `Send` schedules a node of the **parent** graph, and seven of grammar 8.6's own rules are then unstateable. A Send'd task reads the packet as its whole input and writes the **parent's** channels, so a dispatched `flow.*` cannot hold its own channel values (grammar 10.1, 7.6.4 clause 3) and its instances share the caller's `messages`, which grammar 10.4 and Decision D105 make an unwaivable module boundary. `detach: true` is *resolved at dispatch* (D94) and a superstep barrier waits for every task it scheduled. A dispatch of **zero** instances must complete and fire its edges (rule 6), while `goto: []` retires the branch. `max_concurrency` is a per-node bound routes may tighten (D28) and LangGraph's `maxConcurrency` is a run-level config the Pregel runner applies to every task of a superstep. `on_item_error`'s parameterized retry, and the map's own `on_error:` absorbing an exhausted item (rule 10), are policies over an *item* that a node-level `retryPolicy` cannot express — the same mismatch `runtime.runActivity` records for grammar 9. The map's own outgoing edges would be evaluated once per instance, over N different local states, and not at all when N is 0. And LangGraph orders a step's writes by `task.path`, where every `__pregel_pull` sorts before every `__pregel_push`, so a map's writes would land after *every* ordinary node's rather than in the map node's own place in clause 1's node-id order. Index-tagging survives the change: what the map writes is one `runtime.OrderedWrites` per channel, in source-item order, which every emitted reducer unpacks |
+//!
+//! What the row does **not** trade away is grammar 7.6's two properties. P1
+//! holds because the join is the node: `runMap` returns when every instance has
+//! completed, been resolved by `on_item_error`, or been detached, and only then
+//! is the node's routing decision made — in the same task, as for every other
+//! node. P2 is LangGraph's, unchanged.
+//!
 //! # What is emitted for a construct this release does not execute
 //!
-//! `map`, `flow:`, `human` and `store` nodes are parsed, validated, and
-//! **emitted as real nodes with their real topology** — their edges, their
-//! budgets, their place in the graph — whose activity throws
-//! `Unimplemented` naming the construct and the milestone bullet that lands it.
-//! The alternative was refusing to emit a graph for those compositions at all,
-//! which would leave `build` failing on two of the four committed goldens and
-//! nothing type-checking the topology around the construct. A node that says
-//! what it does not do is not the same as a node that pretends: nothing here
-//! answers a plausible value.
+//! `human` and `store` nodes are parsed, validated, and **emitted as real nodes
+//! with their real topology** — their edges, their budgets, their place in the
+//! graph — whose activity throws `Unimplemented` naming the construct and the
+//! milestone bullet that lands it. The alternative was refusing to emit a graph
+//! for those compositions at all, which would leave `build` failing on two of
+//! the four committed goldens and nothing type-checking the topology around the
+//! construct. A node that says what it does not do is not the same as a node
+//! that pretends: nothing here answers a plausible value.
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use crate::ast::common::{ControlTarget, EdgeSource, EdgeTarget, Interpolated};
+use crate::ast::common::{Address, ControlTarget, EdgeSource, EdgeTarget, Interpolated};
 use crate::ast::definition::ProviderKind;
+use crate::ast::flow::FlowContext;
 // The SCC decomposition grammar 7.4 is checked over, reused rather than
 // reimplemented: the ceiling below is sized from the same clause-1 reading the
 // validator applies, and two readings of one rule is how they come to disagree.
 use crate::check::cycles::counted;
 use crate::check::graph::Graph as CheckedGraph;
 use crate::ir::Ir;
-use crate::ir::binding::{Bindings, Exec, Http, NodeInput};
+use crate::ir::binding::{Bindings, Exec, Http, NodeInput, Writes};
 use crate::ir::definition::{Agent, DefinitionBody, Model, Tool};
-use crate::ir::flow::{Edge, Flow, Node, NodeKind, ToolImplementation};
-use crate::ir::schema::FieldMap;
+use crate::ir::flow::{
+    Edge, Flow, ItemError, Map, MapDispatch, Node, NodeKind, ToolImplementation,
+};
+use crate::ir::policy::Policy;
+use crate::ir::schema::{FieldMap, TypeForm, TypeNode};
 
 use super::names::{self, Names};
 use super::policy::{self, Strategy};
@@ -117,11 +145,16 @@ pub fn declare(names: &mut Names, ir: &Ir) {
                 names.declare(address);
                 names.declare(&format!("{address}.shape"));
                 names.declare(&format!("{address}.graph"));
+                names.declare(&format!("{address}.binding"));
                 if needs_start_router(flow) {
                     names.declare(&format!("{address}.start"));
                 }
                 for node in &flow.nodes {
-                    names.declare(&format!("{address}.node.{}", node.id.value.as_str()));
+                    let id = node.id.value.as_str();
+                    names.declare(&format!("{address}.node.{id}"));
+                    if matches!(node.kind, NodeKind::Map { .. }) {
+                        names.declare(&format!("{address}.node.{id}.map"));
+                    }
                 }
             }
             DefinitionBody::Store(_) => {}
@@ -173,9 +206,7 @@ pub fn module(ir: &Ir, names: &Names) -> super::GeneratedFile {
     }
     body.push_str(&registry_source(ir, names, &registry, &mut imported));
 
-    contents.push_str(
-        "\nimport { END, START, StateGraph, isInterrupted } from \"@langchain/langgraph\";\n",
-    );
+    contents.push_str("\nimport { END, START, StateGraph } from \"@langchain/langgraph\";\n");
     contents.push_str("\nimport * as runtime from \"./runtime.ts\";\n");
     imported.sort();
     imported.dedup();
@@ -500,12 +531,16 @@ fn tools(
             "async function {}(args: unknown, context: runtime.RunContext): Promise<unknown> {{\n",
             names.value(address)
         ));
-        text.push_str(&format!("  const input = {input_schema}.parse(args);\n"));
+        text.push_str(&format!(
+            "  const input = runtime.parseResult({input_schema}, args, {});\n",
+            names::string(&format!("the arguments `{address}` was called with"))
+        ));
         match &tool.implementation {
             ToolImplementation::Exec { exec } => {
                 text.push_str(&format!(
-                    "  return {output_schema}.parse(\n    await runtime.runExec({}, input, context),\n  );\n",
-                    exec_binding(exec, &tool.output, address, "    ", true)
+                    "  return runtime.parseResult(\n    {output_schema},\n    await runtime.runExec({}, input, context),\n    {},\n  );\n",
+                    exec_binding(exec, &tool.output, address, "    ", true),
+                    names::string(&format!("the result of `{address}`"))
                 ));
             }
             ToolImplementation::Http { http } => {
@@ -521,15 +556,17 @@ fn tools(
                     ));
                 }
                 text.push_str(&format!(
-                    "  return {output_schema}.parse(\n    await runtime.runHttp({}, {}, context),\n  );\n",
+                    "  return runtime.parseResult(\n    {output_schema},\n    await runtime.runHttp({}, {}, context),\n    {},\n  );\n",
                     http_binding(http, &tool.output, address, "    ", true),
-                    http_request(http, Bound::ToolInput, "    ")
+                    http_request(http, Bound::ToolInput, "    "),
+                    names::string(&format!("the result of `{address}`"))
                 ));
             }
             ToolImplementation::Function { function } => {
                 text.push_str(&format!(
-                    "  return {output_schema}.parse(\n    await runtime.callFunction({}, input, context),\n  );\n",
-                    names::string(function.name.value.as_str())
+                    "  return runtime.parseResult(\n    {output_schema},\n    await runtime.callFunction({}, input, context),\n    {},\n  );\n",
+                    names::string(function.name.value.as_str()),
+                    names::string(&format!("the result of `{address}`"))
                 ));
             }
         }
@@ -720,6 +757,8 @@ fn flow(
         text.push_str("};\n");
     }
 
+    let retained = retained_nodes(flow);
+
     for node in &flow.nodes {
         let id = node.id.value.as_str();
         let resolved = policy::resolve(ir, node);
@@ -732,6 +771,12 @@ fn flow(
                     .to_string()
             })
             .unwrap_or_else(|| "\"any\"".to_string());
+
+        if let NodeKind::Map { map } = &node.kind {
+            text.push_str(&map_descriptor(
+                ir, names, address, flow, node, map, surfaces, imported,
+            ));
+        }
 
         text.push('\n');
         text.push_str(&names::doc(
@@ -748,10 +793,20 @@ fn flow(
         text.push_str(&format!("  flow: {},\n", names::string(address)));
         text.push_str(&format!("  node: {},\n", names::string(id)));
         text.push_str(&emitted_policy(&resolved));
+        if matches!(node.kind, NodeKind::Human { .. }) {
+            // Grammar 9.3 level 1 reaches this node's `on_error` and neither of
+            // the other two fields (Decision D102).
+            text.push_str("  exempt: true,\n");
+        }
+        if retained.contains(id) {
+            // A `map.over` in this flow reads this node's result, and the map
+            // runs in a later step (grammar 8.6 rule 11).
+            text.push_str("  retains: true,\n");
+        }
         text.push_str(&format!(
             "  shapes: {{ input: {input_shape}, state: {state_shape}, output: {output_shape} }},\n"
         ));
-        text.push_str(&input_builder(ir, address, node, surfaces));
+        text.push_str(&input_builder(ir, names, address, node, surfaces));
         text.push_str(&activity(ir, names, address, node, surfaces, imported));
         text.push_str(&writes(ir, address, node, surfaces));
         text.push_str(&edges(ir, address, flow, node));
@@ -829,7 +884,71 @@ fn flow(
         names.value(&format!("{address}.graph")),
         names.value(address)
     ));
+
+    // The same graph, as a `flow:` node and a `map` dispatch reach it
+    // (grammar 8.5, 8.6). An instance is a **separate run** of it, started from
+    // a state built out of the instantiation's bindings alone: grammar 10.1
+    // makes the channel set composition-global in shape and per-instance in
+    // value, so a subgraph sharing the caller's state object would be sharing
+    // the values D68 says nothing falls through.
+    let compiled = names.value(&format!("{address}.graph"));
+    text.push('\n');
+    text.push_str(&names::doc(
+        "",
+        &[format!(
+            "`{address}` as a module: what a `flow:` node instantiates and a `map` \
+             dispatches to (grammar 7.5, 8.5)."
+        )],
+    ));
+    text.push_str(&format!(
+        "const {}: runtime.SubflowBinding = {{\n",
+        names.value(&format!("{address}.binding"))
+    ));
+    text.push_str(&format!("  address: {},\n", names::string(address)));
+    text.push_str(&format!(
+        "  outputs: [{}],\n",
+        flow.outputs
+            .fields
+            .iter()
+            .map(|field| names::string(field.name.value.as_str()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+    text.push_str(&format!("  recursionLimit: {},\n", recursion_limit(flow)));
+    text.push_str(&format!(
+        "  stream: (initial, options) =>\n    \
+         {compiled}.stream(initial, {{\n      \
+         ...options,\n      \
+         streamMode: \"values\",\n      \
+         outputKeys: {compiled}.outputChannels,\n    \
+         }}) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,\n"
+    ));
+    text.push_str("};\n");
     text
+}
+
+/// The nodes of this flow whose result a `map.over` reads (grammar 8.6 rule 11).
+///
+/// `over` is the one surface that reads a node's output from another node's task
+/// (Decision D42), and the producer ran in an earlier step — so its answer is
+/// kept in `$run.outputs`. Only these nodes keep one: a node result is
+/// arbitrarily large and that channel is carried through every superstep.
+fn retained_nodes(flow: &Flow) -> BTreeSet<&str> {
+    let mut retained = BTreeSet::new();
+    for node in &flow.nodes {
+        let NodeKind::Map { map } = &node.kind else {
+            continue;
+        };
+        let root = map.over.value.root.as_str();
+        if flow
+            .nodes
+            .iter()
+            .any(|candidate| candidate.id.value.as_str() == root)
+        {
+            retained.insert(root);
+        }
+    }
+    retained
 }
 
 /// Whether any `start` edge carries a guard, so the flow needs a synthetic
@@ -896,29 +1015,7 @@ fn emitted_policy(resolved: &policy::Resolved<'_>) -> String {
     ));
     text.push_str("  policy: {\n");
     if let (Some(retry), _) = resolved.retry {
-        text.push_str("    retry: {\n");
-        text.push_str(&format!("      max: {},\n", retry.max));
-        text.push_str(&format!(
-            "      backoffMs: {},\n",
-            policy::milliseconds(&retry.backoff.value)
-        ));
-        text.push_str(&format!(
-            "      multiplier: {},\n",
-            names::number(&crate::ast::schema::Number::Float(
-                retry.multiplier.unwrap_or(2.0)
-            ))
-        ));
-        if let Some(max_backoff) = &retry.max_backoff {
-            text.push_str(&format!(
-                "      maxBackoffMs: {},\n",
-                policy::milliseconds(&max_backoff.value)
-            ));
-        }
-        text.push_str(&format!(
-            "      jitter: {},\n",
-            retry.jitter.unwrap_or(true)
-        ));
-        text.push_str("    },\n");
+        text.push_str(&format!("    retry: {},\n", retry_object(retry, "    ")));
     }
     if let (Some(timeout), _) = resolved.timeout {
         text.push_str(&format!(
@@ -941,11 +1038,76 @@ fn emitted_policy(resolved: &policy::Resolved<'_>) -> String {
     text
 }
 
+/// A `retry:` block as the runtime's `RetryPolicy` (grammar 9.1).
+///
+/// Three sites render one: a node's resolved policy, a `flow:` node's `policy:`
+/// override, and a `map`'s `on_item_error: { retry: … }` — which grammar 8.6
+/// rule 10 defines as §9.1's block verbatim, so it is this same rendering.
+fn retry_object(retry: &crate::ir::policy::Retry, indent: &str) -> String {
+    let inner = format!("{indent}  ");
+    let mut text = String::from("{\n");
+    text.push_str(&format!("{inner}max: {},\n", retry.max));
+    text.push_str(&format!(
+        "{inner}backoffMs: {},\n",
+        policy::milliseconds(&retry.backoff.value)
+    ));
+    text.push_str(&format!(
+        "{inner}multiplier: {},\n",
+        names::number(&crate::ast::schema::Number::Float(
+            retry.multiplier.unwrap_or(2.0)
+        ))
+    ));
+    if let Some(max_backoff) = &retry.max_backoff {
+        text.push_str(&format!(
+            "{inner}maxBackoffMs: {},\n",
+            policy::milliseconds(&max_backoff.value)
+        ));
+    }
+    text.push_str(&format!("{inner}jitter: {},\n", retry.jitter.unwrap_or(true)));
+    text.push_str(&format!("{indent}}}"));
+    text
+}
+
+/// A `flow:` node's `policy:` as the runtime's level-1 override (grammar 9.3).
+///
+/// `on_error` takes only `fail` and `skip` here: the `fallback:` form names a
+/// node id of the flow the declaring node sits in, and this level names no flow
+/// (§9.2, Decision D103), so the validator has already refused one.
+fn instance_policy(policy: &Policy) -> String {
+    let mut text = String::from("{\n");
+    if let Some(retry) = &policy.retry {
+        text.push_str(&format!("        retry: {},\n", retry_object(retry, "        ")));
+    }
+    if let Some(timeout) = &policy.timeout {
+        text.push_str(&format!(
+            "        timeoutMs: {},\n",
+            policy::milliseconds(&timeout.value)
+        ));
+    }
+    match &policy.on_error {
+        Some(crate::ir::policy::OnError::Fail { .. }) => {
+            text.push_str("        onError: \"fail\",\n");
+        }
+        Some(crate::ir::policy::OnError::Skip { .. }) => {
+            text.push_str("        onError: \"skip\",\n");
+        }
+        Some(crate::ir::policy::OnError::Fallback { .. }) | None => {}
+    }
+    text.push_str("      }");
+    text
+}
+
 // ---------------------------------------------------------------------------
 // Inputs (grammar 8.0)
 // ---------------------------------------------------------------------------
 
-fn input_builder(ir: &Ir, address: &str, node: &Node, surfaces: &[schema::Surface<'_>]) -> String {
+fn input_builder(
+    ir: &Ir,
+    names: &Names,
+    address: &str,
+    node: &Node,
+    surfaces: &[schema::Surface<'_>],
+) -> String {
     let id = node.id.value.as_str();
     let reader = |field: &str| format!("`{address}` node `{id}`'s input field `{field}`");
 
@@ -1003,12 +1165,73 @@ fn input_builder(ir: &Ir, address: &str, node: &Node, surfaces: &[schema::Surfac
             text.push_str("  }),\n");
             text
         }
-        NodeKind::Flow { .. }
-        | NodeKind::Map { .. }
-        | NodeKind::Human { .. }
-        | NodeKind::Store { .. } => "  input: () => null,\n".to_string(),
+        // A subgraph's parameter surface, bound **totally** at the instantiating
+        // node: every field the subflow declares without a `default:` is bound
+        // here, and nothing falls through by name (grammar 7.5, 8.5, D68).
+        NodeKind::Flow { flow, .. } => {
+            let declared = surface_fields(surfaces, &format!("{}.inputs", flow.value));
+            format!(
+                "  input: (roots) => {},\n",
+                bound_object(node.input.as_ref(), declared.as_ref(), "  ")
+            )
+        }
+        // A `map` node's "input" is its whole dispatch, decided before any
+        // instance runs: which items, which route each takes, and what each is
+        // passed (grammar 8.6). It is built here, outside the node's error
+        // policy, because a per-item binding that reads an absent value fails
+        // the execution rather than one item (grammar 4.1, D110).
+        NodeKind::Map { .. } => format!(
+            "  input: (_roots, view) => runtime.mapPlan({}, view),\n",
+            names.value(&format!("{address}.node.{id}.map"))
+        ),
+        NodeKind::Human { .. } | NodeKind::Store { .. } => "  input: () => null,\n".to_string(),
     }
     .to_string()
+}
+
+/// An object built field by field from a binding map, over a declared surface.
+///
+/// The two module boundaries share it — a `flow:` node's `input:` (grammar 8.5)
+/// and a `map` dispatch's field-map form (grammar 8.6 rule 12) — because both
+/// are total by the same rule: a field the site bound is that expression, a
+/// field it left out carries its own `default:`, and there is no third case the
+/// validator lets through (D68).
+fn bound_object(input: Option<&NodeInput>, declared: &FieldMap, indent: &str) -> String {
+    let bindings = match input {
+        Some(NodeInput::Fields { bindings }) => Some(bindings),
+        _ => None,
+    };
+    let mut text = String::from("({\n");
+    for field in &declared.fields {
+        let name = field.name.value.as_str();
+        let bound = bindings.and_then(|bindings| {
+            bindings
+                .entries
+                .iter()
+                .find(|binding| binding.name.value == name)
+        });
+        match bound {
+            Some(binding) => text.push_str(&format!(
+                "{indent}  {}: runtime.toJson(runtime.evaluate({}, roots)),\n",
+                names::string(name),
+                names::string(binding.value.value.as_str())
+            )),
+            None => match schema::effective_default(&field.ty) {
+                Some(default) => text.push_str(&format!(
+                    "{indent}  {}: {},\n",
+                    names::string(name),
+                    names::literal(&default)
+                )),
+                // Unreachable over an artifact `build` accepted: an unbound
+                // field with no `default:` is a compile error (D68).
+                None => text.push_str(&format!(
+                    "{indent}  // `{name}` is unbound and has no `default:`, which the validator refuses (Decision D68).\n"
+                )),
+            },
+        }
+    }
+    text.push_str(&format!("{indent}}})"));
+    text
 }
 
 /// The four steps of grammar 8.0's in-flow chain, resolved per field.
@@ -1113,7 +1336,11 @@ fn activity(
                 "  run: async (input, context, view) => {{\n    \
                  const answer = await runtime.callAgent(\n      {binding},\n      input,\n      \
                  runtime.historyTurns(view.state[\"messages\"] as unknown[]),\n      context,\n    );\n    \
-                 return {{ output: {schema}.parse(answer.output), history: answer.history }};\n  }},\n"
+                 return {{\n      \
+                 output: runtime.parseResult({schema}, answer.output, {subject}),\n      \
+                 history: answer.history,\n    \
+                 }};\n  }},\n",
+                subject = names::string(&format!("the answer of `{}`", agent.value))
             )
         }
         NodeKind::Function { function } => {
@@ -1126,23 +1353,24 @@ fn activity(
             let output = surface_fields(surfaces, &format!("{address}.node.{id}.output"));
             let schema = output_schema.expect("an exec node has an output surface");
             format!(
-                "  run: async (input, context) => ({{\n    output: {schema}.parse(\n      \
-                 await runtime.runExec({}, input, context),\n    ),\n  }}),\n",
+                "  run: async (input, context) => ({{\n    output: runtime.parseResult(\n      \
+                 {schema},\n      await runtime.runExec({}, input, context),\n      {subject},\n    ),\n  }}),\n",
                 exec_binding(
                     exec,
                     output.as_ref(),
                     &format!("{address}.node.{id}"),
                     "      ",
                     false
-                )
+                ),
+                subject = names::string(&format!("the result of `{address}` node `{id}`"))
             )
         }
         NodeKind::Http { http } => {
             let output = surface_fields(surfaces, &format!("{address}.node.{id}.output"));
             let schema = output_schema.expect("an http node has an output surface");
             format!(
-                "  run: async (input, context) => ({{\n    output: {schema}.parse(\n      \
-                 await runtime.runHttp(\n{},\n        input as {{ query?: Record<string, unknown>; body?: unknown }},\n        context,\n      ),\n    ),\n  }}),\n",
+                "  run: async (input, context) => ({{\n    output: runtime.parseResult(\n      \
+                 {schema},\n      await runtime.runHttp(\n{},\n        input as {{ query?: Record<string, unknown>; body?: unknown }},\n        context,\n      ),\n      {subject},\n    ),\n  }}),\n",
                 indent_block(
                     &http_binding(
                         http,
@@ -1152,15 +1380,47 @@ fn activity(
                         false
                     ),
                     "        "
-                )
+                ),
+                subject = names::string(&format!("the result of `{address}` node `{id}`"))
             )
         }
-        NodeKind::Flow { flow, .. } => {
-            unimplemented_run(&format!("instantiating `{}`", flow.value), "subgraphs")
+        NodeKind::Flow {
+            flow,
+            context,
+            policy,
+        } => {
+            let binding = names.value(&format!("{}.binding", flow.value));
+            let mut text = String::from("  run: async (input, _context, view) =>\n");
+            text.push_str(&format!("    runtime.runSubflow({binding}, {{\n"));
+            text.push_str("      inputs: input as Record<string, unknown>,\n");
+            text.push_str("      execution: view.run.execution,\n");
+            text.push_str(&format!(
+                "      path: runtime.instancePath(view, {}),\n",
+                names::string(id)
+            ));
+            // Grammar 9.3 level 1, with D79's outermost-wins: what already
+            // reached this instance beats what this site declares, per field.
+            text.push_str(&format!(
+                "      policy: runtime.instancePolicy(view.run.policy, {}),\n",
+                policy
+                    .as_ref()
+                    .filter(|policy| !policy.is_empty())
+                    .map_or_else(|| "undefined".to_string(), |policy| instance_policy(policy))
+            ));
+            if matches!(context, Some(FlowContext::Inherit)) {
+                // `context: inherit` shares the caller's history with the
+                // instance; what the instance adds comes back as this node's
+                // contribution to the channel (grammar 8.5, 10.4).
+                text.push_str(
+                    "      history: (view.state[\"messages\"] ?? []) as readonly unknown[],\n",
+                );
+            }
+            text.push_str("    }),\n");
+            text
         }
-        NodeKind::Map { .. } => unimplemented_run(
-            "a `map` dispatch",
-            "homogeneous + discriminator-routed `map`→`Send` with index-tagged reducers",
+        NodeKind::Map { .. } => format!(
+            "  run: async (input, context) =>\n    runtime.runMap({}, input as runtime.MapPlan, context),\n",
+            names.value(&format!("{address}.node.{id}.map"))
         ),
         NodeKind::Human { .. } => unimplemented_run(
             "a `human` pause",
@@ -1179,6 +1439,471 @@ fn unimplemented_run(what: &str, bullet: &str) -> String {
         names::string(what),
         names::string(bullet)
     )
+}
+
+// ---------------------------------------------------------------------------
+// Fan-out (grammar 8.6)
+// ---------------------------------------------------------------------------
+
+/// One `map` node's whole dispatch, as a `runtime.MapDescriptor`.
+///
+/// Everything a fan-out decides is data here: the array it reads, how many
+/// instances may run at once, what each item is called, which route each tag
+/// takes, and what each route writes. The behaviour those describe is
+/// `runtime.runMap`'s, byte-identical in every project.
+#[allow(clippy::too_many_arguments)]
+fn map_descriptor(
+    ir: &Ir,
+    names: &Names,
+    address: &str,
+    flow: &Flow,
+    node: &Node,
+    map: &Map,
+    surfaces: &[schema::Surface<'_>],
+    imported: &mut Vec<String>,
+) -> String {
+    let id = node.id.value.as_str();
+    let binding = map
+        .item_binding
+        .as_ref()
+        .map_or("item", |name| name.value.as_str());
+    let item = map_item_type(ir, address, flow, surfaces, map);
+
+    let mut text = String::from("\n");
+    text.push_str(&names::doc(
+        "",
+        &[format!(
+            "`{address}` node `{id}` — the fan-out it dispatches (grammar 8.6). \
+             `over` resolves against `{}`, and `{}` is what an instance's own \
+             bindings call the item.",
+            map.over.value.as_str(),
+            binding
+        )],
+    ));
+    text.push_str(&format!(
+        "const {}: runtime.MapDescriptor = {{\n",
+        names.value(&format!("{address}.node.{id}.map"))
+    ));
+    text.push_str(&format!("  node: {},\n", names::string(id)));
+    text.push_str(&format!("  as: {},\n", names::string(binding)));
+
+    // The producer half of `over` (grammar 8.6 rule 11): the node whose result
+    // the path reads, if it reads one. `input` and `state` are roots the node
+    // already has, so those paths name no producer.
+    let root = map.over.value.root.as_str();
+    let producer = flow
+        .nodes
+        .iter()
+        .find(|candidate| candidate.id.value.as_str() == root);
+    text.push_str("  source: {\n");
+    text.push_str(&format!(
+        "    path: {},\n",
+        names::string(map.over.value.as_str())
+    ));
+    match producer {
+        Some(producer) => {
+            let path = output_path(ir, address, producer)
+                .expect("`over` reads a node whose result the validator resolved");
+            let fields = surface_fields(surfaces, &path);
+            text.push_str(&format!("    producer: {},\n", names::string(root)));
+            text.push_str(&format!(
+                "    shape: {},\n",
+                cel::shape_of_field_map(fields.as_ref(), "    ")
+            ));
+        }
+        None => text.push_str("    shape: \"any\",\n"),
+    }
+    text.push_str("  },\n");
+
+    text.push_str(&format!("  maxConcurrency: {},\n", map.max_concurrency));
+    text.push_str(&format!(
+        "  onItemError: {},\n",
+        match &map.on_item_error {
+            None | Some(ItemError::Fail { .. }) => "\"fail\"".to_string(),
+            Some(ItemError::Skip { .. }) => "\"skip\"".to_string(),
+            Some(ItemError::Retry { retry, .. }) =>
+                format!("{{ retry: {} }}", retry_object(retry, "  ")),
+        }
+    ));
+
+    match &map.dispatch {
+        MapDispatch::Homogeneous {
+            node: target,
+            input,
+            writes,
+            detach,
+        } => {
+            text.push_str("  routes: [\n");
+            text.push_str(&dispatch_route(
+                ir,
+                names,
+                surfaces,
+                imported,
+                &DispatchSite {
+                    target: &target.value,
+                    tag: None,
+                    max_concurrency: map.max_concurrency,
+                    input: input.as_ref(),
+                    writes: writes.as_ref(),
+                    detach: detach.as_ref().is_some_and(|detach| detach.value),
+                    binding,
+                    item: item.as_ref(),
+                },
+                "    ",
+            ));
+            text.push_str("  ],\n");
+        }
+        MapDispatch::Routed {
+            route_by,
+            routes,
+            default,
+        } => {
+            text.push_str(&format!("  routeBy: {},\n", names::string(route_by.value.as_str())));
+            let union = item.as_ref().and_then(|item| match &item.form {
+                TypeForm::Union(union) => Some(union),
+                _ => None,
+            });
+            text.push_str("  routes: [\n");
+            for route in routes {
+                let tag = route
+                    .tag
+                    .as_ref()
+                    .expect("a named route carries its variant tag");
+                // The narrowing of grammar 8.6 rule 4: the item this route sees
+                // is its **own variant's payload**, which is the shape it was
+                // type-checked against and so the shape it is bound through.
+                let narrowed = union.and_then(|union| {
+                    union
+                        .variants
+                        .iter()
+                        .find(|variant| variant.tag.value == tag.value)
+                        .map(|variant| {
+                            crate::check::maps::narrowed(
+                                &union.discriminator.value,
+                                &[tag.value.as_str()],
+                                &variant.fields,
+                                &route.span,
+                            )
+                        })
+                });
+                text.push_str(&dispatch_route(
+                    ir,
+                    names,
+                    surfaces,
+                    imported,
+                    &DispatchSite {
+                        target: &route.node.value,
+                        tag: Some(tag.value.as_str()),
+                        max_concurrency: route.max_concurrency.unwrap_or(map.max_concurrency),
+                        input: route.input.as_ref(),
+                        writes: route.writes.as_ref(),
+                        detach: route.detach.as_ref().is_some_and(|detach| detach.value),
+                        binding,
+                        item: narrowed.as_ref(),
+                    },
+                    "    ",
+                ));
+            }
+            text.push_str("  ],\n");
+
+            if let Some(default) = default {
+                // The catch-all sees the **unrouted** variants: the
+                // discriminator narrowed to their tags, plus the fields every
+                // one of them declares identically (grammar 8.6 rule 4, D30).
+                let served: Vec<&str> = routes
+                    .iter()
+                    .filter_map(|route| route.tag.as_ref())
+                    .map(|tag| tag.value.as_str())
+                    .collect();
+                let narrowed = union.map(|union| {
+                    let unrouted: Vec<&crate::ir::schema::UnionVariant> = union
+                        .variants
+                        .iter()
+                        .filter(|variant| !served.contains(&variant.tag.value.as_str()))
+                        .collect();
+                    let tags: Vec<&str> = unrouted
+                        .iter()
+                        .map(|variant| variant.tag.value.as_str())
+                        .collect();
+                    crate::check::maps::narrowed(
+                        &union.discriminator.value,
+                        &tags,
+                        &crate::check::maps::common_fields(&unrouted, &default.span),
+                        &default.span,
+                    )
+                });
+                let route = dispatch_route(
+                    ir,
+                    names,
+                    surfaces,
+                    imported,
+                    &DispatchSite {
+                        target: &default.node.value,
+                        tag: Some("default"),
+                        max_concurrency: default.max_concurrency.unwrap_or(map.max_concurrency),
+                        input: default.input.as_ref(),
+                        writes: default.writes.as_ref(),
+                        detach: default.detach.as_ref().is_some_and(|detach| detach.value),
+                        binding,
+                        item: narrowed.as_ref(),
+                    },
+                    "  ",
+                );
+                // The shared renderer writes a list element; the catch-all is a
+                // single value with a key of its own.
+                text.push_str(&format!("  fallback: {}", route.trim_start()));
+            }
+        }
+    }
+
+    text.push_str("};\n");
+    text
+}
+
+/// One dispatch target of a `map`, and everything it decides (grammar 8.6).
+struct DispatchSite<'ir> {
+    target: &'ir Address,
+    tag: Option<&'ir str>,
+    max_concurrency: i64,
+    input: Option<&'ir NodeInput>,
+    writes: Option<&'ir Writes>,
+    detach: bool,
+    /// The map's `as:` name, which is what the whole-item form reads.
+    binding: &'ir str,
+    /// The item type this target sees — narrowed to its variant on a route.
+    item: Option<&'ir TypeNode>,
+}
+
+/// One `runtime.MapRoute`, at this indentation.
+fn dispatch_route(
+    ir: &Ir,
+    names: &Names,
+    surfaces: &[schema::Surface<'_>],
+    imported: &mut Vec<String>,
+    site: &DispatchSite<'_>,
+    indent: &str,
+) -> String {
+    let target = site.target.to_string();
+    let inner = format!("{indent}  ");
+    let mut text = format!("{indent}{{\n");
+    if let Some(tag) = site.tag {
+        text.push_str(&format!("{inner}tag: {},\n", names::string(tag)));
+    }
+    text.push_str(&format!("{inner}target: {},\n", names::string(&target)));
+    text.push_str(&format!("{inner}maxConcurrency: {},\n", site.max_concurrency));
+    text.push_str(&format!("{inner}detach: {},\n", site.detach));
+    text.push_str(&format!(
+        "{inner}itemShape: {},\n",
+        site.item.map_or_else(
+            || "\"any\"".to_string(),
+            |item| cel::shape_of_type(item, &inner)
+        )
+    ));
+
+    // The per-item binding (grammar 8.6 rule 12, Decision D75). Both `input:`
+    // forms are legal here, and which one fits is the target's input contract:
+    // the scalar form binds a string-in agent's single unnamed value, the field
+    // map binds a declared object field by field, and no `input:` at all passes
+    // the whole item.
+    let contract = target_contract(ir, surfaces, &target);
+    text.push_str(&match (site.input, &contract) {
+        (Some(NodeInput::Scalar { value }), _) => format!(
+            "{inner}input: (roots) => runtime.toJson(runtime.evaluate({}, roots)),\n",
+            names::string(value.value.as_str())
+        ),
+        (Some(NodeInput::Fields { .. }), Contract::Fields(fields)) => format!(
+            "{inner}input: (roots) => {},\n",
+            bound_object(site.input, fields.as_ref(), &inner)
+        ),
+        // No `input:`: the whole item is the instance's input, which the
+        // validator has already held to the target's contract.
+        (None, _) | (Some(NodeInput::Fields { .. }), Contract::StringIn) => format!(
+            "{inner}input: (roots) => runtime.toJson(runtime.evaluate({}, roots)),\n",
+            names::string(site.binding)
+        ),
+    });
+
+    text.push_str(&dispatch_run(ir, names, imported, &target, &inner));
+    text.push_str(&if site.detach {
+        // A detached dispatch MUST NOT write reduced state and MUST NOT declare
+        // `writes:` (grammar 8.6 rule 7, Decisions D31, D94) — including the
+        // name-based half, which the validator refuses too. The list is empty
+        // rather than computed, because the join is over before the delivery is,
+        // so a write it made could only land after everything that reads it.
+        format!("{inner}writes: [],\n")
+    } else {
+        target_output_path(ir, &target).map_or_else(
+            || format!("{inner}writes: [],\n"),
+            |path| {
+                let fields = surface_fields(surfaces, &path);
+                write_list(ir, fields.as_ref(), site.writes, &inner)
+            },
+        )
+    });
+    text.push_str(&format!("{indent}}},\n"));
+    text
+}
+
+/// How one dispatched instance is run: an agent call, a tool invocation, or a
+/// subflow instantiation (grammar 8.6, and the target's own section).
+fn dispatch_run(
+    ir: &Ir,
+    names: &Names,
+    imported: &mut Vec<String>,
+    target: &str,
+    indent: &str,
+) -> String {
+    let Some(definition) = ir.definitions.get(target) else {
+        return format!("{indent}run: () => Promise.resolve({{ output: {{}} }}),\n");
+    };
+    match &definition.body {
+        DefinitionBody::Agent(_) => {
+            let binding = names.value(target);
+            let schema = names.value(&format!("{target}.output")).to_string();
+            imported.push(schema.clone());
+            // An empty history, and nothing written back to the caller's: a
+            // dispatched instance runs on a fresh conversation that is discarded
+            // when it completes, and there is no key to say otherwise
+            // (grammar 10.4, Decision D105).
+            format!(
+                "{indent}run: async (input, context) => ({{\n{indent}  \
+                 output: runtime.parseResult(\n{indent}    {schema},\n{indent}    \
+                 (await runtime.callAgent({binding}, input, [], context)).output,\n{indent}    {subject},\n{indent}  ),\n{indent}\
+                 }}),\n",
+                subject = names::string(&format!("the answer of `{target}`"))
+            )
+        }
+        DefinitionBody::Tool(_) => format!(
+            "{indent}run: async (input, context) => ({{ output: await {}(input, context) }}),\n",
+            names.value(target)
+        ),
+        DefinitionBody::Flow(_) => {
+            let binding = names.value(&format!("{target}.binding"));
+            // Grammar 8.6 rule 10: a dispatched subflow's nodes resolve their
+            // policy with **level 1 absent** — a `map` has no `policy:` key — so
+            // no override crosses this boundary, and its history is fresh and
+            // discarded (D105), so no `history:` does either.
+            format!(
+                "{indent}run: async (input, _context, site) =>\n{indent}  \
+                 runtime.runSubflow({binding}, {{\n{indent}    \
+                 inputs: input as Record<string, unknown>,\n{indent}    \
+                 execution: site.execution,\n{indent}    \
+                 path: site.path,\n{indent}  \
+                 }}),\n"
+            )
+        }
+        DefinitionBody::Provider(_) | DefinitionBody::Model(_) | DefinitionBody::Store(_) => {
+            format!("{indent}run: () => Promise.resolve({{ output: {{}} }}),\n")
+        }
+    }
+}
+
+/// What a dispatch target accepts (grammar 8.0, 8.6 rule 12).
+enum Contract<'ir> {
+    /// A string-in agent: one unnamed value (Decision D14).
+    StringIn,
+    /// A declared input object.
+    Fields(Cow<'ir, FieldMap>),
+}
+
+/// The input contract of one `agent.*`, `tool.*` or `flow.*` target.
+fn target_contract<'ir>(
+    ir: &Ir,
+    surfaces: &[schema::Surface<'ir>],
+    target: &str,
+) -> Contract<'ir> {
+    let Some(definition) = ir.definitions.get(target) else {
+        return Contract::StringIn;
+    };
+    match &definition.body {
+        DefinitionBody::Agent(agent) if agent.input.is_none() => Contract::StringIn,
+        DefinitionBody::Agent(_) | DefinitionBody::Tool(_) => {
+            Contract::Fields(surface_fields(surfaces, &format!("{target}.input")))
+        }
+        DefinitionBody::Flow(flow) if flow.inputs.is_some() => {
+            Contract::Fields(surface_fields(surfaces, &format!("{target}.inputs")))
+        }
+        // A flow with no `inputs:` has the surface `inputs: {}` declares: a
+        // closed object with no properties (grammar 3.9), so an instance is
+        // started with an empty object.
+        DefinitionBody::Flow(_) => Contract::Fields(Cow::Owned(FieldMap {
+            surface: crate::ast::schema::Surface::Input,
+            fields: Vec::new(),
+            span: definition.span.clone(),
+        })),
+        DefinitionBody::Provider(_) | DefinitionBody::Model(_) | DefinitionBody::Store(_) => {
+            Contract::StringIn
+        }
+    }
+}
+
+/// The canonical path of a dispatch target's result surface.
+fn target_output_path(ir: &Ir, target: &str) -> Option<String> {
+    match ir.definitions.get(target).map(|definition| &definition.body) {
+        Some(DefinitionBody::Agent(_) | DefinitionBody::Tool(_)) => {
+            Some(format!("{target}.output"))
+        }
+        Some(DefinitionBody::Flow(_)) => Some(format!("{target}.outputs")),
+        _ => None,
+    }
+}
+
+/// The item type a `map` fans out over: what `over` resolves to, one step past
+/// the array (grammar 4.2, 8.6 rule 1).
+///
+/// The walk is [`crate::check::maps::walk`]'s, and the roots are read through
+/// the same surface enumeration the emitted schemas come from — so the type the
+/// item is *bound* through at run time is the type it was *checked* against.
+fn map_item_type(
+    ir: &Ir,
+    address: &str,
+    flow: &Flow,
+    surfaces: &[schema::Surface<'_>],
+    map: &Map,
+) -> Option<TypeNode> {
+    let path = &map.over.value;
+    let steps = &path.steps;
+    let (root, consumed) = match path.root.as_str() {
+        "state" => {
+            let crate::ast::common::PathStep::Field(name) = steps.first()? else {
+                return None;
+            };
+            let channel = ir.state.as_ref()?.entries.get(name.as_str())?;
+            (channel.ty.clone(), 1)
+        }
+        "input" => {
+            let crate::ast::common::PathStep::Field(name) = steps.first()? else {
+                return None;
+            };
+            (
+                flow.inputs.as_ref()?.field(name.as_str())?.ty.clone(),
+                1,
+            )
+        }
+        id => {
+            let producer = flow
+                .nodes
+                .iter()
+                .find(|node| node.id.value.as_str() == id)?;
+            let output = surface_fields(surfaces, &output_path(ir, address, producer)?);
+            let (
+                crate::ast::common::PathStep::Field(selector),
+                crate::ast::common::PathStep::Field(name),
+            ) = (steps.first()?, steps.get(1)?)
+            else {
+                return None;
+            };
+            if selector.as_str() != "output" {
+                return None;
+            }
+            (output.field(name.as_str())?.ty.clone(), 2)
+        }
+    };
+    let resolved = crate::check::maps::walk(root, &steps[consumed.min(steps.len())..])?;
+    match resolved.form {
+        TypeForm::Array(array) => Some(*array.items),
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1460,9 +2185,17 @@ fn writes(ir: &Ir, address: &str, node: &Node, surfaces: &[schema::Surface<'_>])
         return "  writes: [],\n".to_string();
     };
     let fields = surface_fields(surfaces, &path);
-    let remap: BTreeMap<&str, &str> = node
-        .writes
-        .as_ref()
+    write_list(ir, fields.as_ref(), node.writes.as_ref(), "  ")
+}
+
+/// One effective write map (grammar 8.0, 10.3), as the runtime's descriptors.
+///
+/// Shared by the three sites that have one — a node, a `map`'s homogeneous
+/// dispatch, and each route of a routed one — because "the remap, then the
+/// channel of the same name" is one rule and a second spelling of it would be a
+/// second answer about which channel a field lands in.
+fn write_list(ir: &Ir, fields: &FieldMap, remap: Option<&Writes>, indent: &str) -> String {
+    let remap: BTreeMap<&str, &str> = remap
         .map(|writes| {
             writes
                 .entries
@@ -1496,16 +2229,16 @@ fn writes(ir: &Ir, address: &str, node: &Node, surfaces: &[schema::Surface<'_>])
                 crate::ast::document::Reduce::LastWins => "set",
             });
         text.push_str(&format!(
-            "    {{ field: {}, channel: {}, reduce: {} }},\n",
+            "{indent}  {{ field: {}, channel: {}, reduce: {} }},\n",
             names::string(name),
             names::string(channel),
             names::string(reduce)
         ));
     }
     if text.is_empty() {
-        "  writes: [],\n".to_string()
+        format!("{indent}writes: [],\n")
     } else {
-        format!("  writes: [\n{text}  ],\n")
+        format!("{indent}writes: [\n{text}{indent}],\n")
     }
 }
 
@@ -1761,36 +2494,29 @@ export async function runFlow(
   }
   const parsed = flow.parse(inputs);
   const ceiling = options.recursionLimit ?? flow.recursionLimit;
-  let state: GraphState | undefined;
-  try {
-    const supersteps = await flow.stream(
-      {
-        $run: {
-          ...runtime.emptyRun(),
-          input: parsed,
-          execution: {
-            id: options.executionId ?? `exec_${globalThis.crypto.randomUUID()}`,
-            session_key: options.sessionKey ?? "",
-          },
+  // `runtime.quiesce` keeps the last state each superstep produced, which is
+  // what makes a failure's trace survive; the one failure it restates on the way
+  // out is LangGraph stopping the run at the ceiling.
+  const { state, error } = await runtime.quiesce(
+    flow,
+    {
+      $run: {
+        ...runtime.emptyRun(),
+        input: parsed,
+        execution: {
+          id: options.executionId ?? `exec_${globalThis.crypto.randomUUID()}`,
+          session_key: options.sessionKey ?? "",
         },
       },
-      { recursionLimit: ceiling },
-    );
-    for await (const superstep of supersteps) {
-      // What LangGraph's own `invoke` keeps: the last chunk that is a state.
-      // An interrupt is announced as a chunk of its own rather than as one, and
-      // reading it as state would lose the run's — `human:` nodes are the
-      // construct that raises one, and resuming them is a later bullet (PRD §7).
-      if (!isInterrupted(superstep)) state = superstep;
-    }
-  } catch (error) {
+    },
+    ceiling,
+  );
+  if (error !== undefined) {
     throw new runtime.FlowFailure(
       address,
       "did not run to quiescence",
       runtime.failedTrace(state, error),
-      // The one failure here that is not the composition's: LangGraph stopping
-      // the run at the ceiling, announced in its own vocabulary.
-      runtime.restateCeiling(ceiling, error),
+      error,
     );
   }
   if (state === undefined) {

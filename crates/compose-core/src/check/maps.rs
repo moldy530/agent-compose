@@ -524,7 +524,19 @@ fn declared_object(
 
 /// The item type a route sees: the discriminator, narrowed to the tags that
 /// reach it, plus the payload fields (grammar 8.6 rule 4).
-fn narrowed(discriminator: &Ident, tags: &[&str], fields: &FieldMap, span: &Span) -> TypeNode {
+///
+/// `pub(crate)` because the emitter narrows the same way: a route's per-item
+/// expressions are evaluated against the variant's payload, so the shape the
+/// item is *bound* through at run time has to be the shape it was type-checked
+/// against here (grammar 4.1's declared-type reading). Two spellings of one
+/// narrowing rule is exactly the drift that would make an `integer` variant
+/// field a `double` in a compiled router.
+pub(crate) fn narrowed(
+    discriminator: &Ident,
+    tags: &[&str],
+    fields: &FieldMap,
+    span: &Span,
+) -> TypeNode {
     let mut properties = vec![(discriminator.as_str(), model::enum_node(tags, span))];
     let mut owned: Vec<(&str, TypeNode)> = fields
         .fields
@@ -537,7 +549,13 @@ fn narrowed(discriminator: &Ident, tags: &[&str], fields: &FieldMap, span: &Span
 
 /// The fields every unrouted variant declares identically — what `default:`
 /// may select (grammar 8.6 rule 4, Decision D30).
-fn common_fields(variants: &[&crate::ir::schema::UnionVariant], span: &Span) -> FieldMap {
+///
+/// `pub(crate)` for [`narrowed`]'s reason: the emitter binds a `default:`
+/// route's item through this same intersection.
+pub(crate) fn common_fields(
+    variants: &[&crate::ir::schema::UnionVariant],
+    span: &Span,
+) -> FieldMap {
     let mut fields: Vec<Field> = Vec::new();
     let Some((first, rest)) = variants.split_first() else {
         return model::field_map(Vec::new(), span);
@@ -643,7 +661,7 @@ fn resolve(
     // a flow input, or — behind the fixed `output` selector, which is why that
     // root consumes two steps — a node's result schema (grammar 4.1).
     let steps = &path.value.steps;
-    let (mut resolved, consumed) = match path.value.root.as_str() {
+    let (resolved, consumed) = match path.value.root.as_str() {
         "state" => {
             let Some(PathStep::Field(name)) = steps.first() else {
                 return Some((None, described));
@@ -686,22 +704,30 @@ fn resolve(
         }
     };
 
-    for step in steps.iter().skip(consumed) {
-        let next = match (step, &resolved.form) {
+    match walk(resolved, &steps[consumed.min(steps.len())..]) {
+        Some(resolved) => Some((Some(resolved), described)),
+        // The expression type-checked, so a step this walk cannot follow is one
+        // that lands on no single declaration; the CEL type still describes it.
+        None => Some((None, described)),
+    }
+}
+
+/// Follow the remaining steps of a path expression over the declared schemas
+/// (grammar 4.2).
+///
+/// `pub(crate)` because the emitter resolves `over` too — it needs the item's
+/// own declared type to bind the item root through, and a second walk would be
+/// a second reading of grammar 4.2's two selectors.
+pub(crate) fn walk(mut resolved: TypeNode, steps: &[PathStep]) -> Option<TypeNode> {
+    for step in steps {
+        resolved = match (step, &resolved.form) {
             (PathStep::Field(name), TypeForm::Object(object)) => object
                 .properties
                 .field(name.as_str())
-                .map(|field| field.ty.clone()),
-            (PathStep::Index(_), TypeForm::Array(array)) => Some((*array.items).clone()),
-            _ => None,
+                .map(|field| field.ty.clone())?,
+            (PathStep::Index(_), TypeForm::Array(array)) => (*array.items).clone(),
+            _ => return None,
         };
-        match next {
-            Some(next) => resolved = next,
-            // The expression type-checked, so a step this walk cannot follow is
-            // one that lands on no single declaration; the CEL type still
-            // describes it.
-            None => return Some((None, described)),
-        }
     }
-    Some((Some(resolved), described))
+    Some(resolved)
 }

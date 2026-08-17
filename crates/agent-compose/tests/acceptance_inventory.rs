@@ -109,7 +109,7 @@ const CODEGEN: &[Criterion] = &[
             ),
             (
                 "a_tagged_union_output_is_narrowed_per_variant_and_a_bad_tag_is_rejected",
-                Status::Pending("pending: codegen must emit subgraphs"),
+                Status::Live,
             ),
         ],
     },
@@ -273,25 +273,58 @@ const CODEGEN: &[Criterion] = &[
         tests: &[
             (
                 "a_homogeneous_map_dispatches_one_instance_per_item",
-                Status::Pending("pending: codegen must emit `map` as LangGraph `Send`"),
+                Status::Live,
             ),
             (
                 "a_routed_map_sends_each_variant_to_its_own_route",
-                Status::Pending("pending: codegen must emit discriminator-routed `map` dispatch"),
+                Status::Live,
             ),
             (
                 "appended_results_are_ordered_by_source_item_index",
-                Status::Pending("pending: codegen must emit index-tagged reducers"),
+                Status::Live,
+            ),
+            // The three rules of grammar 8.6 the two forms above do not reach:
+            // the `default:` catch-all over the unrouted variants, a sink route
+            // waited on like any other beside a `detach: true` one resolved at
+            // dispatch, and `on_item_error` dropping a failed item.
+            (
+                "a_sink_route_is_joined_and_a_detached_one_is_resolved_at_dispatch",
+                Status::Live,
+            ),
+            // Rule 6's other end: a dispatch of zero instances is a completion,
+            // not a stall — its outgoing edge fires as if every instance had
+            // finished.
+            (
+                "an_empty_fan_out_completes_and_its_downstream_edge_still_fires",
+                Status::Live,
+            ),
+            // A map whose target is a `flow.*` that itself fans out: the
+            // flattened instance path of grammar 9.4, the innermost
+            // `execution.item_index`, and channel values that stay inside their
+            // instance (grammar 10.1).
+            (
+                "a_nested_fan_out_keys_and_isolates_each_instance_by_its_whole_path",
+                Status::Live,
             ),
         ],
     },
     Criterion {
         bullet: Bullet::Codegen,
         phrase: "subgraphs",
-        tests: &[(
-            "a_subgraph_runs_with_explicit_bindings_and_isolated_history",
-            Status::Pending("pending: codegen must emit subgraphs"),
-        )],
+        tests: &[
+            (
+                "a_subgraph_runs_with_explicit_bindings_and_isolated_history",
+                Status::Live,
+            ),
+            // The two keys the default instantiation does not exercise:
+            // `context: inherit`, which shares the caller's history in both
+            // directions, and `policy:`, which is grammar 9.3's level 1 for
+            // every node inside the instance.
+            (
+                "a_subflow_inherits_the_callers_history_and_takes_its_instantiation_policy",
+                Status::Live,
+            ),
+        ],
     },
     Criterion {
         bullet: Bullet::Codegen,
