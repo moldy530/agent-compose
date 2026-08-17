@@ -390,6 +390,8 @@ const DIVERGENCES: &[&str] = &[
     "leap-second-away-from-midnight",
     "duration-skips-a-designator",
     "punycode-payload-undecoded",
+    "omitted-default-is-the-same-item",
+    "dot-matches-a-code-unit",
 ];
 
 fn corpus() -> Vec<Case> {

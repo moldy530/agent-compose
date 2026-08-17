@@ -13,7 +13,7 @@
 //!
 //! # Where the table left latitude, and what was chosen
 //!
-//! Grammar 3.8 fixes seven rows and the snake_case → camelCase key rule. The
+//! Grammar 3.8 fixes eight rows and the snake_case → camelCase key rule. The
 //! rest of the vocabulary of grammar 3.3–3.7 is not in the table, so the choices
 //! below are this module's, made to keep the two columns *observably equivalent*
 //! (that is what the conformance corpus checks) rather than merely plausible:
@@ -21,16 +21,36 @@
 //! | DSL | JSON Schema | Zod | why |
 //! |---|---|---|---|
 //! | `description` | `description` | `.describe(…)` | it reaches the model in a structured-output schema (grammar 3.2) |
+//! | `min_length`/`max_length` | `minLength`/`maxLength` | `.refine(…)` over a code-point count | both keywords count Unicode code points and `.min()`/`.max()` count UTF-16 code units — see below |
 //! | `exclusive_minimum` | `exclusiveMinimum` | `.gt(…)` | Zod spells the exclusive bounds `gt`/`lt` |
 //! | `multiple_of` | `multipleOf` | `.multipleOf(…)` | |
 //! | `min_items` | `minItems` | `.min(…)` | |
-//! | `unique_items` | `uniqueItems` | `.refine(uniqueItems, …)` | Zod has no built-in; the emitted helper compares JSON encodings, which is not what `uniqueItems` means but is what it *decides* here — see below |
+//! | `unique_items` | `uniqueItems` | `.refine(uniqueItems, …)` | Zod has no built-in; the emitted helper compares JSON encodings of the *parsed* elements, which decides the same question the keyword asks everywhere a `default:` does not fill one in — see below |
 //! | `optional: [b]` **and** `default:` on `b` | `b` omitted from `required` | `.default(v)` alone | grammar 3.6 makes a defaulted property implicitly optional, and `.default(v).optional()` would answer `undefined` for an omitted property instead of the default — the one composition where the two orderings differ |
 //!
 //! Two spellings are the table's own and are kept verbatim even where Zod offers
 //! a newer one: a closed object is `z.object({…}).strict()` (not
 //! `z.strictObject`), and an integer is `z.number().int()` (not `z.int()`). The
 //! grammar is normative and both pairs denote the same schema.
+//!
+//! # `min_length`/`max_length`, and what one character is
+//!
+//! JSON Schema counts a string's length in Unicode **code points**; `.min()` and
+//! `.max()` count `String.prototype.length`, which is UTF-16 **code units**.
+//! Every character outside the BMP is one of the first and two of the second, so
+//! the two columns disagree in *both* directions on any document carrying one:
+//! `"😀"` is within `max_length: 1` and below `min_length: 2` to JSON Schema, and
+//! the other way about to `.min()`/`.max()`. That is reachable straight from a
+//! model-facing surface — `agent.output: { title: { type: string, max_length:
+//! 200 } }` constrains the provider by the code-point rule, and an emitted parse
+//! counting code units would refuse the answer it asked for.
+//!
+//! So the bound is written out: `.refine((value) => codePoints(value) <= 200, …)`
+//! over [`HELPERS`]' `codePoints`, which spreads the string and so iterates it by
+//! code point. Like six of the ten formats below, that puts the check where
+//! `z.toJSONSchema` cannot see it; a check that is visible and measures the wrong
+//! thing is the worse of the two. `state.mark`
+//! in the corpus is the pair of documents that tells the two spellings apart.
 //!
 //! # `unique_items`, and the one row that leans on its surroundings
 //!
@@ -51,6 +71,29 @@
 //! corpus's own round trip), which is what would fail if a pinned Zod release
 //! ever stopped normalizing — the alternative, a canonicalizing helper in every
 //! generated project, would be a rule no gate could tell apart from this one.
+//!
+//! Key order is only half of what the argument needs, though: the rule also
+//! wants two *unequal* instances to reach the helper with **different**
+//! encodings, and there the position it is emitted into has one exception.
+//! Nothing this module emits coerces or strips a value — every object is
+//! `.strict()`, no `format:` normalizes, no field transforms — except
+//! `.default(…)`, which fills a property in. So `[{a: "1"}, {a: "1", b: "x"}]`,
+//! where `b` defaults to `"x"`, is two instances to JSON Schema and to anyone
+//! reading the document, and two equal objects by the time the helper sees them:
+//! the emitted parse refuses an array the JSON column accepts. That is
+//! `omitted-default-is-the-same-item` in the ledger below, and `state.visits`
+//! in the corpus is the document that decides it.
+//!
+//! It is declared rather than closed because closing it means checking the
+//! array's **input** —
+//! `z.array(z.unknown()).refine(uniqueItems, …).pipe(z.array(item)…)` — and
+//! `@langchain/core` 1.2.8 converts a Zod pipe from its *input* side
+//! (`interopZodTransformInputSchema`, `dist/utils/json_schema.js`), so
+//! `withStructuredOutput` would then hand the model `{"type": "array", "items":
+//! {}}` for every unique-items array. Trading the whole item schema of the
+//! surface PRD 5.2 is about for one corner of one keyword is the worse bargain,
+//! and the corner is the direction where the emitted parse asks for *more* than
+//! the model was told rather than less.
 //!
 //! # `format:`, and why six of the ten are written out
 //!
@@ -88,12 +131,15 @@
 //! | `leap-second-away-from-midnight` | `format: time`, `format: date-time` | Zod accepts, JSON refuses | `rfc3339Time` admits `:60` wherever the rest parses; the JSON column admits it only where the value normalizes to `23:59:60` UTC. Narrowing the regex to `[0-5]\d` would trade this corner for the opposite one, and neither is reachable from a model emitting a wall-clock time |
 //! | `duration-skips-a-designator` | `format: duration` | Zod accepts, JSON refuses | `P1Y1D`, `PT1H1S`. ISO 8601 admits a skipped designator and RFC 3339's appendix-A ABNF nests them (`dur-year = Y [dur-month]`); grammar 3.3's `duration` is the ISO 8601 one, which is what `z.iso.duration()` reads |
 //! | `punycode-payload-undecoded` | `format: hostname`, `format: email` | Zod accepts, JSON refuses | an `xn--` label whose payload is not decodable punycode. `rfc1123Hostname` checks the label's *shape*; decoding it would be a punycode implementation inside a generated module, for a case a model does not produce |
+//! | `omitted-default-is-the-same-item` | `unique_items` over items carrying a `default:` | JSON accepts, Zod refuses | `[{page: "/"}, {page: "/", via: "direct"}]` where `via` defaults to `"direct"`. The check runs over parsed elements, where the default has been filled in — see the section above for what closing it would cost |
+//! | `dot-matches-a-code-unit` | `pattern:` | JSON accepts, Zod refuses | `^.$` against `"😀"`. The emitted literal carries no `u` flag ([`super::pattern`] says why: `u` mode refuses escapes RE2 accepts), so `.` matches one UTF-16 code unit while the Rust column's engine matches one code point. JSON Schema *defines* `pattern` as ECMA-262, which makes the emitted regex the literal reading and the validating column the loose one; agreeing would take a second regex engine in the compiler, or refusing `.` outright |
 //!
 //! # Patterns
 //!
 //! `pattern:` is RE2 (Decision D12), which is **not** a subset of JavaScript's
 //! syntax — [`super::pattern`] is the module that decides what transfers, and
 //! [`super::diagnostics`] is what refuses a `build` whose patterns do not.
+//!
 
 use std::borrow::Cow;
 
@@ -440,6 +486,8 @@ struct Helper {
     formats: &'static [StringFormat],
     /// Whether an array's `unique_items` calls it.
     unique_items: bool,
+    /// Whether a string's `min_length`/`max_length` calls it.
+    length_bounds: bool,
     /// Other helpers it calls, which therefore must be emitted with it.
     wants: &'static [&'static str],
     /// Its own name, for [`Helper::wants`] to name it by.
@@ -460,9 +508,13 @@ impl Helper {
     /// Whether this type node's own lowering calls this helper by name.
     fn called_by(&self, ty: &TypeNode) -> bool {
         match &ty.form {
-            TypeForm::Scalar(scalar) => scalar
-                .format
-                .is_some_and(|format| self.formats.contains(&format)),
+            TypeForm::Scalar(scalar) => {
+                scalar
+                    .format
+                    .is_some_and(|format| self.formats.contains(&format))
+                    || (self.length_bounds
+                        && (scalar.min_length.is_some() || scalar.max_length.is_some()))
+            }
             TypeForm::Array(array) => self.unique_items && array.unique_items == Some(true),
             TypeForm::Enum(_) | TypeForm::Object(_) | TypeForm::Union(_) => false,
         }
@@ -473,7 +525,28 @@ impl Helper {
 const HELPERS: &[Helper] = &[
     Helper {
         formats: &[],
+        unique_items: false,
+        length_bounds: true,
+        wants: &[],
+        name: "codePoints",
+        source: r#"
+/**
+ * The length `min_length` and `max_length` bound (grammar 3.4).
+ *
+ * JSON Schema counts a string's length in Unicode **code points**, and
+ * `String.prototype.length` — which `.min()` and `.max()` count — is UTF-16
+ * **code units**. Every character outside the BMP is one of the first and two of
+ * the second, so the two disagree in both directions on any string carrying one:
+ * `"😀"` is one code point and two units. Spreading a string iterates it by code
+ * point, which is the rule the schema this composition published states.
+ */
+const codePoints = (value: string): number => [...value].length;
+"#,
+    },
+    Helper {
+        formats: &[],
         unique_items: true,
+        length_bounds: false,
         wants: &[],
         name: "uniqueItems",
         source: r#"
@@ -491,6 +564,12 @@ const HELPERS: &[Helper] = &[
  * by the time this is called. That is a fact about where this is used, which is
  * why it is not exported: applied to raw input, it would call
  * `[{a: 1, b: 2}, {b: 2, a: 1}]` unique and JSON Schema would not.
+ *
+ * One instance of that fact runs the other way. A property with a `default:` is
+ * filled in before this is called, so two items that differ only in omitting it
+ * — two instances to JSON Schema — arrive here as one. The parse is stricter
+ * than the published schema on exactly those arrays, deliberately: see
+ * `omitted-default-is-the-same-item` in the compiler's divergence ledger.
  */
 const uniqueItems = (items: readonly unknown[]): boolean =>
   new Set(items.map((item) => JSON.stringify(item))).size === items.length;
@@ -499,6 +578,7 @@ const uniqueItems = (items: readonly unknown[]): boolean =>
     Helper {
         formats: &[StringFormat::Hostname],
         unique_items: false,
+        length_bounds: false,
         wants: &[],
         name: "rfc1123Hostname",
         source: r#"
@@ -530,6 +610,7 @@ const rfc1123Hostname = (value: string): boolean => {
     Helper {
         formats: &[StringFormat::Date, StringFormat::DateTime],
         unique_items: false,
+        length_bounds: false,
         wants: &[],
         name: "rfc3339Date",
         source: r#"
@@ -555,6 +636,7 @@ const rfc3339Date = (value: string): boolean => {
     Helper {
         formats: &[StringFormat::Time, StringFormat::DateTime],
         unique_items: false,
+        length_bounds: false,
         wants: &[],
         name: "rfc3339Time",
         source: r#"
@@ -572,6 +654,7 @@ const rfc3339Time =
     Helper {
         formats: &[StringFormat::DateTime],
         unique_items: false,
+        length_bounds: false,
         wants: &["rfc3339Date", "rfc3339Time"],
         name: "rfc3339DateTime",
         source: r#"
@@ -595,6 +678,7 @@ const rfc3339DateTime = (value: string): boolean => {
     Helper {
         formats: &[StringFormat::Uri],
         unique_items: false,
+        length_bounds: false,
         wants: &[],
         name: "rfc3986Uri",
         source: r#"
@@ -614,6 +698,7 @@ const rfc3986Uri =
     Helper {
         formats: &[StringFormat::Email],
         unique_items: false,
+        length_bounds: false,
         wants: &["rfc1123Hostname"],
         name: "rfc5321Email",
         source: r#"
@@ -843,11 +928,19 @@ fn scalar_expression(scalar: &Scalar) -> String {
         (ScalarKind::Number, _) => "z.number()".to_string(),
         (ScalarKind::Boolean, _) => "z.boolean()".to_string(),
     };
+    // Not `.min()`/`.max()`: those count UTF-16 code units and the keyword
+    // beside them counts code points — see the module docs.
     if let Some(min) = scalar.min_length {
-        text.push_str(&format!(".min({min})"));
+        text.push_str(&format!(
+            ".refine((value) => codePoints(value) >= {min}, {{ message: \"expected at least {}\" }})",
+            characters(min)
+        ));
     }
     if let Some(max) = scalar.max_length {
-        text.push_str(&format!(".max({max})"));
+        text.push_str(&format!(
+            ".refine((value) => codePoints(value) <= {max}, {{ message: \"expected at most {}\" }})",
+            characters(max)
+        ));
     }
     if let Some(pattern) = &scalar.pattern {
         text.push_str(&format!(".regex({})", regex_expression(pattern)));
@@ -864,6 +957,20 @@ fn scalar_expression(scalar: &Scalar) -> String {
         }
     }
     text
+}
+
+/// A length bound as the message it fails with says it: `1 character`, and
+/// `n characters` for every other bound.
+///
+/// The message is what a reader of a failed parse is handed, and `min_length: 1`
+/// — the "not empty" spelling, and the commonest bound there is — would
+/// otherwise report `expected at least 1 characters`.
+fn characters(count: i64) -> String {
+    if count == 1 {
+        "1 character".to_string()
+    } else {
+        format!("{count} characters")
+    }
 }
 
 /// The check one `format:` lowers to (grammar 3.3).
@@ -1177,7 +1284,10 @@ mod tests {
                 &format!("{CHANNEL}  a: {{ type: string, min_length: 1, max_length: 200 }}\n"),
                 "state.a"
             ),
-            "z.string().min(1).max(200)"
+            "z.string()\
+             .refine((value) => codePoints(value) >= 1, { message: \"expected at least 1 character\" })\
+             .refine((value) => codePoints(value) <= 200, { message: \"expected at most 200 characters\" })",
+            "`.min()`/`.max()` count UTF-16 code units and `minLength`/`maxLength` count code points"
         );
         assert_eq!(
             schema_of(
@@ -1227,7 +1337,7 @@ mod tests {
                 "state.a"
             ),
             "z.string().refine(rfc5321Email, { message: \"expected an email address\" })\
-             .max(320)",
+             .refine((value) => codePoints(value) <= 320, { message: \"expected at most 320 characters\" })",
             "a constraint still chains onto the refined string"
         );
         assert_eq!(
@@ -1279,6 +1389,14 @@ mod tests {
         assert!(at("rfc3339DateTime") > at("rfc3339Date"));
         assert!(at("rfc3339DateTime") > at("rfc3339Time"));
         assert!(at("rfc5321Email").is_none(), "and nothing it does not call");
+
+        // A length bound is the other constraint-level helper: a string that
+        // declares one brings `codePoints` and nothing else.
+        let bounded = module(&format!(
+            "{CHANNEL}  a: {{ type: string, max_length: 8 }}\n"
+        ));
+        assert!(bounded.contains("const codePoints "));
+        assert!(!bounded.contains("const uniqueItems "));
 
         // `email` calls `rfc1123Hostname`, which `hostname` also selects.
         let addressed = module(&format!(

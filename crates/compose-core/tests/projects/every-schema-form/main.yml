@@ -64,6 +64,15 @@ state:
   # the degenerate one: `//` is a line comment, so it emits `/(?:)/`.
   digits:    { type: string, pattern: "^\\d{3}-\\d{4}$" }
   anything:  { type: string, pattern: "" }
+  # A `.` is where the two columns cannot agree: the emitted literal carries no
+  # `u` flag, so `.` is one UTF-16 code unit there and one code point in the
+  # validator's engine. Declared as `dot-matches-a-code-unit`.
+  glyph:     { type: string, pattern: "^.$" }
+  # The length bounds, on a channel with no `pattern:` to hide them behind:
+  # `minLength`/`maxLength` count code points, which is neither what `.min()`
+  # nor what `.max()` counts, so one astral character tells the two spellings
+  # apart in both directions.
+  mark:      { type: string, min_length: 2, max_length: 4 }
   ratio:     { type: number, exclusive_minimum: 0, exclusive_maximum: 1 }
   step:      { type: number, minimum: -1.5, maximum: 1.5, multiple_of: 0.5 }
   urgent:    { type: boolean, default: false }
@@ -88,6 +97,19 @@ state:
       properties:
         name: { type: string }
         rank: { type: integer }
+  # `unique_items` over items one of whose properties carries a `default:`. Two
+  # items that differ only in omitting it are two instances to JSON Schema and
+  # one value after the parse fills it in, which is the one shape where the two
+  # columns cannot agree — declared as `omitted-default-is-the-same-item`.
+  visits:
+    type: array
+    max_items: 4
+    unique_items: true
+    items:
+      type: object
+      properties:
+        page: { type: string }
+        via:  { type: string, default: direct }
   author:
     type: object
     properties:

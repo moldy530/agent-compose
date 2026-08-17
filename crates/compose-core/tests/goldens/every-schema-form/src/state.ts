@@ -22,9 +22,11 @@ import {
   stateAuthors,
   stateDigits,
   stateDraft,
+  stateGlyph,
   stateHost,
   stateLasting,
   stateLatest,
+  stateMark,
   stateMood,
   stateNotes,
   stateOnDay,
@@ -39,6 +41,7 @@ import {
   stateUrgent,
   stateV4,
   stateV6,
+  stateVisits,
   stateWhere,
   stateWhich,
   stateWho,
@@ -88,6 +91,11 @@ export const channels = {
    * Unreduced: single-writer, and a write supplies the whole value.
    * Starts **unset**: reading it before its first write fails the execution (Decision D78).
    */
+  glyph: Annotation<z.infer<typeof stateGlyph>>,
+  /**
+   * Unreduced: single-writer, and a write supplies the whole value.
+   * Starts **unset**: reading it before its first write fails the execution (Decision D78).
+   */
   host: Annotation<z.infer<typeof stateHost>>,
   /**
    * Unreduced: single-writer, and a write supplies the whole value.
@@ -102,6 +110,11 @@ export const channels = {
     reducer: (_left, right) => right,
     default: () => "",
   }),
+  /**
+   * Unreduced: single-writer, and a write supplies the whole value.
+   * Starts **unset**: reading it before its first write fails the execution (Decision D78).
+   */
+  mark: Annotation<z.infer<typeof stateMark>>,
   /**
    * Unreduced: single-writer, and a write supplies the whole value.
    * Starts at `"calm"`.
@@ -194,6 +207,11 @@ export const channels = {
    * Starts **unset**: reading it before its first write fails the execution (Decision D78).
    */
   v6: Annotation<z.infer<typeof stateV6>>,
+  /**
+   * Unreduced: single-writer, and a write supplies the whole value.
+   * Starts **unset**: reading it before its first write fails the execution (Decision D78).
+   */
+  visits: Annotation<z.infer<typeof stateVisits>>,
   /**
    * Unreduced: single-writer, and a write supplies the whole value.
    * Starts **unset**: reading it before its first write fails the execution (Decision D78).

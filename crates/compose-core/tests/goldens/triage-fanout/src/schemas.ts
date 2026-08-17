@@ -13,6 +13,18 @@
 import { z } from "zod";
 
 /**
+ * The length `min_length` and `max_length` bound (grammar 3.4).
+ *
+ * JSON Schema counts a string's length in Unicode **code points**, and
+ * `String.prototype.length` — which `.min()` and `.max()` count — is UTF-16
+ * **code units**. Every character outside the BMP is one of the first and two of
+ * the second, so the two disagree in both directions on any string carrying one:
+ * `"😀"` is one code point and two units. Spreading a string iterates it by code
+ * point, which is the rule the schema this composition published states.
+ */
+const codePoints = (value: string): number => [...value].length;
+
+/**
  * `format: date` (grammar 3.3): an RFC 3339 `full-date`, calendar-checked — the
  * month bounds the day, and February bounds it by the proleptic Gregorian leap
  * rule, so `2026-02-30` is not a date.
@@ -83,7 +95,7 @@ export type AgentSummarizerInput = z.infer<typeof agentSummarizerInput>;
  * `agent.summarizer` — the structured output the model is constrained to, and what routing reads (PRD 5.2, 5.3).
  */
 export const agentSummarizerOutput = z.object({
-  summary: z.string().min(1).describe("The run summary shown to the human reviewer."),
+  summary: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }).describe("The run summary shown to the human reviewer."),
 }).strict();
 export type AgentSummarizerOutput = z.infer<typeof agentSummarizerOutput>;
 
@@ -139,7 +151,7 @@ export type FlowEnrichNodeFetchOutput = z.infer<typeof flowEnrichNodeFetchOutput
 
 /** `flow.triage` — the module's parameters (grammar 7.5). */
 export const flowTriageInputs = z.object({
-  report: z.string().min(1).describe("The raw bug report."),
+  report: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }).describe("The raw bug report."),
   pattern: z.string().describe("Repository search pattern used to ground the triage agent."),
 }).strict();
 export type FlowTriageInputs = z.infer<typeof flowTriageInputs>;
@@ -238,7 +250,7 @@ export type ToolDeadLetterOutput = z.infer<typeof toolDeadLetterOutput>;
 
 /** `tool.repo_grep` — its parameters (grammar 6). */
 export const toolRepoGrepInput = z.object({
-  pattern: z.string().min(1).describe("An RE2 regular expression."),
+  pattern: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }).describe("An RE2 regular expression."),
   max_matches: z.number().int().min(1).max(200).default(50),
 }).strict();
 export type ToolRepoGrepInput = z.infer<typeof toolRepoGrepInput>;

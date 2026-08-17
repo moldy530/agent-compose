@@ -13,6 +13,18 @@
 import { z } from "zod";
 
 /**
+ * The length `min_length` and `max_length` bound (grammar 3.4).
+ *
+ * JSON Schema counts a string's length in Unicode **code points**, and
+ * `String.prototype.length` — which `.min()` and `.max()` count — is UTF-16
+ * **code units**. Every character outside the BMP is one of the first and two of
+ * the second, so the two disagree in both directions on any string carrying one:
+ * `"😀"` is one code point and two units. Spreading a string iterates it by code
+ * point, which is the rule the schema this composition published states.
+ */
+const codePoints = (value: string): number => [...value].length;
+
+/**
  * `format: uri` (grammar 3.3): an absolute RFC 3986 URI — a scheme, a
  * hierarchical part, and the optional query and fragment — spelled as the
  * grammar's own production. `z.url()` is not this check: it is `new URL()`,
@@ -35,7 +47,7 @@ export type AgentResearcherInput = z.infer<typeof agentResearcherInput>;
  * `agent.researcher` — the structured output the model is constrained to, and what routing reads (PRD 5.2, 5.3).
  */
 export const agentResearcherOutput = z.object({
-  draft: z.string().min(1).describe("The complete draft, in Markdown."),
+  draft: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }).describe("The complete draft, in Markdown."),
 }).strict();
 export type AgentResearcherOutput = z.infer<typeof agentResearcherOutput>;
 
@@ -57,7 +69,7 @@ export type AgentReviewerOutput = z.infer<typeof agentReviewerOutput>;
 
 /** `flow.review_loop` — the module's parameters (grammar 7.5). */
 export const flowReviewLoopInputs = z.object({
-  goal: z.string().min(1).describe("What the finished draft must accomplish."),
+  goal: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }).describe("What the finished draft must accomplish."),
 }).strict();
 export type FlowReviewLoopInputs = z.infer<typeof flowReviewLoopInputs>;
 
@@ -71,7 +83,7 @@ export type FlowReviewLoopOutputs = z.infer<typeof flowReviewLoopOutputs>;
 
 /** `tool.web_search` — its parameters (grammar 6). */
 export const toolWebSearchInput = z.object({
-  query: z.string().min(1).describe("The search query."),
+  query: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }).describe("The search query."),
   max_results: z.number().int().min(1).max(10).describe("How many results to return.").default(5),
 }).strict();
 export type ToolWebSearchInput = z.infer<typeof toolWebSearchInput>;

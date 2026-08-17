@@ -393,6 +393,33 @@
   },
   {
     "golden": "every-schema-form",
+    "surface": "state.mark",
+    "about": "`min_length`/`max_length` alone: both columns count Unicode code points, which is not what `.min()`/`.max()` count (grammar 3.4)",
+    "documents": [
+      { "why": "two characters is the lower bound", "valid": true, "document": "ab" },
+      { "why": "and four is the upper one", "valid": true, "document": "abcd" },
+      { "why": "one is below `min_length: 2`", "valid": false, "document": "a" },
+      { "why": "five is above `max_length: 4`", "valid": false, "document": "abcde" },
+      { "why": "one astral character is one code point, so it is below `min_length: 2` — `.min(2)` counts its two UTF-16 code units and would have accepted it", "valid": false, "document": "😀" },
+      { "why": "three astral characters are three code points, within `max_length: 4` — `.max(4)` counts their six code units and would have refused them", "valid": true, "document": "😀😀😀" },
+      { "why": "five are five code points, above the bound in both columns", "valid": false, "document": "😀😀😀😀😀" },
+      { "why": "a length bound is still a string check", "valid": false, "document": 12 }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "state.glyph",
+    "about": "`.` in a `pattern`: one code unit to the emitted JavaScript literal, one code point to the engine that reads the published schema",
+    "documents": [
+      { "why": "one character, and the pattern is anchored to exactly one", "valid": true, "document": "a" },
+      { "why": "two is not one", "valid": false, "document": "ab" },
+      { "why": "and the empty string has none", "valid": false, "document": "" },
+      { "why": "one astral character is one code point and two UTF-16 code units, so a flagless `/^.$/` matches only half of it. The `u` flag that would fix it refuses escapes RE2 accepts, which is why `codegen::pattern` does not add one", "valid": true, "zod": false, "divergence": "dot-matches-a-code-unit", "document": "😀" },
+      { "why": "a pattern is still a string check", "valid": false, "document": 1 }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
     "surface": "state.digits",
     "about": "the escapes and repetitions a `pattern` carries across, and what `\\d` means in each column",
     "documents": [
@@ -439,6 +466,20 @@
       },
       { "why": "`max_items: 4` refuses five", "valid": false, "document": [{ "name": "a", "rank": 1 }, { "name": "b", "rank": 2 }, { "name": "c", "rank": 3 }, { "name": "d", "rank": 4 }, { "name": "e", "rank": 5 }] },
       { "why": "an item at the wrong shape", "valid": false, "document": [{ "name": "a" }] }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "state.visits",
+    "about": "`unique_items` over items carrying a `default:`, which is where comparing parsed elements and comparing instances part company (grammar 3.5, 3.6)",
+    "documents": [
+      { "why": "two different pages", "valid": true, "document": [{ "page": "/" }, { "page": "/help" }] },
+      { "why": "one page reached two ways: the defaulted property is written out on both, and differs", "valid": true, "document": [{ "page": "/", "via": "link" }, { "page": "/", "via": "direct" }] },
+      { "why": "the same instance twice", "valid": false, "document": [{ "page": "/" }, { "page": "/" }] },
+      { "why": "one item omits `via` and the other writes out the value `via` defaults to: two instances to JSON Schema, and one object each by the time `.refine` sees them, because the parse has filled the first one in", "valid": true, "zod": false, "divergence": "omitted-default-is-the-same-item", "document": [{ "page": "/" }, { "page": "/", "via": "direct" }] },
+      { "why": "`max_items: 4` refuses five", "valid": false, "document": [{ "page": "/a" }, { "page": "/b" }, { "page": "/c" }, { "page": "/d" }, { "page": "/e" }] },
+      { "why": "an item missing the property that is not defaulted", "valid": false, "document": [{ "via": "direct" }] },
+      { "why": "items are closed like any object (D8)", "valid": false, "document": [{ "page": "/", "via": "direct", "extra": 1 }] }
     ]
   },
   {

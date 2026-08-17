@@ -13,6 +13,18 @@
 import { z } from "zod";
 
 /**
+ * The length `min_length` and `max_length` bound (grammar 3.4).
+ *
+ * JSON Schema counts a string's length in Unicode **code points**, and
+ * `String.prototype.length` — which `.min()` and `.max()` count — is UTF-16
+ * **code units**. Every character outside the BMP is one of the first and two of
+ * the second, so the two disagree in both directions on any string carrying one:
+ * `"😀"` is one code point and two units. Spreading a string iterates it by code
+ * point, which is the rule the schema this composition published states.
+ */
+const codePoints = (value: string): number => [...value].length;
+
+/**
  * `unique_items: true` (grammar 3.5). Zod has no built-in.
  *
  * JSON Schema's `uniqueItems` compares *instances*: two objects are one item
@@ -26,6 +38,12 @@ import { z } from "zod";
  * by the time this is called. That is a fact about where this is used, which is
  * why it is not exported: applied to raw input, it would call
  * `[{a: 1, b: 2}, {b: 2, a: 1}]` unique and JSON Schema would not.
+ *
+ * One instance of that fact runs the other way. A property with a `default:` is
+ * filled in before this is called, so two items that differ only in omitting it
+ * — two instances to JSON Schema — arrive here as one. The parse is stricter
+ * than the published schema on exactly those arrays, deliberately: see
+ * `omitted-default-is-the-same-item` in the compiler's divergence ledger.
  */
 const uniqueItems = (items: readonly unknown[]): boolean =>
   new Set(items.map((item) => JSON.stringify(item))).size === items.length;
@@ -154,7 +172,7 @@ export type AgentShaperInput = z.infer<typeof agentShaperInput>;
  * `agent.shaper` — the structured output the model is constrained to, and what routing reads (PRD 5.2, 5.3).
  */
 export const agentShaperOutput = z.object({
-  draft: z.string().min(1),
+  draft: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }),
   findings: z.array(z.discriminatedUnion("kind", [
     z.object({
       kind: z.literal("auto_fixable"),
@@ -176,7 +194,7 @@ export type AgentShaperOutput = z.infer<typeof agentShaperOutput>;
 
 /** `flow.shape` — the module's parameters (grammar 7.5). */
 export const flowShapeInputs = z.object({
-  goal: z.string().min(1),
+  goal: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }),
 }).strict();
 export type FlowShapeInputs = z.infer<typeof flowShapeInputs>;
 
@@ -294,6 +312,10 @@ export type StateDigits = z.infer<typeof stateDigits>;
 export const stateDraft = z.string();
 export type StateDraft = z.infer<typeof stateDraft>;
 
+/** State channel `glyph` — its declared type (grammar 10.1). */
+export const stateGlyph = z.string().regex(/^.$/);
+export type StateGlyph = z.infer<typeof stateGlyph>;
+
 /** State channel `host` — its declared type (grammar 10.1). */
 export const stateHost = z.string().refine(rfc1123Hostname, { message: "expected a hostname" });
 export type StateHost = z.infer<typeof stateHost>;
@@ -305,6 +327,10 @@ export type StateLasting = z.infer<typeof stateLasting>;
 /** State channel `latest` — its declared type (grammar 10.1). */
 export const stateLatest = z.string().default("");
 export type StateLatest = z.infer<typeof stateLatest>;
+
+/** State channel `mark` — its declared type (grammar 10.1). */
+export const stateMark = z.string().refine((value) => codePoints(value) >= 2, { message: "expected at least 2 characters" }).refine((value) => codePoints(value) <= 4, { message: "expected at most 4 characters" });
+export type StateMark = z.infer<typeof stateMark>;
 
 /** State channel `mood` — its declared type (grammar 10.1). */
 export const stateMood = z.enum(["calm", "brisk"]).default("calm");
@@ -349,7 +375,7 @@ export const stateSeen = z.object({
 export type StateSeen = z.infer<typeof stateSeen>;
 
 /** State channel `slug` — its declared type (grammar 10.1). */
-export const stateSlug = z.string().min(1).max(64).regex(/^[a-z][a-z0-9-]*$/);
+export const stateSlug = z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }).refine((value) => codePoints(value) <= 64, { message: "expected at most 64 characters" }).regex(/^[a-z][a-z0-9-]*$/);
 export type StateSlug = z.infer<typeof stateSlug>;
 
 /** State channel `step` — its declared type (grammar 10.1). */
@@ -378,6 +404,13 @@ export type StateV4 = z.infer<typeof stateV4>;
 /** State channel `v6` — its declared type (grammar 10.1). */
 export const stateV6 = z.ipv6();
 export type StateV6 = z.infer<typeof stateV6>;
+
+/** State channel `visits` — its declared type (grammar 10.1). */
+export const stateVisits = z.array(z.object({
+  page: z.string(),
+  via: z.string().default("direct"),
+}).strict()).max(4).refine(uniqueItems, { message: "expected unique items" });
+export type StateVisits = z.infer<typeof stateVisits>;
 
 /** State channel `where` — its declared type (grammar 10.1). */
 export const stateWhere = z.string().regex(rfc3986Uri);

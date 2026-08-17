@@ -65,6 +65,7 @@ const RESERVED: &[&str] = &[
     // emitted_helper` keeps the two in step, so a helper added there cannot be
     // forgotten here.
     "z",
+    "codePoints",
     "uniqueItems",
     "rfc1123Hostname",
     "rfc3339Date",

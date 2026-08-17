@@ -53,6 +53,16 @@
 //! `perl-classes-mean-the-ascii-thing-in-both-columns` documents) so the claim
 //! is a test rather than a paragraph.
 //!
+//! `.` is the case where that reasoning stops short of agreement, and it is
+//! declared rather than papered over. Without the `u` flag (see below), `.`
+//! matches one UTF-16 **code unit**, so `^.$` refuses `"😀"` in the emitted Zod
+//! and accepts it in the Rust validator, whose engine matches one **code
+//! point**. Which column is the deviant one is arguable — ECMAScript is what
+//! JSON Schema names, so the emitted regex is the literal reading — but the
+//! difference is real and reachable, so it is `dot-matches-a-code-unit` in
+//! [`super::schema`]'s divergence ledger, with `state.glyph` in the corpus as the
+//! document that decides it.
+//!
 //! # The literal
 //!
 //! A pattern is written as a regex **literal** with any unescaped `/` escaped,
@@ -61,7 +71,8 @@
 //! `new RegExp("").toString()` answers, and for the same reason: `//` opens a
 //! comment. No flags are added: `u` mode rejects escapes RE2 accepts, and both
 //! `RegExp.prototype.test` and JSON Schema's `pattern` are unanchored searches,
-//! so the two agree without one.
+//! so the two agree without one — everywhere but `.`, which is the declared
+//! divergence above and the price of keeping the escapes.
 
 use regex_syntax::ast::{
     Assertion, AssertionKind, Ast, ClassBracketed, ClassPerl, ClassSet, ClassSetBinaryOp,
