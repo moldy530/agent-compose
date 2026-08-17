@@ -139,6 +139,13 @@ const CODEGEN: &[Criterion] = &[
                 "an_agent_nodes_exchange_reaches_the_next_agent_nodes_request",
                 Status::Live,
             ),
+            // What the loop puts *back* on the wire: the model's own content
+            // blocks, and — for an answer that carried none — a node error about
+            // the answer rather than a request no surface accepts.
+            (
+                "a_loop_answer_is_replayed_verbatim_and_an_empty_one_stops_the_node",
+                Status::Live,
+            ),
             // The other three kinds this milestone executes, which are not the
             // model's: an inline `exec:`, an inline `http:`, and a `function:`
             // over a `tool.*` (grammar 8.2, 8.3, 8.4).

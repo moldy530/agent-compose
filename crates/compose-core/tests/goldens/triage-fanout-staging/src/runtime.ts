@@ -340,6 +340,13 @@ export type Turn =
       readonly role: "assistant";
       readonly text?: string;
       readonly toolCalls?: readonly { id: string; name: string; args: unknown }[];
+      /**
+       * The content blocks the model itself sent, when this turn is one being
+       * replayed to the surface that produced it (see [`ModelAnswer.content`]).
+       * Present, they are the turn: `text` and `toolCalls` are a *reading* of an
+       * answer and a replay must be the answer.
+       */
+      readonly blocks?: readonly unknown[];
     }
   | {
       readonly role: "tool";
@@ -352,6 +359,18 @@ export interface ModelAnswer {
   readonly toolCalls: readonly { id: string; name: string; args: unknown }[];
   readonly structured: unknown | null;
   readonly stopReason: string | null;
+  /**
+   * The answer's own content blocks, on a surface that sends them.
+   *
+   * A tool loop replays its assistant turns, and a turn rebuilt from `text` and
+   * `toolCalls` is not the turn the model sent: the Messages API also answers
+   * with `thinking` blocks — which a model with `settings: { thinking: … }`
+   * sends as a matter of course, and which it requires back unaltered beside the
+   * `tool_use` blocks they preceded. So the loop replays these when they are
+   * here, and only falls back to the reading when they are not (Chat
+   * Completions, whose answer is a message rather than a block list).
+   */
+  readonly content?: readonly unknown[];
 }
 
 /**
@@ -456,6 +475,11 @@ async function callMessages(
         })),
       };
     }
+    // A turn the model sent goes back exactly as it came — thinking blocks and
+    // all, which the Messages API requires unaltered beside the `tool_use`
+    // blocks they preceded. Only a turn this runtime *composed* (the shared
+    // history channel of grammar 10.4) is rendered from its parts.
+    if (turn.blocks !== undefined) return { role: "assistant", content: [...turn.blocks] };
     const content: unknown[] = [];
     if (turn.text !== undefined && turn.text !== "") content.push({ type: "text", text: turn.text });
     for (const call of turn.toolCalls ?? []) {
@@ -512,6 +536,7 @@ async function callMessages(
       })),
     structured: pinnedUse === undefined ? null : (pinnedUse["input"] ?? null),
     stopReason: (answer["stop_reason"] as string | null) ?? null,
+    content: blocks,
   };
 }
 
@@ -644,6 +669,10 @@ export interface AgentBinding {
  * The final call still offers the agent's tools beside the pinned one: the
  * history it carries holds `tool_use`/`tool_result` blocks, and both surfaces
  * refuse a request that carries those without declaring the tools they name.
+ *
+ * Every loop answer is replayed by [`replayed`], which is where an answer that
+ * carried nothing at all stops the node instead of becoming an empty turn the
+ * next request could not legally carry.
  */
 export async function callAgent(
   agent: AgentBinding,
@@ -669,11 +698,8 @@ export async function callAgent(
         { system: agent.prompt, turns, tools: agent.tools },
         context.signal,
       );
-      if (answer.toolCalls.length === 0) {
-        turns.push({ role: "assistant", text: answer.text ?? "" });
-        break;
-      }
-      turns.push({ role: "assistant", text: answer.text ?? "", toolCalls: answer.toolCalls });
+      turns.push(replayed(agent, answer));
+      if (answer.toolCalls.length === 0) break;
 
       const results: { id: string; name: string; content: string }[] = [];
       for (const call of answer.toolCalls) {
@@ -706,6 +732,46 @@ export async function callAgent(
       { role: "user", content: rendered },
       { role: "assistant", content: JSON.stringify(final.structured) },
     ],
+  };
+}
+
+/**
+ * The assistant turn one loop answer goes back into the conversation as.
+ *
+ * Two things happen here, and the second is why it is a function rather than an
+ * object literal at the call site.
+ *
+ * The turn is the model's **own** content where the surface sent blocks, rather
+ * than a turn rebuilt from the `text` and `toolCalls` this runtime read out of
+ * them. Rebuilding drops whatever it does not read — a `thinking` block, which a
+ * model with `settings: { thinking: … }` sends with every answer and which the
+ * Messages API requires back unaltered beside the `tool_use` blocks it preceded.
+ *
+ * And an answer that carried **nothing** ends the node here, with a message
+ * about the answer. A `max_tokens` cut can end a turn with an empty content
+ * list, and the turn built from one is `{"role": "assistant", "content": []}` —
+ * a message the Messages API refuses (`content: List should have at least 1
+ * item`), as does `crates/mock-provider`, which holds this project to that same
+ * wire. Sending it anyway would report the model's empty answer as a provider
+ * 400 one call later, about the wrong request.
+ */
+function replayed(agent: AgentBinding, answer: ModelAnswer): Turn {
+  const blocks = answer.content;
+  const empty =
+    blocks === undefined
+      ? (answer.text ?? "") === "" && answer.toolCalls.length === 0
+      : blocks.length === 0;
+  if (empty) {
+    const why = answer.stopReason === null ? "" : ` (\`stop_reason: ${answer.stopReason}\`)`;
+    throw new Error(
+      `\`${agent.address}\` was answered with no content${why}, so its tool loop has no turn to send back`,
+    );
+  }
+  return {
+    role: "assistant",
+    text: answer.text ?? "",
+    ...(answer.toolCalls.length > 0 ? { toolCalls: answer.toolCalls } : {}),
+    ...(blocks === undefined ? {} : { blocks }),
   };
 }
 

@@ -945,6 +945,142 @@ fn an_agent_nodes_exchange_reaches_the_next_agent_nodes_request() {
     assert!(provider.snapshot().is_drained());
 }
 
+/// A loop answer is replayed as the model sent it, and an answer that carried
+/// nothing stops the node instead of becoming a turn no provider accepts.
+///
+/// Both halves are about the same line of the tool loop — the assistant turn it
+/// pushes before deciding what to do next — and both are only observable one
+/// call later, in the request that carries the replayed turn:
+///
+///   * a `thinking` block is content the Messages API sends whenever a model
+///     declares `settings: { thinking: … }` and requires back **unaltered**
+///     beside the `tool_use` blocks it preceded, so a loop that rebuilt the turn
+///     from the text and the tool calls it read would drop it;
+///   * an answer cut short at `max_tokens` can carry no content at all, and the
+///     turn built from one is `{"role": "assistant", "content": []}` — which the
+///     Messages API refuses, and which `crates/mock-provider` refuses in its
+///     place here, so sending it would report the model's empty answer as a
+///     provider 400 about the wrong request.
+///
+/// `Outcome::raw` is what scripts both: they are answers a *provider* sends and
+/// the scripted reply shapes are the ones a test asks for by name, so the body
+/// is written out here rather than derived.
+#[test]
+fn a_loop_answer_is_replayed_verbatim_and_an_empty_one_stops_the_node() {
+    let thinking = json!({
+        "type": "thinking",
+        "thinking": "The goal needs one fact.",
+        "signature": "c2lnbmF0dXJl",
+    });
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::raw(
+                200,
+                json!({
+                    "id": "msg_thinking",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": SONNET,
+                    "content": [
+                        thinking,
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_lookup",
+                            "name": "lookup",
+                            "input": { "query": "a fact" },
+                        },
+                    ],
+                    "stop_reason": "tool_use",
+                    "stop_sequence": null,
+                    "usage": { "input_tokens": 12, "output_tokens": 34 },
+                }),
+            ),
+        ),
+        Script::new(SONNET, Outcome::text("found it")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "feedback": "a looked-up snippet" })),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke(
+        "agent-anthropic",
+        "flow.research",
+        &[("goal", "ship it")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+
+    let recorded = provider.requests();
+    assert_eq!(recorded.len(), 3, "two loop calls, then the pinned one");
+    assert!(
+        recorded.iter().all(RecordedRequest::is_valid),
+        "every request is one the Messages API would accept: {:?}",
+        recorded
+            .iter()
+            .map(RecordedRequest::failures)
+            .collect::<Vec<_>>()
+    );
+    let replayed = recorded[1].body()["messages"][1].clone();
+    assert_eq!(replayed["role"], "assistant");
+    assert_eq!(
+        replayed["content"][0], thinking,
+        "the model's own blocks go back unaltered, thinking first: {replayed}"
+    );
+    assert_eq!(
+        replayed["content"][1]["type"], "tool_use",
+        "…with the call it ended on: {replayed}"
+    );
+    assert_eq!(
+        replayed["content"].as_array().map(Vec::len),
+        Some(2),
+        "…and nothing invented beside them: {replayed}"
+    );
+
+    // The same node, answered with nothing at all.
+    let empty = MockProvider::start().expect("a loopback port");
+    empty.enqueue(Script::new(
+        SONNET,
+        Outcome::raw(
+            200,
+            json!({
+                "id": "msg_empty",
+                "type": "message",
+                "role": "assistant",
+                "model": SONNET,
+                "content": [],
+                "stop_reason": "max_tokens",
+                "stop_sequence": null,
+                "usage": { "input_tokens": 12, "output_tokens": 4096 },
+            }),
+        ),
+    ));
+
+    let cut = harness::invoke(
+        "agent-anthropic",
+        "flow.research",
+        &[("goal", "ship it")],
+        &empty,
+    )
+    .expect("the toolchain was there a moment ago");
+    let failure = cut.failed();
+    assert!(
+        failure.contains("no content") && failure.contains("max_tokens"),
+        "the node fails about the answer it got, naming why it was empty: \
+         {failure}"
+    );
+    assert_eq!(
+        empty.requests().len(),
+        1,
+        "and no second request was sent: a turn with nothing in it never \
+         reached the wire"
+    );
+}
+
 /// The intra-agent tool loop runs the tool, feeds the result back, and stops at
 /// `max_tool_iterations` rather than looping forever.
 ///
