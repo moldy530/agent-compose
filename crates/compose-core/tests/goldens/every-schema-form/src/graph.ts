@@ -24,6 +24,12 @@ import {
   flowShapeNodeNotifyOutput,
   flowShapeNodeProbeOutput,
   flowShapeNodeRecallOutput,
+  toolDispatchInput,
+  toolDispatchOutput,
+  toolFileTicketInput,
+  toolFileTicketOutput,
+  toolLookupInput,
+  toolLookupOutput,
   toolPingInput,
   toolPingOutput,
 } from "./schemas.ts";
@@ -187,6 +193,22 @@ const flowShapeNodeRecallShape: runtime.Shape = {
 };
 
 /**
+ * `provider.aws` — a `bedrock` connection (grammar 12.1). Every value is read when a node calls it, never at import: a build carries no credential and `./index.ts` is where their presence is checked (PRD 5.9).
+ */
+const providerAws: runtime.ProviderBinding = {
+  address: "provider.aws",
+  kind: "bedrock",
+};
+
+/**
+ * `provider.gcp` — a `vertex` connection (grammar 12.1). Every value is read when a node calls it, never at import: a build carries no credential and `./index.ts` is where their presence is checked (PRD 5.9).
+ */
+const providerGcp: runtime.ProviderBinding = {
+  address: "provider.gcp",
+  kind: "vertex",
+};
+
+/**
  * `provider.p` — an `openai_compatible` connection (grammar 12.1). Every value is read when a node calls it, never at import: a build carries no credential and `./index.ts` is where their presence is checked (PRD 5.9).
  */
 const providerP: runtime.ProviderBinding = {
@@ -207,6 +229,73 @@ const modelM: runtime.ModelBinding = {
   provider: providerP,
   settings: {},
 };
+
+/**
+ * `tool.dispatch` — an HTTP request (grammar 6.1). Its arguments are parsed with its own declared `input:` before the implementation sees them, which is the checked signature grammar 8.4 asks for and the model's arguments are held to.
+ */
+async function toolDispatch(args: unknown, context: runtime.RunContext): Promise<unknown> {
+  const input = toolDispatchInput.parse(args);
+  const roots = { input: runtime.bind(input, {
+    "properties": {
+      "payload": {
+        "properties": {
+          "kind": "string"
+        }
+      },
+      "trace": "string"
+    }
+  }) };
+  return toolDispatchOutput.parse(
+    await runtime.runHttp({
+      method: "POST",
+      url: ["https://example.test/dispatch"],
+      headers: [],
+      expectStatus: "2xx",
+      decoding: { envelope: [], decoded: ["accepted"], empty: false },
+    }, {
+      query: {
+        "trace": runtime.toJson(runtime.evaluate("input.trace", roots)),
+      },
+      body: input,
+    }, context),
+  );
+}
+
+/**
+ * `tool.file_ticket` — an HTTP request (grammar 6.1). Its arguments are parsed with its own declared `input:` before the implementation sees them, which is the checked signature grammar 8.4 asks for and the model's arguments are held to.
+ */
+async function toolFileTicket(args: unknown, context: runtime.RunContext): Promise<unknown> {
+  const input = toolFileTicketInput.parse(args);
+  return toolFileTicketOutput.parse(
+    await runtime.runHttp({
+      method: "POST",
+      url: ["https://example.test/tickets"],
+      headers: [],
+      expectStatus: "2xx",
+      decoding: { envelope: [], decoded: [], raw: "id", empty: false },
+    }, {
+      body: input,
+    }, context),
+  );
+}
+
+/**
+ * `tool.lookup` — an HTTP request (grammar 6.1). Its arguments are parsed with its own declared `input:` before the implementation sees them, which is the checked signature grammar 8.4 asks for and the model's arguments are held to.
+ */
+async function toolLookup(args: unknown, context: runtime.RunContext): Promise<unknown> {
+  const input = toolLookupInput.parse(args);
+  return toolLookupOutput.parse(
+    await runtime.runHttp({
+      method: "GET",
+      url: ["https://example.test/search"],
+      headers: [],
+      expectStatus: "2xx",
+      decoding: { envelope: [], decoded: ["hits"], empty: false },
+    }, {
+      query: input,
+    }, context),
+  );
+}
 
 /**
  * `tool.ping` — a subprocess (grammar 6.1). Its arguments are parsed with its own declared `input:` before the implementation sees them, which is the checked signature grammar 8.4 asks for and the model's arguments are held to.

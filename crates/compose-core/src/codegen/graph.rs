@@ -73,7 +73,7 @@ use std::collections::BTreeMap;
 use crate::ast::common::{ControlTarget, EdgeSource, EdgeTarget, Interpolated};
 use crate::ast::definition::ProviderKind;
 use crate::ir::Ir;
-use crate::ir::binding::{Exec, Http, NodeInput};
+use crate::ir::binding::{Bindings, Exec, Http, NodeInput};
 use crate::ir::definition::{Agent, DefinitionBody, Model, Tool};
 use crate::ir::flow::{Edge, Flow, Node, NodeKind, ToolImplementation};
 use crate::ir::schema::FieldMap;
@@ -377,7 +377,9 @@ const fn provider_kind(kind: ProviderKind) -> &'static str {
         ProviderKind::AzureOpenAi => "azure_openai",
         // Grammar 12.1's two SDK-reached kinds have no HTTP endpoint the spec
         // points at, so the runtime has no surface to render them onto. The
-        // binding is still emitted, and calling it says which kind it is.
+        // binding is still emitted — `runtime.ProviderKind` carries both, so a
+        // project declaring one type-checks like any other — and `callModel` is
+        // where a run that reaches one is told what it reached.
         ProviderKind::Bedrock => "bedrock",
         ProviderKind::Vertex => "vertex",
     }
@@ -502,15 +504,21 @@ fn tools(
                 ));
             }
             ToolImplementation::Http { http } => {
-                let roots = format!(
-                    "{{ input: runtime.bind(input, {}) }}",
-                    cel::shape_of_field_map(input_fields.as_ref(), "  ")
-                );
-                text.push_str(&format!("  const roots = {roots};\n"));
+                // `roots` is what a declared `query:`/`body:` expression is
+                // evaluated against — the tool's own `input` and nothing else
+                // (grammar 6.1, D65). A binding that declares neither sends the
+                // input object whole and evaluates nothing, so it gets no
+                // `roots` rather than an unused one.
+                if http.query.is_some() || http.body.is_some() {
+                    text.push_str(&format!(
+                        "  const roots = {{ input: runtime.bind(input, {}) }};\n",
+                        cel::shape_of_field_map(input_fields.as_ref(), "  ")
+                    ));
+                }
                 text.push_str(&format!(
                     "  return {output_schema}.parse(\n    await runtime.runHttp({}, {}, context),\n  );\n",
                     http_binding(http, &tool.output, address, "    ", true),
-                    http_request(http, None, "    ")
+                    http_request(http, Bound::ToolInput, "    ")
                 ));
             }
             ToolImplementation::Function { function } => {
@@ -982,7 +990,11 @@ fn input_builder(ir: &Ir, address: &str, node: &Node, surfaces: &[schema::Surfac
         },
         NodeKind::Http { http } => {
             let mut text = String::from("  input: (roots) => ({\n");
-            text.push_str(&http_request_fields(http, node.input.as_ref(), "    "));
+            text.push_str(&http_request_fields(
+                http,
+                Bound::of_node(node.input.as_ref()),
+                "    ",
+            ));
             text.push_str("  }),\n");
             text
         }
@@ -1342,73 +1354,94 @@ fn decoding(output: &FieldMap, envelope: &[&str], tool_surface: bool) -> String 
     )
 }
 
+/// What fills the half of a request the `http:` block did not write out
+/// (grammar 6.1's *bound input object*, 8.3's *Request payload*, D66).
+///
+/// The two surfaces bind different things, which is why this is an enum rather
+/// than an `Option<&Bindings>`:
+///
+/// * a **`tool.*`** has a declared `input:` schema, and the object the caller's
+///   arguments parsed into *is* the bound object — it goes on the wire whole;
+/// * an **inline node** has no input schema of its own, so its `input:`
+///   bindings build an ad-hoc object field by field, each one a flow-scoped CEL
+///   expression evaluated against `roots` (grammar 8.3). The field-map form is
+///   the only legal one there (D88), so a scalar `input:` reaches this as
+///   [`Bound::Nothing`] — the validator has already refused it.
+enum Bound<'a> {
+    /// A `tool.*`'s own parsed `input`.
+    ToolInput,
+    /// An inline node's `input:` bindings.
+    NodeFields(&'a Bindings),
+    /// Nothing to fall back on: the block wrote the request out in full, or
+    /// there is no input at all.
+    Nothing,
+}
+
+impl<'a> Bound<'a> {
+    /// What an inline node's `input:` binds, if anything.
+    fn of_node(input: Option<&'a NodeInput>) -> Self {
+        match input {
+            Some(NodeInput::Fields { bindings }) => Self::NodeFields(bindings),
+            _ => Self::Nothing,
+        }
+    }
+}
+
 /// A tool binding's request: its `query:`/`body:` values over the tool's own
-/// `input` (grammar 6.1, Decision D65).
-fn http_request(http: &Http, node_input: Option<&NodeInput>, indent: &str) -> String {
+/// `input` (grammar 6.1, Decision D65), and the input object itself in whichever
+/// of the two the binding left unwritten.
+fn http_request(http: &Http, bound: Bound<'_>, indent: &str) -> String {
     let mut text = String::from("{\n");
-    text.push_str(&http_request_fields(
-        http,
-        node_input,
-        &format!("{indent}  "),
-    ));
+    text.push_str(&http_request_fields(http, bound, &format!("{indent}  ")));
     text.push_str(&format!("{indent}}}"));
     text
 }
 
+/// One `query`/`body` slot written out from explicit bindings.
+fn request_slot(slot: &str, bindings: &Bindings, indent: &str) -> String {
+    let mut text = format!("{indent}{slot}: {{\n");
+    for binding in &bindings.entries {
+        text.push_str(&format!(
+            "{indent}  {}: runtime.toJson(runtime.evaluate({}, roots)),\n",
+            names::string(&binding.name.value),
+            names::string(binding.value.value.as_str())
+        ));
+    }
+    text.push_str(&format!("{indent}}},\n"));
+    text
+}
+
 /// The `query` and `body` an `http:` surface sends (grammar 6.1, 8.3).
-fn http_request_fields(http: &Http, node_input: Option<&NodeInput>, indent: &str) -> String {
+///
+/// Each slot is the block's own key where it declared one, and otherwise the
+/// bound input object — as the body on a body-bearing method and as the query
+/// string on `GET`/`HEAD`, which is the convention grammar 6.1 states and 8.3
+/// reuses. The two never compete for one slot: D66 makes declaring both a
+/// compile error, so the `else` here is reached only where the block is silent.
+fn http_request_fields(http: &Http, bound: Bound<'_>, indent: &str) -> String {
     let mut text = String::new();
-    let bound = match node_input {
-        Some(NodeInput::Fields { bindings }) => Some(bindings),
-        _ => None,
-    };
     let body_bearing = !matches!(
         http.method.value,
         crate::ast::binding::HttpMethod::Get | crate::ast::binding::HttpMethod::Head
     );
 
-    if let Some(query) = &http.query {
-        text.push_str(&format!("{indent}query: {{\n"));
-        for binding in &query.entries {
-            text.push_str(&format!(
-                "{indent}  {}: runtime.toJson(runtime.evaluate({}, roots)),\n",
-                names::string(&binding.name.value),
-                names::string(binding.value.value.as_str())
-            ));
+    // `query` before `body`, whichever of them the input object filled: the
+    // emitted object's key order is the request's rather than the method's.
+    for (slot, declared) in [("query", http.query.as_ref()), ("body", http.body.as_ref())] {
+        if let Some(bindings) = declared {
+            text.push_str(&request_slot(slot, bindings, indent));
+            continue;
         }
-        text.push_str(&format!("{indent}}},\n"));
-    } else if !body_bearing && let Some(bindings) = bound {
-        text.push_str(&format!("{indent}query: {{\n"));
-        for binding in &bindings.entries {
-            text.push_str(&format!(
-                "{indent}  {}: runtime.toJson(runtime.evaluate({}, roots)),\n",
-                names::string(&binding.name.value),
-                names::string(binding.value.value.as_str())
-            ));
+        // The input object goes to the body on a body-bearing method and to the
+        // query string on `GET`/`HEAD`; the other slot stays unsent.
+        if (slot == "body") != body_bearing {
+            continue;
         }
-        text.push_str(&format!("{indent}}},\n"));
-    }
-
-    if let Some(body) = &http.body {
-        text.push_str(&format!("{indent}body: {{\n"));
-        for binding in &body.entries {
-            text.push_str(&format!(
-                "{indent}  {}: runtime.toJson(runtime.evaluate({}, roots)),\n",
-                names::string(&binding.name.value),
-                names::string(binding.value.value.as_str())
-            ));
+        match &bound {
+            Bound::ToolInput => text.push_str(&format!("{indent}{slot}: input,\n")),
+            Bound::NodeFields(bindings) => text.push_str(&request_slot(slot, bindings, indent)),
+            Bound::Nothing => {}
         }
-        text.push_str(&format!("{indent}}},\n"));
-    } else if body_bearing && let Some(bindings) = bound {
-        text.push_str(&format!("{indent}body: {{\n"));
-        for binding in &bindings.entries {
-            text.push_str(&format!(
-                "{indent}  {}: runtime.toJson(runtime.evaluate({}, roots)),\n",
-                names::string(&binding.name.value),
-                names::string(binding.value.value.as_str())
-            ));
-        }
-        text.push_str(&format!("{indent}}},\n"));
     }
     text
 }
