@@ -1250,11 +1250,22 @@ const EXECUTION_SHAPE = {
  * spends (grammar 7.4) and the branch it spends it on land in the same write.
  *
  * **What a guard sees.** The state as of the start of this step, with this
- * node's own writes applied through their channels' reduce policies. Grammar
- * 7.6 evaluates a step's edges after *every* node of the step has written, so a
- * guard here does not see a concurrent sibling's writes — the one place this
- * shaping is narrower than the model it implements, and it is reachable only
- * from a fork whose branches write a channel the other branch's guard reads.
+ * node's own writes applied through their channels' reduce policies — so a
+ * guard here does not see a concurrent sibling's writes. Grammar 7.6's P1 is
+ * per node ("a node's outgoing edges are evaluated only after **that node** has
+ * completed"), and this is that reading: routing is part of the node's own task.
+ * Reachable only from a fork whose branches write a channel the other branch's
+ * guard reads, which
+ * `a_guard_sees_its_own_writes_and_not_a_concurrent_siblings` pins.
+ *
+ * **Which errors `on_error` governs.** The node's own, and only those. Grammar 9
+ * is a policy over an *activity* — what the model, the process or the request
+ * did — while reading an unset channel or an absent property fails the
+ * **execution** (grammar 10.1, Decisions D78, D101, D110). Those are different
+ * outcomes, and `skip` and `fallback` would swallow the second into the first,
+ * so the input is built **outside** the policy-governed `try`: an expression
+ * that cannot be evaluated propagates, and only what the activity did reaches
+ * the `catch`.
  */
 export async function runNode(
   descriptor: NodeDescriptor,
@@ -1280,12 +1291,14 @@ export async function runNode(
   // because a node never reads another's output (Decision D42).
   const configuration: Roots = {
     input: bindRoot(run.input, descriptor.shapes.input),
-    state: bindRoot(state, descriptor.shapes.state),
+    state: bindRoot(declared(state, descriptor.shapes.state), descriptor.shapes.state),
     execution: bindRoot(run.execution, EXECUTION_SHAPE),
   };
 
+  // Outside the `try` on purpose — see *Which errors `on_error` governs* above.
+  const input = descriptor.input(configuration, view);
+
   try {
-    const input = descriptor.input(configuration, view);
     const answer = await runActivity(
       descriptor.flow,
       descriptor.node,
@@ -1299,7 +1312,10 @@ export async function runNode(
   } catch (error) {
     const strategy = descriptor.policy.onError;
     failure = error instanceof NodeFailure ? error : undefined;
-    attempts = failure?.attempts ?? 1;
+    // `runActivity` wraps everything the activity threw in a `NodeFailure`
+    // carrying the attempts it *made*, so the fallback is for an error that
+    // reached here without one being made at all — and `0` is what that is.
+    attempts = failure?.attempts ?? 0;
     if (strategy === "fail") throw error;
     if (typeof strategy === "object") {
       // The node's own outgoing edges are not evaluated: the fallback target is
@@ -1323,7 +1339,7 @@ export async function runNode(
   }
 
   const update: Record<string, unknown> = {};
-  const localState: Record<string, unknown> = { ...state };
+  const localState = declared(state, descriptor.shapes.state);
   const written: string[] = [];
   if (!skipped) {
     const fields = (output ?? {}) as Record<string, unknown>;
@@ -1377,6 +1393,38 @@ function bindRoot(value: unknown, shape: Shape): CelValue {
     throw new CelError("a root is absent");
   }
   return bound;
+}
+
+/**
+ * The channels the `state` root exposes: exactly the ones the composition
+ * declares (grammar 4.1, 10.1).
+ *
+ * The graph's state object holds more than that — `messages`, the implicit
+ * conversation history of grammar 10.4, and `$run`, this compiler's own channel
+ * — and neither is a name an expression may read: the validator types `state`
+ * from the `state:` section alone, so `state.messages` is an undefined channel
+ * at compile time and would be a readable object at run time. Narrowing here is
+ * what keeps the runtime scope equal to the declared one.
+ *
+ * It is also what keeps a node's cost flat in the length of the run. `bind`
+ * copies what it is given, and `$run` carries the whole routing trace (PRD 5.3),
+ * so binding the raw state object copied every earlier step's trace entries into
+ * CEL values at every node — quadratic in the trace, for a root nothing can
+ * name.
+ */
+function declared(
+  state: Readonly<Record<string, unknown>>,
+  shape: Shape,
+): Record<string, unknown> {
+  const properties = typeof shape === "object" && "properties" in shape ? shape.properties : {};
+  const narrowed: Record<string, unknown> = {};
+  for (const channel of Object.keys(properties)) {
+    // An unset channel stays absent rather than arriving as `undefined`: which
+    // channels a value carries is what `has()` reads and what a failed read
+    // reports (grammar 10.1, Decision D78).
+    if (state[channel] !== undefined) narrowed[channel] = state[channel];
+  }
+  return narrowed;
 }
 
 // ---------------------------------------------------------------------------

@@ -875,6 +875,35 @@ function equal(left: CelValue, right: CelValue): boolean {
   return false;
 }
 
+/**
+ * Order two strings the way the Rust column does: by **code point**.
+ *
+ * JavaScript's own `<` compares UTF-16 **code units**, and the two orders are not
+ * the same one. A code point at or above U+10000 is stored as a surrogate pair
+ * whose leading unit is in U+D800..U+DBFF, so `<` sorts every astral character
+ * *below* every BMP character in U+E000..U+FFFF — while a Rust `String`, which is
+ * UTF-8, sorts by byte and therefore by code point, putting them above. `'�'
+ * < '\u{1F600}'` is `true` there and `false` under a bare `<`, which is a legal
+ * guard the two columns would route opposite ways.
+ *
+ * Comparing code points *is* comparing UTF-8 bytes: the encoding is order
+ * preserving, so no encoder is needed and none is used. A lone surrogate has no
+ * UTF-8 encoding and cannot occur in a Rust `String` at all, so where one appears
+ * this orders it by its own value — there is no other column to agree with.
+ */
+function compareStrings(left: string, right: string): number {
+  if (left === right) return 0;
+  const a = [...left];
+  const b = [...right];
+  const shared = Math.min(a.length, b.length);
+  for (let index = 0; index < shared; index += 1) {
+    const x = a[index]!.codePointAt(0)!;
+    const y = b[index]!.codePointAt(0)!;
+    if (x !== y) return x < y ? -1 : 1;
+  }
+  return a.length === b.length ? 0 : a.length < b.length ? -1 : 1;
+}
+
 function order(operator: string, left: CelValue, right: CelValue): boolean {
   let comparison: number;
   if (isNumber(left) && isNumber(right)) {
@@ -887,7 +916,7 @@ function order(operator: string, left: CelValue, right: CelValue): boolean {
       comparison = pair.left < pair.right ? -1 : pair.left > pair.right ? 1 : 0;
     }
   } else if (typeof left === "string" && typeof right === "string") {
-    comparison = left < right ? -1 : left > right ? 1 : 0;
+    comparison = compareStrings(left, right);
   } else if (typeof left === "boolean" && typeof right === "boolean") {
     comparison = left === right ? 0 : left ? 1 : -1;
   } else {

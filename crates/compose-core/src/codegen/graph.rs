@@ -27,9 +27,24 @@
 //! * **P2, one run per step** — a node named by two `goto`s taken in one
 //!   superstep is scheduled once, which is LangGraph's own semantics.
 //!
-//! The one place this shaping is narrower than grammar 7.6's model is stated in
-//! the runtime: a guard sees the state its node ran on plus that node's own
-//! writes, not a concurrent sibling's from the same step.
+//! # What a guard sees, and why that is a reading rather than a consequence
+//!
+//! A guard sees the state its node ran on plus that node's own writes, **not** a
+//! concurrent sibling's from the same step. That is not a detail of the shaping;
+//! it is a choice between two sentences of grammar 7.6 that do not agree, and it
+//! is recorded here in the ledger style [`super::cel`] and [`super::schema`] use
+//! for the same reason — a difference a reader signed off on, or a bug.
+//!
+//! | id | where | which way | why it is left |
+//! |---|---|---|---|
+//! | `a-guard-does-not-see-a-concurrent-siblings-write` | an edge guard reading a channel a concurrent branch writes in the same step | the guard sees **its own node's** writes only | grammar 7.6's P1 is stated per node — "a node's outgoing edges are evaluated only after **that node** has completed" — and routing inside the node's own task is exactly that. The *Steps* paragraph above P1 reads the other way ("when every node of step *k* has completed, its writes are applied … and its outgoing edges are evaluated"), which would need a second superstep between every node and its own edges: a deferred router node per flow, doubling the step count, moving the trace's step numbers, and evaluating a guard in a task that is not the node's — which P1 is written to forbid. The per-node reading is the one implemented, and `a_guard_sees_its_own_writes_and_not_a_concurrent_siblings` pins it |
+//!
+//! The row is reachable — a fork whose branches write a channel the other
+//! branch's guard reads — so it is a routing outcome rather than a corner, and
+//! **that is why it is pinned rather than left to be re-derived**. Which of the
+//! two sentences is normative is the grammar's to say; until it says, this is
+//! the answer the compiler gives and the test is what makes a change to it
+//! deliberate.
 //!
 //! # `start`
 //!
