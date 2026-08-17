@@ -31,8 +31,9 @@
 #     step: its own node's writes, and **not** a concurrent sibling's
 #     (grammar 7.6 P1, read per node).
 #   * `flow.ordering` — two concurrent writers of one `append` channel whose node
-#     ids run opposite to both their completion order and their declaration
-#     order, so only grammar 7.6.4 clause 1 explains the result.
+#     ids run opposite to their completion order, to the order their nodes are
+#     declared in (and so registered in), and to the order their edges are
+#     declared in, so only grammar 7.6.4 clause 1 explains the result.
 #   * `flow.unset` and `flow.unset_expression` — reading a channel nothing has
 #     written fails the **execution**, naming the channel and the reader, and
 #     neither `on_error: skip` nor a `fallback:` absorbs it: those are strategies
@@ -554,8 +555,12 @@ flow.ordering:
       items: { type: string }
   nodes:
     # `alpha` sorts first by node id and finishes last; `zulu` sorts last and
-    # finishes first, and its edge is declared first. Only grammar 7.6.4 clause 1
-    # — writers ordered by ascending node id — puts `alpha` first in the result.
+    # finishes first, is declared first among the nodes, and its edge is declared
+    # first too. So node-id order disagrees with all three of the orders a
+    # compiled graph could otherwise have inherited — the registration order
+    # `addNode` is called in, the declaration order of the edges, and the order
+    # the two writers complete in — and only grammar 7.6.4 clause 1, writers
+    # ordered by ascending node id, puts `alpha` first in the result.
     split:
       exec:
         command: printf
@@ -563,19 +568,19 @@ flow.ordering:
         output:
           stdout: { type: string }
 
-    alpha:
+    zulu:
       exec:
-        command: "${OPS_BIN}/sh"
-        args: ["-c", 'sleep 0.3; printf "%s" alpha']
+        command: printf
+        args: ["%s", "zulu"]
         output:
           stdout: { type: string }
       writes:
         stdout: checks
 
-    zulu:
+    alpha:
       exec:
-        command: printf
-        args: ["%s", "zulu"]
+        command: "${OPS_BIN}/sh"
+        args: ["-c", 'sleep 0.3; printf "%s" alpha']
         output:
           stdout: { type: string }
       writes:

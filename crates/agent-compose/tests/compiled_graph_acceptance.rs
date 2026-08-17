@@ -1695,10 +1695,17 @@ fn a_guard_sees_its_own_writes_and_not_a_concurrent_siblings() {
 /// LangGraph bump that changed task ordering would silently reorder every
 /// `append` channel a fork writes, with a green suite.
 ///
-/// The fixture makes all three orders disagree. `alpha` sorts **first** by node
-/// id, is declared **last** among the fork's edges, and finishes **last**
-/// (it sleeps 300ms); `zulu` sorts last, is declared first, and finishes first.
-/// Only clause 1 puts `alpha` at the head of the result.
+/// The fixture makes every other order disagree. `alpha` sorts **first** by node
+/// id, is declared **last** among the flow's nodes *and* last among the fork's
+/// edges, and finishes **last** (it sleeps 300ms); `zulu` sorts last, is
+/// declared first in both positions, and finishes first. Only clause 1 puts
+/// `alpha` at the head of the result.
+///
+/// The node-declaration axis is the one the emitted code actually rides on and
+/// the one a fixture is likeliest to leave untested: `codegen::graph` calls
+/// `.addNode` in declaration order, so a fixture declaring its writers in
+/// ascending id order would pass whether the scheduler ordered writes by node id
+/// or by registration. Declaring them in reverse is what tells the two apart.
 #[test]
 fn concurrent_writers_append_in_node_id_order_not_completion_order() {
     let provider = MockProvider::start().expect("a loopback port");
