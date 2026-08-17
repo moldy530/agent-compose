@@ -50,7 +50,7 @@
 //! | call | command |
 //! |---|---|
 //! | [`build`] | `agent-compose build <entrypoint> --target <name> --out <dir>` |
-//! | [`invoke`] | `node <driver> <project> <flow> <inputs.json> <trace.json>`, over the emitted `runFlow` |
+//! | [`invoke`] | `bun <driver> <project> <flow> <inputs.json> <trace.json>`, over the emitted `runFlow` |
 //! | [`run`] | `agent-compose run <entrypoint> <flow> --input k=v … [--session <key>]` |
 //! | [`serve`] | `agent-compose serve <entrypoint> --port 0`, announcing its address on stdout |
 //!
@@ -430,9 +430,9 @@ pub fn build_entrypoint(entrypoint: &Path, purpose: &str) -> Option<(PathBuf, Ou
 /// emitted one, the provider is the scripted one, and what comes back is the
 /// flow's own `outputs:` plus the routing trace the run recorded (PRD 5.3).
 ///
-/// Answers `None` when the Node toolchain is absent and this is not CI, which is
-/// the same skip `tests/generated_code_gates.rs` takes; a test that gets `None`
-/// has nothing to assert and returns.
+/// Answers `None` when Bun is absent and this is not CI, which is the same skip
+/// `tests/generated_code_gates.rs` takes; a test that gets `None` has nothing to
+/// assert and returns.
 pub fn invoke(
     name: &str,
     flow: &str,
@@ -633,7 +633,7 @@ pub const MACHINE: &[&str] = &["PATH", "HOME"];
 /// `validate` and `build` are left alone: env refs survive *unresolved* into the
 /// IR and into generated code (PRD 5.9), so a compile-time command reads none of
 /// them, and clearing the environment around a build that may yet shell out to
-/// the Node toolchain would buy nothing for it.
+/// the JavaScript toolchain would buy nothing for it.
 pub fn seal(command: &mut Command, environment: &[(String, String)]) {
     command.env_clear();
     for passed_through in MACHINE {
