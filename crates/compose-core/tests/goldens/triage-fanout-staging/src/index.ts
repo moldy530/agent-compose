@@ -12,8 +12,9 @@
 //
 // It is also where the env-ref presence check of PRD 5.9 runs. `readEnvironment`
 // is called at module scope, so loading this module is what "process start"
-// means for this project: any `node src/index.ts`, and any import of it, throws
-// naming every missing variable before a graph is built or a model is called.
+// means for this project: any `bun src/index.ts` or `node src/index.ts`, and any
+// import of it, throws naming every missing variable before a graph is built or
+// a model is called.
 // The compiler never runs it — `agent-compose build` reads no environment, which
 // is what keeps a build on one machine reproducible on another and keeps a
 // credential out of every file it writes (PRD 5.9: refs "survive into the IR
