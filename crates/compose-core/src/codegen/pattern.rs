@@ -35,7 +35,16 @@
 //!   are anchors in RE2 and the literal letters `A` and `z` in a JavaScript
 //!   regex without `u`; `\a` is a bell in RE2 and the letter `a` in JavaScript;
 //!   `\p{Greek}` is a Unicode class in RE2 and the letter `p` followed by a
-//!   braced literal in JavaScript.
+//!   braced literal in JavaScript; `[]-]` is the class `{]`, `-`}` in RE2 and
+//!   the *empty* class followed by two literals in JavaScript; `[a[b]]` is the
+//!   union `{a, b}` in RE2 and the class `{a, [, b}` followed by a literal `]`
+//!   in JavaScript.
+//!
+//! The last two are inside a bracketed class, which is why every literal a class
+//! holds — including the two endpoints of a range — goes through the same
+//! decision as one written outside it. A class is not a quoted region: `[\a-b]`
+//! and `[\x41-\u{1F600}]` are the escapes above, one level in, and reading a
+//! range's endpoints as opaque would let each of them through.
 //!
 //! Everything else transfers: literals and their escapes, `.`, `^`, `$`, `\b`,
 //! `\B`, the Perl classes, bracketed classes and ranges, all four repetition
@@ -53,15 +62,21 @@
 //! `perl-classes-mean-the-ascii-thing-in-both-columns` documents) so the claim
 //! is a test rather than a paragraph.
 //!
-//! `.` is the case where that reasoning stops short of agreement, and it is
+//! Two constructs are where that reasoning stops short of agreement, and both are
 //! declared rather than papered over. Without the `u` flag (see below), `.`
 //! matches one UTF-16 **code unit**, so `^.$` refuses `"😀"` in the emitted Zod
 //! and accepts it in the Rust validator, whose engine matches one **code
-//! point**. Which column is the deviant one is arguable — ECMAScript is what
-//! JSON Schema names, so the emitted regex is the literal reading — but the
-//! difference is real and reachable, so it is `dot-matches-a-code-unit` in
-//! [`super::schema`]'s divergence ledger, with `state.glyph` in the corpus as the
-//! document that decides it.
+//! point**. And `\b`/`\B` are word boundaries in both engines over *different*
+//! word characters: ECMAScript's are ASCII, and the validating engine's are
+//! Unicode — the one Perl construct the paragraph above does not cover, because
+//! the translation it relies on rewrites `\w` and leaves the boundary alone. So
+//! `\bcat\b` accepts `"caté"` in the emitted Zod and refuses it in the Rust
+//! column. Which column is the deviant one is arguable in both cases —
+//! ECMAScript is what JSON Schema names, so the emitted regex is the literal
+//! reading — but each difference is real and reachable, so they are
+//! `dot-matches-a-code-unit` and `word-boundary-is-unicode-aware` in
+//! [`super::schema`]'s divergence ledger, with `state.glyph` and `state.word` in
+//! the corpus as the documents that decide them.
 //!
 //! # The literal
 //!
@@ -301,8 +316,11 @@ fn set(kind: &ClassSet) -> Result<(), Unsupported> {
 
 fn set_item(item: &ClassSetItem) -> Result<(), Unsupported> {
     match item {
-        ClassSetItem::Empty(_) | ClassSetItem::Range(ClassSetRange { .. }) => Ok(()),
-        ClassSetItem::Literal(literal) => literal_representable(literal),
+        ClassSetItem::Empty(_) => Ok(()),
+        ClassSetItem::Range(ClassSetRange { start, end, .. }) => {
+            class_literal(start).and_then(|()| class_literal(end))
+        }
+        ClassSetItem::Literal(literal) => class_literal(literal),
         ClassSetItem::Unicode(_) => Err(unicode_class()),
         ClassSetItem::Ascii(_) => Err(Unsupported::new(
             "`pattern` uses a POSIX class (`[[:alpha:]]`), which a JavaScript regular expression \
@@ -310,9 +328,40 @@ fn set_item(item: &ClassSetItem) -> Result<(), Unsupported> {
             "write the class out — `[[:alpha:]]` is `[A-Za-z]` (grammar 3.3, Decision D12)",
         )),
         ClassSetItem::Perl(ClassPerl { .. }) => Ok(()),
-        ClassSetItem::Bracketed(class) => bracketed(class),
+        // `[a[b]]` is the union `{a, b}` to RE2 and, to a JavaScript regular
+        // expression without the `v` flag, the class `{a, [, b}` followed by a
+        // literal `]` — a whole different set, and a different length of match.
+        ClassSetItem::Bracketed(_) => Err(Unsupported::new(
+            "`pattern` nests a character class (`[a[b]]`), which a JavaScript regular expression \
+             without the `v` flag reads as a literal `[` inside the outer class",
+            "write the union out as one class — `[a[b]]` is `[ab]` (grammar 3.3, Decision D12)",
+        )),
         ClassSetItem::Union(ClassSetUnion { items, .. }) => items.iter().try_for_each(set_item),
     }
+}
+
+/// One literal written **inside** a bracketed class.
+///
+/// Every escape [`literal_representable`] decides is legal inside a class too, so
+/// a class is not a region this walk may skip: `[\a-b]` is the bell escape and
+/// `[\x41-\u{1F600}]` is the `\u{…}` one, each one level in.
+///
+/// One spelling is a hazard only in here. RE2 (like POSIX) reads a `]` written
+/// **first** in a class as a member of it — `[]-]` is `{]`, `-`}`, and `[^]a]`
+/// is everything but `]` and `a` — while a JavaScript regular expression closes
+/// the class at that `]` instead: `[]` matches nothing at all and `[^]` matches
+/// anything, with the rest of the intended class left over as literals. Nothing
+/// fails; the schema means something else entirely, in both directions.
+fn class_literal(literal: &Literal) -> Result<(), Unsupported> {
+    if matches!(literal.kind, LiteralKind::Verbatim) && literal.c == ']' {
+        return Err(Unsupported::new(
+            "`pattern` writes `]` unescaped inside a character class, which is RE2's spelling for \
+             a class that holds one — a JavaScript regular expression closes the class there \
+             instead",
+            "escape it: `[]-]` is `[\\]-]` and `[^]a]` is `[^\\]a]` (grammar 3.3, Decision D12)",
+        ));
+    }
+    literal_representable(literal)
 }
 
 #[cfg(test)]
@@ -365,7 +414,13 @@ mod tests {
             "\\x41\\u00e9",
             "\\t\\n\\r\\f\\v",
             ".{1,8}",
-            "[]-]",
+            // The escaped spellings of the two class hazards below, which are
+            // the same set in both engines and are what the refusals send a
+            // reader to.
+            "[\\]-]",
+            "[^\\]a]",
+            "[ab]",
+            "[\\x41-\\x5a]",
         ] {
             let emitted = ok(pattern);
             assert!(
@@ -406,6 +461,43 @@ mod tests {
                 "`{pattern}` was refused for the wrong reason: {refusal:?}"
             );
         }
+    }
+
+    /// A class is a region of the pattern, not a quoted one: the escapes above
+    /// mean the same things one level in, and two spellings mean something
+    /// *else* only in here.
+    ///
+    /// `[]-]` and `[^]a]` are RE2's (and POSIX's) way of putting a `]` in a
+    /// class; JavaScript closes the class at that `]`, which makes `[]-]` an
+    /// expression that matches nothing and `[^]a]` one that matches almost
+    /// everything. `[a[b]]` is a nested class in RE2 and a literal `[` in
+    /// JavaScript. Each was accepted and copied verbatim, and each inverts the
+    /// verdict on most documents — see `codegen::schema`'s corpus for the
+    /// measured columns.
+    #[test]
+    fn a_class_is_walked_like_the_pattern_around_it() {
+        for (pattern, expected) in [
+            ("[]-]", "unescaped inside a character class"),
+            ("[^]a]", "unescaped inside a character class"),
+            ("[]-a]", "unescaped inside a character class"),
+            ("^[a[b]]$", "nests a character class"),
+            ("[a[b]c]", "nests a character class"),
+            // A range's endpoints are literals like any other, and reading them
+            // as opaque let two refused escapes through.
+            ("[\\a-b]", "\\a"),
+            ("[\\x41-\\u{1F600}]", "\\u{…}"),
+            ("[\\U00000041-b]", "\\u{…}"),
+        ] {
+            let refusal = refused(pattern);
+            assert!(
+                refusal.message.contains(expected),
+                "`{pattern}` was refused for the wrong reason: {refusal:?}"
+            );
+        }
+        assert!(
+            refused("[]-]").help.contains("[\\]-]"),
+            "the help writes the spelling that transfers"
+        );
     }
 
     #[test]

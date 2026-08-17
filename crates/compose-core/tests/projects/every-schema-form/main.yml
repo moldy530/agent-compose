@@ -68,6 +68,13 @@ state:
   # `u` flag, so `.` is one UTF-16 code unit there and one code point in the
   # validator's engine. Declared as `dot-matches-a-code-unit`.
   glyph:     { type: string, pattern: "^.$" }
+  # `\b` is the other one. Both engines have a word boundary and they disagree
+  # about what a word character is at it: ECMAScript's is ASCII, the validating
+  # engine keeps Rust's Unicode one — which is exactly what `\w`, `\d` and `\s`
+  # do *not* do, because the translation that makes those agree rewrites the
+  # classes and leaves the boundary alone. Declared as
+  # `word-boundary-is-unicode-aware`.
+  word:      { type: string, pattern: "\\bcat\\b" }
   # The length bounds, on a channel with no `pattern:` to hide them behind:
   # `minLength`/`maxLength` count code points, which is neither what `.min()`
   # nor what `.max()` counts, so one astral character tells the two spellings

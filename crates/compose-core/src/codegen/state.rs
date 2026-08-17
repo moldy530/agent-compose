@@ -70,7 +70,6 @@
 
 use crate::ast::document::Reduce;
 use crate::ir::Ir;
-use crate::ir::schema::TypeForm;
 
 use super::names::{self, Names};
 use super::schema;
@@ -222,15 +221,13 @@ fn describe(channel: &crate::ir::Channel) -> Vec<String> {
 /// The channel's initial value as TypeScript source, or `None` when it starts
 /// unset.
 fn initial(channel: &crate::ir::Channel) -> Option<String> {
-    let declared = match &channel.ty.form {
-        TypeForm::Scalar(scalar) => scalar.default.as_ref(),
-        TypeForm::Enum(enumeration) => enumeration.default.as_ref(),
-        TypeForm::Object(object) => object.default.as_ref(),
-        TypeForm::Array(array) => array.default.as_ref(),
-        TypeForm::Union(_) => None,
-    };
-    if let Some(default) = declared {
-        return Some(names::literal(&default.value));
+    // The value the `default:` denotes, not the text it was written as: a
+    // property the literal leaves out and that carries its own `default:` is
+    // filled in, which is what makes grammar 10.1's "total from step 0" true and
+    // what keeps this expression assignable to the channel's own value type
+    // (`schema::effective_default`).
+    if let Some(default) = schema::effective_default(&channel.ty) {
+        return Some(names::literal(&default));
     }
     // The identity element of the reduce, which is what makes a fan-out that
     // produced zero items read as "nothing yet" (grammar 10.1).
@@ -359,6 +356,30 @@ mod tests {
         assert!(
             emitted.contains("default: () => ({ \"fixed\": 0 }),"),
             "{emitted}"
+        );
+    }
+
+    /// The initial value is the one the `default:` **denotes**, so a property
+    /// the literal leaves out and that carries its own `default:` is filled in.
+    ///
+    /// Grammar 10.1 promises an object `default:` makes the channel total from
+    /// step 0, and grammar 3.6 makes a defaulted property optional in the
+    /// literal that supplies it — the nested default is the only thing that can
+    /// keep both true at once. It is also the difference between a `default: ()
+    /// =>` expression that fits the channel's own value type and one `tsc`
+    /// rejects (`Property 'count' is missing`).
+    #[test]
+    fn a_default_is_completed_with_the_defaults_nested_inside_it() {
+        let emitted = state_of(
+            "  seen:\n    type: object\n    properties:\n      count: { type: integer, default: 0 }\n      other: { type: string }\n    reduce: merge\n    default: { other: \"x\" }\n",
+        );
+        assert!(
+            emitted.contains("default: () => ({ \"other\": \"x\", \"count\": 0 }),"),
+            "{emitted}"
+        );
+        assert!(
+            emitted.contains("Starts at `{ \"other\": \"x\", \"count\": 0 }`."),
+            "the doc comment says the value the channel really starts at: {emitted}"
         );
     }
 

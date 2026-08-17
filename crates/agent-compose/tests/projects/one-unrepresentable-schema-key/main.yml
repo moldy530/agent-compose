@@ -1,0 +1,44 @@
+# A composition `validate` accepts and `build` cannot compile.
+#
+# The channel-name rule one level down. `constructor` is a legal grammar 2.1
+# identifier, so a field map may declare a property called that and a union may
+# name it as its `discriminator` — and both become a **key of an emitted Zod
+# object shape**, which is read off the value being parsed with a plain property
+# lookup. Every JavaScript object answers `constructor` out of
+# `Object.prototype`, so:
+#
+# * `settings.constructor` is optional at its surface (grammar 3.6 makes a
+#   defaulted property optional), and the emitted parse refuses `{"retries": 1}`
+#   — a document its own published JSON Schema accepts — with `expected string,
+#   received function`;
+# * `source`'s union throws out of the first `safeParse`
+#   (`propValues[key].add is not a function`), after type-checking and after
+#   constructing its graph.
+#
+# `constructors`, `construct` and the `constructor_name` property are the
+# controls: neighbours a check matching on a prefix would take with it. So is
+# `kind`, an ordinary discriminator in the same file.
+version: "0.1"
+
+state:
+  settings:
+    type: object
+    properties:
+      retries:     { type: integer }
+      constructor: { type: string, default: "ctor" }
+  source:
+    discriminator: constructor
+    variants:
+      upload: { filename: { type: string } }
+      crawl:  { url: { type: string } }
+  fine:
+    type: object
+    properties:
+      constructors:     { type: string }
+      construct:        { type: string }
+      constructor_name: { type: string }
+  routed:
+    discriminator: kind
+    variants:
+      one: { x: { type: string } }
+      two: { y: { type: integer } }

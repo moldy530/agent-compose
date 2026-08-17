@@ -46,6 +46,7 @@ import {
   stateWhere,
   stateWhich,
   stateWho,
+  stateWord,
 } from "./schemas.ts";
 
 /**
@@ -233,6 +234,11 @@ export const channels = {
    * Starts **unset**: reading it before its first write fails the execution (Decision D78).
    */
   who: Annotation<z.infer<typeof stateWho>>,
+  /**
+   * Unreduced: single-writer, and a write supplies the whole value.
+   * Starts **unset**: reading it before its first write fails the execution (Decision D78).
+   */
+  word: Annotation<z.infer<typeof stateWord>>,
   /**
    * The implicit conversation history (grammar 10.4, PRD 5.7 tier 3): append-only,
    * never declared in `state:`, and isolated across flow boundaries by default.

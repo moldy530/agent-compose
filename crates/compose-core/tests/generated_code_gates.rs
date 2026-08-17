@@ -412,6 +412,7 @@ const DIVERGENCES: &[&str] = &[
     "punycode-payload-undecoded",
     "omitted-default-is-the-same-item",
     "dot-matches-a-code-unit",
+    "word-boundary-is-unicode-aware",
 ];
 
 fn corpus() -> Vec<Case> {

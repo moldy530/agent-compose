@@ -6,11 +6,22 @@
 # into `src/schemas.ts` produces a module no runtime can load — so `build`
 # refuses, with a span, rather than exiting `0` over it.
 #
-# `slug` is the control: a pattern using the vocabulary both engines share, in
-# the same file, so a check that refused everything would fail this fixture too.
+# `bracket` and `nested` are the quieter half of the same rule. Both *parse* as
+# JavaScript, and both parse as something else: `[]-]` is RE2's spelling of a
+# class holding `]` and `-`, and JavaScript closes the class at that `]`, making
+# it an empty class that matches nothing; `[a[b]]` is the union `{a, b}` in RE2
+# and the class `{a, [, b}` followed by a literal `]` in JavaScript. Nothing
+# fails at load; the schema means something else.
+#
+# `slug` and `escaped` are the controls: patterns using the vocabulary both
+# engines share, in the same file, so a check that refused everything would fail
+# this fixture too.
 version: "0.1"
 
 state:
-  slug:  { type: string, pattern: "^(?<word>[a-z]+)-\\d{4}$" }
-  loud:  { type: string, pattern: "(?i)^abc$" }
-  named: { type: string, pattern: "(?P<word>[a-z]+)" }
+  slug:    { type: string, pattern: "^(?<word>[a-z]+)-\\d{4}$" }
+  loud:    { type: string, pattern: "(?i)^abc$" }
+  named:   { type: string, pattern: "(?P<word>[a-z]+)" }
+  bracket: { type: string, pattern: "^[]-]$" }
+  nested:  { type: string, pattern: "^[a[b]]$" }
+  escaped: { type: string, pattern: "^[\\]-]$" }

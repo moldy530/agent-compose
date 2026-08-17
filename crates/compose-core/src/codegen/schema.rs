@@ -95,7 +95,7 @@
 //! and the corner is the direction where the emitted parse asks for *more* than
 //! the model was told rather than less.
 //!
-//! # `format:`, and why six of the ten are written out
+//! # `format:`, and why seven of the ten are written out
 //!
 //! Grammar 3.3 fixes a closed vocabulary of ten formats and grammar 3.8's table
 //! says nothing about any of them, so the reading is this module's to choose —
@@ -104,15 +104,16 @@
 //! not claim to be: `z.url()` is `new URL()`, which repairs its input;
 //! `z.iso.datetime()` is an upper-case-only ISO 8601 profile, not RFC 3339;
 //! `z.email()` is a deliberately narrow subset; `z.hostname()` admits the root
-//! dot. Every one of those was a document the published JSON Schema accepted and
-//! the emitted Zod refused — a model answering its own contract and failing the
-//! parse.
+//! dot; `z.uuid()` reads the version and variant nibbles that RFC 9562's *layout*
+//! defines and its string production does not. Every one of those was a document
+//! the published JSON Schema accepted and the emitted Zod refused — a model
+//! answering its own contract and failing the parse.
 //!
 //! So the reading is named by RFC, and where Zod's constructor reads a different
 //! one the check is written out in [`HELPERS`] (`rfc3339Date`, `rfc3339Time`,
-//! `rfc3339DateTime`, `rfc3986Uri`, `rfc1123Hostname`, `rfc5321Email`). Four
-//! formats keep their constructor because on those four the two agree:
-//! `duration`, `uuid`, `ipv4`, `ipv6`. [`zod_format`] is the whole table.
+//! `rfc3339DateTime`, `rfc3986Uri`, `rfc4122Uuid`, `rfc1123Hostname`,
+//! `rfc5321Email`). Three formats keep their constructor because on those three
+//! the two agree: `duration`, `ipv4`, `ipv6`. [`zod_format`] is the whole table.
 //!
 //! # The divergence ledger
 //!
@@ -134,6 +135,7 @@
 //! | `punycode-payload-undecoded` | `format: hostname`, `format: email` | Zod accepts, JSON refuses | an `xn--` label whose payload is not decodable punycode. `rfc1123Hostname` checks the label's *shape*; decoding it would be a punycode implementation inside a generated module, for a case a model does not produce |
 //! | `omitted-default-is-the-same-item` | `unique_items` over items carrying a `default:` | JSON accepts, Zod refuses | `[{page: "/"}, {page: "/", via: "direct"}]` where `via` defaults to `"direct"`. The check runs over parsed elements, where the default has been filled in — see the section above for what closing it would cost |
 //! | `dot-matches-a-code-unit` | `pattern:` | JSON accepts, Zod refuses | `^.$` against `"😀"`. The emitted literal carries no `u` flag ([`super::pattern`] says why: `u` mode refuses escapes RE2 accepts), so `.` matches one UTF-16 code unit while the Rust column's engine matches one code point. JSON Schema *defines* `pattern` as ECMA-262, which makes the emitted regex the literal reading and the validating column the loose one; agreeing would take a second regex engine in the compiler, or refusing `.` outright |
+//! | `word-boundary-is-unicode-aware` | `pattern:` | Zod accepts, JSON refuses | `\bcat\b` against `"caté"`. Both engines have `\b` and both call it a word boundary; they disagree about what a word character is. ECMAScript's is ASCII, and the validating column keeps Rust's Unicode one — the translation that makes `\w`, `\d` and `\s` agree (`^\w$` refuses `é` in both) rewrites the *classes* and leaves the boundary alone. Same shape as the row above, and the same reading: ECMA-262 is what JSON Schema names |
 //!
 //! # Patterns
 //!
@@ -156,8 +158,8 @@
 //! * `state.tags` → `minItems`/`maxItems` kept, `uniqueItems` gone;
 //! * `state.mark` → `{"type": "string"}`; both length bounds gone.
 //!
-//! The `.regex`-spelled formats (`uri`, `time`) survive as `pattern`, so the loss
-//! tracks the spelling rather than the keyword.
+//! The `.regex`-spelled formats (`uri`, `time`, `uuid`) survive as `pattern`, so
+//! the loss tracks the spelling rather than the keyword.
 //!
 //! This module does not get to fix that: the schema a provider is handed is the
 //! node-fn PR's emission, and *which* schema it hands over — a conversion of
@@ -173,8 +175,10 @@ use std::borrow::Cow;
 
 use serde_json::{Map, Value, json};
 
+use crate::ast::common::Ident;
 use crate::ast::schema::{Number, ScalarKind, StringFormat};
 use crate::check::model;
+use crate::diag::Spanned;
 use crate::ir::definition::DefinitionBody;
 use crate::ir::flow::NodeKind;
 use crate::ir::schema::{ArrayType, EnumType, FieldMap, ObjectType, Scalar, TypeForm, TypeNode};
@@ -724,6 +728,26 @@ const rfc3986Uri =
 "#,
     },
     Helper {
+        formats: &[StringFormat::Uuid],
+        unique_items: false,
+        length_bounds: false,
+        wants: &[],
+        name: "rfc4122Uuid",
+        source: r#"
+/**
+ * `format: uuid` (grammar 3.3): the RFC 4122 (now RFC 9562) string
+ * representation — five hyphen-separated groups of hex digits, in either case,
+ * which is exactly what JSON Schema's `uuid` reads. `z.uuid()` is a narrower
+ * check: it also enforces the version and variant nibbles of the *layout*, so it
+ * refuses a Microsoft GUID (`…-c456-…`), a version-0 or version-9 value, and
+ * anything else a system upstream of this one minted without following RFC
+ * 9562's field rules. The published schema blesses those, so the parse beside it
+ * has to as well.
+ */
+const rfc4122Uuid = /^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/;
+"#,
+    },
+    Helper {
         formats: &[StringFormat::Email],
         unique_items: false,
         length_bounds: false,
@@ -794,6 +818,24 @@ impl Surface<'_> {
         }
     }
 
+    /// Visit every name the emitted Zod uses as a **key**, outermost first.
+    ///
+    /// Two things become keys of an object shape: a field map's property names
+    /// (grammar 3.1, 3.4) and a union's `discriminator` (grammar 3.7), which is
+    /// both the key `z.discriminatedUnion` indexes on and a `z.literal` property
+    /// of every variant. A variant *tag* is not one — it is the value that key
+    /// holds — and neither is a channel name, which [`channels`] enumerates for
+    /// the state model.
+    ///
+    /// [`super::diagnostics`] reads it for the same reason it reads [`walk`]: a
+    /// rule about what a key may be spelled has to reach the nested ones too.
+    pub fn walk_keys(&self, visit: &mut dyn FnMut(&Spanned<Ident>, KeyKind)) {
+        match &self.body {
+            Body::Fields(fields) => walk_map_keys(fields, visit),
+            Body::Type(ty) => walk_type_keys(ty, visit),
+        }
+    }
+
     /// Whether any type node anywhere inside this surface satisfies `predicate`.
     fn declares(&self, predicate: &dyn Fn(&TypeNode) -> bool) -> bool {
         match &self.body {
@@ -803,6 +845,49 @@ impl Surface<'_> {
                 .any(|field| declares(&field.ty, predicate)),
             Body::Type(ty) => declares(ty, predicate),
         }
+    }
+}
+
+/// What makes one name a key of an emitted object shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyKind {
+    /// A property of a field map or of an object type node (grammar 3.1, 3.4).
+    Property,
+    /// A union's tag field (grammar 3.7).
+    Discriminator,
+}
+
+impl KeyKind {
+    /// How a diagnostic names it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Property => "schema property",
+            Self::Discriminator => "discriminator",
+        }
+    }
+}
+
+/// Visit every key of one field map, and of everything nested inside it.
+fn walk_map_keys(fields: &FieldMap, visit: &mut dyn FnMut(&Spanned<Ident>, KeyKind)) {
+    for field in &fields.fields {
+        visit(&field.name, KeyKind::Property);
+        walk_type_keys(&field.ty, visit);
+    }
+}
+
+/// Visit every key one type node introduces, and of everything nested inside it.
+fn walk_type_keys(ty: &TypeNode, visit: &mut dyn FnMut(&Spanned<Ident>, KeyKind)) {
+    match &ty.form {
+        TypeForm::Array(array) => walk_type_keys(&array.items, visit),
+        TypeForm::Object(object) => walk_map_keys(&object.properties, visit),
+        TypeForm::Union(union) => {
+            visit(&union.discriminator, KeyKind::Discriminator);
+            for variant in &union.variants {
+                walk_map_keys(&variant.fields, visit);
+            }
+        }
+        TypeForm::Scalar(_) | TypeForm::Enum(_) => {}
     }
 }
 
@@ -929,8 +1014,8 @@ pub fn type_node(ty: &TypeNode, indent: &str) -> String {
     if let Some(description) = &ty.description {
         text.push_str(&format!(".describe({})", names::string(&description.value)));
     }
-    if let Some(default) = declared_default(ty) {
-        text.push_str(&format!(".default({})", names::literal(default)));
+    if let Some(default) = effective_default(ty) {
+        text.push_str(&format!(".default({})", names::literal(&default)));
     }
     text
 }
@@ -938,6 +1023,14 @@ pub fn type_node(ty: &TypeNode, indent: &str) -> String {
 /// The `default:` a type node declares, whichever form carries it. A union never
 /// does (grammar 3.6).
 fn declared_default(ty: &TypeNode) -> Option<&crate::ast::common::Literal> {
+    declared_default_entry(ty).map(|default| &default.value)
+}
+
+/// The same, with the span the literal was written at — which is the span a
+/// filled-in property borrows when [`effective_default`] copies it.
+fn declared_default_entry(
+    ty: &TypeNode,
+) -> Option<&crate::diag::Spanned<crate::ast::common::Literal>> {
     match &ty.form {
         TypeForm::Scalar(scalar) => scalar.default.as_ref(),
         TypeForm::Enum(enumeration) => enumeration.default.as_ref(),
@@ -945,7 +1038,143 @@ fn declared_default(ty: &TypeNode) -> Option<&crate::ast::common::Literal> {
         TypeForm::Array(array) => array.default.as_ref(),
         TypeForm::Union(_) => None,
     }
-    .map(|default| &default.value)
+}
+
+/// The value this type node's `default:` **denotes**: the literal as written,
+/// with every nested `default:` it leaves out filled in.
+///
+/// Grammar 3.6 makes a property carrying a `default:` implicitly optional at its
+/// surface, so `default: { other: "x" }` on an object whose `count` defaults to
+/// `0` is a literal that validates against the type node it sits on, and the
+/// validator accepts it. It is not the whole value, though: grammar 10.1 says a
+/// channel `default:` is what "makes the whole channel total from step 0", and
+/// the nested `default:` is the only thing that can supply `count`. So the
+/// denoted value is the literal *parsed against its own schema*, which is this —
+/// a compile-time parse, because both columns want the answer and neither runs
+/// the other's.
+///
+/// Emitting the literal as written instead was not merely incomplete, it did not
+/// compile: Zod 4's `.default(v)` takes `core.output<T>`, in which a defaulted
+/// property is **required**, so `z.object({count: z.number().int().default(0), …
+/// }).strict().default({other: "x"})` is a `tsc` error — `build` exiting `0` over
+/// a project that cannot pass the type gate CLAUDE.md requires of every one.
+///
+/// Only the two forms that *hold* other type nodes can gain anything, and a
+/// literal of the wrong shape is left alone: the validator has already refused
+/// it, and guessing at a repair would emit something nobody wrote.
+pub(super) fn effective_default(ty: &TypeNode) -> Option<Cow<'_, crate::ast::common::Literal>> {
+    declared_default_entry(ty).map(|default| complete(ty, &default.value))
+}
+
+/// One literal, completed against the type node it is the `default:` of.
+fn complete<'a>(
+    ty: &'a TypeNode,
+    value: &'a crate::ast::common::Literal,
+) -> Cow<'a, crate::ast::common::Literal> {
+    use crate::ast::common::Literal;
+
+    match (&ty.form, value) {
+        (TypeForm::Object(object), Literal::Mapping(_)) => {
+            complete_mapping(&object.properties, value)
+        }
+        (TypeForm::Array(array), Literal::Sequence(items)) => {
+            let mut completed = Vec::with_capacity(items.len());
+            let mut changed = false;
+            for item in items {
+                let value = complete(&array.items, &item.value);
+                changed |= matches!(value, Cow::Owned(_));
+                completed.push(crate::diag::Spanned {
+                    value: value.into_owned(),
+                    span: item.span.clone(),
+                });
+            }
+            if changed {
+                Cow::Owned(Literal::Sequence(completed))
+            } else {
+                Cow::Borrowed(value)
+            }
+        }
+        // A union carries no `default:` of its own (grammar 3.6) and still
+        // reaches here inside one: an object's default supplies a union-typed
+        // property as a mapping, and the variant that mapping's discriminator
+        // names is the field map to complete it against.
+        (TypeForm::Union(union), Literal::Mapping(entries)) => {
+            let tag = entries
+                .iter()
+                .find(|entry| entry.key.value == union.discriminator.value.as_str())
+                .and_then(|entry| match &entry.value.value {
+                    Literal::String(text) => Some(text.as_str()),
+                    _ => None,
+                });
+            union
+                .variants
+                .iter()
+                .find(|variant| Some(variant.tag.value.as_str()) == tag)
+                .map_or(Cow::Borrowed(value), |variant| {
+                    complete_mapping(&variant.fields, value)
+                })
+        }
+        _ => Cow::Borrowed(value),
+    }
+}
+
+/// A mapping literal completed against the field map it denotes a value of:
+/// every entry completed in place, then every declared property the mapping
+/// leaves out and that carries its own `default:` appended, in declaration
+/// order.
+///
+/// Written entries keep the order they were written in, so a literal that needs
+/// nothing back is the same bytes it always was.
+fn complete_mapping<'a>(
+    fields: &'a FieldMap,
+    value: &'a crate::ast::common::Literal,
+) -> Cow<'a, crate::ast::common::Literal> {
+    use crate::ast::common::{Literal, LiteralEntry};
+
+    let Literal::Mapping(entries) = value else {
+        return Cow::Borrowed(value);
+    };
+    let mut completed: Vec<LiteralEntry> = Vec::with_capacity(entries.len());
+    let mut changed = false;
+    for entry in entries {
+        let value = match fields.field(&entry.key.value) {
+            Some(field) => complete(&field.ty, &entry.value.value),
+            None => Cow::Borrowed(&entry.value.value),
+        };
+        changed |= matches!(value, Cow::Owned(_));
+        completed.push(LiteralEntry {
+            key: entry.key.clone(),
+            value: crate::diag::Spanned {
+                value: value.into_owned(),
+                span: entry.value.span.clone(),
+            },
+        });
+    }
+    for field in &fields.fields {
+        let name = field.name.value.as_str();
+        if entries.iter().any(|entry| entry.key.value == name) {
+            continue;
+        }
+        let Some(default) = declared_default_entry(&field.ty) else {
+            continue;
+        };
+        changed = true;
+        completed.push(LiteralEntry {
+            key: crate::diag::Spanned {
+                value: name.to_string(),
+                span: field.name.span.clone(),
+            },
+            value: crate::diag::Spanned {
+                value: complete(&field.ty, &default.value).into_owned(),
+                span: default.span.clone(),
+            },
+        });
+    }
+    if changed {
+        Cow::Owned(Literal::Mapping(completed))
+    } else {
+        Cow::Borrowed(value)
+    }
 }
 
 fn scalar_expression(scalar: &Scalar) -> String {
@@ -1003,11 +1232,11 @@ fn characters(count: i64) -> String {
 
 /// The check one `format:` lowers to (grammar 3.3).
 ///
-/// Four of the ten are Zod's own constructor, because on those four Zod's
+/// Three of the ten are Zod's own constructor, because on those three Zod's
 /// reading and JSON Schema's `format` keyword agree on every document the
-/// conformance corpus can find: `duration`, `uuid`, `ipv4`, `ipv6`.
+/// conformance corpus can find: `duration`, `ipv4`, `ipv6`.
 ///
-/// The other six are written out in [`HELPERS`] instead, because their
+/// The other seven are written out in [`HELPERS`] instead, because their
 /// constructors read a *different specification* from the one JSON Schema's
 /// keyword names — and JSON Schema is what a model is handed, so a value it
 /// blessed that the emitted Zod then refused is a run failing on its own
@@ -1022,6 +1251,10 @@ fn characters(count: i64) -> String {
 ///   a single-label domain, and an address literal.
 /// * `uri` — `z.url()` is the WHATWG parser, which repairs its input rather than
 ///   validating it.
+/// * `uuid` — `z.uuid()` enforces RFC 9562's version and variant nibbles, which
+///   the string representation JSON Schema's `uuid` reads does not constrain: a
+///   legacy GUID and a version-0 value are UUIDs to the published schema and not
+///   to the constructor.
 /// * `hostname` — `z.hostname()` accepts a trailing root dot.
 const fn zod_format(format: StringFormat) -> &'static str {
     match format {
@@ -1037,7 +1270,7 @@ const fn zod_format(format: StringFormat) -> &'static str {
             "z.string().refine(rfc5321Email, { message: \"expected an email address\" })"
         }
         StringFormat::Uri => "z.string().regex(rfc3986Uri)",
-        StringFormat::Uuid => "z.uuid()",
+        StringFormat::Uuid => "z.string().regex(rfc4122Uuid)",
         StringFormat::Hostname => {
             "z.string().refine(rfc1123Hostname, { message: \"expected a hostname\" })"
         }
@@ -1215,8 +1448,11 @@ pub fn json_type_node(ty: &TypeNode) -> Value {
     if let Some(description) = &ty.description {
         object.insert("description".to_string(), json!(description.value));
     }
-    if let Some(default) = declared_default(ty) {
-        object.insert("default".to_string(), json_literal(default));
+    // The value the `default:` denotes rather than the text it was written as —
+    // the same one the Zod column installs, so the published annotation and the
+    // parse beside it cannot say two different things (see [`effective_default`]).
+    if let Some(default) = effective_default(ty) {
+        object.insert("default".to_string(), json_literal(&default));
     }
     schema
 }
@@ -1380,8 +1616,16 @@ mod tests {
                 &format!("{CHANNEL}  a: {{ type: string, format: uuid }}\n"),
                 "state.a"
             ),
-            "z.uuid()",
-            "the four that agree with JSON Schema keep their constructor"
+            "z.string().regex(rfc4122Uuid)",
+            "`z.uuid()` enforces the version and variant nibbles the string form does not"
+        );
+        assert_eq!(
+            schema_of(
+                &format!("{CHANNEL}  a: {{ type: string, format: duration }}\n"),
+                "state.a"
+            ),
+            "z.iso.duration()",
+            "the three that agree with JSON Schema keep their constructor"
         );
     }
 
@@ -1463,6 +1707,98 @@ mod tests {
                 "state.a"
             ),
             "z.number().int().default(1)"
+        );
+    }
+
+    /// A `default:` denotes the value its literal **parses to**, so a property
+    /// the literal leaves out and that carries its own `default:` is filled in.
+    ///
+    /// Grammar 3.6 makes a defaulted property optional at its surface, so the
+    /// literal below validates and the validator accepts it; grammar 10.1 says
+    /// the channel is nevertheless total from step 0, which only the nested
+    /// default can make true. Zod agrees in the type system — `.default()` takes
+    /// the *output* type, where `count` is required — so emitting the literal as
+    /// written was a project `tsc` refused.
+    #[test]
+    fn a_default_is_completed_with_the_defaults_nested_inside_it() {
+        assert_eq!(
+            schema_of(
+                &format!(
+                    "{CHANNEL}  a:\n    type: object\n    properties:\n      count: {{ type: integer, default: 0 }}\n      other: {{ type: string }}\n    default: {{ other: \"x\" }}\n"
+                ),
+                "state.a"
+            ),
+            "z.object({\n  count: z.number().int().default(0),\n  other: z.string(),\n})\
+             .strict().default({ \"other\": \"x\", \"count\": 0 })",
+            "the written entries keep their order and the filled-in one is appended"
+        );
+
+        // One level further in: an array default whose items carry a default.
+        assert_eq!(
+            schema_of(
+                &format!(
+                    "{CHANNEL}  a:\n    type: array\n    max_items: 4\n    items:\n      type: object\n      properties:\n        page: {{ type: string }}\n        via: {{ type: string, default: direct }}\n    default: [{{ page: \"/\" }}]\n"
+                ),
+                "state.a"
+            ),
+            "z.array(z.object({\n  page: z.string(),\n  via: z.string().default(\"direct\"),\n})\
+             .strict()).max(4).default([{ \"page\": \"/\", \"via\": \"direct\" }])"
+        );
+
+        // And a union-typed property, which carries no `default:` of its own and
+        // still reaches the completion inside one: the variant its
+        // discriminator names is the field map to complete against.
+        let union = schema_of(
+            &format!(
+                "{CHANNEL}  a:\n    type: object\n    properties:\n      source:\n        discriminator: kind\n        variants:\n          upload: {{ name: {{ type: string }}, retries: {{ type: integer, default: 3 }} }}\n          crawl: {{ url: {{ type: string }} }}\n    default: {{ source: {{ kind: upload, name: \"f\" }} }}\n"
+            ),
+            "state.a",
+        );
+        assert!(
+            union.ends_with(
+                ".default({ \"source\": { \"kind\": \"upload\", \"name\": \"f\", \"retries\": 3 } })"
+            ),
+            "{union}"
+        );
+    }
+
+    /// The completion is the *same* value in both columns: the published
+    /// annotation and the value the parse installs cannot say different things.
+    #[test]
+    fn the_json_column_publishes_the_default_the_parse_installs() {
+        let ir = ir_of(&format!(
+            "{CHANNEL}  a:\n    type: object\n    properties:\n      count: {{ type: integer, default: 0 }}\n      other: {{ type: string }}\n    default: {{ other: \"x\" }}\n"
+        ));
+        let surfaces = surfaces(&ir);
+        let Body::Type(ty) = &surfaces[0].body else {
+            panic!("a channel is a type node");
+        };
+        assert_eq!(
+            json_type_node(ty)["default"],
+            json!({ "other": "x", "count": 0 })
+        );
+    }
+
+    /// A literal that needs nothing back is the bytes it always was — the
+    /// completion is not a rewrite of every default.
+    #[test]
+    fn a_default_that_supplies_everything_is_left_alone() {
+        let supplied = schema_of(
+            &format!(
+                "{CHANNEL}  a:\n    type: object\n    properties:\n      count: {{ type: integer, default: 0 }}\n      other: {{ type: string }}\n    default: {{ other: \"x\", count: 7 }}\n"
+            ),
+            "state.a",
+        );
+        assert!(
+            supplied.ends_with(".default({ \"other\": \"x\", \"count\": 7 })"),
+            "{supplied}"
+        );
+        assert_eq!(
+            schema_of(
+                &format!("{CHANNEL}  a:\n    type: string\n    default: \"x\"\n"),
+                "state.a"
+            ),
+            "z.string().default(\"x\")"
         );
     }
 

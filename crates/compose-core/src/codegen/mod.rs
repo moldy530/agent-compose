@@ -207,13 +207,22 @@ pub fn emit(ir: &Ir) -> GeneratedProject {
 ///   RE2 (Decision D12) and RE2 is not a subset of ECMAScript (see [`pattern`]).
 ///   Emitting it anyway produces a `src/schemas.ts` that fails to parse: not a
 ///   wrong schema, an unloadable module, and `build` exiting `0` over it.
-/// * **A state channel named after a property every JavaScript object carries.**
-///   `constructor` is a legal grammar 2.1 identifier and grammar 2.5 reserves
-///   only the seven roots, so the validator accepts it — and the emitted
-///   `channels` object is read by `StateGraph` with a plain property lookup, so
-///   the graph cannot be constructed (see [`state::INHERITED_PROPERTY_NAMES`]).
-///   That project type-checks and loads; it fails at `new StateGraph(State)`,
-///   which is past every gate a build has.
+/// * **A name every JavaScript object already answers to.** `constructor` is a
+///   legal grammar 2.1 identifier and grammar 2.5 reserves only the seven roots,
+///   so the validator accepts it wherever an identifier goes — and three of
+///   those positions become a **key read off a plain object** in the emitted
+///   project (see [`state::INHERITED_PROPERTY_NAMES`]):
+///   * a **state channel** name, which `StateGraph` looks up in its channel
+///     table before installing the channel, so the graph cannot be constructed;
+///   * a **schema property** name, which `z.object({…})` reads off the value it
+///     is parsing, so an omitted property arrives holding `Object` and the parse
+///     refuses a document the published JSON Schema accepts;
+///   * a **`discriminator`** name, which `z.discriminatedUnion` indexes its
+///     variants by, so the parse throws (`propValues[key].add is not a
+///     function`) rather than answering.
+///
+///   All three type-check, and the first two also load; each fails at a point no
+///   gate a build has would reach.
 ///
 /// So this is the pass between the validator and the emitter. It is the same
 /// shape as the validator — an [`Ir`] in, [`Diagnostic`]s out, spans included —
@@ -254,6 +263,54 @@ pub fn diagnostics(ir: &Ir) -> Vec<Diagnostic> {
                  spelling of it"
             )),
         );
+    }
+
+    // The same name, one level down: every key of an emitted object shape. The
+    // dedup is by span rather than by name, because a store's `value_schema` is
+    // a surface in its own right *and* is embedded in the row every `get` on it
+    // derives (grammar 11.4) — one declaration, one diagnostic.
+    let mut keys: std::collections::BTreeSet<(String, usize, usize)> =
+        std::collections::BTreeSet::new();
+    for surface in schema::surfaces(ir) {
+        surface.walk_keys(&mut |key, kind| {
+            let name = key.value.as_str();
+            if !state::inherited_property_name(name) {
+                return;
+            }
+            if !keys.insert((
+                key.span.source.as_str().to_string(),
+                key.span.bytes.start,
+                key.span.bytes.end,
+            )) {
+                return;
+            }
+            found.push(
+                Diagnostic::error(
+                    DiagnosticCode::InvalidValue,
+                    key.span.clone(),
+                    format!(
+                        "a {} named `{name}` is one this target cannot hold: the emitted schema \
+                         reads `{name}` off the value it is parsing with a plain property lookup, \
+                         which every JavaScript object answers from `Object.prototype` — so {}",
+                        kind.as_str(),
+                        match kind {
+                            schema::KeyKind::Property =>
+                                "a document that leaves it out is read as carrying a function \
+                                 there, and the parse refuses what the published JSON Schema \
+                                 accepts",
+                            schema::KeyKind::Discriminator =>
+                                "the union indexes its variants by a function and the parse throws \
+                                 instead of answering",
+                        }
+                    ),
+                )
+                .with_help(format!(
+                    "rename it — grammar 3.8 lowers this schema to an object keyed by the names it \
+                     declares, so `{name}` is the key the emitted parse has to use and there is no \
+                     second spelling of it"
+                )),
+            );
+        });
     }
 
     let mut reported: std::collections::BTreeSet<(String, usize, usize, String)> =
@@ -513,11 +570,130 @@ state:
         );
     }
 
+    /// The same name one level down: a **schema property** and a
+    /// **`discriminator`** are keys of an emitted object shape too, and the
+    /// prototype lookup does not care which of the three positions it is in.
+    ///
+    /// Each of these is a project the compiler used to emit happily. The
+    /// property one type-checks, loads, and then refuses `{"a": "x"}` — a
+    /// document its own published JSON Schema accepts, because grammar 3.6 makes
+    /// a defaulted property optional — with `expected string, received
+    /// function`. The discriminator one gets further still: it type-checks,
+    /// constructs its graph, and throws `propValues[key].add is not a function`
+    /// out of the first `safeParse`.
+    #[test]
+    fn a_schema_key_named_after_a_property_every_object_carries_is_refused() {
+        let ir = ir_of(
+            r#"version: "0.1"
+
+state:
+  proto:
+    type: object
+    properties:
+      a: { type: string }
+      constructor: { type: string, default: "d" }
+  tagged:
+    type: array
+    max_items: 4
+    items:
+      discriminator: constructor
+      variants:
+        one: { x: { type: string } }
+        two: { y: { type: integer } }
+  fine:
+    type: object
+    properties:
+      constructors: { type: string }
+      construct: { type: string }
+"#,
+        );
+        let reported = diagnostics(&ir);
+        assert_eq!(reported.len(), 2, "{reported:#?}");
+        assert!(reported.iter().all(Diagnostic::is_error));
+
+        assert!(
+            reported[0]
+                .message
+                .contains("a schema property named `constructor`"),
+            "{:?}",
+            reported[0].message
+        );
+        assert!(
+            reported[0]
+                .message
+                .contains("the parse refuses what the published JSON Schema accepts"),
+            "the message says which way it fails: {:?}",
+            reported[0].message
+        );
+        // The span is the property key itself, not the channel above it.
+        assert_eq!(
+            (
+                reported[0].span.start.line,
+                reported[0].span.start.column,
+                reported[0].span.bytes.len()
+            ),
+            (8, 7, "constructor".len()),
+        );
+
+        assert!(
+            reported[1]
+                .message
+                .contains("a discriminator named `constructor`"),
+            "{:?}",
+            reported[1].message
+        );
+        assert!(
+            reported[1].message.contains("throws instead of answering"),
+            "{:?}",
+            reported[1].message
+        );
+        assert_eq!(
+            (
+                reported[1].span.start.line,
+                reported[1].span.start.column,
+                reported[1].span.bytes.len()
+            ),
+            (13, 22, "constructor".len()),
+        );
+    }
+
+    /// A key two surfaces reach is reported once, and a variant *tag* — which is
+    /// a value rather than a key — is not reported at all.
+    #[test]
+    fn a_schema_key_reached_by_more_than_one_surface_is_reported_once() {
+        let ir = ir_of(
+            r#"version: "0.1"
+
+store.s:
+  kind: kv
+  scope: global
+  description: Holds a row.
+  value_schema:
+    constructor: { type: string }
+
+flow.f:
+  outputs: {}
+  nodes:
+    look: { store: store.s, op: get, key: "'k'" }
+    again: { store: store.s, op: get, key: "'j'" }
+  edges:
+    - { from: start, to: look }
+    - { from: look, to: again }
+    - { from: again, to: end }
+"#,
+        );
+        let reported = diagnostics(&ir);
+        assert_eq!(reported.len(), 1, "{reported:#?}");
+        assert!(reported[0].message.contains("a schema property"));
+    }
+
     /// Grammar 2.1's identifier admits exactly one of the inherited property
     /// names, so `constructor` is the whole of what this check can ever report —
-    /// which is why it is the only name the corpus and the fixtures carry.
+    /// in any of the three positions, since a channel name, a field-map property
+    /// name and a `discriminator` are all that one identifier class. It is why
+    /// it is the only name the corpus and the fixtures carry.
     #[test]
-    fn constructor_is_the_only_inherited_property_name_a_channel_can_be_called() {
+    fn constructor_is_the_only_inherited_property_name_an_identifier_can_spell() {
         let reachable: Vec<&str> = state::INHERITED_PROPERTY_NAMES
             .iter()
             .copied()

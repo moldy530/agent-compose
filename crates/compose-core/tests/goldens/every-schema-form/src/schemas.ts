@@ -129,6 +129,18 @@ const rfc3986Uri =
   /^[A-Za-z][A-Za-z0-9+\-.]*:(?:\/\/(?:(?:[A-Za-z0-9\-._~!$&'()*+,;=:]|%[0-9A-Fa-f]{2})*@)?(?:\[[A-Za-z0-9:.]+\]|(?:[A-Za-z0-9\-._~!$&'()*+,;=]|%[0-9A-Fa-f]{2})*)(?::\d*)?(?:\/(?:[A-Za-z0-9\-._~!$&'()*+,;=:@]|%[0-9A-Fa-f]{2})*)*|\/?(?:(?:[A-Za-z0-9\-._~!$&'()*+,;=:@]|%[0-9A-Fa-f]{2})+(?:\/(?:[A-Za-z0-9\-._~!$&'()*+,;=:@]|%[0-9A-Fa-f]{2})*)*)?)(?:\?(?:[A-Za-z0-9\-._~!$&'()*+,;=:@/?]|%[0-9A-Fa-f]{2})*)?(?:#(?:[A-Za-z0-9\-._~!$&'()*+,;=:@/?]|%[0-9A-Fa-f]{2})*)?$/;
 
 /**
+ * `format: uuid` (grammar 3.3): the RFC 4122 (now RFC 9562) string
+ * representation — five hyphen-separated groups of hex digits, in either case,
+ * which is exactly what JSON Schema's `uuid` reads. `z.uuid()` is a narrower
+ * check: it also enforces the version and variant nibbles of the *layout*, so it
+ * refuses a Microsoft GUID (`…-c456-…`), a version-0 or version-9 value, and
+ * anything else a system upstream of this one minted without following RFC
+ * 9562's field rules. The published schema blesses those, so the parse beside it
+ * has to as well.
+ */
+const rfc4122Uuid = /^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/;
+
+/**
  * `format: email` (grammar 3.3): an RFC 5322 `addr-spec` whose domain is an RFC
  * 1123 host name or an address literal — the reading JSON Schema's `email`
  * takes. `z.email()` is a deliberately narrow subset of it and refuses three
@@ -421,9 +433,13 @@ export const stateWhere = z.string().regex(rfc3986Uri);
 export type StateWhere = z.infer<typeof stateWhere>;
 
 /** State channel `which` — its declared type (grammar 10.1). */
-export const stateWhich = z.uuid();
+export const stateWhich = z.string().regex(rfc4122Uuid);
 export type StateWhich = z.infer<typeof stateWhich>;
 
 /** State channel `who` — its declared type (grammar 10.1). */
 export const stateWho = z.string().refine(rfc5321Email, { message: "expected an email address" });
 export type StateWho = z.infer<typeof stateWho>;
+
+/** State channel `word` — its declared type (grammar 10.1). */
+export const stateWord = z.string().regex(/\bcat\b/);
+export type StateWord = z.infer<typeof stateWord>;

@@ -72,6 +72,7 @@ const RESERVED: &[&str] = &[
     "rfc3339Time",
     "rfc3339DateTime",
     "rfc3986Uri",
+    "rfc4122Uuid",
     "rfc5321Email",
     // `src/state.ts`
     "Annotation",

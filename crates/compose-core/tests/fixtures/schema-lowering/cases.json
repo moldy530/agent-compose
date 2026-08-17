@@ -315,7 +315,16 @@
       { "why": "a version 4 UUID", "valid": true, "document": "3f2504e0-4f89-41d3-9a0c-0305e82c3301" },
       { "why": "the nil UUID", "valid": true, "document": "00000000-0000-0000-0000-000000000000" },
       { "why": "upper case is the same UUID", "valid": true, "document": "3F2504E0-4F89-41D3-9A0C-0305E82C3301" },
+      { "why": "a Microsoft GUID: the variant nibble is `c`, which RFC 9562's layout does not define and its string production does not constrain. `z.uuid()` refuses it, which is why `format: uuid` is written out rather than borrowed from that constructor", "valid": true, "document": "123e4567-e89b-12d3-c456-426614174000" },
+      { "why": "the other reserved variant nibble", "valid": true, "document": "123e4567-e89b-12d3-d456-426614174000" },
+      { "why": "version nibble 0, which no RFC 9562 version uses", "valid": true, "document": "123e4567-e89b-02d3-a456-426614174000" },
+      { "why": "version nibble 9, which no RFC 9562 version uses either", "valid": true, "document": "123e4567-e89b-92d3-a456-426614174000" },
       { "why": "a hyphen out of place", "valid": false, "document": "3f2504e04f8941d39a0c0305e82c3301" },
+      { "why": "one hex digit too many", "valid": false, "document": "3f2504e0-4f89-41d3-9a0c-0305e82c33011" },
+      { "why": "`g` is not a hex digit", "valid": false, "document": "3f2504e0-4f89-41d3-9a0c-0305e82c330g" },
+      { "why": "the braced Microsoft spelling is a different string representation", "valid": false, "document": "{3f2504e0-4f89-41d3-9a0c-0305e82c3301}" },
+      { "why": "and so is the URN form", "valid": false, "document": "urn:uuid:3f2504e0-4f89-41d3-9a0c-0305e82c3301" },
+      { "why": "surrounding space is not trimmed", "valid": false, "document": " 3f2504e0-4f89-41d3-9a0c-0305e82c3301" },
       { "why": "one hex digit short", "valid": false, "document": "3f2504e0-4f89-41d3-9a0c-0305e82c330" },
       { "why": "not a UUID", "valid": false, "document": "nope" }
     ]
@@ -415,6 +424,21 @@
       { "why": "two is not one", "valid": false, "document": "ab" },
       { "why": "and the empty string has none", "valid": false, "document": "" },
       { "why": "one astral character is one code point and two UTF-16 code units, so a flagless `/^.$/` matches only half of it. The `u` flag that would fix it refuses escapes RE2 accepts, which is why `codegen::pattern` does not add one", "valid": true, "zod": false, "divergence": "dot-matches-a-code-unit", "document": "😀" },
+      { "why": "a pattern is still a string check", "valid": false, "document": 1 }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "state.word",
+    "about": "`\\b` in a `pattern`: a word boundary over ASCII word characters in the emitted JavaScript literal, and over Unicode ones in the engine that reads the published schema",
+    "documents": [
+      { "why": "the word on its own, boundaries at both ends", "valid": true, "document": "cat" },
+      { "why": "a `pattern` is an unanchored search in both columns", "valid": true, "document": "the cat sat" },
+      { "why": "`!` is a non-word character in both columns, so the boundary holds", "valid": true, "document": "cat!" },
+      { "why": "an ASCII digit is a word character in both columns, so there is no boundary after `cat`", "valid": false, "document": "cat1" },
+      { "why": "`é` is a word character to the validating engine and not to ECMAScript, so the boundary holds only in the emitted column. This is `\\w`'s divergence in the one place the ECMAScript translation cannot reach: it rewrites the classes and leaves the boundary alone", "valid": false, "zod": true, "divergence": "word-boundary-is-unicode-aware", "document": "caté" },
+      { "why": "the same, on the leading boundary", "valid": false, "zod": true, "divergence": "word-boundary-is-unicode-aware", "document": "écat" },
+      { "why": "and outside Latin: `中` is a word character to the validating engine only", "valid": false, "zod": true, "divergence": "word-boundary-is-unicode-aware", "document": "cat中" },
       { "why": "a pattern is still a string check", "valid": false, "document": 1 }
     ]
   },

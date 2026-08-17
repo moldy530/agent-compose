@@ -459,6 +459,10 @@ fn an_invalid_composition_is_reported_and_nothing_is_written() {
 /// no spelling for an inline flag group — copying it into `src/schemas.ts` would
 /// produce a module that fails to parse, taking every schema in it with it. The
 /// bug this pins is `build` exiting `0` over exactly that.
+///
+/// Two of the four are the quieter half: `^[]-]$` and `^[a[b]]$` both *parse* as
+/// JavaScript and denote a different set there, so nothing fails and the
+/// published schema and the emitted parse answer differently.
 #[test]
 fn a_pattern_javascript_cannot_express_refuses_the_build_but_not_validation() {
     let projects = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/projects");
@@ -494,9 +498,15 @@ fn a_pattern_javascript_cannot_express_refuses_the_build_but_not_validation() {
         "(?i)^abc$",
         "(?P<word>…)",
         "(?<word>…)",
-        "main.yml:15:10",
-        "main.yml:16:10",
-        "is valid and cannot be compiled for `local`: 2 errors",
+        "writes `]` unescaped inside a character class",
+        "^[]-]$",
+        "nests a character class",
+        "^[a[b]]$",
+        "main.yml:23:12",
+        "main.yml:24:12",
+        "main.yml:25:12",
+        "main.yml:26:12",
+        "is valid and cannot be compiled for `local`: 4 errors",
     ] {
         assert!(
             report.contains(expected),
@@ -506,6 +516,10 @@ fn a_pattern_javascript_cannot_express_refuses_the_build_but_not_validation() {
     assert!(
         !report.contains("(?<word>[a-z]+)-"),
         "the control pattern uses only what both engines share and is not reported:\n{report}"
+    );
+    assert!(
+        !report.contains("^[\\]-]$"),
+        "the escaped class is the spelling that transfers and is not reported:\n{report}"
     );
     assert_eq!(
         files_under(&out),
@@ -574,6 +588,74 @@ fn a_channel_name_the_target_cannot_hold_refuses_the_build_but_not_validation() 
     assert!(
         !report.contains("`construct`") && !report.contains("`constructors`"),
         "the neighbours in the same section are not reported:\n{report}"
+    );
+    assert_eq!(
+        files_under(&out),
+        Vec::<String>::new(),
+        "a composition this target cannot express produces no project"
+    );
+}
+
+/// The same name one level down: a **schema property** and a **discriminator**
+/// are keys of an emitted object shape too, and both refuse the build.
+///
+/// The channel rule above is about the one key `StateGraph` reads. These are the
+/// keys `z.object({…})` and `z.discriminatedUnion` read, off the value being
+/// parsed, and the failure is quieter than the channel one in both cases: the
+/// property version type-checks, loads, constructs its graph, and then refuses a
+/// document the project's own published JSON Schema accepts; the discriminator
+/// version gets that far and throws out of the first `safeParse`.
+#[test]
+fn a_schema_key_the_target_cannot_hold_refuses_the_build_but_not_validation() {
+    let projects = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/projects");
+    let out = scratch("schema-key");
+
+    let validated = Command::cargo_bin("agent-compose")
+        .expect("the binary under test is built")
+        .current_dir(&projects)
+        .env("NO_COLOR", "1")
+        .args(["validate", "one-unrepresentable-schema-key/main.yml"])
+        .output()
+        .expect("the command runs");
+    assert_eq!(
+        code(&validated),
+        0,
+        "the composition is valid; `constructor` is a legal identifier: {}",
+        stderr(&validated)
+    );
+
+    let built = Command::cargo_bin("agent-compose")
+        .expect("the binary under test is built")
+        .current_dir(&projects)
+        .env("NO_COLOR", "1")
+        .args(["build", "one-unrepresentable-schema-key/main.yml", "--out"])
+        .arg(&out)
+        .output()
+        .expect("the command runs");
+
+    assert_eq!(code(&built), 1, "{}", stderr(&built));
+    let report = stderr(&built);
+    for expected in [
+        "a schema property named `constructor`",
+        "a discriminator named `constructor`",
+        "Object.prototype",
+        "rename it",
+        // Each span is the key itself, where it is written.
+        "main.yml:28:7",
+        "main.yml:30:20",
+        "is valid and cannot be compiled for `local`: 2 errors",
+    ] {
+        assert!(
+            report.contains(expected),
+            "the report does not carry `{expected}`:\n{report}"
+        );
+    }
+    assert!(
+        !report.contains("`constructors`")
+            && !report.contains("`construct`")
+            && !report.contains("constructor_name")
+            && !report.contains("named `kind`"),
+        "the neighbours in the same file are not reported:\n{report}"
     );
     assert_eq!(
         files_under(&out),
