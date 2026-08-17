@@ -16,14 +16,17 @@
 //! licence to replace what is already there. So:
 //!
 //! * **writing** replaces every emitted file and **removes** any other file under
-//!   `src/` *that this compiler wrote*, then prunes the directories left empty. A
-//!   module that was renamed between two compiler releases would otherwise
-//!   linger, still importable, and `--check` would report it forever on a project
-//!   that had just been rebuilt. A file under `src/` with no generated-file
-//!   header is not the compiler's to delete, and an emitted path already
-//!   occupied in a directory the compiler has never built into is not its to
-//!   replace; either one stops the write instead — see [`write`] — because
-//!   `--out` can name a directory the compiler never made.
+//!   `src/` *that this compiler wrote*, then prunes the directories **that
+//!   removal** left empty. A module that was renamed between two compiler
+//!   releases would otherwise linger, still importable, and `--check` would
+//!   report it forever on a project that had just been rebuilt. A file under
+//!   `src/` with no generated-file header is not the compiler's to delete, and
+//!   an emitted path already occupied in a directory the compiler has never
+//!   built into is not its to replace; either one stops the write instead — see
+//!   [`write`] — because `--out` can name a directory the compiler never made.
+//!   An empty directory under `src/` is neither: it holds nothing to lose and
+//!   nothing to refuse over, so it is simply left where it is
+//!   ([`prune_emptied_directories`]).
 //! * **checking** reports a file that is missing, one whose bytes differ, and one
 //!   under `src/` that the emitter did not produce — the three ways a committed
 //!   project can stop matching its spec (PRD §8: "hand-edited generated code
@@ -198,7 +201,7 @@ pub(crate) fn write(project: &GeneratedProject, out: &Path) -> Result<Written, R
     for path in &stale {
         std::fs::remove_file(at(out, path))?;
     }
-    prune_empty_directories(&out.join(compose_core::codegen::OWNED_DIRECTORY))?;
+    prune_emptied_directories(out, &stale)?;
 
     Ok(Written {
         files: project.files().len(),
@@ -338,27 +341,33 @@ fn owned_files(out: &Path) -> io::Result<Vec<String>> {
     Ok(found)
 }
 
-/// Remove the directories under `src/` that hold nothing, deepest first, and
-/// `src/` itself if it is empty.
-fn prune_empty_directories(root: &Path) -> io::Result<()> {
-    let mut directories = Vec::new();
-    let mut queue = vec![root.to_path_buf()];
-    while let Some(directory) = queue.pop() {
-        let entries = match std::fs::read_dir(&directory) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
-        };
-        for entry in entries {
-            let entry = entry?;
-            if entry.file_type()?.is_dir() {
-                queue.push(entry.path());
-            }
+/// Remove the directories **this write** emptied: the ancestors, under `src/`,
+/// of the files it removed, deepest first.
+///
+/// A module that moved between two compiler releases leaves its directory
+/// behind, and a rebuild that left it there would report drift forever on a
+/// project it had just rebuilt — so the removal has to take the directory with
+/// it. What it must not take is a directory the compiler never created. An empty
+/// `src/vendor/` is not a file, so [`owned_files`] does not see it, [`claimed`]
+/// has nothing to refuse over it, and a sweep of every empty directory under
+/// `src/` deleted it on the *first* build into the directory — the one case the
+/// module header says is not the compiler's to touch.
+///
+/// Scoping it to the ancestors of what was removed is the whole of the fix: a
+/// directory this write did not empty is a directory it has no claim on,
+/// whatever else is or is not in it.
+fn prune_emptied_directories(out: &Path, removed: &[String]) -> io::Result<()> {
+    let root = out.join(compose_core::codegen::OWNED_DIRECTORY);
+    let mut directories: BTreeSet<PathBuf> = BTreeSet::new();
+    for path in removed {
+        let mut directory = at(out, path);
+        while directory.pop() && directory.starts_with(&root) {
+            directories.insert(directory.clone());
         }
-        directories.push(directory);
     }
-    // Deepest first, so a directory holding only empty directories is empty by
-    // the time it is reached.
+    // Deepest first, so a directory holding only directories this write emptied
+    // is empty by the time it is reached.
+    let mut directories: Vec<PathBuf> = directories.into_iter().collect();
     directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
     for directory in directories {
         if std::fs::read_dir(&directory).is_ok_and(|mut entries| entries.next().is_none()) {
@@ -497,6 +506,51 @@ mod tests {
             "nothing outside `src/` is removed"
         );
         assert!(out.join("package-lock.json").is_file());
+    }
+
+    /// The prune takes the directories *this write* emptied and no others.
+    ///
+    /// An empty directory under `src/` is invisible to every refusal the write
+    /// makes: `owned_files` collects files, so there is nothing to call foreign,
+    /// and `claimed` has no header to read. A sweep of every empty directory
+    /// under `src/` therefore deleted one on the **first** build into a
+    /// directory — which is exactly the case the module header says is not the
+    /// compiler's to touch.
+    #[test]
+    fn a_directory_the_write_did_not_empty_is_left_where_it_is() {
+        let project = project();
+        let out = scratch("keep-directory");
+        std::fs::create_dir_all(out.join("src/keepme")).expect("writable");
+        std::fs::create_dir_all(out.join("src/nested/deeper")).expect("writable");
+
+        assert_eq!(
+            write(&project, &out).expect("writable"),
+            Written {
+                files: project.files().len(),
+                removed: Vec::new(),
+            },
+            "an empty directory is not a file the write has anything to say about"
+        );
+        assert!(
+            out.join("src/keepme").is_dir() && out.join("src/nested/deeper").is_dir(),
+            "a first build emptied a directory it never created"
+        );
+
+        // …and the directory a removal *does* empty still goes, at any depth.
+        std::fs::write(
+            out.join("src/nested/deeper/old.ts"),
+            "// This file was generated by agent-compose 0.0.1 from `main.yml`.\n",
+        )
+        .expect("writable");
+        assert_eq!(
+            write(&project, &out).expect("writable").removed,
+            ["src/nested/deeper/old.ts".to_string()]
+        );
+        assert!(
+            !out.join("src/nested").exists(),
+            "the empty chain the removal left behind is pruned to `src/`"
+        );
+        assert!(out.join("src/keepme").is_dir(), "and nothing beside it is");
     }
 
     /// A `src/` the compiler did not write is not a `src/` it may empty.
