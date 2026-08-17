@@ -128,6 +128,13 @@ const CODEGEN: &[Criterion] = &[
                 "an_agent_node_sends_its_prompt_input_and_output_schema_on_chat_completions",
                 Status::Live,
             ),
+            // The other thing that surface can answer with: a refusal, which
+            // carries its reason and is otherwise indistinguishable from a
+            // `max_tokens` cut.
+            (
+                "a_refused_answer_carries_the_reason_the_model_gave",
+                Status::Live,
+            ),
             (
                 "an_agent_node_bounds_its_tool_loop_at_max_tool_iterations",
                 Status::Live,

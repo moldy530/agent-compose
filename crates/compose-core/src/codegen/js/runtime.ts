@@ -295,8 +295,24 @@ function describe(error: unknown): string {
 // Providers and models
 // ---------------------------------------------------------------------------
 
-/** The four provider kinds that speak an HTTP surface (grammar 12.1). */
-export type ProviderKind = "anthropic" | "openai" | "openai_compatible" | "azure_openai";
+/**
+ * Every `kind:` grammar 12.1 admits — including the two this runtime cannot
+ * call.
+ *
+ * Four of them speak an HTTP surface. `bedrock` and `vertex` are reached
+ * through a cloud SDK, which is why grammar 12.1's rows give them neither
+ * `base_url:` nor `headers:`: there is no bare endpoint to point at. They are
+ * here because the type has to describe every binding the compiler emits — a
+ * composition declaring one is valid, and `build` writes its project — and
+ * [`callModel`] is where the gap is reported, once, in the run that reached it.
+ */
+export type ProviderKind =
+  | "anthropic"
+  | "openai"
+  | "openai_compatible"
+  | "azure_openai"
+  | "bedrock"
+  | "vertex";
 
 /** A resolved `provider.*` (grammar 12.1). Values are read when a node runs. */
 export interface ProviderBinding {
@@ -365,6 +381,15 @@ export interface ModelAnswer {
    * Completions, whose answer is a message rather than a block list).
    */
   readonly content?: readonly unknown[];
+  /**
+   * The reason the model gave for declining, on a surface that states one.
+   *
+   * Chat Completions answers a refusal with `content: null` and a `refusal`
+   * string, which is otherwise indistinguishable from an answer cut short by
+   * `max_tokens` — both arrive as no structured output. Carrying it lets the
+   * node error say which happened.
+   */
+  readonly refusal?: string | null;
 }
 
 /**
@@ -402,9 +427,35 @@ function baseUrl(provider: ProviderBinding): string {
   if (provider.baseUrl !== undefined) return provider.baseUrl.replace(/\/+$/, "");
   if (provider.kind === "anthropic") return "https://api.anthropic.com";
   if (provider.kind === "openai") return "https://api.openai.com";
+  // `openai_compatible` and `azure_openai` require `base_url:` (grammar 12.1),
+  // so reaching this is a binding that lost one between the spec and the
+  // process — not an author who forgot to declare it.
   throw new Error(
-    `\`${provider.address}\` is \`kind: ${provider.kind}\`, which has no default endpoint: declare \`base_url:\``,
+    `\`${provider.address}\` is \`kind: ${provider.kind}\` and reached the wire with no \`base_url:\``,
   );
+}
+
+/**
+ * One header set out of the layers that compose it, later layers winning.
+ *
+ * Header names are **case-insensitive** (grammar 6.1, 12.1) and `fetch` is not:
+ * it builds its `Headers` by *appending* each key of the object it is handed, so
+ * `Content-Type` beside `content-type` reaches the server as one header carrying
+ * both values joined by a comma — two media types in the field an API dispatches
+ * on. Folding the name is what makes a declared header replace the one this
+ * runtime would have sent rather than join it; the spelling that won is the one
+ * that goes out, because a server is entitled to read the name it was sent.
+ */
+function headerSet(
+  ...layers: readonly (Readonly<Record<string, string>> | undefined)[]
+): Record<string, string> {
+  const folded = new Map<string, [string, string]>();
+  for (const layer of layers) {
+    for (const [name, value] of Object.entries(layer ?? {})) {
+      folded.set(name.toLowerCase(), [name, value]);
+    }
+  }
+  return Object.fromEntries(folded.values());
 }
 
 async function send(
@@ -416,7 +467,7 @@ async function send(
 ): Promise<Record<string, unknown>> {
   const response = await fetch(url, {
     method: "POST",
-    headers: { "content-type": "application/json", ...headers, ...(model.provider.headers ?? {}) },
+    headers: headerSet({ "content-type": "application/json" }, headers, model.provider.headers),
     body: JSON.stringify(body),
     signal,
   });
@@ -438,6 +489,15 @@ export async function callModel(
   },
   signal: AbortSignal,
 ): Promise<ModelAnswer> {
+  // Grammar 12.1's two SDK-reached kinds. There is no request to compose for
+  // them — no endpoint, no header set, and a signing scheme that belongs to a
+  // cloud SDK — so the gap is reported here rather than as a malformed call.
+  // `base_url:` is not the fix: those rows do not take one.
+  if (model.provider.kind === "bedrock" || model.provider.kind === "vertex") {
+    throw new Error(
+      `\`${model.provider.address}\` is \`kind: ${model.provider.kind}\`, which is reached through a cloud SDK rather than an HTTP endpoint (grammar 12.1) and which this compiler release does not call: bind \`${model.address}\` to an \`anthropic\`, \`openai\`, \`openai_compatible\` or \`azure_openai\` provider`,
+    );
+  }
   return model.provider.kind === "anthropic"
     ? await callMessages(model, request, signal)
     : await callChatCompletions(model, request, signal);
@@ -622,6 +682,10 @@ async function callChatCompletions(
     structured:
       request.pinned === undefined || content === null ? null : (JSON.parse(content) as unknown),
     stopReason: (choice["finish_reason"] as string | null) ?? null,
+    // A refusal is `content: null` beside a stated reason (WIRE-NOTES (3)). The
+    // absence of content is what every other branch here sees; the reason is the
+    // only thing that tells a refusal from a `max_tokens` cut.
+    refusal: (message["refusal"] as string | null) ?? null,
   };
 }
 
@@ -716,8 +780,18 @@ export async function callAgent(
     context.signal,
   );
   if (final.structured === null) {
+    // Why there is no answer, where the surface said: a stated refusal first,
+    // and otherwise the stop reason, which is what tells a `max_tokens` cut from
+    // a model that simply sent nothing. Without either, "no structured output"
+    // is true and says nothing a reader can act on.
+    const why =
+      final.refusal !== undefined && final.refusal !== null
+        ? `: the model declined — ${final.refusal}`
+        : final.stopReason === null
+          ? ""
+          : ` (\`stop_reason: ${final.stopReason}\`)`;
     throw new Error(
-      `\`${agent.address}\` asked for \`${agent.output.name}\` and the answer carried no structured output`,
+      `\`${agent.address}\` asked for \`${agent.output.name}\` and the answer carried no structured output${why}`,
     );
   }
   return {
@@ -872,6 +946,21 @@ export async function runExec(
       });
       child.on("error", reject);
       child.on("close", (code) => resolve({ code: code ?? -1, stdout, stderr }));
+      // A command that never reads its input closes the pipe while this write is
+      // still in flight, and Node reports that as an `error` **event on the
+      // stream** rather than as a rejected promise. Unhandled, an EventEmitter
+      // `error` aborts the whole process — past `retry`, `timeout`, `skip` and
+      // `fallback` alike (grammar 9), past `runFlow`'s own `catch`, so the run
+      // would not even leave the trace PRD 5.3 promises, and under `serve` it
+      // would take every concurrent execution down with it. EPIPE is the child
+      // declining the input rather than a failure — `printf` declines it by
+      // design — so the exit code and the streams stay the result; a destroyed
+      // stream is this run being aborted, which the abort path already reports;
+      // anything else fails the node through the same promise a spawn error
+      // does.
+      child.stdin.on("error", (error: NodeJS.ErrnoException) => {
+        if (error.code !== "EPIPE" && error.code !== "ERR_STREAM_DESTROYED") reject(error);
+      });
       if (stdin !== undefined) {
         child.stdin.end(stdin);
       } else {
@@ -917,12 +1006,17 @@ export async function runHttp(
   for (const [name, value] of Object.entries(request.query ?? {})) {
     url.searchParams.set(name, typeof value === "string" ? value : JSON.stringify(value));
   }
-  const headers: Record<string, string> = {};
+  const declared: Record<string, string> = {};
   for (const header of binding.headers) {
-    headers[header.name] = interpolate(header.value);
+    declared[header.name] = interpolate(header.value);
   }
   const sendsBody = request.body !== undefined && !["GET", "HEAD"].includes(binding.method);
-  if (sendsBody) headers["content-type"] = "application/json";
+  // The body this runtime composes is JSON, so `application/json` is the media
+  // type a binding that said nothing gets — and a binding that *did* say
+  // something replaces it rather than adding to it. See [`headerSet`].
+  const headers = sendsBody
+    ? headerSet({ "content-type": "application/json" }, declared)
+    : headerSet(declared);
 
   const response = await fetch(url, {
     method: binding.method,

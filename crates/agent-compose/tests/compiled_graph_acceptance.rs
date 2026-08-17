@@ -860,6 +860,67 @@ fn an_agent_node_sends_its_prompt_input_and_output_schema_on_chat_completions() 
     assert!(provider.snapshot().is_drained());
 }
 
+/// A model that declines to answer says why, and the node error repeats it.
+///
+/// Chat Completions states a refusal as `content: null` beside a `refusal`
+/// string (`WIRE-NOTES.md` (3)). Every branch of the reader sees the same thing
+/// as an answer cut short by `max_tokens` — no structured output — so a node
+/// error built from the absence alone is true and useless: it cannot tell an
+/// author whose model refused from one whose budget ran out, and those have
+/// opposite fixes.
+///
+/// The refusal is served with [`Outcome::raw`] because it is exactly what the
+/// scripted shapes will not compose: a reply the *generated code* must reject.
+#[test]
+fn a_refused_answer_carries_the_reason_the_model_gave() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        LOCAL,
+        Outcome::raw(
+            200,
+            json!({
+                "id": "chatcmpl_refusal",
+                "object": "chat.completion",
+                "created": 1_735_689_600,
+                "model": LOCAL,
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "refusal": "I can't help with that request.",
+                    },
+                    "finish_reason": "stop",
+                }],
+                "usage": { "prompt_tokens": 12, "completion_tokens": 8, "total_tokens": 20 },
+            }),
+        ),
+    ));
+
+    let Some(run) = harness::invoke(
+        "agent-openai",
+        "flow.review",
+        &[("goal", "ship it"), ("draft", "a draft")],
+        &provider,
+    ) else {
+        return;
+    };
+    let failure = run.failed();
+    assert!(
+        failure.contains("I can't help with that request."),
+        "the node error repeats the reason the surface stated: {failure}"
+    );
+    assert!(
+        failure.contains("agent.reviewer"),
+        "…and names the agent that asked: {failure}"
+    );
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "an agent with no tools makes exactly one call, and a refusal ends it"
+    );
+}
+
 /// The conversation crosses from one agent node to the next: what the first was
 /// asked, what it answered, then what the second was asked (grammar 10.4, PRD
 /// 5.7 tier 3).
@@ -1785,9 +1846,8 @@ fn an_edge_guard_routes_on_the_source_nodes_structured_output() {
 ///
 /// CLAUDE.md makes this a CI gate: two interpreters is a semantic-drift risk, and
 /// the corpus is the mitigation. The Rust side already runs in
-/// `crates/compose-core/tests/cel_conformance.rs`; this is the other half.
-/// The Rust side already runs in `crates/compose-core/tests/cel_conformance.rs`;
-/// this is the other half, over the **same files**, run against the evaluator a
+/// `crates/compose-core/tests/cel_conformance.rs`; this is the other half, over
+/// the **same files**, run against the evaluator a
 /// built project embeds (`src/cel.ts`). The driver is committed beside this suite
 /// rather than written inline, because it carries a JSON reader that keeps `1`
 /// and `1.0` apart — the distinction the corpus's int64 cases exist to pin, and

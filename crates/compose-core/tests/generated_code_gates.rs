@@ -1,11 +1,12 @@
 //! The generated-code checks of CLAUDE.md's *Validation strategy*, run against
 //! the **real** pinned JavaScript toolchain.
 //!
-//! Eight gates. The first four are in increasing strength, each one existing
+//! Eleven gates. The first four are in increasing strength, each one existing
 //! because the one above it passes on code the one below it catches; the next two
 //! are about the schemas rather than the graph; the seventh is about a
-//! composition that has no generated project at all; and the last is about a
-//! rule the grammar states once per surface:
+//! composition that has no generated project at all; and the last four are
+//! about what a binding does on the wire, which no amount of type-checking or
+//! graph construction reaches:
 //!
 //! 1. **`tsc --noEmit`** — every golden project type-checks under its own strict
 //!    `tsconfig.json`, against installed `@langchain/langgraph`, `@langchain/core`
@@ -60,6 +61,21 @@
 //!    driven out of a golden's own runtime, over a payload with whitespace at
 //!    either end, so which reading this compiler took is a committed fact rather
 //!    than an accident of a shared decoder.
+//! 9. **A command that never reads its input** — grammar 8.2 writes a scalar
+//!    `input:` to the child's stdin, and `printf` exits without draining it. The
+//!    EPIPE that follows arrives as an `error` *event*, outside the promise the
+//!    node's own error policy is built on, so an unhandled one aborts the whole
+//!    process rather than failing the node. Nothing about a returned value is
+//!    wrong there — no value is returned — which is why it is a gate and not an
+//!    assertion.
+//! 10. **A declared `Content-Type`** — header names are case-insensitive
+//!     (grammar 6.1) and `fetch` composes its `Headers` by appending, so a
+//!     binding's own media type would ride out beside the runtime's instead of
+//!     replacing it. The server here is loopback and reports what it received.
+//! 11. **A bound input object on a `GET`** — the other half of the same
+//!     sentence: without `query:`/`body:`, the object goes out as query
+//!     parameters rather than as a body. Which slot codegen fills is a golden's
+//!     to commit; this is what the runtime does with what it was handed.
 //!
 //! # The toolchain fixture
 //!
@@ -630,6 +646,147 @@ fn a_raw_binding_trims_stdout_and_takes_a_response_body_verbatim() {
         "an `http` implementation binds the raw response text — every byte of \
          it, which is what its own sentence says"
     );
+}
+
+/// Gate 2f: a command that never reads its input still completes.
+///
+/// Grammar 8.2 sends a scalar `input:` to the child's standard input, and no
+/// command is obliged to drain it. When one does not, the pipe closes under a
+/// write still in flight and Node reports EPIPE as an `error` **event on the
+/// stream** — outside the promise `runExec` settles, so grammar 9's policies
+/// cannot see it: unhandled, it aborts the process past `retry`, `timeout`,
+/// `skip` and `fallback` alike, past the `catch` that writes the run's trace
+/// (PRD 5.3), and under `serve` it would end every concurrent execution.
+///
+/// A gate rather than a unit test because the failure is a property of the
+/// **process**: nothing about the returned value is wrong, the returned value
+/// never arrives. And a payload larger than a pipe buffer rather than a
+/// convenient one, because a small write lands in the kernel's buffer and
+/// succeeds whether or not anybody reads it — which is exactly how this shipped.
+#[test]
+fn a_command_that_never_reads_its_input_still_completes() {
+    let Some(root) = installed() else {
+        return;
+    };
+    let project = staged(goldens::golden("review-loop"), root, "unread-stdin");
+
+    let output = Command::new("node")
+        .arg(root.join("unread-stdin.mjs"))
+        .arg(&project)
+        .output()
+        .expect("node runs");
+    assert!(
+        output.status.success(),
+        "writing to a command that does not read its input killed the process:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let answer: Value =
+        serde_json::from_slice(&output.stdout).expect("the runner prints one JSON object");
+
+    assert!(
+        answer["sent"].as_u64().is_some_and(|bytes| bytes > 65_536),
+        "the payload has to exceed a pipe buffer for the write to fail at all, \
+         found {} bytes",
+        answer["sent"]
+    );
+    assert_eq!(
+        answer["result"]["exit_code"], 0,
+        "the child's own exit code is the node's outcome: declining the input is \
+         not a failure (grammar 8.2)"
+    );
+    assert_eq!(
+        answer["result"]["stdout"], "done",
+        "and its output is what the node decodes"
+    );
+}
+
+/// Gate 2g: a declared `Content-Type` replaces the runtime's rather than joining
+/// it.
+///
+/// Header names are case-insensitive (grammar 6.1) and `fetch` is not: it builds
+/// its `Headers` by appending each key of the object it is handed, so
+/// `Content-Type` declared beside the `content-type` `runHttp` sends with a JSON
+/// body reaches the server as one field carrying **both** media types. An API
+/// that dispatches on it answers 415 to a composition that reads correctly.
+///
+/// Both directions are asserted, because a runtime that dropped the header
+/// handling altogether would pass the first half: the declared media type is
+/// what arrives when there is one, and `application/json` is what arrives when
+/// there is not.
+#[test]
+fn a_declared_content_type_replaces_the_one_the_runtime_would_have_sent() {
+    let Some(answer) = http_request_gate("declared-headers") else {
+        return;
+    };
+    assert_eq!(
+        answer["declared"]["header"].as_str(),
+        Some("application/vnd.acme+json"),
+        "a declared media type is the whole of the header the server sees"
+    );
+    assert_eq!(
+        answer["default"]["header"].as_str(),
+        Some("application/json"),
+        "and a binding that declares none still says what its body is"
+    );
+    for which in ["declared", "default"] {
+        assert_eq!(
+            answer[which]["body"].as_str(),
+            Some(r#"{"goal":"g"}"#),
+            "the body is the bound object either way"
+        );
+    }
+}
+
+/// Gate 2h: the object a `GET` binding sends becomes the URL's parameters.
+///
+/// The other half of grammar 6.1's convention for a request the block did not
+/// write out: the bound input object is the JSON body on a body-bearing method
+/// and the **query string** on `GET`/`HEAD`. Which of the two slots codegen
+/// fills is committed in the goldens; this is what the runtime does with the
+/// object it was handed — that it reaches the server as parameters at all, and
+/// that a value which is not a string is spelled rather than dropped.
+#[test]
+fn a_bound_input_object_reaches_a_get_as_its_query_string() {
+    let Some(answer) = http_request_gate("query-string") else {
+        return;
+    };
+    let url = answer["query"]["url"]
+        .as_str()
+        .expect("the URL it received");
+    let (path, query) = url.split_once('?').unwrap_or((url, ""));
+    assert_eq!(path, "/tickets", "the binding's own path is untouched");
+    let mut parameters: Vec<&str> = query.split('&').collect();
+    parameters.sort_unstable();
+    assert_eq!(
+        parameters,
+        ["limit=3", "term=a+widget"],
+        "every property of the bound object is a parameter, percent-encoded, \
+         and a number is spelled rather than dropped"
+    );
+    assert_eq!(
+        answer["query"]["body"].as_str(),
+        Some(""),
+        "and a `GET` sends no body (grammar 6.1)"
+    );
+}
+
+/// The runner both `http:` request gates read, run once per gate so each one
+/// fails on its own.
+fn http_request_gate(purpose: &str) -> Option<Value> {
+    let root = installed()?;
+    let project = staged(goldens::golden("review-loop"), root, purpose);
+
+    let output = Command::new("node")
+        .arg(root.join("http-request.mjs"))
+        .arg(&project)
+        .output()
+        .expect("node runs");
+    assert!(
+        output.status.success(),
+        "the `http:` request runner failed:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    Some(serde_json::from_slice(&output.stdout).expect("the runner prints one JSON object"))
 }
 
 /// Gate 7: the channel names the compiler refuses are names LangGraph refuses.
