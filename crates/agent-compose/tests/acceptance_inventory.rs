@@ -228,6 +228,13 @@ const CODEGEN: &[Criterion] = &[
                 "a_failed_runs_trace_holds_what_landed_and_the_node_it_stopped_at",
                 Status::Live,
             ),
+            // The other end of the same record: a run that quiesced, so its
+            // trace is complete, and then could not materialize an output
+            // (grammar 7.6.3, 10.1). The trace has to survive that too.
+            (
+                "a_run_that_quiesces_without_an_output_fails_carrying_its_whole_trace",
+                Status::Live,
+            ),
         ],
     },
     Criterion {
@@ -244,6 +251,18 @@ const CODEGEN: &[Criterion] = &[
             // cannot reach.
             (
                 "the_review_loop_example_runs_its_cycle_against_the_mock_provider",
+                Status::Live,
+            ),
+            // Grammar 7.4's *other* clause, which PRD 5.4 accepts and which is
+            // not a static termination proof: a cycle whose only bound is a CEL
+            // exit condition runs as long as its guard says, and the superstep
+            // ceiling is what catches the one whose guard never goes false.
+            (
+                "a_cel_bounded_cycle_runs_the_passes_its_guard_asks_for",
+                Status::Live,
+            ),
+            (
+                "a_run_that_reaches_the_superstep_ceiling_says_which_bound_was_missing",
                 Status::Live,
             ),
         ],

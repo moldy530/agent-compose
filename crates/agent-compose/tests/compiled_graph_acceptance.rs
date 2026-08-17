@@ -1820,6 +1820,64 @@ fn reading_an_unset_channel_fails_the_run_whatever_the_error_policy_says() {
     );
 }
 
+/// A run that quiesces and then cannot answer fails like every other run that
+/// cannot answer, carrying the trace it made (PRD 5.3, grammar 7.6.3, 10.1).
+///
+/// The same unset channel as the test above, read at the *other* place a run
+/// reads state. There, the read builds a node's input and the graph dies
+/// mid-run; here the graph runs to quiescence and the read is the one
+/// materializing the flow's `outputs:` — so this is the failure whose routing
+/// record is **complete**. Every step landed; the whole account of how the flow
+/// got somewhere it could not answer from is in hand at the moment it fails.
+///
+/// Which is why the failure has to be the same shape as the others. Every caller
+/// of `runFlow` — `agent-compose run`, the generated `serve` app, this suite's
+/// own driver — reads `FlowFailure.trace`, and a bare `Error` raised past that
+/// type reports an empty trace for exactly the run that has a full one.
+#[test]
+fn a_run_that_quiesces_without_an_output_fails_carrying_its_whole_trace() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let Some(run) = harness::invoke_with(
+        "activities",
+        "flow.missing_output",
+        &json!({}),
+        &harness::environment(&provider),
+    ) else {
+        return;
+    };
+    let failure = run.failed();
+    assert!(
+        failure.contains("FlowFailure"),
+        "it fails as a `FlowFailure` — the one type a caller reads a trace off: \
+         {failure}"
+    );
+    assert!(
+        failure.contains("`pending`") && failure.contains("output field `pending`"),
+        "…naming the channel and the reader (grammar 10.1, Decision D78): {failure}"
+    );
+
+    assert_eq!(
+        run.visited(),
+        ["pick", "other"],
+        "the whole run is in the trace, because the whole run happened"
+    );
+    let pick = run.entries("pick");
+    assert_eq!(pick[0]["outcome"], "completed");
+    assert_eq!(
+        pick[0]["routing"]["targets"],
+        json!(["other"]),
+        "the routing decision survives the failure, which is the point of \
+         raising one that carries a trace: {}",
+        pick[0]
+    );
+    assert_eq!(
+        run.entries("other")[0]["writes"],
+        json!(["checks"]),
+        "…and so does what the branch it took wrote — to a channel that is not \
+         the one the output field reads"
+    );
+}
+
 /// A run that fails still reports every routing decision it made (PRD 5.3).
 ///
 /// The trace is the record of what a run did, and the runs it is most wanted for
@@ -2330,6 +2388,109 @@ fn a_bounded_cycle_leaves_through_its_escape_edge_when_the_budget_is_spent() {
     assert_eq!(
         review[3]["routing"]["edges"][0]["reason"],
         "the `max_iterations` budget is spent"
+    );
+}
+
+/// A cycle bounded only by a CEL exit condition runs the passes its guard asks
+/// for (PRD 5.4, grammar 7.4 clause 2).
+///
+/// Grammar 7.4's two clauses are proofs of different strength and the superstep
+/// ceiling a run takes has to be sized from both. Clause 1's `max_iterations` is
+/// a number the composition declares, so a ceiling can be derived from it;
+/// clause 2's exit condition declares nothing — grammar 7.4 says outright that
+/// only clause 1 makes a loop provably finite — so a ceiling derived from
+/// counting bounds alone gives a clause-2 cycle no budget at all and stops it at
+/// `25 + |nodes|` supersteps.
+///
+/// `flow.long_loop` is that shape reduced to nothing else: one node, no
+/// `max_iterations` anywhere, and a guard asking for 30 passes. `25 + 1` is 26,
+/// so a run of it is the difference between the two sizings — it either
+/// completes or dies at the net, and no assertion about the guard is needed to
+/// tell which.
+#[test]
+fn a_cel_bounded_cycle_runs_the_passes_its_guard_asks_for() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let Some(run) = harness::invoke_with(
+        "bounded-cycle",
+        "flow.long_loop",
+        &json!({}),
+        &harness::environment(&provider),
+    ) else {
+        return;
+    };
+    run.succeeded();
+
+    let passes = run.entries("step").len();
+    assert_eq!(
+        passes,
+        30,
+        "the guard's own count of passes ran, not the ceiling's: {:?}",
+        run.visited()
+    );
+    assert!(
+        passes > 26,
+        "…and more than `25 + |nodes|`, which is what a ceiling sized from \
+         counting bounds alone would have allowed"
+    );
+    assert_eq!(
+        run.outputs()["log"].as_array().map(Vec::len),
+        Some(30),
+        "every pass appended: {}",
+        run.outputs()["log"]
+    );
+}
+
+/// A run stopped by the superstep ceiling says which bound the composition was
+/// missing, rather than which knob LangGraph has (PRD 5.4, grammar 7.4).
+///
+/// Clause 2 is decided syntactically (Decision D98) and its guard is a runtime
+/// value, so `validate` accepts a loop whose exit condition never comes true and
+/// nothing inside the composition ends it. That is the case the ceiling exists
+/// for, and the diagnostic is the whole of what a reader gets: LangGraph
+/// announces reaching a `recursionLimit` with a link to its own troubleshooting
+/// page, naming a config key no `agent-compose` surface spells. The restatement
+/// has to name the composition's own missing bound instead, and keep LangGraph's
+/// error as the cause so nothing is hidden.
+#[test]
+fn a_run_that_reaches_the_superstep_ceiling_says_which_bound_was_missing() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let Some(run) = harness::invoke_with(
+        "bounded-cycle",
+        "flow.runaway",
+        &json!({}),
+        &harness::environment(&provider),
+    ) else {
+        return;
+    };
+    let failure = run.failed();
+
+    // The trace is the run's own count of the supersteps it took, so the message
+    // is checked against what happened rather than against a literal that would
+    // have to be edited every time the sizing moves.
+    let supersteps = run.trace().len();
+    assert!(
+        failure.contains(&format!("ceiling of {supersteps} supersteps")),
+        "the message names the ceiling the run actually reached: {failure}"
+    );
+    assert!(
+        failure.contains("grammar 7.4 clause 2") && failure.contains("max_iterations"),
+        "…says which bound the composition was missing, and how to declare it: \
+         {failure}"
+    );
+    assert!(
+        failure.contains("recursionLimit"),
+        "…and how to raise the net for one run instead: {failure}"
+    );
+    assert!(
+        failure.contains("GraphRecursionError"),
+        "LangGraph's own error is kept as the cause rather than replaced: \
+         {failure}"
+    );
+
+    assert!(
+        run.trace().iter().all(|entry| entry["node"] == "spin"),
+        "the trace of a run the net caught is still a trace: every superstep it \
+         took is in it (PRD 5.3)"
     );
 }
 

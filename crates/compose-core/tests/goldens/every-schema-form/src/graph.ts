@@ -644,9 +644,14 @@ export interface FlowRun {
  * anything runs, which is where an invocation that the flow cannot accept is
  * refused by field name (grammar 13.2).
  *
- * A run that does not reach quiescence raises `runtime.FlowFailure`, which
- * carries the trace it did make and the original error as its `cause` — see
- * `CompiledFlow.stream` for why the run is streamed to keep it.
+ * A run that produces no answer raises `runtime.FlowFailure`, which carries the
+ * trace it did make and the original error as its `cause` — see
+ * `CompiledFlow.stream` for why the run is streamed to keep it. Both of the ways
+ * that happens raise it: a run that never reached quiescence, and a run that
+ * reached quiescence holding no value for one of its `outputs:` fields
+ * (grammar 10.1, Decision D78). The second is the one whose trace is complete —
+ * every step landed — so dropping it there would lose the whole routing record
+ * of a run that made one.
  */
 export async function runFlow(
   address: string,
@@ -664,6 +669,7 @@ export async function runFlow(
     );
   }
   const parsed = flow.parse(inputs);
+  const ceiling = options.recursionLimit ?? flow.recursionLimit;
   let state: GraphState | undefined;
   try {
     const supersteps = await flow.stream(
@@ -677,7 +683,7 @@ export async function runFlow(
           },
         },
       },
-      { recursionLimit: options.recursionLimit ?? flow.recursionLimit },
+      { recursionLimit: ceiling },
     );
     for await (const superstep of supersteps) {
       // What LangGraph's own `invoke` keeps: the last chunk that is a state.
@@ -687,7 +693,14 @@ export async function runFlow(
       if (!isInterrupted(superstep)) state = superstep;
     }
   } catch (error) {
-    throw new runtime.FlowFailure(address, runtime.failedTrace(state, error), error);
+    throw new runtime.FlowFailure(
+      address,
+      "did not run to quiescence",
+      runtime.failedTrace(state, error),
+      // The one failure here that is not the composition's: LangGraph stopping
+      // the run at the ceiling, announced in its own vocabulary.
+      runtime.restateCeiling(ceiling, error),
+    );
   }
   if (state === undefined) {
     // Unreachable: `streamMode: "values"` emits the state the run started from
@@ -695,16 +708,30 @@ export async function runFlow(
     // function can answer for, and saying so beats reading `undefined` as empty.
     throw new Error(`\`${address}\` produced no state`);
   }
+  const quiesced = state;
 
   const outputs: Record<string, unknown> = {};
-  for (const field of flow.outputs) {
-    outputs[field] = runtime.channelValue(
-      state as unknown as Record<string, unknown>,
-      field,
-      `\`${address}\`'s output field \`${field}\``,
+  try {
+    for (const field of flow.outputs) {
+      outputs[field] = runtime.channelValue(
+        quiesced as unknown as Record<string, unknown>,
+        field,
+        `\`${address}\`'s output field \`${field}\``,
+      );
+    }
+  } catch (error) {
+    // Inside the same record as every other way a run fails to answer: the run
+    // got all the way here, so `$run.trace` holds every step it took, and that
+    // is the routing record a reader wants most when the flow cannot say what it
+    // produced (PRD 5.3).
+    throw new runtime.FlowFailure(
+      address,
+      "reached quiescence without an output",
+      quiesced.$run.trace,
+      error,
     );
   }
-  return { outputs, trace: state.$run.trace, state };
+  return { outputs, trace: quiesced.$run.trace, state: quiesced };
 }
 
 /**

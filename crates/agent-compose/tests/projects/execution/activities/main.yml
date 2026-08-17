@@ -37,6 +37,11 @@
 #     written fails the **execution**, naming the channel and the reader, and
 #     neither `on_error: skip` nor a `fallback:` absorbs it: those are strategies
 #     over a node's own error (grammar 10.1, 9.2, Decisions D78, D97, D110).
+#   * `flow.missing_output` — the same unset channel read at the *other* place a
+#     run reads state: materializing the flow's `outputs:` at quiescence
+#     (grammar 7.6.3). The run itself succeeds, so this is the failure whose
+#     routing record is complete — and therefore the one whose trace a report
+#     must still carry (PRD 5.3).
 #   * `flow.dead_end` — a completed node whose every outgoing edge is untaken,
 #     which is grammar 7.3 rule 7's failure. It is also the flow that fails
 #     *after* a step has landed, which is what makes the trace of a failed run
@@ -678,3 +683,35 @@ flow.unset_expression:
     - { from: start, to: bound }
     - { from: bound, to: end }
     - { from: rescue, to: end }
+
+flow.missing_output:
+  description: A run that reaches quiescence holding no value for its output field.
+  outputs:
+    # The one channel here with no `default:` and no writer anywhere in this
+    # flow, so it is still unset when the run quiesces — and materializing the
+    # outputs is where that is discovered (grammar 7.6.3, 10.1, Decision D78).
+    pending:
+      type: string
+  nodes:
+    # Runs and routes, so the run has a routing record to lose.
+    pick:
+      exec:
+        command: printf
+        args: ["%s", "pick"]
+        output:
+          stdout: { type: string }
+
+    other:
+      exec:
+        command: printf
+        args: ["%s", "other"]
+        output:
+          stdout: { type: string }
+      writes:
+        stdout: checks
+
+  edges:
+    - { from: start, to: pick }
+    - { from: pick, to: other, when: "pick.output.stdout == 'pick'" }
+    - { from: pick, to: end, else: true }
+    - { from: other, to: end }

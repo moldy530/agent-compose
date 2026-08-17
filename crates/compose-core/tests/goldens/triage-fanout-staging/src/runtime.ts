@@ -57,7 +57,7 @@
 import { spawn } from "node:child_process";
 import process from "node:process";
 
-import { Command } from "@langchain/langgraph";
+import { Command, GraphRecursionError } from "@langchain/langgraph";
 
 import { CelError, bind, evaluate, evaluateGuard, toJson } from "./cel.ts";
 import type { CelValue, Roots, Shape } from "./cel.ts";
@@ -1402,7 +1402,7 @@ export function abortedEntry(error: unknown): TraceEntry | undefined {
 }
 
 /**
- * A run that did not reach quiescence, and the trace it made before it stopped.
+ * A run that produced no answer, and the trace it made before it stopped.
  *
  * PRD 5.3 asks that routing decisions appear in traces as data, and a failed run
  * is where a trace is wanted most: it is the record of which guards answered
@@ -1412,6 +1412,13 @@ export function abortedEntry(error: unknown): TraceEntry | undefined {
  * state each superstep produced, and raises this in place of the error the graph
  * threw. The original is the `cause`, so a report that prints the chain says
  * exactly what it said before.
+ *
+ * `what` is which of a run's two ways of failing this is, because both of them
+ * have a trace to carry: a run that never reached quiescence, and a run that
+ * reached it and could not materialize an output (grammar 7.6.3, 10.1). One
+ * error type for both is what lets every caller — `agent-compose run`, the
+ * generated `serve` app, an ejected project — read `.trace` without asking which
+ * kind of failure it has.
  */
 export class FlowFailure extends Error {
   /** The flow that was running. */
@@ -1419,13 +1426,57 @@ export class FlowFailure extends Error {
   /** What landed, plus the entry of the node the run aborted at. */
   readonly trace: readonly TraceEntry[];
 
-  constructor(flow: string, trace: readonly TraceEntry[], cause: unknown) {
-    super(`\`${flow}\` did not run to quiescence: ${describe(cause)}`);
+  constructor(flow: string, what: string, trace: readonly TraceEntry[], cause: unknown) {
+    super(`\`${flow}\` ${what}: ${describe(cause)}`);
     this.name = "FlowFailure";
     this.flow = flow;
     this.trace = trace;
     this.cause = cause;
   }
+}
+
+/**
+ * A run stopped by the superstep ceiling rather than by anything it declared.
+ *
+ * The ceiling is the compiler's safety net (see `CompiledFlow.recursionLimit`),
+ * and LangGraph announces reaching it in its own terms — a `recursionLimit`
+ * config key and a link to its troubleshooting page, neither of which is a thing
+ * this composition has. What a reader needs instead is that the net caught a
+ * loop the composition did not bound itself: grammar 7.4 clause 2 admits a cycle
+ * bounded only by a CEL exit condition, PRD 5.4 accepts it as a bound that is
+ * *not* a static termination proof, and a guard that never goes false therefore
+ * loops until something outside the composition stops it.
+ */
+export class SuperstepCeiling extends Error {
+  /** The ceiling the run was given. */
+  readonly ceiling: number;
+
+  constructor(ceiling: number, cause: unknown) {
+    super(
+      `the run reached its ceiling of ${ceiling} supersteps. The ceiling is the compiler's ` +
+        "safety net rather than one of the composition's own bounds: it is sized from the " +
+        "`max_iterations` budgets the flow declares, plus an allowance for every cycle " +
+        "bounded only by a CEL exit condition (grammar 7.4 clause 2) — which declares no " +
+        "number of passes at all, so a guard that never goes false loops until the net " +
+        "catches it. Bound the loop where it is, with `max_iterations:` on a `when:`-guarded " +
+        "edge inside it, or raise the net for one run with " +
+        "`runFlow(flow, inputs, { recursionLimit })`",
+    );
+    this.name = "SuperstepCeiling";
+    this.ceiling = ceiling;
+    this.cause = cause;
+  }
+}
+
+/**
+ * LangGraph's recursion error, restated in the composition's own terms, and the
+ * error unchanged otherwise.
+ *
+ * The pinned import is the detection: a release that renamed the class fails
+ * `tsc` on this module rather than silently passing its message through.
+ */
+export function restateCeiling(ceiling: number, error: unknown): unknown {
+  return error instanceof GraphRecursionError ? new SuperstepCeiling(ceiling, error) : error;
 }
 
 /**

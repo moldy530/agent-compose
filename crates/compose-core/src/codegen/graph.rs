@@ -72,6 +72,11 @@ use std::collections::BTreeMap;
 
 use crate::ast::common::{ControlTarget, EdgeSource, EdgeTarget, Interpolated};
 use crate::ast::definition::ProviderKind;
+// The SCC decomposition grammar 7.4 is checked over, reused rather than
+// reimplemented: the ceiling below is sized from the same clause-1 reading the
+// validator applies, and two readings of one rule is how they come to disagree.
+use crate::check::cycles::counted;
+use crate::check::graph::Graph as CheckedGraph;
 use crate::ir::Ir;
 use crate::ir::binding::{Bindings, Exec, Http, NodeInput};
 use crate::ir::definition::{Agent, DefinitionBody, Model, Tool};
@@ -1619,21 +1624,57 @@ fn registry_source(
     text
 }
 
+/// The passes a cycle carrying no counting bound is given, per node in it.
+///
+/// Grammar 7.4's two clauses are not the same kind of statement: clause 1's
+/// `max_iterations` is a number the composition declares, so a ceiling can be
+/// *derived* from it, while clause 2's CEL exit condition declares nothing —
+/// grammar 7.4 and PRD 5.4 both say outright that it is not a static termination
+/// proof. So this is a policy number, and the only honest way to pick one is to
+/// say what it is between: an order of magnitude above the revision counts PRD
+/// 5.4's own loops describe (evaluator-optimizer, plan-revise, ReAct), and an
+/// order of magnitude below the 1000 a counting bound may declare — generous
+/// enough that no loop a reader would call reasonable meets it, small enough
+/// that a guard which never goes false stops in bounded time rather than
+/// running forever. [`RUN_FLOW`]'s `recursionLimit` option raises it for one
+/// run, and `runtime.SuperstepCeiling` is what says so when the net catches a
+/// run.
+const CEL_BOUNDED_PASSES: i64 = 100;
+
 /// How many supersteps a flow instance may take before LangGraph refuses.
 ///
 /// A safety net rather than a semantic bound: the bounds that decide a run are
-/// the composition's own (`max_iterations`, grammar 7.4). This is sized so that
-/// every counting bound can be spent in full — one pass per budget through every
-/// node — with room for the acyclic part on either side, and `runFlow` takes an
-/// override for a CEL-bounded loop (grammar 7.4 clause 2) that legitimately runs
-/// longer.
+/// the composition's own (grammar 7.4). Sized from both of that section's
+/// clauses, because they are proofs of different strength:
+///
+/// * every **counting** bound can be spent in full — one pass per budget through
+///   every node — with room for the acyclic part on either side;
+/// * every cycle bounded **only** by a CEL exit condition gets
+///   [`CEL_BOUNDED_PASSES`] passes through each of its own nodes, since nothing
+///   in the composition says how many it takes.
+///
+/// The second is what keeps the net off the loops PRD 5.4 exists for: a review
+/// cycle carrying no `max_iterations` is bounded by grammar 7.4 clause 2 and by
+/// nothing this function can count, and sizing it as though it ran once would
+/// stop a legitimate run at `25 + |nodes|` supersteps.
 fn recursion_limit(flow: &Flow) -> i64 {
     let budgets: i64 = flow
         .edges
         .iter()
         .filter_map(|edge| edge.max_iterations)
         .sum();
-    25 + (flow.nodes.len() as i64) * (1 + budgets)
+    let graph = CheckedGraph::new(flow);
+    let unproven: i64 = graph
+        .components()
+        .iter()
+        .filter(|members| {
+            members
+                .first()
+                .is_some_and(|first| graph.cyclic(*first) && !counted(&graph, members))
+        })
+        .map(|members| members.len() as i64)
+        .sum();
+    25 + (flow.nodes.len() as i64) * (1 + budgets) + unproven * CEL_BOUNDED_PASSES
 }
 
 const REGISTRY_DOC: &str = r#"
@@ -1694,9 +1735,14 @@ export interface FlowRun {
  * anything runs, which is where an invocation that the flow cannot accept is
  * refused by field name (grammar 13.2).
  *
- * A run that does not reach quiescence raises `runtime.FlowFailure`, which
- * carries the trace it did make and the original error as its `cause` — see
- * `CompiledFlow.stream` for why the run is streamed to keep it.
+ * A run that produces no answer raises `runtime.FlowFailure`, which carries the
+ * trace it did make and the original error as its `cause` — see
+ * `CompiledFlow.stream` for why the run is streamed to keep it. Both of the ways
+ * that happens raise it: a run that never reached quiescence, and a run that
+ * reached quiescence holding no value for one of its `outputs:` fields
+ * (grammar 10.1, Decision D78). The second is the one whose trace is complete —
+ * every step landed — so dropping it there would lose the whole routing record
+ * of a run that made one.
  */
 export async function runFlow(
   address: string,
@@ -1714,6 +1760,7 @@ export async function runFlow(
     );
   }
   const parsed = flow.parse(inputs);
+  const ceiling = options.recursionLimit ?? flow.recursionLimit;
   let state: GraphState | undefined;
   try {
     const supersteps = await flow.stream(
@@ -1727,7 +1774,7 @@ export async function runFlow(
           },
         },
       },
-      { recursionLimit: options.recursionLimit ?? flow.recursionLimit },
+      { recursionLimit: ceiling },
     );
     for await (const superstep of supersteps) {
       // What LangGraph's own `invoke` keeps: the last chunk that is a state.
@@ -1737,7 +1784,14 @@ export async function runFlow(
       if (!isInterrupted(superstep)) state = superstep;
     }
   } catch (error) {
-    throw new runtime.FlowFailure(address, runtime.failedTrace(state, error), error);
+    throw new runtime.FlowFailure(
+      address,
+      "did not run to quiescence",
+      runtime.failedTrace(state, error),
+      // The one failure here that is not the composition's: LangGraph stopping
+      // the run at the ceiling, announced in its own vocabulary.
+      runtime.restateCeiling(ceiling, error),
+    );
   }
   if (state === undefined) {
     // Unreachable: `streamMode: "values"` emits the state the run started from
@@ -1745,16 +1799,30 @@ export async function runFlow(
     // function can answer for, and saying so beats reading `undefined` as empty.
     throw new Error(`\`${address}\` produced no state`);
   }
+  const quiesced = state;
 
   const outputs: Record<string, unknown> = {};
-  for (const field of flow.outputs) {
-    outputs[field] = runtime.channelValue(
-      state as unknown as Record<string, unknown>,
-      field,
-      `\`${address}\`'s output field \`${field}\``,
+  try {
+    for (const field of flow.outputs) {
+      outputs[field] = runtime.channelValue(
+        quiesced as unknown as Record<string, unknown>,
+        field,
+        `\`${address}\`'s output field \`${field}\``,
+      );
+    }
+  } catch (error) {
+    // Inside the same record as every other way a run fails to answer: the run
+    // got all the way here, so `$run.trace` holds every step it took, and that
+    // is the routing record a reader wants most when the flow cannot say what it
+    // produced (PRD 5.3).
+    throw new runtime.FlowFailure(
+      address,
+      "reached quiescence without an output",
+      quiesced.$run.trace,
+      error,
     );
   }
-  return { outputs, trace: state.$run.trace, state };
+  return { outputs, trace: quiesced.$run.trace, state: quiesced };
 }
 
 /**
@@ -2445,5 +2513,95 @@ tool.rank:
             [("rank_candidates".to_string(), "tool.rank".to_string())]
         );
         assert!(host_functions(&ir_of("version: \"0.1\"\n")).is_empty());
+    }
+
+    /// The superstep ceiling of one flow of this composition.
+    fn ceiling(source: &str, address: &str) -> i64 {
+        let ir = ir_of(source);
+        let definition = ir
+            .definitions
+            .get(address)
+            .unwrap_or_else(|| panic!("`{address}` is declared"));
+        let DefinitionBody::Flow(flow) = &definition.body else {
+            panic!("`{address}` is not a flow");
+        };
+        recursion_limit(flow)
+    }
+
+    /// A two-node flow of this composition, wrapped around the edges it is given.
+    fn two_node_flow(edges: &str) -> String {
+        format!(
+            r#"{PREAMBLE}
+flow.f:
+  outputs: {{ draft: {{ type: string }} }}
+  nodes:
+    write: {{ agent: agent.reviewer }}
+    review: {{ agent: agent.reviewer }}
+  edges:
+{edges}
+"#
+        )
+    }
+
+    /// The ceiling is sized from **both** of grammar 7.4's clauses, because they
+    /// are proofs of different strength (PRD 5.4).
+    ///
+    /// A counting bound is a number the composition states, so the net can be
+    /// derived from it. A CEL exit condition states none — grammar 7.4 says
+    /// outright that only clause 1 makes a loop provably finite — so a net
+    /// derived from counting bounds alone gives a clause-2 cycle nothing, and a
+    /// review loop written the way PRD 5.4 describes it stops at `25 + |nodes|`
+    /// supersteps having declared no such limit anywhere.
+    #[test]
+    fn the_superstep_ceiling_budgets_a_cel_bounded_cycle_as_well_as_a_counted_one() {
+        let acyclic = two_node_flow(
+            "    - { from: start, to: write }\n    \
+             - { from: write, to: review }\n    \
+             - { from: review, to: end }",
+        );
+        assert_eq!(ceiling(&acyclic, "flow.f"), 25 + 2, "no cycle, no budget");
+
+        let budgeted = two_node_flow(
+            "    - { from: start, to: write }\n    \
+             - { from: write, to: review }\n    \
+             - { from: review, to: write, when: \"review.output.verdict == 'revise'\", max_iterations: 3 }\n    \
+             - { from: review, to: end, else: true }",
+        );
+        assert_eq!(
+            ceiling(&budgeted, "flow.f"),
+            25 + 2 * (1 + 3),
+            "a declared budget can be spent in full through every node"
+        );
+
+        // The same loop with the budget removed: still bounded (grammar 7.4
+        // clause 2, the guarded back-edge beside an `else:` escape), and now
+        // nothing in it says how many passes it takes.
+        let unbudgeted = two_node_flow(
+            "    - { from: start, to: write }\n    \
+             - { from: write, to: review }\n    \
+             - { from: review, to: write, when: \"review.output.verdict == 'revise'\" }\n    \
+             - { from: review, to: end, else: true }",
+        );
+        assert_eq!(
+            ceiling(&unbudgeted, "flow.f"),
+            25 + 2 + 2 * CEL_BOUNDED_PASSES,
+            "both of its nodes are in the unproven cycle, so both are budgeted"
+        );
+
+        // A self-edge is a one-node SCC and is bounded like any other cycle
+        // (grammar 7.2), so it is budgeted like any other cycle too.
+        let self_edge = format!(
+            r#"{PREAMBLE}
+flow.f:
+  outputs: {{ draft: {{ type: string }} }}
+  nodes:
+    review: {{ agent: agent.reviewer }}
+  edges:
+    - {{ from: start, to: review }}
+    - {{ from: review, to: review, when: "review.output.verdict == 'revise'" }}
+    - {{ from: review, to: end, else: true }}
+"#
+        );
+        assert_eq!(ceiling(&self_edge, "flow.f"), 25 + 1 + CEL_BOUNDED_PASSES);
     }
 }

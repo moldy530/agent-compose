@@ -38,9 +38,18 @@ PRD 5.3 asks for: one entry per node execution, carrying the guards that were
 evaluated, what they answered, which edges were taken, and the state of any
 `max_iterations` budget they spent.
 
-A run that does not reach quiescence throws a `FlowFailure`, and it carries that
-same record: `.trace` holds every step that completed plus one final entry for
-the node the run stopped at, and `.cause` is the error itself.
+A run that produces no answer throws a `FlowFailure`, and it carries that same
+record: `.trace` holds every step that completed plus one final entry for the
+node the run stopped at, and `.cause` is the error itself. Both ways a run can
+fail raise it — one that never reached quiescence, and one that reached
+quiescence holding no value for a field its `outputs:` declares — so `.trace` is
+readable without asking which happened.
+
+`recursionLimit` is the one option that is not about identity: it raises the
+superstep ceiling for a single run. The ceiling is a safety net rather than one
+of the composition's own bounds, sized from the `max_iterations` budgets a flow
+declares plus an allowance for every cycle bounded only by a CEL exit condition,
+and a run that reaches it fails with a `SuperstepCeiling` saying so.
 
 `src/index.ts` calls `readEnvironment()` at module scope, so loading this project
 is what checks its environment: a missing variable throws before anything runs,

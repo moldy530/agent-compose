@@ -1,16 +1,33 @@
-# M1 acceptance fixture: a bounded cycle, guarded routing, and node policy.
+# M1 acceptance fixture: bounded cycles, guarded routing, and node policy.
 #
-# The write <-> review loop of PRD 5.4 and §6, reduced to what the runtime has to
-# get right: an edge guard evaluated over the source node's output (PRD 5.3), a
-# `max_iterations` budget on the back-edge, and an `else:` escape that fires both
-# on `approve` and on the pass where the budget is spent (grammar 7.4). The
-# iteration counter codegen emits per bounded cycle is the observable: a scripted
-# run that answers `revise` forever must leave through `end` on the fourth pass,
-# not loop.
+# Grammar 7.4 bounds a cycle two ways and they are proofs of different strength,
+# so each clause gets a flow here:
 #
-# `retry:` and `timeout:` sit on the two nodes so the policy resolution chain
-# (grammar 9.3) has something to resolve: project `defaults:` under a per-node
-# override.
+#   * `flow.review_loop` — clause 1, a **counting** bound. The write <-> review
+#     loop of PRD 5.4 and §6, reduced to what the runtime has to get right: an
+#     edge guard evaluated over the source node's output (PRD 5.3), a
+#     `max_iterations` budget on the back-edge, and an `else:` escape that fires
+#     both on `approve` and on the pass where the budget is spent. The iteration
+#     counter codegen emits per bounded cycle is the observable: a scripted run
+#     that answers `revise` forever must leave through `end` on the fourth pass,
+#     not loop.
+#   * `flow.long_loop` — clause 2, a **CEL exit condition** and nothing else. No
+#     number appears anywhere in it, so the superstep ceiling `runFlow` runs
+#     under cannot be derived from the composition; it has to be sized for a loop
+#     that legitimately runs longer than a counting bound would have paid for.
+#   * `flow.runaway` — the same clause-2 shape with a guard that never goes
+#     false, which grammar 7.4 and PRD 5.4 both admit precisely because clause 2
+#     is not a static termination proof. What stops it is the ceiling, and the
+#     failure has to say so in the composition's own terms rather than in
+#     LangGraph's.
+#
+# The two clause-2 flows are `exec:` rather than agent nodes: they run tens of
+# passes, and a scripted model response per pass would say nothing the counting
+# loop above does not already say.
+#
+# `retry:` and `timeout:` sit on the review loop's two nodes so the policy
+# resolution chain (grammar 9.3) has something to resolve: project `defaults:`
+# under a per-node override.
 version: "0.1"
 
 defaults:
@@ -24,6 +41,19 @@ state:
     default: ""
   feedback:
     description: The reviewer's most recent feedback, fed back into the writer.
+    type: string
+    default: ""
+  log:
+    description: One element per pass of the CEL-bounded loop (grammar 10.2's `append`).
+    type: array
+    max_items: 64
+    items: { type: string }
+    reduce: append
+  marker:
+    description: >-
+      Written on every pass of the runaway loop, and read by the guard that
+      sends it round again — so the guard is a runtime value that never goes
+      false, which is the shape grammar 7.4 clause 2 admits without proving.
     type: string
     default: ""
 
@@ -109,3 +139,55 @@ flow.review_loop:
     - from: review
       to: end
       else: true
+
+flow.long_loop:
+  description: A cycle bounded by a CEL exit condition alone, run past what a counting bound would pay for.
+  outputs:
+    log:
+      type: array
+      max_items: 64
+      items: { type: string }
+  nodes:
+    step:
+      exec:
+        command: printf
+        args: ["%s", "step"]
+        output:
+          stdout: { type: string }
+      writes:
+        stdout: log
+
+  edges:
+    - { from: start, to: step }
+    # Grammar 7.4 clause 2, in one node: a `when:`-guarded edge staying inside the
+    # SCC, and an `else:` edge leaving it. No `max_iterations` anywhere, so
+    # nothing in this flow says how many passes it takes — the exit is a runtime
+    # value, and 30 of them is more than a ceiling sized from counting bounds
+    # alone would allow.
+    - { from: step, to: step, when: "size(state.log) < 30" }
+    - { from: step, to: end, else: true }
+
+flow.runaway:
+  description: The same CEL exit condition with a guard that never goes false.
+  outputs:
+    marker:
+      type: string
+  nodes:
+    spin:
+      exec:
+        command: printf
+        args: ["%s", "spin"]
+        output:
+          stdout: { type: string }
+      writes:
+        stdout: marker
+
+  edges:
+    - { from: start, to: spin }
+    # `spin` writes `marker` and its own guard reads it back (grammar 7.6 P1), so
+    # this is `true` from the first pass on and the loop never leaves through the
+    # `else:`. `validate` accepts it — clause 2 is decided syntactically
+    # (Decision D98) and cannot know what a guard will answer — which is the
+    # whole reason the superstep ceiling exists.
+    - { from: spin, to: spin, when: "state.marker == 'spin'" }
+    - { from: spin, to: end, else: true }
