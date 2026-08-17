@@ -1,10 +1,11 @@
 //! The generated-code checks of CLAUDE.md's *Validation strategy*, run against
 //! the **real** pinned JavaScript toolchain.
 //!
-//! Seven gates. The first four are in increasing strength, each one existing
+//! Eight gates. The first four are in increasing strength, each one existing
 //! because the one above it passes on code the one below it catches; the next two
-//! are about the schemas rather than the graph; the last is about a composition
-//! that has no generated project at all:
+//! are about the schemas rather than the graph; the seventh is about a
+//! composition that has no generated project at all; and the last is about a
+//! rule the grammar states once per surface:
 //!
 //! 1. **`tsc --noEmit`** — every golden project type-checks under its own strict
 //!    `tsconfig.json`, against installed `@langchain/langgraph`, `@langchain/core`
@@ -52,6 +53,13 @@
 //!    it — and asks Node for `Object.getOwnPropertyNames(Object.prototype)`, so
 //!    the Rust-side list is checked against the object model rather than against
 //!    a memory of it.
+//! 8. **What a raw binding binds** — the single string-typed property of a
+//!    `tool.*` takes *trimmed* raw stdout from an `exec:` implementation and the
+//!    raw response text from an `http:` one, which is grammar 6.1 stating one
+//!    exception once per surface with one word different between them. Both are
+//!    driven out of a golden's own runtime, over a payload with whitespace at
+//!    either end, so which reading this compiler took is a committed fact rather
+//!    than an accident of a shared decoder.
 //!
 //! # The toolchain fixture
 //!
@@ -572,6 +580,56 @@ fn the_run_channel_folds_a_steps_contributions_in_canonical_order() {
         .map(|entry| entry["node"].as_str().expect("a node id"))
         .collect();
     assert_eq!(nodes, ["draft", "review", "merge"]);
+}
+
+/// Gate 2e: what the single string-typed property of a `tool.*` binds, on each
+/// of the two surfaces that can implement one (grammar 6.1).
+///
+/// The grammar states the exception once per binding and the two sentences
+/// differ by a word: `exec:` binds "trimmed raw stdout", `http:` binds "the raw
+/// response text". A shared decoder makes it easy for one reading to be applied
+/// to both by accident and for nobody to notice — trailing whitespace is a shell
+/// artefact on stdout, where a command that ends its output with a newline has
+/// said nothing by it, and payload in a response body, where every byte is what
+/// the server chose to send. So both are run, over one payload with whitespace
+/// at either end, and the difference is asserted rather than assumed.
+#[test]
+fn a_raw_binding_trims_stdout_and_takes_a_response_body_verbatim() {
+    let Some(root) = installed() else {
+        return;
+    };
+    let project = staged(goldens::golden("review-loop"), root, "raw-decoding");
+
+    let output = Command::new("node")
+        .arg(root.join("raw-decoding.mjs"))
+        .arg(&project)
+        .output()
+        .expect("node runs");
+    assert!(
+        output.status.success(),
+        "the raw-binding runner failed:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let answer: Value =
+        serde_json::from_slice(&output.stdout).expect("the runner prints one JSON object");
+
+    let sent = answer["sent"].as_str().expect("the payload it sent");
+    assert_ne!(
+        sent.trim(),
+        sent,
+        "the payload has to carry whitespace for either reading to be visible"
+    );
+    assert_eq!(
+        answer["exec"]["text"].as_str(),
+        Some(sent.trim()),
+        "an `exec` implementation binds trimmed raw stdout (grammar 6.1)"
+    );
+    assert_eq!(
+        answer["http"]["text"].as_str(),
+        Some(sent),
+        "an `http` implementation binds the raw response text — every byte of \
+         it, which is what its own sentence says"
+    );
 }
 
 /// Gate 7: the channel names the compiler refuses are names LangGraph refuses.

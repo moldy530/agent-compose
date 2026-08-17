@@ -1289,9 +1289,15 @@ fn decoding(output: &FieldMap, envelope: &[&str], tool_surface: bool) -> String 
         return "{ envelope: [], decoded: [], empty: true }".to_string();
     }
     // Grammar 6.1: a `tool.*` whose `output` declares exactly one property and
-    // that property is string-typed takes the trimmed raw stream whole. The
-    // count is over the whole property set (Decision D109), and the exception is
-    // a `tool.*`-surface rule (Decision D91).
+    // that property is string-typed takes the raw stream whole. The count is
+    // over the whole property set (Decision D109), and the exception is a
+    // `tool.*`-surface rule (Decision D91).
+    //
+    // *How* whole is the implementation's, and the two surfaces differ: grammar
+    // 6.1 says "trimmed raw stdout" for `exec` and "the raw response text" for
+    // `http`, so the descriptor names the property and `runtime.decode` — where
+    // the stream is — takes each sentence at its word. See its doc comment, and
+    // `a_raw_binding_trims_stdout_and_takes_a_response_body_verbatim`.
     if tool_surface
         && output.fields.len() == 1
         && matches!(

@@ -816,6 +816,8 @@ export interface Decoding {
   /**
    * The single string property that takes the raw stream whole — the
    * `tool.*`-surface exception of grammar 6.1, absent on inline nodes (D91).
+   *
+   * What "whole" means is the surface's, not this descriptor's: see [`decode`].
    */
   readonly raw?: string;
   /** No result at all: nothing is decoded (grammar 6.1's `output: {}`). */
@@ -890,11 +892,16 @@ export async function runExec(
     );
   }
 
-  return decode(binding.decoding, result.stdout, {
-    exit_code: result.code,
-    stdout: result.stdout,
-    stderr: result.stderr,
-  });
+  return decode(
+    binding.decoding,
+    result.stdout,
+    {
+      exit_code: result.code,
+      stdout: result.stdout,
+      stderr: result.stderr,
+    },
+    "trimmed",
+  );
 }
 
 /** A resolved `http:` block. */
@@ -941,17 +948,30 @@ export async function runHttp(
       }: ${text.slice(0, 200)}`,
     );
   }
-  return decode(binding.decoding, text, { status: response.status, body: text });
+  return decode(binding.decoding, text, { status: response.status, body: text }, "verbatim");
 }
 
-/** Read a result out of a raw stream and an envelope (grammar 8.2, 8.3, 6.1). */
+/**
+ * Read a result out of a raw stream and an envelope (grammar 8.2, 8.3, 6.1).
+ *
+ * `binds` is how the single string-typed property of a `tool.*` takes the raw
+ * stream, and the two surfaces differ there by one word of grammar 6.1: the
+ * `exec` binding says **"trimmed raw stdout"**, the `http` binding says **"the
+ * raw response text"**. The difference is the streams rather than the rule —
+ * trailing whitespace is a shell artefact on stdout, where a command that ends
+ * its output with a newline has said nothing by it, and is payload in a response
+ * body, where every byte is what the server chose to send.
+ */
 function decode(
   decoding: Decoding,
   raw: string,
   envelope: Readonly<Record<string, unknown>>,
+  binds: "trimmed" | "verbatim",
 ): unknown {
   if (decoding.empty) return {};
-  if (decoding.raw !== undefined) return { [decoding.raw]: raw.trim() };
+  if (decoding.raw !== undefined) {
+    return { [decoding.raw]: binds === "trimmed" ? raw.trim() : raw };
+  }
 
   const result: Record<string, unknown> = {};
   for (const field of decoding.envelope) {
