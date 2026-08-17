@@ -1,8 +1,9 @@
 //! The generated-code checks of CLAUDE.md's *Validation strategy*, run against
 //! the **real** pinned JavaScript toolchain.
 //!
-//! Five gates, in increasing strength. Each one exists because the one above it
-//! passes on code the one below it catches:
+//! Six gates. The first four are in increasing strength, each one existing
+//! because the one above it passes on code the one below it catches; the last two
+//! are about the schemas rather than the graph:
 //!
 //! 1. **`tsc --noEmit`** — every golden project type-checks under its own strict
 //!    `tsconfig.json`, against installed `@langchain/langgraph`, `@langchain/core`
@@ -34,6 +35,14 @@
 //!    the document carries **both** verdicts and names one of [`DIVERGENCES`],
 //!    so a difference is something a reader signed off on rather than something
 //!    a thin corpus failed to notice.
+//! 6. **What a provider would be handed** — `@langchain/core`'s own converter is
+//!    run over the emitted schemas, because PRD 5.2 delivers an output schema
+//!    through `withStructuredOutput` and that mechanism sends JSON Schema rather
+//!    than the Zod it was given. The conversion drops every check spelled
+//!    `.refine`, so the contract a model is constrained by is weaker than the
+//!    parse that follows it — see `codegen::schema`'s *What a provider is handed*.
+//!    Gate 5 is what makes the two columns agree; this is what says which of them
+//!    a model actually sees.
 //!
 //! # The toolchain fixture
 //!
@@ -761,6 +770,146 @@ fn the_emitted_zod_agrees_with_the_json_schema_lowering() {
         expected.iter().map(Vec::len).sum::<usize>(),
         "not every document reached both columns"
     );
+}
+
+/// One surface whose emitted Zod says more than the schema a provider would be
+/// handed for it.
+struct Weakening {
+    /// The surface, by canonical path — all of them from `every-schema-form`,
+    /// which is the golden that reaches every spelling.
+    surface: &'static str,
+    /// The JSON Schema keyword this compiler's own lowering writes and the
+    /// conversion of the emitted Zod does not.
+    keyword: &'static str,
+    /// What the check is, for the failure message.
+    about: &'static str,
+}
+
+/// What `withStructuredOutput` would lose, one row per spelling that loses
+/// something.
+///
+/// Zod models a `.refine` as an opaque predicate, and a JSON Schema conversion
+/// has nowhere to put it — so every check `codegen::schema` writes out rather
+/// than borrowing from a constructor disappears on the way to the model. The
+/// rows are the three shapes that happens in, plus one reached through a nested
+/// property, because "only the top level is affected" would be a comforting and
+/// wrong reading of the first three.
+const WEAKENINGS: &[Weakening] = &[
+    Weakening {
+        surface: "state.at",
+        keyword: "format",
+        about: "`format: date-time`, written out as `refine(rfc3339DateTime, …)`",
+    },
+    Weakening {
+        surface: "state.mark",
+        keyword: "maxLength",
+        about: "`max_length`, written out over a code-point count",
+    },
+    Weakening {
+        surface: "state.tags",
+        keyword: "uniqueItems",
+        about: "`unique_items`, which Zod has no built-in for",
+    },
+    Weakening {
+        surface: "agent.shaper.output",
+        keyword: "format",
+        about: "`format: email` on a nested property, two levels in",
+    },
+];
+
+/// Gate 4: what PRD 5.2's delivery mechanism would hand a provider, and what it
+/// drops on the way.
+///
+/// `withStructuredOutput` does not send Zod to anyone: `@langchain/core` converts
+/// it to JSON Schema first, and that conversion keeps what Zod models as a check
+/// and drops what it models as a refinement. Six of the ten formats, both length
+/// bounds and `unique_items` are refinements, so the contract a model is
+/// constrained by is strictly weaker than the parse its answer then faces —
+/// which is the failure `codegen::schema` was written to prevent, pointed the
+/// other way.
+///
+/// This gate does not fix that; the schema a node fn hands over is the next PR's
+/// emission, and *which* schema (a conversion of this Zod, or the lowering this
+/// compiler already publishes and the corpus proves equal to the parse) is a
+/// design question PRD 5.2 does not answer. What it does is keep the evidence
+/// current: the conversion is the library's own, the schemas are the committed
+/// goldens, and the day either half stops being true this fails and the question
+/// can be answered differently.
+#[test]
+fn what_the_structured_output_mechanism_would_be_handed() {
+    let golden = goldens::golden("every-schema-form");
+    let ir = artifact(golden);
+    let surfaces = compose_core::codegen::schema::surfaces(&ir);
+    let names = compose_core::codegen::names::Names::of(&ir);
+
+    // The compiler's own lowering first: it needs no toolchain, and a row whose
+    // keyword this column does not even write would be checking nothing.
+    for row in WEAKENINGS {
+        let surface = surfaces
+            .iter()
+            .find(|surface| surface.path == row.surface)
+            .unwrap_or_else(|| panic!("`every-schema-form` declares no `{}`", row.surface));
+        let published = match &surface.body {
+            compose_core::codegen::schema::Body::Fields(fields) => {
+                compose_core::codegen::schema::json_field_map(fields)
+            }
+            compose_core::codegen::schema::Body::Type(ty) => {
+                compose_core::codegen::schema::json_type_node(ty)
+            }
+        };
+        assert!(
+            mentions(&published, row.keyword),
+            "this compiler's lowering of `{}` writes no `{}`, so the row says nothing about {}",
+            row.surface,
+            row.keyword,
+            row.about,
+        );
+    }
+
+    let Some(root) = installed() else {
+        return;
+    };
+    let project = staged(golden, root, "structured-output");
+    let mut runner = Command::new("node");
+    runner
+        .arg(root.join("structured-output-schema.mjs"))
+        .arg(&project);
+    for row in WEAKENINGS {
+        runner.arg(names.value(row.surface));
+    }
+    let output = runner.output().expect("node runs");
+    assert!(
+        output.status.success(),
+        "the emitted schemas did not convert:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let converted: Value =
+        serde_json::from_slice(&output.stdout).expect("the runner prints one schema per export");
+
+    for row in WEAKENINGS {
+        let handed = &converted[names.value(row.surface)];
+        assert!(
+            !mentions(handed, row.keyword),
+            "`{}` reaches a provider carrying `{}` after all: {} survived the conversion, so the \
+             emitted Zod and the schema a model is constrained by no longer differ here. That is \
+             the premise of `codegen::schema`'s *What a provider is handed* — re-read it before \
+             deleting this row.",
+            row.surface,
+            row.keyword,
+            row.about,
+        );
+    }
+}
+
+/// Whether a JSON Schema writes this keyword anywhere inside it.
+fn mentions(schema: &Value, keyword: &str) -> bool {
+    match schema {
+        Value::Object(map) => {
+            map.contains_key(keyword) || map.values().any(|value| mentions(value, keyword))
+        }
+        Value::Array(items) => items.iter().any(|item| mentions(item, keyword)),
+        _ => false,
+    }
 }
 
 /// The fixture and the emitter pin the same versions.

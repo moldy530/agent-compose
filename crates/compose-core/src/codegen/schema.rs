@@ -48,8 +48,8 @@
 //! So the bound is written out: `.refine((value) => codePoints(value) <= 200, …)`
 //! over [`HELPERS`]' `codePoints`, which spreads the string and so iterates it by
 //! code point. Like six of the ten formats below, that puts the check where
-//! `z.toJSONSchema` cannot see it; a check that is visible and measures the wrong
-//! thing is the worse of the two. `state.mark`
+//! `z.toJSONSchema` cannot see it (see *What a provider is handed*); a check that
+//! is visible and measures the wrong thing is the worse of the two. `state.mark`
 //! in the corpus is the pair of documents that tells the two spellings apart.
 //!
 //! # `unique_items`, and the one row that leans on its surroundings
@@ -140,6 +140,33 @@
 //! syntax — [`super::pattern`] is the module that decides what transfers, and
 //! [`super::diagnostics`] is what refuses a `build` whose patterns do not.
 //!
+//! # What a provider is handed
+//!
+//! PRD 5.2 delivers an agent's output schema through `withStructuredOutput`, and
+//! what that mechanism *does* with the Zod this module emits is a fact worth
+//! writing down before the PR that wires it: `@langchain/core` 1.2.8 converts a
+//! Zod v4 schema by calling `toJSONSchema` from `zod/v4/core`
+//! (`dist/utils/json_schema.js`), and that conversion keeps what Zod models as a
+//! *check* and drops what it models as a *refinement*, silently. Against the
+//! committed `every-schema-form` golden and the pinned versions, that is:
+//!
+//! * `state.at` → `{"type": "string"}`; the `format: date-time` check is gone,
+//!   as it is for the five other written-out formats;
+//! * `state.tags` → `minItems`/`maxItems` kept, `uniqueItems` gone;
+//! * `state.mark` → `{"type": "string"}`; both length bounds gone.
+//!
+//! The `.regex`-spelled formats (`uri`, `time`) survive as `pattern`, so the loss
+//! tracks the spelling rather than the keyword.
+//!
+//! This module does not get to fix that: the schema a provider is handed is the
+//! node-fn PR's emission, and *which* schema it hands over — a conversion of
+//! this Zod, or [`json_field_map`]'s lowering, which is the column the
+//! conformance corpus already proves equal to the parse — is a design question
+//! PRD 5.2 does not answer and CLAUDE.md's PRD discipline says must be resolved
+//! before that area is implemented. What belongs here is the evidence, and a
+//! gate that keeps it true: `what_the_structured_output_mechanism_would_be_handed`
+//! in `tests/generated_code_gates.rs` runs the real conversion over the real
+//! goldens and fails when either half of the premise changes.
 
 use std::borrow::Cow;
 
