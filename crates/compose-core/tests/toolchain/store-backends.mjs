@@ -1,0 +1,189 @@
+// Drives a generated project's `src/stores.ts` — the local `kv`, `vector` and
+// `blob` backends PRD 5.8's zero-infra guarantee promises — and reports what
+// each op answered.
+//
+// The bindings are written here rather than read out of `src/graph.ts`, and that
+// is deliberate: what `graph.ts` emits for a `store.*` is already held by the
+// golden corpus and by the acceptance suite, while what the *backends* do with
+// one — the scope partitions, the idempotency ledger, the key encoding — is
+// behaviour no committed diff can show. So this constructs the bindings and
+// exercises the module directly, which is also what lets one runner answer for
+// both supported runtimes (PRD §9.18).
+//
+// `vector` is not here: its ops embed through a real provider connection
+// (grammar 11.2), which is a network round trip and belongs in the acceptance
+// suite, where there is a scripted provider to answer it.
+//
+// Usage: node store-backends.mjs <generated project directory> <data directory>
+// Output: one JSON object of everything the gate asserts about.
+
+import { pathToFileURL } from "node:url";
+import path from "node:path";
+import process from "node:process";
+
+const [, , project, data] = process.argv;
+if (project === undefined || data === undefined) {
+  throw new Error("usage: node store-backends.mjs <project> <data directory>");
+}
+
+// Read by `dataRoot()` at every call, so setting it before the import is not
+// required — but setting it here keeps the whole run inside one directory the
+// caller can throw away.
+process.env["AGENT_COMPOSE_DATA_DIR"] = data;
+
+const stores = await import(pathToFileURL(path.resolve(project, "src/stores.ts")).href);
+
+/** A store-op node's context, with the record channel a trace entry reads. */
+const context = (id, session = "") => ({
+  execution: { id, session_key: session },
+  signal: new AbortController().signal,
+  node: "probe",
+  storeRecords: [],
+});
+
+/** One binding, with the local backend the `local` target resolves. */
+const binding = (name, kind, scope, extra = {}) => ({
+  address: `store.${name}`,
+  name,
+  kind,
+  scope,
+  metadata: false,
+  backend: {
+    provider: kind === "kv" ? "sqlite" : kind === "vector" ? "sqlite_vec" : "local_fs",
+    from: "the `local` target substitutes local storage for every store unconditionally",
+  },
+  ...extra,
+});
+
+const node = (key) => ({ via: "node", ...(key === undefined ? {} : { idempotencyKey: key }) });
+
+/** What a call threw, or `null` when it did not throw. */
+const refusal = async (work) => {
+  try {
+    await work();
+    return null;
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+};
+
+const answer = {};
+
+// --- `kv`, at `global` scope: the whole catalogue, and the ledger ------------
+
+{
+  const store = binding("prefs", "kv", "global");
+  const run = context("exec_kv");
+  await stores.runStoreOp(store, "set", { key: "a", value: { theme: "dark" } }, run, node("k/1"));
+  await stores.runStoreOp(store, "set", { key: "b", value: { theme: "light" } }, run, node("k/2"));
+  answer.kvHit = await stores.runStoreOp(store, "get", { key: "a" }, run, node());
+  answer.kvMiss = await stores.runStoreOp(store, "get", { key: "z" }, run, node());
+  answer.kvList = await stores.runStoreOp(store, "list", { limit: 10 }, run, node());
+  answer.kvPrefixed = await stores.runStoreOp(store, "list", { prefix: "b", limit: 10 }, run, node());
+  answer.kvDeleted = await stores.runStoreOp(store, "delete", { key: "b" }, run, node("k/3"));
+  answer.kvDeletedAgain = await stores.runStoreOp(store, "delete", { key: "b" }, run, node("k/4"));
+
+  // At-least-once, deduped on the key of grammar 9.4: the second write carries
+  // the key the first did, so the effect does not happen twice and the answer is
+  // the one the first attempt gave.
+  const repeated = await stores.runStoreOp(
+    store,
+    "set",
+    { key: "a", value: { theme: "REWRITTEN" } },
+    run,
+    node("k/1"),
+  );
+  answer.dedupedWrite = repeated;
+  answer.afterDedupedWrite = await stores.runStoreOp(store, "get", { key: "a" }, run, node());
+
+  // …and a write under a *different* key is a different effect.
+  await stores.runStoreOp(store, "set", { key: "a", value: { theme: "changed" } }, run, node("k/5"));
+  answer.afterSecondWrite = await stores.runStoreOp(store, "get", { key: "a" }, run, node());
+
+  answer.records = run.storeRecords;
+}
+
+// --- `session`: one file, one partition per key ------------------------------
+
+{
+  const store = binding("memory", "kv", "session");
+  const first = context("exec_s1", "session-a");
+  const second = context("exec_s2", "session-a");
+  const other = context("exec_s3", "session-b");
+  await stores.runStoreOp(store, "set", { key: "note", value: { text: "mine" } }, first, node("s/1"));
+  answer.sessionSame = await stores.runStoreOp(store, "get", { key: "note" }, second, node());
+  answer.sessionOther = await stores.runStoreOp(store, "get", { key: "note" }, other, node());
+  answer.sessionUnkeyed = await refusal(() =>
+    stores.runStoreOp(store, "get", { key: "note" }, context("exec_s4"), node()),
+  );
+}
+
+// --- `execution`: dies with the run -----------------------------------------
+
+{
+  const store = binding("scratch", "kv", "execution");
+  const run = context("exec_e1");
+  await stores.runStoreOp(store, "set", { key: "k", value: { text: "held" } }, run, node("e/1"));
+  answer.executionHit = await stores.runStoreOp(store, "get", { key: "k" }, run, node());
+  stores.releaseExecution("exec_e1");
+  answer.executionAfterRelease = await stores.runStoreOp(store, "get", { key: "k" }, run, node());
+  // A second execution never saw the first's, released or not.
+  answer.executionOther = await stores.runStoreOp(
+    store,
+    "get",
+    { key: "k" },
+    context("exec_e2"),
+    node(),
+  );
+}
+
+// --- `blob`: a directory of files, keyed reversibly --------------------------
+
+{
+  const store = binding("artifacts", "blob", "global");
+  const run = context("exec_blob");
+  await stores.runStoreOp(
+    store,
+    "put",
+    { key: "notes/one.txt", value: "first", contentType: "text/plain" },
+    run,
+    node("b/1"),
+  );
+  await stores.runStoreOp(store, "put", { key: "notes/two.txt", value: "second" }, run, node("b/2"));
+  await stores.runStoreOp(store, "put", { key: "other", value: "third" }, run, node("b/3"));
+  answer.blobHit = await stores.runStoreOp(store, "get", { key: "notes/one.txt" }, run, node());
+  answer.blobMiss = await stores.runStoreOp(store, "get", { key: "notes/none" }, run, node());
+  // The keys come back as they were written, which is what makes the file-name
+  // encoding reversible rather than merely safe.
+  answer.blobList = await stores.runStoreOp(store, "list", { limit: 10 }, run, node());
+  answer.blobPrefixed = await stores.runStoreOp(
+    store,
+    "list",
+    { prefix: "notes/", limit: 10 },
+    run,
+    node(),
+  );
+  answer.blobDeleted = await stores.runStoreOp(store, "delete", { key: "other" }, run, node("b/4"));
+  answer.blobLimited = await stores.runStoreOp(store, "list", { limit: 1 }, run, node());
+  answer.blobEmptyKey = await refusal(() =>
+    stores.runStoreOp(store, "get", { key: "" }, run, node()),
+  );
+  answer.blobLongKey = await refusal(() =>
+    stores.runStoreOp(store, "get", { key: "x".repeat(300) }, run, node()),
+  );
+  // A key that percent-encodes to nothing a path can climb out of.
+  answer.blobEncoded = stores.encodeKey("../escape me");
+}
+
+// --- A backend this compiler release does not implement ----------------------
+
+{
+  const store = binding("remote", "kv", "global", {
+    backend: { provider: "redis", from: "the `kv` default of the `staging` target" },
+  });
+  answer.productionBackend = await refusal(() =>
+    stores.runStoreOp(store, "get", { key: "a" }, context("exec_r"), node()),
+  );
+}
+
+process.stdout.write(JSON.stringify(answer));

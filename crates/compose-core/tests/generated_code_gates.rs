@@ -2,14 +2,15 @@
 //! the **real** pinned JavaScript toolchain — under **Bun**, which PRD §9.18
 //! makes the default runtime and package manager of every emitted project.
 //!
-//! Fifteen gates. The first four are in increasing strength, each one existing
+//! Sixteen gates. The first four are in increasing strength, each one existing
 //! because the one above it passes on code the one below it catches; the fifth
 //! is about a construct whose guarantees are only observable from inside the
 //! runtime; the next two are about the schemas rather than the graph; the eighth
 //! is about a composition that has no generated project at all; the next four
 //! are about what a binding does on the wire, which no amount of type-checking or
-//! graph construction reaches; and the last three are about the *other* runtime —
-//! the Node fallback the same decision keeps supported:
+//! graph construction reaches; the three after those are about the *other*
+//! runtime — the Node fallback the same decision keeps supported — and the last
+//! is about the storage underneath a `store.*`:
 //!
 //! 1. **`bun run typecheck`** — every golden project type-checks under its own
 //!    strict `tsconfig.json`, against installed `@langchain/langgraph`,
@@ -133,6 +134,15 @@
 //!     differently for every reader on the fallback while every gate stayed
 //!     green. Gate 13 loads, constructs, reduces and launches a golden under
 //!     Node; it never validates a document or evaluates a guard.
+//! 16. **The store backends** — `src/stores.ts`, driven directly. PRD 5.8's
+//!     zero-infra guarantee is a promise about behaviour a golden diff cannot
+//!     show: which partition a `scope:` addresses, whether a write's idempotency
+//!     key is honoured, what a `list` answers a prefix with, and whether a key
+//!     that would climb out of a directory becomes a file name that cannot. A
+//!     composition using a store emits the same bytes with every one of those
+//!     wrong. Gate 13 runs the same runner under Node, because a WebAssembly
+//!     SQLite over `node:fs` is exactly the dependency that could answer the two
+//!     engines differently.
 //!
 //! # The toolchain fixture
 //!
@@ -178,7 +188,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 use goldens::{GOLDENS, Golden, artifact, emitted, files_under, goldens_root};
-use serde_json::Value;
+use serde_json::{Value, json};
 use toolchain::{bun, installed, required, runner, runs};
 
 /// The golden gate 13 runs under Node.
@@ -1444,6 +1454,188 @@ fn the_bound_object_arrived_as_parameters(answer: &Value) {
     );
 }
 
+/// Gate 16: the local store backends do what PRD 5.8 says a store does.
+///
+/// `src/stores.ts` is where the zero-infra guarantee actually lives, and almost
+/// none of it is visible from a golden diff: which partition a `scope:`
+/// addresses, whether an idempotency key is honoured, what a `list` answers a
+/// prefix with, and whether a key that would climb out of a directory becomes a
+/// file name that cannot. A composition that used a store would produce the
+/// same emitted bytes with every one of those wrong.
+///
+/// So the module is driven directly, with bindings the runner writes rather than
+/// ones `src/graph.ts` emits: what `graph.ts` emits is already committed and
+/// already exercised end to end by the acceptance suite, and what is in question
+/// here is the backend underneath it. Gate 13 runs the same runner under Node,
+/// because a WebAssembly SQLite over `node:fs` is exactly the kind of dependency
+/// that could behave differently on the fallback runtime.
+#[test]
+fn the_local_store_backends_partition_dedupe_and_encode_what_they_are_given() {
+    let Some(root) = installed() else {
+        return;
+    };
+    let project = staged(goldens::golden("review-loop"), root, "stores");
+    let data = root.join("projects").join("stores").join("data");
+    let _ = fs::remove_dir_all(&data);
+
+    let output = runner("store-backends.mjs")
+        .arg(&project)
+        .arg(&data)
+        .output()
+        .expect("bun runs");
+    assert!(
+        output.status.success(),
+        "the store-backend runner failed:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let answer: Value =
+        serde_json::from_slice(&output.stdout).expect("the runner prints one JSON object");
+    the_local_backends_behaved(&answer);
+}
+
+/// What the store-backend runner answered, whichever runtime ran it — shared
+/// with gate 13 for the reason [`a_raw_binding_bound`] is: the SQLite here is a
+/// WebAssembly module over `node:fs`, and a difference between the two engines
+/// would be a difference in what every store in every emitted project does.
+fn the_local_backends_behaved(answer: &Value) {
+    // The `kv` catalogue of grammar 11.4, row by row.
+    assert_eq!(
+        answer["kvHit"],
+        json!({ "value": { "theme": "dark" }, "found": true })
+    );
+    assert_eq!(
+        answer["kvMiss"],
+        json!({ "found": false }),
+        "a miss answers `found: false` with **no** `value` at all (Decision D110)"
+    );
+    assert_eq!(answer["kvList"], json!({ "keys": ["a", "b"] }));
+    assert_eq!(
+        answer["kvPrefixed"],
+        json!({ "keys": ["b"] }),
+        "`prefix:` filters, and the answer is in key order"
+    );
+    assert_eq!(answer["kvDeleted"], json!({ "deleted": true }));
+    assert_eq!(
+        answer["kvDeletedAgain"],
+        json!({ "deleted": false }),
+        "a delete of nothing deleted nothing"
+    );
+
+    // At-least-once, deduped on grammar 9.4's key: the repeated write answers
+    // what the first attempt answered and does **not** happen twice.
+    assert_eq!(answer["dedupedWrite"], json!({ "key": "a" }));
+    assert_eq!(
+        answer["afterDedupedWrite"]["value"]["theme"], "dark",
+        "a write whose key the backend had already applied is not applied again"
+    );
+    assert_eq!(
+        answer["afterSecondWrite"]["value"]["theme"], "changed",
+        "…and a write under a different key is a different effect"
+    );
+
+    // The records a trace entry carries (PRD 5.8): a read keeps its answer, a
+    // write keeps its key and whether the backend had seen it.
+    let records = answer["records"]
+        .as_array()
+        .expect("every op records what it did");
+    let write = records
+        .iter()
+        .find(|record| record["idempotencyKey"] == "k/1")
+        .expect("the first write is recorded");
+    assert_eq!(write["effect"], "write");
+    assert_eq!(write["deduped"], json!(false));
+    assert!(
+        records
+            .iter()
+            .any(|record| record["idempotencyKey"] == "k/1" && record["deduped"] == json!(true)),
+        "the repeated write is recorded as the duplicate it was: {records:#?}"
+    );
+    let read = records
+        .iter()
+        .find(|record| record["effect"] == "read" && record["op"] == "get")
+        .expect("a read is recorded");
+    assert_eq!(read["answer"]["found"], json!(true));
+    assert!(read["idempotencyKey"].is_null(), "a read carries no key");
+
+    // `scope: session` — one store, one partition per session key.
+    assert_eq!(
+        answer["sessionSame"],
+        json!({ "value": { "text": "mine" }, "found": true }),
+        "a later execution under the same session key reads what the first wrote"
+    );
+    assert_eq!(
+        answer["sessionOther"],
+        json!({ "found": false }),
+        "…and another session key is another partition"
+    );
+    let unkeyed = answer["sessionUnkeyed"]
+        .as_str()
+        .expect("a session-scoped store with no session identity is refused");
+    assert!(
+        unkeyed.contains("store.memory") && unkeyed.contains("scope: session"),
+        "the refusal names the store (grammar 11.3): {unkeyed}"
+    );
+
+    // `scope: execution` — dies with the run, and never crosses to another.
+    assert_eq!(answer["executionHit"]["found"], json!(true));
+    assert_eq!(
+        answer["executionAfterRelease"],
+        json!({ "found": false }),
+        "what an execution-scoped store held is gone when the run ends"
+    );
+    assert_eq!(answer["executionOther"], json!({ "found": false }));
+
+    // `blob` — files on disk, keyed reversibly.
+    assert_eq!(
+        answer["blobHit"],
+        json!({ "value": "first", "found": true })
+    );
+    assert_eq!(answer["blobMiss"], json!({ "found": false }));
+    assert_eq!(
+        answer["blobList"],
+        json!({ "keys": ["notes/one.txt", "notes/two.txt", "other"] }),
+        "a `list` answers with the keys that were written, not with what the \
+         filesystem made of them"
+    );
+    assert_eq!(
+        answer["blobPrefixed"],
+        json!({ "keys": ["notes/one.txt", "notes/two.txt"] })
+    );
+    assert_eq!(answer["blobDeleted"], json!({ "deleted": true }));
+    assert_eq!(
+        answer["blobLimited"],
+        json!({ "keys": ["notes/one.txt"] }),
+        "`limit:` bounds what a `list` answers"
+    );
+    assert!(
+        answer["blobEmptyKey"]
+            .as_str()
+            .is_some_and(|message| message.contains("empty key")),
+        "{}",
+        answer["blobEmptyKey"]
+    );
+    assert!(
+        answer["blobLongKey"]
+            .as_str()
+            .is_some_and(|message| message.contains("one key per file")),
+        "a key no filesystem can hold is refused by name: {}",
+        answer["blobLongKey"]
+    );
+    assert_eq!(
+        answer["blobEncoded"], "%2E%2E%2Fescape%20me",
+        "`.` and `/` are both encoded, so no key becomes a path that climbs out"
+    );
+
+    // A backend grammar 14.2 names and this release does not implement.
+    let production = answer["productionBackend"]
+        .as_str()
+        .expect("a `redis` backend is refused rather than answered from the wrong store");
+    assert!(
+        production.contains("redis") && production.contains("M3"),
+        "the refusal names the backend and the milestone that lands it: {production}"
+    );
+}
+
 /// The runner both `http:` request gates read, run once per gate so each one
 /// fails on its own.
 fn http_request_gate(purpose: &str) -> Option<Value> {
@@ -2227,6 +2419,29 @@ fn a_generated_project_installs_type_checks_and_runs_under_the_node_fallback() {
     let request = node_runner("http-request.mjs", &project);
     the_declared_media_type_arrived_alone(&request);
     the_bound_object_arrived_as_parameters(&request);
+
+    // Gate 16, asked of the other runtime. The local store backends are a
+    // WebAssembly SQLite over `node:fs` and a directory of files, which is
+    // exactly the shape of dependency that can behave differently on the
+    // fallback — and every store in every emitted project runs on it.
+    let data = root
+        .join("projects")
+        .join("node-fallback")
+        .join("store-data");
+    let _ = fs::remove_dir_all(&data);
+    let stored = node_command("store-backends.mjs")
+        .arg(&project)
+        .arg(&data)
+        .output()
+        .expect("node runs");
+    assert!(
+        stored.status.success(),
+        "the store-backend runner failed under Node:\n{}",
+        String::from_utf8_lossy(&stored.stderr),
+    );
+    the_local_backends_behaved(
+        &serde_json::from_slice(&stored.stdout).expect("the runner prints one JSON object"),
+    );
 
     // Gate 8's list, asked of the other engine.
     let refused = compose_core::codegen::state::INHERITED_PROPERTY_NAMES;

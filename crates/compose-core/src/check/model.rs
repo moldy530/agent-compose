@@ -915,11 +915,9 @@ pub(crate) fn store_tool_input(
     let string = || scalar_node(ScalarKind::String, span);
     let mut fields: Vec<(&str, TypeNode)> = Vec::new();
     match (kind, op) {
-        (StoreKind::Kv, StoreOp::Get)
-        | (StoreKind::Blob, StoreOp::Get)
-        | (StoreKind::Vector, StoreOp::Delete)
-        | (StoreKind::Kv, StoreOp::Delete)
-        | (StoreKind::Blob, StoreOp::Delete) => {
+        // Grammar 11.5 synthesizes no `delete` tool for any kind, so the only
+        // one-parameter row here is a `get`.
+        (StoreKind::Kv, StoreOp::Get) | (StoreKind::Blob, StoreOp::Get) => {
             fields.push(("key", string()));
         }
         (StoreKind::Kv, StoreOp::Set) => {

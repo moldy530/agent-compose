@@ -1,6 +1,6 @@
 //! `agent-compose` — the compiler's command line.
 //!
-//! Two commands exist. The first is the product's core loop (PRD §7 M0):
+//! Four commands exist. The first is the product's core loop (PRD §7 M0):
 //!
 //! ```text
 //! agent-compose validate <path> [--target <name>] [--format human|json]
@@ -26,16 +26,41 @@
 //! here is the surface — argument parsing, the choice of report format, writing
 //! the files, and the exit code.
 //!
+//! The last two are invocation (PRD 5.11):
+//!
+//! ```text
+//! agent-compose run <path> <flow> [--input k=v]... [--session <key>]
+//!                                 [--target <name>] [--out <dir>]
+//!                                 [--format human|json]
+//! agent-compose serve <path> [--host <host>] [--port <port>]
+//!                            [--target <name>] [--out <dir>]
+//!                            [--format human|json]
+//! ```
+//!
+//! Both **build first**, exactly as `build` would and into the same directory,
+//! and then launch the emitted project's own command line (`bun src/index.ts …`,
+//! or `node` under the fallback). Nothing about invoking a compiled graph lives
+//! in this binary — see [`launch`], which is also where the two preconditions of
+//! *starting* something are checked: every `${ENV}` reference has a value
+//! (PRD §9.15) and the pinned dependency set is installed where the project can
+//! resolve it.
+//!
+//! `run`'s **stdout is the run's answer** — the flow's outputs as one JSON
+//! object, or the whole record under `--format json` — so this side writes
+//! nothing there; the build report goes to stderr, and to stdout only when the
+//! composition was refused and there is no run to answer for. `serve`'s stdout
+//! is the app's readiness line for the same reason.
+//!
 //! # Exit codes
 //!
 //! | code | meaning |
 //! |---|---|
 //! | `0` | clean: nothing was reported |
-//! | `1` | diagnostics were reported, or `build --check` found drift |
-//! | `2` | the command could not run: bad usage, an unreadable entrypoint, or an output directory that could not be written |
+//! | `1` | diagnostics were reported, `build --check` found drift, or a `run` produced no answer |
+//! | `2` | the command could not run: bad usage, an unreadable entrypoint, an output directory that could not be written, a missing environment variable, an uninstalled dependency set, or no JavaScript runtime to launch |
 //!
-//! The split between `1` and `2` is the difference between *the composition is
-//! wrong* and *the command could not be run against it*. A missing `imports:`
+//! The split between `1` and `2` is the difference between *the answer is no*
+//! and *the command could not be run at all*. A missing `imports:`
 //! entry is the composition's problem and exits `1` with a diagnostic naming the
 //! file; an entrypoint that is not a readable file, or an `--out` holding files
 //! this compiler did not write and would have replaced (see [`build::write`]),

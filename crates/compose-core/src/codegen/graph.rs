@@ -82,14 +82,25 @@
 //!
 //! # What is emitted for a construct this release does not execute
 //!
-//! `human` and `store` nodes are parsed, validated, and **emitted as real nodes
-//! with their real topology** — their edges, their budgets, their place in the
-//! graph — whose activity throws `Unimplemented` naming the construct and the
-//! milestone bullet that lands it. The alternative was refusing to emit a graph
-//! for those compositions at all, which would leave `build` failing on two of
-//! the four committed goldens and nothing type-checking the topology around the
-//! construct. A node that says what it does not do is not the same as a node
-//! that pretends: nothing here answers a plausible value.
+//! A `human` node is parsed, validated, and **emitted as a real node with its
+//! real topology** — its edges, its budgets, its place in the graph, its
+//! `on_timeout:` control transfer — whose activity throws `Unimplemented` naming
+//! the construct and the milestone that lands it (PRD §9's resolved question 4
+//! puts the runtime in M2). The alternative was refusing to emit a graph for
+//! such a composition at all, which would leave `build` failing on a committed
+//! golden and nothing type-checking the topology around the construct. A node
+//! that says what it does not do is not the same as a node that pretends:
+//! nothing here answers a plausible value.
+//!
+//! The same posture covers a store bound to a **production** backend. Grammar
+//! 14.2's vocabulary reaches past this release — `redis`, `pgvector`, `s3` and
+//! the rest land in M3 — so [`backend_of`] resolves the alias at compile time
+//! and the emitted binding carries the provider it resolved to; `src/stores.ts`
+//! is where a store bound to one says so, naming the backend, where the
+//! resolution came from, and the milestone. Under `--target local` no alias and
+//! no per-kind default is consulted at all (PRD 5.8, Decision D87), which is
+//! what makes a project with production infrastructure in `deploy/staging.yml`
+//! still runnable with none.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
@@ -3660,6 +3671,186 @@ flow.f:
             "a route references its members, so it is declared after them:\n{emitted}"
         );
         assert!(emitted.contains("  model: modelDefault,\n"), "{emitted}");
+    }
+
+    /// A composition with stores: the fixture the store tests share.
+    const STORES: &str = r#"version: "0.1"
+
+state:
+  found: { type: boolean, default: false }
+
+provider.p:
+  kind: anthropic
+  api_key: ${MODEL_KEY}
+
+provider.embeds:
+  kind: openai_compatible
+  base_url: ${EMBED_URL}
+
+model.m:
+  provider: provider.p
+  id: some-model
+
+store.prefs:
+  kind: kv
+  scope: execution
+  description: What this run was told.
+  value_schema:
+    theme: { type: string }
+
+store.docs:
+  kind: vector
+  scope: global
+  description: The documentation.
+  embed: { model: text-embedding-3-small, provider: provider.embeds, dimensions: 4 }
+  metadata_schema:
+    source: { type: string }
+  agent_access: read
+
+agent.grounded:
+  model: model.m
+  prompt: Answer.
+  stores: [store.docs, store.prefs]
+  input:
+    question: { type: string }
+  output:
+    answer: { type: string }
+
+flow.f:
+  inputs:
+    question: { type: string }
+  outputs: {}
+  nodes:
+    load:
+      store: store.prefs
+      op: get
+      key: "'k'"
+      writes: { found: found }
+    ask: { agent: agent.grounded, input: { question: "input.question" } }
+  edges:
+    - { from: start, to: load }
+    - { from: load, to: ask }
+    - { from: ask, to: end }
+"#;
+
+    /// A store is one binding both consumption surfaces reach (PRD 5.8), and it
+    /// carries the backend the active target resolved (grammar 11.3).
+    #[test]
+    fn a_store_is_one_binding_carrying_the_backend_its_target_resolved() {
+        let emitted = emit(STORES);
+        assert!(
+            emitted.contains("const storePrefs: stores.StoreBinding = {"),
+            "{emitted}"
+        );
+        assert!(emitted.contains("  kind: \"kv\",\n  scope: \"execution\","));
+        assert!(
+            emitted.contains("    provider: \"sqlite\",\n"),
+            "`--target local` substitutes local storage for every store: {emitted}"
+        );
+        assert!(
+            emitted.contains("    provider: \"sqlite_vec\",\n"),
+            "…per kind: {emitted}"
+        );
+        // A `vector` store's `embed:` names the connection that computes the
+        // vectors, which is a `provider.*` and never the backend (D116).
+        assert!(
+            emitted.contains("  embed: {\n    store: \"store.docs\",\n    model: \"text-embedding-3-small\",\n    provider: providerEmbeds,\n    dimensions: 4,\n  },"),
+            "{emitted}"
+        );
+        // Absent and `{}` are different declarations (D114), and this is the
+        // field the difference reaches the runtime through.
+        assert!(emitted.contains("  metadata: true,\n"), "{emitted}");
+        assert!(emitted.contains("  metadata: false,\n"), "{emitted}");
+
+        // The store-op node evaluates its parameters in the input phase and
+        // carries the idempotency key of grammar 9.4 to the backend.
+        assert!(
+            emitted.contains("    key: String(runtime.toJson(runtime.evaluate(\"'k'\", roots))),"),
+            "{emitted}"
+        );
+        assert!(
+            emitted.contains(
+                "{ via: \"node\", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, \"load\")].join(\"/\") }"
+            ),
+            "{emitted}"
+        );
+    }
+
+    /// An attached store synthesizes grammar 11.5's tools, narrowed by
+    /// `agent_access:` (Decision D37).
+    #[test]
+    fn an_attached_store_synthesizes_its_tools_and_agent_access_narrows_them() {
+        let emitted = emit(STORES);
+        let agent = emitted
+            .split("const agentGrounded: runtime.AgentBinding = {")
+            .nth(1)
+            .expect("the agent is emitted");
+        // `store.docs` is `agent_access: read`, so the write tool is withheld;
+        // `store.prefs` takes the `read_write` default and gets both.
+        assert!(agent.contains("name: \"docs_search\","), "{agent}");
+        assert!(!agent.contains("docs_upsert"), "{agent}");
+        assert!(agent.contains("name: \"prefs_get\","), "{agent}");
+        assert!(agent.contains("name: \"prefs_set\","), "{agent}");
+        // The arguments are parsed against the emitted Zod for the tool's own
+        // surface — the same schema the JSON column constrains the model with.
+        assert!(
+            agent.contains("runtime.parseResult(storeDocsToolSearchInput, args,"),
+            "{agent}"
+        );
+        assert!(
+            agent.contains("stores.runStoreTool(\n          storeDocs,\n          \"search\","),
+            "{agent}"
+        );
+        // …and a store's own `description:` is what tells the model which store
+        // it is choosing.
+        assert!(
+            agent.contains("Search by meaning in `store.docs`. The documentation."),
+            "{agent}"
+        );
+    }
+
+    /// Under a named target the store's backend is the deploy layer's, and a
+    /// backend this release does not implement still **builds**: the refusal is
+    /// the runtime's, at the op, naming where the binding came from.
+    #[test]
+    fn a_named_target_resolves_a_stores_backend_through_its_deploy_layer() {
+        let directory = std::env::temp_dir().join(format!(
+            "agent-compose-store-backend-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(directory.join("deploy")).expect("a scratch directory");
+        std::fs::write(directory.join("main.yml"), STORES).expect("the entrypoint is writable");
+        std::fs::write(
+            directory.join("deploy/staging.yml"),
+            "version: \"0.1\"\n\nstorage_backends:\n  defaults:\n    kv: { provider: redis, url: \"${REDIS_URL}\" }\n  aliases:\n    docs_db: { provider: chroma, url: \"${CHROMA_URL}\" }\n",
+        )
+        .expect("the deploy file is writable");
+
+        let resolution = crate::resolve_with_target(directory.join("main.yml"), "staging");
+        let _ = std::fs::remove_dir_all(&directory);
+        assert!(
+            resolution.diagnostics.is_empty(),
+            "{:#?}",
+            resolution.diagnostics
+        );
+        let ir = resolution.ir.expect("a clean resolution has an artifact");
+        let mut names = Names::of(&ir);
+        declare(&mut names, &ir);
+        let emitted = module(&ir, &names).contents;
+
+        assert!(
+            emitted.contains(
+                "    provider: \"redis\",\n    from: \"the `kv` default of the `staging` target\","
+            ),
+            "the per-kind default is what a store naming no alias resolves to: {emitted}"
+        );
+        // `store.docs` names no alias in this fixture, so it falls to the
+        // built-in rather than to the `docs_db` alias beside it.
+        assert!(
+            emitted.contains("    provider: \"sqlite_vec\",\n    from: \"the built-in for `kind: vector`, which the `staging` target does not override\","),
+            "{emitted}"
+        );
     }
 
     /// A declared `route_on:` replaces the default rather than extending it.
