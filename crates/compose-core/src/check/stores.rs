@@ -349,7 +349,7 @@ pub(crate) fn check_session_scope(ctx: &mut Ctx) {
             continue;
         }
         let flow = trigger.flow.value.to_string();
-        for store in reach::stores_of(ctx, &flow) {
+        for store in reach::stores_of(ctx.ir, &flow) {
             let Some(definition) =
                 ctx.ir
                     .definitions

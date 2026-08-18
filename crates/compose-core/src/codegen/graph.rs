@@ -82,20 +82,40 @@
 //!
 //! # What is emitted for a construct this release does not execute
 //!
-//! `human` and `store` nodes are parsed, validated, and **emitted as real nodes
-//! with their real topology** — their edges, their budgets, their place in the
-//! graph — whose activity throws `Unimplemented` naming the construct and the
-//! milestone bullet that lands it. The alternative was refusing to emit a graph
-//! for those compositions at all, which would leave `build` failing on two of
-//! the four committed goldens and nothing type-checking the topology around the
-//! construct. A node that says what it does not do is not the same as a node
-//! that pretends: nothing here answers a plausible value.
+//! A `human` node is parsed, validated, and **emitted as a real node with its
+//! real topology** — its edges, its budgets, its place in the graph, its
+//! `on_timeout:` control transfer — whose activity throws `Unimplemented` naming
+//! the construct and the milestone that lands it (PRD §9's resolved question 4
+//! puts the runtime in M2). The alternative was refusing to emit a graph for
+//! such a composition at all, which would leave `build` failing on a committed
+//! golden and nothing type-checking the topology around the construct. A node
+//! that says what it does not do is not the same as a node that pretends:
+//! nothing here answers a plausible value.
+//!
+//! The same posture covers a store bound to a **production** backend. Grammar
+//! 14.2's vocabulary reaches past this release — `redis`, `pgvector`, `s3` and
+//! the rest land in M3 — so [`backend_of`] resolves the alias at compile time
+//! and the emitted binding carries the provider it resolved to; `src/stores.ts`
+//! is where a store bound to one says so, naming the backend, where the
+//! resolution came from, and the milestone. Under `--target local` no alias and
+//! no per-kind default is consulted at all (PRD 5.8, Decision D87), which is
+//! what makes a project with production infrastructure in `deploy/staging.yml`
+//! still runnable with none.
+//!
+//! And it covers a `flow.*` in an agent's `tools:` — flow-as-tool, grammar 5.4.
+//! The tool is on the wire with the whole contract that section gives it, and
+//! its `invoke` is what refuses (see [`flow_tool`]). This one is worth naming
+//! because it is where the posture was once broken the other way: the entry was
+//! emitted as a source *comment* and no tool, so a composition the validator had
+//! analysed the attachment of — grammar 7.7 clause 4 carries session coherence,
+//! sync interrupt-freedom and recursion through it — reached the provider with
+//! the tool missing and nothing anywhere saying so.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ast::common::{Address, ControlTarget, EdgeSource, EdgeTarget, Interpolated};
-use crate::ast::definition::ProviderKind;
+use crate::ast::definition::{ProviderKind, StoreKind};
 use crate::ast::flow::FlowContext;
 // The SCC decomposition grammar 7.4 is checked over, reused rather than
 // reimplemented: the ceiling below is sized from the same clause-1 reading the
@@ -109,7 +129,7 @@ use crate::ir::flow::{
     Edge, Flow, ItemError, Map, MapDispatch, Node, NodeKind, ToolImplementation,
 };
 use crate::ir::policy::Policy;
-use crate::ir::schema::{FieldMap, TypeForm, TypeNode};
+use crate::ir::schema::{Field, FieldMap, TypeForm, TypeNode};
 
 use super::names::{self, Names};
 use super::policy::{self, Strategy};
@@ -157,7 +177,11 @@ pub fn declare(names: &mut Names, ir: &Ir) {
                     }
                 }
             }
-            DefinitionBody::Store(_) => {}
+            // A store's binding is a `const` of its own, and it is the value a
+            // store-op node and a synthesized tool both reach (grammar 11).
+            DefinitionBody::Store(_) => {
+                names.declare(address);
+            }
         }
     }
     // A key of the emitter's own rather than `state.shape`, which a channel
@@ -187,8 +211,9 @@ pub fn module(ir: &Ir, names: &Names) -> super::GeneratedFile {
     body.push_str(&shapes(ir, names, &surfaces));
     body.push_str(&providers(ir, names));
     body.push_str(&models(ir, names));
+    body.push_str(&stores(ir, names));
     body.push_str(&tools(ir, names, &surfaces, &mut imported));
-    body.push_str(&agents(ir, names, &surfaces));
+    body.push_str(&agents(ir, names, &surfaces, &mut imported));
 
     let mut registry: Vec<(String, String)> = Vec::new();
     for (address, definition) in &ir.definitions {
@@ -208,6 +233,7 @@ pub fn module(ir: &Ir, names: &Names) -> super::GeneratedFile {
 
     contents.push_str("\nimport { END, START, StateGraph } from \"@langchain/langgraph\";\n");
     contents.push_str("\nimport * as runtime from \"./runtime.ts\";\n");
+    contents.push_str("import * as stores from \"./stores.ts\";\n");
     imported.sort();
     imported.dedup();
     if !imported.is_empty() {
@@ -421,46 +447,26 @@ const fn provider_kind(kind: ProviderKind) -> &'static str {
     }
 }
 
+/// Every `model.*`, direct bindings first and routes after them.
+///
+/// The order is load-bearing rather than cosmetic: a route's members are the
+/// `const`s it names, and `model.default` sorts before `model.fast` in the IR's
+/// address order — so emitting in that order would produce a module that
+/// references a binding before its declaration and throws at import. Two passes
+/// is the whole of the fix, and grammar 12.2 makes it sufficient: a route's
+/// members are direct models, never other routes (Decision D39).
 fn models(ir: &Ir, names: &Names) -> String {
     let mut text = String::new();
     for (address, definition) in &ir.definitions {
-        let DefinitionBody::Model(model) = &definition.body else {
+        let DefinitionBody::Model(Model::Direct(direct)) = &definition.body else {
             continue;
-        };
-        let (bound, note) = match model {
-            Model::Direct(direct) => (direct, String::new()),
-            Model::Route(route) => {
-                // Failover is a later M1 bullet ("model routing with
-                // trace-recorded failover"). A route binds its **first** member
-                // — the one a live call reaches first either way — so a
-                // composition that declares one runs rather than refusing to
-                // build, and the note says what is missing rather than leaving
-                // a reader to infer it from behaviour.
-                let first = route.route.first().expect("a route has members");
-                let Some(member) = ir.definitions.get(&first.value.to_string()) else {
-                    continue;
-                };
-                let DefinitionBody::Model(Model::Direct(direct)) = &member.body else {
-                    continue;
-                };
-                (
-                    direct,
-                    format!(
-                        " This is `{}`, the first member of the route `{address}` declares: \
-                         failover is not executed by this compiler release (PRD §7 M1: \
-                         model routing with trace-recorded failover), so a condition in \
-                         `route_on:` fails the node rather than moving to the next member.",
-                        first.value
-                    ),
-                )
-            }
         };
         text.push('\n');
         text.push_str(&names::doc(
             "",
             &[format!(
-                "`{address}` — `{}` on `{}` (grammar 12.2).{note}",
-                bound.id.value, bound.provider.value
+                "`{address}` — `{}` on `{}` (grammar 12.2).",
+                direct.id.value, direct.provider.value
             )],
         ));
         text.push_str(&format!(
@@ -468,16 +474,16 @@ fn models(ir: &Ir, names: &Names) -> String {
             names.value(address)
         ));
         text.push_str(&format!("  address: {},\n", names::string(address)));
-        text.push_str(&format!("  id: {},\n", names::string(&bound.id.value)));
+        text.push_str(&format!("  id: {},\n", names::string(&direct.id.value)));
         text.push_str(&format!(
             "  provider: {},\n",
-            names.value(&bound.provider.value.to_string())
+            names.value(&direct.provider.value.to_string())
         ));
-        if bound.settings.is_empty() {
+        if direct.settings.is_empty() {
             text.push_str("  settings: {},\n");
         } else {
             text.push_str("  settings: {\n");
-            for (key, value) in &bound.settings {
+            for (key, value) in &direct.settings {
                 text.push_str(&format!(
                     "    {}: {},\n",
                     names::string(key),
@@ -488,7 +494,225 @@ fn models(ir: &Ir, names: &Names) -> String {
         }
         text.push_str("};\n");
     }
+
+    for (address, definition) in &ir.definitions {
+        let DefinitionBody::Model(Model::Route(route)) = &definition.body else {
+            continue;
+        };
+        let conditions: Vec<String> = route
+            .route_on
+            .as_ref()
+            .map(|declared| {
+                declared
+                    .iter()
+                    .map(|condition| condition.value.as_str().to_string())
+                    .collect()
+            })
+            // Grammar 12.2's default, written out rather than left to the
+            // runtime: `route_on:` decides which failures fail over, and a
+            // default a reader cannot see in the emitted binding is one they
+            // would have to look up.
+            .unwrap_or_else(|| {
+                DEFAULT_ROUTE_ON
+                    .iter()
+                    .map(|condition| (*condition).to_string())
+                    .collect()
+            });
+        text.push('\n');
+        text.push_str(&names::doc(
+            "",
+            &[format!(
+                "`{address}` — an ordered failover route over {} (grammar 12.2, PRD 5.9). \
+                 A member that refuses with one of the conditions below moves the call to \
+                 the next; anything else fails the node, and which member served a call is \
+                 recorded in the trace.",
+                crate::parse::reader::list(
+                    route
+                        .route
+                        .iter()
+                        .map(|member| member.value.to_string())
+                        .collect::<Vec<_>>()
+                )
+            )],
+        ));
+        text.push_str(&format!(
+            "const {}: runtime.ModelRoute = {{\n",
+            names.value(address)
+        ));
+        text.push_str(&format!("  address: {},\n", names::string(address)));
+        text.push_str(&format!(
+            "  route: [{}],\n",
+            route
+                .route
+                .iter()
+                .map(|member| names.value(&member.value.to_string()).to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        text.push_str(&format!(
+            "  routeOn: [{}],\n",
+            conditions
+                .iter()
+                .map(|condition| names::string(condition))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        text.push_str("};\n");
+    }
     text
+}
+
+/// Grammar 12.2's `route_on:` default.
+const DEFAULT_ROUTE_ON: &[&str] = &["rate_limit", "overloaded", "timeout"];
+
+// ---------------------------------------------------------------------------
+// Stores (grammar 11)
+// ---------------------------------------------------------------------------
+
+/// Every `store.*`, as the binding `src/stores.ts` runs ops against.
+///
+/// One `const` per store rather than one per usage, because PRD 5.8's whole
+/// point is that a store is **one definition with two consumption surfaces**: a
+/// `store:` node and a synthesized tool address the same binding, so a
+/// `scope: execution` store an agent wrote through is the same store the next
+/// node reads.
+fn stores(ir: &Ir, names: &Names) -> String {
+    let mut text = String::new();
+    for (address, definition) in &ir.definitions {
+        let DefinitionBody::Store(store) = &definition.body else {
+            continue;
+        };
+        let local = address
+            .split_once('.')
+            .map_or(address.as_str(), |(_, rest)| rest);
+        let backend = backend_of(ir, store);
+        text.push('\n');
+        text.push_str(&names::doc(
+            "",
+            &[format!(
+                "`{address}` — a `{}` store with `scope: {}`, on the `{}` backend ({}) \
+                 (grammar 11.1, 11.3).",
+                store.kind.as_str(),
+                store.scope.as_str(),
+                backend.provider,
+                backend.from
+            )],
+        ));
+        text.push_str(&format!(
+            "const {}: stores.StoreBinding = {{\n",
+            names.value(address)
+        ));
+        text.push_str(&format!("  address: {},\n", names::string(address)));
+        text.push_str(&format!("  name: {},\n", names::string(local)));
+        text.push_str(&format!(
+            "  kind: {},\n",
+            names::string(store.kind.as_str())
+        ));
+        text.push_str(&format!(
+            "  scope: {},\n",
+            names::string(store.scope.as_str())
+        ));
+        if let Some(description) = &store.description {
+            text.push_str(&format!(
+                "  description: {},\n",
+                names::string(&description.value)
+            ));
+        }
+        // Absent and `{}` are different declarations, and this is the field the
+        // difference reaches the runtime through: a store with no
+        // `metadata_schema:` derives matches with no `metadata` at all
+        // (Decision D114).
+        text.push_str(&format!(
+            "  metadata: {},\n",
+            store.metadata_schema.is_some()
+        ));
+        if let Some(embed) = &store.embed {
+            text.push_str("  embed: {\n");
+            text.push_str(&format!("    store: {},\n", names::string(address)));
+            text.push_str(&format!(
+                "    model: {},\n",
+                names::string(&embed.model.value)
+            ));
+            text.push_str(&format!(
+                "    provider: {},\n",
+                names.value(&embed.provider.value.to_string())
+            ));
+            if let Some(dimensions) = embed.dimensions {
+                text.push_str(&format!("    dimensions: {dimensions},\n"));
+            }
+            text.push_str("  },\n");
+        }
+        text.push_str("  backend: {\n");
+        text.push_str(&format!(
+            "    provider: {},\n",
+            names::string(backend.provider)
+        ));
+        text.push_str(&format!("    from: {},\n", names::string(&backend.from)));
+        text.push_str("  },\n");
+        text.push_str("};\n");
+    }
+    text
+}
+
+/// Which backend a store resolved to under the active target, and why.
+struct Backend {
+    provider: &'static str,
+    from: String,
+}
+
+/// Grammar 11.3's resolution order, run at compile time.
+///
+/// `--target local` substitutes local storage for **every** store
+/// unconditionally, so under it no alias and no per-kind default is consulted at
+/// all (PRD 5.8, Decision D87) — which is what makes a project with production
+/// infrastructure in `deploy/staging.yml` still buildable and runnable with none.
+/// Under any other target the order is the grammar's: explicit alias, then the
+/// per-kind `defaults:`, then the target built-in, which is the same local
+/// storage because it is the only backend this compiler release implements.
+fn backend_of(ir: &Ir, store: &crate::ir::definition::Store) -> Backend {
+    let built_in = match store.kind {
+        StoreKind::Kv => "sqlite",
+        StoreKind::Vector => "sqlite_vec",
+        StoreKind::Blob => "local_fs",
+    };
+    if ir.target == crate::DEFAULT_TARGET {
+        return Backend {
+            provider: built_in,
+            from: "the `local` target substitutes local storage for every store unconditionally"
+                .to_string(),
+        };
+    }
+    let backends = ir.deploy.storage_backends.as_ref();
+    if let Some(alias) = &store.backend
+        && let Some(config) =
+            backends.and_then(|backends| backends.aliases.get(alias.value.as_str()))
+    {
+        return Backend {
+            provider: config.provider.as_str(),
+            from: format!(
+                "the alias `{}`, defined by the `{}` target",
+                alias.value, ir.target
+            ),
+        };
+    }
+    if let Some(config) = backends.and_then(|backends| backends.defaults.get(store.kind.as_str())) {
+        return Backend {
+            provider: config.provider.as_str(),
+            from: format!(
+                "the `{}` default of the `{}` target",
+                store.kind.as_str(),
+                ir.target
+            ),
+        };
+    }
+    Backend {
+        provider: built_in,
+        from: format!(
+            "the built-in for `kind: {}`, which the `{}` target does not override",
+            store.kind.as_str(),
+            ir.target
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -579,7 +803,12 @@ fn tools(
 // Agents (grammar 5)
 // ---------------------------------------------------------------------------
 
-fn agents(ir: &Ir, names: &Names, surfaces: &[schema::Surface<'_>]) -> String {
+fn agents(
+    ir: &Ir,
+    names: &Names,
+    surfaces: &[schema::Surface<'_>],
+    imported: &mut Vec<String>,
+) -> String {
     let mut text = String::new();
     for (address, definition) in &ir.definitions {
         let DefinitionBody::Agent(agent) = &definition.body else {
@@ -627,22 +856,21 @@ fn agents(ir: &Ir, names: &Names, surfaces: &[schema::Surface<'_>]) -> String {
             json_literal(&schema::json_field_map(output.as_ref()), "    ")
         ));
         text.push_str("  },\n");
-        if agent.tools.is_empty() {
+        if agent.tools.is_empty() && agent.stores.is_empty() {
             text.push_str("  tools: [],\n");
         } else {
             text.push_str("  tools: [\n");
             for reference in &agent.tools {
                 let tool_address = reference.value.to_string();
-                let Some(tool) = ir.definitions.get(&tool_address) else {
+                let Some(attached) = ir.definitions.get(&tool_address) else {
                     continue;
                 };
-                let DefinitionBody::Tool(tool) = &tool.body else {
-                    // A `flow.*` in a tool list is flow-as-tool, which needs
-                    // subgraph instantiation — a later M1 bullet.
-                    text.push_str(&format!(
-                        "    // `{tool_address}` is a flow attached as a tool, which this \
-                         compiler release does not run.\n"
-                    ));
+                let DefinitionBody::Tool(tool) = &attached.body else {
+                    // A `flow.*` here is flow-as-tool (grammar 5.4): a real tool
+                    // on the wire, whose call this release does not serve.
+                    if let DefinitionBody::Flow(attached) = &attached.body {
+                        text.push_str(&flow_tool(ir, surfaces, &tool_address, attached));
+                    }
                     continue;
                 };
                 let local_name = tool_address
@@ -666,6 +894,7 @@ fn agents(ir: &Ir, names: &Names, surfaces: &[schema::Surface<'_>]) -> String {
                 text.push_str(&format!("      invoke: {},\n", names.value(&tool_address)));
                 text.push_str("    },\n");
             }
+            text.push_str(&store_tools(ir, names, surfaces, agent, imported));
             text.push_str("  ],\n");
         }
         text.push_str(&format!(
@@ -680,6 +909,158 @@ fn agents(ir: &Ir, names: &Names, surfaces: &[schema::Surface<'_>]) -> String {
 /// Grammar 5's default for `max_tool_iterations:` (Decision D51, PRD §9.14).
 const DEFAULT_TOOL_ITERATIONS: i64 = 8;
 
+/// One `flow.*` in an agent's `tools:` — flow-as-tool (grammar 5.4, PRD 5.1).
+///
+/// The tool is **emitted**, with the name, description and parameter schema
+/// grammar 5.4 gives it: its local name is the name the model calls, its
+/// `description:` — which the validator requires exactly here — is the selection
+/// signal, and its `inputs:` is the parameter schema. Only the call is refused,
+/// by an `invoke` that throws `runtime.Unimplemented` naming the construct.
+///
+/// That is this module's posture for a construct it does not run, and the
+/// alternative it replaces is the one the header calls out by name: an agent
+/// whose `tools:` names a flow used to reach the provider with that tool simply
+/// *absent* — no diagnostic at `validate`, none at `build`, and a model that
+/// could not call what the composition attached. The compiler analyses the
+/// attachment as a call everywhere else — grammar 7.7 clause 4 carries session
+/// coherence, sync interrupt-freedom and recursion through it, and grammar
+/// 11.5's collision rule reserves its name against a store's — so dropping it at
+/// the last step was the emitter answering a plausible value.
+///
+/// What is still not here is the instantiation. A `flow:` node hands
+/// `runtime.runSubflow` an instance path and a policy off its `NodeView`
+/// (grammar 9.3, 9.4), and neither exists at a tool call: how many times a model
+/// calls a tool is the model's, so the effect site a nested store write derives
+/// its idempotency key from is not derivable the way a node's is, and where an
+/// instance's own trace joins the caller's is undecided. Those are questions for
+/// the PRD, not for this function to answer quietly.
+fn flow_tool(ir: &Ir, surfaces: &[schema::Surface<'_>], address: &str, flow: &Flow) -> String {
+    let local = address.split_once('.').map_or(address, |(_, rest)| rest);
+    let description = flow.description.as_ref().map_or_else(
+        // Unreachable over a composition `validate` accepted: grammar 5.4 makes
+        // `description:` REQUIRED of a flow in a `tools:` list, and
+        // `check::bindings` refuses one without. Said rather than unwrapped,
+        // because a panic here would be a `build` crash over a rule with a
+        // diagnostic of its own.
+        || format!("The flow `{address}`, attached as a tool."),
+        |description| description.value.clone(),
+    );
+    let parameters = flow_parameters(ir, surfaces, address);
+    let mut text = String::from("    {\n");
+    text.push_str(&format!("      name: {},\n", names::string(local)));
+    text.push_str(&format!("      address: {},\n", names::string(address)));
+    text.push_str(&format!(
+        "      description: {},\n",
+        names::string(&description)
+    ));
+    text.push_str(&format!(
+        "      schema: {},\n",
+        json_literal(&schema::json_fields(parameters.as_ref()), "      ")
+    ));
+    text.push_str(&format!(
+        "      invoke: () => {{\n        throw new runtime.Unimplemented({}, {});\n      }},\n",
+        names::string(&format!("`{address}` attached as a tool")),
+        names::string(
+            "a subflow instantiated from a model's tool call — the same flow \
+             reached from a `flow:` node runs (grammar 8.5, 5.4)"
+        )
+    ));
+    text.push_str("    },\n");
+    text
+}
+
+/// The tools an agent's attached stores synthesize (grammar 11.5, PRD 5.8).
+///
+/// One `AgentTool` per row of grammar 11.5's table, read through the store's
+/// `agent_access:` — so a store declared `read` offers its reading ops and not
+/// its writing one, which is the least-privilege knob Decision D37 adds and PRD
+/// §9.13 accepts. The arguments are parsed against the emitted Zod for the tool's
+/// own surface before the store sees them, which is the same schema the JSON
+/// column below constrains the model with: constrain == parse, exactly as for an
+/// agent's own output (PRD §9.16).
+///
+/// They are **appended** to the declared tools rather than merged into them, so
+/// a transcript reads in the order the composition declares: `tools:` first,
+/// then `stores:` in their own declaration order.
+fn store_tools(
+    ir: &Ir,
+    names: &Names,
+    surfaces: &[schema::Surface<'_>],
+    agent: &Agent,
+    imported: &mut Vec<String>,
+) -> String {
+    let mut text = String::new();
+    for reference in &agent.stores {
+        let address = reference.value.to_string();
+        let Some(definition) = ir.definitions.get(&address) else {
+            continue;
+        };
+        let DefinitionBody::Store(store) = &definition.body else {
+            continue;
+        };
+        let local = address
+            .split_once('.')
+            .map_or(address.as_str(), |(_, rest)| rest);
+        let access = store
+            .agent_access
+            .unwrap_or(crate::ast::definition::AgentAccess::ReadWrite);
+        for op in crate::check::model::store_tools(store.kind, access) {
+            let name = crate::check::model::store_tool_name(local, *op);
+            let path = format!("{address}.tool.{}.input", op.as_str());
+            let schema_name = names.value(&path).to_string();
+            imported.push(schema_name.clone());
+            let arguments = surface_fields(surfaces, &path);
+            text.push_str("    {\n");
+            text.push_str(&format!("      name: {},\n", names::string(&name)));
+            text.push_str(&format!("      address: {},\n", names::string(&address)));
+            text.push_str(&format!(
+                "      description: {},\n",
+                names::string(&store_tool_description(store, &address, *op))
+            ));
+            text.push_str(&format!(
+                "      schema: {},\n",
+                json_literal(&schema::json_field_map(arguments.as_ref()), "      ")
+            ));
+            text.push_str(&format!(
+                "      invoke: async (args, context) =>\n        stores.runStoreTool(\n          \
+                 {},\n          {},\n          runtime.parseResult({schema_name}, args, {}) as Record<string, unknown>,\n          \
+                 context,\n        ),\n",
+                names.value(&address),
+                names::string(op.as_str()),
+                names::string(&format!("the arguments `{name}` was called with"))
+            ));
+            text.push_str("    },\n");
+        }
+    }
+    text
+}
+
+/// What a synthesized store tool tells the model it does.
+///
+/// The store's own `description:` is the LLM-facing half grammar 11.1 asks for,
+/// and the op supplies the verb: a model choosing between `docs_search` and
+/// `prefs_get` is choosing between two stores, and a description that named only
+/// the op would leave it guessing which.
+fn store_tool_description(
+    store: &crate::ir::definition::Store,
+    address: &str,
+    op: crate::ast::flow::StoreOp,
+) -> String {
+    let what = match op {
+        crate::ast::flow::StoreOp::Get => "Read one stored value by key from",
+        crate::ast::flow::StoreOp::Set => "Store a value under a key in",
+        crate::ast::flow::StoreOp::Delete => "Delete the value at a key in",
+        crate::ast::flow::StoreOp::List => "List the keys of",
+        crate::ast::flow::StoreOp::Search => "Search by meaning in",
+        crate::ast::flow::StoreOp::Upsert => "Add or replace a document in",
+        crate::ast::flow::StoreOp::Put => "Store an object under a key in",
+    };
+    match &store.description {
+        Some(description) => format!("{what} `{address}`. {}", description.value.trim()),
+        None => format!("{what} `{address}`."),
+    }
+}
+
 /// The name the agent's output schema is offered to the model under.
 ///
 /// `<local name>_output`, which is what makes a transcript readable — except
@@ -687,7 +1068,7 @@ const DEFAULT_TOOL_ITERATIONS: i64 = 8;
 /// would be one tool on the wire and the pinned choice would be ambiguous.
 fn output_tool_name(ir: &Ir, agent: &Agent, local: &str) -> String {
     let mut name = format!("{local}_output");
-    let attached: Vec<String> = agent
+    let mut attached: Vec<String> = agent
         .tools
         .iter()
         .filter_map(|reference| {
@@ -699,6 +1080,27 @@ fn output_tool_name(ir: &Ir, agent: &Agent, local: &str) -> String {
             })
         })
         .collect();
+    // The synthesized store tools are on the wire beside the declared ones
+    // (grammar 11.5), so they are names the pinned output tool has to avoid too:
+    // two tools of one name would make the pinned choice ambiguous.
+    for reference in &agent.stores {
+        let address = reference.value.to_string();
+        let Some(definition) = ir.definitions.get(&address) else {
+            continue;
+        };
+        let DefinitionBody::Store(store) = &definition.body else {
+            continue;
+        };
+        let store_local = address
+            .split_once('.')
+            .map_or(address.as_str(), |(_, rest)| rest);
+        let access = store
+            .agent_access
+            .unwrap_or(crate::ast::definition::AgentAccess::ReadWrite);
+        for op in crate::check::model::store_tools(store.kind, access) {
+            attached.push(crate::check::model::store_tool_name(store_local, *op));
+        }
+    }
     let mut ordinal = 2;
     while attached.iter().any(|tool| tool == &name) {
         name = format!("{local}_output_{ordinal}");
@@ -1175,7 +1577,7 @@ fn input_builder(
         // node: every field the subflow declares without a `default:` is bound
         // here, and nothing falls through by name (grammar 7.5, 8.5, D68).
         NodeKind::Flow { flow, .. } => {
-            let declared = surface_fields(surfaces, &format!("{}.inputs", flow.value));
+            let declared = flow_parameters(ir, surfaces, &flow.value.to_string());
             format!(
                 "  input: (roots) => {},\n",
                 bound_object(node.input.as_ref(), declared.as_ref(), "  ")
@@ -1190,9 +1592,91 @@ fn input_builder(
             "  input: (_roots, view) => runtime.mapPlan({}, view),\n",
             names.value(&format!("{address}.node.{id}.map"))
         ),
-        NodeKind::Human { .. } | NodeKind::Store { .. } => "  input: () => null,\n".to_string(),
+        // A store op's parameters are its own row in grammar 11.4, and six of
+        // the nine are CEL over `input`/`state`/`execution` (grammar 8.8). They
+        // are evaluated **here**, in the node's input phase, for the reason
+        // every node's input is built here: an expression that cannot be
+        // evaluated fails the execution rather than the activity, and neither
+        // `skip` nor a `fallback:` may absorb that (Decisions D78, D110).
+        NodeKind::Store { params, .. } => store_params(params),
+        NodeKind::Human { .. } => "  input: () => null,\n".to_string(),
     }
     .to_string()
+}
+
+/// One store op's parameters, as the object `stores.runStoreOp` takes.
+///
+/// The three literals of grammar 8.8 — `top_k`, `limit`, `content_type` — are
+/// written out as literals rather than evaluated: a store op's bound is a
+/// written-down number, readable without running the graph, exactly as a
+/// fan-out's is a schema bound.
+fn store_params(params: &crate::ir::flow::StoreParams) -> String {
+    let mut text = String::from("  input: (roots) => ({\n");
+    for (key, expression) in [
+        ("key", params.key.as_ref()),
+        ("query", params.query.as_ref()),
+        ("prefix", params.prefix.as_ref()),
+    ] {
+        let Some(expression) = expression else {
+            continue;
+        };
+        text.push_str(&format!(
+            "    {key}: String(runtime.toJson(runtime.evaluate({}, roots))),\n",
+            names::string(expression.value.as_str())
+        ));
+    }
+    match &params.value {
+        // A `vector upsert`'s and a `blob put`'s value is one expression: the
+        // text, or the content.
+        Some(crate::ir::flow::StoreValue::Expression { value }) => {
+            text.push_str(&format!(
+                "    value: String(runtime.toJson(runtime.evaluate({}, roots))),\n",
+                names::string(value.value.as_str())
+            ));
+        }
+        // A `kv set`'s is a field map checked against the store's `value_schema`.
+        Some(crate::ir::flow::StoreValue::Fields { bindings }) => {
+            text.push_str("    value: {\n");
+            for binding in &bindings.entries {
+                text.push_str(&format!(
+                    "      {}: runtime.toJson(runtime.evaluate({}, roots)),\n",
+                    names::string(&binding.name.value),
+                    names::string(binding.value.value.as_str())
+                ));
+            }
+            text.push_str("    },\n");
+        }
+        None => {}
+    }
+    for (key, map) in [
+        ("filter", params.filter.as_ref()),
+        ("metadata", params.metadata.as_ref()),
+    ] {
+        let Some(map) = map else { continue };
+        text.push_str(&format!("    {key}: {{\n"));
+        for binding in &map.entries {
+            text.push_str(&format!(
+                "      {}: runtime.toJson(runtime.evaluate({}, roots)),\n",
+                names::string(&binding.name.value),
+                names::string(binding.value.value.as_str())
+            ));
+        }
+        text.push_str("    },\n");
+    }
+    if let Some(top_k) = params.top_k {
+        text.push_str(&format!("    topK: {top_k},\n"));
+    }
+    if let Some(limit) = params.limit {
+        text.push_str(&format!("    limit: {limit},\n"));
+    }
+    if let Some(content_type) = &params.content_type {
+        text.push_str(&format!(
+            "    contentType: {},\n",
+            names::string(&content_type.value)
+        ));
+    }
+    text.push_str("  }),\n");
+    text
 }
 
 /// An object built field by field from a binding map, over a declared surface.
@@ -1201,14 +1685,15 @@ fn input_builder(
 /// and a `map` dispatch's field-map form (grammar 8.6 rule 12) — because both
 /// are total by the same rule: a field the site bound is that expression, a
 /// field it left out carries its own `default:`, and there is no third case the
-/// validator lets through (D68).
-fn bound_object(input: Option<&NodeInput>, declared: &FieldMap, indent: &str) -> String {
+/// validator lets through (D68). A surface with no fields is `{}`: the object a
+/// flow declaring no `inputs:` is started with.
+fn bound_object(input: Option<&NodeInput>, declared: &[Field], indent: &str) -> String {
     let bindings = match input {
         Some(NodeInput::Fields { bindings }) => Some(bindings),
         _ => None,
     };
     let mut text = String::from("({\n");
-    for field in &declared.fields {
+    for field in declared {
         let name = field.name.value.as_str();
         let bound = bindings.and_then(|bindings| {
             bindings
@@ -1328,11 +1813,16 @@ fn activity(
     imported: &mut Vec<String>,
 ) -> String {
     let id = node.id.value.as_str();
-    let output_schema = output_path(ir, address, node).map(|path| {
-        let name = names.value(&path).to_string();
-        imported.push(name.clone());
-        name
-    });
+    // A store-op node parses nothing — see its arm below — so its derived row is
+    // not imported: an import a module never reads would be noise in every
+    // golden that has a store in it.
+    let output_schema = output_path(ir, address, node)
+        .filter(|_| !matches!(node.kind, NodeKind::Store { .. }))
+        .map(|path| {
+            let name = names.value(&path).to_string();
+            imported.push(name.clone());
+            name
+        });
 
     match &node.kind {
         NodeKind::Agent { agent } => {
@@ -1344,7 +1834,8 @@ fn activity(
                  runtime.historyTurns(view.state[\"messages\"] as unknown[]),\n      context,\n    );\n    \
                  return {{\n      \
                  output: runtime.parseResult({schema}, answer.output, {subject}),\n      \
-                 history: answer.history,\n    \
+                 history: answer.history,\n      \
+                 models: answer.models,\n    \
                  }};\n  }},\n",
                 subject = names::string(&format!("the answer of `{}`", agent.value))
             )
@@ -1435,11 +1926,23 @@ fn activity(
         ),
         NodeKind::Human { .. } => unimplemented_run(
             "a `human` pause",
-            "`agent-compose serve` (generated Fastify app for http triggers: start/resume/status)",
+            "the `human` node runtime, which PRD §9's resolved question 4 schedules for M2",
         ),
-        NodeKind::Store { store, op, .. } => unimplemented_run(
-            &format!("a `{}` on `{}`", op.as_str(), store.value),
-            "store-op nodes + synthesized store tools with SQLite/local-disk backends",
+        // The result is **not** parsed against the emitted Zod for the derived
+        // row. That schema describes a shape this compiler's own runtime builds
+        // rather than a contract with something outside the process, and the one
+        // field grammar 11.4 marks optional — `value` on a `get` that missed —
+        // is required in it, so a parse would refuse exactly the answer
+        // Decision D110 says a miss gives.
+        NodeKind::Store { store, op, .. } => format!(
+            "  run: async (input, context, view) => ({{\n    \
+             output: await stores.runStoreOp(\n      {},\n      {},\n      \
+             input as stores.StoreParams,\n      context,\n      \
+             {{ via: \"node\", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, {})].join(\"/\") }},\n    \
+             ),\n  }}),\n",
+            names.value(&store.value.to_string()),
+            names::string(op.as_str()),
+            names::string(id)
         ),
     }
 }
@@ -1817,10 +2320,13 @@ fn dispatch_run(
             // when it completes, and there is no key to say otherwise
             // (grammar 10.4, Decision D105).
             format!(
-                "{indent}run: async (input, context) => ({{\n{indent}  \
-                 output: runtime.parseResult(\n{indent}    {schema},\n{indent}    \
-                 (await runtime.callAgent({binding}, input, [], context)).output,\n{indent}    {subject},\n{indent}  ),\n{indent}\
-                 }}),\n",
+                "{indent}run: async (input, context) => {{\n{indent}  \
+                 const answer = await runtime.callAgent({binding}, input, [], context);\n{indent}  \
+                 return {{\n{indent}    \
+                 output: runtime.parseResult({schema}, answer.output, {subject}),\n{indent}    \
+                 models: answer.models,\n{indent}  \
+                 }};\n{indent}\
+                 }},\n",
                 subject = names::string(&format!("the answer of `{target}`"))
             )
         }
@@ -1866,8 +2372,9 @@ fn dispatch_run(
 enum Contract<'ir> {
     /// A string-in agent: one unnamed value (Decision D14).
     StringIn,
-    /// A declared input object.
-    Fields(Cow<'ir, FieldMap>),
+    /// A declared input object, as the fields bound field by field. A flow with
+    /// no `inputs:` is this with no entries, not a missing contract.
+    Fields(Cow<'ir, [Field]>),
 }
 
 /// The input contract of one `agent.*`, `tool.*` or `flow.*` target.
@@ -1877,23 +2384,54 @@ fn target_contract<'ir>(ir: &Ir, surfaces: &[schema::Surface<'ir>], target: &str
     };
     match &definition.body {
         DefinitionBody::Agent(agent) if agent.input.is_none() => Contract::StringIn,
-        DefinitionBody::Agent(_) | DefinitionBody::Tool(_) => {
-            Contract::Fields(surface_fields(surfaces, &format!("{target}.input")))
-        }
-        DefinitionBody::Flow(flow) if flow.inputs.is_some() => {
-            Contract::Fields(surface_fields(surfaces, &format!("{target}.inputs")))
-        }
-        // A flow with no `inputs:` has the surface `inputs: {}` declares: a
-        // closed object with no properties (grammar 3.9), so an instance is
-        // started with an empty object.
-        DefinitionBody::Flow(_) => Contract::Fields(Cow::Owned(FieldMap {
-            surface: crate::ast::schema::Surface::Input,
-            fields: Vec::new(),
-            span: definition.span.clone(),
-        })),
+        DefinitionBody::Agent(_) | DefinitionBody::Tool(_) => Contract::Fields(fields_of(
+            surface_fields(surfaces, &format!("{target}.input")),
+        )),
+        DefinitionBody::Flow(_) => Contract::Fields(flow_parameters(ir, surfaces, target)),
         DefinitionBody::Provider(_) | DefinitionBody::Model(_) | DefinitionBody::Store(_) => {
             Contract::StringIn
         }
+    }
+}
+
+/// The parameter surface of one `flow.*`: what an instantiating site binds.
+///
+/// A flow with no `inputs:` has the surface `inputs: {}` declares — a closed
+/// object with no properties (grammar 3.9) — and it is *written nowhere*, so
+/// [`schema::surfaces`] emits no `<flow>.inputs` for it and there is no field
+/// map to look up. That is not an absence for each use site to discover: it is
+/// the empty parameter list, and an instance is started with an empty object.
+///
+/// Both module boundaries resolve their target's parameters here — a `flow:`
+/// node (grammar 8.5) and a `map` dispatch onto a flow (grammar 8.6 rule 12) —
+/// so an inputs-less subflow reads the same from either position. Answering
+/// only at the `map` boundary is how the `flow:` node position came to reach
+/// [`surface_fields`]'s panic on a composition `validate` accepts, which
+/// `a_flow_node_instantiates_a_subflow_that_declares_no_inputs` pins.
+fn flow_parameters<'ir>(
+    ir: &Ir,
+    surfaces: &[schema::Surface<'ir>],
+    address: &str,
+) -> Cow<'ir, [Field]> {
+    let declares_inputs =
+        ir.definitions
+            .get(address)
+            .is_some_and(|definition| match &definition.body {
+                DefinitionBody::Flow(flow) => flow.inputs.is_some(),
+                _ => false,
+            });
+    if declares_inputs {
+        fields_of(surface_fields(surfaces, &format!("{address}.inputs")))
+    } else {
+        Cow::Borrowed(&[])
+    }
+}
+
+/// A field map's entries, keeping whatever the map itself was borrowed as.
+fn fields_of(map: Cow<'_, FieldMap>) -> Cow<'_, [Field]> {
+    match map {
+        Cow::Borrowed(map) => Cow::Borrowed(&map.fields),
+        Cow::Owned(map) => Cow::Owned(map.fields),
     }
 }
 
@@ -2378,6 +2916,26 @@ fn registry_source(
                     .join(", "))
                 .unwrap_or_default()
         ));
+        text.push_str("    inputKinds: {");
+        let kinds: Vec<String> = flow
+            .inputs
+            .as_ref()
+            .map(|inputs| {
+                inputs
+                    .fields
+                    .iter()
+                    .map(|field| {
+                        format!(
+                            " {}: {},",
+                            names::string(field.name.value.as_str()),
+                            names::string(input_kind(&field.ty))
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        text.push_str(&kinds.join(""));
+        text.push_str(if kinds.is_empty() { "},\n" } else { " },\n" });
         text.push_str(&format!(
             "    outputs: [{}],\n",
             flow.outputs
@@ -2387,13 +2945,29 @@ fn registry_source(
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
+        text.push_str(&format!(
+            "    sessionStores: [{}],\n",
+            session_stores(ir, address)
+                .iter()
+                .map(|store| names::string(store))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
         text.push_str(&format!("    recursionLimit: {},\n", recursion_limit(flow)));
         text.push_str(&match &flow.inputs {
             Some(_) => {
                 let schema = names.value(&format!("{address}.inputs")).to_string();
                 imported.push(schema.clone());
+                // Through `runtime.parseResult` rather than the schema's own
+                // `.parse`, for the reason every other result is: the message is
+                // what a caller acts on. This is the surface an invocation
+                // arrives at — `--input k=v` from the CLI, one decoded payload
+                // from the app — and grammar 13.2 asks it to fail "naming the
+                // field", which a schema library's own multi-line dump does only
+                // in the sense that the name is somewhere inside it (PRD G3).
                 format!(
-                    "    parse: (inputs: unknown) => {schema}.parse(inputs) as Record<string, unknown>,\n"
+                    "    parse: (inputs: unknown) =>\n      runtime.parseResult({schema}, inputs, {}) as Record<string, unknown>,\n",
+                    names::string(&format!("the `inputs:` of `{address}`"))
                 )
             }
             // A flow with no `inputs:` takes none, so an invocation supplies
@@ -2416,6 +2990,40 @@ fn registry_source(
     text.push_str("};\n");
     text.push_str(RUN_FLOW);
     text
+}
+
+/// How a `--input` value is read for one declared field (grammar 13.2).
+fn input_kind(ty: &TypeNode) -> &'static str {
+    match &ty.form {
+        TypeForm::Scalar(scalar) => match scalar.kind {
+            crate::ast::schema::ScalarKind::String => "string",
+            crate::ast::schema::ScalarKind::Integer => "integer",
+            crate::ast::schema::ScalarKind::Number => "number",
+            crate::ast::schema::ScalarKind::Boolean => "boolean",
+        },
+        // An enum is a closed set of strings (Decision D9), so its argument is
+        // one of them written out — text, not a JSON document.
+        TypeForm::Enum(_) => "string",
+        TypeForm::Object(_) | TypeForm::Array(_) | TypeForm::Union(_) => "json",
+    }
+}
+
+/// The `scope: session` stores a flow reaches (grammar 7.7, 11.3).
+///
+/// The same relation the validator's session-coherence check quantifies over,
+/// read here rather than restated: two spellings of one traversal is how they
+/// come to disagree about which flows need a session key (Decision D86).
+fn session_stores(ir: &Ir, address: &str) -> Vec<String> {
+    crate::check::reach::stores_of(ir, address)
+        .into_iter()
+        .filter(|store| {
+            matches!(
+                ir.definitions.get(store).map(|definition| &definition.body),
+                Some(DefinitionBody::Store(store))
+                    if store.scope == crate::ast::definition::StoreScope::Session
+            )
+        })
+        .collect()
 }
 
 /// The passes a cycle carrying no counting bound is given, per node in it.
@@ -2472,14 +3080,39 @@ fn recursion_limit(flow: &Flow) -> i64 {
 }
 
 const REGISTRY_DOC: &str = r#"
+/**
+ * How a declared flow input reads a command-line value (grammar 13.2).
+ *
+ * `json` is every structured shape — an object, an array, a tagged union — for
+ * which the one honest reading of a shell argument is the document it spells.
+ */
+export type InputKind = "string" | "integer" | "number" | "boolean" | "json";
+
 /** One compiled flow: what it takes, what it answers, and how to run it. */
 export interface CompiledFlow {
   /** Its typed address (grammar 2.2). */
   readonly address: string;
   /** The fields its `inputs:` declares (grammar 7.5). */
   readonly inputs: readonly string[];
+  /**
+   * What each declared input *is*, so a `--input k=v` argument can be read as
+   * the type the field declares rather than reaching Zod as text (grammar 13.2).
+   */
+  readonly inputKinds: Readonly<Record<string, InputKind>>;
   /** The fields its `outputs:` declares, each read from the channel of that name. */
   readonly outputs: readonly string[];
+  /**
+   * The `scope: session` stores this flow **reaches**, under the relation
+   * grammar 7.7 fixes — its own nodes, its maps' dispatch targets, the flows it
+   * instantiates, and the stores of every agent it reaches.
+   *
+   * A run of this flow needs a session identity exactly when this list is not
+   * empty (grammar 11.3): a declared trigger supplies it through `session_key:`,
+   * and the CLI through `--session`. Checked at run start rather than at
+   * validate, for the reason env-ref presence is: the value does not exist until
+   * the invocation does.
+   */
+  readonly sessionStores: readonly string[];
   /** The superstep ceiling a run of it takes by default. */
   readonly recursionLimit: number;
   /** Parse an invocation's inputs against the flow's own schema (grammar 13.2). */
@@ -2521,6 +3154,30 @@ export interface FlowRun {
 }
 
 /**
+ * Why a flow that reaches a `scope: session` store refuses a run that arrived
+ * with no session identity (grammar 11.3, 13.2).
+ *
+ * One sentence in one place, because it is raised from two and the two must not
+ * drift: `src/cli.ts` raises it as a **usage** error, before a `run` starts
+ * anything, because a missing `--session` is an argument the caller has to add —
+ * the same class as an unknown `--input` name or an absent `${ENV}`, which
+ * grammar 11.3 says outright by likening this check to env-ref presence (§4.3);
+ * `runFlow` raises it for every other caller, where the key arrives per
+ * invocation.
+ *
+ * Named by the store rather than by the flow, because the store is what the
+ * author has to look at. And three ways a run arrives with none are named,
+ * because two of them are advice a reader has already taken: a declared
+ * `session_key:` that *evaluated* to the empty string — an absent header, a
+ * payload member that was not sent — is an identity-less run whose trigger does
+ * declare one, and a message offering only the two remedies would send that
+ * reader to look at a line that is already there (PRD G3).
+ */
+export function sessionRefusal(address: string, stores: readonly string[]): string {
+  return `\`${address}\` reaches ${stores.map((store) => `\`${store}\``).join(", ")}, which ${stores.length === 1 ? "is" : "are"} \`scope: session\`, so this run needs a session identity and arrived with none: pass \`--session <key>\` to \`agent-compose run\`, or declare \`session_key:\` on the trigger that starts it — and where one is declared, it answered the empty string for this invocation (grammar 11.3, 13.2)`;
+}
+
+/**
  * Run one flow to quiescence and materialize its outputs.
  *
  * This is the invocation surface `agent-compose run` and the generated `serve`
@@ -2555,23 +3212,39 @@ export async function runFlow(
   }
   const parsed = flow.parse(inputs);
   const ceiling = options.recursionLimit ?? flow.recursionLimit;
+  const sessionKey = options.sessionKey ?? "";
+  // Grammar 11.3, checked where the value first exists: a flow that reaches a
+  // `scope: session` store keys off the identity its trigger supplies, and a run
+  // started without one would silently address a partition named by the empty
+  // string. `src/cli.ts` decides the same thing one step earlier for a `run`,
+  // where the identity is a command-line argument; this is the guard for every
+  // caller it cannot stand in for — a `serve` request, an ejected invocation —
+  // where the key arrives per invocation and its absence really is a failure of
+  // that run rather than of the command.
+  if (sessionKey === "" && flow.sessionStores.length > 0) {
+    throw new Error(sessionRefusal(address, flow.sessionStores));
+  }
+  const executionId = options.executionId ?? `exec_${globalThis.crypto.randomUUID()}`;
   // `runtime.quiesce` keeps the last state each superstep produced, which is
   // what makes a failure's trace survive; the one failure it restates on the way
   // out is LangGraph stopping the run at the ceiling.
-  const { state, error } = await runtime.quiesce(
-    flow,
-    {
-      $run: {
-        ...runtime.emptyRun(),
-        input: parsed,
-        execution: {
-          id: options.executionId ?? `exec_${globalThis.crypto.randomUUID()}`,
-          session_key: options.sessionKey ?? "",
+  const { state, error } = await runtime
+    .quiesce(
+      flow,
+      {
+        $run: {
+          ...runtime.emptyRun(),
+          input: parsed,
+          execution: { id: executionId, session_key: sessionKey },
         },
       },
-    },
-    ceiling,
-  );
+      ceiling,
+    )
+    // `scope: execution` means what it says: whatever this run's own stores held
+    // is released when the run ends, however it ended (PRD 5.8, grammar 11.1).
+    // A `serve` process runs many executions, so a store that stayed open would
+    // be both a leak and a lifetime the composition did not declare.
+    .finally(() => stores.releaseExecution(executionId));
   if (error !== undefined) {
     throw new runtime.FlowFailure(
       address,
@@ -3081,10 +3754,98 @@ flow.f:
         );
     }
 
-    /// A `model.*` route binds its first member, and the note says failover is
-    /// not what this release does with the rest.
+    /// A flow attached as a tool is **on the wire** with the contract grammar
+    /// 5.4 gives it, and only its call is refused.
+    ///
+    /// The two halves are one rule. A tool the compiler drops is a model that
+    /// cannot call what the composition attached and a run that says nothing
+    /// about it — no diagnostic at `validate`, none at `build`, and an agent the
+    /// validator analysed the attachment of (grammar 7.7 clause 4) reaching the
+    /// provider without it. So the name, the description grammar 5.4 requires
+    /// here, and the `inputs:` schema are all emitted; the `invoke` is where
+    /// this release says what it does not do.
     #[test]
-    fn a_route_binds_its_first_member_and_says_what_is_missing() {
+    fn a_flow_attached_as_a_tool_is_offered_to_the_model_and_refuses_its_call() {
+        let emitted = emit(&format!(
+            r#"{PREAMBLE}
+agent.caller:
+  model: model.m
+  prompt: Answer.
+  output: {{ draft: {{ type: string }} }}
+  tools: [flow.helper, flow.bare]
+
+flow.helper:
+  description: Summarise one passage into a line.
+  inputs: {{ passage: {{ type: string, min_length: 1 }} }}
+  outputs: {{ draft: {{ type: string }} }}
+  nodes:
+    write: {{ agent: agent.reviewer }}
+  edges:
+    - {{ from: start, to: write }}
+    - {{ from: write, to: end }}
+
+flow.bare:
+  description: Answer with no arguments at all.
+  outputs: {{ draft: {{ type: string }} }}
+  nodes:
+    write: {{ agent: agent.reviewer }}
+  edges:
+    - {{ from: start, to: write }}
+    - {{ from: write, to: end }}
+
+flow.f:
+  inputs: {{ goal: {{ type: string }} }}
+  outputs: {{ draft: {{ type: string }} }}
+  nodes:
+    say: {{ agent: agent.caller }}
+  edges:
+    - {{ from: start, to: say }}
+    - {{ from: say, to: end }}
+"#
+        ));
+        // The local name is the name on the wire, and the address travels with
+        // it so a transcript says which flow was attached.
+        assert!(emitted.contains("      name: \"helper\","), "{emitted}");
+        assert!(
+            emitted.contains("      address: \"flow.helper\","),
+            "{emitted}"
+        );
+        // Grammar 5.4: the flow's own `description:` is the selection signal.
+        assert!(
+            emitted.contains("      description: \"Summarise one passage into a line.\","),
+            "{emitted}"
+        );
+        // …and its `inputs:` is the parameter schema, `min_length:` included.
+        assert!(emitted.contains("\"minLength\": 1"), "{emitted}");
+        assert!(
+            emitted
+                .contains("throw new runtime.Unimplemented(\"`flow.helper` attached as a tool\","),
+            "{emitted}"
+        );
+        // A flow with no `inputs:` is a no-argument tool rather than a panic:
+        // the empty parameter list is written nowhere, so there is no field map
+        // to look up (see `flow_parameters`).
+        assert!(emitted.contains("      name: \"bare\","), "{emitted}");
+        assert!(
+            emitted.contains("throw new runtime.Unimplemented(\"`flow.bare` attached as a tool\","),
+            "{emitted}"
+        );
+        assert!(
+            !emitted
+                .contains("is a flow attached as a tool, which this compiler release does not run"),
+            "the construct is emitted rather than commented away:\n{emitted}"
+        );
+    }
+
+    /// A `model.*` route is an ordered ladder over its members, and it is
+    /// emitted **after** every direct binding it names.
+    ///
+    /// The order is the load-bearing half. `model.default` sorts before
+    /// `model.fast` and `model.smart` in the IR's address order, so a single
+    /// pass would emit a `const` that references two declared later — a module
+    /// that type-checks and throws at import, past every gate a build has.
+    #[test]
+    fn a_route_is_an_ordered_ladder_emitted_after_its_members() {
         let emitted = emit(&format!(
             r#"{PREAMBLE}
 model.fast:
@@ -3110,14 +3871,238 @@ flow.f:
 "#
         ));
         let routed = emitted
-            .split("const modelDefault: runtime.ModelBinding")
+            .split("const modelDefault: runtime.ModelRoute = {")
             .nth(1)
             .expect("the route is emitted");
-        assert!(routed.contains("id: \"some-model\","), "{routed}");
         assert!(
-            emitted.contains("failover is not executed by this compiler release"),
+            routed.contains("route: [modelM, modelFast],"),
+            "the members are the route's own order: {routed}"
+        );
+        assert!(
+            routed.contains("routeOn: [\"rate_limit\", \"overloaded\", \"timeout\"],"),
+            "grammar 12.2's default is written out: {routed}"
+        );
+        assert!(
+            emitted.find("const modelFast: runtime.ModelBinding")
+                < emitted.find("const modelDefault: runtime.ModelRoute"),
+            "a route references its members, so it is declared after them:\n{emitted}"
+        );
+        assert!(emitted.contains("  model: modelDefault,\n"), "{emitted}");
+    }
+
+    /// A composition with stores: the fixture the store tests share.
+    const STORES: &str = r#"version: "0.1"
+
+state:
+  found: { type: boolean, default: false }
+
+provider.p:
+  kind: anthropic
+  api_key: ${MODEL_KEY}
+
+provider.embeds:
+  kind: openai_compatible
+  base_url: ${EMBED_URL}
+
+model.m:
+  provider: provider.p
+  id: some-model
+
+store.prefs:
+  kind: kv
+  scope: execution
+  description: What this run was told.
+  value_schema:
+    theme: { type: string }
+
+store.docs:
+  kind: vector
+  scope: global
+  description: The documentation.
+  embed: { model: text-embedding-3-small, provider: provider.embeds, dimensions: 4 }
+  metadata_schema:
+    source: { type: string }
+  agent_access: read
+
+agent.grounded:
+  model: model.m
+  prompt: Answer.
+  stores: [store.docs, store.prefs]
+  input:
+    question: { type: string }
+  output:
+    answer: { type: string }
+
+flow.f:
+  inputs:
+    question: { type: string }
+  outputs: {}
+  nodes:
+    load:
+      store: store.prefs
+      op: get
+      key: "'k'"
+      writes: { found: found }
+    ask: { agent: agent.grounded, input: { question: "input.question" } }
+  edges:
+    - { from: start, to: load }
+    - { from: load, to: ask }
+    - { from: ask, to: end }
+"#;
+
+    /// A store is one binding both consumption surfaces reach (PRD 5.8), and it
+    /// carries the backend the active target resolved (grammar 11.3).
+    #[test]
+    fn a_store_is_one_binding_carrying_the_backend_its_target_resolved() {
+        let emitted = emit(STORES);
+        assert!(
+            emitted.contains("const storePrefs: stores.StoreBinding = {"),
             "{emitted}"
         );
+        assert!(emitted.contains("  kind: \"kv\",\n  scope: \"execution\","));
+        assert!(
+            emitted.contains("    provider: \"sqlite\",\n"),
+            "`--target local` substitutes local storage for every store: {emitted}"
+        );
+        assert!(
+            emitted.contains("    provider: \"sqlite_vec\",\n"),
+            "…per kind: {emitted}"
+        );
+        // A `vector` store's `embed:` names the connection that computes the
+        // vectors, which is a `provider.*` and never the backend (D116).
+        assert!(
+            emitted.contains("  embed: {\n    store: \"store.docs\",\n    model: \"text-embedding-3-small\",\n    provider: providerEmbeds,\n    dimensions: 4,\n  },"),
+            "{emitted}"
+        );
+        // Absent and `{}` are different declarations (D114), and this is the
+        // field the difference reaches the runtime through.
+        assert!(emitted.contains("  metadata: true,\n"), "{emitted}");
+        assert!(emitted.contains("  metadata: false,\n"), "{emitted}");
+
+        // The store-op node evaluates its parameters in the input phase and
+        // carries the idempotency key of grammar 9.4 to the backend.
+        assert!(
+            emitted.contains("    key: String(runtime.toJson(runtime.evaluate(\"'k'\", roots))),"),
+            "{emitted}"
+        );
+        assert!(
+            emitted.contains(
+                "{ via: \"node\", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, \"load\")].join(\"/\") }"
+            ),
+            "{emitted}"
+        );
+    }
+
+    /// An attached store synthesizes grammar 11.5's tools, narrowed by
+    /// `agent_access:` (Decision D37).
+    #[test]
+    fn an_attached_store_synthesizes_its_tools_and_agent_access_narrows_them() {
+        let emitted = emit(STORES);
+        let agent = emitted
+            .split("const agentGrounded: runtime.AgentBinding = {")
+            .nth(1)
+            .expect("the agent is emitted");
+        // `store.docs` is `agent_access: read`, so the write tool is withheld;
+        // `store.prefs` takes the `read_write` default and gets both.
+        assert!(agent.contains("name: \"docs_search\","), "{agent}");
+        assert!(!agent.contains("docs_upsert"), "{agent}");
+        assert!(agent.contains("name: \"prefs_get\","), "{agent}");
+        assert!(agent.contains("name: \"prefs_set\","), "{agent}");
+        // The arguments are parsed against the emitted Zod for the tool's own
+        // surface — the same schema the JSON column constrains the model with.
+        assert!(
+            agent.contains("runtime.parseResult(storeDocsToolSearchInput, args,"),
+            "{agent}"
+        );
+        assert!(
+            agent.contains("stores.runStoreTool(\n          storeDocs,\n          \"search\","),
+            "{agent}"
+        );
+        // …and a store's own `description:` is what tells the model which store
+        // it is choosing.
+        assert!(
+            agent.contains("Search by meaning in `store.docs`. The documentation."),
+            "{agent}"
+        );
+    }
+
+    /// Under a named target the store's backend is the deploy layer's, and a
+    /// backend this release does not implement still **builds**: the refusal is
+    /// the runtime's, at the op, naming where the binding came from.
+    #[test]
+    fn a_named_target_resolves_a_stores_backend_through_its_deploy_layer() {
+        let directory = std::env::temp_dir().join(format!(
+            "agent-compose-store-backend-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(directory.join("deploy")).expect("a scratch directory");
+        std::fs::write(directory.join("main.yml"), STORES).expect("the entrypoint is writable");
+        std::fs::write(
+            directory.join("deploy/staging.yml"),
+            "version: \"0.1\"\n\nstorage_backends:\n  defaults:\n    kv: { provider: redis, url: \"${REDIS_URL}\" }\n  aliases:\n    docs_db: { provider: chroma, url: \"${CHROMA_URL}\" }\n",
+        )
+        .expect("the deploy file is writable");
+
+        let resolution = crate::resolve_with_target(directory.join("main.yml"), "staging");
+        let _ = std::fs::remove_dir_all(&directory);
+        assert!(
+            resolution.diagnostics.is_empty(),
+            "{:#?}",
+            resolution.diagnostics
+        );
+        let ir = resolution.ir.expect("a clean resolution has an artifact");
+        let mut names = Names::of(&ir);
+        declare(&mut names, &ir);
+        let emitted = module(&ir, &names).contents;
+
+        assert!(
+            emitted.contains(
+                "    provider: \"redis\",\n    from: \"the `kv` default of the `staging` target\","
+            ),
+            "the per-kind default is what a store naming no alias resolves to: {emitted}"
+        );
+        // `store.docs` names no alias in this fixture, so it falls to the
+        // built-in rather than to the `docs_db` alias beside it.
+        assert!(
+            emitted.contains("    provider: \"sqlite_vec\",\n    from: \"the built-in for `kind: vector`, which the `staging` target does not override\","),
+            "{emitted}"
+        );
+    }
+
+    /// A declared `route_on:` replaces the default rather than extending it.
+    #[test]
+    fn a_declared_route_on_is_what_the_ladder_fails_over_on() {
+        let emitted = emit(&format!(
+            r#"{PREAMBLE}
+model.fast:
+  provider: provider.p
+  id: another-model
+
+model.default:
+  route: [model.m, model.fast]
+  route_on: [server_error]
+
+agent.routed:
+  model: model.default
+  prompt: Answer.
+  output: {{ draft: {{ type: string }} }}
+
+flow.f:
+  inputs: {{ goal: {{ type: string }} }}
+  outputs: {{ draft: {{ type: string }} }}
+  nodes:
+    say: {{ agent: agent.routed, input: "input.goal" }}
+  edges:
+    - {{ from: start, to: say }}
+    - {{ from: say, to: end }}
+"#
+        ));
+        assert!(
+            emitted.contains("routeOn: [\"server_error\"],"),
+            "{emitted}"
+        );
+        assert!(!emitted.contains("\"rate_limit\""), "{emitted}");
     }
 
     /// The output schema is offered under `<agent>_output` — except where the
@@ -3682,5 +4667,68 @@ flow.f:
         let binding = declaration(&emitted, "flowInnerBinding: runtime.SubflowBinding");
         assert!(binding.contains("address: \"flow.inner\","), "{binding}");
         assert!(binding.contains("outputs: [\"draft\"],"), "{binding}");
+    }
+
+    /// A flow that declares no `inputs:` is instantiable from **both** module
+    /// boundaries, and from either it is started with an empty object.
+    ///
+    /// `inputs:` is optional (grammar 7.5) and an inputs-less flow is ordinary —
+    /// `flow.tenant_recall` in the store acceptance fixture is one. Nothing
+    /// writes the surface down, so `schema::surfaces` emits no `<flow>.inputs`
+    /// for it; asking for that surface at a use site is what used to panic the
+    /// emitter (`no schema surface is emitted for ...`) on a composition
+    /// `validate` accepts clean, which is why the assertion below opens by
+    /// checking that it does.
+    #[test]
+    fn a_flow_node_instantiates_a_subflow_that_declares_no_inputs() {
+        let source = format!(
+            r#"{PREAMBLE}
+flow.inner:
+  outputs: {{ draft: {{ type: string }} }}
+  nodes:
+    only: {{ agent: agent.reviewer, input: {{ goal: "'fixed'", draft: "state.draft" }} }}
+  edges:
+    - {{ from: start, to: only }}
+    - {{ from: only, to: end }}
+
+flow.f:
+  inputs: {{ goals: {{ type: array, max_items: 4, items: {{ type: string }} }} }}
+  outputs: {{ draft: {{ type: string }} }}
+  nodes:
+    sub: {{ flow: flow.inner }}
+    each:
+      map:
+        over: input.goals
+        node: flow.inner
+        max_concurrency: 2
+        input: {{}}
+        writes: {{ draft: notes }}
+  edges:
+    - {{ from: start, to: sub }}
+    - {{ from: sub, to: each }}
+    - {{ from: each, to: end }}
+"#
+        );
+        let ir = ir_of(&source);
+        assert!(
+            crate::check(&ir).is_empty(),
+            "the composition validates clean, so `build` owes it a project: {:#?}",
+            crate::check(&ir)
+        );
+
+        let mut names = Names::of(&ir);
+        declare(&mut names, &ir);
+        let emitted = module(&ir, &names).contents;
+
+        assert!(
+            declaration(&emitted, "flowFNodeSub:").contains("input: (roots) => ({\n  }),"),
+            "a `flow:` node onto an inputs-less subflow binds the empty \
+             object:\n{emitted}"
+        );
+        assert!(
+            declaration(&emitted, "flowFNodeEachMap:").contains("input: (roots) => ({\n      }),"),
+            "…and so does a `map` dispatch onto the same flow, which is the \
+             position that already answered:\n{emitted}"
+        );
     }
 }

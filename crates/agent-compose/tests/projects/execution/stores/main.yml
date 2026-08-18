@@ -5,17 +5,21 @@
 #   * **store-op nodes** — `load`, `remember` and `reread` below: deterministic,
 #     graph-invoked, schema-checked against `value_schema`, and under
 #     `--target local` backed by SQLite/local disk with no infrastructure at all;
-#   * **agent-attached** — `store.docs` and `store.prefs` on `agent.grounded`:
-#     codegen synthesizes LLM-facing tools from each store's kind and schema
-#     (grammar 11.5), and they appear in the model request the mock records.
+#   * **agent-attached** — `store.docs`, `store.prefs` and `store.artifacts` on
+#     `agent.grounded`: codegen synthesizes LLM-facing tools from each store's
+#     kind and schema (grammar 11.5), they appear in the model request the mock
+#     records, and a model that calls one reaches the same backends the nodes do.
+#     All three kinds are attached, so all three rows of 11.5's table are real.
 #
 # `agent_access:` is what makes the second surface worth a fixture of its own:
 # `store.docs` is `read`, so the synthesized surface is `docs_search` and NOT
-# `docs_upsert`, while `store.prefs` takes the `read_write` default and
-# synthesizes `prefs_get` **and** `prefs_set`. The tool list of the recorded
-# request is exactly that claim, checkable. The key itself is Decision D37 and
-# still PRD §10's first open question — the grammar accepts it (M0), and if the
-# PRD declines it this fixture drops the line and keeps everything else.
+# `docs_upsert`, while `store.notes` — the same **kind** — takes the `read_write`
+# default and gets both, and `store.prefs` gets `prefs_get` **and** `prefs_set`.
+# The tool list of the recorded request is exactly that claim, checkable, and the
+# two vector stores make it a comparison rather than an absence. The key itself
+# is Decision D37 and still PRD §10's first open question — the grammar accepts
+# it (M0), and if the PRD declines it this fixture drops the line and keeps
+# everything else.
 #
 # `embed.provider` is an `openai_compatible` connection because embeddings are
 # served by a provider that publishes the capability (grammar 11.2), and it is a
@@ -51,6 +55,45 @@ state:
     type: string
     default: ""
 
+  # What `flow.ground` reads back out of the vector and blob backends. Every one
+  # of these declares a default no op ever produces, so a stubbed backend that
+  # answered nothing could not pass.
+  stored_id:
+    type: string
+    default: nothing was indexed
+  blob_found:
+    type: boolean
+    default: false
+  blob_value:
+    type: string
+    default: nothing was stored
+  blob_keys:
+    description: The keys `listing` found, which is what a `list` answers.
+    type: array
+    max_items: 10
+    items:
+      type: string
+    default: []
+
+  # …and what `flow.remember` reads out of the session-scoped one, which is the
+  # store whose whole point is surviving the execution that wrote it.
+  seen_before:
+    type: boolean
+    default: false
+  recalled:
+    type: object
+    properties:
+      note:
+        type: string
+    default: { note: "" }
+
+  # What `flow.ingest`'s model says it wrote down. The channel exists so the
+  # subflow has an output to hand back; what it is asserted about is the trace,
+  # not the string.
+  ingested:
+    type: string
+    default: ""
+
 provider.mock:
   kind: anthropic
   api_key: ${MOCK_API_KEY}
@@ -77,6 +120,11 @@ store.prefs:
     verbosity:
       enum: [low, high]
 
+# `dimensions:` is asserted against what the provider answers (grammar 11.2), and
+# `crates/mock-provider`'s embeddings surface answers an 8-wide vector — small on
+# purpose, because nothing there is a language model. Declaring the width the
+# harness really produces is what puts that assertion on the path a run takes;
+# declaring 1536 here would only mean this fixture never reached a vector op.
 store.docs:
   kind: vector
   scope: global
@@ -84,10 +132,51 @@ store.docs:
   embed:
     model: text-embedding-3-small
     provider: provider.embeddings
-    dimensions: 1536
+    dimensions: 8
   metadata_schema:
     source: { type: string }
   agent_access: read
+
+# The same kind as `store.docs` at the other `agent_access:`, which is what makes
+# the narrowing a comparison rather than an absence: one attachment list offers
+# `notes_upsert` and withholds `docs_upsert`. It is also the store a model can
+# both write and read in one node, so the arguments a synthesized tool carries —
+# including the `metadata:` an upsert supplies and the `filter:` a search matches
+# it with — are observable from what a later tool call answers, with nothing
+# staged behind it. `scope: execution` because it holds this run's own working
+# notes and nothing after the run has any business reading them.
+store.notes:
+  kind: vector
+  scope: execution
+  description: What the model wrote down while answering.
+  embed:
+    model: text-embedding-3-small
+    provider: provider.embeddings
+    dimensions: 8
+  metadata_schema:
+    source: { type: string }
+
+# The third kind (grammar 11.1): bulk content on local disk under
+# `--target local`. It is reached both ways — store-op nodes in `flow.ground`,
+# and the three tools grammar 11.5's third row synthesizes for an attached
+# `blob` (`artifacts_get`, `artifacts_list`, `artifacts_put`), which is the row
+# no other store here covers.
+store.artifacts:
+  kind: blob
+  scope: global
+  description: What a run wrote down, by name.
+
+# `scope: session` is the one lifetime that outlives an execution, and this is
+# the store that proves it: two runs sharing a `--session` see each other's
+# writes, and a run with no session identity at all is refused at start naming
+# this store (grammar 11.3, 13.2).
+store.memory:
+  kind: kv
+  scope: session
+  description: What this session has been told.
+  value_schema:
+    note:
+      type: string
 
 agent.grounded:
   description: Answers a question using the documentation it can search.
@@ -95,7 +184,7 @@ agent.grounded:
   prompt: |
     Answer the question. Search the documentation before answering, and record
     any preference the user states.
-  stores: [store.docs, store.prefs]
+  stores: [store.docs, store.notes, store.prefs, store.artifacts]
   input:
     question: { type: string }
     known: { type: boolean }
@@ -158,3 +247,225 @@ flow.answer:
     - { from: ask, to: remember }
     - { from: remember, to: reread }
     - { from: reread, to: end }
+
+# The other two kinds, end to end, with no model in the loop: a `vector` upsert
+# and the search that finds it back, and a `blob` written, read and listed.
+#
+# `find` writes nothing. A node's result is readable only from an edge guard and
+# a `map.over` (D42), so what a `search` answered is asserted from the **trace**
+# instead — which is the record PRD 5.8 asks a read to leave behind, and the one
+# place a `matches` row is observable at all.
+flow.ground:
+  description: Index one document, search for it, and round-trip a blob.
+  inputs:
+    text:
+      type: string
+      min_length: 1
+  outputs:
+    stored_id:
+      type: string
+    blob_found:
+      type: boolean
+    blob_value:
+      type: string
+    blob_keys:
+      type: array
+      max_items: 10
+      items:
+        type: string
+  nodes:
+    index:
+      store: store.docs
+      op: upsert
+      key: "'doc-1'"
+      value: "input.text"
+      metadata:
+        source: "'fixture'"
+      writes:
+        id: stored_id
+
+    find:
+      store: store.docs
+      op: search
+      query: "input.text"
+      top_k: 3
+      filter:
+        source: "'fixture'"
+
+    keep:
+      store: store.artifacts
+      op: put
+      key: "'note.txt'"
+      value: "input.text"
+      content_type: text/plain
+
+    reread:
+      store: store.artifacts
+      op: get
+      key: "'note.txt'"
+      writes:
+        found: blob_found
+        value: blob_value
+
+    listing:
+      store: store.artifacts
+      op: list
+      prefix: "'note'"
+      limit: 10
+      writes:
+        keys: blob_keys
+
+  edges:
+    - { from: start, to: index }
+    - { from: index, to: find }
+    - { from: find, to: keep }
+    - { from: keep, to: reread }
+    - { from: reread, to: listing }
+    - { from: listing, to: end }
+
+# Cross-session memory, declaratively (PRD 5.8): the read happens before the
+# write, so a second run under the same session key sees what the first left.
+flow.remember:
+  description: Recall what this session was told, then record what it says now.
+  inputs:
+    note:
+      type: string
+      min_length: 1
+  outputs:
+    seen_before:
+      type: boolean
+    recalled:
+      type: object
+      properties:
+        note:
+          type: string
+  nodes:
+    recall:
+      store: store.memory
+      op: get
+      key: "execution.session_key"
+      writes:
+        found: seen_before
+        value: recalled
+
+    save:
+      store: store.memory
+      op: set
+      key: "execution.session_key"
+      value:
+        note: "input.note"
+
+  edges:
+    - { from: start, to: recall }
+    - { from: recall, to: save }
+    - { from: save, to: end }
+
+# The one key a declared `manual` trigger carries that changes what a CLI run
+# **does** (grammar 13.2, §13's preamble: declaring the trigger "lets it carry a
+# `description:` or a `session_key:` remap"). `flow.remember` above is reached
+# through the *implicit* entry and keys off `--session` itself; this flow is
+# reached through a declared one that remaps it, and it only reads — so which
+# partition a run addressed is the whole of what it answers.
+triggers:
+  tenant_cli:
+    type: manual
+    flow: flow.tenant_recall
+    session_key: '"tenant/" + payload.session'
+
+flow.tenant_recall:
+  description: Recall this session's note, under a trigger that remaps `--session`.
+  outputs:
+    seen_before:
+      type: boolean
+    recalled:
+      type: object
+      properties:
+        note:
+          type: string
+  nodes:
+    recall:
+      store: store.memory
+      op: get
+      key: "execution.session_key"
+      writes:
+        found: seen_before
+        value: recalled
+
+  edges:
+    - { from: start, to: recall }
+    - { from: recall, to: end }
+
+# A store write inside a **retried subflow**, which is where a trace can lose an
+# effect that really happened (PRD 5.3, 5.8).
+#
+# A `flow:` node's attempt is a whole instance, and a retried one runs two: the
+# first writes and fails somewhere after, the second re-derives the same
+# idempotency key (grammar 9.4) and the backend dedupes it. Both instances have a
+# trace, and only a report carrying both says what the execution did — the second
+# alone reads as a run that wrote nothing and re-issued a duplicate with nothing
+# to have duplicated.
+#
+# `agent.scribe` is what fails: the model answers with a status the route does
+# not fail over on (there is no `route:` here at all), so the node fails after
+# `save` has already had its effect. Which attempt fails is the script's to
+# decide, so the same pair of flows decides both the retry that recovers and the
+# retry that does not.
+agent.scribe:
+  description: Confirms in one line what was written down.
+  model: model.smart
+  prompt: Confirm the note in one line.
+  input:
+    note: { type: string }
+  output:
+    line:
+      type: string
+      min_length: 1
+
+flow.ingest:
+  description: Write a note to the session store, then have the model confirm it.
+  inputs:
+    note:
+      type: string
+      min_length: 1
+  outputs:
+    ingested:
+      type: string
+  nodes:
+    save:
+      store: store.memory
+      op: set
+      key: "execution.session_key"
+      value:
+        note: "input.note"
+
+    confirm:
+      agent: agent.scribe
+      input:
+        note: "input.note"
+      writes:
+        line: ingested
+
+  edges:
+    - { from: start, to: save }
+    - { from: save, to: confirm }
+    - { from: confirm, to: end }
+
+flow.reingest:
+  description: Instantiate `flow.ingest` under a `retry:`, so an attempt is an instance.
+  inputs:
+    note:
+      type: string
+      min_length: 1
+  outputs:
+    ingested:
+      type: string
+  nodes:
+    sub:
+      flow: flow.ingest
+      input:
+        note: "input.note"
+      retry: { max: 1, backoff: 10ms }
+
+  edges:
+    - { from: start, to: sub }
+    - { from: sub, to: end }

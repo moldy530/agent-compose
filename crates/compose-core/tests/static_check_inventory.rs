@@ -173,6 +173,15 @@ const M0: &[Check] = &[
 
 /// The validator-owned rules `docs/grammar.md` Appendix B names that PRD §7 M0's
 /// sentence does not enumerate individually.
+///
+/// Two rows are the exception and label themselves. Half of `duplicate-route` —
+/// the half about two triggers rather than about the routes the app mounts for
+/// itself — and the whole of `conflicting-session-key` are rules the compiler
+/// applies that the grammar does not state, kept because each refuses an
+/// ambiguity the emitted project would otherwise resolve by picking, and
+/// reported as doc defects at their own rows and in `check/triggers.rs::routes`
+/// and `::manual_session_keys`. A reader auditing this list against the grammar
+/// should find every other row there.
 const GRAMMAR: &[Check] = &[
     Check {
         rule: "balanced convergence (7.6.2, D112)",
@@ -241,9 +250,61 @@ const GRAMMAR: &[Check] = &[
         evidence: Evidence::Fixture,
     },
     Check {
+        // The third row whose rule the spec does not state, and for the same
+        // shape of reason as the two below. §11.5 states the collision rule for
+        // a synthesized name against an attached one, and states the *reason* —
+        // an attachment's name on the wire is its address's local name — but no
+        // sentence and no Decision entry says what `tool.condense` beside
+        // `flow.condense` on one agent means, and the published schema accepts
+        // it. §5.4's duplicate rule is about entries rather than names, and the
+        // parser raises that one. `check/bindings.rs::attached_tool_collisions`
+        // reports the gap as a doc defect and says why the check is kept
+        // meanwhile; the citation here is deliberately not a section number for
+        // the rule itself, so this row cannot be read as evidence that the
+        // grammar states it.
+        rule: "two attached tools do not share a local name (compiler rule over 5.4's attachment naming and 11.5's collision rule)",
+        pass: "check/bindings.rs",
+        codes: &["tool-name-collision"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
         rule: "a `method: GET` trigger does not read through `payload.body` (13.3, D117)",
         pass: "check/triggers.rs",
         codes: &["invalid-expression"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        // The one row half of whose rule the spec does not state. Its **second**
+        // half does: §13.3 has a generated app expose `status` and `resume`
+        // beside each trigger's `start`, so those two routes are taken and a
+        // trigger cannot claim one. Its **first** half is derived rather than
+        // written — §13.3 fixes the mount model (one route per `http` trigger,
+        // at the `path:` and `method:` each one *defaults*) but no sentence and
+        // no Decision entry forbids two triggers landing on one pair, and the
+        // published schema accepts it. `check/triggers.rs::routes` reports that
+        // as a doc defect and says why the check is kept meanwhile; the citation
+        // here is deliberately not a section number for the half the grammar
+        // does not state, so this row cannot be read as evidence that it does.
+        rule: "an `http` trigger's route is free: unclaimed by another trigger (compiler rule over 13.3's mount model), and not one the generated app mounts for itself (13.3)",
+        pass: "check/triggers.rs",
+        codes: &["duplicate-route"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        // The second row whose rule the spec does not state, and for the same
+        // shape of reason as the one above. §13.2 makes a `manual` trigger's
+        // `session_key:` a legal *remap* of the CLI's `--session`, and §13's
+        // preamble makes the entry it remaps per **flow** ("it contributes no
+        // entry to the IR's trigger table and has no name") — but no sentence
+        // and no Decision entry says what two `manual` triggers on one flow
+        // declaring two different remaps mean, and the published schema accepts
+        // it. `check/triggers.rs::manual_session_keys` reports that as a doc
+        // defect and says why the check is kept meanwhile; the citation here is
+        // deliberately not a section number for the rule itself, so this row
+        // cannot be read as evidence that the grammar states it.
+        rule: "two `manual` triggers naming one flow agree about `session_key:` (compiler rule over 13.2's remap and 13's per-flow CLI entry)",
+        pass: "check/triggers.rs",
+        codes: &["conflicting-session-key"],
         evidence: Evidence::Fixture,
     },
     Check {

@@ -17,6 +17,7 @@
 import { END, START, StateGraph } from "@langchain/langgraph";
 
 import * as runtime from "./runtime.ts";
+import * as stores from "./stores.ts";
 import {
   agentFixerOutput,
   agentSummarizerOutput,
@@ -29,8 +30,8 @@ import {
   flowTriageNodeAnnounceOutput,
   flowTriageNodeApproveOutput,
   flowTriageNodeEscalateOutput,
-  flowTriageNodeRememberOutput,
   flowTriageNodeVerifyOutput,
+  storeDocsToolSearchInput,
   toolDeadLetterInput,
   toolDeadLetterOutput,
   toolRepoGrepInput,
@@ -231,6 +232,44 @@ const modelSmart: runtime.ModelBinding = {
   provider: providerAnthropic,
   settings: {
     "max_tokens": 8000,
+  },
+};
+
+/**
+ * `store.docs` — a `vector` store with `scope: global`, on the `chroma` backend (the alias `docs_db`, defined by the `staging` target) (grammar 11.1, 11.3).
+ */
+const storeDocs: stores.StoreBinding = {
+  address: "store.docs",
+  name: "docs",
+  kind: "vector",
+  scope: "global",
+  description: "Project documentation, chunked, for grounding triage decisions.",
+  metadata: true,
+  embed: {
+    store: "store.docs",
+    model: "text-embedding-3-small",
+    provider: providerLocal,
+    dimensions: 1536,
+  },
+  backend: {
+    provider: "chroma",
+    from: "the alias `docs_db`, defined by the `staging` target",
+  },
+};
+
+/**
+ * `store.triage_memory` — a `kv` store with `scope: session`, on the `redis` backend (the `kv` default of the `staging` target) (grammar 11.1, 11.3).
+ */
+const storeTriageMemory: stores.StoreBinding = {
+  address: "store.triage_memory",
+  name: "triage_memory",
+  kind: "kv",
+  scope: "session",
+  description: "What this session has already triaged.",
+  metadata: false,
+  backend: {
+    provider: "redis",
+    from: "the `kv` default of the `staging` target",
   },
 };
 
@@ -472,7 +511,53 @@ const agentTriage: runtime.AgentBinding = {
       "type": "object"
     },
   },
-  tools: [],
+  tools: [
+    {
+      name: "docs_search",
+      address: "store.docs",
+      description: "Search by meaning in `store.docs`. Project documentation, chunked, for grounding triage decisions.",
+      schema: {
+        "additionalProperties": false,
+        "properties": {
+          "filter": {
+            "additionalProperties": false,
+            "default": {},
+            "properties": {
+              "source": {
+                "type": "string"
+              },
+              "updated_at": {
+                "format": "date-time",
+                "type": "string"
+              }
+            },
+            "required": [],
+            "type": "object"
+          },
+          "query": {
+            "type": "string"
+          },
+          "top_k": {
+            "maximum": 100,
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "query",
+          "top_k"
+        ],
+        "type": "object"
+      },
+      invoke: async (args, context) =>
+        stores.runStoreTool(
+          storeDocs,
+          "search",
+          runtime.parseResult(storeDocsToolSearchInput, args, "the arguments `docs_search` was called with") as Record<string, unknown>,
+          context,
+        ),
+    },
+  ],
   maxToolIterations: 8,
 };
 
@@ -657,6 +742,7 @@ const flowTriageNodeClassify: runtime.NodeDescriptor = {
     return {
       output: runtime.parseResult(agentTriageOutput, answer.output, "the answer of `agent.triage`"),
       history: answer.history,
+      models: answer.models,
     };
   },
   writes: [],
@@ -713,13 +799,13 @@ const flowTriageNodeDispatchMap: runtime.MapDescriptor = {
         "file": runtime.toJson(runtime.evaluate("finding.file", roots)),
         "patch_hint": runtime.toJson(runtime.evaluate("finding.patch_hint", roots)),
       }),
-      run: async (input, context) => ({
-        output: runtime.parseResult(
-          agentFixerOutput,
-          (await runtime.callAgent(agentFixer, input, [], context)).output,
-          "the answer of `agent.fixer`",
-        ),
-      }),
+      run: async (input, context) => {
+        const answer = await runtime.callAgent(agentFixer, input, [], context);
+        return {
+          output: runtime.parseResult(agentFixerOutput, answer.output, "the answer of `agent.fixer`"),
+          models: answer.models,
+        };
+      },
       writes: [
         { field: "patch", channel: "patches", reduce: "append" },
       ],
@@ -947,6 +1033,7 @@ const flowTriageNodeSummarize: runtime.NodeDescriptor = {
     return {
       output: runtime.parseResult(agentSummarizerOutput, answer.output, "the answer of `agent.summarizer`"),
       history: answer.history,
+      models: answer.models,
     };
   },
   writes: [
@@ -975,10 +1062,22 @@ const flowTriageNodeRemember: runtime.NodeDescriptor = {
     onError: "skip",
   },
   shapes: { input: flowTriageShape, state: stateShape, output: flowTriageNodeRememberShape },
-  input: () => null,
-  run: () => {
-    throw new runtime.Unimplemented("a `set` on `store.triage_memory`", "store-op nodes + synthesized store tools with SQLite/local-disk backends");
-  },
+  input: (roots) => ({
+    key: String(runtime.toJson(runtime.evaluate("execution.session_key", roots))),
+    value: {
+      "last_report": runtime.toJson(runtime.evaluate("input.report", roots)),
+      "patch_count": runtime.toJson(runtime.evaluate("size(state.patches)", roots)),
+    },
+  }),
+  run: async (input, context, view) => ({
+    output: await stores.runStoreOp(
+      storeTriageMemory,
+      "set",
+      input as stores.StoreParams,
+      context,
+      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "remember")].join("/") },
+    ),
+  }),
   writes: [],
   edges: [
     { to: "approve" },
@@ -997,7 +1096,7 @@ const flowTriageNodeApprove: runtime.NodeDescriptor = {
   shapes: { input: flowTriageShape, state: stateShape, output: flowTriageNodeApproveShape },
   input: () => null,
   run: () => {
-    throw new runtime.Unimplemented("a `human` pause", "`agent-compose serve` (generated Fastify app for http triggers: start/resume/status)");
+    throw new runtime.Unimplemented("a `human` pause", "the `human` node runtime, which PRD §9's resolved question 4 schedules for M2");
   },
   writes: [
     { field: "decision", channel: "human_decision", reduce: "set" },
@@ -1114,14 +1213,39 @@ const flowTriageBinding: runtime.SubflowBinding = {
     }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
 };
 
+/**
+ * How a declared flow input reads a command-line value (grammar 13.2).
+ *
+ * `json` is every structured shape — an object, an array, a tagged union — for
+ * which the one honest reading of a shell argument is the document it spells.
+ */
+export type InputKind = "string" | "integer" | "number" | "boolean" | "json";
+
 /** One compiled flow: what it takes, what it answers, and how to run it. */
 export interface CompiledFlow {
   /** Its typed address (grammar 2.2). */
   readonly address: string;
   /** The fields its `inputs:` declares (grammar 7.5). */
   readonly inputs: readonly string[];
+  /**
+   * What each declared input *is*, so a `--input k=v` argument can be read as
+   * the type the field declares rather than reaching Zod as text (grammar 13.2).
+   */
+  readonly inputKinds: Readonly<Record<string, InputKind>>;
   /** The fields its `outputs:` declares, each read from the channel of that name. */
   readonly outputs: readonly string[];
+  /**
+   * The `scope: session` stores this flow **reaches**, under the relation
+   * grammar 7.7 fixes — its own nodes, its maps' dispatch targets, the flows it
+   * instantiates, and the stores of every agent it reaches.
+   *
+   * A run of this flow needs a session identity exactly when this list is not
+   * empty (grammar 11.3): a declared trigger supplies it through `session_key:`,
+   * and the CLI through `--session`. Checked at run start rather than at
+   * validate, for the reason env-ref presence is: the value does not exist until
+   * the invocation does.
+   */
+  readonly sessionStores: readonly string[];
   /** The superstep ceiling a run of it takes by default. */
   readonly recursionLimit: number;
   /** Parse an invocation's inputs against the flow's own schema (grammar 13.2). */
@@ -1153,9 +1277,12 @@ export const flows: Readonly<Record<string, CompiledFlow>> = {
   "flow.enrich": {
     address: "flow.enrich",
     inputs: ["report"],
+    inputKinds: { "report": "string", },
     outputs: ["report_normalized"],
+    sessionStores: [],
     recursionLimit: 26,
-    parse: (inputs: unknown) => flowEnrichInputs.parse(inputs) as Record<string, unknown>,
+    parse: (inputs: unknown) =>
+      runtime.parseResult(flowEnrichInputs, inputs, "the `inputs:` of `flow.enrich`") as Record<string, unknown>,
     stream: (initial, options) =>
       flowEnrichGraph.stream(initial, {
         ...options,
@@ -1166,9 +1293,12 @@ export const flows: Readonly<Record<string, CompiledFlow>> = {
   "flow.triage": {
     address: "flow.triage",
     inputs: ["report", "pattern"],
+    inputKinds: { "report": "string", "pattern": "string", },
     outputs: ["summary", "patches"],
+    sessionStores: ["store.triage_memory"],
     recursionLimit: 36,
-    parse: (inputs: unknown) => flowTriageInputs.parse(inputs) as Record<string, unknown>,
+    parse: (inputs: unknown) =>
+      runtime.parseResult(flowTriageInputs, inputs, "the `inputs:` of `flow.triage`") as Record<string, unknown>,
     stream: (initial, options) =>
       flowTriageGraph.stream(initial, {
         ...options,
@@ -1186,6 +1316,30 @@ export interface FlowRun {
   readonly trace: readonly runtime.TraceEntry[];
   /** The whole state at quiescence. */
   readonly state: GraphState;
+}
+
+/**
+ * Why a flow that reaches a `scope: session` store refuses a run that arrived
+ * with no session identity (grammar 11.3, 13.2).
+ *
+ * One sentence in one place, because it is raised from two and the two must not
+ * drift: `src/cli.ts` raises it as a **usage** error, before a `run` starts
+ * anything, because a missing `--session` is an argument the caller has to add —
+ * the same class as an unknown `--input` name or an absent `${ENV}`, which
+ * grammar 11.3 says outright by likening this check to env-ref presence (§4.3);
+ * `runFlow` raises it for every other caller, where the key arrives per
+ * invocation.
+ *
+ * Named by the store rather than by the flow, because the store is what the
+ * author has to look at. And three ways a run arrives with none are named,
+ * because two of them are advice a reader has already taken: a declared
+ * `session_key:` that *evaluated* to the empty string — an absent header, a
+ * payload member that was not sent — is an identity-less run whose trigger does
+ * declare one, and a message offering only the two remedies would send that
+ * reader to look at a line that is already there (PRD G3).
+ */
+export function sessionRefusal(address: string, stores: readonly string[]): string {
+  return `\`${address}\` reaches ${stores.map((store) => `\`${store}\``).join(", ")}, which ${stores.length === 1 ? "is" : "are"} \`scope: session\`, so this run needs a session identity and arrived with none: pass \`--session <key>\` to \`agent-compose run\`, or declare \`session_key:\` on the trigger that starts it — and where one is declared, it answered the empty string for this invocation (grammar 11.3, 13.2)`;
 }
 
 /**
@@ -1223,23 +1377,39 @@ export async function runFlow(
   }
   const parsed = flow.parse(inputs);
   const ceiling = options.recursionLimit ?? flow.recursionLimit;
+  const sessionKey = options.sessionKey ?? "";
+  // Grammar 11.3, checked where the value first exists: a flow that reaches a
+  // `scope: session` store keys off the identity its trigger supplies, and a run
+  // started without one would silently address a partition named by the empty
+  // string. `src/cli.ts` decides the same thing one step earlier for a `run`,
+  // where the identity is a command-line argument; this is the guard for every
+  // caller it cannot stand in for — a `serve` request, an ejected invocation —
+  // where the key arrives per invocation and its absence really is a failure of
+  // that run rather than of the command.
+  if (sessionKey === "" && flow.sessionStores.length > 0) {
+    throw new Error(sessionRefusal(address, flow.sessionStores));
+  }
+  const executionId = options.executionId ?? `exec_${globalThis.crypto.randomUUID()}`;
   // `runtime.quiesce` keeps the last state each superstep produced, which is
   // what makes a failure's trace survive; the one failure it restates on the way
   // out is LangGraph stopping the run at the ceiling.
-  const { state, error } = await runtime.quiesce(
-    flow,
-    {
-      $run: {
-        ...runtime.emptyRun(),
-        input: parsed,
-        execution: {
-          id: options.executionId ?? `exec_${globalThis.crypto.randomUUID()}`,
-          session_key: options.sessionKey ?? "",
+  const { state, error } = await runtime
+    .quiesce(
+      flow,
+      {
+        $run: {
+          ...runtime.emptyRun(),
+          input: parsed,
+          execution: { id: executionId, session_key: sessionKey },
         },
       },
-    },
-    ceiling,
-  );
+      ceiling,
+    )
+    // `scope: execution` means what it says: whatever this run's own stores held
+    // is released when the run ends, however it ended (PRD 5.8, grammar 11.1).
+    // A `serve` process runs many executions, so a store that stayed open would
+    // be both a leak and a lifetime the composition did not declare.
+    .finally(() => stores.releaseExecution(executionId));
   if (error !== undefined) {
     throw new runtime.FlowFailure(
       address,

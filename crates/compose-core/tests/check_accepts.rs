@@ -7,6 +7,15 @@
 //! in the suite would notice. Every case here is one the grammar names, and
 //! several are the *accepting* half of a rule the negative corpus pins the
 //! rejecting half of.
+//!
+//! Each case is also **emitted**, because over-rejection has a second form the
+//! validator alone cannot show. A composition this file accepts is one `build`,
+//! `run` and `serve` all owe a project to; an emitter that reached for a schema
+//! nobody wrote, or indexed a list a legal shape leaves empty, refuses it as a
+//! panic and exit 101 rather than as a diagnostic — a spec that validates clean
+//! and cannot be compiled. The bytes are the golden corpus's subject; that the
+//! emitter answers *at all* over the whole legal surface is this one's, since
+//! the legal-but-unusual compositions live here.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -42,6 +51,21 @@ fn accepts(name: &str, body: &str) {
         diagnostics.is_empty(),
         "{name} should check cleanly, got:\n{}",
         render(&diagnostics)
+    );
+
+    // The emitter's own over-rejection: a legal shape it never learned to write.
+    //
+    // Every case here is a composition `validate` accepts, and `build`, `run`
+    // and `serve` all owe one a project — so the emitter reaching an
+    // `unreachable!` or an indexing panic over a shape this corpus admits is the
+    // same failure this file exists to catch, arriving as exit 101 instead of as
+    // a diagnostic. The emitted bytes are the goldens' subject and not this
+    // file's; that the emitter *answers at all* is this one's, because the
+    // corpus of legal-but-unusual compositions is here rather than there.
+    let project = compose_core::emit(&ir);
+    assert!(
+        !project.files().is_empty(),
+        "{name} validates, so `build` owes it a project, and it emitted no files"
     );
 }
 
@@ -287,6 +311,57 @@ flow.f:
     - { from: start, to: fan }
     - { from: fan, to: direct }
     - { from: direct, to: end }
+"#,
+    );
+}
+
+/// The same target from the *other* module boundary: a `flow:` node
+/// instantiating a flow that declares no `inputs:` (grammar 7.5, 8.5).
+///
+/// `inputs:` is optional, so the instantiation binds nothing and writes no
+/// `input:` at all — and it is still total over the parameter list, because the
+/// list is empty (Decision D68). Legal, ordinary — `flow.tenant_recall` in the
+/// store acceptance fixture is an inputs-less flow — and reached by nothing in
+/// the example corpus, which is what left the emitter with a surface it never
+/// learned to look up: nobody writes `inputs: {}` down, so no `<flow>.inputs`
+/// schema is emitted for such a flow, and asking for one panicked `build`,
+/// `run` and `serve` on a composition `validate` had just accepted. The `map`
+/// case above is the position that already answered.
+#[test]
+fn a_flow_node_instantiates_a_flow_with_no_inputs() {
+    accepts(
+        "flow-node-no-inputs",
+        r#"
+state:
+  seen:
+    type: string
+    default: ""
+flow.inner:
+  outputs:
+    seen: { type: string }
+  nodes:
+    stamp:
+      exec:
+        command: printf
+        args: ["%s", "hi"]
+        output:
+          stdout: { type: string }
+      writes:
+        stdout: seen
+  edges:
+    - { from: start, to: stamp }
+    - { from: stamp, to: end }
+flow.f:
+  outputs:
+    seen: { type: string }
+  nodes:
+    sub:
+      flow: flow.inner
+      writes:
+        seen: seen
+  edges:
+    - { from: start, to: sub }
+    - { from: sub, to: end }
 "#,
     );
 }
@@ -1210,6 +1285,143 @@ flow.f:
     n:
       agent: agent.a
       input: { text: "input.goal" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }
+"#,
+    );
+}
+
+/// A route the app's own routes only *look* like stays legal (grammar 13.3).
+///
+/// The accepting half of `invalid-check/an-http-trigger-claims-a-route-the-app-mounts`,
+/// and the reason it is written out rather than assumed: the app mounts exactly
+/// `GET /executions/:id` and `POST /executions/:id/resume`, so a check that
+/// matched a *prefix*, or matched the path without the method, would refuse
+/// every one of these — a longer path under the same prefix, a shorter one, the
+/// reserved path at another method, and the `POST` one at the `GET` one's
+/// address. Each is a route the router can tell apart from the app's, and none
+/// of them is the app's.
+#[test]
+fn a_trigger_route_beside_the_apps_own_routes() {
+    accepts(
+        "routes-beside-reserved",
+        r#"
+agent.a:
+  model: model.m
+  prompt: Do it.
+  input:
+    text: { type: string }
+  output:
+    result: { type: string }
+triggers:
+  detail:
+    type: http
+    flow: flow.f
+    method: GET
+    path: /executions/:id/detail
+    input:
+      goal: "payload.query['goal']"
+  index:
+    type: http
+    flow: flow.f
+    method: GET
+    path: /executions
+    input:
+      goal: "payload.query['goal']"
+  replace:
+    type: http
+    flow: flow.f
+    method: PUT
+    path: /executions/:id
+    input:
+      goal: "payload.body.goal"
+  restart:
+    type: http
+    flow: flow.f
+    method: GET
+    path: /executions/:id/resume
+    input:
+      goal: "payload.query['goal']"
+flow.f:
+  inputs:
+    goal: { type: string }
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.a
+      input: { text: "input.goal" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }
+"#,
+    );
+}
+
+/// The accepting half of
+/// `invalid-check/manual-triggers-disagree-about-the-session-key`, which is
+/// where the rule could go wrong in the other direction. Four `manual` triggers
+/// here and none of them conflicts:
+///
+/// * `cli` and `also_cli` name one flow and declare the **same** remap, which is
+///   one answer written twice rather than two answers;
+/// * `quiet_cli` names that same flow and declares **no** `session_key:` — the
+///   key's `"payload.session"` default, which is a trigger with no opinion about
+///   an entry rather than a third answer for it (grammar 13.1's table);
+/// * `other_cli` declares a different remap for a **different** flow, which is a
+///   different CLI entry entirely.
+///
+/// A rule that compared any two `manual` triggers, or read an undeclared
+/// `session_key:` as a declaration of the default, would refuse all of this.
+#[test]
+fn manual_triggers_that_agree_or_are_silent_about_the_session_key() {
+    accepts(
+        "manual-session-keys",
+        r#"
+store.memory:
+  kind: kv
+  scope: session
+  value_schema:
+    text: { type: string }
+triggers:
+  cli:
+    type: manual
+    flow: flow.f
+    session_key: '"tenant/" + payload.session'
+  also_cli:
+    type: manual
+    flow: flow.f
+    session_key: '"tenant/" + payload.session'
+  quiet_cli:
+    type: manual
+    flow: flow.f
+  other_cli:
+    type: manual
+    flow: flow.g
+    session_key: '"other/" + payload.session'
+flow.f:
+  inputs:
+    goal: { type: string }
+  outputs: {}
+  nodes:
+    n:
+      store: store.memory
+      op: set
+      key: "input.goal"
+      value: { text: "input.goal" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }
+flow.g:
+  inputs:
+    goal: { type: string }
+  outputs: {}
+  nodes:
+    n:
+      store: store.memory
+      op: set
+      key: "input.goal"
+      value: { text: "input.goal" }
   edges:
     - { from: start, to: n }
     - { from: n, to: end }

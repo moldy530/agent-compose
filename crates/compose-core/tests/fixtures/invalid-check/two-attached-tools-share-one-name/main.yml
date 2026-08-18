@@ -1,0 +1,59 @@
+# rule: two entries of one `tools:` list are one tool on the model's side when their local names are equal (compiler rule over grammar 5.4's attachment naming and 11.5's collision rule)
+# code: tool-name-collision
+# message: `agent.a` attaches `tool.condense` and `flow.condense`, which are one `condense` tool on the model's side
+# at: main.yml:48:26
+# label: main.yml:48:11 the first is attached here
+# help: an attached tool's name is its address's local name — the only name it has on the model's side (grammar 5.4, 11.5): rename one of the two definitions, or drop one of the attachments
+#
+# Grammar 5.4's own duplicate rule is about *entries* — `tools: [tool.x, tool.x]`
+# — and the parser raises that one. This is the other way two attachments
+# collide: different addresses, one local name, and that name is the only one
+# either has on the wire. Both are emitted, so the request would carry two tools
+# called `condense`.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+state:
+  line: { type: string, default: "" }
+tool.condense:
+  description: Condense a passage the deterministic way.
+  input:
+    passage: { type: string }
+  output:
+    line: { type: string }
+  exec:
+    command: condense
+flow.condense:
+  description: Condense a passage with a model.
+  inputs:
+    passage: { type: string }
+  outputs:
+    line: { type: string }
+  nodes:
+    reduce:
+      exec:
+        command: condense
+        output:
+          line: { type: string }
+  edges:
+    - { from: start, to: reduce }
+    - { from: reduce, to: end }
+agent.a:
+  model: model.m
+  prompt: Decide.
+  tools: [tool.condense, flow.condense]
+  output:
+    verdict: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.a
+      input: "'x'"
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }

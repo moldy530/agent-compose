@@ -97,6 +97,20 @@ pub const PINS: &[(&str, &str)] = &[
     // `^3.25.32 || ^4.2.0`; the 4 line is the one whose format constructors
     // (`z.email()`, `z.iso.datetime()`) this compiler emits.
     ("zod", "4.4.3"),
+    // The HTTP framework PRD 5.11 names for the `http` trigger surface ("a
+    // generated Fastify app wrapping the compiled graph"). Pinned exactly for
+    // the same reason LangGraph is: what a framework answers for a body it
+    // cannot decode is behaviour grammar 13.3 and Decision D117 state, so a
+    // release that changed it would change what a compiled graph does.
+    ("fastify", "5.12.0"),
+    // SQLite, for the `kv` and `vector` backends of PRD 5.8's zero-infra
+    // guarantee. A WebAssembly build with no dependencies, no native step and no
+    // install script — which is what makes it the *portable* SQLite: `bun:sqlite`
+    // is a Bun-only specifier PRD §9.18 forbids in generated code, and
+    // `node:sqlite` is a Node builtin Bun does not implement, so neither can be
+    // the one driver an emitted project uses on both runtimes. See
+    // `super::stores` for the trade that buys.
+    ("node-sqlite3-wasm", "0.8.60"),
 ];
 
 /// The development dependencies: the type gate and the runtime's own types.
@@ -231,7 +245,10 @@ pub fn readme(ir: &Ir) -> super::GeneratedFile {
         ir.entrypoint, ir.target
     ));
     contents.push_str(README_BODY);
+    contents.push_str(&store_data(ir));
+    contents.push_str(&route_timeouts(ir));
     contents.push_str(&host_functions(ir));
+    contents.push_str(README_PINS);
 
     let mut pins = String::from("\n| package | version |\n|---|---|\n");
     for (package, version) in PINS.iter().chain(DEV_PINS) {
@@ -253,11 +270,15 @@ const README_BODY: &str = r#"
 |---|---|
 | `src/cel.ts` | the CEL evaluator the routers embed (PRD 5.5) |
 | `src/env.ts` | every `${ENV}` reference the composition makes, and `readEnvironment()`, the presence check over them |
-| `src/runtime.ts` | what every node does when it runs: the retry/timeout/error policy of grammar 9, the provider surfaces, the `exec`/`http` wrappers, and the router |
+| `src/runtime.ts` | what every node does when it runs: the retry/timeout/error policy of grammar 9, the provider surfaces, the model failover ladder, the `exec`/`http` wrappers, and the router |
+| `src/stores.ts` | the local store backends: SQLite for `kv` and `vector`, a directory of files for `blob` (PRD 5.8) |
 | `src/schemas.ts` | every schema the composition declares, as Zod |
 | `src/state.ts` | the graph's state model: one channel per `state:` channel, the implicit conversation history, and `$run` — what the runtime keeps beside them |
 | `src/graph.ts` | the compiled graph: one node per flow node, the `flows` registry, and `runFlow` |
-| `src/index.ts` | the project's public surface, and the one caller of `readEnvironment()` |
+| `src/triggers.ts` | the composition's declared `http` triggers: their routes, their response modes, and the CEL that reads a request payload |
+| `src/serve.ts` | the app over those triggers: start, status and resume (PRD 5.11) |
+| `src/cli.ts` | this project's own command line, which `agent-compose run` and `agent-compose serve` launch |
+| `src/index.ts` | the project's public surface, the one caller of `readEnvironment()`, and the entry point the command line hangs off |
 
 ## Running a flow
 
@@ -319,6 +340,45 @@ bun run typecheck    # tsc --noEmit, the type gate
 bun src/index.ts
 ```
 
+`bun src/index.ts` with no arguments starts nothing: loading the project is the
+environment check, and there is nothing else a bare launch could mean. With a
+verb it is this project's command line, which is exactly what `agent-compose
+run` and `agent-compose serve` launch:
+
+```sh
+bun src/index.ts run flow.<name> --input goal=... [--session <key>] [--format json]
+bun src/index.ts serve --port 8787
+```
+
+`run` prints the flow's `outputs:` as one JSON object on **stdout** and its
+report — what ran, which model served each call, what each store did, which
+edges were taken — on **stderr**, with the path of the file the whole trace was
+written to. `--format json` folds both into one document on stdout instead.
+`--session` is the session identity of PRD 5.8: a flow that reaches a
+`scope: session` store needs one, and a `run` without it is refused before
+anything starts, naming the store — an argument to add rather than a run to
+retry, so it exits `2` like an `--input` the flow does not declare. A declared
+`manual` trigger may remap it — its `session_key:` is CEL over
+a payload whose one member is this argument, and what that expression answers is
+the partition the run addresses (grammar 13.2). Declared on no trigger, the
+argument is the identity.
+
+`serve` starts the app over the composition's declared `http` triggers and
+announces where it is listening as one JSON line on stdout. Beside them it
+mounts two routes of its own — `GET /executions/:id` for an execution's status
+and `POST /executions/:id/resume` — so those two are the app's and a trigger
+cannot declare either: the compiler refuses one that does. Executions are
+tracked in that process: durable execution and checkpointers are a later
+milestone, so a status route answers `404` for an id the process did not start —
+and every execution it *did* start, with its outputs and its trace, is held for
+the life of the process, so a long-running `serve` grows with the number of
+requests it has answered. Restarting it is the only way to reclaim that until
+the checkpointer arrives and an execution stops living in memory.
+
+Stopping it stops the graph: `agent-compose serve` passes `SIGINT` and `SIGTERM`
+on to this project, which closes the app and exits, so a supervisor that signals
+the command is not left with a listener behind it.
+
 ### On Node instead
 
 Node **>=22.18.0** is a supported fallback, and nothing here is written for one
@@ -338,7 +398,145 @@ installer-specific — no `packageManager` field, no lockfile, no install-time
 script — so bun, npm and pnpm all resolve it to the same versions. The lockfile
 your installer writes is yours: `agent-compose build` never writes or removes
 one.
+"#;
 
+/// The section a composition declaring a `store.*` gets.
+///
+/// A store is the one construct that leaves something behind on disk, and where
+/// it leaves it is a promise this project keeps rather than a detail of
+/// `src/stores.ts`: a reader who wants to inspect, back up or delete what a run
+/// stored has to be told the layout. A composition with no store gets no
+/// section, exactly as one using no `function:` binding gets no host-function
+/// section.
+fn store_data(ir: &Ir) -> String {
+    let stores = ir.definitions.values().any(|definition| {
+        matches!(
+            definition.body,
+            crate::ir::definition::DefinitionBody::Store(_)
+        )
+    });
+    if !stores {
+        return String::new();
+    }
+    String::from(STORE_DATA)
+}
+
+const STORE_DATA: &str = r#"
+## Where a store keeps its data
+
+`--target local` substitutes SQLite and local disk for every store
+unconditionally, so a composition with a `store.*` in it runs with nothing
+installed (PRD 5.8). What it writes lives under this directory:
+
+```text
+.agent-compose/stores/<name>.sqlite                      a `kv` or `vector` store
+.agent-compose/blobs/<name>/<partition>/values/<key>     a `blob` store
+.agent-compose/traces/<flow>-<execution id>.json         what `run` wrote out
+```
+
+`<partition>` is the store's declared `scope:` made concrete — `global`,
+`session/<session key>`, or `execution/<execution id>` — so one file holds every
+session and a read never sees another's. A `scope: execution` store is held in
+memory and released when the run ends, which is what "dies with the run" means.
+`AGENT_COMPOSE_DATA_DIR` moves the whole directory; the paths under it stay the
+same. It is derived from this project's own location rather than from the
+working directory, so a graph reads the same store wherever it was launched from.
+
+One thing under the directory is not a store's: the traces above, which
+`agent-compose run` writes and names on stderr. The whole directory is listed in
+`.gitignore` — what a run produced is not what a build emitted.
+
+### One process at a time
+
+**Run one of these at a time against one project.** The local backends are the
+zero-infra ones: `kv` and `vector` are a SQLite database opened through a
+WebAssembly build over `node:fs`, which has no cross-process locking, so two
+`agent-compose run`s sharing a `session` or `global` store race for it and the
+loser fails the node with `SQLite3Error: database is locked`. It fails loudly
+rather than corrupting anything, and a `serve` process — which runs its
+executions in **one** process — is not affected. Concurrency across processes
+arrives with the production `storage_backends:` of a later milestone; until then
+`--target local` means one process, which is the same boundary the target draws
+everywhere else.
+
+**Nothing here is pruned.** A store keeps what was written to it until you
+delete the file, and that includes the idempotency ledger a keyed write leaves
+beside its effect (the `applied` table of a SQLite store, the `applied`
+directory of a blob one — one entry per key) — so a long-lived
+`global` store's ledger grows with the number of writes ever made to it, and so
+does the traces directory. Retention is yours: everything under
+`.agent-compose/` is safe to remove between runs, and removing it is what "start
+clean" means.
+"#;
+
+/// The section a composition with a `route_on: [timeout]` route gets.
+///
+/// Three of grammar 12.2's conditions are answers a provider sends, and the
+/// runtime classifies each from what came back. The fourth is the absence of an
+/// answer, and it is the only one whose behaviour depends on something the
+/// author writes somewhere else: a node's `timeout:`, which is the budget the
+/// ladder divides between the members that still have a successor (see
+/// `callModel` in `src/runtime.ts`). A composition with no `timeout:` anywhere
+/// has declared no wall-clock bound — grammar 9.3's built-in level is "no
+/// timeout" — so nothing measures the silence and the condition never fires.
+///
+/// That is not something the signature of a `route:` shows, and it is exactly
+/// the kind of thing a reader discovers at three in the morning, so it is
+/// written where they meet the key. Emitted only for a route that declares the
+/// condition, because for every other composition it would be advice about a
+/// key it does not have.
+fn route_timeouts(ir: &Ir) -> String {
+    let declared = ir.definitions.values().any(|definition| {
+        let crate::ir::definition::DefinitionBody::Model(crate::ir::definition::Model::Route(
+            route,
+        )) = &definition.body
+        else {
+            return false;
+        };
+        // An absent `route_on:` is grammar 12.2's default, which names
+        // `timeout` — so the section belongs to a route that said nothing as
+        // much as to one that said this.
+        route.route_on.as_ref().is_none_or(|conditions| {
+            conditions.iter().any(|condition| {
+                matches!(
+                    condition.value,
+                    crate::ast::definition::RouteCondition::Timeout
+                )
+            })
+        })
+    });
+    if !declared {
+        return String::new();
+    }
+    String::from(ROUTE_TIMEOUTS)
+}
+
+const ROUTE_TIMEOUTS: &str = r#"
+## `route_on: [timeout]` needs a `timeout:`
+
+A model route fails over on the conditions its `route_on:` names, and three of
+them are things a provider says: a 429 is `rate_limit`, a 529 or a 503 is
+`overloaded`, any other 5xx is `server_error`. `timeout` is the one that is not.
+A provider that accepted the request and answers nothing says nothing at all, so
+the runtime has to decide when to stop waiting — and what it decides that
+against is the **node's own `timeout:`** (grammar 9.2), divided between the
+members that still have one after them. The first member of a two-member route
+under `timeout: 30s` is given 15 seconds; a member that does not answer inside
+its share fails over, and the last member keeps whatever is left, so the ladder
+never outlives the node's budget.
+
+A node that resolves **no** `timeout:` — none of its own, none from an
+instantiating `policy:`, none from `defaults:` — has declared no wall-clock bound
+at all (grammar 9.3's built-in level is "no retry, no timeout"), so there is
+nothing for a share to be a share of. Such a node waits on a silent provider for
+as long as it stays silent, exactly as it would with a single model, and the
+`timeout` in its `route_on:` never fires. A dropped connection, a refused socket
+and a name that does not resolve are a different case: the socket reports those,
+so they classify as `timeout` and fail over whether or not a budget is declared.
+"#;
+
+/// The pins table's own heading, emitted after every conditional section.
+const README_PINS: &str = r#"
 ## Pinned versions
 
 A compiler release targets one LangGraph release (PRD 5.12). Upgrading is a
@@ -441,10 +639,12 @@ pub fn gitignore(ir: &Ir) -> super::GeneratedFile {
 const GITIGNORE: &str = "\
 #
 # A generated project is meant to be committed — `build --check` in CI is what
-# that buys (PRD §8). These two are the exceptions: one is an install artifact,
-# and the other is the thing the spec deliberately never contains.
+# that buys (PRD §8). These three are the exceptions: an install artifact, the
+# thing the spec deliberately never contains, and the data this project's own
+# stores keep (PRD 5.8).
 node_modules/
 .env
+.agent-compose/
 ";
 
 /// `src/index.ts`.
@@ -459,10 +659,10 @@ pub fn index(ir: &Ir) -> super::GeneratedFile {
 }
 
 const INDEX: &str = r#"//
-// The project's public surface. Everything a consumer of this graph needs —
-// the schemas, the state model, the graph itself, `runFlow`, and the
-// environment it requires — is re-exported here, so an ejected project has one
-// entry point and `run`/`serve` have one module to import.
+// The project's public surface, and its entry point. Everything a consumer of
+// this graph needs — the schemas, the state model, the graph itself, `runFlow`,
+// and the environment it requires — is re-exported here, so an ejected project
+// has one entry point and `run`/`serve` have one module to launch.
 //
 // It is also where the env-ref presence check of PRD 5.9 runs. `readEnvironment`
 // is called at module scope, so loading this module is what "process start"
@@ -473,6 +673,32 @@ const INDEX: &str = r#"//
 // is what keeps a build on one machine reproducible on another and keeps a
 // credential out of every file it writes (PRD 5.9: refs "survive into the IR
 // unresolved").
+//
+// # Running it, rather than importing it
+//
+// Launched **as a program** it is this project's command line (`./cli.ts`):
+//
+// ```sh
+// bun src/index.ts run flow.<name> --input k=v
+// bun src/index.ts serve --port 8787
+// ```
+//
+// `agent-compose run` and `agent-compose serve` launch exactly that, so the
+// command a reader is given in README.md is the command the compiler runs. With
+// no verb it starts nothing: loading the project is the environment check and
+// there is nothing else for a bare launch to mean.
+//
+// The dispatch is guarded on this being the **entry** module: importing the
+// barrel from a host script must not turn that script's own arguments into a
+// verb. The guard compares `import.meta.url` against the entry path through
+// `pathToFileURL`, which both supported runtimes answer the same way — rather
+// than through the one-word property Bun has had for longer than Node, which a
+// generated module may not reach for (PRD §9.18). `./cli.ts` is loaded only when
+// there is a verb, so an import pays for neither the command line nor the HTTP
+// framework behind `serve`.
+
+import process from "node:process";
+import { pathToFileURL } from "node:url";
 
 import { readEnvironment } from "./env.ts";
 
@@ -482,6 +708,12 @@ export * from "./schemas.ts";
 export * from "./state.ts";
 
 readEnvironment();
+
+const entry = process.argv[1];
+if (entry !== undefined && pathToFileURL(entry).href === import.meta.url && process.argv.length > 2) {
+  const { runMain } = await import("./cli.ts");
+  await runMain(process.argv.slice(2));
+}
 "#;
 
 #[cfg(test)]
@@ -608,6 +840,125 @@ mod tests {
         );
         // …and the manifest field that would contradict all of it.
         assert!(contents.contains("no `packageManager` field"), "{contents}");
+    }
+
+    /// A composition with a `store.*` is told where its data goes, and one
+    /// without gets no section — the same rule the host-function section
+    /// follows.
+    ///
+    /// A store is the one construct that leaves something behind on disk, so a
+    /// reader who wants to inspect, back up or delete what a run stored has to
+    /// be told the layout. The ordering is asserted too: the section is the
+    /// project's, and it belongs with the rest of what the project does rather
+    /// than after the version table nobody reads to the end of.
+    #[test]
+    fn a_composition_with_a_store_is_told_where_its_data_goes() {
+        let plain = readme(&ir_of("version: \"0.1\"\n")).contents;
+        assert!(
+            !plain.contains("## Where a store keeps its data"),
+            "a composition with no store keeps nothing"
+        );
+
+        let contents = readme(&ir_of(
+            r#"version: "0.1"
+
+store.prefs:
+  kind: kv
+  scope: session
+  description: What this session was told.
+  value_schema:
+    theme: { type: string }
+"#,
+        ))
+        .contents;
+        let section = contents
+            .find("## Where a store keeps its data")
+            .expect("the section is emitted");
+        assert!(
+            contents.contains(".agent-compose/stores/<name>.sqlite"),
+            "{contents}"
+        );
+        assert!(
+            contents.contains("session/<session key>"),
+            "the partition a `scope:` becomes: {contents}"
+        );
+        assert!(
+            contents.contains("AGENT_COMPOSE_DATA_DIR"),
+            "…and the one variable that moves it: {contents}"
+        );
+        assert!(
+            section
+                < contents
+                    .find("## Pinned versions")
+                    .expect("the pin table has a heading"),
+            "the section sits with the rest of what the project does"
+        );
+        assert!(
+            section > contents.find("### On Node instead").expect("the fallback"),
+            "…and after the launch instructions it is about"
+        );
+    }
+
+    /// A route that can fail over on `timeout` is told what measures one.
+    ///
+    /// The condition is the only one whose behaviour depends on a key written
+    /// somewhere else — a node's `timeout:` — so a reader of a project with a
+    /// route in it finds that here rather than in a run that waited forever. A
+    /// project with no such route is not told about a key it does not have.
+    #[test]
+    fn a_route_that_fails_over_on_timeout_is_told_what_measures_one() {
+        let models = |route_on: &str| {
+            format!(
+                r#"version: "0.1"
+
+provider.p:
+  kind: anthropic
+  api_key: ${{K}}
+
+model.smart:
+  provider: provider.p
+  id: one
+
+model.fast:
+  provider: provider.p
+  id: two
+
+model.default:
+  route: [model.smart, model.fast]{route_on}
+"#
+            )
+        };
+
+        let plain = readme(&ir_of("version: \"0.1\"\n")).contents;
+        assert!(
+            !plain.contains("## `route_on: [timeout]` needs a `timeout:`"),
+            "a composition with no route is not told about one"
+        );
+        let narrowed = readme(&ir_of(&models("\n  route_on: [rate_limit]"))).contents;
+        assert!(
+            !narrowed.contains("## `route_on: [timeout]` needs a `timeout:`"),
+            "…nor is a route that declared the condition away: {narrowed}"
+        );
+
+        for route_on in ["", "\n  route_on: [overloaded, timeout]"] {
+            let contents = readme(&ir_of(&models(route_on))).contents;
+            let section = contents
+                .find("## `route_on: [timeout]` needs a `timeout:`")
+                .unwrap_or_else(|| {
+                    panic!("the section is emitted for `route_on:{route_on:?}`: {contents}")
+                });
+            assert!(
+                contents.contains("grammar 9.3's built-in level is \"no retry, no timeout\""),
+                "…and says what a node with no budget does: {contents}"
+            );
+            assert!(
+                section
+                    < contents
+                        .find("## Pinned versions")
+                        .expect("the pin table has a heading"),
+                "the section sits with the rest of what the project does"
+            );
+        }
     }
 
     /// The two pin tables and the README's table are one list. A dependency

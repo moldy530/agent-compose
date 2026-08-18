@@ -9,11 +9,12 @@
 # spelling this compiler could get wrong in a way only a type-checker or a parse
 # would notice.
 #
-# It is deliberately the smallest graph that carries all of it: one flow, one
-# agent, one store. What is being covered here is the schema language, not the
-# topology — plus the handful of *binding* shapes no example reaches, which are
-# marked where they are declared and are here for the same reason: a spelling
-# only `tsc` or a real request would notice.
+# It is deliberately the smallest graph that carries all of it: one agent, one
+# store, and one flow plus the one-node subflow `flow.condense` that exists only
+# to be *attached* to that agent. What is being covered here is the schema
+# language, not the topology — plus the handful of *binding* shapes no example
+# reaches, which are marked where they are declared and are here for the same
+# reason: a spelling only `tsc` or a real request would notice.
 version: "0.1"
 
 state:
@@ -244,10 +245,39 @@ store.docs:
     source:     { type: string }
     updated_at: { type: string, format: date-time }
 
+# The one-node subflow that exists to be attached, not to be run: a `flow.*` in
+# an agent's `tools:` is flow-as-tool (grammar 5.4, PRD 5.1), whose `inputs:`
+# becomes the tool's **parameter schema**. That is a lowering site no other
+# surface reaches — every other tool schema comes from a `tool.*`'s own `input:`
+# — and the constraints on the field below are what make the two distinguishable
+# in the emitted JSON.
+flow.condense:
+  description: Condense a passage into the one line worth keeping.
+  inputs:
+    passage:
+      type: string
+      min_length: 1
+      max_length: 4096
+  outputs:
+    latest: { type: string }
+  nodes:
+    reduce:
+      exec:
+        command: "true"
+        output:
+          latest: { type: string }
+  edges:
+    - { from: start, to: reduce }
+    - { from: reduce, to: end }
+
 agent.shaper:
   description: Produces one of everything.
   model: model.m
   prompt: Produce a shape.
+  # A flow attached as a tool, which is the other half of the shape above: the
+  # agent's tool list carries it beside nothing else, so the emitted binding is
+  # readable as exactly what grammar 5.4 gives a `flow.*` on the wire.
+  tools: [flow.condense]
   input:
     goal: { type: string, description: What to shape. }
   output:

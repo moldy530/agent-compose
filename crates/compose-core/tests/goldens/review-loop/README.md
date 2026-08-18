@@ -15,11 +15,15 @@ The LangGraph TypeScript project `agent-compose build` produced from `main.yml`,
 |---|---|
 | `src/cel.ts` | the CEL evaluator the routers embed (PRD 5.5) |
 | `src/env.ts` | every `${ENV}` reference the composition makes, and `readEnvironment()`, the presence check over them |
-| `src/runtime.ts` | what every node does when it runs: the retry/timeout/error policy of grammar 9, the provider surfaces, the `exec`/`http` wrappers, and the router |
+| `src/runtime.ts` | what every node does when it runs: the retry/timeout/error policy of grammar 9, the provider surfaces, the model failover ladder, the `exec`/`http` wrappers, and the router |
+| `src/stores.ts` | the local store backends: SQLite for `kv` and `vector`, a directory of files for `blob` (PRD 5.8) |
 | `src/schemas.ts` | every schema the composition declares, as Zod |
 | `src/state.ts` | the graph's state model: one channel per `state:` channel, the implicit conversation history, and `$run` — what the runtime keeps beside them |
 | `src/graph.ts` | the compiled graph: one node per flow node, the `flows` registry, and `runFlow` |
-| `src/index.ts` | the project's public surface, and the one caller of `readEnvironment()` |
+| `src/triggers.ts` | the composition's declared `http` triggers: their routes, their response modes, and the CEL that reads a request payload |
+| `src/serve.ts` | the app over those triggers: start, status and resume (PRD 5.11) |
+| `src/cli.ts` | this project's own command line, which `agent-compose run` and `agent-compose serve` launch |
+| `src/index.ts` | the project's public surface, the one caller of `readEnvironment()`, and the entry point the command line hangs off |
 
 ## Running a flow
 
@@ -81,6 +85,45 @@ bun run typecheck    # tsc --noEmit, the type gate
 bun src/index.ts
 ```
 
+`bun src/index.ts` with no arguments starts nothing: loading the project is the
+environment check, and there is nothing else a bare launch could mean. With a
+verb it is this project's command line, which is exactly what `agent-compose
+run` and `agent-compose serve` launch:
+
+```sh
+bun src/index.ts run flow.<name> --input goal=... [--session <key>] [--format json]
+bun src/index.ts serve --port 8787
+```
+
+`run` prints the flow's `outputs:` as one JSON object on **stdout** and its
+report — what ran, which model served each call, what each store did, which
+edges were taken — on **stderr**, with the path of the file the whole trace was
+written to. `--format json` folds both into one document on stdout instead.
+`--session` is the session identity of PRD 5.8: a flow that reaches a
+`scope: session` store needs one, and a `run` without it is refused before
+anything starts, naming the store — an argument to add rather than a run to
+retry, so it exits `2` like an `--input` the flow does not declare. A declared
+`manual` trigger may remap it — its `session_key:` is CEL over
+a payload whose one member is this argument, and what that expression answers is
+the partition the run addresses (grammar 13.2). Declared on no trigger, the
+argument is the identity.
+
+`serve` starts the app over the composition's declared `http` triggers and
+announces where it is listening as one JSON line on stdout. Beside them it
+mounts two routes of its own — `GET /executions/:id` for an execution's status
+and `POST /executions/:id/resume` — so those two are the app's and a trigger
+cannot declare either: the compiler refuses one that does. Executions are
+tracked in that process: durable execution and checkpointers are a later
+milestone, so a status route answers `404` for an id the process did not start —
+and every execution it *did* start, with its outputs and its trace, is held for
+the life of the process, so a long-running `serve` grows with the number of
+requests it has answered. Restarting it is the only way to reclaim that until
+the checkpointer arrives and an execution stops living in memory.
+
+Stopping it stops the graph: `agent-compose serve` passes `SIGINT` and `SIGTERM`
+on to this project, which closes the app and exits, so a supervisor that signals
+the command is not left with a listener behind it.
+
 ### On Node instead
 
 Node **>=22.18.0** is a supported fallback, and nothing here is written for one
@@ -101,6 +144,28 @@ script — so bun, npm and pnpm all resolve it to the same versions. The lockfil
 your installer writes is yours: `agent-compose build` never writes or removes
 one.
 
+## `route_on: [timeout]` needs a `timeout:`
+
+A model route fails over on the conditions its `route_on:` names, and three of
+them are things a provider says: a 429 is `rate_limit`, a 529 or a 503 is
+`overloaded`, any other 5xx is `server_error`. `timeout` is the one that is not.
+A provider that accepted the request and answers nothing says nothing at all, so
+the runtime has to decide when to stop waiting — and what it decides that
+against is the **node's own `timeout:`** (grammar 9.2), divided between the
+members that still have one after them. The first member of a two-member route
+under `timeout: 30s` is given 15 seconds; a member that does not answer inside
+its share fails over, and the last member keeps whatever is left, so the ladder
+never outlives the node's budget.
+
+A node that resolves **no** `timeout:` — none of its own, none from an
+instantiating `policy:`, none from `defaults:` — has declared no wall-clock bound
+at all (grammar 9.3's built-in level is "no retry, no timeout"), so there is
+nothing for a share to be a share of. Such a node waits on a silent provider for
+as long as it stays silent, exactly as it would with a single model, and the
+`timeout` in its `route_on:` never fires. A dropped connection, a refused socket
+and a name that does not resolve are a different case: the socket reports those,
+so they classify as `timeout` and fail over whether or not a budget is declared.
+
 ## Pinned versions
 
 A compiler release targets one LangGraph release (PRD 5.12). Upgrading is a
@@ -112,6 +177,8 @@ review the diff.
 | `@langchain/langgraph` | `1.4.10` |
 | `@langchain/core` | `1.2.8` |
 | `zod` | `4.4.3` |
+| `fastify` | `5.12.0` |
+| `node-sqlite3-wasm` | `0.8.60` |
 | `@types/node` | `22.20.1` |
 | `typescript` | `7.0.2` |
 

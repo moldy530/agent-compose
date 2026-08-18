@@ -204,6 +204,28 @@ export const agentShaperOutput = z.object({
 }).strict();
 export type AgentShaperOutput = z.infer<typeof agentShaperOutput>;
 
+/** `flow.condense` — the module's parameters (grammar 7.5). */
+export const flowCondenseInputs = z.object({
+  passage: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }).refine((value) => codePoints(value) <= 4096, { message: "expected at most 4096 characters" }),
+}).strict();
+export type FlowCondenseInputs = z.infer<typeof flowCondenseInputs>;
+
+/**
+ * `flow.condense` — the module's result, materialized from the state channels of the same names at quiescence (grammar 7.5, 7.6.3).
+ */
+export const flowCondenseOutputs = z.object({
+  latest: z.string(),
+}).strict();
+export type FlowCondenseOutputs = z.infer<typeof flowCondenseOutputs>;
+
+/**
+ * `flow.condense` node `reduce` — what the subprocess produces (grammar 8.2).
+ */
+export const flowCondenseNodeReduceOutput = z.object({
+  latest: z.string(),
+}).strict();
+export type FlowCondenseNodeReduceOutput = z.infer<typeof flowCondenseNodeReduceOutput>;
+
 /** `flow.shape` — the module's parameters (grammar 7.5). */
 export const flowShapeInputs = z.object({
   goal: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }),

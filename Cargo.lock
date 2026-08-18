@@ -10,6 +10,7 @@ dependencies = [
  "assert_cmd",
  "clap",
  "compose-core",
+ "libc",
  "mock-provider",
  "serde_json",
 ]

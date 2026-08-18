@@ -1,0 +1,48 @@
+# rule: an `http` trigger does not claim a route the generated app mounts for itself (13.3)
+# code: duplicate-route
+# message: the trigger `status_of` declares the route `GET /executions/:id`, which the generated app mounts for itself
+# at: main.yml:35:11
+# help: a generated app mounts `status` and `resume` for itself, beside each trigger's `start` (grammar 13.3) — `GET /executions/:id`, `POST /executions/:id/resume` — and cannot dispatch one method and path two ways: give the trigger its own `path:`
+#
+# §13.3 has a generated app expose `status` and `resume` beside each trigger's
+# `start`, at two fixed addresses. They are taken, so a trigger cannot have one:
+# the app mounts both unconditionally and refuses to start when a trigger's route
+# is a second declaration of either. `GET /executions/:id` is a legal `path:` —
+# the router's parameter syntax "passes through unexamined" (§13.3) — which is
+# exactly why this is a compile error rather than a spelling nobody would write.
+#
+# Unlike the trigger-against-trigger half of this check, this half follows from a
+# sentence the grammar writes. See `check/triggers.rs::routes`.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.a:
+  model: model.m
+  prompt: Do the thing.
+  input:
+    text: { type: string }
+  output:
+    result: { type: string }
+triggers:
+  status_of:
+    type: http
+    flow: flow.f
+    method: GET
+    path: /executions/:id
+    input:
+      goal: "payload.query.goal"
+flow.f:
+  inputs:
+    goal: { type: string }
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.a
+      input: { text: "input.goal" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }

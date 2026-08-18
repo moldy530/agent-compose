@@ -81,10 +81,20 @@
 //! bounded for the same reason `times` is — each count at most a billion,
 //! because the Chat Completions surface serves their sum.
 //!
+//! # Embeddings, the one surface that is not scripted
+//!
+//! `POST /v1/embeddings` — and its Azure spelling — answers a `vector` store's
+//! `embed:` connection (grammar 11.2) **without** a script, deterministically in
+//! the input text. A model call is a decision the graph makes and a scripted
+//! answer is what a test asserts against; an embedding is neither, and a queue
+//! for it would make every store test enqueue answers it never reads. See
+//! `WIRE-NOTES.md` for what it answers with and why that is enough for a
+//! `search` assertion.
+//!
 //! # What is *not* here
 //!
-//! Streaming, embeddings, the Files/Batch APIs, and the Bedrock and Vertex SDK
-//! surfaces. A request for any of them is refused by name rather than answered
+//! Streaming, the Files/Batch APIs, and the Bedrock and Vertex SDK surfaces. A
+//! request for any of them is refused by name rather than answered
 //! approximately: an acceptance harness that guesses is worse than one that
 //! says it does not know.
 

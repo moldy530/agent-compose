@@ -2,14 +2,16 @@
 //! the **real** pinned JavaScript toolchain — under **Bun**, which PRD §9.18
 //! makes the default runtime and package manager of every emitted project.
 //!
-//! Fifteen gates. The first four are in increasing strength, each one existing
+//! Seventeen gates. The first four are in increasing strength, each one existing
 //! because the one above it passes on code the one below it catches; the fifth
 //! is about a construct whose guarantees are only observable from inside the
 //! runtime; the next two are about the schemas rather than the graph; the eighth
 //! is about a composition that has no generated project at all; the next four
 //! are about what a binding does on the wire, which no amount of type-checking or
-//! graph construction reaches; and the last three are about the *other* runtime —
-//! the Node fallback the same decision keeps supported:
+//! graph construction reaches; the three after those are about the *other*
+//! runtime — the Node fallback the same decision keeps supported; the sixteenth
+//! is about the storage underneath a `store.*`; and the last is about the
+//! argument parser every launch of an emitted project goes through:
 //!
 //! 1. **`bun run typecheck`** — every golden project type-checks under its own
 //!    strict `tsconfig.json`, against installed `@langchain/langgraph`,
@@ -133,6 +135,23 @@
 //!     differently for every reader on the fallback while every gate stayed
 //!     green. Gate 13 loads, constructs, reduces and launches a golden under
 //!     Node; it never validates a document or evaluates a guard.
+//! 16. **The store backends** — `src/stores.ts`, driven directly. PRD 5.8's
+//!     zero-infra guarantee is a promise about behaviour a golden diff cannot
+//!     show: which partition a `scope:` addresses, whether a write's idempotency
+//!     key is honoured, what a `list` answers a prefix with, and whether a key
+//!     that would climb out of a directory becomes a file name that cannot. A
+//!     composition using a store emits the same bytes with every one of those
+//!     wrong. Gate 13 runs the same runner under Node, because a WebAssembly
+//!     SQLite over `node:fs` is exactly the dependency that could answer the two
+//!     engines differently.
+//! 17. **The project's own command line** — `bun src/index.ts run … --fromat
+//!     json` and `serve --prot 8787`: a flag neither verb declares, on the
+//!     surface PRD 5.12's eject path leaves as the *only* way to launch the
+//!     project. `agent-compose run` never sends one — clap refuses it first — so
+//!     nothing else in the suite reaches this parser, and an option it accepted
+//!     and never read would be a caller asking for the JSON record, getting
+//!     human output, and being told `0`. D50's rule, asserted where the compiler
+//!     is no longer standing in front of it.
 //!
 //! # The toolchain fixture
 //!
@@ -177,8 +196,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
-use goldens::{GOLDENS, Golden, artifact, emitted, files_under, goldens_root};
-use serde_json::Value;
+use goldens::{GOLDENS, Golden, artifact, emitted, files_under, golden, goldens_root};
+use serde_json::{Value, json};
 use toolchain::{bun, installed, required, runner, runs};
 
 /// The golden gate 13 runs under Node.
@@ -1444,6 +1463,270 @@ fn the_bound_object_arrived_as_parameters(answer: &Value) {
     );
 }
 
+/// Gate 16: the local store backends do what PRD 5.8 says a store does.
+///
+/// `src/stores.ts` is where the zero-infra guarantee actually lives, and almost
+/// none of it is visible from a golden diff: which partition a `scope:`
+/// addresses, whether an idempotency key is honoured, what a `list` answers a
+/// prefix with, and whether a key that would climb out of a directory becomes a
+/// file name that cannot. A composition that used a store would produce the
+/// same emitted bytes with every one of those wrong.
+///
+/// So the module is driven directly, with bindings the runner writes rather than
+/// ones `src/graph.ts` emits: what `graph.ts` emits is already committed and
+/// already exercised end to end by the acceptance suite, and what is in question
+/// here is the backend underneath it. Gate 13 runs the same runner under Node,
+/// because a WebAssembly SQLite over `node:fs` is exactly the kind of dependency
+/// that could behave differently on the fallback runtime.
+#[test]
+fn the_local_store_backends_partition_dedupe_and_encode_what_they_are_given() {
+    let Some(root) = installed() else {
+        return;
+    };
+    let project = staged(goldens::golden("review-loop"), root, "stores");
+    let data = root.join("projects").join("stores").join("data");
+    let _ = fs::remove_dir_all(&data);
+
+    let output = runner("store-backends.mjs")
+        .arg(&project)
+        .arg(&data)
+        .output()
+        .expect("bun runs");
+    assert!(
+        output.status.success(),
+        "the store-backend runner failed:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let answer: Value =
+        serde_json::from_slice(&output.stdout).expect("the runner prints one JSON object");
+    the_local_backends_behaved(&answer);
+}
+
+/// What the store-backend runner answered, whichever runtime ran it — shared
+/// with gate 13 for the reason [`a_raw_binding_bound`] is: the SQLite here is a
+/// WebAssembly module over `node:fs`, and a difference between the two engines
+/// would be a difference in what every store in every emitted project does.
+fn the_local_backends_behaved(answer: &Value) {
+    // The `kv` catalogue of grammar 11.4, row by row.
+    assert_eq!(
+        answer["kvHit"],
+        json!({ "value": { "theme": "dark" }, "found": true })
+    );
+    assert_eq!(
+        answer["kvMiss"],
+        json!({ "found": false }),
+        "a miss answers `found: false` with **no** `value` at all (Decision D110)"
+    );
+    assert_eq!(answer["kvList"], json!({ "keys": ["a", "b"] }));
+    assert_eq!(
+        answer["kvPrefixed"],
+        json!({ "keys": ["b"] }),
+        "`prefix:` filters, and the answer is in key order"
+    );
+    assert_eq!(answer["kvDeleted"], json!({ "deleted": true }));
+    assert_eq!(
+        answer["kvDeletedAgain"],
+        json!({ "deleted": false }),
+        "a delete of nothing deleted nothing"
+    );
+
+    // At-least-once, deduped on grammar 9.4's key: the repeated write answers
+    // what the first attempt answered and does **not** happen twice.
+    assert_eq!(answer["dedupedWrite"], json!({ "key": "a" }));
+    assert_eq!(
+        answer["afterDedupedWrite"]["value"]["theme"], "dark",
+        "a write whose key the backend had already applied is not applied again"
+    );
+    assert_eq!(
+        answer["afterSecondWrite"]["value"]["theme"], "changed",
+        "…and a write under a different key is a different effect"
+    );
+
+    // A `prefix:` outside the BMP. SQLite's `substr` counts characters and a
+    // JavaScript `.length` counts UTF-16 code units, so a filter that mixed the
+    // two answers this legal read with the wrong keys — and grammar 11.4 puts no
+    // character restriction on the parameter.
+    assert_eq!(
+        answer["astralAll"],
+        json!({ "keys": ["zzz", "\u{1F600}alpha", "\u{1F600}beta"] }),
+        "the keys are there to be filtered in the first place"
+    );
+    assert_eq!(
+        answer["astralPrefix"],
+        json!({ "keys": ["\u{1F600}alpha", "\u{1F600}beta"] }),
+        "an astral prefix matches the keys that start with it"
+    );
+    assert_eq!(
+        answer["astralDeeper"],
+        json!({ "keys": ["\u{1F600}alpha"] }),
+        "…and one more character narrows it, rather than sliding off the key"
+    );
+    assert_eq!(
+        answer["astralMiss"],
+        json!({ "keys": [] }),
+        "a prefix nothing carries still matches nothing"
+    );
+    assert_eq!(
+        answer["astralBlobPrefix"], answer["astralPrefix"],
+        "the `blob` backend's `list` answers the same prefix the same way: one op \
+         of grammar 11.4's catalogue, two backends"
+    );
+
+    // …and in the same **order**, which is the half of that claim a prefix over
+    // one astral character does not decide. SQLite compares UTF-8 bytes and a
+    // JavaScript sort compares UTF-16 code units, and above the BMP the two
+    // disagree: bytes put U+FF00 (`EF BC 80`) before U+1F600 (`F0 9F 98 80`),
+    // while the surrogate `D83D` puts U+1F600 first. Grammar 11.4 fixes no
+    // order, so neither is wrong on its own — but `list` is one op of one
+    // catalogue, and with the `limit:` the row requires the two would answer
+    // one store's worth of content with different keys.
+    assert_eq!(
+        answer["kvOrder"],
+        json!(["zz", "\u{FF00}", "\u{1F600}"]),
+        "SQLite's `ORDER BY key` is UTF-8 byte order"
+    );
+    assert_eq!(
+        answer["blobOrder"], answer["kvOrder"],
+        "and the `blob` backend sorts its file names the same way"
+    );
+    assert_eq!(
+        answer["kvOrderLimited"],
+        json!(["zz", "\u{FF00}"]),
+        "which is what `limit:` truncates"
+    );
+    assert_eq!(
+        answer["blobOrderLimited"], answer["kvOrderLimited"],
+        "so a `limit:` answers the same keys from either backend"
+    );
+
+    // A keyed `blob` write whose grammar 9.4 key is longer than a file name.
+    // The key is composed from the execution and one frame per enclosing `map`,
+    // so its length is the graph's; a ledger that made it a file name directly
+    // would fail here *after* applying the effect, leaving the retry below to
+    // apply it a second time.
+    assert!(
+        answer["deepKeyLength"]
+            .as_u64()
+            .is_some_and(|length| length > 255),
+        "the probe's key has to be longer than a file name for this to be the \
+         case it is about: {}",
+        answer["deepKeyLength"]
+    );
+    assert_eq!(answer["deepWrite"], json!({ "key": "deep.txt" }));
+    assert_eq!(
+        answer["deepValue"]["value"], "first",
+        "the retry under the same key answered what the first attempt answered \
+         and did not overwrite it"
+    );
+    assert_eq!(
+        answer["deepDeduped"],
+        json!([false, true]),
+        "…which is the ledger doing its job, not the write failing"
+    );
+
+    // The records a trace entry carries (PRD 5.8): a read keeps its answer, a
+    // write keeps its key and whether the backend had seen it.
+    let records = answer["records"]
+        .as_array()
+        .expect("every op records what it did");
+    let write = records
+        .iter()
+        .find(|record| record["idempotencyKey"] == "k/1")
+        .expect("the first write is recorded");
+    assert_eq!(write["effect"], "write");
+    assert_eq!(write["deduped"], json!(false));
+    assert!(
+        records
+            .iter()
+            .any(|record| record["idempotencyKey"] == "k/1" && record["deduped"] == json!(true)),
+        "the repeated write is recorded as the duplicate it was: {records:#?}"
+    );
+    let read = records
+        .iter()
+        .find(|record| record["effect"] == "read" && record["op"] == "get")
+        .expect("a read is recorded");
+    assert_eq!(read["answer"]["found"], json!(true));
+    assert!(read["idempotencyKey"].is_null(), "a read carries no key");
+
+    // `scope: session` — one store, one partition per session key.
+    assert_eq!(
+        answer["sessionSame"],
+        json!({ "value": { "text": "mine" }, "found": true }),
+        "a later execution under the same session key reads what the first wrote"
+    );
+    assert_eq!(
+        answer["sessionOther"],
+        json!({ "found": false }),
+        "…and another session key is another partition"
+    );
+    let unkeyed = answer["sessionUnkeyed"]
+        .as_str()
+        .expect("a session-scoped store with no session identity is refused");
+    assert!(
+        unkeyed.contains("store.memory") && unkeyed.contains("scope: session"),
+        "the refusal names the store (grammar 11.3): {unkeyed}"
+    );
+
+    // `scope: execution` — dies with the run, and never crosses to another.
+    assert_eq!(answer["executionHit"]["found"], json!(true));
+    assert_eq!(
+        answer["executionAfterRelease"],
+        json!({ "found": false }),
+        "what an execution-scoped store held is gone when the run ends"
+    );
+    assert_eq!(answer["executionOther"], json!({ "found": false }));
+
+    // `blob` — files on disk, keyed reversibly.
+    assert_eq!(
+        answer["blobHit"],
+        json!({ "value": "first", "found": true })
+    );
+    assert_eq!(answer["blobMiss"], json!({ "found": false }));
+    assert_eq!(
+        answer["blobList"],
+        json!({ "keys": ["notes/one.txt", "notes/two.txt", "other"] }),
+        "a `list` answers with the keys that were written, not with what the \
+         filesystem made of them"
+    );
+    assert_eq!(
+        answer["blobPrefixed"],
+        json!({ "keys": ["notes/one.txt", "notes/two.txt"] })
+    );
+    assert_eq!(answer["blobDeleted"], json!({ "deleted": true }));
+    assert_eq!(
+        answer["blobLimited"],
+        json!({ "keys": ["notes/one.txt"] }),
+        "`limit:` bounds what a `list` answers"
+    );
+    assert!(
+        answer["blobEmptyKey"]
+            .as_str()
+            .is_some_and(|message| message.contains("empty key")),
+        "{}",
+        answer["blobEmptyKey"]
+    );
+    assert!(
+        answer["blobLongKey"]
+            .as_str()
+            .is_some_and(|message| message.contains("one key per file")),
+        "a key no filesystem can hold is refused by name: {}",
+        answer["blobLongKey"]
+    );
+    assert_eq!(
+        answer["blobEncoded"], "%2E%2E%2Fescape%20me",
+        "`.` and `/` are both encoded, so no key becomes a path that climbs out"
+    );
+
+    // A backend grammar 14.2 names and this release does not implement.
+    let production = answer["productionBackend"]
+        .as_str()
+        .expect("a `redis` backend is refused rather than answered from the wrong store");
+    assert!(
+        production.contains("redis") && production.contains("M3"),
+        "the refusal names the backend and the milestone that lands it: {production}"
+    );
+}
+
 /// The runner both `http:` request gates read, run once per gate so each one
 /// fails on its own.
 fn http_request_gate(purpose: &str) -> Option<Value> {
@@ -1609,6 +1892,92 @@ fn the_generated_project_checks_its_environment_when_it_is_loaded() {
         checked > 0,
         "no golden references an environment variable, so nothing exercised the check"
     );
+}
+
+/// Gate 17: the project's own command line refuses an option its verb does not
+/// take.
+///
+/// `agent-compose run` is shielded by its own argument parser and sends only the
+/// flags it knows; the emitted command line is what PRD 5.12's eject path leaves
+/// a reader with, and it is the only launch surface an ejected project has. A
+/// `--name` it accepted and never read would be a caller asking for the JSON
+/// record and getting human output at exit `0`, with nothing anywhere to say so
+/// — which is D50's rule ("a typo in `retrry:` must be a diagnostic, not a
+/// silently ignored key") broken on the one surface the compiler does not stand
+/// in front of.
+///
+/// Both verbs, because their option lists are declared separately and a list
+/// that went stale on one of them is exactly what this catches. The refusal must
+/// also *list what the verb takes*: a reader who mistyped `--format` is one
+/// character from the answer, and PRD G3 makes saying so part of the product.
+#[test]
+fn the_generated_command_line_refuses_an_option_its_verb_does_not_take() {
+    let Some(root) = installed() else {
+        return;
+    };
+    let golden = golden("review-loop");
+    let project = staged(golden, root, "usage");
+    let references = compose_core::codegen::env::References::of(&artifact(golden));
+
+    let launch = |arguments: &[&str]| {
+        let mut command = bun();
+        command.arg(project.join("src/index.ts"));
+        command.args(arguments);
+        for name in references.names() {
+            command.env(name, "supplied");
+        }
+        command.output().expect("bun runs")
+    };
+
+    for (arguments, verb, mistyped, listed) in [
+        (
+            ["run", "flow.review_loop", "--fromat", "json"].as_slice(),
+            "run",
+            "--fromat",
+            ["`--input`", "`--session`", "`--format`"].as_slice(),
+        ),
+        (
+            ["serve", "--prot", "8787"].as_slice(),
+            "serve",
+            "--prot",
+            ["`--host`", "`--port`"].as_slice(),
+        ),
+        // The option table is an object, and every object carries
+        // `constructor`. A membership test spelled as a lookup reads that
+        // inherited function as an arity and takes the flag — the same
+        // property-versus-key confusion `build` refuses a channel named
+        // `constructor` over (gate 8), one layer out.
+        (
+            ["run", "flow.review_loop", "--constructor", "x"].as_slice(),
+            "run",
+            "--constructor",
+            ["`--input`", "`--session`", "`--format`"].as_slice(),
+        ),
+    ] {
+        let output = launch(arguments);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "`{arguments:?}` is a command that could not run, which is exit 2:\n{}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "…and nothing ran, so stdout carries no answer: {}",
+            String::from_utf8_lossy(&output.stdout),
+        );
+        let complaint = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            complaint.contains(&format!("`{mistyped}` is not an option of `{verb}`")),
+            "the refusal names the flag and the verb:\n{complaint}"
+        );
+        for option in listed {
+            assert!(
+                complaint.contains(option),
+                "…and lists {option}, which the verb does take:\n{complaint}"
+            );
+        }
+    }
 }
 
 /// Every declared divergence is exercised, and every cited one is declared.
@@ -2227,6 +2596,29 @@ fn a_generated_project_installs_type_checks_and_runs_under_the_node_fallback() {
     let request = node_runner("http-request.mjs", &project);
     the_declared_media_type_arrived_alone(&request);
     the_bound_object_arrived_as_parameters(&request);
+
+    // Gate 16, asked of the other runtime. The local store backends are a
+    // WebAssembly SQLite over `node:fs` and a directory of files, which is
+    // exactly the shape of dependency that can behave differently on the
+    // fallback — and every store in every emitted project runs on it.
+    let data = root
+        .join("projects")
+        .join("node-fallback")
+        .join("store-data");
+    let _ = fs::remove_dir_all(&data);
+    let stored = node_command("store-backends.mjs")
+        .arg(&project)
+        .arg(&data)
+        .output()
+        .expect("node runs");
+    assert!(
+        stored.status.success(),
+        "the store-backend runner failed under Node:\n{}",
+        String::from_utf8_lossy(&stored.stderr),
+    );
+    the_local_backends_behaved(
+        &serde_json::from_slice(&stored.stdout).expect("the runner prints one JSON object"),
+    );
 
     // Gate 8's list, asked of the other engine.
     let refused = compose_core::codegen::state::INHERITED_PROPERTY_NAMES;

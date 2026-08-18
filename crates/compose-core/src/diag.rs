@@ -437,6 +437,14 @@ pub enum DiagnosticCode {
     /// `detach: true` under a durably checkpointed target (grammar 8.6 rule 7,
     /// Decision D59).
     UnsupportedDetach,
+
+    // --- triggers (grammar 13.3) ------------------------------------------
+    /// Two `http` triggers declare one route: the same effective `path:` at the
+    /// same `method:` (grammar 13.3).
+    DuplicateRoute,
+    /// Two `manual` triggers name one flow and declare different `session_key:`
+    /// expressions, which are two answers for one CLI entry (grammar 13.2).
+    ConflictingSessionKey,
 }
 
 impl DiagnosticCode {
@@ -503,6 +511,8 @@ impl DiagnosticCode {
         Self::SyncTriggerInterrupt,
         Self::NonDominatingSource,
         Self::UnsupportedDetach,
+        Self::DuplicateRoute,
+        Self::ConflictingSessionKey,
     ];
 
     /// The stable kebab-case spelling of this code.
@@ -563,6 +573,8 @@ impl DiagnosticCode {
             Self::SyncTriggerInterrupt => "sync-trigger-interrupt",
             Self::NonDominatingSource => "non-dominating-source",
             Self::UnsupportedDetach => "unsupported-detach",
+            Self::DuplicateRoute => "duplicate-route",
+            Self::ConflictingSessionKey => "conflicting-session-key",
         }
     }
 }
@@ -795,7 +807,7 @@ mod tests {
         }
         assert_eq!(
             DiagnosticCode::ALL.len(),
-            DiagnosticCode::UnsupportedDetach as usize + 1,
+            DiagnosticCode::ConflictingSessionKey as usize + 1,
             "`DiagnosticCode::ALL` stops short of the last declared variant"
         );
     }

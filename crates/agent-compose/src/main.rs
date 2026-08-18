@@ -1,6 +1,6 @@
 //! `agent-compose` — the compiler's command line.
 //!
-//! Two commands exist. The first is the product's core loop (PRD §7 M0):
+//! Four commands exist. The first is the product's core loop (PRD §7 M0):
 //!
 //! ```text
 //! agent-compose validate <path> [--target <name>] [--format human|json]
@@ -26,16 +26,41 @@
 //! here is the surface — argument parsing, the choice of report format, writing
 //! the files, and the exit code.
 //!
+//! The last two are invocation (PRD 5.11):
+//!
+//! ```text
+//! agent-compose run <path> <flow> [--input k=v]... [--session <key>]
+//!                                 [--target <name>] [--out <dir>]
+//!                                 [--format human|json]
+//! agent-compose serve <path> [--host <host>] [--port <port>]
+//!                            [--target <name>] [--out <dir>]
+//!                            [--format human|json]
+//! ```
+//!
+//! Both **build first**, exactly as `build` would and into the same directory,
+//! and then launch the emitted project's own command line (`bun src/index.ts …`,
+//! or `node` under the fallback). Nothing about invoking a compiled graph lives
+//! in this binary — see [`launch`], which is also where the two preconditions of
+//! *starting* something are checked: every `${ENV}` reference has a value
+//! (PRD §9.15) and the pinned dependency set is installed where the project can
+//! resolve it.
+//!
+//! `run`'s **stdout is the run's answer** — the flow's outputs as one JSON
+//! object, or the whole record under `--format json` — so this side writes
+//! nothing there; the build report goes to stderr, and to stdout only when the
+//! composition was refused and there is no run to answer for. `serve`'s stdout
+//! is the app's readiness line for the same reason.
+//!
 //! # Exit codes
 //!
 //! | code | meaning |
 //! |---|---|
 //! | `0` | clean: nothing was reported |
-//! | `1` | diagnostics were reported, or `build --check` found drift |
-//! | `2` | the command could not run: bad usage, an unreadable entrypoint, or an output directory that could not be written |
+//! | `1` | diagnostics were reported, `build --check` found drift, or a `run` produced no answer |
+//! | `2` | the command could not run: bad usage, an unreadable entrypoint, an output directory that could not be written, a missing environment variable, an uninstalled dependency set, or no JavaScript runtime to launch |
 //!
-//! The split between `1` and `2` is the difference between *the composition is
-//! wrong* and *the command could not be run against it*. A missing `imports:`
+//! The split between `1` and `2` is the difference between *the answer is no*
+//! and *the command could not be run at all*. A missing `imports:`
 //! entry is the composition's problem and exits `1` with a diagnostic naming the
 //! file; an entrypoint that is not a readable file, or an `--out` holding files
 //! this compiler did not write and would have replaced (see [`build::write`]),
@@ -74,6 +99,7 @@
 //! resolves the built-in `local` target, which requires no deploy file at all.
 
 mod build;
+mod launch;
 mod report;
 
 use std::io::{self, Write};
@@ -127,6 +153,48 @@ enum Command {
         #[arg(long, value_enum, default_value_t = Format::Human)]
         format: Format,
     },
+    /// Run one flow through its manual trigger (validates, builds, then launches)
+    Run {
+        /// Path to the spec entrypoint (conventionally `main.yml`)
+        path: PathBuf,
+        /// The flow to run, as a typed address (`flow.<name>`)
+        flow: String,
+        /// One input binding, repeatable: `--input goal=ship it`
+        #[arg(long = "input", value_name = "FIELD=VALUE")]
+        inputs: Vec<String>,
+        /// The session identity session-scoped stores key off (grammar 11.3)
+        #[arg(long, value_name = "KEY")]
+        session: Option<String>,
+        /// Deploy target to resolve and emit for
+        #[arg(long, value_name = "NAME", default_value = DEFAULT_TARGET)]
+        target: String,
+        /// Where to write the generated project [default: <project>/build/<target>]
+        #[arg(long, value_name = "DIR")]
+        out: Option<PathBuf>,
+        /// How to report what was found, and how the run answers
+        #[arg(long, value_enum, default_value_t = Format::Human)]
+        format: Format,
+    },
+    /// Serve the project's `http` triggers (validates, builds, then launches the app)
+    Serve {
+        /// Path to the spec entrypoint (conventionally `main.yml`)
+        path: PathBuf,
+        /// The address to listen on
+        #[arg(long, value_name = "HOST", default_value = "127.0.0.1")]
+        host: String,
+        /// The port to listen on; `0` takes one the operating system picks
+        #[arg(long, value_name = "PORT", default_value_t = 0)]
+        port: u16,
+        /// Deploy target to resolve and emit for
+        #[arg(long, value_name = "NAME", default_value = DEFAULT_TARGET)]
+        target: String,
+        /// Where to write the generated project [default: <project>/build/<target>]
+        #[arg(long, value_name = "DIR")]
+        out: Option<PathBuf>,
+        /// How to report what was found
+        #[arg(long, value_enum, default_value_t = Format::Human)]
+        format: Format,
+    },
 }
 
 /// How a report is written.
@@ -156,6 +224,150 @@ fn main() -> ExitCode {
             let out = out.unwrap_or_else(|| build::default_out(&path, &target));
             build_project(&path, &target, &out, check, format)
         }
+        Command::Run {
+            path,
+            flow,
+            inputs,
+            session,
+            target,
+            out,
+            format,
+        } => {
+            let out = out.unwrap_or_else(|| build::default_out(&path, &target));
+            let mut arguments = vec!["run".to_string(), flow];
+            for binding in inputs {
+                arguments.push("--input".to_string());
+                arguments.push(binding);
+            }
+            if let Some(session) = session {
+                arguments.push("--session".to_string());
+                arguments.push(session);
+            }
+            arguments.push("--format".to_string());
+            arguments.push(
+                match format {
+                    Format::Human => "human",
+                    Format::Json => "json",
+                }
+                .to_string(),
+            );
+            launch(&path, "run", &target, &out, format, &arguments)
+        }
+        Command::Serve {
+            path,
+            host,
+            port,
+            target,
+            out,
+            format,
+        } => {
+            let out = out.unwrap_or_else(|| build::default_out(&path, &target));
+            let arguments = vec![
+                "serve".to_string(),
+                "--host".to_string(),
+                host,
+                "--port".to_string(),
+                port.to_string(),
+            ];
+            launch(&path, "serve", &target, &out, format, &arguments)
+        }
+    }
+}
+
+/// `agent-compose run` and `agent-compose serve`: build, then start.
+///
+/// The build half is [`build_project`]'s, run in the same order and refusing on
+/// the same report — a composition the compiler has something to say about is
+/// not one to launch. What it adds is the two preconditions of *starting*
+/// something, both of them PRD §9.15's ("`run`/`serve` fail fast before invoking
+/// the graph"): every `${ENV}` reference the composition makes has a value, and
+/// the pinned dependency set is installed where the project can resolve it.
+///
+/// Nothing is written to stdout on this side. The child's stdout **is** the
+/// command's answer — the flow's outputs for `run`, the readiness line for
+/// `serve` — so a report that shared the stream would corrupt it; the build
+/// report goes to stderr, or to stdout as JSON only when it is what the command
+/// answers, which is when the composition was refused and nothing was launched.
+fn launch(
+    entrypoint: &Path,
+    command: &str,
+    target: &str,
+    out: &Path,
+    format: Format,
+    arguments: &[String],
+) -> ExitCode {
+    // The verb is the caller's, not this function's: both commands come through
+    // here, and a `serve` told that "`run` takes a spec entrypoint" names a
+    // command the caller did not type.
+    if let Err(reason) = usable(entrypoint, command) {
+        return fail(&reason);
+    }
+
+    let (validation, ir) = analyse(entrypoint, target);
+    let mut report = Diagnostics::new();
+    report.extend(validation);
+    let validated = report.is_empty();
+    if let (Some(ir), true) = (&ir, validated) {
+        report.extend(compose_core::target_diagnostics(ir));
+    }
+    report.sort();
+    let diagnostics = report.into_vec();
+    let Some(ir) = ir.filter(|_| diagnostics.is_empty()) else {
+        // The composition is the answer, so the report is what this command
+        // writes — on the stream the format names, exactly as `validate` does.
+        let written = match format {
+            Format::Json => match report::json(&diagnostics) {
+                Ok(text) => write(&mut io::stdout().lock(), &text),
+                Err(error) => return fail(&format!("cannot write the report as JSON: {error}")),
+            },
+            Format::Human => {
+                let color = report::color_enabled();
+                let root = entrypoint.parent().unwrap_or_else(|| Path::new(""));
+                let mut stream = io::stderr().lock();
+                write(&mut stream, &report::human(root, &diagnostics, color)).and_then(|()| {
+                    write(
+                        &mut stream,
+                        &report::verdict(entrypoint, target, &diagnostics, color),
+                    )
+                })
+            }
+        };
+        let _ = written;
+        return ExitCode::from(REPORTED);
+    };
+
+    let project = compose_core::emit(&ir);
+    match build::write(&project, out) {
+        Ok(_) => {}
+        Err(build::Refusal::Io(error)) => {
+            return fail(&format!("cannot write `{}`: {error}", out.display()));
+        }
+        Err(build::Refusal::NotOurs(paths)) => {
+            return fail(&format!(
+                "`{}` holds {} this compiler did not write ({}): point `--out` at a directory \
+                 of its own, or move {} aside",
+                out.display(),
+                if paths.len() == 1 { "a file" } else { "files" },
+                paths
+                    .iter()
+                    .map(|path| format!("`{path}`"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                if paths.len() == 1 { "it" } else { "them" },
+            ));
+        }
+    }
+
+    let runtime = match launch::runtime()
+        .and_then(|runtime| launch::environment(&ir).map(|()| runtime))
+        .and_then(|runtime| launch::dependencies(out).map(|()| runtime))
+    {
+        Ok(runtime) => runtime,
+        Err(launch::Refusal::Unusable(reason)) => return fail(&reason),
+    };
+    match launch::spawn(&runtime, out, arguments) {
+        Ok(code) => ExitCode::from(code),
+        Err(launch::Refusal::Unusable(reason)) => fail(&reason),
     }
 }
 

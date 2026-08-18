@@ -22,6 +22,17 @@ annotate-snippets = "0.12"
 # writes is the enclosing object.
 serde_json = "1"
 
+[target.'cfg(unix)'.dependencies]
+# Signal delivery, which `run` and `serve` need and `std` has no API for: both
+# verbs launch the emitted project as a child and must hand it the `SIGINT` or
+# `SIGTERM` they were sent, or a stopped `serve` leaves a listening app behind
+# (see `launch::spawn`). `libc` is the crate that declares those two calls —
+# `sigaction` and `kill` — and nothing else: it adds no code to the binary that
+# `std`, which already links the platform's C library, does not link anyway.
+# Unix-gated because signals are a POSIX facility; the Windows build keeps the
+# plain wait it has always had.
+libc = "0.2"
+
 [dev-dependencies]
 # The CLI integration tests. Chosen over `trycmd` because one harness has to pin
 # three different things about a run — the exact bytes on each stream, the exit

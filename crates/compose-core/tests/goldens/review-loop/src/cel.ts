@@ -827,15 +827,40 @@ function present(operand: CelValue, field: string, spelling: string): boolean {
   throw new CelError(`\`${spelling}\` selects a field of a ${typeName(operand)}, which has none`);
 }
 
-/** The spelling of a path, for the message an absent read fails with. */
+/**
+ * The spelling of a path, for the message an absent read fails with.
+ *
+ * An index whose key is a **string literal** is spelled as written, because that
+ * key is usually the whole content of the diagnostic: the absent read a caller
+ * of a generated app meets first is a trigger's
+ * `session_key: "payload.headers['x-session']"` against a request that carried
+ * no such header, and `payload.headers[…] is not present` names everything about
+ * that mistake except the one thing the caller can act on. It is also the
+ * spelling the validator's own column already uses for this case — `Path` in
+ * `src/cel/mod.rs` records a literal key and prints it — so the two
+ * interpreters name one sub-path one way (PRD G3, grammar 4.1).
+ *
+ * A computed key stays `[…]`: its value is this run's rather than the
+ * expression's, and printing it would put run data into a message a reader
+ * matches against their spec.
+ */
 function spell(expression: Expr): string {
   switch (expression.kind) {
     case "ident":
       return expression.name;
     case "select":
       return `${spell(expression.operand)}.${expression.field}`;
-    case "index":
-      return `${spell(expression.operand)}[…]`;
+    case "index": {
+      const key = expression.key;
+      // `JSON.stringify` is a double-quoted CEL string literal carrying only
+      // escapes this module's own lexer reads back (`\"`, `\\`, `\uXXXX`), so
+      // the spelling round-trips rather than merely reads.
+      const written =
+        key.kind === "literal" && typeof key.value === "string"
+          ? JSON.stringify(key.value)
+          : "…";
+      return `${spell(expression.operand)}[${written}]`;
+    }
     default:
       return "an expression";
   }

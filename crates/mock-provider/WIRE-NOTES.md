@@ -45,9 +45,24 @@ waits for structured output (PRD 5.2); nothing in M1 streams. A server that
 answered a streaming request with a non-streaming body would be teaching the
 generated client something false about the provider.
 
-**Embeddings are not served.** `store.docs`-style vector stores name an
-`embed.provider` (grammar 11.2), and M1 backs stores with SQLite/local disk. When
-the embedding call becomes real, `POST /v1/embeddings` is an additive route here.
+**Embeddings are served, and are the one route that is not scripted.**
+`store.docs`-style vector stores name an `embed.provider` (grammar 11.2), so a
+`vector` op is a store op with a real HTTP round trip inside it — and unlike a
+model call, what comes back is not a decision the graph makes. A test asserts
+about the *search*, never about the vector, so a scripted queue here would make
+every store test enqueue answers it never reads.
+
+`POST /v1/embeddings` (and its Azure spelling) therefore answers without a
+script, **deterministically in the text**: a small vector — eight dimensions,
+because nothing here is a language model — derived from the input's lowercased
+words, so identical texts embed identically, different texts embed differently,
+and a text scores higher against its own document than against an unrelated one.
+That is exactly the property a `search` assertion needs and it holds with no
+model in the loop. The *request* is still held to the surface's shape — a
+`model`, and an `input` list of strings — because a compiled graph that sent
+something else would be a codegen bug this harness exists to catch. A fixture
+that declares `embed.dimensions:` declares **8**, since grammar 11.2 asserts the
+declared width against what the provider answered.
 
 ---
 

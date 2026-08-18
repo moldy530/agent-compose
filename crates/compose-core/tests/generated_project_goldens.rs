@@ -144,6 +144,39 @@ fn every_golden_file_says_it_is_generated() {
     }
 }
 
+/// Every emitted byte is text a diff tool will show.
+///
+/// This is the other half of "goldens are reviewed in PRs like any other code"
+/// (CLAUDE.md): a committed file is only a review surface while `git diff` is
+/// willing to print it, and git calls a file binary the moment it finds a NUL in
+/// the first few kilobytes — one control character inside one string literal is
+/// enough to turn a whole emitted module into `Binary files differ`. TypeScript
+/// admits those characters in source, so nothing else would catch it; a codepoint
+/// that needs to *be* in a string belongs there as an escape.
+///
+/// Tab, newline and carriage return are the three a text file legitimately holds.
+/// It emits rather than reads, so a regression fails here on the run that
+/// introduced it instead of on the run that regenerated the corpus.
+#[test]
+fn every_emitted_file_is_text_a_diff_will_print() {
+    for golden in GOLDENS {
+        for file in emitted(golden).files() {
+            let found = file.contents.chars().enumerate().find(|(_, character)| {
+                character.is_control() && !matches!(character, '\t' | '\n' | '\r')
+            });
+            assert!(
+                found.is_none(),
+                "`{}/{}` carries U+{:04X} at character {}: write it as an escape, \
+                 or a diff of this file reads `Binary files differ`",
+                golden.directory,
+                file.path,
+                found.expect("a control character").1 as u32,
+                found.expect("a control character").0,
+            );
+        }
+    }
+}
+
 /// The corpus reaches both targets of the example that has two.
 ///
 /// A golden set that only ever emitted `local` would not notice a deploy layer

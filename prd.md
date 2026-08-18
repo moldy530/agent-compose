@@ -436,7 +436,10 @@ Formerly open, now settled — rationale lives in the referenced sections:
 
 ## 10. Open Questions
 
-_None. New questions raised during grammar/spec work land here and must be resolved (moved to §9) before implementation of the affected area begins._
+_New questions raised during grammar/spec work land here and must be resolved (moved to §9) before implementation of the affected area begins._
+
+1. **Instance identity for model-invoked subflows** (raised by flow-as-tool codegen): a flow called as a tool has no `flow:` node, so no instance path — but §9.4 idempotency keys and store scoping derive from that path, and two calls in one tool loop must not share one. What frame does a tool-call instantiation contribute (a per-call ordinal? the tool-loop turn?), and which policy level governs it? Gates the flow-as-tool runtime; until resolved, the tool is emitted and visible but its invocation returns a documented not-implemented error.
+2. **Trace join for model-invoked subflows**: where does a tool-invoked subflow instance's trace attach — inside the agent node's `ModelCall` record (like a tool call) or as a dispatch record (like a `flow:` node)? Gates the same runtime.
 
 ## 11. References
 

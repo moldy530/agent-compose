@@ -360,7 +360,51 @@ pub(crate) fn agent_tools(ctx: &mut Ctx, address: &str, agent: &Agent) {
             ),
         );
     }
+    attached_tool_collisions(ctx, address, agent);
     store_tool_collisions(ctx, address, agent);
+}
+
+/// Two entries of one `tools:` list whose **local names** are equal are one tool
+/// on the model's side, which is a compile error.
+///
+/// Grammar 11.5 states this rule for the pair it is easiest to hit — a
+/// synthesized store tool against an attached one — and states it in exactly
+/// these terms ("a synthesized tool name that collides with an attached
+/// `tool.*`/`flow.*` tool name"), so the *reason* is written down: an
+/// attachment's name on the wire is its address's local name, and one name is
+/// one tool. What no sentence and no Decision entry says is that the same holds
+/// between two **declared** attachments — `tool.condense` beside `flow.condense`
+/// — and the published schema accepts it. That is a doc defect in §5.4, whose
+/// duplicate rule is about entries rather than names; the check is kept
+/// meanwhile because the alternative is worse than a missing sentence. Both
+/// attachments are emitted (a dropped one is the silent-tool bug flow-as-tool
+/// codegen exists to fix), so the request carries two tools of one name — which
+/// the provider surfaces refuse outright — and if one were dropped instead, the
+/// model would be given a contract the composition did not attach.
+fn attached_tool_collisions(ctx: &mut Ctx, address: &str, agent: &Agent) {
+    for (position, attached) in agent.tools.iter().enumerate() {
+        let local = attached.value.name.as_str();
+        let Some(first) = agent.tools[..position]
+            .iter()
+            .find(|earlier| earlier.value.name.as_str() == local)
+        else {
+            continue;
+        };
+        ctx.push(
+            Diagnostic::error(
+                DiagnosticCode::ToolNameCollision,
+                attached.span.clone(),
+                format!(
+                    "`{address}` attaches `{}` and `{}`, which are one `{local}` tool on the model's side",
+                    first.value, attached.value
+                ),
+            )
+            .with_label(first.span.clone(), "the first is attached here")
+            .with_help(
+                "an attached tool's name is its address's local name — the only name it has on the model's side (grammar 5.4, 11.5): rename one of the two definitions, or drop one of the attachments",
+            ),
+        );
+    }
 }
 
 /// An attached store synthesizes LLM-facing tools, and one of those names

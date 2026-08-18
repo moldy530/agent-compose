@@ -228,6 +228,19 @@ export const storeDocsMetadataSchema = z.object({
 }).strict();
 export type StoreDocsMetadataSchema = z.infer<typeof storeDocsMetadataSchema>;
 
+/**
+ * `store.docs` — the arguments of its synthesized `docs_search` tool, which is its `search` row of grammar 11.4 with the expressions replaced by what the model supplies (grammar 11.5).
+ */
+export const storeDocsToolSearchInput = z.object({
+  query: z.string(),
+  top_k: z.number().int().min(1).max(100),
+  filter: z.object({
+    source: z.string().optional(),
+    updated_at: z.string().refine(rfc3339DateTime, { message: "expected an RFC 3339 date-time" }).optional(),
+  }).strict().default({}),
+}).strict();
+export type StoreDocsToolSearchInput = z.infer<typeof storeDocsToolSearchInput>;
+
 /** `store.triage_memory` — the value it stores (grammar 11.1). */
 export const storeTriageMemoryValueSchema = z.object({
   last_report: z.string().describe("The most recent report triaged in this session."),

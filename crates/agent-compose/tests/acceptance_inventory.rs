@@ -368,6 +368,24 @@ const CODEGEN: &[Criterion] = &[
                 "a_subflow_inherits_the_callers_history_and_takes_its_instantiation_policy",
                 Status::Live,
             ),
+            // An instantiation under a `retry:` is more than one instance, and
+            // each is a run with effects and a trace of its own — so what the
+            // boundary reports is a claim about the subgraph rather than about
+            // the policy above it, and it belongs to this criterion.
+            (
+                "a_retried_subflow_reports_the_instance_of_every_attempt",
+                Status::Live,
+            ),
+            // The subgraph's *other* call site. PRD 5.1's flow-as-tool
+            // equivalence makes an agent's `tools:` entry a second way to reach
+            // the same module, and grammar 7.7 clause 4 analyses it as one — so
+            // what the provider is offered, and what a call to it does in a
+            // release that does not instantiate from there, belong to this
+            // criterion rather than to the agent's.
+            (
+                "a_flow_attached_as_a_tool_reaches_the_model_and_refuses_the_call",
+                Status::Live,
+            ),
         ],
     },
     Criterion {
@@ -412,17 +430,35 @@ const CODEGEN: &[Criterion] = &[
         tests: &[
             (
                 "a_store_op_node_reads_and_writes_the_local_backend",
-                Status::Pending(
-                    "pending: codegen must emit store-op nodes over the SQLite/local-disk backends",
-                ),
+                Status::Live,
+            ),
+            // The other two kinds, which the `kv` round trip above does not
+            // reach: a `vector` store — whose ops embed through a real provider
+            // connection (grammar 11.2) — and a `blob` store on local disk.
+            (
+                "a_vector_and_a_blob_store_round_trip_through_the_local_backends",
+                Status::Live,
+            ),
+            // The lifetime that outlives an execution, which is the whole of
+            // PRD 5.8's cross-session memory story — and the run-start refusal
+            // that keeps it honest when no session identity was supplied.
+            (
+                "a_session_scoped_store_outlives_the_execution_that_wrote_it",
+                Status::Live,
             ),
             (
                 "an_attached_store_synthesizes_its_tool_surface_in_the_model_request",
-                Status::Pending("pending: codegen must synthesize store tools"),
+                Status::Live,
             ),
+            ("agent_access_read_withholds_the_write_tool", Status::Live),
+            // The two rows above decide the tool *list*. This one decides the
+            // surface: a model that calls one of those tools reaches the same
+            // backend the store-op nodes reach, carrying the arguments it sent —
+            // which a list cannot show, and which is the half of "synthesized
+            // store tools" a composition actually depends on.
             (
-                "agent_access_read_withholds_the_write_tool",
-                Status::Pending("pending: codegen must synthesize store tools"),
+                "an_agent_calling_a_synthesized_store_tool_reaches_the_backend_with_its_arguments",
+                Status::Live,
             ),
         ],
     },
@@ -432,15 +468,43 @@ const CODEGEN: &[Criterion] = &[
         tests: &[
             (
                 "a_route_fails_over_to_its_next_member_and_the_trace_records_it",
-                Status::Pending(
-                    "pending: codegen must emit model routing with trace-recorded failover",
-                ),
+                Status::Live,
             ),
             (
                 "a_condition_outside_route_on_fails_the_node_instead_of_failing_over",
-                Status::Pending(
-                    "pending: codegen must emit model routing with trace-recorded failover",
-                ),
+                Status::Live,
+            ),
+            // The three conditions the first row does not stage, each failing
+            // over through a route that declares it. `route_on:` is a declared
+            // list, so a criterion met for one of its members and not the others
+            // would be met by an accident of which status the fixture happened
+            // to script — and with this row grammar 12.2's whole enumeration is
+            // staged **positively**, so a classifier that stopped recognising a
+            // condition fails here instead of quietly turning the row above into
+            // the only place that condition appears.
+            (
+                "every_declared_condition_is_recognized_from_the_shape_the_provider_answers_with",
+                Status::Live,
+            ),
+            // `timeout` twice, because it is two conditions wearing one name: a
+            // provider that *reports* a failure to answer, which the row above
+            // stages as a dropped connection, and a provider that reports
+            // nothing at all, which only a budget can end.
+            (
+                "a_route_member_that_answers_nothing_fails_over_inside_the_nodes_budget",
+                Status::Live,
+            ),
+            // "recorded" is the load-bearing half of this phrase, and a record
+            // that survived only a successful run would not be one — nor one
+            // that survived only the *winning attempt* of a retried node, which
+            // is the other half and the one the answer alone cannot carry.
+            (
+                "an_exhausted_route_records_every_member_it_spent_in_the_failed_nodes_trace",
+                Status::Live,
+            ),
+            (
+                "a_node_that_succeeded_on_a_retry_records_what_its_earlier_attempt_called",
+                Status::Live,
             ),
         ],
     },
@@ -453,10 +517,20 @@ const CODEGEN: &[Criterion] = &[
     Criterion {
         bullet: Bullet::Codegen,
         phrase: "env-ref presence checks at process start",
-        tests: &[(
-            "a_missing_env_ref_fails_at_process_start_naming_the_variable",
-            Status::Live,
-        )],
+        tests: &[
+            (
+                "a_missing_env_ref_fails_at_process_start_naming_the_variable",
+                Status::Live,
+            ),
+            // PRD §9.15's other half: `run`/`serve` fail fast *before* invoking
+            // the graph, which is a different check with a different message —
+            // the compiler names every reference and the site each is written
+            // at, without a runtime having been started at all.
+            (
+                "run_refuses_before_it_launches_when_a_variable_is_missing",
+                Status::Live,
+            ),
+        ],
     },
 ];
 
@@ -473,32 +547,96 @@ const COMMANDS: &[Criterion] = &[
     Criterion {
         bullet: Bullet::Commands,
         phrase: "`agent-compose run` (manual trigger)",
-        tests: &[(
-            "run_executes_a_manual_trigger_and_prints_the_flow_outputs",
-            Status::Pending("pending: `agent-compose run` must exist"),
-        )],
+        tests: &[
+            (
+                "run_executes_a_manual_trigger_and_prints_the_flow_outputs",
+                Status::Live,
+            ),
+            // What the other report format answers with: the whole record on
+            // stdout, which is the shape a caller that parses one stream reads.
+            (
+                "run_reports_its_whole_record_under_the_json_format",
+                Status::Live,
+            ),
+            // …and the precondition of *starting* something that has nothing to
+            // do with the composition: the pinned dependency set.
+            (
+                "run_says_what_is_missing_when_the_dependency_set_is_not_installed",
+                Status::Live,
+            ),
+            // The one key a *declared* manual trigger adds to the entry that
+            // exists without it (grammar 13.2): the `session_key:` remap of
+            // `--session`, which decides the partition a session-scoped store
+            // op addresses.
+            (
+                "a_declared_manual_trigger_remaps_the_session_the_cli_was_given",
+                Status::Live,
+            ),
+        ],
     },
-    // Two tests, because the criterion's three verbs do not unlock together.
+    // Four tests, because the criterion's three verbs do not unlock together.
     // PRD §7 M1 puts `serve` — start, resume and status — in this milestone,
     // while PRD §9's resolved question 4 says the `human` node runtime "may land
     // M2". Only `resume` needs that runtime: an interrupt is what there is to
     // resume from. So start/status is decided over the `http-trigger` fixture's
-    // interrupt-free flow and is `serve`'s to unlock, and resume is decided over
-    // its `human` flow and names the runtime it waits on. Keeping them in one
-    // test would have forced the `serve` PR either to ship an M2-scheduled
-    // feature or to edit this inventory — the drift it exists to prevent.
+    // interrupt-free flow and is `serve`'s to unlock — as is `respond: sync` and
+    // its timeout upgrade, and the half of `resume` that is about the route
+    // existing and validating what it was given. What is left pending is the one
+    // claim that needs an interrupt to resume *from*, and it names it.
     Criterion {
         bullet: Bullet::Commands,
         phrase: "`agent-compose serve` (generated Fastify app for http triggers: start/resume/status)",
         tests: &[
             (
                 "serve_exposes_start_and_status_for_an_http_trigger",
-                Status::Pending("pending: `agent-compose serve` must exist"),
+                Status::Live,
             ),
+            (
+                "serve_answers_a_sync_trigger_and_upgrades_when_its_timeout_expires",
+                Status::Live,
+            ),
+            (
+                "resume_validates_the_execution_and_names_the_runtime_it_waits_for",
+                Status::Live,
+            ),
+            // What the app does with a request is as much a part of "generated
+            // Fastify app" as which routes it mounts: the body rule of
+            // Decision D117, and the completion webhook `start` fires.
+            (
+                "a_request_with_an_empty_body_starts_an_execution_and_a_non_object_one_does_not",
+                Status::Live,
+            ),
+            (
+                "a_completion_webhook_fires_with_the_runs_report_and_only_when_a_url_was_given",
+                Status::Live,
+            ),
+            // …and what it answers a caller whose request the trigger's own
+            // bindings could not read, which is the first place a CEL
+            // diagnostic is read by somebody outside the composition (PRD G3).
+            (
+                "a_trigger_that_cannot_read_a_request_names_the_key_it_looked_for",
+                Status::Live,
+            ),
+            // And what the *command* answers when there is no app to serve.
+            (
+                "serve_answers_two_with_a_sentence_when_it_cannot_take_the_port",
+                Status::Live,
+            ),
+            // …and what it answers for the one collision the compiler cannot
+            // decide, which is a route rather than an address.
+            (
+                "serve_names_the_route_collision_the_compiler_could_not_see",
+                Status::Live,
+            ),
+            // …and what it does when there is one and it is asked to stop. The
+            // command is not the server — it launches the emitted project and
+            // waits on it — so "the app is served by this command" is only true
+            // if ending the command ends the app.
+            ("stopping_serve_stops_the_app_it_started", Status::Live),
             (
                 "serve_resumes_an_interrupted_execution_against_the_human_nodes_schema",
                 Status::Pending(
-                    "pending: `agent-compose serve` must exist, and the `human` node runtime with it",
+                    "pending: the `human` node runtime, which PRD §9's resolved question 4 schedules for M2",
                 ),
             ),
         ],

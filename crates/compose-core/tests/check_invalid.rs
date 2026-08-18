@@ -78,10 +78,12 @@ const CHECK_CODES: &[&str] = &[
     "unbalanced-convergence",
     "unreachable-node",
     "recursive-flow",
+    "conflicting-session-key",
     "sync-trigger-interrupt",
     "non-dominating-source",
     "unsupported-detach",
     "conflicting-keys",
+    "duplicate-route",
 ];
 
 struct Anchor {

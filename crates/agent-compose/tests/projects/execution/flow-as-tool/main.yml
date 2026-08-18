@@ -1,0 +1,130 @@
+# M1 acceptance fixture: a flow attached to an agent as a tool (grammar 5.4).
+#
+# PRD 5.1's flow-as-tool equivalence gives a `flow.*` two call sites, and this
+# project has both over **one** subflow so the pair is comparable:
+#
+#   * `flow.ask` attaches `flow.condense` to `agent.answerer`'s `tools:`, where
+#     the model decides whether to call it. The tool is on the wire with the
+#     contract grammar 5.4 gives it — its local name, the `description:` the
+#     validator requires exactly here, and its `inputs:` as the parameter schema
+#     — and a call to it is what this compiler release refuses, by name;
+#   * `flow.pipe` instantiates the same subflow at a `flow:` node (grammar 8.5),
+#     where it runs. That is the half the refusal points a reader at, so it is
+#     exercised rather than asserted about.
+#
+# Nothing here fans out or loops: the subject is which call sites a `flow.*` can
+# be reached from, and a second construct in the project would only make a
+# transcript harder to read.
+version: "0.1"
+
+defaults:
+  timeout: 60s
+  on_error: fail
+
+state:
+  answer:
+    description: What `agent.answerer` finally said.
+    type: string
+    default: ""
+  line:
+    description: The one line `flow.condense` reduces a passage to.
+    type: string
+    default: ""
+
+provider.mock:
+  kind: anthropic
+  api_key: ${MOCK_API_KEY}
+  base_url: ${MOCK_BASE_URL}
+
+model.smart:
+  provider: provider.mock
+  id: claude-sonnet-4-6
+  settings:
+    max_tokens: 4096
+
+agent.summariser:
+  description: Reduces a passage to a single line.
+  model: model.smart
+  prompt: |
+    Reduce the passage to one line.
+  input:
+    passage:
+      type: string
+  output:
+    line:
+      type: string
+      min_length: 1
+
+# The subflow both call sites reach. `description:` is REQUIRED of it because it
+# is attached as a tool below, and it is the selection signal the model reads
+# (grammar 5.4).
+flow.condense:
+  description: Condense one passage into a single line.
+  inputs:
+    passage:
+      type: string
+      min_length: 1
+  outputs:
+    line:
+      type: string
+  nodes:
+    reduce:
+      agent: agent.summariser
+      input:
+        passage: "input.passage"
+  edges:
+    - { from: start, to: reduce }
+    - { from: reduce, to: end }
+
+agent.answerer:
+  description: Answers a question, with a flow attached as a tool.
+  model: model.smart
+  prompt: |
+    Answer the question. Condense anything long before you quote it.
+  input:
+    question:
+      type: string
+  output:
+    answer:
+      type: string
+      min_length: 1
+  tools: [flow.condense]
+
+# Call site one: the model's. Whether `condense` is called at all is the model's
+# decision, which is what makes the tool list of the request the observable.
+flow.ask:
+  description: Answer a question, with the subflow offered to the model.
+  inputs:
+    question:
+      type: string
+      min_length: 1
+  outputs:
+    answer:
+      type: string
+  nodes:
+    ask:
+      agent: agent.answerer
+      input:
+        question: "input.question"
+  edges:
+    - { from: start, to: ask }
+    - { from: ask, to: end }
+
+# Call site two: the graph's. The same subflow, instantiated deterministically.
+flow.pipe:
+  description: Condense a passage through a `flow:` node instead.
+  inputs:
+    passage:
+      type: string
+      min_length: 1
+  outputs:
+    line:
+      type: string
+  nodes:
+    condense:
+      flow: flow.condense
+      input:
+        passage: "input.passage"
+  edges:
+    - { from: start, to: condense }
+    - { from: condense, to: end }

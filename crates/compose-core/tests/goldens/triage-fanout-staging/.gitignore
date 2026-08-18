@@ -6,7 +6,9 @@
 # the whole directory out and stop regenerating it.
 #
 # A generated project is meant to be committed — `build --check` in CI is what
-# that buys (PRD §8). These two are the exceptions: one is an install artifact,
-# and the other is the thing the spec deliberately never contains.
+# that buys (PRD §8). These three are the exceptions: an install artifact, the
+# thing the spec deliberately never contains, and the data this project's own
+# stores keep (PRD 5.8).
 node_modules/
 .env
+.agent-compose/

@@ -28,19 +28,17 @@
 //!   are properties of the emitted TypeScript, and a CLI that has not been
 //!   written yet is not what makes them true or false.
 //! * [`run`] shells out to `agent-compose run`, which is its own M1 deliverable
-//!   (PRD §7 M1's second bullet). Exactly one test uses it —
-//!   `run_executes_a_manual_trigger_and_prints_the_flow_outputs` — and it is
-//!   `#[ignore]`d until that command exists, which is what keeps "the CLI works"
-//!   an honest claim rather than one the graph tests answer on its behalf.
+//!   (PRD §7 M1's second bullet). The tests that use it are about **the command**
+//!   — that it validates, builds, checks the environment, launches the emitted
+//!   project and prints what it produced — which is what keeps "the CLI works" an
+//!   honest claim rather than one the graph tests answer on its behalf.
 //!
-//! `serve` is the same shape as `run`: not written yet, `#[ignore]`d, and shelled
-//! out to for real when it is.
+//! [`serve`] is the same shape: the real command, over the real emitted app.
 //!
 //! Every helper below reaches the **real** compiler and the **real** emitted
 //! project — there are no stubs here, deliberately: un-ignoring is the
 //! definition of done, and a harness of stubs would let a test pass against a
-//! stub. This paragraph is part of that contract, so a PR that lands `run` or
-//! `serve` edits it in the same commit that un-ignores their tests.
+//! stub.
 //!
 //! # Interface assumptions
 //!
@@ -50,9 +48,14 @@
 //! | call | command |
 //! |---|---|
 //! | [`build`] | `agent-compose build <entrypoint> --target <name> --out <dir>` |
-//! | [`invoke`] | `bun <driver> <project> <flow> <inputs.json> <trace.json>`, over the emitted `runFlow` |
-//! | [`run`] | `agent-compose run <entrypoint> <flow> --input k=v … [--session <key>]` |
-//! | [`serve`] | `agent-compose serve <entrypoint> --port 0`, announcing its address on stdout |
+//! | [`invoke`] | `bun <driver> <project> <flow> <inputs.json> <trace.json> <session>`, over the emitted `runFlow` |
+//! | [`run`] | `agent-compose run <entrypoint> <flow> --input k=v … [--session <key>] --out <dir>` |
+//! | [`serve`] | `agent-compose serve <entrypoint> --port 0 --out <dir>`, announcing its address on stdout |
+//!
+//! `--out` is the one flag the original table did not name, and both verbs take
+//! it for the reason [`scratch_project`] gives: a launch needs the pinned
+//! dependency set to resolve and a store's data to be this test's own, and both
+//! are properties of *where the project was built*.
 //!
 //! Both invocation forms print the flow's outputs as one JSON object on stdout
 //! (PRD 5.11's `run` is a CLI verb over a flow's declared output schema, so a
@@ -94,10 +97,12 @@
 #[path = "../../../compose-core/tests/support/toolchain.rs"]
 pub mod toolchain;
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 // `bun_command` beside `bun`: a test that needs the *runtime* and not the pinned
@@ -121,6 +126,7 @@ pub const FIXTURES: &[&str] = &[
     "agent-openai",
     "bounded-cycle",
     "fanout",
+    "flow-as-tool",
     "http-trigger",
     "model-failover",
     "provider-kinds",
@@ -243,9 +249,14 @@ impl Drop for Scratch {
 
 /// What `validate` said about a project.
 pub fn validate(name: &str, target: &str) -> Output {
+    validate_entrypoint(&fixture(name), target)
+}
+
+/// The same, for any composition on disk.
+pub fn validate_entrypoint(entrypoint: &Path, target: &str) -> Output {
     agent_compose()
         .arg("validate")
-        .arg(fixture(name))
+        .arg(entrypoint)
         .args(["--target", target])
         .env("NO_COLOR", "1")
         .output()
@@ -369,10 +380,44 @@ impl Run {
         );
         self.stderr()
     }
+
+    /// Every routing decision the run recorded, in step order (PRD 5.3).
+    ///
+    /// Read from the file the command **names on stderr**, which is the whole
+    /// point of it naming one: a trace grows with the run, so the terminal gets
+    /// a summary and a reader — a person or this harness — gets the file.
+    pub fn trace(&self) -> Vec<Value> {
+        let stderr = self.stderr();
+        let path = stderr
+            .lines()
+            .find_map(|line| line.strip_prefix("trace: "))
+            .unwrap_or_else(|| panic!("the run names where it wrote its trace\nstderr: {stderr}"))
+            .trim()
+            .to_string();
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("cannot read the trace at `{path}`: {error}"));
+        serde_json::from_str(&text).expect("the trace is a JSON array")
+    }
+
+    /// One node's trace entries, in step order.
+    pub fn entries(&self, node: &str) -> Vec<Value> {
+        self.trace()
+            .into_iter()
+            .filter(|entry| entry["node"] == node)
+            .collect()
+    }
 }
 
+/// The session identity every [`invoke`] supplies.
+///
+/// `runFlow` refuses a run whose flow reaches a `scope: session` store with no
+/// session key (grammar 11.3), and one of the worked examples has such a store —
+/// so the driver always supplies one. Which one it is says nothing: what a test
+/// asserts about a session-scoped store is that a write outlives the execution.
+pub const SESSION: &str = "acceptance-session";
+
 /// The driver [`invoke`] runs: it imports the emitted project and calls its own
-/// `runFlow`, which is the surface `run` and `serve` will be built on.
+/// `runFlow`, which is the surface `run` and `serve` are built on.
 fn driver() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/compiled_graph_acceptance/invoke-flow.mjs")
 }
@@ -404,11 +449,17 @@ pub fn build_under_toolchain(name: &str, purpose: &str) -> Option<(PathBuf, Outp
     build_entrypoint(&fixture(name), purpose)
 }
 
-/// The same, for any composition on disk — a fixture, or a worked [`example`].
+/// A directory beneath the installed toolchain for one built project.
 ///
-/// Each call gets its own directory: cargo runs the tests of one binary on
-/// parallel threads, and two of them writing one project would race.
-pub fn build_entrypoint(entrypoint: &Path, purpose: &str) -> Option<(PathBuf, Output)> {
+/// Everything that **runs** an emitted project builds into one of these, for two
+/// reasons that both matter. `node_modules` resolves by walking up, so a project
+/// built anywhere else could not import the pinned dependency set — and every
+/// call gets its own directory, because cargo runs the tests of one binary on
+/// parallel threads and two of them writing one project would race. It is also
+/// where a store's data lands (`.agent-compose/`), so a fresh directory is a
+/// fresh store: a `scope: global` store that carried a previous test's writes
+/// would make an assertion about a `search` depend on test order.
+pub fn scratch_project(purpose: &str) -> Option<PathBuf> {
     let root = installed()?;
     static NEXT: AtomicU32 = AtomicU32::new(0);
     let out = root.join("projects").join(format!(
@@ -417,6 +468,12 @@ pub fn build_entrypoint(entrypoint: &Path, purpose: &str) -> Option<(PathBuf, Ou
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
     let _ = std::fs::remove_dir_all(&out);
+    Some(out)
+}
+
+/// The same, for any composition on disk — a fixture, or a worked [`example`].
+pub fn build_entrypoint(entrypoint: &Path, purpose: &str) -> Option<(PathBuf, Output)> {
+    let out = scratch_project(purpose)?;
     let output = agent_compose()
         .arg("build")
         .arg(entrypoint)
@@ -516,7 +573,8 @@ pub fn invoke_entrypoint(
         .arg(&project)
         .arg(flow)
         .arg(&inputs_path)
-        .arg(&trace_path);
+        .arg(&trace_path)
+        .arg(SESSION);
     seal(&mut command, environment);
     let output = command.output().expect("bun runs");
     Some(Invocation {
@@ -595,7 +653,16 @@ impl Invocation {
 }
 
 /// `agent-compose run <fixture> <flow> --input k=v …`, pointed at the mock.
-pub fn run(name: &str, flow: &str, inputs: &[(&str, &str)], provider: &MockProvider) -> Run {
+///
+/// Answers `None` when Bun is absent and this is not CI, the same skip
+/// [`invoke`] takes: the command builds a project and then launches it, so it
+/// needs the same toolchain a compiled graph does.
+pub fn run(
+    name: &str,
+    flow: &str,
+    inputs: &[(&str, &str)],
+    provider: &MockProvider,
+) -> Option<Run> {
     run_with(name, flow, inputs, &environment(provider))
 }
 
@@ -606,12 +673,51 @@ pub fn run_with(
     flow: &str,
     inputs: &[(&str, &str)],
     environment: &[(String, String)],
+) -> Option<Run> {
+    let out = scratch_project("run")?;
+    Some(run_into(&out, name, flow, inputs, None, environment))
+}
+
+/// The same again, into a directory the **caller** owns.
+///
+/// Which is what a session-scoped store needs from this harness: a store's data
+/// lives under the built project (`.agent-compose/`), so two runs that are meant
+/// to see each other's writes have to be two runs of one directory. Everything
+/// else takes a fresh one.
+pub fn run_into(
+    out: &Path,
+    name: &str,
+    flow: &str,
+    inputs: &[(&str, &str)],
+    session: Option<&str>,
+    environment: &[(String, String)],
+) -> Run {
+    run_formatted(out, name, flow, inputs, session, None, environment)
+}
+
+/// The same, choosing the report format — the one flag that changes what a run
+/// writes on which stream.
+pub fn run_formatted(
+    out: &Path,
+    name: &str,
+    flow: &str,
+    inputs: &[(&str, &str)],
+    session: Option<&str>,
+    format: Option<&str>,
+    environment: &[(String, String)],
 ) -> Run {
     let mut command = agent_compose();
     command.arg("run").arg(fixture(name)).arg(flow);
     for (field, value) in inputs {
         command.arg("--input").arg(format!("{field}={value}"));
     }
+    if let Some(session) = session {
+        command.arg("--session").arg(session);
+    }
+    if let Some(format) = format {
+        command.arg("--format").arg(format);
+    }
+    command.arg("--out").arg(out);
     seal(&mut command, environment);
     let output = command.output().expect("the command runs");
     Run { output }
@@ -653,14 +759,77 @@ pub fn seal(command: &mut Command, environment: &[(String, String)]) {
 }
 
 /// A served project, killed when the test ends.
+///
+/// **The whole tree, not the command.** `agent-compose serve` is one process and
+/// the app is another — the emitted project, launched by it — so a harness that
+/// killed the command alone would leave the app listening, holding its port and
+/// its project directory, reparented to init and never told to stop. That is not
+/// a slow cleanup; it is a leak per served test, on every `cargo test`, and it
+/// makes the suite non-hermetic on a runner that is reused. So [`serve`] puts
+/// the command in a **process group of its own** and this kills the group.
+///
+/// `SIGKILL` rather than a graceful `SIGTERM`, because what is being asserted
+/// about a served app is asserted before this runs: a graceful stop would be a
+/// second thing to wait for and would make the end of every serve test a race
+/// with the app's own shutdown. The command forwards `SIGTERM` on its own — the
+/// test that pins it is
+/// `stopping_serve_stops_the_app_it_started`, which is where that behaviour is
+/// decided rather than here.
 pub struct Served {
     child: Child,
+    /// Whether the command has already been waited on, and its pid with it.
+    ///
+    /// A reaped pid is not this process's any more — the number is the system's
+    /// to hand out again — so nothing is signalled once this is set. A test that
+    /// stops the command itself is the only thing that sets it.
+    reaped: bool,
     /// Where the generated app is listening.
     pub base_url: String,
 }
 
+impl Served {
+    /// Send one signal to the command **alone**, leaving the group to the app.
+    ///
+    /// Which is the whole point where it is used: a signal delivered to the
+    /// command and not to the app is how "the command hands its signals on" is
+    /// asked as a question rather than assumed.
+    #[cfg(unix)]
+    pub fn signal(&self, signal: libc::c_int) {
+        assert!(!self.reaped, "the command has already been waited on");
+        // SAFETY: a pid this process spawned and has not reaped.
+        unsafe {
+            libc::kill(
+                libc::pid_t::try_from(self.child.id()).expect("a pid"),
+                signal,
+            );
+        }
+    }
+
+    /// Wait for the command to exit and answer with its status.
+    pub fn wait(&mut self) -> std::process::ExitStatus {
+        let status = self.child.wait().expect("the command is waited on");
+        self.reaped = true;
+        status
+    }
+}
+
 impl Drop for Served {
     fn drop(&mut self) {
+        if self.reaped {
+            return;
+        }
+        #[cfg(unix)]
+        {
+            // The negated pid is the group [`serve`] spawned the command into,
+            // so this reaches the emitted app as well as the command that
+            // launched it. `ESRCH` — a group whose members are already gone — is
+            // an expected answer and is ignored like every other.
+            if let Ok(pid) = libc::pid_t::try_from(self.child.id()) {
+                // SAFETY: `pid` is this process's own child, unreaped until the
+                // `wait` below, so its group is still its own.
+                unsafe { libc::kill(-pid, libc::SIGKILL) };
+            }
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -674,14 +843,26 @@ impl Drop for Served {
 /// The environment is [`seal`]ed exactly as a `run`'s is: a served app resolves
 /// the same env refs at process start, so the two halves of the harness have to
 /// agree on what a fixture's refs may resolve from.
-pub fn serve(name: &str, provider: &MockProvider) -> Served {
+///
+/// The command is spawned into a **process group of its own**, which is what
+/// lets [`Served::drop`] end the app the command launched rather than only the
+/// command — see there.
+pub fn serve(name: &str, provider: &MockProvider) -> Option<Served> {
+    let out = scratch_project("serve")?;
     let mut command = agent_compose();
     command
         .arg("serve")
         .arg(fixture(name))
         .args(["--port", "0"])
+        .arg("--out")
+        .arg(&out)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     seal(&mut command, &environment(provider));
     let mut child = command.spawn().expect("the command runs");
     let stdout = child.stdout.take().expect("stdout is piped");
@@ -695,7 +876,46 @@ pub fn serve(name: &str, provider: &MockProvider) -> Served {
         .as_str()
         .unwrap_or_else(|| panic!("the readiness line names no base url: {announced}"))
         .to_string();
-    Served { child, base_url }
+    Some(Served {
+        child,
+        reaped: false,
+        base_url,
+    })
+}
+
+/// `agent-compose serve <fixture> --port <port>`, **waited on** rather than
+/// listened to.
+///
+/// [`serve`] reads a readiness line and hands back a live app, which is what a
+/// test of the served surface wants and exactly what a test of a *failed start*
+/// cannot use: there is no readiness line, and a harness waiting for one would
+/// hang instead of failing. So this one runs the command to completion and hands
+/// back what it wrote and how it exited.
+pub fn serve_refused(name: &str, provider: &MockProvider, port: u16) -> Option<Output> {
+    serve_refused_entrypoint(&fixture(name), provider, port)
+}
+
+/// The same, for any composition on disk.
+///
+/// Which is what a *route* collision needs and a fixture cannot give: the
+/// composition it takes is one the app refuses to mount, so a fixture of it
+/// would be a project the rest of the suite builds, type-checks and can never
+/// serve. The compositions written for this are written where they are read.
+pub fn serve_refused_entrypoint(
+    entrypoint: &Path,
+    provider: &MockProvider,
+    port: u16,
+) -> Option<Output> {
+    let out = scratch_project("serve-refused")?;
+    let mut command = agent_compose();
+    command
+        .arg("serve")
+        .arg(entrypoint)
+        .args(["--port", &port.to_string()])
+        .arg("--out")
+        .arg(&out);
+    seal(&mut command, &environment(provider));
+    Some(command.output().expect("the command runs"))
 }
 
 /// The states a status report can be asserted about: an execution has either
@@ -729,4 +949,132 @@ pub fn settled(app: &Client, execution: &str) -> Value {
         );
         std::thread::sleep(Duration::from_millis(25));
     }
+}
+
+/// Where a `callback:` webhook is delivered: a socket that answers `200` and
+/// keeps what it was posted.
+///
+/// The generated app POSTs its completion report to whatever URL the trigger's
+/// `callback:` CEL produced (grammar 13.3, PRD 5.11), and nothing else in this
+/// harness can receive one — [`MockProvider`] is a *provider* surface, and the
+/// served app is the thing under test. So this is the other end of the webhook:
+/// a listener a test points a `callback_url` at, which records every delivery in
+/// arrival order.
+///
+/// It answers `200` to anything and reads no route, because what is under test
+/// is which requests the app makes rather than what a receiver does with them.
+pub struct Receiver {
+    /// The base URL to build a `callback_url` from.
+    pub base_url: String,
+    delivered: Arc<Mutex<Vec<Value>>>,
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Receiver {
+    /// Bind a receiver on loopback.
+    pub fn start() -> std::io::Result<Self> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let base_url = format!("http://{}", listener.local_addr()?);
+        listener.set_nonblocking(true)?;
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let delivered = Arc::clone(&delivered);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            if let Some(body) = deliver(&mut stream) {
+                                delivered.lock().expect("the deliveries").push(body);
+                            }
+                        }
+                        // Nothing has connected yet; the stop flag is read
+                        // between polls, which is how the thread ends.
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            })
+        };
+        Ok(Self {
+            base_url,
+            delivered,
+            stop,
+            thread: Some(thread),
+        })
+    }
+
+    /// Every delivery so far, in arrival order.
+    pub fn delivered(&self) -> Vec<Value> {
+        self.delivered.lock().expect("the deliveries").clone()
+    }
+
+    /// Wait for `count` deliveries, or say what arrived instead.
+    ///
+    /// A webhook is fired *after* the run settles, so a test that read the list
+    /// straight after a `202` would be asserting about scheduling luck.
+    pub fn wait_for(&self, count: usize, budget: Duration) -> Vec<Value> {
+        let deadline = Instant::now() + budget;
+        loop {
+            let held = self.delivered();
+            if held.len() >= count {
+                return held;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "only {} of {count} webhook deliveries arrived: {held:?}",
+                held.len()
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+}
+
+impl Drop for Receiver {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Read one HTTP request off `stream`, answer it `200`, and hand back its body.
+fn deliver(stream: &mut TcpStream) -> Option<Value> {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("a read budget");
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 1024];
+    let mut head: Option<usize> = None;
+    let mut length = 0usize;
+    loop {
+        if head.is_none()
+            && let Some(at) = buffer.windows(4).position(|window| window == b"\r\n\r\n")
+        {
+            head = Some(at + 4);
+            let text = String::from_utf8_lossy(&buffer[..at]).to_lowercase();
+            length = text
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse().ok())
+                .unwrap_or(0);
+        }
+        if let Some(start) = head
+            && buffer.len() >= start + length
+        {
+            break;
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => buffer.extend_from_slice(&chunk[..read]),
+        }
+    }
+    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+    let start = head?;
+    serde_json::from_slice(&buffer[start..]).ok()
 }

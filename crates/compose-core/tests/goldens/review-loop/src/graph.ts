@@ -17,6 +17,7 @@
 import { END, START, StateGraph } from "@langchain/langgraph";
 
 import * as runtime from "./runtime.ts";
+import * as stores from "./stores.ts";
 import {
   agentResearcherOutput,
   agentReviewerOutput,
@@ -74,19 +75,6 @@ const providerAnthropic: runtime.ProviderBinding = {
   },
 };
 
-/**
- * `model.default` — `claude-sonnet-4-6` on `provider.anthropic` (grammar 12.2). This is `model.smart`, the first member of the route `model.default` declares: failover is not executed by this compiler release (PRD §7 M1: model routing with trace-recorded failover), so a condition in `route_on:` fails the node rather than moving to the next member.
- */
-const modelDefault: runtime.ModelBinding = {
-  address: "model.default",
-  id: "claude-sonnet-4-6",
-  provider: providerAnthropic,
-  settings: {
-    "max_tokens": 8000,
-    "thinking": { "budget_tokens": 4000 },
-  },
-};
-
 /** `model.fast` — `claude-haiku-4-5` on `provider.anthropic` (grammar 12.2). */
 const modelFast: runtime.ModelBinding = {
   address: "model.fast",
@@ -108,6 +96,15 @@ const modelSmart: runtime.ModelBinding = {
     "max_tokens": 8000,
     "thinking": { "budget_tokens": 4000 },
   },
+};
+
+/**
+ * `model.default` — an ordered failover route over `model.smart`, `model.fast` (grammar 12.2, PRD 5.9). A member that refuses with one of the conditions below moves the call to the next; anything else fails the node, and which member served a call is recorded in the trace.
+ */
+const modelDefault: runtime.ModelRoute = {
+  address: "model.default",
+  route: [modelSmart, modelFast],
+  routeOn: ["rate_limit", "overloaded", "timeout"],
 };
 
 /**
@@ -295,6 +292,7 @@ const flowReviewLoopNodeWrite: runtime.NodeDescriptor = {
     return {
       output: runtime.parseResult(agentResearcherOutput, answer.output, "the answer of `agent.researcher`"),
       history: answer.history,
+      models: answer.models,
     };
   },
   writes: [
@@ -329,6 +327,7 @@ const flowReviewLoopNodeReview: runtime.NodeDescriptor = {
     return {
       output: runtime.parseResult(agentReviewerOutput, answer.output, "the answer of `agent.reviewer`"),
       history: answer.history,
+      models: answer.models,
     };
   },
   writes: [
@@ -373,14 +372,39 @@ const flowReviewLoopBinding: runtime.SubflowBinding = {
     }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
 };
 
+/**
+ * How a declared flow input reads a command-line value (grammar 13.2).
+ *
+ * `json` is every structured shape — an object, an array, a tagged union — for
+ * which the one honest reading of a shell argument is the document it spells.
+ */
+export type InputKind = "string" | "integer" | "number" | "boolean" | "json";
+
 /** One compiled flow: what it takes, what it answers, and how to run it. */
 export interface CompiledFlow {
   /** Its typed address (grammar 2.2). */
   readonly address: string;
   /** The fields its `inputs:` declares (grammar 7.5). */
   readonly inputs: readonly string[];
+  /**
+   * What each declared input *is*, so a `--input k=v` argument can be read as
+   * the type the field declares rather than reaching Zod as text (grammar 13.2).
+   */
+  readonly inputKinds: Readonly<Record<string, InputKind>>;
   /** The fields its `outputs:` declares, each read from the channel of that name. */
   readonly outputs: readonly string[];
+  /**
+   * The `scope: session` stores this flow **reaches**, under the relation
+   * grammar 7.7 fixes — its own nodes, its maps' dispatch targets, the flows it
+   * instantiates, and the stores of every agent it reaches.
+   *
+   * A run of this flow needs a session identity exactly when this list is not
+   * empty (grammar 11.3): a declared trigger supplies it through `session_key:`,
+   * and the CLI through `--session`. Checked at run start rather than at
+   * validate, for the reason env-ref presence is: the value does not exist until
+   * the invocation does.
+   */
+  readonly sessionStores: readonly string[];
   /** The superstep ceiling a run of it takes by default. */
   readonly recursionLimit: number;
   /** Parse an invocation's inputs against the flow's own schema (grammar 13.2). */
@@ -412,9 +436,12 @@ export const flows: Readonly<Record<string, CompiledFlow>> = {
   "flow.review_loop": {
     address: "flow.review_loop",
     inputs: ["goal"],
+    inputKinds: { "goal": "string", },
     outputs: ["draft"],
+    sessionStores: [],
     recursionLimit: 33,
-    parse: (inputs: unknown) => flowReviewLoopInputs.parse(inputs) as Record<string, unknown>,
+    parse: (inputs: unknown) =>
+      runtime.parseResult(flowReviewLoopInputs, inputs, "the `inputs:` of `flow.review_loop`") as Record<string, unknown>,
     stream: (initial, options) =>
       flowReviewLoopGraph.stream(initial, {
         ...options,
@@ -432,6 +459,30 @@ export interface FlowRun {
   readonly trace: readonly runtime.TraceEntry[];
   /** The whole state at quiescence. */
   readonly state: GraphState;
+}
+
+/**
+ * Why a flow that reaches a `scope: session` store refuses a run that arrived
+ * with no session identity (grammar 11.3, 13.2).
+ *
+ * One sentence in one place, because it is raised from two and the two must not
+ * drift: `src/cli.ts` raises it as a **usage** error, before a `run` starts
+ * anything, because a missing `--session` is an argument the caller has to add —
+ * the same class as an unknown `--input` name or an absent `${ENV}`, which
+ * grammar 11.3 says outright by likening this check to env-ref presence (§4.3);
+ * `runFlow` raises it for every other caller, where the key arrives per
+ * invocation.
+ *
+ * Named by the store rather than by the flow, because the store is what the
+ * author has to look at. And three ways a run arrives with none are named,
+ * because two of them are advice a reader has already taken: a declared
+ * `session_key:` that *evaluated* to the empty string — an absent header, a
+ * payload member that was not sent — is an identity-less run whose trigger does
+ * declare one, and a message offering only the two remedies would send that
+ * reader to look at a line that is already there (PRD G3).
+ */
+export function sessionRefusal(address: string, stores: readonly string[]): string {
+  return `\`${address}\` reaches ${stores.map((store) => `\`${store}\``).join(", ")}, which ${stores.length === 1 ? "is" : "are"} \`scope: session\`, so this run needs a session identity and arrived with none: pass \`--session <key>\` to \`agent-compose run\`, or declare \`session_key:\` on the trigger that starts it — and where one is declared, it answered the empty string for this invocation (grammar 11.3, 13.2)`;
 }
 
 /**
@@ -469,23 +520,39 @@ export async function runFlow(
   }
   const parsed = flow.parse(inputs);
   const ceiling = options.recursionLimit ?? flow.recursionLimit;
+  const sessionKey = options.sessionKey ?? "";
+  // Grammar 11.3, checked where the value first exists: a flow that reaches a
+  // `scope: session` store keys off the identity its trigger supplies, and a run
+  // started without one would silently address a partition named by the empty
+  // string. `src/cli.ts` decides the same thing one step earlier for a `run`,
+  // where the identity is a command-line argument; this is the guard for every
+  // caller it cannot stand in for — a `serve` request, an ejected invocation —
+  // where the key arrives per invocation and its absence really is a failure of
+  // that run rather than of the command.
+  if (sessionKey === "" && flow.sessionStores.length > 0) {
+    throw new Error(sessionRefusal(address, flow.sessionStores));
+  }
+  const executionId = options.executionId ?? `exec_${globalThis.crypto.randomUUID()}`;
   // `runtime.quiesce` keeps the last state each superstep produced, which is
   // what makes a failure's trace survive; the one failure it restates on the way
   // out is LangGraph stopping the run at the ceiling.
-  const { state, error } = await runtime.quiesce(
-    flow,
-    {
-      $run: {
-        ...runtime.emptyRun(),
-        input: parsed,
-        execution: {
-          id: options.executionId ?? `exec_${globalThis.crypto.randomUUID()}`,
-          session_key: options.sessionKey ?? "",
+  const { state, error } = await runtime
+    .quiesce(
+      flow,
+      {
+        $run: {
+          ...runtime.emptyRun(),
+          input: parsed,
+          execution: { id: executionId, session_key: sessionKey },
         },
       },
-    },
-    ceiling,
-  );
+      ceiling,
+    )
+    // `scope: execution` means what it says: whatever this run's own stores held
+    // is released when the run ends, however it ended (PRD 5.8, grammar 11.1).
+    // A `serve` process runs many executions, so a store that stayed open would
+    // be both a leak and a lifetime the composition did not declare.
+    .finally(() => stores.releaseExecution(executionId));
   if (error !== undefined) {
     throw new runtime.FlowFailure(
       address,

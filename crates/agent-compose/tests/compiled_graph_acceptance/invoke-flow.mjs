@@ -16,7 +16,13 @@
 // a driver that dropped it would make a failed run's trace unreadable from a
 // test — the runs whose trace a test most wants to assert about.
 //
-// Usage: node invoke-flow.mjs <project> <flow> <inputs.json> <trace.json>
+// The session identity is passed too, because `runFlow` refuses a run whose flow
+// reaches a `scope: session` store without one (grammar 11.3) — the same rule
+// `agent-compose run --session` satisfies. A constant is enough here: what these
+// tests assert about a session-scoped store is that a write survives the
+// execution, which needs an identity rather than a particular one.
+//
+// Usage: node invoke-flow.mjs <project> <flow> <inputs.json> <trace.json> [session]
 // Output: the flow's outputs as one JSON object on stdout; the trace is written
 // to <trace.json>, so stdout stays exactly what `agent-compose run` prints.
 
@@ -25,7 +31,7 @@ import path from "node:path";
 import process from "node:process";
 import { pathToFileURL } from "node:url";
 
-const [, , project, flow, inputsPath, tracePath] = process.argv;
+const [, , project, flow, inputsPath, tracePath, session] = process.argv;
 if (project === undefined || flow === undefined || inputsPath === undefined) {
   throw new Error("usage: node invoke-flow.mjs <project> <flow> <inputs.json> [trace.json]");
 }
@@ -45,7 +51,7 @@ const { runFlow } = await import(pathToFileURL(path.resolve(project, "src/index.
 
 let run;
 try {
-  run = await runFlow(flow, inputs);
+  run = await runFlow(flow, inputs, session === undefined ? {} : { sessionKey: session });
 } catch (error) {
   if (tracePath !== undefined) {
     const trace = Array.isArray(error?.trace) ? error.trace : [];
