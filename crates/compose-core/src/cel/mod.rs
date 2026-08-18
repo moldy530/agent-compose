@@ -83,6 +83,42 @@ use std::sync::Arc;
 use ::cel::Program;
 use ::cel::common::ast::{Expr, IdedExpr, LiteralValue};
 
+/// The evaluation context this project's **Rust** column runs under.
+///
+/// Nothing in the compiler evaluates an expression (see *What is checked here,
+/// and what is not*), so the only consumer of this is the conformance corpus —
+/// which is precisely why it exists: the corpus is evidence that two
+/// implementations agree, and evidence is worthless if one of the two is
+/// configured differently from run to run. One context, built here, used by
+/// `tests/cel_conformance.rs` and by anything that later needs to evaluate.
+///
+/// It is [`Context::default`] plus **one standard overload the pinned crate
+/// does not carry**: `matches` in its global spelling. CEL's standard
+/// definitions give the predicate two overloads — `s.matches(p)` and
+/// `matches(s, p)` — grammar 4.1 puts the standard function set on the surface,
+/// and the compiler's front-end accepts both (the arity table below); `cel`
+/// 0.14.3 implements only the receiver form, which left one expression
+/// `validate` accepts and this project's own evaluator could not run. The
+/// registration is the crate's own implementation under the second name, so the
+/// two spellings cannot answer differently.
+///
+/// The **other** recorded gap is not closed here, because it cannot be: `size`
+/// over a string counts bytes in `cel` 0.14.3 and code points in the
+/// specification, and `add_function` does not override a built-in — the
+/// registry is consulted after the standard set. See
+/// `tests/fixtures/cel-conformance/README.md` for what follows from that, and
+/// `codegen::cel` for the ledger row.
+///
+/// # Panics
+///
+/// Never. The registration is infallible.
+#[must_use]
+pub fn evaluation_context() -> ::cel::Context<'static> {
+    let mut context = ::cel::Context::default();
+    context.add_function("matches", ::cel::functions::matches);
+    context
+}
+
 use crate::diag::DiagnosticCode;
 use crate::parse::reader::{list, suggest};
 
@@ -353,6 +389,116 @@ pub fn analyze(source: &str, scope: &Scope) -> Analysis {
         ty,
         reads: walk.reads,
         problems: walk.problems,
+    }
+}
+
+/// The pattern one `matches()` call is given (grammar 4.1).
+///
+/// The distinction is the whole point: a pattern written down is one a compiler
+/// can read and decide about, and a computed one is not. See
+/// [`matches_patterns`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MatchesPattern {
+    /// A string literal: `state.draft.matches('^a[0-9]$')`.
+    Literal(String),
+    /// Anything else — a channel, a concatenation, a conditional.
+    Computed,
+}
+
+/// Every `matches()` pattern this expression carries, outermost call first.
+///
+/// `matches` is the one construct on grammar 4.1's surface that takes a
+/// **regular expression** as data, which makes its argument a second little
+/// language inside the first — and the two implementations of *that* language
+/// are not the two of CEL. The CEL specification defines the predicate over
+/// RE2; the evaluator a compiled router embeds has only JavaScript's `RegExp`,
+/// and RE2 is not a syntactic subset of it (see
+/// [`crate::codegen::pattern`], which decides the same question for
+/// `pattern:`). So a pattern has to be *read* before a project is emitted, and
+/// reading it starts with getting it out of the expression.
+///
+/// Nothing here judges a pattern: this answers what the calls were given, and
+/// [`crate::codegen::diagnostics`] is what refuses over the answer — the same
+/// split `pattern:` already has, because "is it RE2" is the specification's
+/// question and "does *this target* hold it" is the target's.
+///
+/// Both standard spellings are read (`s.matches(p)` and `matches(s, p)`), and
+/// the walk reaches inside comprehensions, so a `matches` under an `exists` is
+/// not missed. A call whose arity is neither form contributes nothing: the
+/// front-end has already refused it ([`analyze`]), and there is no argument to
+/// call the pattern.
+#[must_use]
+pub fn matches_patterns(source: &str) -> Vec<MatchesPattern> {
+    let mut found = Vec::new();
+    // A call is spelled with its name, so an expression whose text does not
+    // carry it has none — and that is nearly every expression a composition
+    // writes. Deciding it without a parse keeps the target check's cost
+    // proportional to the `matches()` a spec actually has.
+    if !source.contains("matches") {
+        return found;
+    }
+    // The same two bounds [`analyze`] refuses past, for the same reason: this
+    // walk recurses once per level too, and an expression it would exhaust the
+    // stack on is one the validator has already reported.
+    let shape = shape(source);
+    if shape.nesting > MAX_NESTING || shape.operations > MAX_OPERATIONS {
+        return found;
+    }
+    let Ok(program) = Program::compile(source) else {
+        return found;
+    };
+    patterns_in(program.expression(), &mut found);
+    found
+}
+
+/// The walk [`matches_patterns`] is, over every sub-expression.
+fn patterns_in(expr: &IdedExpr, found: &mut Vec<MatchesPattern>) {
+    match &expr.expr {
+        Expr::Unspecified | Expr::Literal(_) | Expr::Ident(_) => {}
+        Expr::Select(select) => patterns_in(&select.operand, found),
+        Expr::List(elements) => {
+            for element in &elements.elements {
+                patterns_in(element, found);
+            }
+        }
+        Expr::Map(entries) => {
+            for entry in &entries.entries {
+                if let ::cel::common::ast::EntryExpr::MapEntry(entry) = &entry.expr {
+                    patterns_in(&entry.key, found);
+                    patterns_in(&entry.value, found);
+                }
+            }
+        }
+        Expr::Struct(_) => {}
+        Expr::Call(call) => {
+            if call.func_name.as_str() == "matches" {
+                // `s.matches(p)` puts the subject in `target`; `matches(s, p)`
+                // puts it in the first argument. Either way the pattern is the
+                // last one, and either way there is exactly one other operand.
+                let operands = usize::from(call.target.is_some()) + call.args.len();
+                if operands == 2 {
+                    found.push(match &call.args.last().expect("two operands").expr {
+                        Expr::Literal(LiteralValue::String(text)) => {
+                            MatchesPattern::Literal(text.inner().to_string())
+                        }
+                        _ => MatchesPattern::Computed,
+                    });
+                }
+            }
+            if let Some(target) = &call.target {
+                patterns_in(target, found);
+            }
+            for argument in &call.args {
+                patterns_in(argument, found);
+            }
+        }
+        Expr::Comprehension(comprehension) => {
+            patterns_in(&comprehension.iter_range, found);
+            patterns_in(&comprehension.accu_init, found);
+            patterns_in(&comprehension.loop_cond, found);
+            patterns_in(&comprehension.loop_step, found);
+            patterns_in(&comprehension.result, found);
+        }
     }
 }
 
@@ -1883,6 +2029,75 @@ mod tests {
                 .map(Read::spelling)
                 .collect::<Vec<_>>(),
             ["find.matches[…]"]
+        );
+    }
+
+    /// Both standard spellings, and the difference the target check turns on.
+    #[test]
+    fn a_matches_pattern_is_read_out_of_either_spelling() {
+        assert_eq!(
+            matches_patterns("state.draft.matches('^a[0-9]$')"),
+            [MatchesPattern::Literal("^a[0-9]$".to_string())]
+        );
+        assert_eq!(
+            matches_patterns("matches(state.draft, '^a[0-9]$')"),
+            [MatchesPattern::Literal("^a[0-9]$".to_string())]
+        );
+        // A pattern that is not written down is the other answer, whether it is
+        // a channel, a concatenation, or a conditional.
+        for source in [
+            "state.draft.matches(state.needle)",
+            "state.draft.matches('^' + state.needle)",
+            "state.draft.matches(state.strict ? '^a$' : 'a')",
+        ] {
+            assert_eq!(
+                matches_patterns(source),
+                [MatchesPattern::Computed],
+                "{source}"
+            );
+        }
+    }
+
+    /// Every call, in declaration order, however deeply the expression buries
+    /// them — a walk that stopped at the first would leave the second shipping.
+    #[test]
+    fn every_matches_call_of_an_expression_is_read_including_inside_a_macro() {
+        assert_eq!(
+            matches_patterns(
+                "state.draft.matches('^a$') || matches(state.note, 'b') && state.x.matches(state.p)"
+            ),
+            [
+                MatchesPattern::Literal("^a$".to_string()),
+                MatchesPattern::Literal("b".to_string()),
+                MatchesPattern::Computed,
+            ]
+        );
+        // A comprehension is expanded by the parser into a loop whose step
+        // holds the predicate, so reaching it means walking the expansion.
+        assert_eq!(
+            matches_patterns("state.items.exists(i, i.matches('^x'))"),
+            [MatchesPattern::Literal("^x".to_string())]
+        );
+        // Nothing to find is the common answer, and it is not an error.
+        assert!(matches_patterns("size(state.items) > 0").is_empty());
+    }
+
+    /// An expression the front-end refuses contributes no pattern rather than a
+    /// wrong one — there is nothing to report against a source that does not
+    /// parse, and [`analyze`] has already reported it.
+    #[test]
+    fn an_unreadable_expression_yields_no_patterns() {
+        assert!(matches_patterns("state.draft.matches(").is_empty());
+        // A call wearing the name in neither standard arity is a form the
+        // front-end refuses; there is no argument to call the pattern.
+        assert!(matches_patterns("matches(state.draft)").is_empty());
+        assert!(
+            matches_patterns(&format!(
+                "{}'x'.matches('a'){}",
+                "(".repeat(20),
+                ")".repeat(20)
+            ))
+            .is_empty()
         );
     }
 }

@@ -1,10 +1,12 @@
 //! The generated-code checks of CLAUDE.md's *Validation strategy*, run against
 //! the **real** pinned JavaScript toolchain.
 //!
-//! Seven gates. The first four are in increasing strength, each one existing
+//! Eleven gates. The first four are in increasing strength, each one existing
 //! because the one above it passes on code the one below it catches; the next two
-//! are about the schemas rather than the graph; the last is about a composition
-//! that has no generated project at all:
+//! are about the schemas rather than the graph; the seventh is about a
+//! composition that has no generated project at all; and the last four are
+//! about what a binding does on the wire, which no amount of type-checking or
+//! graph construction reaches:
 //!
 //! 1. **`tsc --noEmit`** — every golden project type-checks under its own strict
 //!    `tsconfig.json`, against installed `@langchain/langgraph`, `@langchain/core`
@@ -37,13 +39,12 @@
 //!    so a difference is something a reader signed off on rather than something
 //!    a thin corpus failed to notice.
 //! 6. **What a provider would be handed** — `@langchain/core`'s own converter is
-//!    run over the emitted schemas, because PRD 5.2 delivers an output schema
-//!    through `withStructuredOutput` and that mechanism sends JSON Schema rather
-//!    than the Zod it was given. The conversion drops every check spelled
-//!    `.refine`, so the contract a model is constrained by is weaker than the
-//!    parse that follows it — see `codegen::schema`'s *What a provider is handed*.
-//!    Gate 5 is what makes the two columns agree; this is what says which of them
-//!    a model actually sees.
+//!    run over the emitted schemas, because `withStructuredOutput` sends JSON
+//!    Schema rather than the Zod it was given, and the conversion drops every
+//!    check spelled `.refine`. That is why PRD 9.16 sends the compiler's own
+//!    lowering instead, and this gate measures the road not taken — see
+//!    `codegen::schema`'s *What a provider is handed*. Gate 5 is what makes the
+//!    two columns agree; this is what says why a model is shown the one it is.
 //! 7. **The refusal's evidence** — `compose_core::codegen::diagnostics` refuses to
 //!    build a composition whose `state:` names a channel after a property every
 //!    JavaScript object carries (`constructor`). That refusal is an
@@ -53,6 +54,28 @@
 //!    it — and asks Node for `Object.getOwnPropertyNames(Object.prototype)`, so
 //!    the Rust-side list is checked against the object model rather than against
 //!    a memory of it.
+//! 8. **What a raw binding binds** — the single string-typed property of a
+//!    `tool.*` takes *trimmed* raw stdout from an `exec:` implementation and the
+//!    raw response text from an `http:` one, which is grammar 6.1 stating one
+//!    exception once per surface with one word different between them. Both are
+//!    driven out of a golden's own runtime, over a payload with whitespace at
+//!    either end, so which reading this compiler took is a committed fact rather
+//!    than an accident of a shared decoder.
+//! 9. **A command that never reads its input** — grammar 8.2 writes a scalar
+//!    `input:` to the child's stdin, and `printf` exits without draining it. The
+//!    EPIPE that follows arrives as an `error` *event*, outside the promise the
+//!    node's own error policy is built on, so an unhandled one aborts the whole
+//!    process rather than failing the node. Nothing about a returned value is
+//!    wrong there — no value is returned — which is why it is a gate and not an
+//!    assertion.
+//! 10. **A declared `Content-Type`** — header names are case-insensitive
+//!     (grammar 6.1) and `fetch` composes its `Headers` by appending, so a
+//!     binding's own media type would ride out beside the runtime's instead of
+//!     replacing it. The server here is loopback and reports what it received.
+//! 11. **A bound input object on a `GET`** — the other half of the same
+//!     sentence: without `query:`/`body:`, the object goes out as query
+//!     parameters rather than as a body. Which slot codegen fills is a golden's
+//!     to commit; this is what the runtime does with what it was handed.
 //!
 //! # The toolchain fixture
 //!
@@ -227,8 +250,14 @@ fn every_generated_project_constructs_its_state_model() {
             .as_ref()
             .map(|state| state.entries.keys().cloned().collect())
             .unwrap_or_default();
-        // Grammar 10.4: `messages` is implicit, never declared, and always there.
+        // Two channels a composition never declares and every graph has:
+        // grammar 10.4's implicit conversation history, and the compiler's own
+        // `$run` — the flow input, the execution identity, the per-bounded-edge
+        // counters grammar 7.4 puts in graph state, and the routing trace
+        // (see `codegen::state`). Both are named here rather than filtered out,
+        // so a third one appearing is this test's failure rather than nobody's.
         declared.push("messages".to_string());
+        declared.push("$run".to_string());
         assert_eq!(
             channels, declared,
             "`{}`'s state model is not the composition's channel set",
@@ -463,8 +492,24 @@ fn the_emitted_state_model_reduces_the_way_its_policies_say() {
             entry.golden,
             String::from_utf8_lossy(&output.stderr),
         );
-        let answer: Value =
+        let mut answer: Value =
             serde_json::from_slice(&output.stdout).expect("the runner prints the state as JSON");
+        // The compiler's own channel is not what this gate is about: it holds no
+        // reduce policy an author wrote, and its own reducer is decided by
+        // `the_run_channel_folds_a_steps_contributions_in_canonical_order`
+        // below. What is asserted here is that it is *there* and starts empty,
+        // which is the one thing a wrong `default:` would break.
+        let run = answer
+            .as_object_mut()
+            .expect("the state is an object")
+            .remove("$run")
+            .expect("every state model carries the compiler's own channel");
+        assert_eq!(
+            run["step"], 0,
+            "nothing here runs a node, so no step is taken"
+        );
+        assert_eq!(run["trace"], serde_json::json!([]));
+        assert_eq!(run["iterations"], serde_json::json!({}));
         let expected: Value = serde_json::from_str(entry.expected).expect("the row is JSON");
         assert_eq!(
             answer, expected,
@@ -473,6 +518,275 @@ fn the_emitted_state_model_reduces_the_way_its_policies_say() {
             entry.golden
         );
     }
+}
+
+/// Gate 2d: the compiler's own channel folds a step's contributions in the
+/// canonical order, whatever order they arrive in (grammar 7.6.4).
+///
+/// Concurrent nodes of one step each write a piece of `$run`, and a reducer sees
+/// them one at a time in whatever order the scheduler finished them. Grammar
+/// 7.6.4 says completion order is never what decides the result, so the two
+/// orders below have to fold to the same channel — and the trace has to come out
+/// ordered by `(step, node)` rather than by arrival, or a replay would produce a
+/// plausible alternative to the live run's record instead of a reproduction of
+/// it.
+#[test]
+fn the_run_channel_folds_a_steps_contributions_in_canonical_order() {
+    let Some(root) = installed() else {
+        return;
+    };
+    let project = staged(goldens::golden("review-loop"), root, "run-channel");
+
+    // Two nodes completing in one step, plus a later step: the shape a fork
+    // produces. `review` finished first and `draft` second, which is the order
+    // the canonical one is *not*.
+    let arrived = r#"[
+        { "step": 1, "traversals": { "review": 1 },
+          "trace": [{ "step": 1, "node": "review", "outcome": "completed" }] },
+        { "step": 1, "traversals": { "draft": 1 }, "iterations": { "flow.f#2": 1 },
+          "trace": [{ "step": 1, "node": "draft", "outcome": "completed" }] },
+        { "step": 2, "traversals": { "merge": 1 },
+          "trace": [{ "step": 2, "node": "merge", "outcome": "completed" }] }
+    ]"#;
+    let reversed = r#"[
+        { "step": 1, "traversals": { "draft": 1 }, "iterations": { "flow.f#2": 1 },
+          "trace": [{ "step": 1, "node": "draft", "outcome": "completed" }] },
+        { "step": 1, "traversals": { "review": 1 },
+          "trace": [{ "step": 1, "node": "review", "outcome": "completed" }] },
+        { "step": 2, "traversals": { "merge": 1 },
+          "trace": [{ "step": 2, "node": "merge", "outcome": "completed" }] }
+    ]"#;
+
+    let fold = |contributions: &str, purpose: &str| -> Value {
+        let path = project.join(format!("run-{purpose}.json"));
+        fs::write(&path, contributions).expect("the scratch area is writable");
+        let output = Command::new("node")
+            .arg(root.join("run-channel.mjs"))
+            .arg(&project)
+            .arg(&path)
+            .output()
+            .expect("node runs");
+        assert!(
+            output.status.success(),
+            "the run channel did not fold:\n{}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        serde_json::from_slice(&output.stdout).expect("the runner prints the channel as JSON")
+    };
+
+    let folded = fold(arrived, "arrived");
+    assert_eq!(
+        folded,
+        fold(reversed, "reversed"),
+        "completion order decided the channel's value"
+    );
+
+    // The step is the larger of the two, the counters merged key-wise, and the
+    // trace is in `(step, node)` order rather than arrival order.
+    assert_eq!(folded["step"], 2);
+    assert_eq!(folded["iterations"]["flow.f#2"], 1);
+    assert_eq!(
+        folded["traversals"],
+        serde_json::json!({ "draft": 1, "merge": 1, "review": 1 })
+    );
+    let nodes: Vec<&str> = folded["trace"]
+        .as_array()
+        .expect("a trace")
+        .iter()
+        .map(|entry| entry["node"].as_str().expect("a node id"))
+        .collect();
+    assert_eq!(nodes, ["draft", "review", "merge"]);
+}
+
+/// Gate 2e: what the single string-typed property of a `tool.*` binds, on each
+/// of the two surfaces that can implement one (grammar 6.1).
+///
+/// The grammar states the exception once per binding and the two sentences
+/// differ by a word: `exec:` binds "trimmed raw stdout", `http:` binds "the raw
+/// response text". A shared decoder makes it easy for one reading to be applied
+/// to both by accident and for nobody to notice — trailing whitespace is a shell
+/// artefact on stdout, where a command that ends its output with a newline has
+/// said nothing by it, and payload in a response body, where every byte is what
+/// the server chose to send. So both are run, over one payload with whitespace
+/// at either end, and the difference is asserted rather than assumed.
+#[test]
+fn a_raw_binding_trims_stdout_and_takes_a_response_body_verbatim() {
+    let Some(root) = installed() else {
+        return;
+    };
+    let project = staged(goldens::golden("review-loop"), root, "raw-decoding");
+
+    let output = Command::new("node")
+        .arg(root.join("raw-decoding.mjs"))
+        .arg(&project)
+        .output()
+        .expect("node runs");
+    assert!(
+        output.status.success(),
+        "the raw-binding runner failed:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let answer: Value =
+        serde_json::from_slice(&output.stdout).expect("the runner prints one JSON object");
+
+    let sent = answer["sent"].as_str().expect("the payload it sent");
+    assert_ne!(
+        sent.trim(),
+        sent,
+        "the payload has to carry whitespace for either reading to be visible"
+    );
+    assert_eq!(
+        answer["exec"]["text"].as_str(),
+        Some(sent.trim()),
+        "an `exec` implementation binds trimmed raw stdout (grammar 6.1)"
+    );
+    assert_eq!(
+        answer["http"]["text"].as_str(),
+        Some(sent),
+        "an `http` implementation binds the raw response text — every byte of \
+         it, which is what its own sentence says"
+    );
+}
+
+/// Gate 2f: a command that never reads its input still completes.
+///
+/// Grammar 8.2 sends a scalar `input:` to the child's standard input, and no
+/// command is obliged to drain it. When one does not, the pipe closes under a
+/// write still in flight and Node reports EPIPE as an `error` **event on the
+/// stream** — outside the promise `runExec` settles, so grammar 9's policies
+/// cannot see it: unhandled, it aborts the process past `retry`, `timeout`,
+/// `skip` and `fallback` alike, past the `catch` that writes the run's trace
+/// (PRD 5.3), and under `serve` it would end every concurrent execution.
+///
+/// A gate rather than a unit test because the failure is a property of the
+/// **process**: nothing about the returned value is wrong, the returned value
+/// never arrives. And a payload larger than a pipe buffer rather than a
+/// convenient one, because a small write lands in the kernel's buffer and
+/// succeeds whether or not anybody reads it — which is exactly how this shipped.
+#[test]
+fn a_command_that_never_reads_its_input_still_completes() {
+    let Some(root) = installed() else {
+        return;
+    };
+    let project = staged(goldens::golden("review-loop"), root, "unread-stdin");
+
+    let output = Command::new("node")
+        .arg(root.join("unread-stdin.mjs"))
+        .arg(&project)
+        .output()
+        .expect("node runs");
+    assert!(
+        output.status.success(),
+        "writing to a command that does not read its input killed the process:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let answer: Value =
+        serde_json::from_slice(&output.stdout).expect("the runner prints one JSON object");
+
+    assert!(
+        answer["sent"].as_u64().is_some_and(|bytes| bytes > 65_536),
+        "the payload has to exceed a pipe buffer for the write to fail at all, \
+         found {} bytes",
+        answer["sent"]
+    );
+    assert_eq!(
+        answer["result"]["exit_code"], 0,
+        "the child's own exit code is the node's outcome: declining the input is \
+         not a failure (grammar 8.2)"
+    );
+    assert_eq!(
+        answer["result"]["stdout"], "done",
+        "and its output is what the node decodes"
+    );
+}
+
+/// Gate 2g: a declared `Content-Type` replaces the runtime's rather than joining
+/// it.
+///
+/// Header names are case-insensitive (grammar 6.1) and `fetch` is not: it builds
+/// its `Headers` by appending each key of the object it is handed, so
+/// `Content-Type` declared beside the `content-type` `runHttp` sends with a JSON
+/// body reaches the server as one field carrying **both** media types. An API
+/// that dispatches on it answers 415 to a composition that reads correctly.
+///
+/// Both directions are asserted, because a runtime that dropped the header
+/// handling altogether would pass the first half: the declared media type is
+/// what arrives when there is one, and `application/json` is what arrives when
+/// there is not.
+#[test]
+fn a_declared_content_type_replaces_the_one_the_runtime_would_have_sent() {
+    let Some(answer) = http_request_gate("declared-headers") else {
+        return;
+    };
+    assert_eq!(
+        answer["declared"]["header"].as_str(),
+        Some("application/vnd.acme+json"),
+        "a declared media type is the whole of the header the server sees"
+    );
+    assert_eq!(
+        answer["default"]["header"].as_str(),
+        Some("application/json"),
+        "and a binding that declares none still says what its body is"
+    );
+    for which in ["declared", "default"] {
+        assert_eq!(
+            answer[which]["body"].as_str(),
+            Some(r#"{"goal":"g"}"#),
+            "the body is the bound object either way"
+        );
+    }
+}
+
+/// Gate 2h: the object a `GET` binding sends becomes the URL's parameters.
+///
+/// The other half of grammar 6.1's convention for a request the block did not
+/// write out: the bound input object is the JSON body on a body-bearing method
+/// and the **query string** on `GET`/`HEAD`. Which of the two slots codegen
+/// fills is committed in the goldens; this is what the runtime does with the
+/// object it was handed — that it reaches the server as parameters at all, and
+/// that a value which is not a string is spelled rather than dropped.
+#[test]
+fn a_bound_input_object_reaches_a_get_as_its_query_string() {
+    let Some(answer) = http_request_gate("query-string") else {
+        return;
+    };
+    let url = answer["query"]["url"]
+        .as_str()
+        .expect("the URL it received");
+    let (path, query) = url.split_once('?').unwrap_or((url, ""));
+    assert_eq!(path, "/tickets", "the binding's own path is untouched");
+    let mut parameters: Vec<&str> = query.split('&').collect();
+    parameters.sort_unstable();
+    assert_eq!(
+        parameters,
+        ["limit=3", "term=a+widget"],
+        "every property of the bound object is a parameter, percent-encoded, \
+         and a number is spelled rather than dropped"
+    );
+    assert_eq!(
+        answer["query"]["body"].as_str(),
+        Some(""),
+        "and a `GET` sends no body (grammar 6.1)"
+    );
+}
+
+/// The runner both `http:` request gates read, run once per gate so each one
+/// fails on its own.
+fn http_request_gate(purpose: &str) -> Option<Value> {
+    let root = installed()?;
+    let project = staged(goldens::golden("review-loop"), root, purpose);
+
+    let output = Command::new("node")
+        .arg(root.join("http-request.mjs"))
+        .arg(&project)
+        .output()
+        .expect("node runs");
+    assert!(
+        output.status.success(),
+        "the `http:` request runner failed:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    Some(serde_json::from_slice(&output.stdout).expect("the runner prints one JSON object"))
 }
 
 /// Gate 7: the channel names the compiler refuses are names LangGraph refuses.
@@ -907,13 +1221,14 @@ const WEAKENINGS: &[Weakening] = &[
 /// which is the failure `codegen::schema` was written to prevent, pointed the
 /// other way.
 ///
-/// This gate does not fix that; the schema a node fn hands over is the next PR's
-/// emission, and *which* schema (a conversion of this Zod, or the lowering this
-/// compiler already publishes and the corpus proves equal to the parse) is a
-/// design question PRD 5.2 does not answer. What it does is keep the evidence
-/// current: the conversion is the library's own, the schemas are the committed
-/// goldens, and the day either half stops being true this fails and the question
-/// can be answered differently.
+/// That question — a conversion of this Zod, or the lowering this compiler
+/// already publishes and the corpus proves equal to the parse — is **answered**:
+/// PRD 9.16 takes the lowering, and `codegen::runtime`'s agent call sends it over
+/// `fetch` with no `withStructuredOutput` in the path. So this gate measures the
+/// road not taken, and that is the point of keeping it: the conversion is the
+/// library's own, the schemas are the committed goldens, and the day it stops
+/// dropping refinements this fails — which is exactly the revisit condition 9.16
+/// names.
 #[test]
 fn what_the_structured_output_mechanism_would_be_handed() {
     let golden = goldens::golden("every-schema-form");

@@ -112,26 +112,61 @@ use regex_syntax::ast::{
 
 use super::names;
 
-/// Why one `pattern:` cannot be lowered to a JavaScript regular expression.
+/// Why one regular expression cannot be lowered to a JavaScript one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Unsupported {
     /// The one-line statement, in diagnostic voice: lowercase, no trailing stop.
+    ///
+    /// It opens with [`SUBJECT`], the surface this walk was written for. A
+    /// caller reading it for another surface renames that with [`Self::about`]
+    /// rather than composing a second sentence around it.
     pub message: String,
     /// What to write instead.
     pub help: String,
 }
 
+/// The subject every [`Unsupported::message`] opens with.
+const SUBJECT: &str = "`pattern`";
+
 impl Unsupported {
     fn new(message: impl Into<String>, help: impl Into<String>) -> Self {
+        let message = message.into();
+        debug_assert!(
+            message.starts_with(SUBJECT),
+            "every refusal names its subject first so `about` can rename it: {message}"
+        );
         Self {
-            message: message.into(),
+            message,
             help: help.into(),
         }
     }
+
+    /// The same statement, about a different surface.
+    ///
+    /// Two surfaces reach this walk and only one of them is a `pattern:` key:
+    /// grammar 4.1's `matches()` takes a regular expression as an *argument*,
+    /// and gets the same verdict from the same table (see
+    /// [`super::diagnostics`]). Reasons are what this module owns; who they are
+    /// about is the caller's, so the subject is substituted at the point of
+    /// reading rather than carried in every constructor.
+    #[must_use]
+    pub fn about(&self, subject: &str) -> String {
+        self.message
+            .strip_prefix(SUBJECT)
+            .map_or_else(|| self.message.clone(), |rest| format!("{subject}{rest}"))
+    }
 }
 
-/// One `pattern:` as the JavaScript expression the emitter writes, or the reason
-/// it has none.
+/// One regular expression as the JavaScript expression the emitter writes, or
+/// the reason it has none.
+///
+/// Two surfaces call this: `pattern:` (through [`super::diagnostics`]) and
+/// grammar 4.1's `matches()`, whose argument is a regular expression reached
+/// through an expression instead of a schema. The **whether it is RE2 at all**
+/// half below is reachable only from the second, because `parse::schema`'s
+/// `is_re2` refuses a `pattern:` that is not one before an artifact exists — so
+/// the help says "a regular expression here" rather than naming a key that the
+/// caller may not have.
 ///
 /// # Errors
 ///
@@ -144,7 +179,8 @@ pub fn javascript(pattern: &str) -> Result<String, Unsupported> {
                 "`pattern` is not a valid regular expression: {}",
                 error.kind()
             ),
-            "`pattern:` is RE2 — no backreferences and no lookaround (grammar 3.3, Decision D12)",
+            "a regular expression here is RE2 — no backreferences and no lookaround (grammar 3.3, \
+             Decision D12)",
         )
     })?;
     representable(&ast)?;
@@ -513,6 +549,45 @@ mod tests {
             refused("[]-]").help.contains("[\\]-]"),
             "the help writes the spelling that transfers"
         );
+    }
+
+    /// Every refusal names its subject first, so the second surface that reads
+    /// this table can rename it rather than compose a sentence around it.
+    ///
+    /// The renaming is what lets `matches()` share one table with `pattern:`
+    /// (see [`super::diagnostics`]); a message that opened some other way would
+    /// come out of `about` unchanged and read as though it were about a
+    /// `pattern:` key that the composition does not have.
+    #[test]
+    fn every_refusal_names_its_subject_first_and_can_be_told_to_name_another() {
+        for pattern in [
+            "(?i)^abc$",
+            "(?P<word>[a-z]+)",
+            "^[]-]$",
+            "^[a[b]]$",
+            "\\Aabc\\z",
+            "\\p{Greek}+",
+            "[[:alpha:]]+",
+            "(unclosed",
+            "(?<=a)b",
+            "(a)\\1",
+        ] {
+            let refusal = refused(pattern);
+            assert!(
+                refusal.message.starts_with(SUBJECT),
+                "`{pattern}` is refused with a message `about` cannot rename: {refusal:?}"
+            );
+            let renamed = refusal.about("this guard's pattern");
+            assert!(
+                renamed.starts_with("this guard's pattern "),
+                "`{pattern}`: {renamed}"
+            );
+            assert_eq!(
+                renamed.len(),
+                refusal.message.len() - SUBJECT.len() + "this guard's pattern".len(),
+                "`about` substitutes the subject rather than editing the reason"
+            );
+        }
     }
 
     #[test]

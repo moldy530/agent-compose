@@ -1,0 +1,129 @@
+# M1 acceptance fixture: the two Chat Completions kinds `agent-openai` does not
+# reach.
+#
+# Grammar 12.1 gives four of its six provider kinds an HTTP surface, and three of
+# those speak Chat Completions. `agent-openai` covers `openai_compatible`; the
+# other two differ from it **only** on the wire, which is exactly the kind of
+# difference a graph-level assertion cannot see:
+#
+#   * `azure_openai` — the credential is `api-key:` rather than
+#     `authorization: Bearer`, the route is `/openai/v1/chat/completions` rather
+#     than `/v1/chat/completions`, and `api_version:` rides the query string
+#     (`crates/mock-provider/WIRE-NOTES.md` §7);
+#   * `openai` — a bearer token like `openai_compatible`, plus the `organization:`
+#     of grammar 12.1's row, which reaches the wire as `openai-organization:`.
+#
+# Without this fixture those four branches are emitted and never run: every other
+# fixture binds `anthropic` or `openai_compatible`. The mock is strict about each
+# of them — an Azure request that authenticates the direct way is answered 401 —
+# so a regression in any one is caught here or nowhere.
+#
+# One flow per kind rather than one flow with two nodes: what is being decided is
+# a single request's shape, and a flow whose second agent replays the first one's
+# exchange would put the conversation channel between the assertion and its
+# subject.
+version: "0.1"
+
+state:
+  verdict:
+    enum: [approve, revise]
+    default: approve
+  feedback:
+    type: string
+    default: ""
+  summary:
+    type: string
+    default: ""
+
+provider.azure:
+  kind: azure_openai
+  # Grammar 12.1's row for this kind requires all three: there is no default
+  # endpoint for a per-resource Azure deployment, and no default api-version.
+  base_url: ${MOCK_BASE_URL}
+  api_key: ${MOCK_API_KEY}
+  api_version: "2024-10-21"
+
+provider.direct:
+  kind: openai
+  api_key: ${MOCK_API_KEY}
+  # Optional on this kind — the runtime defaults to `https://api.openai.com` —
+  # and supplied here for the same reason every other fixture supplies it: a run
+  # in CI reaches the mock and nothing else.
+  base_url: ${MOCK_BASE_URL}
+  organization: org-acceptance
+
+model.hosted:
+  provider: provider.azure
+  id: gpt-4o-mini
+  settings:
+    temperature: 0.1
+
+model.direct:
+  provider: provider.direct
+  id: gpt-4o
+  settings:
+    temperature: 0.3
+
+agent.reviewer:
+  description: Reviews a goal and returns a routable verdict.
+  model: model.hosted
+  prompt: |
+    You are a meticulous technical reviewer.
+  input:
+    goal:
+      type: string
+  output:
+    verdict:
+      enum: [approve, revise]
+    feedback:
+      type: string
+
+agent.summarizer:
+  description: Summarizes a review in one line.
+  model: model.direct
+  prompt: |
+    You summarize reviews in one line.
+  input:
+    notes:
+      type: string
+  output:
+    summary:
+      type: string
+
+flow.azure:
+  description: "One agent node whose provider is `kind: azure_openai`."
+  inputs:
+    goal:
+      type: string
+      min_length: 1
+  outputs:
+    verdict:
+      enum: [approve, revise]
+    feedback:
+      type: string
+  nodes:
+    review:
+      agent: agent.reviewer
+      input:
+        goal: "input.goal"
+  edges:
+    - { from: start, to: review }
+    - { from: review, to: end }
+
+flow.direct:
+  description: "One agent node whose provider is `kind: openai`."
+  inputs:
+    notes:
+      type: string
+      min_length: 1
+  outputs:
+    summary:
+      type: string
+  nodes:
+    summarize:
+      agent: agent.summarizer
+      input:
+        notes: "input.notes"
+  edges:
+    - { from: start, to: summarize }
+    - { from: summarize, to: end }

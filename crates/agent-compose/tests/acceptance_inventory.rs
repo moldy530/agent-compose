@@ -96,15 +96,20 @@ const CODEGEN: &[Criterion] = &[
                 "a_tagged_union_output_is_emitted_as_a_discriminated_union_narrowed_per_variant",
                 Status::Live,
             ),
+            // What a reducer is *called in*: concurrent writers of one step land
+            // in ascending node-id order, which grammar 7.6.4 clause 1 fixes and
+            // the scheduler supplies.
+            (
+                "concurrent_writers_append_in_node_id_order_not_completion_order",
+                Status::Live,
+            ),
             (
                 "state_channels_carry_their_declared_types_and_defaults",
-                Status::Pending("pending: `agent-compose run` must execute the emitted graph"),
+                Status::Live,
             ),
             (
                 "a_tagged_union_output_is_narrowed_per_variant_and_a_bad_tag_is_rejected",
-                Status::Pending(
-                    "pending: an agent node fn must parse its answer with the emitted union schema",
-                ),
+                Status::Pending("pending: codegen must emit subgraphs"),
             ),
         ],
     },
@@ -114,36 +119,153 @@ const CODEGEN: &[Criterion] = &[
         tests: &[
             (
                 "an_agent_node_sends_its_prompt_input_and_output_schema",
-                Status::Pending("pending: codegen must emit agent node fns"),
+                Status::Live,
             ),
             // The same criterion on the other HTTP surface. Three of grammar
             // 12.1's six provider kinds reach Chat Completions, so a node fn
             // that only works on Messages is half a node fn.
             (
                 "an_agent_node_sends_its_prompt_input_and_output_schema_on_chat_completions",
-                Status::Pending("pending: codegen must emit agent node fns"),
+                Status::Live,
+            ),
+            // What that surface's structured output cannot promise, and what it
+            // still does: an `optional:` property costs `strict`, and the parse
+            // is what holds the answer to the contract instead
+            // (`codegen::runtime`'s divergence ledger).
+            (
+                "a_nested_optional_property_costs_the_strict_decoder_and_not_the_parse",
+                Status::Live,
+            ),
+            // The other two of those three kinds. `azure_openai` and `openai`
+            // differ from `openai_compatible` only in the request — auth header,
+            // route, `api-version` query, `openai-organization` — so a node fn
+            // that compiles them wrong is invisible to every assertion about
+            // what a flow produced.
+            (
+                "each_chat_completions_kind_authenticates_and_routes_the_way_its_row_says",
+                Status::Live,
+            ),
+            // The other thing that surface can answer with: a refusal, which
+            // carries its reason and is otherwise indistinguishable from a
+            // `max_tokens` cut.
+            (
+                "a_refused_answer_carries_the_reason_the_model_gave",
+                Status::Live,
             ),
             (
                 "an_agent_node_bounds_its_tool_loop_at_max_tool_iterations",
-                Status::Pending("pending: codegen must emit the agent tool loop"),
+                Status::Live,
+            ),
+            // What an agent node leaves behind for the next one: the implicit
+            // `messages` channel of grammar 10.4 (PRD 5.7 tier 3), which is
+            // state no composition declares and only the wire makes visible.
+            (
+                "an_agent_nodes_exchange_reaches_the_next_agent_nodes_request",
+                Status::Live,
+            ),
+            // What the loop puts *back* on the wire: the model's own content
+            // blocks, and — for an answer that carried none — a node error about
+            // the answer rather than a request no surface accepts.
+            (
+                "a_loop_answer_is_replayed_verbatim_and_an_empty_one_stops_the_node",
+                Status::Live,
+            ),
+            // The other three kinds this milestone executes, which are not the
+            // model's: an inline `exec:`, an inline `http:`, and a `function:`
+            // over a `tool.*` (grammar 8.2, 8.3, 8.4).
+            (
+                "the_deterministic_node_kinds_run_and_decode_their_results",
+                Status::Live,
+            ),
+            // The escape hatch of grammar 6.1, and the registration it costs.
+            (
+                "a_host_registered_function_runs_and_an_unregistered_one_says_so",
+                Status::Live,
+            ),
+            // How those two inline kinds are *parameterised*: `input:` bindings
+            // as the child's environment, a scalar one on its stdin, and the two
+            // widened accepted-outcome lists that make a failure routable data
+            // (grammar 8.2, 8.3, Decisions D84, D88).
+            (
+                "an_inline_nodes_parameters_reach_the_process_and_the_wire",
+                Status::Live,
             ),
         ],
     },
     Criterion {
         bullet: Bullet::Codegen,
         phrase: "routers with embedded CEL",
-        tests: &[(
-            "an_edge_guard_routes_on_the_source_nodes_structured_output",
-            Status::Pending("pending: codegen must emit routers with embedded CEL"),
-        )],
+        tests: &[
+            (
+                "an_edge_guard_routes_on_the_source_nodes_structured_output",
+                Status::Live,
+            ),
+            // The two rules of grammar 7.3 an enum guard alone does not reach:
+            // multicast with a per-step join, and what a `skip` changes about
+            // the routing algorithm (rule 6, Decision D97).
+            (
+                "a_multicast_fork_fires_every_true_edge_and_the_convergence_runs_once",
+                Status::Live,
+            ),
+            (
+                "a_skipped_node_routes_through_its_else_edge_and_writes_nothing",
+                Status::Live,
+            ),
+            // A guard on an edge leaving `start`, which grammar 7.2 admits and
+            // which has no node to be evaluated at.
+            ("a_guarded_start_edge_decides_the_first_step", Status::Live),
+            // *When* a guard is evaluated, which decides what it can see: its own
+            // node's writes and not a concurrent sibling's (grammar 7.6 P1, read
+            // per node — see `codegen::graph`'s ledger row).
+            (
+                "a_guard_sees_its_own_writes_and_not_a_concurrent_siblings",
+                Status::Live,
+            ),
+            // Where a routing decision *goes*: the trace PRD 5.3 asks for,
+            // including on the runs that fail — and the router's own failure,
+            // grammar 7.3 rule 7, which no static check can reach.
+            (
+                "a_failed_runs_trace_holds_what_landed_and_the_node_it_stopped_at",
+                Status::Live,
+            ),
+            // The other end of the same record: a run that quiesced, so its
+            // trace is complete, and then could not materialize an output
+            // (grammar 7.6.3, 10.1). The trace has to survive that too.
+            (
+                "a_run_that_quiesces_without_an_output_fails_carrying_its_whole_trace",
+                Status::Live,
+            ),
+        ],
     },
     Criterion {
         bullet: Bullet::Codegen,
         phrase: "bounded cycles",
-        tests: &[(
-            "a_bounded_cycle_leaves_through_its_escape_edge_when_the_budget_is_spent",
-            Status::Pending("pending: codegen must emit the per-cycle iteration counter"),
-        )],
+        tests: &[
+            (
+                "a_bounded_cycle_leaves_through_its_escape_edge_when_the_budget_is_spent",
+                Status::Live,
+            ),
+            // The same cycle in the *documented* project rather than a fixture,
+            // with an agent carrying `tools:` inside the loop and a `model.*`
+            // route bound to its first member — the two things `bounded-cycle`
+            // cannot reach.
+            (
+                "the_review_loop_example_runs_its_cycle_against_the_mock_provider",
+                Status::Live,
+            ),
+            // Grammar 7.4's *other* clause, which PRD 5.4 accepts and which is
+            // not a static termination proof: a cycle whose only bound is a CEL
+            // exit condition runs as long as its guard says, and the superstep
+            // ceiling is what catches the one whose guard never goes false.
+            (
+                "a_cel_bounded_cycle_runs_the_passes_its_guard_asks_for",
+                Status::Live,
+            ),
+            (
+                "a_run_that_reaches_the_superstep_ceiling_says_which_bound_was_missing",
+                Status::Live,
+            ),
+        ],
     },
     Criterion {
         bullet: Bullet::Codegen,
@@ -177,11 +299,33 @@ const CODEGEN: &[Criterion] = &[
         tests: &[
             (
                 "a_node_retries_its_model_call_per_its_declared_policy",
-                Status::Pending("pending: codegen must emit retry policy"),
+                Status::Live,
             ),
             (
                 "a_node_timeout_fires_and_its_error_policy_takes_over",
-                Status::Pending("pending: codegen must emit timeout policy"),
+                Status::Live,
+            ),
+            // The same budget over a child process, and the third `on_error`
+            // strategy: a fallback replaces the node's own edges (D21).
+            (
+                "a_node_timeout_fires_over_a_child_process_and_its_fallback_takes_over",
+                Status::Live,
+            ),
+            // …and over the one activity the runtime does not control: a
+            // grammar 6.1 host function that never looks at `context.signal`.
+            // The other two observe the abort because the runtime spawns and
+            // fetches for them, so only this one decides that the deadline is
+            // raced rather than merely signalled.
+            (
+                "a_node_timeout_fires_over_a_host_function_that_ignores_its_signal",
+                Status::Live,
+            ),
+            // The criterion's boundary: which errors a policy governs at all.
+            // An unset-channel read fails the *execution* (grammar 10.1, D78),
+            // and neither `skip` nor a `fallback:` absorbs it.
+            (
+                "reading_an_unset_channel_fails_the_run_whatever_the_error_policy_says",
+                Status::Live,
             ),
         ],
     },
@@ -234,7 +378,7 @@ const CODEGEN: &[Criterion] = &[
         phrase: "env-ref presence checks at process start",
         tests: &[(
             "a_missing_env_ref_fails_at_process_start_naming_the_variable",
-            Status::Pending("pending: `agent-compose run` must execute the emitted graph"),
+            Status::Live,
         )],
     },
 ];
@@ -360,7 +504,7 @@ const STRATEGY: &[Criterion] = &[
         // topology yet, so "constructs its graph" is not yet a claim to make.
         tests: &[(
             "every_generated_project_type_checks_and_constructs_its_graph",
-            Status::Pending("pending: codegen must assemble the flows into `src/graph.ts`"),
+            Status::Live,
         )],
     },
     Criterion {
@@ -368,7 +512,7 @@ const STRATEGY: &[Criterion] = &[
         phrase: "shared fixtures (expression + input + expected result) executed against both the Rust validator's interpreter and the JS evaluator embedded in generated code",
         tests: &[(
             "the_generated_cel_evaluator_agrees_with_the_validator_on_the_conformance_corpus",
-            Status::Pending("pending: generated routers must embed a JS CEL evaluator"),
+            Status::Live,
         )],
     },
 ];
@@ -719,7 +863,7 @@ fn every_bullet_contributes_criteria() {
 /// Every acceptance fixture the suite names is a project on disk.
 #[test]
 fn every_acceptance_fixture_exists() {
-    let projects = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/projects/m1");
+    let projects = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/projects/execution");
     let mut found: Vec<String> = fs::read_dir(&projects)
         .expect("the acceptance fixture corpus exists")
         .filter_map(|entry| entry.ok())

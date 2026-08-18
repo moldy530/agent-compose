@@ -85,6 +85,10 @@ use serde_json::{Value, json};
 const SONNET: &str = "claude-sonnet-4-6";
 const HAIKU: &str = "claude-haiku-4-5";
 const LOCAL: &str = "qwen3-coder-30b";
+/// The `provider-kinds` fixture's two models: one per Chat Completions kind that
+/// is neither `openai_compatible` nor already bound elsewhere.
+const AZURE_HOSTED: &str = "gpt-4o-mini";
+const OPENAI_DIRECT: &str = "gpt-4o";
 
 // ---------------------------------------------------------------------------
 // PRD §7 M1, bullet 3 — "Mock provider server + e2e harness". Live.
@@ -637,10 +641,8 @@ fn a_tagged_union_output_is_emitted_as_a_discriminated_union_narrowed_per_varian
 /// `build` now emits that state model, and `compose-core`'s
 /// `tests/generated_code_gates.rs` constructs it under the pinned LangGraph on
 /// every `cargo test`. What this test adds is the half only a run can show — that
-/// the declared defaults are what a flow *returns* — so its reason names the
-/// command it waits on rather than the emission that has landed.
+/// the declared defaults are what a flow *returns*.
 #[test]
-#[ignore = "pending: `agent-compose run` must execute the emitted graph"]
 fn state_channels_carry_their_declared_types_and_defaults() {
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue(Script::new(
@@ -648,12 +650,14 @@ fn state_channels_carry_their_declared_types_and_defaults() {
         Outcome::structured(json!({ "verdict": "revise", "feedback": "tighten it" })),
     ));
 
-    let run = harness::run(
+    let Some(run) = harness::invoke(
         "agent-anthropic",
         "flow.review",
         &[("goal", "ship it"), ("draft", "a draft")],
         &provider,
-    );
+    ) else {
+        return;
+    };
     run.succeeded();
 
     // Written by name from the agent's output (grammar 8.0, 10.3), and read back
@@ -680,11 +684,13 @@ fn state_channels_carry_their_declared_types_and_defaults() {
 /// The `z.discriminatedUnion` this needs is emitted, and `compose-core`'s
 /// `tests/generated_code_gates.rs` runs a corpus through it that includes this
 /// very refusal — a tag the union does not declare, rejected by both the emitted
-/// Zod and the JSON Schema the same lowering produces. What is left is the node
-/// function that parses a model's answer with it, which is what makes the
-/// refusal a *run* failure naming the tag.
+/// Zod and the JSON Schema the same lowering produces. An agent node fn now
+/// parses its answer with the emitted schema, which is what turns that refusal
+/// into a run failure; what is left is the *fixture's* first node, a `flow:`
+/// instantiation of `flow.normalize`, so this run cannot reach `classify` until
+/// subgraphs do.
 #[test]
-#[ignore = "pending: an agent node fn must parse its answer with the emitted union schema"]
+#[ignore = "pending: codegen must emit subgraphs"]
 fn a_tagged_union_output_is_narrowed_per_variant_and_a_bad_tag_is_rejected() {
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue_all([
@@ -727,7 +733,6 @@ fn a_tagged_union_output_is_narrowed_per_variant_and_a_bad_tag_is_rejected() {
 /// output tool and leave another one callable, so no single test can assert
 /// both.
 #[test]
-#[ignore = "pending: codegen must emit agent node fns"]
 fn an_agent_node_sends_its_prompt_input_and_output_schema() {
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue(Script::new(
@@ -735,12 +740,14 @@ fn an_agent_node_sends_its_prompt_input_and_output_schema() {
         Outcome::structured(json!({ "verdict": "revise", "feedback": "tighten it" })),
     ));
 
-    let run = harness::run(
+    let Some(run) = harness::invoke(
         "agent-anthropic",
         "flow.review",
         &[("goal", "ship it"), ("draft", "a draft")],
         &provider,
-    );
+    ) else {
+        return;
+    };
     run.succeeded();
 
     let recorded = provider.requests();
@@ -790,7 +797,6 @@ fn an_agent_node_sends_its_prompt_input_and_output_schema() {
 /// codegen bug that no Messages-API test can see, and three of grammar 12.1's
 /// six kinds reach this surface.
 #[test]
-#[ignore = "pending: codegen must emit agent node fns"]
 fn an_agent_node_sends_its_prompt_input_and_output_schema_on_chat_completions() {
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue(Script::new(
@@ -798,12 +804,14 @@ fn an_agent_node_sends_its_prompt_input_and_output_schema_on_chat_completions() 
         Outcome::structured(json!({ "verdict": "revise", "feedback": "tighten it" })),
     ));
 
-    let run = harness::run(
+    let Some(run) = harness::invoke(
         "agent-openai",
         "flow.review",
         &[("goal", "ship it"), ("draft", "a draft")],
         &provider,
-    );
+    ) else {
+        return;
+    };
     run.succeeded();
 
     let recorded = provider.requests();
@@ -856,6 +864,475 @@ fn an_agent_node_sends_its_prompt_input_and_output_schema_on_chat_completions() 
     assert!(provider.snapshot().is_drained());
 }
 
+/// What an `optional:` property costs on this surface, and what it does not.
+///
+/// OpenAI's structured-output decoder closes a schema only when every object in
+/// it lists every property in `required`, so an agent whose output nests an
+/// object with `optional:` is sent `strict: false` — the model is *not*
+/// constrained by the schema its answer is then parsed with, which is the one
+/// property PRD 9.16 calls load-bearing. `codegen::runtime`'s
+/// `strict-is-refused-by-an-optional-property` row is where that is signed off
+/// on, with the three alternatives and why each is worse; this is the test the
+/// row names, and it pins both halves of it.
+///
+/// The second half is what keeps the degradation bounded. An unconstrained model
+/// can answer something the schema does not admit — here a `meta` carrying a
+/// property nothing declared, which a closed decoder could not have produced —
+/// and the emitted Zod is what refuses it. The contract moves from the decoder
+/// to the parse; it does not stop being enforced.
+#[test]
+fn a_nested_optional_property_costs_the_strict_decoder_and_not_the_parse() {
+    let provider = MockProvider::start().expect("a loopback port");
+    // `owner` omitted — the property whose being `optional:` is what costs the
+    // strict decoder, answered the way the author said it may be.
+    provider.enqueue(Script::new(
+        LOCAL,
+        Outcome::structured(json!({ "verdict": "revise", "meta": { "severity": "high" } })),
+    ));
+
+    let Some(run) = harness::invoke(
+        "agent-openai",
+        "flow.triage",
+        &[("report", "the build is red")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(run.outputs()["meta"], json!({ "severity": "high" }));
+
+    let recorded = provider.requests();
+    assert_eq!(recorded.len(), 1);
+    let call = &recorded[0];
+    assert!(call.is_valid(), "{:?}", call.failures());
+    let Some(StructuredOutput::JsonSchema { schema, strict, .. }) = call.structured_output.as_ref()
+    else {
+        panic!(
+            "this surface asks with `response_format` (WIRE-NOTES (3)): {:?}",
+            call.structured_output
+        );
+    };
+    assert_eq!(
+        schema["properties"]["meta"]["required"],
+        json!(["severity"]),
+        "the schema on the wire is the whole one, `optional:` included"
+    );
+    assert!(
+        !*strict,
+        "…and a schema with a property outside `required` is one OpenAI's decoder \
+         cannot be asked to close (`strict-is-refused-by-an-optional-property`)"
+    );
+
+    // The other half of the row. The model was unconstrained, so it can answer
+    // what the schema does not admit — and the emitted Zod is what refuses it,
+    // before any edge is evaluated (PRD 5.2).
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        LOCAL,
+        Outcome::structured(json!({
+            "verdict": "revise",
+            "meta": { "severity": "high", "assignee": "nobody" },
+        })),
+    ));
+    let unconstrained = harness::invoke(
+        "agent-openai",
+        "flow.triage",
+        &[("report", "the build is red")],
+        &provider,
+    )
+    .expect("the toolchain was there a moment ago");
+    let failure = unconstrained.failed();
+    assert!(
+        failure.contains("triage"),
+        "the node whose answer did not parse is named: {failure}"
+    );
+    assert!(
+        failure.contains("assignee"),
+        "…and so is the property the schema does not declare: {failure}"
+    );
+}
+
+/// The two Chat Completions kinds the fixture above does not reach, each
+/// authenticating and routing the way grammar 12.1's row for it says.
+///
+/// `openai_compatible` is one of three kinds that speak this surface, and the
+/// other two differ from it *only* in the request — which is precisely the
+/// difference an outputs assertion cannot see, and precisely what codegen can
+/// get wrong. `azure_openai` sends the credential as `api-key:` (a request that
+/// authenticates the direct way is answered 401 by the mock, as
+/// `an_azure_request_without_a_subscription_key_is_refused` pins), reaches
+/// `/openai/v1/chat/completions`, and carries `api_version:` in the query;
+/// `kind: openai` sends a bearer token and the `organization:` of its own row as
+/// `openai-organization:`. Four runtime branches, emitted-but-unrun until here.
+///
+/// This is the same argument
+/// `an_agent_node_sends_its_prompt_input_and_output_schema_on_chat_completions`
+/// makes for itself, one level down: a kind that never runs a compiled graph is
+/// a kind whose regression ships green.
+#[test]
+fn each_chat_completions_kind_authenticates_and_routes_the_way_its_row_says() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(
+            AZURE_HOSTED,
+            Outcome::structured(json!({ "verdict": "revise", "feedback": "tighten it" })),
+        ),
+        Script::new(
+            OPENAI_DIRECT,
+            Outcome::structured(json!({ "summary": "the reviewer asked for one change" })),
+        ),
+    ]);
+
+    let Some(azure) = harness::invoke(
+        "provider-kinds",
+        "flow.azure",
+        &[("goal", "ship it")],
+        &provider,
+    ) else {
+        return;
+    };
+    azure.succeeded();
+    assert_eq!(azure.outputs()["verdict"], "revise");
+
+    let direct = harness::invoke(
+        "provider-kinds",
+        "flow.direct",
+        &[("notes", "tighten it")],
+        &provider,
+    )
+    .expect("the toolchain was there a moment ago");
+    direct.succeeded();
+    assert_eq!(
+        direct.outputs()["summary"],
+        "the reviewer asked for one change"
+    );
+
+    let recorded = provider.requests();
+    assert_eq!(recorded.len(), 2, "one agent node each");
+
+    let hosted = &recorded[0];
+    assert!(hosted.is_valid(), "{:?}", hosted.failures());
+    assert_eq!(hosted.surface, Surface::AzureOpenAi);
+    assert_eq!(hosted.model, AZURE_HOSTED);
+    assert_eq!(
+        hosted.path, "/openai/v1/chat/completions",
+        "`azure_openai` has its own route (WIRE-NOTES §7)"
+    );
+    assert_eq!(
+        hosted.query, "api-version=2024-10-21",
+        "…and its `api_version:` rides the query string"
+    );
+    assert_eq!(
+        hosted.headers["api-key"], "mock-provider-key",
+        "…and the credential is a subscription key, not a bearer token"
+    );
+    assert!(
+        !hosted.headers.contains_key("authorization"),
+        "the direct spelling is not sent beside it: {:?}",
+        hosted.headers
+    );
+
+    let plain = &recorded[1];
+    assert!(plain.is_valid(), "{:?}", plain.failures());
+    assert_eq!(plain.surface, Surface::OpenAi);
+    assert_eq!(plain.model, OPENAI_DIRECT);
+    assert_eq!(plain.path, "/v1/chat/completions");
+    assert_eq!(plain.query, "", "`api-version` belongs to Azure alone");
+    assert_eq!(plain.headers["authorization"], "Bearer mock-provider-key");
+    assert_eq!(
+        plain.headers["openai-organization"], "org-acceptance",
+        "the optional `organization:` of grammar 12.1's `openai` row"
+    );
+    assert!(
+        !plain.headers.contains_key("api-key"),
+        "…and not the Azure spelling: {:?}",
+        plain.headers
+    );
+    assert!(provider.snapshot().is_drained());
+}
+
+/// A model that declines to answer says why, and the node error repeats it.
+///
+/// Chat Completions states a refusal as `content: null` beside a `refusal`
+/// string (`WIRE-NOTES.md` (3)). Every branch of the reader sees the same thing
+/// as an answer cut short by `max_tokens` — no structured output — so a node
+/// error built from the absence alone is true and useless: it cannot tell an
+/// author whose model refused from one whose budget ran out, and those have
+/// opposite fixes.
+///
+/// The refusal is served with [`Outcome::raw`] because it is exactly what the
+/// scripted shapes will not compose: a reply the *generated code* must reject.
+#[test]
+fn a_refused_answer_carries_the_reason_the_model_gave() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        LOCAL,
+        Outcome::raw(
+            200,
+            json!({
+                "id": "chatcmpl_refusal",
+                "object": "chat.completion",
+                "created": 1_735_689_600,
+                "model": LOCAL,
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "refusal": "I can't help with that request.",
+                    },
+                    "finish_reason": "stop",
+                }],
+                "usage": { "prompt_tokens": 12, "completion_tokens": 8, "total_tokens": 20 },
+            }),
+        ),
+    ));
+
+    let Some(run) = harness::invoke(
+        "agent-openai",
+        "flow.review",
+        &[("goal", "ship it"), ("draft", "a draft")],
+        &provider,
+    ) else {
+        return;
+    };
+    let failure = run.failed();
+    assert!(
+        failure.contains("I can't help with that request."),
+        "the node error repeats the reason the surface stated: {failure}"
+    );
+    assert!(
+        failure.contains("agent.reviewer"),
+        "…and names the agent that asked: {failure}"
+    );
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "an agent with no tools makes exactly one call, and a refusal ends it"
+    );
+}
+
+/// The conversation crosses from one agent node to the next: what the first was
+/// asked, what it answered, then what the second was asked (grammar 10.4, PRD
+/// 5.7 tier 3).
+///
+/// The implicit `messages` channel is state no composition declares and every
+/// agent node writes, so the only place it is visible is the wire: the second
+/// node's request is the first node's exchange plus its own turn. Strict
+/// alternation is the property that makes it *sendable* — an assistant turn is
+/// followed by a user turn, never by another assistant turn — and it is why the
+/// intra-agent tool loop's own turns stay out of the channel: an assistant turn
+/// carrying `tool_use` blocks is well formed only when the very next turn
+/// answers every one of them, which a later node's input never does.
+#[test]
+fn an_agent_nodes_exchange_reaches_the_next_agent_nodes_request() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "verdict": "revise", "feedback": "tighten it" })),
+        ),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "verdict": "approve", "feedback": "tightened" })),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke(
+        "agent-anthropic",
+        "flow.pair",
+        &[("goal", "ship it"), ("draft", "a draft")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+
+    let recorded = provider.requests();
+    assert_eq!(recorded.len(), 2);
+    assert!(recorded.iter().all(RecordedRequest::is_valid));
+    assert_eq!(
+        recorded[0].body()["messages"].as_array().map(Vec::len),
+        Some(1),
+        "the first node opens the conversation: {}",
+        recorded[0].body()["messages"]
+    );
+
+    let messages = recorded[1].body()["messages"].clone();
+    assert_eq!(
+        messages.as_array().map(Vec::len),
+        Some(3),
+        "the second node is called with the first node's exchange and its own \
+         turn, and with nothing else: {messages}"
+    );
+    assert_eq!(messages[0]["role"], "user");
+    assert_eq!(
+        messages[0]["content"], "{\"goal\":\"ship it\",\"draft\":\"a draft\"}",
+        "what the first node was asked, verbatim"
+    );
+    assert_eq!(messages[1]["role"], "assistant");
+    assert_eq!(
+        messages[1]["content"][0]["type"], "text",
+        "and what it answered, as one text block: {}",
+        messages[1]
+    );
+    let answered: Value = messages[1]["content"][0]["text"]
+        .as_str()
+        .and_then(|text| serde_json::from_str(text).ok())
+        .unwrap_or_else(|| panic!("the assistant turn carries its answer: {}", messages[1]));
+    assert_eq!(
+        answered,
+        json!({ "verdict": "revise", "feedback": "tighten it" }),
+        "the structured answer is what crosses, not the tool call that carried \
+         it: {}",
+        messages[1]
+    );
+    assert_eq!(messages[2]["role"], "user");
+    assert_eq!(
+        messages[2]["content"], "{\"goal\":\"ship it\",\"draft\":\"tighten it\"}",
+        "then the second node's own input, which read the channel the first \
+         wrote: {messages}"
+    );
+    assert_eq!(run.outputs()["verdict"], "approve");
+    assert!(provider.snapshot().is_drained());
+}
+
+/// A loop answer is replayed as the model sent it, and an answer that carried
+/// nothing stops the node instead of becoming a turn no provider accepts.
+///
+/// Both halves are about the same line of the tool loop — the assistant turn it
+/// pushes before deciding what to do next — and both are only observable one
+/// call later, in the request that carries the replayed turn:
+///
+///   * a `thinking` block is content the Messages API sends whenever a model
+///     declares `settings: { thinking: … }` and requires back **unaltered**
+///     beside the `tool_use` blocks it preceded, so a loop that rebuilt the turn
+///     from the text and the tool calls it read would drop it;
+///   * an answer cut short at `max_tokens` can carry no content at all, and the
+///     turn built from one is `{"role": "assistant", "content": []}` — which the
+///     Messages API refuses, and which `crates/mock-provider` refuses in its
+///     place here, so sending it would report the model's empty answer as a
+///     provider 400 about the wrong request.
+///
+/// `Outcome::raw` is what scripts both: they are answers a *provider* sends and
+/// the scripted reply shapes are the ones a test asks for by name, so the body
+/// is written out here rather than derived.
+#[test]
+fn a_loop_answer_is_replayed_verbatim_and_an_empty_one_stops_the_node() {
+    let thinking = json!({
+        "type": "thinking",
+        "thinking": "The goal needs one fact.",
+        "signature": "c2lnbmF0dXJl",
+    });
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::raw(
+                200,
+                json!({
+                    "id": "msg_thinking",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": SONNET,
+                    "content": [
+                        thinking,
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_lookup",
+                            "name": "lookup",
+                            "input": { "query": "a fact" },
+                        },
+                    ],
+                    "stop_reason": "tool_use",
+                    "stop_sequence": null,
+                    "usage": { "input_tokens": 12, "output_tokens": 34 },
+                }),
+            ),
+        ),
+        Script::new(SONNET, Outcome::text("found it")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "feedback": "a looked-up snippet" })),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke(
+        "agent-anthropic",
+        "flow.research",
+        &[("goal", "ship it")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+
+    let recorded = provider.requests();
+    assert_eq!(recorded.len(), 3, "two loop calls, then the pinned one");
+    assert!(
+        recorded.iter().all(RecordedRequest::is_valid),
+        "every request is one the Messages API would accept: {:?}",
+        recorded
+            .iter()
+            .map(RecordedRequest::failures)
+            .collect::<Vec<_>>()
+    );
+    let replayed = recorded[1].body()["messages"][1].clone();
+    assert_eq!(replayed["role"], "assistant");
+    assert_eq!(
+        replayed["content"][0], thinking,
+        "the model's own blocks go back unaltered, thinking first: {replayed}"
+    );
+    assert_eq!(
+        replayed["content"][1]["type"], "tool_use",
+        "…with the call it ended on: {replayed}"
+    );
+    assert_eq!(
+        replayed["content"].as_array().map(Vec::len),
+        Some(2),
+        "…and nothing invented beside them: {replayed}"
+    );
+
+    // The same node, answered with nothing at all.
+    let empty = MockProvider::start().expect("a loopback port");
+    empty.enqueue(Script::new(
+        SONNET,
+        Outcome::raw(
+            200,
+            json!({
+                "id": "msg_empty",
+                "type": "message",
+                "role": "assistant",
+                "model": SONNET,
+                "content": [],
+                "stop_reason": "max_tokens",
+                "stop_sequence": null,
+                "usage": { "input_tokens": 12, "output_tokens": 4096 },
+            }),
+        ),
+    ));
+
+    let cut = harness::invoke(
+        "agent-anthropic",
+        "flow.research",
+        &[("goal", "ship it")],
+        &empty,
+    )
+    .expect("the toolchain was there a moment ago");
+    let failure = cut.failed();
+    assert!(
+        failure.contains("no content") && failure.contains("max_tokens"),
+        "the node fails about the answer it got, naming why it was empty: \
+         {failure}"
+    );
+    assert_eq!(
+        empty.requests().len(),
+        1,
+        "and no second request was sent: a turn with nothing in it never \
+         reached the wire"
+    );
+}
+
 /// The intra-agent tool loop runs the tool, feeds the result back, and stops at
 /// `max_tool_iterations` rather than looping forever.
 ///
@@ -865,7 +1342,6 @@ fn an_agent_node_sends_its_prompt_input_and_output_schema_on_chat_completions() 
 /// makes the bound a runtime default rather than a declared one, and rewrites
 /// this test's fixture and its first assertion, not its subject.
 #[test]
-#[ignore = "pending: codegen must emit the agent tool loop"]
 fn an_agent_node_bounds_its_tool_loop_at_max_tool_iterations() {
     let provider = MockProvider::start().expect("a loopback port");
     // `agent.researcher` declares `max_tool_iterations: 2`, so a model that only
@@ -878,12 +1354,14 @@ fn an_agent_node_bounds_its_tool_loop_at_max_tool_iterations() {
         .times(8),
     );
 
-    let run = harness::run(
+    let Some(run) = harness::invoke(
         "agent-anthropic",
         "flow.research",
         &[("goal", "ship it")],
         &provider,
-    );
+    ) else {
+        return;
+    };
     let failure = run.failed();
     assert!(
         failure.contains("max_tool_iterations") || failure.contains("tool"),
@@ -910,6 +1388,612 @@ fn an_agent_node_bounds_its_tool_loop_at_max_tool_iterations() {
     assert_eq!(
         second[2]["content"][0]["type"], "tool_result",
         "the tool's result leads the turn that answers it"
+    );
+}
+
+/// The three deterministic node kinds run, and each reads its result the way its
+/// own surface says (grammar 8.2, 8.3, 8.4, 6.1).
+///
+/// One run over `flow.pipeline`, because the claim is about a graph rather than
+/// about three constructs in isolation: an inline `http:` node whose envelope
+/// `status` and decoded body field arrive together (Decision D56), an inline
+/// `exec:` node whose result *is* the process envelope, and a `function:` node
+/// over a `tool.*` whose single string-typed property takes raw stdout — the
+/// `tool.*`-surface exception of grammar 6.1 that Decision D91 withholds from
+/// inline nodes.
+#[test]
+fn the_deterministic_node_kinds_run_and_decode_their_results() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "verdict": "fast", "note": "a note" })),
+    ));
+
+    let Some(run) = harness::invoke(
+        "activities",
+        "flow.pipeline",
+        &[("goal", "ship it")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    let outputs = run.outputs();
+
+    // The `http:` node reached a real server — the mock's own control plane — and
+    // its result carries both halves: `status` from the response envelope, and
+    // `requests` decoded out of the JSON body.
+    assert_eq!(outputs["status"], json!(200));
+    // The `exec:` node's `stdout` is the envelope field, appended to a reduced
+    // channel one element per write (grammar 10.2, Decision D58).
+    assert_eq!(outputs["checks"], json!(["merged"]));
+    // `publish` wrote last; `check`'s raw-stdout binding is what it overwrote,
+    // and the run visited it.
+    assert_eq!(outputs["report"], "published");
+    assert!(
+        run.visited().contains(&"check".to_string()),
+        "the `function:` node ran: {:?}",
+        run.visited()
+    );
+    assert_eq!(provider.requests().len(), 1, "one agent, one call");
+}
+
+/// The `function:` binding is the escape hatch, and what it costs is a
+/// registration the host has to make (grammar 6.1, PRD 5.5).
+///
+/// Both halves, because either alone would be a claim about the other: an
+/// unregistered function fails the run by name and says how to fix it, and a
+/// registered one is called with arguments already parsed against the tool's own
+/// declared `input:` — the checked signature grammar 8.4 asks for.
+#[test]
+fn a_host_registered_function_runs_and_an_unregistered_one_says_so() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let environment = harness::environment(&provider);
+
+    let Some(unregistered) =
+        harness::invoke_with("activities", "flow.hosted", &json!({}), &environment)
+    else {
+        return;
+    };
+    let failure = unregistered.failed();
+    assert!(
+        failure.contains("rank_candidates"),
+        "the failure names the registration that is missing: {failure}"
+    );
+    assert!(
+        failure.contains("registerFunction"),
+        "…and how to supply it: {failure}"
+    );
+
+    let registered = harness::invoke_hosted(
+        "activities",
+        "flow.hosted",
+        &json!({}),
+        &environment,
+        Some(
+            r#"import { registerFunction } from "./src/runtime.ts";
+registerFunction("rank_candidates", (args) => ({ ranked: `ranked: ${args.text}` }));
+"#,
+        ),
+    )
+    .expect("the toolchain was there a moment ago");
+    registered.succeeded();
+    assert_eq!(
+        registered.outputs()["report"],
+        "ranked: candidates",
+        "the host's answer reached the channel the node's `writes:` names"
+    );
+}
+
+/// Two edges of one fork both fire, and the node they meet at runs **once**
+/// (grammar 7.3 rule 6, 7.6 P1/P2).
+#[test]
+fn a_multicast_fork_fires_every_true_edge_and_the_convergence_runs_once() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "verdict": "fast", "note": "a note" })),
+    ));
+
+    let Some(run) = harness::invoke(
+        "activities",
+        "flow.pipeline",
+        &[("goal", "ship it")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+
+    let plan = run.entries("plan");
+    assert_eq!(
+        plan[0]["routing"]["targets"],
+        json!(["probe", "check"]),
+        "both guards were true, so both edges fired (grammar 7.3 rule 6)"
+    );
+    assert_eq!(
+        plan[0]["routing"]["edges"][2]["taken"],
+        json!(false),
+        "…and the `else:` edge did not, because a guarded sibling was taken"
+    );
+
+    // P2: `merge` is targeted by two edges taken in one step and runs once.
+    let visited = run.visited();
+    assert_eq!(
+        visited.iter().filter(|node| *node == "merge").count(),
+        1,
+        "the convergence ran once: {visited:?}"
+    );
+    // …in the step after both of its predecessors, which is P1: a node's edges
+    // are evaluated only after it has completed.
+    let step = |node: &str| run.entries(node)[0]["step"].as_i64().expect("a step");
+    assert_eq!(
+        step("probe"),
+        step("check"),
+        "the two branches are one step"
+    );
+    assert_eq!(step("merge"), step("probe") + 1);
+}
+
+/// A guard on an edge leaving `start` decides the first step, over the roots
+/// grammar 4.1 gives it (`start` has no output).
+#[test]
+fn a_guarded_start_edge_decides_the_first_step() {
+    let provider = MockProvider::start().expect("a loopback port");
+    for (pick, expected) in [(true, "left"), (false, "right")] {
+        let Some(run) = harness::invoke_with(
+            "activities",
+            "flow.entry",
+            &json!({ "pick": pick }),
+            &harness::environment(&provider),
+        ) else {
+            return;
+        };
+        run.succeeded();
+        assert_eq!(run.outputs()["report"], expected);
+        assert_eq!(
+            run.visited(),
+            ["$start", expected],
+            "the guards are evaluated at a node, because `start` is not one"
+        );
+    }
+}
+
+/// An inline node's parameters reach the process and the wire the way grammar
+/// 8.2 and 8.3 say, including the two widenings that turn a failure into data.
+///
+/// Four claims one run decides, each of which a regression would ship green
+/// because the shapes are all *probed* elsewhere and none was asserted:
+///
+/// 1. **`input:` → environment** (grammar 8.2). The bindings are the object
+///    handed to the child as environment variables, upper-snake-cased on the
+///    way in, and the block's own `env:` writes into that same environment. The
+///    child prints both, so a wrong spelling is a wrong string rather than a
+///    silent empty one.
+/// 2. **scalar `input:` → stdin** (grammar 8.0's table, Decision D88). `cat`
+///    prints what was written there and nothing else.
+/// 3. **widened `expect_exit`** (Decision D84). `false` exits 1, which the
+///    default `[0]` makes a node error; widened, it completes and its
+///    `exit_code` is what an edge guard routes on.
+/// 4. **widened `expect_status`** (D84 again, on the response side). The mock
+///    404s an unrouted path, which the default (any 2xx) makes a node error;
+///    widened, it is a status the node records.
+#[test]
+fn an_inline_nodes_parameters_reach_the_process_and_the_wire() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let Some(run) = harness::invoke(
+        "activities",
+        "flow.plumbing",
+        &[("goal", "ship-it")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    let outputs = run.outputs();
+
+    // 1: `goal:` arrived as `$GOAL`, and the block's `env:` as `$SUFFIX`.
+    assert_eq!(
+        outputs["report"], "ship-it/from-env",
+        "an `input:` binding is upper-snake-cased into the child's environment, \
+         beside the block's own `env:` (grammar 8.2)"
+    );
+    // 2: the scalar binding was the child's stdin, and nothing else was.
+    assert_eq!(
+        outputs["checks"],
+        json!(["ship-it/from-stdin"]),
+        "a scalar `input:` goes on stdin (Decision D88)"
+    );
+    // 3: the run reached `absent` at all, which only the widened `expect_exit`
+    // allows — under the default, `tolerated` is a node error and `on_error:
+    // fail` aborts before any of this.
+    let tolerated = run.entries("tolerated");
+    assert_eq!(tolerated[0]["outcome"], "completed");
+    assert_eq!(
+        tolerated[0]["routing"]["edges"][0]["value"],
+        json!(true),
+        "`exit_code == 1` is routable data because `expect_exit` was widened \
+         (grammar 8.2, Decision D84)"
+    );
+    assert_eq!(tolerated[0]["routing"]["targets"], json!(["absent"]));
+    // 4: a 404 recorded rather than raised.
+    assert_eq!(
+        outputs["status"],
+        json!(404),
+        "a status inside a widened `expect_status` completes the node (grammar 8.3)"
+    );
+    assert_eq!(run.entries("absent")[0]["outcome"], "completed");
+}
+
+/// A guard sees its own node's writes and **not** a concurrent sibling's.
+///
+/// Grammar 7.6 says both of these and they are in tension: P1 is per node ("a
+/// node's outgoing edges are evaluated only after **that node** has completed"),
+/// while the *Steps* paragraph above it evaluates a step's edges after every
+/// node of the step has written. Routing here is part of the node's own task,
+/// which is P1's reading, so `bravo`'s guard over `state.beacon` is `false`
+/// while `alpha` — running in the same step — is writing `lit` to it.
+///
+/// This test **pins that reading** rather than endorsing it: it is a reachable
+/// routing choice, and a document that does not say which answer is right is
+/// what makes it a choice. See `codegen::graph`'s note beside the emitted
+/// router; the clarification request goes to the grammar's owner.
+///
+/// The second guard is the half that has to keep working either way: a node's
+/// own writes **are** visible to its own guards, through their channels' reduce
+/// policies.
+#[test]
+fn a_guard_sees_its_own_writes_and_not_a_concurrent_siblings() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let Some(run) = harness::invoke_with(
+        "activities",
+        "flow.visibility",
+        &json!({}),
+        &harness::environment(&provider),
+    ) else {
+        return;
+    };
+    run.succeeded();
+
+    // Both branches ran, in one step: that is what makes the question askable.
+    let step = |node: &str| run.entries(node)[0]["step"].as_i64().expect("a step");
+    assert_eq!(
+        step("alpha"),
+        step("bravo"),
+        "the fork's branches are one step"
+    );
+
+    let bravo = run.entries("bravo");
+    let edges = &bravo[0]["routing"]["edges"];
+    assert_eq!(
+        edges[0]["value"],
+        json!(false),
+        "`alpha` wrote `beacon` in this same step and `bravo`'s guard does not \
+         see it (grammar 7.6 P1, read per node)"
+    );
+    assert_eq!(
+        edges[1]["value"],
+        json!(true),
+        "`bravo`'s own write is visible to `bravo`'s own guard"
+    );
+    assert_eq!(bravo[0]["routing"]["targets"], json!(["mine"]));
+    assert_eq!(
+        run.outputs()["checks"],
+        json!(["mine"]),
+        "only the own-write branch ran"
+    );
+    // …and `alpha` really did write it, so the `false` above is about *when* the
+    // write is visible rather than about whether it happened.
+    assert_eq!(run.entries("alpha")[0]["writes"], json!(["beacon"]));
+}
+
+/// Concurrent writers of one `append` channel land in ascending node-id order,
+/// whatever order they complete or are declared in (grammar 7.6.4 clause 1).
+///
+/// The ordering is inherited from the scheduler rather than imposed by anything
+/// this compiler emits, which is exactly why it needs an assertion: a pinned
+/// LangGraph bump that changed task ordering would silently reorder every
+/// `append` channel a fork writes, with a green suite.
+///
+/// The fixture makes every other order disagree. `alpha` sorts **first** by node
+/// id, is declared **last** among the flow's nodes *and* last among the fork's
+/// edges, and finishes **last** (it sleeps 300ms); `zulu` sorts last, is
+/// declared first in both positions, and finishes first. Only clause 1 puts
+/// `alpha` at the head of the result.
+///
+/// The node-declaration axis is the one the emitted code actually rides on and
+/// the one a fixture is likeliest to leave untested: `codegen::graph` calls
+/// `.addNode` in declaration order, so a fixture declaring its writers in
+/// ascending id order would pass whether the scheduler ordered writes by node id
+/// or by registration. Declaring them in reverse is what tells the two apart.
+#[test]
+fn concurrent_writers_append_in_node_id_order_not_completion_order() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let Some(run) = harness::invoke_with(
+        "activities",
+        "flow.ordering",
+        &json!({}),
+        &harness::environment(&provider),
+    ) else {
+        return;
+    };
+    run.succeeded();
+    let step = |node: &str| run.entries(node)[0]["step"].as_i64().expect("a step");
+    assert_eq!(step("alpha"), step("zulu"), "both writers are one step");
+    assert_eq!(
+        run.outputs()["checks"],
+        json!(["alpha", "zulu"]),
+        "writers are ordered by ascending node id (grammar 7.6.4 clause 1), not \
+         by the order they completed or were declared in"
+    );
+}
+
+/// Reading a channel nothing has written fails the **execution**, and no
+/// `on_error:` strategy absorbs it (grammar 10.1, Decisions D78, D97, D110).
+///
+/// The two outcomes are distinct and D97 says so outright: `skip` exists to
+/// continue past a *node's* failure, and choosing `false` for a guard over a
+/// skipped node's output is what keeps it from being a synonym for `fail`. An
+/// unset-channel read is not a node's failure at all — no attempt was made, the
+/// activity never ran — so a `skip` that swallowed it would turn "fails the
+/// execution naming the channel and the reader" into a silent continue, and a
+/// `fallback:` would turn it into a route.
+///
+/// Both spellings of the read, because they take different paths through the
+/// emitted node function: `flow.unset` resolves the tool's argument **by name**
+/// from the channel of the same name (grammar 8.0 step 2), and
+/// `flow.unset_expression` writes the read out as CEL.
+///
+/// Each half asserts on the trace rather than on the absence of one. A failed
+/// run's trace holds the node it stopped at (PRD 5.3, see
+/// `a_failed_runs_trace_holds_what_landed_and_the_node_it_stopped_at`), so
+/// "`skip` did not swallow this" is the *presence* of a `failed` entry for the
+/// reader — which a run that had continued past it could not produce, and which
+/// an empty trace would not have distinguished from any other failure.
+#[test]
+fn reading_an_unset_channel_fails_the_run_whatever_the_error_policy_says() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let environment = harness::environment(&provider);
+
+    let Some(skipped) = harness::invoke_with("activities", "flow.unset", &json!({}), &environment)
+    else {
+        return;
+    };
+    let failure = skipped.failed();
+    assert!(
+        failure.contains("`pending`"),
+        "the failure names the channel (grammar 10.1): {failure}"
+    );
+    assert!(
+        failure.contains("is unset") && failure.contains("reads it"),
+        "…and the reader: {failure}"
+    );
+    let named = skipped.entries("named");
+    assert_eq!(
+        named.len(),
+        1,
+        "the reader is in the trace once: {:?}",
+        skipped.trace()
+    );
+    assert_eq!(
+        named[0]["outcome"], "failed",
+        "`on_error: skip` did not turn the execution failure into a skip: {}",
+        named[0]
+    );
+    assert!(
+        named[0]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("`pending`")),
+        "…and the entry says what stopped it: {}",
+        named[0]
+    );
+    assert!(
+        !skipped.visited().contains(&"after".to_string()),
+        "…so nothing continued past it: {:?}",
+        skipped.visited()
+    );
+
+    let bound = harness::invoke_with(
+        "activities",
+        "flow.unset_expression",
+        &json!({}),
+        &environment,
+    )
+    .expect("the toolchain was there a moment ago");
+    let failure = bound.failed();
+    assert!(
+        failure.contains("pending"),
+        "the expression's failure names what it could not read: {failure}"
+    );
+    let read = bound.entries("bound");
+    assert_eq!(
+        read.len(),
+        1,
+        "the reader is in the trace once: {:?}",
+        bound.trace()
+    );
+    assert_eq!(read[0]["outcome"], "failed", "{}", read[0]);
+    assert_eq!(
+        read[0]["fallback"],
+        Value::Null,
+        "a `fallback:` did not route around it either — the entry names none, \
+         and a fallback that had been taken would: {}",
+        read[0]
+    );
+    assert!(
+        !bound.visited().contains(&"rescue".to_string()),
+        "…and the fallback target never ran: {:?}",
+        bound.visited()
+    );
+}
+
+/// A run that quiesces and then cannot answer fails like every other run that
+/// cannot answer, carrying the trace it made (PRD 5.3, grammar 7.6.3, 10.1).
+///
+/// The same unset channel as the test above, read at the *other* place a run
+/// reads state. There, the read builds a node's input and the graph dies
+/// mid-run; here the graph runs to quiescence and the read is the one
+/// materializing the flow's `outputs:` — so this is the failure whose routing
+/// record is **complete**. Every step landed; the whole account of how the flow
+/// got somewhere it could not answer from is in hand at the moment it fails.
+///
+/// Which is why the failure has to be the same shape as the others. Every caller
+/// of `runFlow` — `agent-compose run`, the generated `serve` app, this suite's
+/// own driver — reads `FlowFailure.trace`, and a bare `Error` raised past that
+/// type reports an empty trace for exactly the run that has a full one.
+#[test]
+fn a_run_that_quiesces_without_an_output_fails_carrying_its_whole_trace() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let Some(run) = harness::invoke_with(
+        "activities",
+        "flow.missing_output",
+        &json!({}),
+        &harness::environment(&provider),
+    ) else {
+        return;
+    };
+    let failure = run.failed();
+    assert!(
+        failure.contains("FlowFailure"),
+        "it fails as a `FlowFailure` — the one type a caller reads a trace off: \
+         {failure}"
+    );
+    assert!(
+        failure.contains("`pending`") && failure.contains("output field `pending`"),
+        "…naming the channel and the reader (grammar 10.1, Decision D78): {failure}"
+    );
+
+    assert_eq!(
+        run.visited(),
+        ["pick", "other"],
+        "the whole run is in the trace, because the whole run happened"
+    );
+    let pick = run.entries("pick");
+    assert_eq!(pick[0]["outcome"], "completed");
+    assert_eq!(
+        pick[0]["routing"]["targets"],
+        json!(["other"]),
+        "the routing decision survives the failure, which is the point of \
+         raising one that carries a trace: {}",
+        pick[0]
+    );
+    assert_eq!(
+        run.entries("other")[0]["writes"],
+        json!(["checks"]),
+        "…and so does what the branch it took wrote — to a channel that is not \
+         the one the output field reads"
+    );
+}
+
+/// A run that fails still reports every routing decision it made (PRD 5.3).
+///
+/// The trace is the record of what a run did, and the runs it is most wanted for
+/// are the ones that did not finish. Nothing is checkpointed, so a graph
+/// invocation that throws takes the state — and the trace inside it — with it;
+/// what makes this assertable is that `runFlow` streams the run and keeps each
+/// superstep, and that a node which throws hands its own entry to the failure.
+///
+/// `flow.dead_end` is the shape that decides both halves at once: `pre` runs,
+/// writes and routes (the landed half), and `head` completes and then finds
+/// every outgoing edge untaken — grammar 7.3 rule 7, which is a run-time failure
+/// no static check can reach, and whose entry has to carry the guard values or
+/// nothing says why the run stopped.
+#[test]
+fn a_failed_runs_trace_holds_what_landed_and_the_node_it_stopped_at() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let Some(run) = harness::invoke_with(
+        "activities",
+        "flow.dead_end",
+        &json!({}),
+        &harness::environment(&provider),
+    ) else {
+        return;
+    };
+    let failure = run.failed();
+    assert!(
+        failure.contains("no viable route out of `head`"),
+        "the run says which node had nowhere to go (grammar 7.3 rule 7): {failure}"
+    );
+
+    assert_eq!(
+        run.visited(),
+        ["pre", "head"],
+        "both steps are in the trace: the one that landed, and the one that \
+         stopped the run"
+    );
+    let pre = run.entries("pre");
+    assert_eq!(pre[0]["outcome"], "completed");
+    assert_eq!(
+        pre[0]["writes"],
+        json!(["checks"]),
+        "what the landed step wrote survives the failure: {}",
+        pre[0]
+    );
+    assert_eq!(pre[0]["routing"]["targets"], json!(["head"]));
+
+    let head = run.entries("head");
+    assert_eq!(head[0]["outcome"], "failed");
+    assert_eq!(
+        head[0]["routing"]["edges"][0]["value"],
+        json!(false),
+        "the guard that answered `false` is what explains the failure, so the \
+         entry carries the decision rather than only the error: {}",
+        head[0]
+    );
+    assert_eq!(
+        head[0]["routing"]["targets"],
+        json!([]),
+        "…with no target, which is the failure itself: {}",
+        head[0]
+    );
+    assert_eq!(
+        head[0]["writes"],
+        Value::Null,
+        "the superstep a run dies in lands nothing, so its entry claims no \
+         writes: {}",
+        head[0]
+    );
+}
+
+/// A skipped node writes nothing, and the one thing that changes about its
+/// routing is the value of a guard over its own output (grammar 9.2, D97).
+#[test]
+fn a_skipped_node_routes_through_its_else_edge_and_writes_nothing() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "verdict": "fast", "note": "a note" })),
+    ));
+
+    let Some(run) = harness::invoke(
+        "activities",
+        "flow.pipeline",
+        &[("goal", "ship it")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+
+    // `tally` runs `false`, which exits 1 — outside the default `expect_exit:
+    // [0]` — so the node errors and its declared `on_error: skip` applies.
+    let tally = run.entries("tally");
+    assert_eq!(tally[0]["outcome"], "skipped");
+    assert_eq!(
+        tally[0]["writes"],
+        json!([]),
+        "a skipped node writes nothing (grammar 9.2)"
+    );
+    assert_eq!(
+        tally[0]["routing"]["edges"][0]["value"],
+        json!(false),
+        "its guard reads its own output, which is not there, so it is `false` \
+         rather than an error (Decision D97)"
+    );
+    assert_eq!(tally[0]["routing"]["targets"], json!(["publish"]));
+    assert!(
+        !run.visited().contains(&"rework".to_string()),
+        "the guarded branch was not taken"
     );
 }
 
@@ -957,8 +2041,13 @@ fn a_subgraph_runs_with_explicit_bindings_and_isolated_history() {
 
 /// An edge guard routes on the source node's structured output, deterministically
 /// (PRD 5.3).
+///
+/// The transition is the compiled router's and the value is the model's, which is
+/// PRD G4's whole claim: the same graph, the same guards, and the branch decided
+/// by a field the model filled in. The trace is asserted beside the outputs
+/// because PRD 5.3 asks for routing decisions to *be data* rather than to be
+/// inferred from what happened next.
 #[test]
-#[ignore = "pending: codegen must emit routers with embedded CEL"]
 fn an_edge_guard_routes_on_the_source_nodes_structured_output() {
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue_all([
@@ -966,20 +2055,22 @@ fn an_edge_guard_routes_on_the_source_nodes_structured_output() {
             SONNET,
             Outcome::structured(json!({ "draft": "the first draft" })),
         )
-        .matching("ship it"),
+        .matching("research writer"),
         Script::new(
             SONNET,
             Outcome::structured(json!({ "verdict": "approve", "feedback": "" })),
         )
-        .matching("the first draft"),
+        .matching("meticulous technical reviewer"),
     ]);
 
-    let run = harness::run(
+    let Some(run) = harness::invoke(
         "bounded-cycle",
         "flow.review_loop",
         &[("goal", "ship it")],
         &provider,
-    );
+    ) else {
+        return;
+    };
     run.succeeded();
 
     assert_eq!(
@@ -988,6 +2079,22 @@ fn an_edge_guard_routes_on_the_source_nodes_structured_output() {
         "`approve` takes the `else:` edge to `end`, so the writer never runs again"
     );
     assert_eq!(run.outputs()["draft"], "the first draft");
+    assert_eq!(run.visited(), ["write", "review"]);
+
+    // The decision, as data: the guarded back-edge was evaluated against the
+    // model's own field and came out false, and the `else:` edge fired because no
+    // guarded sibling was taken (grammar 7.3 rules 3 and 4).
+    let review = run.entries("review");
+    let routing = &review[0]["routing"];
+    assert_eq!(routing["targets"], json!(["__end__"]));
+    assert_eq!(
+        routing["edges"][0]["when"],
+        "review.output.verdict == 'revise'"
+    );
+    assert_eq!(routing["edges"][0]["value"], json!(false));
+    assert_eq!(routing["edges"][0]["taken"], json!(false));
+    assert_eq!(routing["edges"][1]["else"], json!(true));
+    assert_eq!(routing["edges"][1]["taken"], json!(true));
 }
 
 /// The JS evaluator generated routers embed agrees with the Rust one the
@@ -995,9 +2102,13 @@ fn an_edge_guard_routes_on_the_source_nodes_structured_output() {
 ///
 /// CLAUDE.md makes this a CI gate: two interpreters is a semantic-drift risk, and
 /// the corpus is the mitigation. The Rust side already runs in
-/// `crates/compose-core/tests/cel_conformance.rs`; this is the other half.
+/// `crates/compose-core/tests/cel_conformance.rs`; this is the other half, over
+/// the **same files**, run against the evaluator a
+/// built project embeds (`src/cel.ts`). The driver is committed beside this suite
+/// rather than written inline, because it carries a JSON reader that keeps `1`
+/// and `1.0` apart — the distinction the corpus's int64 cases exist to pin, and
+/// one `JSON.parse` throws away.
 #[test]
-#[ignore = "pending: generated routers must embed a JS CEL evaluator"]
 fn the_generated_cel_evaluator_agrees_with_the_validator_on_the_conformance_corpus() {
     let built = harness::build("bounded-cycle", "local");
     built.succeeded();
@@ -1006,39 +2117,13 @@ fn the_generated_cel_evaluator_agrees_with_the_validator_on_the_conformance_corp
         .parent()
         .expect("crates/")
         .join("compose-core/tests/fixtures/cel-conformance");
-    let driver = built.root().join("cel-conformance.mjs");
-    std::fs::write(
-        &driver,
-        r#"
-import { readdirSync, readFileSync } from "node:fs";
-import { evaluate } from "./cel.js";
-
-const corpus = process.argv[2];
-const divergences = [];
-for (const file of readdirSync(corpus).filter((name) => name.endsWith(".json"))) {
-  for (const testCase of JSON.parse(readFileSync(`${corpus}/${file}`, "utf8"))) {
-    if (testCase.error !== undefined) continue;
-    let actual;
-    try {
-      actual = evaluate(testCase.expression, testCase.input ?? {});
-    } catch (error) {
-      divergences.push({ name: testCase.name, threw: String(error) });
-      continue;
-    }
-    if (JSON.stringify(actual) !== JSON.stringify(testCase.result)) {
-      divergences.push({ name: testCase.name, expected: testCase.result, actual });
-    }
-  }
-}
-process.stdout.write(JSON.stringify(divergences));
-"#,
-    )
-    .expect("the driver is written into the generated project");
+    let driver = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/compiled_graph_acceptance/cel-conformance.mjs");
 
     let output = std::process::Command::new("node")
         .arg(&driver)
+        .arg(built.root())
         .arg(&corpus)
-        .current_dir(built.root())
         .output()
         .expect("node runs the generated evaluator");
     assert!(
@@ -1053,10 +2138,188 @@ process.stdout.write(JSON.stringify(divergences));
     );
 }
 
+/// `examples/review-loop` — the documented project, compiled and **run**.
+///
+/// Every other test here runs a fixture, and a fixture is written for the test.
+/// This one runs what a reader is shown: the same files `compose-core`'s golden
+/// corpus is emitted from, so the bytes under test are the committed golden's.
+/// Two things it carries that no fixture does:
+///
+/// * `agent.researcher` declares `tools:` **inside the cycle**, so every pass of
+///   the loop is a tool-loop call followed by the pinned structured one — the
+///   interaction between grammar 7.4's budget and grammar 5's intra-agent loop,
+///   which the `bounded-cycle` fixture's tool-less agents cannot reach;
+/// * it binds `model.default`, which is a `route:`. Failover is a later bullet
+///   (PRD §7 M1), and codegen binds the route's **first member** statically with
+///   a note saying so, which is what makes the example runnable today: the run
+///   below reaches `model.smart`'s `claude-sonnet-4-6`, and the day failover
+///   lands this is the test that says the binding still resolves.
+///
+/// **Why a preamble.** The example's `provider.anthropic` declares no
+/// `base_url:` — it is written to talk to Anthropic, which is the point of an
+/// example — so the harness redirects egress in the host module the driver
+/// imports before the graph. Nothing about the composition or the emitted
+/// project differs; a fixture parameterises its `base_url:` instead, which is
+/// why the fixtures exist and why this is the one test that needs the preamble.
+#[test]
+fn the_review_loop_example_runs_its_cycle_against_the_mock_provider() {
+    let provider = MockProvider::start().expect("a loopback port");
+
+    // `revise`, `revise`, `approve` — three passes of the cycle, inside a
+    // `max_iterations: 3` budget that therefore never runs out.
+    //
+    // Both agents bind `claude-sonnet-4-6` (the reviewer directly, the writer
+    // through `model.default`'s first member), so one queue serves both and each
+    // entry says which agent's prompt it answers. Within one agent the entries
+    // are consumed in order, which is the alternation an agent *with* tools
+    // makes: a loop call offering the tools and pinning nothing, answered with
+    // text, then the pinned call answered with structured output.
+    let writer = "a research writer";
+    let reviewer = "meticulous technical reviewer";
+    let mut scripts = Vec::new();
+    for (pass, verdict) in [(1, "revise"), (2, "revise"), (3, "approve")] {
+        scripts.push(Script::new(SONNET, Outcome::text("searching")).matching(writer));
+        scripts.push(
+            Script::new(
+                SONNET,
+                Outcome::structured(json!({ "draft": format!("# draft {pass}") })),
+            )
+            .matching(writer),
+        );
+        scripts.push(Script::new(SONNET, Outcome::text("reading")).matching(reviewer));
+        scripts.push(
+            Script::new(
+                SONNET,
+                Outcome::structured(json!({
+                    "verdict": verdict,
+                    "feedback": if verdict == "approve" { "" } else { "tighten it" },
+                })),
+            )
+            .matching(reviewer),
+        );
+    }
+    provider.enqueue_all(scripts);
+
+    let mut environment = harness::environment(&provider);
+    for (name, value) in [
+        ("ANTHROPIC_API_KEY", "mock-provider-key"),
+        ("SEARCH_API_KEY", "mock-provider-key"),
+        ("SEARCH_HOST", "search.invalid"),
+    ] {
+        environment.push((name.to_string(), value.to_string()));
+    }
+
+    let Some(run) = harness::invoke_entrypoint(
+        &harness::example("review-loop"),
+        "examples/review-loop",
+        "flow.review_loop",
+        &json!({ "goal": "explain the compiler" }),
+        &environment,
+        Some(REDIRECT_TO_MOCK),
+    ) else {
+        return;
+    };
+    run.succeeded();
+
+    assert_eq!(
+        run.visited(),
+        ["write", "review", "write", "review", "write", "review"],
+        "two `revise` passes over the back edge, then the `approve` that leaves \
+         through the `else:` escape"
+    );
+    assert_eq!(
+        run.outputs()["draft"],
+        "# draft 3",
+        "the flow returns the `draft` channel as it stood at quiescence \
+         (grammar 7.5)"
+    );
+
+    let recorded = provider.requests();
+    assert_eq!(
+        recorded.len(),
+        12,
+        "six agent invocations, each a tool-loop call and a pinned one"
+    );
+    assert!(recorded.iter().all(RecordedRequest::is_valid));
+    assert!(
+        recorded
+            .iter()
+            .all(|call| call.tools.contains(&"web_search".to_string())),
+        "`tool.web_search` is attached to both agents and reaches every call: {:?}",
+        recorded.iter().map(|call| &call.tools).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        recorded[0].structured_output, None,
+        "a tool loop's first call pins nothing"
+    );
+    assert!(
+        recorded[1].structured_output.is_some(),
+        "…and the call that ends it pins the output schema (PRD 5.2)"
+    );
+    assert!(
+        recorded.iter().all(|call| call.model == SONNET),
+        "`model.default` binds its route's first member, `model.smart` (PRD §7 M1)"
+    );
+
+    // The back edge's budget was spent twice and never exhausted: what ended the
+    // loop was the model's `approve`, not `max_iterations: 3`. The third pass
+    // records no budget at all — a guard that came out false spends nothing —
+    // which is what tells this run apart from `bounded-cycle`'s, where the
+    // budget is what stops it.
+    let review: Vec<Value> = run
+        .entries("review")
+        .iter()
+        .map(|entry| entry["routing"]["edges"][0].clone())
+        .collect();
+    assert_eq!(
+        review
+            .iter()
+            .map(|edge| edge["value"].clone())
+            .collect::<Vec<_>>(),
+        [json!(true), json!(true), json!(false)],
+        "two `revise` verdicts, then the `approve`"
+    );
+    assert_eq!(
+        review
+            .iter()
+            .map(|edge| edge["budget"]["used"].clone())
+            .collect::<Vec<_>>(),
+        [json!(1), json!(2), Value::Null],
+    );
+    assert_eq!(
+        run.entries("review")[2]["routing"]["targets"],
+        json!(["__end__"]),
+        "the `else:` escape is what leaves the cycle on `approve` (grammar 7.4)"
+    );
+    assert!(provider.snapshot().is_drained(), "every script was served");
+}
+
+/// The host preamble that points `examples/review-loop` at the mock.
+///
+/// The example names no `base_url:`, so the emitted client resolves
+/// `https://api.anthropic.com` — see the test above for why that is right and
+/// why the redirect belongs here rather than in the composition. It rewrites the
+/// host and nothing else: the request a compiled graph sends is still the one
+/// the mock validates, over a real socket.
+const REDIRECT_TO_MOCK: &str = r#"import process from "node:process";
+
+const upstream = "https://api.anthropic.com";
+const mock = process.env["MOCK_BASE_URL"].replace(/\/+$/, "");
+const inner = globalThis.fetch;
+globalThis.fetch = (resource, init) => {
+  const url =
+    typeof resource === "string"
+      ? resource
+      : resource instanceof URL
+        ? resource.href
+        : resource.url;
+  return inner(url.startsWith(upstream) ? mock + url.slice(upstream.length) : url, init);
+};
+"#;
+
 /// A bounded cycle stops at its budget and leaves through the escape edge, rather
 /// than looping (PRD 5.4).
 #[test]
-#[ignore = "pending: codegen must emit the per-cycle iteration counter"]
 fn a_bounded_cycle_leaves_through_its_escape_edge_when_the_budget_is_spent() {
     let provider = MockProvider::start().expect("a loopback port");
     // A model that never approves: only `max_iterations: 3` can end this run.
@@ -1078,12 +2341,14 @@ fn a_bounded_cycle_leaves_through_its_escape_edge_when_the_budget_is_spent() {
         .matching("meticulous technical reviewer"),
     ]);
 
-    let run = harness::run(
+    let Some(run) = harness::invoke(
         "bounded-cycle",
         "flow.review_loop",
         &[("goal", "ship it")],
         &provider,
-    );
+    ) else {
+        return;
+    };
     run.succeeded();
 
     // One write, then three (write, review) passes on the back-edge budget: the
@@ -1094,6 +2359,146 @@ fn a_bounded_cycle_leaves_through_its_escape_edge_when_the_budget_is_spent() {
         "four writer calls and four reviewer calls, then the escape — not a loop"
     );
     assert_eq!(run.outputs()["draft"], "a draft");
+    assert_eq!(
+        run.visited(),
+        [
+            "write", "review", "write", "review", "write", "review", "write", "review"
+        ]
+    );
+
+    // The counter is the observable: it spends one unit per traversal, stops at
+    // the declared budget, and the pass that finds it spent takes the escape
+    // instead (grammar 7.4, Decision D19).
+    let review = run.entries("review");
+    let spent: Vec<Value> = review
+        .iter()
+        .map(|entry| entry["routing"]["edges"][0]["budget"]["used"].clone())
+        .collect();
+    assert_eq!(spent, [json!(1), json!(2), json!(3), json!(3)]);
+    for (index, entry) in review.iter().enumerate() {
+        let last = index == 3;
+        assert_eq!(
+            entry["routing"]["edges"][0]["value"],
+            json!(true),
+            "the model said `revise` on every pass, including the last"
+        );
+        assert_eq!(entry["routing"]["edges"][0]["taken"], json!(!last));
+        assert_eq!(
+            entry["routing"]["targets"],
+            if last {
+                json!(["__end__"])
+            } else {
+                json!(["write"])
+            }
+        );
+    }
+    assert_eq!(
+        review[3]["routing"]["edges"][0]["reason"],
+        "the `max_iterations` budget is spent"
+    );
+}
+
+/// A cycle bounded only by a CEL exit condition runs the passes its guard asks
+/// for (PRD 5.4, grammar 7.4 clause 2).
+///
+/// Grammar 7.4's two clauses are proofs of different strength and the superstep
+/// ceiling a run takes has to be sized from both. Clause 1's `max_iterations` is
+/// a number the composition declares, so a ceiling can be derived from it;
+/// clause 2's exit condition declares nothing — grammar 7.4 says outright that
+/// only clause 1 makes a loop provably finite — so a ceiling derived from
+/// counting bounds alone gives a clause-2 cycle no budget at all and stops it at
+/// `25 + |nodes|` supersteps.
+///
+/// `flow.long_loop` is that shape reduced to nothing else: one node, no
+/// `max_iterations` anywhere, and a guard asking for 30 passes. `25 + 1` is 26,
+/// so a run of it is the difference between the two sizings — it either
+/// completes or dies at the net, and no assertion about the guard is needed to
+/// tell which.
+#[test]
+fn a_cel_bounded_cycle_runs_the_passes_its_guard_asks_for() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let Some(run) = harness::invoke_with(
+        "bounded-cycle",
+        "flow.long_loop",
+        &json!({}),
+        &harness::environment(&provider),
+    ) else {
+        return;
+    };
+    run.succeeded();
+
+    let passes = run.entries("step").len();
+    assert_eq!(
+        passes,
+        30,
+        "the guard's own count of passes ran, not the ceiling's: {:?}",
+        run.visited()
+    );
+    assert!(
+        passes > 26,
+        "…and more than `25 + |nodes|`, which is what a ceiling sized from \
+         counting bounds alone would have allowed"
+    );
+    assert_eq!(
+        run.outputs()["log"].as_array().map(Vec::len),
+        Some(30),
+        "every pass appended: {}",
+        run.outputs()["log"]
+    );
+}
+
+/// A run stopped by the superstep ceiling says which bound the composition was
+/// missing, rather than which knob LangGraph has (PRD 5.4, grammar 7.4).
+///
+/// Clause 2 is decided syntactically (Decision D98) and its guard is a runtime
+/// value, so `validate` accepts a loop whose exit condition never comes true and
+/// nothing inside the composition ends it. That is the case the ceiling exists
+/// for, and the diagnostic is the whole of what a reader gets: LangGraph
+/// announces reaching a `recursionLimit` with a link to its own troubleshooting
+/// page, naming a config key no `agent-compose` surface spells. The restatement
+/// has to name the composition's own missing bound instead, and keep LangGraph's
+/// error as the cause so nothing is hidden.
+#[test]
+fn a_run_that_reaches_the_superstep_ceiling_says_which_bound_was_missing() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let Some(run) = harness::invoke_with(
+        "bounded-cycle",
+        "flow.runaway",
+        &json!({}),
+        &harness::environment(&provider),
+    ) else {
+        return;
+    };
+    let failure = run.failed();
+
+    // The trace is the run's own count of the supersteps it took, so the message
+    // is checked against what happened rather than against a literal that would
+    // have to be edited every time the sizing moves.
+    let supersteps = run.trace().len();
+    assert!(
+        failure.contains(&format!("ceiling of {supersteps} supersteps")),
+        "the message names the ceiling the run actually reached: {failure}"
+    );
+    assert!(
+        failure.contains("grammar 7.4 clause 2") && failure.contains("max_iterations"),
+        "…says which bound the composition was missing, and how to declare it: \
+         {failure}"
+    );
+    assert!(
+        failure.contains("recursionLimit"),
+        "…and how to raise the net for one run instead: {failure}"
+    );
+    assert!(
+        failure.contains("GraphRecursionError"),
+        "LangGraph's own error is kept as the cause rather than replaced: \
+         {failure}"
+    );
+
+    assert!(
+        run.trace().iter().all(|entry| entry["node"] == "spin"),
+        "the trace of a run the net caught is still a trace: every superstep it \
+         took is in it (PRD 5.3)"
+    );
 }
 
 /// A homogeneous map dispatches one instance per item, bounded by
@@ -1224,26 +2629,31 @@ fn appended_results_are_ordered_by_source_item_index() {
 /// A node retries its model call per its declared policy, and the retries are
 /// visible as repeated calls.
 #[test]
-#[ignore = "pending: codegen must emit retry policy"]
 fn a_node_retries_its_model_call_per_its_declared_policy() {
     let provider = MockProvider::start().expect("a loopback port");
     // `write` declares `retry: { max: 2, backoff: 1s }`: one attempt plus two
     // retries, and the third answer is the one that lands.
     provider.enqueue_all([
-        Script::new(SONNET, Outcome::server_error()).times(2),
-        Script::new(SONNET, Outcome::structured(json!({ "draft": "a draft" }))),
+        Script::new(SONNET, Outcome::server_error())
+            .times(2)
+            .matching("research writer"),
+        Script::new(SONNET, Outcome::structured(json!({ "draft": "a draft" })))
+            .matching("research writer"),
         Script::new(
             SONNET,
             Outcome::structured(json!({ "verdict": "approve", "feedback": "" })),
-        ),
+        )
+        .matching("meticulous technical reviewer"),
     ]);
 
-    let run = harness::run(
+    let Some(run) = harness::invoke(
         "bounded-cycle",
         "flow.review_loop",
         &[("goal", "ship it")],
         &provider,
-    );
+    ) else {
+        return;
+    };
     run.succeeded();
 
     assert_eq!(
@@ -1252,27 +2662,36 @@ fn a_node_retries_its_model_call_per_its_declared_policy() {
         "three attempts at the writer, then the reviewer"
     );
     assert_eq!(run.outputs()["draft"], "a draft");
+    // `write` declares `retry: { max: 2, … }` — one attempt plus two retries —
+    // and the node it feeds took one (grammar 9.1). The trace counts them, so a
+    // retry that silently stopped happening is visible as a number rather than as
+    // a transcript length.
+    assert_eq!(run.entries("write")[0]["attempts"], json!(3));
+    assert_eq!(run.entries("review")[0]["attempts"], json!(1));
 }
 
 /// A node timeout fires on a provider that never answers, and the node's error
 /// policy takes over from there.
 #[test]
-#[ignore = "pending: codegen must emit timeout policy"]
 fn a_node_timeout_fires_and_its_error_policy_takes_over() {
     let provider = MockProvider::start().expect("a loopback port");
     // `review` declares `timeout: 10s`; the scripted provider never answers, and
     // the project's `defaults: { on_error: fail }` is what the run reports.
     provider.enqueue_all([
-        Script::new(SONNET, Outcome::structured(json!({ "draft": "a draft" }))),
-        Script::new(SONNET, Outcome::timeout(Duration::from_secs(30))),
+        Script::new(SONNET, Outcome::structured(json!({ "draft": "a draft" })))
+            .matching("research writer"),
+        Script::new(SONNET, Outcome::timeout(Duration::from_secs(30)))
+            .matching("meticulous technical reviewer"),
     ]);
 
-    let run = harness::run(
+    let Some(run) = harness::invoke(
         "bounded-cycle",
         "flow.review_loop",
         &[("goal", "ship it")],
         &provider,
-    );
+    ) else {
+        return;
+    };
     let failure = run.failed();
     assert!(
         failure.contains("review"),
@@ -1281,6 +2700,153 @@ fn a_node_timeout_fires_and_its_error_policy_takes_over() {
     assert!(
         failure.contains("timeout") || failure.contains("timed out"),
         "…and what happened to it: {failure}"
+    );
+    // The abort reason becomes the failure's `cause`, and a run prints the whole
+    // chain — so it counts the attempts the node *made* too. One attempt was
+    // made here; a chain saying `0` under a message saying `1` reads as two
+    // facts about one node.
+    assert!(
+        failure.contains("after 1 attempt(s)") && !failure.contains("after 0 attempt(s)"),
+        "the message and the cause count the same attempts: {failure}"
+    );
+
+    // And the trace says the same thing the message does: `on_error: fail` ends
+    // the run *at* this node, so the node it ended at is the trace's last entry
+    // — with the attempts it made, counted once more (PRD 5.3).
+    let review = run.entries("review");
+    assert_eq!(
+        review.len(),
+        1,
+        "the node that timed out is in the trace: {:?}",
+        run.trace()
+    );
+    assert_eq!(review[0]["outcome"], "failed", "{}", review[0]);
+    assert_eq!(review[0]["attempts"], 1, "{}", review[0]);
+    assert_eq!(
+        run.visited().last().map(String::as_str),
+        Some("review"),
+        "…and it is where the run stopped: {:?}",
+        run.visited()
+    );
+}
+
+/// The same budget, spent on a child process rather than on a provider — and the
+/// `on_error: { fallback: … }` that takes over when it does.
+///
+/// Three things this decides that the model-side twin above cannot. The fallback
+/// **replaces** the node's own edges rather than running beside them (grammar
+/// 9.2, Decision D21), so the target is what runs next and `slow`'s own
+/// `to: end` is not evaluated; the budget is the *node's* rather than the
+/// provider client's, which is why an `exec:` node with no network in it times
+/// out at all; and the budget is spent across attempts rather than per attempt
+/// (grammar 9.1), which the trace's `attempts` is what makes observable.
+#[test]
+fn a_node_timeout_fires_over_a_child_process_and_its_fallback_takes_over() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let Some(run) = harness::invoke("activities", "flow.deadline", &[], &provider) else {
+        return;
+    };
+    run.succeeded();
+
+    assert_eq!(run.outputs()["report"], "rescued");
+    assert_eq!(run.visited(), ["slow", "rescue"]);
+    let slow = run.entries("slow");
+    assert_eq!(slow[0]["outcome"], "failed");
+    assert_eq!(slow[0]["fallback"], "rescue");
+    assert!(
+        slow[0]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("timed out")),
+        "the trace records what happened to it: {}",
+        slow[0]["error"]
+    );
+    assert!(
+        slow[0]["routing"].is_null(),
+        "a fallback is taken *instead of* the node's own edges: {}",
+        slow[0]
+    );
+    // `slow` declares `retry: { max: 3 }` — four attempts allowed — and made
+    // one: the first spent the whole 300ms budget, and grammar 9.1 spends that
+    // budget across attempts rather than resetting it per attempt. A trace that
+    // reported 4 here would be describing three sleeps that never ran.
+    assert_eq!(slow[0]["attempts"], json!(1));
+    // The count the *message* carries is the same one, which it has to be: the
+    // abort reason becomes the failure's `cause` and a run prints the chain, so
+    // two numbers for one fact would be read as two facts.
+    assert!(
+        slow[0]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("after 1 attempt(s)")),
+        "the message counts what the trace counts: {}",
+        slow[0]["error"]
+    );
+}
+
+/// The same budget once more, over the one activity the runtime does not
+/// control: a grammar 6.1 `function:` binding whose host implementation never
+/// looks at `context.signal`.
+///
+/// Neither test above decides this. `exec:` and `http:` observe the abort
+/// because the runtime is what spawns and fetches for them, so a deadline that
+/// only *signalled* — handing `context.signal` to the activity and trusting it
+/// — would still pass both. A host function is arbitrary caller code, and so is
+/// a host-implemented tool called inside an agent's tool loop, which reaches
+/// `invoke` with this same context; grammar 9.2 bounds "one node execution" and
+/// names no kind that is exempt. So `runActivity` **races** the deadline against
+/// the activity, and the node fails on time whatever the implementation does.
+///
+/// What racing cannot do is stop the work, and the assertion is about that
+/// boundary. The host answers `too late` two seconds into a 300ms budget: a
+/// cooperative-only deadline would let the node complete and write that string,
+/// while a raced one fails the node at 300ms and *discards* the value when it
+/// arrives. `rescued` is the fallback's, so only the second reading produces it.
+#[test]
+fn a_node_timeout_fires_over_a_host_function_that_ignores_its_signal() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let Some(run) = harness::invoke_hosted(
+        "activities",
+        "flow.stubborn",
+        &json!({}),
+        &harness::environment(&provider),
+        // No mention of `context.signal` anywhere in here, which is the point:
+        // this is what an ordinary host implementation looks like.
+        Some(
+            r#"import { registerFunction } from "./src/runtime.ts";
+registerFunction("rank_candidates", async () => {
+  await new Promise((resolve) => setTimeout(resolve, 2000));
+  return { ranked: "too late" };
+});
+"#,
+        ),
+    ) else {
+        return;
+    };
+    run.succeeded();
+
+    assert_eq!(
+        run.outputs()["report"],
+        "rescued",
+        "the node failed at its deadline, so the abandoned call's answer was \
+         discarded rather than written"
+    );
+    assert_eq!(run.visited(), ["call", "rescue"]);
+    let call = run.entries("call");
+    assert_eq!(call[0]["outcome"], "failed", "{}", call[0]);
+    assert_eq!(call[0]["fallback"], "rescue", "{}", call[0]);
+    // One attempt, and the budget is what ended it — not a host function that
+    // threw, which would reach the same `outcome` by a different route.
+    assert_eq!(call[0]["attempts"], json!(1));
+    assert!(
+        call[0]["error"]
+            .as_str()
+            .is_some_and(|error| { error.contains("timed out") && error.contains("300ms budget") }),
+        "the trace names the budget that ended it: {}",
+        call[0]["error"]
+    );
+    assert!(
+        call[0]["routing"].is_null(),
+        "a fallback is taken *instead of* the node's own edges: {}",
+        call[0]
     );
 }
 
@@ -1504,7 +3070,6 @@ fn a_condition_outside_route_on_fails_the_node_instead_of_failing_over() {
 /// started execution hits, before the first model call — which needs a command
 /// that starts one.
 #[test]
-#[ignore = "pending: `agent-compose run` must execute the emitted graph"]
 fn a_missing_env_ref_fails_at_process_start_naming_the_variable() {
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue(Script::new(SONNET, Outcome::text("never reached")));
@@ -1513,12 +3078,14 @@ fn a_missing_env_ref_fails_at_process_start_naming_the_variable() {
         .into_iter()
         .filter(|(name, _)| name != harness::API_KEY)
         .collect();
-    let run = harness::run_with(
+    let Some(run) = harness::invoke_with(
         "agent-anthropic",
         "flow.review",
-        &[("goal", "ship it"), ("draft", "a draft")],
+        &json!({ "goal": "ship it", "draft": "a draft" }),
         &environment,
-    );
+    ) else {
+        return;
+    };
     let failure = run.failed();
 
     assert!(
@@ -1758,44 +3325,50 @@ fn serve_resumes_an_interrupted_execution_against_the_human_nodes_schema() {
 ///   so "constructs its graph" is not a claim this milestone can make until the
 ///   flows are assembled into it.
 #[test]
-#[ignore = "pending: codegen must assemble the flows into `src/graph.ts`"]
 fn every_generated_project_type_checks_and_constructs_its_graph() {
     for name in harness::FIXTURES {
-        let built = harness::build(name, "local");
-        built.succeeded();
-
-        let install = std::process::Command::new("npm")
-            .args(["install", "--no-audit", "--no-fund"])
-            .current_dir(built.root())
-            .output()
-            .expect("npm runs");
+        let Some((project, built)) = harness::build_under_toolchain(name, "gate") else {
+            return;
+        };
         assert!(
-            install.status.success(),
-            "`{name}`'s dependencies did not install: {}",
-            String::from_utf8_lossy(&install.stderr)
+            built.status.success(),
+            "`{name}` did not build:\n{}",
+            String::from_utf8_lossy(&built.stderr)
         );
 
-        let typecheck = std::process::Command::new("npx")
-            .args(["tsc", "--noEmit"])
-            .current_dir(built.root())
-            .output()
-            .expect("tsc runs");
+        let typecheck = std::process::Command::new(
+            project
+                .parent()
+                .and_then(Path::parent)
+                .expect("the toolchain root")
+                .join("node_modules/.bin/tsc"),
+        )
+        .args(["--noEmit", "-p", "."])
+        .current_dir(&project)
+        .output()
+        .expect("tsc runs");
         assert!(
             typecheck.status.success(),
             "`{name}` does not type-check:\n{}",
             String::from_utf8_lossy(&typecheck.stdout)
         );
 
-        // Constructing the graph is a stronger check than compiling it: a state
-        // model LangGraph refuses, or an edge to a node that is not registered,
-        // is a runtime error at build time and a green `tsc` either way.
+        // Constructing every flow's graph is a stronger check than compiling it:
+        // an edge to a node that is not registered, or a node reachable only
+        // through a control-transfer position that `ends` did not declare, is a
+        // runtime error at construction and a green `tsc` either way.
         let construct = std::process::Command::new("node")
             .args([
                 "--input-type=module",
                 "-e",
-                "const graph = await import('./src/graph.ts'); graph.createBuilder().compile();",
+                "const graph = await import('./src/graph.ts');\
+                 graph.createBuilder();\
+                 if (Object.keys(graph.flows).length === 0) process.exit(0);\
+                 for (const flow of Object.values(graph.flows)) {\
+                   if (typeof flow.stream !== 'function') throw new Error(`${flow.address} has no graph`);\
+                 }",
             ])
-            .current_dir(built.root())
+            .current_dir(&project)
             .output()
             .expect("node runs");
         assert!(

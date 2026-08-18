@@ -10,8 +10,10 @@
 # would notice.
 #
 # It is deliberately the smallest graph that carries all of it: one flow, one
-# agent, one store, one tool. What is being covered here is the schema language,
-# not the topology.
+# agent, one store. What is being covered here is the schema language, not the
+# topology — plus the handful of *binding* shapes no example reaches, which are
+# marked where they are declared and are here for the same reason: a spelling
+# only `tsc` or a real request would notice.
 version: "0.1"
 
 state:
@@ -151,6 +153,19 @@ provider.p:
   api_key: ${SHAPES_KEY}
   base_url: ${SHAPES_URL}
 
+# Grammar 12.1's two SDK-reached kinds. Nothing in `examples/` declares one, so
+# without these no golden ever carries the `kind:` literals `bedrock` and
+# `vertex` — and a `ProviderKind` that had never heard of them would type-check
+# every golden in the corpus and fail on the first composition that used one.
+provider.aws:
+  kind: bedrock
+  region: us-east-1
+
+provider.gcp:
+  kind: vertex
+  project: shapes
+  location: us-central1
+
 model.m:
   provider: provider.p
   id: a-model
@@ -163,6 +178,51 @@ tool.ping:
   output: {}
   exec:
     command: "true"
+
+# An `http:` binding that writes neither `query:` nor `body:`, on each of the two
+# methods that read the omission differently: grammar 6.1 sends the bound input
+# object as the JSON body on a body-bearing method and as query parameters on
+# `GET`/`HEAD`. Every `http:` binding in `examples/` states its own `body:`, so
+# this is the only place the convention itself is emitted.
+tool.file_ticket:
+  description: Files a ticket from the whole input object.
+  input:
+    title:   { type: string }
+    summary: { type: string }
+  output:
+    id: { type: string }
+  http:
+    method: POST
+    url: "https://example.test/tickets"
+
+tool.lookup:
+  description: Looks a term up, with the input object as the query string.
+  input:
+    term:  { type: string }
+    limit: { type: integer, minimum: 1 }
+  output:
+    hits: { type: array, max_items: 8, items: { type: string } }
+  http:
+    method: GET
+    url: "https://example.test/search"
+
+# The half-and-half case, which is legal because the two keys claim different
+# slots (grammar 6.1, Decision D66): `query:` is written out and evaluated over
+# the tool's own `input`, and the body is the input object the block did not
+# claim. This is the only tool here that emits the CEL roots a `query:`/`body:`
+# expression is evaluated against.
+tool.dispatch:
+  description: Posts the input object, with one parameter written out.
+  input:
+    trace:   { type: string }
+    payload: { type: object, properties: { kind: { type: string } } }
+  output:
+    accepted: { type: boolean }
+  http:
+    method: POST
+    url: "https://example.test/dispatch"
+    query:
+      trace: "input.trace"
 
 store.notes:
   kind: kv

@@ -63,7 +63,7 @@ Prior art validates the declarative direction but leaves gaps:
 
 - **Every agent must declare an output schema** (JSON Schema). This is load-bearing for routing (5.3) and for distribution (5.7: every edge is serializable).
 - Input schemas optional; default is string-in for entrypoint agents (duckflux's "string by default, schema opt-in").
-- Codegen emits Zod schemas + `withStructuredOutput`.
+- Codegen emits Zod schemas for state typing and reply parsing. The schema a provider is *constrained by* is the compiler's own JSON-Schema lowering — the same column the reply is parsed against — sent on the wire directly rather than through `withStructuredOutput`, whose Zod→JSON-Schema conversion silently drops constraints (§9.16).
 
 ### 5.3 Routing — runtime always routes; the question is who produced the value
 
@@ -429,6 +429,7 @@ Formerly open, now settled — rationale lives in the referenced sections:
 13. **`agent_access` on store attachment** → accepted: a `stores:` entry may narrow the synthesized tool surface to read-only (`agent_access: read`; default `read_write`). One enum buys declarative least-privilege for store tools, the same posture placement isolation takes for compute (5.8, 5.10; grammar D37).
 14. **`max_tool_iterations` on agents** → accepted, default 8: the intra-agent tool loop was the one remaining unbounded loop in a compiled graph; a declarative bound completes the static-termination story that 5.4 starts (5.4, 5.5; grammar D51).
 15. **Env-ref presence checking** → launch-time, not build-time. 5.8/5.9 originally said `build` checks presence while the M1 milestone said process start; the artifact-portability posture decides it — a build must succeed anywhere, including CI holding no secrets, or committable IRs and least-privilege distribution (5.10) break. Generated code verifies its environment at process start; `run`/`serve` fail fast before invoking the graph. `validate` and `build` check syntax only (5.8, 5.9).
+16. **The schema a provider is handed** → the compiler's JSON-Schema lowering, on the wire, not a `withStructuredOutput` conversion of the emitted Zod. The load-bearing property is constrain==parse equality: the schema a model is constrained by must be the schema its answer is parsed with, or an agent can honor its contract and still fail the parse. The pinned `@langchain/core` Zod conversion silently drops refinement-spelled constraints (`format:`, `uniqueItems`, length bounds), breaking that equality; the two columns are equal by construction only for the JSON lowering, proven document-by-document in CI. A permanent gate measures the dropped-constraint behavior so the choice is revisited if the conversion ever stops lossy-dropping (5.2; codegen schema module).
 
 ## 10. Open Questions
 

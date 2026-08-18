@@ -245,6 +245,50 @@ fn a_malformed_tool_loop_is_refused_and_recorded() {
     );
 }
 
+/// An assistant turn with an **empty content list** is refused, which is the
+/// shape a tool loop produces when it replays an answer that carried nothing.
+///
+/// The Messages API refuses `content: []` (`List should have at least 1 item`),
+/// and a loop that rebuilt its assistant turn out of the text and tool calls it
+/// read would send exactly that after a `max_tokens` cut. The compiler's runtime
+/// stops the node on such an answer instead — but only this side says the shape
+/// is refused at all, and a mock that quietly accepted it would let that
+/// regression back in without a failing test.
+#[test]
+fn an_assistant_turn_with_no_content_is_refused() {
+    let provider = MockProvider::start().expect("a port");
+    provider.enqueue(Script::new(MODEL, Outcome::text("never served")));
+
+    let response = send(
+        &provider.client(),
+        &json!({
+            "model": MODEL,
+            "max_tokens": 1024,
+            "messages": [
+                { "role": "user", "content": "go" },
+                { "role": "assistant", "content": [] },
+            ],
+        }),
+    );
+
+    assert_eq!(response.status, 400);
+    assert_eq!(response.header(HARNESS_HEADER), Some(REFUSED_INVALID));
+    let body = response.json();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .expect("a message")
+            .contains("messages.1.content: List should have at least 1 item"),
+        "{body}"
+    );
+    assert_eq!(
+        provider.snapshot().queues[MODEL],
+        1,
+        "a refused request consumes nothing"
+    );
+}
+
 /// A call with no `x-api-key` is refused **401 `authentication_error`**, the
 /// status the Messages API answers and the one `@anthropic-ai/sdk` raises
 /// `AuthenticationError` from.

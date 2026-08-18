@@ -40,6 +40,21 @@
     "result": false
   },
   {
+    "name": "starts-with-has-no-global-spelling",
+    "expression": "startsWith('draft-1', 'draft')",
+    "error": true
+  },
+  {
+    "name": "ends-with-has-no-global-spelling",
+    "expression": "endsWith('draft-1', '-1')",
+    "error": true
+  },
+  {
+    "name": "contains-has-no-global-spelling",
+    "expression": "contains('a needle here', 'needle')",
+    "error": true
+  },
+  {
     "name": "matches-an-anchored-pattern",
     "expression": "'a1'.matches('^a[0-9]$')",
     "result": true
@@ -53,6 +68,61 @@
     "name": "matches-false",
     "expression": "'ab'.matches('^a[0-9]$')",
     "result": false
+  },
+  {
+    "name": "matches-in-its-global-spelling",
+    "expression": "matches('a1', '^a[0-9]$')",
+    "result": true
+  },
+  {
+    "name": "matches-in-its-global-spelling-is-false-when-it-does-not",
+    "expression": "matches('ab', '^a[0-9]$')",
+    "result": false
+  },
+  {
+    "name": "matches-an-alternation",
+    "expression": "'abc'.matches('^(a|z)bc$')",
+    "result": true
+  },
+  {
+    "name": "matches-a-bounded-repetition",
+    "expression": "'aaa'.matches('^a{2,3}$')",
+    "result": true
+  },
+  {
+    "name": "matches-a-bounded-repetition-that-is-too-long",
+    "expression": "'aaaa'.matches('^a{2,3}$')",
+    "result": false
+  },
+  {
+    "name": "matches-the-perl-classes-over-ascii",
+    "expression": "'x9 '.matches('^\\\\w\\\\d\\\\s$')",
+    "result": true
+  },
+  {
+    "name": "matches-a-negated-character-class",
+    "expression": "'abc'.matches('^[^0-9]+$')",
+    "result": true
+  },
+  {
+    "name": "matches-a-named-group-in-the-javascript-spelling",
+    "expression": "'key=value'.matches('^(?<k>[a-z]+)=(?<v>[a-z]+)$')",
+    "result": true
+  },
+  {
+    "name": "matches-a-non-capturing-group-and-a-lazy-quantifier",
+    "expression": "'aab'.matches('^(?:a)+?ab$')",
+    "result": true
+  },
+  {
+    "name": "matches-an-escaped-metacharacter",
+    "expression": "'1+1'.matches('^1\\\\+1$')",
+    "result": true
+  },
+  {
+    "name": "matches-the-empty-pattern-which-every-string-carries",
+    "expression": "'anything'.matches('')",
+    "result": true
   },
   {
     "name": "a-single-quoted-escape",
@@ -75,6 +145,12 @@
     "name": "an-enum-valued-field-compares-as-a-string",
     "expression": "review.output.verdict == 'revise'",
     "input": { "review": { "output": { "verdict": "revise" } } },
+    "result": true
+  },
+  {
+    "name": "a-string-predicate-over-a-node-output-field",
+    "expression": "write.output.draft.startsWith('# ')",
+    "input": { "write": { "output": { "draft": "# a heading" } } },
     "result": true
   }
 ]

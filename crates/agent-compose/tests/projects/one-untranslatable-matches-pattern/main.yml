@@ -1,0 +1,66 @@
+# A composition `validate` accepts and `build` cannot compile — the sibling of
+# `one-untranslatable-pattern`, one surface across.
+#
+# Grammar 4.1 puts CEL's standard `matches` on the expression surface, and the
+# CEL specification defines it over RE2 — the same second language `pattern:` is
+# written in, reached through a guard instead of a schema. The evaluator a
+# compiled router embeds has only `new RegExp(…)`, so the mismatch is reachable
+# from both sides and `build` refuses over each:
+#
+#   * `loud` — `(?i)` is RE2 and a `SyntaxError: Invalid group` in JavaScript, so
+#     the guard `validate` accepts is one that kills the run at the first edge;
+#   * `ahead` and `backref` — look-around and backreferences are JavaScript's and
+#     are **not** RE2, so the compiled router answers a guard the specification's
+#     own engine refuses to compile at all;
+#   * `computed` — a pattern the compiler never sees is one it can promise
+#     nothing about, in either direction.
+#
+# `plain` and `named` are the controls: the vocabulary both engines share,
+# written in both of `matches`'s standard spellings, in the same file — so a
+# check that refused every `matches()` would fail this fixture too.
+version: "0.1"
+
+state:
+  note:
+    type: string
+    default: ""
+  needle:
+    description: A pattern held in state, which is what makes `computed` computed.
+    type: string
+    default: "^a$"
+  report:
+    type: string
+    default: ""
+
+flow.probe:
+  outputs:
+    report:
+      type: string
+  nodes:
+    read:
+      exec:
+        command: printf
+        args: ["%s", "read"]
+        output:
+          stdout: { type: string }
+      writes:
+        stdout: report
+    act:
+      exec:
+        command: printf
+        args: ["%s", "acted"]
+        output:
+          stdout: { type: string }
+      writes:
+        stdout: report
+
+  edges:
+    - { from: start, to: read }
+    - { from: read, to: act, when: "state.note.matches('(?i)urgent')" }
+    - { from: read, to: act, when: "matches(state.note, 'a(?=b)')" }
+    - { from: read, to: act, when: "state.note.matches('(a)\\\\1')" }
+    - { from: read, to: act, when: "state.note.matches(state.needle)" }
+    - { from: read, to: act, when: "state.note.matches('^[a-z]+-[0-9]{4}$')" }
+    - { from: read, to: act, when: "matches(state.note, '^(?<word>[a-z]+)$')" }
+    - { from: read, to: end, else: true }
+    - { from: act, to: end }

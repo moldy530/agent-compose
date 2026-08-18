@@ -13,11 +13,43 @@ The LangGraph TypeScript project `agent-compose build` produced from `main.yml`,
 
 | path | what it holds |
 |---|---|
+| `src/cel.ts` | the CEL evaluator the routers embed (PRD 5.5) |
 | `src/env.ts` | every `${ENV}` reference the composition makes, and `readEnvironment()`, the presence check over them |
+| `src/runtime.ts` | what every node does when it runs: the retry/timeout/error policy of grammar 9, the provider surfaces, the `exec`/`http` wrappers, and the router |
 | `src/schemas.ts` | every schema the composition declares, as Zod |
-| `src/state.ts` | the graph's state model: one channel per `state:` channel, plus the implicit conversation history |
-| `src/graph.ts` | the compiled graph |
+| `src/state.ts` | the graph's state model: one channel per `state:` channel, the implicit conversation history, and `$run` — what the runtime keeps beside them |
+| `src/graph.ts` | the compiled graph: one node per flow node, the `flows` registry, and `runFlow` |
 | `src/index.ts` | the project's public surface, and the one caller of `readEnvironment()` |
+
+## Running a flow
+
+```ts
+import { runFlow } from "./src/index.ts";
+
+const run = await runFlow("flow.<name>", { /* the flow's declared inputs */ });
+console.log(run.outputs); // its `outputs:`, materialized at quiescence
+console.log(run.trace);   // every routing decision the run made, as data
+```
+
+Every flow is runnable whether or not a `manual` trigger names it (PRD 5.11),
+so `flows` holds them all. The inputs are parsed against the flow's own
+`inputs:` schema before anything runs, and the trace is the routing record
+PRD 5.3 asks for: one entry per node execution, carrying the guards that were
+evaluated, what they answered, which edges were taken, and the state of any
+`max_iterations` budget they spent.
+
+A run that produces no answer throws a `FlowFailure`, and it carries that same
+record: `.trace` holds every step that completed plus one final entry for the
+node the run stopped at, and `.cause` is the error itself. Both ways a run can
+fail raise it — one that never reached quiescence, and one that reached
+quiescence holding no value for a field its `outputs:` declares — so `.trace` is
+readable without asking which happened.
+
+`recursionLimit` is the one option that is not about identity: it raises the
+superstep ceiling for a single run. The ceiling is a safety net rather than one
+of the composition's own bounds, sized from the `max_iterations` budgets a flow
+declares plus an allowance for every cycle bounded only by a CEL exit condition,
+and a run that reaches it fails with a `SuperstepCeiling` saying so.
 
 `src/index.ts` calls `readEnvironment()` at module scope, so loading this project
 is what checks its environment: a missing variable throws before anything runs,

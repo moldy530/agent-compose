@@ -24,9 +24,13 @@
 # Every provider here declares `base_url: ${MOCK_BASE_URL}`. That is what lets
 # the acceptance harness point a compiled graph at the mock provider without the
 # spec differing between a scripted run and a real one (PRD 5.9: env refs survive
-# unresolved into the IR and resolve at process start). `examples/` cannot serve
-# as an acceptance fixture for exactly this reason: its `provider.anthropic`
-# names no base URL, so a graph built from it talks to Anthropic.
+# unresolved into the IR and resolve at process start), and it is why the fixtures
+# are written rather than borrowed: `examples/review-loop`'s `provider.anthropic`
+# names no base URL, so a graph built from it talks to Anthropic. That example is
+# still run — `the_review_loop_example_runs_its_cycle_against_the_mock_provider`
+# redirects its egress from the host module the driver imports before the graph —
+# but the redirect is a harness affordance rather than something the spec offers,
+# so everything decidable from a fixture is decided here instead.
 version: "0.1"
 
 # Four channels, and the two halves of "state channels carry their declared
@@ -157,6 +161,44 @@ flow.review:
   edges:
     - { from: start, to: review }
     - { from: review, to: end }
+
+flow.pair:
+  description: Two agent nodes in a row, so the conversation crosses between them.
+  # The implicit `messages` channel of grammar 10.4 (PRD 5.7 tier 3): each agent
+  # node appends its rendered input and its structured answer, and the next one
+  # is called with what is there. Two nodes is the smallest flow where that is
+  # observable at all — one node's history is empty by construction — and the
+  # second reads `state.feedback` so its own user turn carries what the first
+  # answered, which is what tells a *shared* history from a repeated input.
+  inputs:
+    goal:
+      type: string
+      min_length: 1
+    draft:
+      type: string
+      min_length: 1
+  outputs:
+    verdict:
+      enum: [approve, revise]
+    feedback:
+      type: string
+  nodes:
+    first:
+      agent: agent.reviewer
+      input:
+        goal: "input.goal"
+        draft: "input.draft"
+
+    second:
+      agent: agent.reviewer
+      input:
+        goal: "input.goal"
+        draft: "state.feedback"
+
+  edges:
+    - { from: start, to: first }
+    - { from: first, to: second }
+    - { from: second, to: end }
 
 flow.research:
   description: Look one fact up and return what the researcher reported.

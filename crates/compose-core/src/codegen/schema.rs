@@ -154,9 +154,9 @@
 //!
 //! # What a provider is handed
 //!
-//! PRD 5.2 delivers an agent's output schema through `withStructuredOutput`, and
-//! what that mechanism *does* with the Zod this module emits is a fact worth
-//! writing down before the PR that wires it: `@langchain/core` 1.2.8 converts a
+//! `withStructuredOutput` is the mechanism PRD 5.2 named before 9.16 amended it,
+//! and what that mechanism *does* with the Zod this module emits is the
+//! measurement the amendment rests on: `@langchain/core` 1.2.8 converts a
 //! Zod v4 schema by calling `toJSONSchema` from `zod/v4/core`
 //! (`dist/utils/json_schema.js`), and that conversion keeps what Zod models as a
 //! *check* and drops what it models as a *refinement*, silently. Against the
@@ -170,15 +170,36 @@
 //! The `.regex`-spelled formats (`uri`, `time`, `uuid`) survive as `pattern`, so
 //! the loss tracks the spelling rather than the keyword.
 //!
-//! This module does not get to fix that: the schema a provider is handed is the
-//! node-fn PR's emission, and *which* schema it hands over — a conversion of
-//! this Zod, or [`json_field_map`]'s lowering, which is the column the
-//! conformance corpus already proves equal to the parse — is a design question
-//! PRD 5.2 does not answer and CLAUDE.md's PRD discipline says must be resolved
-//! before that area is implemented. What belongs here is the evidence, and a
-//! gate that keeps it true: `what_the_structured_output_mechanism_would_be_handed`
-//! in `tests/generated_code_gates.rs` runs the real conversion over the real
-//! goldens and fails when either half of the premise changes.
+//! **Which schema a provider is handed is decided, and it is not that
+//! conversion** — PRD 9.16 is where the decision is logged, and PRD 5.2 is
+//! amended to it. The question that log entry closes — a conversion of this Zod,
+//! or [`json_field_map`]'s lowering — was answered by the one property that makes
+//! structured output load-bearing for routing: the schema a model is
+//! *constrained by* has to be the schema its answer is then *parsed with*, or an
+//! agent can answer its own contract and fail the parse. Those two are equal by
+//! construction only for the JSON column, which
+//! `the_emitted_zod_agrees_with_the_json_schema_lowering` proves document by
+//! document — so [`super::runtime`]'s agent call sends [`json_field_map`]'s
+//! lowering, over `fetch`, with no `withStructuredOutput` in the path.
+//!
+//! The evidence stays, and so does the gate that keeps it true:
+//! `what_the_structured_output_mechanism_would_be_handed` in
+//! `tests/generated_code_gates.rs` runs the real conversion over the real
+//! goldens, and it now measures **the road not taken** — the day that conversion
+//! stops dropping refinements is the day the choice could be reconsidered, which
+//! is the revisit condition PRD 9.16 names. This comment is the evidence behind
+//! that entry: the measurements above are what the decision was made on.
+//!
+//! One surface cannot keep that equality all the way down, and the gap is
+//! recorded rather than left to be found. OpenAI's structured-output decoder
+//! closes a schema only when every object in it lists every property in
+//! `required`, so an agent whose output nests an `optional:` property (grammar
+//! 3.4) is sent `strict: false` and is constrained by nothing — while the parse
+//! still runs over this module's lowering, unchanged. That row lives in
+//! [`super::runtime`]'s ledger rather than here, because it is a property of the
+//! *request* and not of the lowering: what this module publishes is what goes on
+//! the wire and what the answer is checked against, on both surfaces and at
+//! either `strict`.
 
 use std::borrow::Cow;
 

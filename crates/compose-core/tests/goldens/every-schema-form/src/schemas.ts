@@ -281,6 +281,47 @@ export const storeNotesValueSchema = z.object({
 }).strict();
 export type StoreNotesValueSchema = z.infer<typeof storeNotesValueSchema>;
 
+/** `tool.dispatch` — its parameters (grammar 6). */
+export const toolDispatchInput = z.object({
+  trace: z.string(),
+  payload: z.object({
+    kind: z.string(),
+  }).strict(),
+}).strict();
+export type ToolDispatchInput = z.infer<typeof toolDispatchInput>;
+
+/** `tool.dispatch` — its result (grammar 6). */
+export const toolDispatchOutput = z.object({
+  accepted: z.boolean(),
+}).strict();
+export type ToolDispatchOutput = z.infer<typeof toolDispatchOutput>;
+
+/** `tool.file_ticket` — its parameters (grammar 6). */
+export const toolFileTicketInput = z.object({
+  title: z.string(),
+  summary: z.string(),
+}).strict();
+export type ToolFileTicketInput = z.infer<typeof toolFileTicketInput>;
+
+/** `tool.file_ticket` — its result (grammar 6). */
+export const toolFileTicketOutput = z.object({
+  id: z.string(),
+}).strict();
+export type ToolFileTicketOutput = z.infer<typeof toolFileTicketOutput>;
+
+/** `tool.lookup` — its parameters (grammar 6). */
+export const toolLookupInput = z.object({
+  term: z.string(),
+  limit: z.number().int().min(1),
+}).strict();
+export type ToolLookupInput = z.infer<typeof toolLookupInput>;
+
+/** `tool.lookup` — its result (grammar 6). */
+export const toolLookupOutput = z.object({
+  hits: z.array(z.string()).max(8),
+}).strict();
+export type ToolLookupOutput = z.infer<typeof toolLookupOutput>;
+
 /** `tool.ping` — its parameters (grammar 6). */
 export const toolPingInput = z.object({}).strict();
 export type ToolPingInput = z.infer<typeof toolPingInput>;

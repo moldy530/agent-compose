@@ -145,6 +145,13 @@ These are load-bearing and pinned by tests in `src/` and `tests/`:
   message's **`tool_calls: []`** is the same mistake one message lower, sent by
   a client that always writes the key when it echoes history, and it is refused
   with the same sentence at `messages.N.tool_calls`.
+* **An assistant turn with an empty content list is refused.**
+  `messages.N.content: List should have at least 1 item` — the Messages API's
+  own sentence, and the shape a tool loop sends when it *rebuilds* its assistant
+  turn from the text and tool calls it read rather than replaying what the model
+  sent. An answer cut short at `max_tokens`, or one that was all `thinking`,
+  reduces to nothing under that reading; a compiled graph must stop on the empty
+  answer instead, and this is the rule that says which of the two happened.
 
 ---
 

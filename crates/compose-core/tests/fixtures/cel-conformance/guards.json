@@ -1,0 +1,125 @@
+[
+  {
+    "name": "a-verdict-guard-is-taken",
+    "expression": "review.output.verdict == 'revise'",
+    "input": { "review": { "output": { "verdict": "revise", "feedback": "tighten it" } } },
+    "result": true
+  },
+  {
+    "name": "the-complement-of-a-verdict-guard",
+    "expression": "review.output.verdict != 'approve'",
+    "input": { "review": { "output": { "verdict": "revise", "feedback": "tighten it" } } },
+    "result": true
+  },
+  {
+    "name": "a-negated-verdict-guard",
+    "expression": "!(review.output.verdict == 'approve')",
+    "input": { "review": { "output": { "verdict": "approve", "feedback": "" } } },
+    "result": false
+  },
+  {
+    "name": "a-verdict-outside-an-in-list",
+    "expression": "review.output.verdict in ['approve']",
+    "input": { "review": { "output": { "verdict": "revise", "feedback": "" } } },
+    "result": false
+  },
+  {
+    "name": "a-guard-conjoining-an-output-field-and-a-channel",
+    "expression": "review.output.verdict == 'revise' && size(state.feedback) > 0",
+    "input": {
+      "review": { "output": { "verdict": "revise", "feedback": "again" } },
+      "state": { "feedback": "again" }
+    },
+    "result": true
+  },
+  {
+    "name": "a-conjunction-a-false-channel-term-closes",
+    "expression": "review.output.verdict == 'revise' && size(state.feedback) > 0",
+    "input": {
+      "review": { "output": { "verdict": "revise", "feedback": "" } },
+      "state": { "feedback": "" }
+    },
+    "result": false
+  },
+  {
+    "name": "a-disjunction-over-two-channels",
+    "expression": "state.round == 1 || state.round == 2",
+    "input": { "state": { "round": 2 } },
+    "result": true
+  },
+  {
+    "name": "a-discriminator-read-off-a-union-item",
+    "expression": "finding.kind == 'auto_fixable'",
+    "input": { "finding": { "kind": "auto_fixable", "file": "src/lib.rs", "hint": "rename it" } },
+    "result": true
+  },
+  {
+    "name": "a-union-payload-field-read-after-its-tag",
+    "expression": "finding.kind == 'auto_fixable' && finding.file.startsWith('src/')",
+    "input": { "finding": { "kind": "auto_fixable", "file": "src/lib.rs", "hint": "rename it" } },
+    "result": true
+  },
+  {
+    "name": "a-macro-over-a-list-of-union-items",
+    "expression": "classify.output.findings.exists(f, f.kind == 'needs_human')",
+    "input": {
+      "classify": {
+        "output": {
+          "findings": [
+            { "kind": "auto_fixable", "file": "a.rs", "hint": "rename it" },
+            { "kind": "needs_human", "summary": "unclear", "severity": "high" }
+          ]
+        }
+      }
+    },
+    "result": true
+  },
+  {
+    "name": "a-bound-on-a-fan-out-source",
+    "expression": "size(plan.output.tasks) > 0 && size(plan.output.tasks) <= 10",
+    "input": { "plan": { "output": { "tasks": [{ "title": "one" }, { "title": "two" }] } } },
+    "result": true
+  },
+  {
+    "name": "an-exec-envelope-exit-code-routes",
+    "expression": "run.output.exit_code == 0",
+    "input": { "run": { "output": { "exit_code": 0, "stdout": "ok\n" } } },
+    "result": true
+  },
+  {
+    "name": "a-widened-http-status-is-routable-data",
+    "expression": "probe.output.status == 404",
+    "input": { "probe": { "output": { "status": 404, "body": "" } } },
+    "result": true
+  },
+  {
+    "name": "a-guard-over-the-execution-object",
+    "expression": "execution.session_key != ''",
+    "input": { "execution": { "id": "exec_01", "session_key": "session-7" } },
+    "result": true
+  },
+  {
+    "name": "a-guard-asking-before-it-reads",
+    "expression": "has(review.output.feedback) && size(review.output.feedback) > 0",
+    "input": { "review": { "output": { "verdict": "approve" } } },
+    "result": false
+  },
+  {
+    "name": "int-arithmetic-inside-a-guard",
+    "expression": "state.totals.fixed + 1 > 2",
+    "input": { "state": { "totals": { "fixed": 2 } } },
+    "result": true
+  },
+  {
+    "name": "a-guard-reading-an-output-field-the-result-omits-fails",
+    "expression": "load.output.value.theme == 'dark'",
+    "input": { "load": { "output": { "found": false } } },
+    "error": true
+  },
+  {
+    "name": "reading-the-item-index-where-no-map-encloses-the-expression-fails",
+    "expression": "execution.item_index == 0",
+    "input": { "execution": { "id": "exec_01", "session_key": "" } },
+    "error": true
+  }
+]

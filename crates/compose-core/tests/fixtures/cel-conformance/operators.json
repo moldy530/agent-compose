@@ -120,6 +120,42 @@
     "result": true
   },
   {
+    "name": "string-ordering-outside-ascii-where-both-readings-agree",
+    "expression": "state.acute < state.euro",
+    "input": { "state": { "acute": "é", "euro": "€" } },
+    "result": true
+  },
+  {
+    "name": "string-ordering-is-by-code-point-not-by-utf-16-code-unit",
+    "expression": "state.replacement < state.astral",
+    "input": { "state": { "replacement": "�", "astral": "😀" } },
+    "result": true
+  },
+  {
+    "name": "string-ordering-puts-a-private-use-character-below-an-astral-one",
+    "expression": "state.private < state.astral",
+    "input": { "state": { "private": "", "astral": "😀" } },
+    "result": true
+  },
+  {
+    "name": "string-ordering-reads-the-same-both-ways-round-across-the-astral-edge",
+    "expression": "state.astral > state.replacement",
+    "input": { "state": { "replacement": "�", "astral": "😀" } },
+    "result": true
+  },
+  {
+    "name": "string-ordering-between-two-astral-characters",
+    "expression": "state.grin < state.beam",
+    "input": { "state": { "grin": "😀", "beam": "😁" } },
+    "result": true
+  },
+  {
+    "name": "string-ordering-is-a-prefix-comparison-when-one-string-runs-out",
+    "expression": "state.short < state.long",
+    "input": { "state": { "short": "😀", "long": "😀a" } },
+    "result": true
+  },
+  {
     "name": "list-equality-is-element-wise",
     "expression": "[1, 2] == [1, 2]",
     "result": true
@@ -142,7 +178,14 @@
   {
     "name": "boolean-guard-over-declared-roots",
     "expression": "state.count > 0 && input.goal != ''",
-    "input": { "state": { "count": 2 }, "input": { "goal": "ship" } },
+    "input": {
+      "state": {
+        "count": 2
+      },
+      "input": {
+        "goal": "ship"
+      }
+    },
     "result": true
   },
   {
@@ -168,6 +211,54 @@
   {
     "name": "int-overflow-is-an-error-and-not-a-wrap",
     "expression": "9223372036854775807 + 1",
+    "error": true
+  },
+  {
+    "name": "logical-and-is-false-when-the-other-side-errors",
+    "expression": "state.missing && false",
+    "input": {
+      "state": {}
+    },
+    "result": false
+  },
+  {
+    "name": "logical-and-is-false-when-the-error-is-on-the-right",
+    "expression": "false && state.missing",
+    "input": {
+      "state": {}
+    },
+    "result": false
+  },
+  {
+    "name": "logical-and-propagates-the-error-when-nothing-absorbs-it",
+    "expression": "state.missing && true",
+    "input": {
+      "state": {}
+    },
+    "error": true
+  },
+  {
+    "name": "logical-or-is-true-when-the-other-side-errors",
+    "expression": "state.missing || true",
+    "input": {
+      "state": {}
+    },
+    "result": true
+  },
+  {
+    "name": "logical-or-is-true-when-the-error-is-on-the-right",
+    "expression": "true || state.missing",
+    "input": {
+      "state": {}
+    },
+    "result": true
+  },
+  {
+    "name": "logical-or-propagates-the-error-when-nothing-absorbs-it",
+    "expression": "state.missing || false",
+    "input": {
+      "state": {}
+    },
     "error": true
   }
 ]

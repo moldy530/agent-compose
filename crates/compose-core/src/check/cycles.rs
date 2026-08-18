@@ -132,14 +132,24 @@ pub(crate) fn check<'a>(ctx: &mut Ctx<'a>, cx: &FlowCx<'a>, graph: &Graph<'a>) {
 
 /// Whether an SCC satisfies either of grammar 7.4's two clauses.
 fn bounded(graph: &Graph<'_>, members: &[usize]) -> bool {
-    for member in members {
-        for edge in graph.outgoing(Vertex::Node(*member)) {
-            if graph.edge(*edge).max_iterations.is_some() && inside(graph, *member, *edge) {
-                return true;
-            }
-        }
-    }
-    members.iter().any(|member| exits(graph, *member))
+    counted(graph, members) || members.iter().any(|member| exits(graph, *member))
+}
+
+/// Grammar 7.4 clause 1, of a whole SCC: some edge whose `from` and `to` are
+/// both in it carries `max_iterations`.
+///
+/// Crate-visible because [`crate::codegen::graph`] reads the same clause to size
+/// a flow's superstep ceiling — a cycle with a counting bound states a number
+/// the ceiling can be derived from, and one without states none. Two readings of
+/// one clause is how a validator and an emitter come to disagree about which
+/// loops are which.
+pub(crate) fn counted(graph: &Graph<'_>, members: &[usize]) -> bool {
+    members.iter().any(|member| {
+        graph
+            .outgoing(Vertex::Node(*member))
+            .iter()
+            .any(|edge| graph.edge(*edge).max_iterations.is_some() && inside(graph, *member, *edge))
+    })
 }
 
 /// Grammar 7.4 clause 2, of one node of the SCC.

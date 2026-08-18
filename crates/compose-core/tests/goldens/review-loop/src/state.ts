@@ -12,6 +12,8 @@
 // a composition never declares and every graph has.
 
 import { Annotation, MessagesAnnotation } from "@langchain/langgraph";
+
+import * as runtime from "./runtime.ts";
 import type { z } from "zod";
 
 import {
@@ -49,6 +51,20 @@ export const channels = {
    * never declared in `state:`, and isolated across flow boundaries by default.
    */
   messages: MessagesAnnotation.spec.messages,
+  /**
+   * The compiler's own channel: what the *runtime* needs beside the composition's
+   * channels and cannot put anywhere else — the flow instance's input object and
+   * execution identity (the `input` and `execution` roots of grammar 4.1), the
+   * per-bounded-edge counters grammar 7.4 requires in graph state, the per-node
+   * traversal ordinals of grammar 9.4, the step number of grammar 7.6, and the
+   * routing trace PRD 5.3 asks for.
+   *
+   * Grammar 2.1's identifier cannot spell `$run`, so no composition collides with it.
+   */
+  $run: Annotation<runtime.RunChannel, Partial<runtime.RunChannel>>({
+    reducer: runtime.mergeRun,
+    default: runtime.emptyRun,
+  }),
 };
 
 /** The state schema the graph is built from. */

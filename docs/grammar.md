@@ -1469,10 +1469,14 @@ outputs alone, so a replay reproduces the live run's schedule and values exactly
 (PRD 5.6, 5.12).
 
 **Steps.** A flow instance executes in **steps**. Step 0 runs the nodes targeted
-by the taken edges leaving `start`. When every node of step *k* has completed,
-its writes are applied to state (§7.6.4) and its outgoing edges are evaluated
-(§7.3); the union of the targets of all edges taken in step *k* is step *k+1*.
-The instance finishes when that union is empty (§7.6.3).
+by the taken edges leaving `start`. Each node's outgoing edges are evaluated
+when **that node** completes (P1, §7.6.1), over the state the node started its
+step on plus the node's own writes — a concurrent sibling's same-step write is
+not visible to a guard, exactly as it is not visible to the node's own
+execution. When every node of step *k* has completed, all of step *k*'s writes
+are applied to state in canonical order (§7.6.4); the union of the targets of
+all edges taken in step *k* is step *k+1*. The instance finishes when that
+union is empty (§7.6.3).
 
 A node **completes** when its own work is done. For the two composite kinds:
 

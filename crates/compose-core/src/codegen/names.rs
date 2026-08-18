@@ -82,7 +82,15 @@ const RESERVED: &[&str] = &[
     "GraphState",
     "GraphStateUpdate",
     // `src/graph.ts`
+    "END",
+    "START",
     "StateGraph",
+    "isInterrupted",
+    "runtime",
+    "flows",
+    "CompiledFlow",
+    "FlowRun",
+    "runFlow",
     "createBuilder",
     // `src/env.ts`
     "process",
@@ -137,6 +145,24 @@ impl Names {
         capitalize(self.value(path))
     }
 
+    /// Assign a name to a path the schema enumeration does not reach.
+    ///
+    /// `src/graph.ts` declares module-level names of its own — one per provider,
+    /// model, agent and tool binding, one per flow builder, one per node
+    /// descriptor, one per shape — and they share the emitted project's single
+    /// module namespace with the schemas. Declaring them here rather than
+    /// deriving them separately is what makes a collision impossible instead of
+    /// unlikely: [`Names::assign`]'s `_2` suffix is the same mechanism, over one
+    /// table.
+    ///
+    /// Idempotent, so a path declared twice keeps its first name.
+    pub fn declare(&mut self, path: &str) -> &str {
+        if !self.assigned.contains_key(path) {
+            self.assign(path);
+        }
+        self.value(path)
+    }
+
     /// Assign one name, disambiguating against everything assigned so far.
     fn assign(&mut self, path: &str) {
         let candidate = camel(path);
@@ -157,8 +183,19 @@ impl Names {
 /// Words are the maximal runs of `[a-z0-9]` between `.` and `_` separators, so
 /// empty runs — a trailing underscore, a doubled one — contribute nothing. That
 /// is exactly the collapse [`Names`] disambiguates afterwards.
+///
+/// A leading `$` marks a path the **emitter** invented rather than one a
+/// composition spelled — `$state.shape`, the shape every declared channel is
+/// read through — and is dropped, so an invented path reads as the name it would
+/// have had. It is a marker rather than a spelling: grammar 2.1's identifier
+/// cannot open with `$`, so an invented path is a key no composition reaches,
+/// and where a composition really does own the unprefixed one (a channel called
+/// `shape`) the registry keeps them apart the way it keeps any two colliding
+/// names apart — the composition's is assigned first, from the schema surfaces,
+/// and the invented one takes `_2`.
 #[must_use]
 pub fn camel(path: &str) -> String {
+    let path = path.strip_prefix('$').unwrap_or(path);
     let mut name = String::with_capacity(path.len());
     for word in path.split(['.', '_']).filter(|word| !word.is_empty()) {
         if name.is_empty() {
@@ -349,6 +386,36 @@ mod tests {
         );
         names.assign("read.environment");
         assert_eq!(names.value("read.environment"), "readEnvironment_2");
+    }
+
+    /// A path the emitter invents is a key of its own, and reads as the name it
+    /// would have had.
+    ///
+    /// `$` is the marker, and it works because grammar 2.1's identifier cannot
+    /// open with one: the invented path is unreachable from a composition, so it
+    /// can never be the *same* key as a declared surface — and dropping the
+    /// marker when the name is spelled means the common case, where nothing
+    /// declares the path it shadows, is spelled the way it always was.
+    #[test]
+    fn an_invented_path_is_its_own_key_and_still_reads_plainly() {
+        let mut names = Names {
+            assigned: BTreeMap::new(),
+            taken: BTreeMap::new(),
+        };
+        names.assign("$state.shape");
+        assert_eq!(names.value("$state.shape"), "stateShape");
+
+        // With the composition's own surface assigned first — which is the order
+        // `Names::of` then `graph::declare` runs in — the invented path is the
+        // one that takes the suffix.
+        let mut names = Names {
+            assigned: BTreeMap::new(),
+            taken: BTreeMap::new(),
+        };
+        names.assign("state.shape");
+        names.assign("$state.shape");
+        assert_eq!(names.value("state.shape"), "stateShape");
+        assert_eq!(names.value("$state.shape"), "stateShape_2");
     }
 
     /// The same composition assigns the same names however its channels are
