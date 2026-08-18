@@ -508,11 +508,13 @@ export interface RunContext {
    * PRD 5.9 asks for failover to be recorded rather than inferred from a
    * provider's own logs.
    *
-   * [`callModel`] is what writes it, on both of its ways out. [`runNode`] reads
-   * it only when the activity threw: an answer that carries `models` carries
-   * them in an order the node decided (a `map`'s, which is source-item order),
-   * while what arrives here arrives in the order the calls were made, across
-   * every attempt the node's `retry:` policy made.
+   * [`callModel`] is what writes it, on both of its ways out, and [`runNode`]
+   * reads it on both of *its* ways out — see [`merged`]. What arrives here
+   * arrives in the order the calls were made, across every attempt the node's
+   * `retry:` policy made and every instance a `map` dispatched, while an answer
+   * that carries `models` carries the subset it put in an order the node decided
+   * (a `map`'s, which is source-item order). So the answer decides the order and
+   * this decides the set.
    */
   readonly modelCalls?: ModelCall[];
 }
@@ -3915,6 +3917,36 @@ const EXECUTION_SHAPE = {
 } as const;
 
 /**
+ * Every model call one node execution made, reported once (PRD 5.9).
+ *
+ * `made` is the node's own channel ([`RunContext.modelCalls`]): every call, in
+ * the order it was made, across every attempt the node's `retry:` policy made
+ * and every instance a `map` dispatched. `ordered` is what the *answer* carried,
+ * which is the subset the node put in an order of its own — a `map`'s, which is
+ * source-item order — and which is therefore the shape a reader of a successful
+ * run expects.
+ *
+ * The two are not the same set. An answer can only hold what its own attempt
+ * produced and only what the node had something to say about, so three kinds of
+ * real call fall outside it: an earlier attempt's, an item whose own retries
+ * were exhausted and which `on_item_error: skip` absorbed, and an item-level
+ * retry's earlier attempts. This puts them back, ahead of `ordered` and in the
+ * order they were made, and identifies them by **identity** rather than by
+ * shape: [`callModel`] pushes the very object it returns, so a call is in
+ * `ordered` exactly when it is the same object.
+ */
+function merged(
+  made: readonly ModelCall[],
+  ordered: readonly ModelCall[] | undefined,
+): readonly ModelCall[] | undefined {
+  if (made.length === 0) return ordered;
+  if (ordered === undefined || ordered.length === 0) return [...made];
+  const carried = new Set(ordered);
+  const outside = made.filter((call) => !carried.has(call));
+  return outside.length === 0 ? ordered : [...outside, ...ordered];
+}
+
+/**
  * Run one node: its input, its activity, its writes, and its routing decision —
  * in one LangGraph task, which is what makes grammar 7.6's P1 (a node's edges
  * are evaluated only after it has completed) structural rather than asserted.
@@ -3988,9 +4020,10 @@ export async function runNode(
   // (PRD 5.8). Owned here rather than by `runActivity` so a node that fails
   // still reports what it wrote before it did.
   const storeRecords: StoreRecord[] = [];
-  // And every model call, for the same reason and read the same way: only when
-  // the activity threw, because an answer that carries `models` carries them in
-  // the order the node decided (PRD 5.9, and see `RunContext.modelCalls`).
+  // And every model call, for the same reason and read the same way: whichever
+  // way the node leaves, this is the set that really happened, and an answer —
+  // when there is one — is what puts the calls it carried in the order the node
+  // decided (PRD 5.9, and see `RunContext.modelCalls` and `merged`).
   const modelCalls: ModelCall[] = [];
 
   /** This node's entry, for a failure that leaves nothing else behind. */
@@ -4043,7 +4076,20 @@ export async function runNode(
     channels = answer.value.channels;
     dispatches = answer.value.dispatches;
     inner = answer.value.inner;
-    models = answer.value.models;
+    // Every model call this node execution made, which is more than the answer
+    // can carry (PRD 5.9, `RunContext.modelCalls`). An answer holds the calls it
+    // *ordered* — a `map`'s in source-item order — and by construction only the
+    // ones the attempt it came out of made, so a node that succeeded on its
+    // second `retry:` attempt would otherwise report a trace with no trace of
+    // the first, spent ladder and all. What `modelCalls` holds beside them
+    // really happened and has nowhere else to be reported: an earlier attempt's
+    // calls, and the calls of an item the fan-out absorbed under
+    // `on_item_error: skip`. They are reported ahead of the ordering the answer
+    // imposes, in the order they were made, rather than interleaved into an
+    // ordering that is not a clock — see [`merged`]. `stores` on the same entry
+    // has always been the whole of `storeRecords` for the same reason, and this
+    // is the half that was missing it.
+    models = merged(modelCalls, answer.value.models);
   } catch (error) {
     const strategy = policy.onError;
     failure = error instanceof NodeFailure ? error : undefined;
