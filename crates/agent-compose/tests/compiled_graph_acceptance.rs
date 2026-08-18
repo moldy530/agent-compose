@@ -4543,6 +4543,15 @@ fn a_session_scoped_store_outlives_the_execution_that_wrote_it() {
         failure.contains("store.memory") && failure.contains("scope: session"),
         "the refusal names the store, which is what the author has to look at: {failure}"
     );
+    assert!(
+        failure.contains("where one is declared, it answered the empty string for this invocation"),
+        "…and names all three ways a run arrives with no identity, the one this \
+         run did not take included: a trigger's declared `session_key:` that \
+         evaluated to nothing is an identity-less run whose author has already \
+         taken both of the other two remedies, and a message offering only those \
+         two would send that reader to look at a line already there (PRD G3): \
+         {failure}"
+    );
 }
 
 /// A declared `manual` trigger's `session_key:` remaps the `--session` the CLI

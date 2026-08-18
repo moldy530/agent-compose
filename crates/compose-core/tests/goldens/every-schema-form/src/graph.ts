@@ -783,9 +783,16 @@ export async function runFlow(
   // started without one would silently address a partition named by the empty
   // string. Named by the store rather than by the flow, because the store is
   // what the author has to look at.
+  //
+  // Three ways a run arrives here and all three are named, because two of them
+  // are advice a reader has already taken. A declared `session_key:` that
+  // *evaluated* to the empty string — an absent header, a payload member that
+  // was not sent — is an identity-less run whose trigger does declare one, and a
+  // message offering only the two remedies would send that reader to look at a
+  // line that is already there (PRD G3).
   if (sessionKey === "" && flow.sessionStores.length > 0) {
     throw new Error(
-      `\`${address}\` reaches ${flow.sessionStores.map((store) => `\`${store}\``).join(", ")}, which ${flow.sessionStores.length === 1 ? "is" : "are"} \`scope: session\`, so this run needs a session identity: pass \`--session <key>\` to \`agent-compose run\`, or declare \`session_key:\` on the trigger that starts it (grammar 11.3, 13.2)`,
+      `\`${address}\` reaches ${flow.sessionStores.map((store) => `\`${store}\``).join(", ")}, which ${flow.sessionStores.length === 1 ? "is" : "are"} \`scope: session\`, so this run needs a session identity and arrived with none: pass \`--session <key>\` to \`agent-compose run\`, or declare \`session_key:\` on the trigger that starts it — and where one is declared, it answered the empty string for this invocation (grammar 11.3, 13.2)`,
     );
   }
   const executionId = options.executionId ?? `exec_${globalThis.crypto.randomUUID()}`;
