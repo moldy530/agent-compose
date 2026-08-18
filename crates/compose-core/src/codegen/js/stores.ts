@@ -67,10 +67,22 @@
 //   execution), so the record is what a trace holds and what a later replay will
 //   read.
 // * **writes are at-least-once, keyed** — a store-op node's write carries the
-//   idempotency key of grammar 9.4, and this backend dedupes on it: the key and
-//   the op's own answer are written in the **same transaction** as the effect, so
-//   an attempt that failed half way leaves neither, and a retry of the same
-//   effect site answers what the first attempt answered instead of writing twice.
+//   idempotency key of grammar 9.4, and this backend dedupes on it: a retry of
+//   the same effect site answers what the first attempt answered instead of
+//   writing twice.
+//
+//   In the SQLite-backed kinds the key and the op's own answer are written in
+//   the **same transaction** as the effect, so an attempt that failed half way
+//   leaves neither. The `blob` backend is a directory rather than a database and
+//   has no transaction to join: it applies the effect and then publishes the
+//   ledger entry by writing it to a temporary name and renaming it into place,
+//   which is atomic on every filesystem this runs on — so a half-written marker
+//   is impossible, but a process that dies **between** the two leaves the effect
+//   applied with no marker, and the next attempt applies it again. For `put`
+//   that is a byte-identical overwrite; for `delete` the repeat answers
+//   `deleted: false` where the first attempt answered `deleted: true`. That is
+//   the difference between a transactional store and a filesystem, and it is
+//   written down here rather than promised away.
 //
 // A store write an **agent** made through a synthesized tool (grammar 11.5)
 // carries no key and is not deduped. Grammar 9.4 names exactly two carriers — "a
@@ -617,7 +629,14 @@ function tabular(
       const prefix = params.prefix ?? "";
       const rows = database.all(
         "SELECT key FROM entries WHERE scope_key = ? AND substr(key, 1, ?) = ? ORDER BY key LIMIT ?",
-        [scopeKey, prefix.length, prefix, limit],
+        // Characters, not JavaScript string length. SQLite's `substr` over TEXT
+        // counts **characters**, and a JavaScript `.length` counts UTF-16 code
+        // units — so an emoji in the prefix makes the two disagree by one per
+        // astral character, and the comparison silently answers with the wrong
+        // keys (usually none) for a `prefix:` grammar 11.4 puts no restriction
+        // on. Spreading the string iterates code points, which is what SQLite
+        // is counting on the other side.
+        [scopeKey, [...prefix].length, prefix, limit],
       ) as Row[];
       return { keys: rows.map((row) => String(row["key"])) };
     }
@@ -704,8 +723,15 @@ function blobOp(
       return { row: JSON.parse(fs.readFileSync(marker, "utf8")) as Record<string, unknown>, deduped: true };
     }
     const row = blobEffect(store, op, params, values, types);
+    // Published by rename, which is atomic: a marker a reader finds is a marker
+    // written whole, so a later attempt never parses half a row back as the
+    // answer the first one gave. What a rename cannot give this backend is the
+    // transaction the SQLite kinds have — see this module's header for what a
+    // process that dies between the effect and the marker leaves behind.
     fs.mkdirSync(ledger, { recursive: true });
-    fs.writeFileSync(marker, JSON.stringify(row));
+    const staged = `${marker}.${process.pid}.partial`;
+    fs.writeFileSync(staged, JSON.stringify(row));
+    fs.renameSync(staged, marker);
     return { row, deduped: false };
   }
   return { row: blobEffect(store, op, params, values, types), deduped: false };

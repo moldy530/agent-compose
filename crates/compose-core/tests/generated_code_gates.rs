@@ -1533,6 +1533,36 @@ fn the_local_backends_behaved(answer: &Value) {
         "…and a write under a different key is a different effect"
     );
 
+    // A `prefix:` outside the BMP. SQLite's `substr` counts characters and a
+    // JavaScript `.length` counts UTF-16 code units, so a filter that mixed the
+    // two answers this legal read with the wrong keys — and grammar 11.4 puts no
+    // character restriction on the parameter.
+    assert_eq!(
+        answer["astralAll"],
+        json!({ "keys": ["zzz", "\u{1F600}alpha", "\u{1F600}beta"] }),
+        "the keys are there to be filtered in the first place"
+    );
+    assert_eq!(
+        answer["astralPrefix"],
+        json!({ "keys": ["\u{1F600}alpha", "\u{1F600}beta"] }),
+        "an astral prefix matches the keys that start with it"
+    );
+    assert_eq!(
+        answer["astralDeeper"],
+        json!({ "keys": ["\u{1F600}alpha"] }),
+        "…and one more character narrows it, rather than sliding off the key"
+    );
+    assert_eq!(
+        answer["astralMiss"],
+        json!({ "keys": [] }),
+        "a prefix nothing carries still matches nothing"
+    );
+    assert_eq!(
+        answer["astralBlobPrefix"], answer["astralPrefix"],
+        "the `blob` backend's `list` answers the same prefix the same way: one op \
+         of grammar 11.4's catalogue, two backends"
+    );
+
     // The records a trace entry carries (PRD 5.8): a read keeps its answer, a
     // write keeps its key and whether the backend had seen it.
     let records = answer["records"]

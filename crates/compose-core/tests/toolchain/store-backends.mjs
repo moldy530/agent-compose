@@ -103,6 +103,59 @@ const answer = {};
   answer.records = run.storeRecords;
 }
 
+// --- A `prefix:` outside the BMP, which two string lengths disagree about -----
+
+{
+  // Grammar 11.4 puts no character restriction on `prefix:`, and the two sides
+  // of the comparison count characters differently: SQLite's `substr` counts
+  // **characters**, a JavaScript `.length` counts UTF-16 code units, and an
+  // astral character is one of the first and two of the second. A prefix filter
+  // that mixed the two answers a legal read with the wrong keys — silently, and
+  // the answer goes into the trace as history.
+  const store = binding("emoji", "kv", "global");
+  const run = context("exec_astral");
+  await stores.runStoreOp(store, "set", { key: "😀alpha", value: { n: 1 } }, run, node("a/1"));
+  await stores.runStoreOp(store, "set", { key: "😀beta", value: { n: 2 } }, run, node("a/2"));
+  await stores.runStoreOp(store, "set", { key: "zzz", value: { n: 3 } }, run, node("a/3"));
+  answer.astralAll = await stores.runStoreOp(store, "list", { limit: 10 }, run, node());
+  answer.astralPrefix = await stores.runStoreOp(
+    store,
+    "list",
+    { prefix: "😀", limit: 10 },
+    run,
+    node(),
+  );
+  answer.astralDeeper = await stores.runStoreOp(
+    store,
+    "list",
+    { prefix: "😀al", limit: 10 },
+    run,
+    node(),
+  );
+  answer.astralMiss = await stores.runStoreOp(
+    store,
+    "list",
+    { prefix: "😀gamma", limit: 10 },
+    run,
+    node(),
+  );
+
+  // The same three prefixes against a `blob` store, whose `list` is JavaScript
+  // rather than SQL: the two backends answer one op of grammar 11.4's catalogue,
+  // so they have to answer it the same way.
+  const blobs = binding("emoji_blobs", "blob", "global");
+  await stores.runStoreOp(blobs, "put", { key: "😀alpha", value: "one" }, run, node("a/4"));
+  await stores.runStoreOp(blobs, "put", { key: "😀beta", value: "two" }, run, node("a/5"));
+  await stores.runStoreOp(blobs, "put", { key: "zzz", value: "three" }, run, node("a/6"));
+  answer.astralBlobPrefix = await stores.runStoreOp(
+    blobs,
+    "list",
+    { prefix: "😀", limit: 10 },
+    run,
+    node(),
+  );
+}
+
 // --- `session`: one file, one partition per key ------------------------------
 
 {
