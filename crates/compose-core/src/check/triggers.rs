@@ -21,7 +21,8 @@
 //! so the read fails every time (grammar 13.3, Decision D117).
 //!
 //! One rule relates two triggers rather than reading inside one: two `http`
-//! triggers MUST NOT declare the same route ([`routes`]).
+//! triggers MUST NOT declare the same route ([`routes`]). It is the one rule in
+//! this file the normative spec does not state — see there.
 
 use crate::ast::trigger::TriggerMethod;
 use crate::cel::ty::Type;
@@ -44,18 +45,38 @@ pub(crate) fn check(ctx: &mut Ctx) {
     routes(ctx);
 }
 
-/// Two `http` triggers declaring one route (grammar 13.3).
+/// Two `http` triggers declaring one route.
 ///
 /// The generated app mounts one route per declared `http` trigger, at its
 /// effective `path:` and `method:` — the pair each one *defaults* rather than
 /// the pair each one writes, since `path:` defaults to `/triggers/<name>` and
-/// `method:` to `POST`. A router cannot dispatch one pair two ways, so a second
-/// trigger claiming the first's route makes the app refuse to start: every
-/// request to that route would have to run two flows, and no answer to "which
-/// one" is written anywhere. That is a guaranteed runtime failure visible in the
-/// two trigger objects, which the grammar's standing posture refuses at compile
-/// time naming the construct rather than shipping (§13.3's own reading of it,
-/// Decision D117).
+/// `method:` to `POST` (§13.3's table). A router cannot dispatch one pair two
+/// ways, so a second trigger claiming the first's route makes the app refuse to
+/// start — Fastify answers `FST_ERR_DUPLICATED_ROUTE` at `listen` — and every
+/// request to that route would have to run two flows, with no answer to "which
+/// one" written anywhere. That is a guaranteed runtime failure visible in the
+/// two trigger objects, and refusing one of those at compile time naming the
+/// construct is the standing posture §7.6.3 takes on a guaranteed dead end and
+/// §13.3 takes on a `GET` reading `payload.body`.
+///
+/// # This rule is the compiler's, not yet the spec's
+///
+/// **`docs/grammar.md` does not state it.** §13.3 fixes the mount model this is
+/// derived from — `path:` is "route of the generated app", it defaults to
+/// `/triggers/<name>`, `method:` defaults to `POST`, and "generated apps expose
+/// `start`, `resume`, and `status` routes" — but says nothing about two triggers
+/// landing on one pair, no Decision entry covers it (D117 is `payload.body` on a
+/// bodyless request), and `schemas/agent-compose.schema.json` accepts it. So a
+/// spec that an editor validates green is refused here.
+///
+/// That direction is the one Appendix B sanctions — "a file that passes the
+/// schema and fails `validate` is normal and expected", and the schema cannot
+/// see two sibling triggers' *effective* routes anyway — but the appendix
+/// enumerates the rules it defers, and this one is not among them. Reported as a
+/// doc defect: the grammar wants a sentence in §13.3 and a Decision entry, and
+/// the check is written to be exactly what that sentence would say, so ratifying
+/// it changes no behaviour. It is kept rather than dropped because dropping it
+/// ships the failure instead of the diagnostic.
 ///
 /// **Exact pairs only.** A router's parameter syntax "passes through
 /// unexamined" (§13.3), so `/reviews/:id` beside `/reviews/:name` is a conflict

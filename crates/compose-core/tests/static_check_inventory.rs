@@ -173,6 +173,12 @@ const M0: &[Check] = &[
 
 /// The validator-owned rules `docs/grammar.md` Appendix B names that PRD §7 M0's
 /// sentence does not enumerate individually.
+///
+/// One row is the exception and labels itself: `duplicate-route` is a rule the
+/// compiler applies that the grammar does not state, kept because the failure it
+/// refuses is guaranteed, and reported as a doc defect at its own row and in
+/// `check/triggers.rs::routes`. A reader auditing this list against the grammar
+/// should find every other row there.
 const GRAMMAR: &[Check] = &[
     Check {
         rule: "balanced convergence (7.6.2, D112)",
@@ -247,7 +253,15 @@ const GRAMMAR: &[Check] = &[
         evidence: Evidence::Fixture,
     },
     Check {
-        rule: "two `http` triggers do not declare one route (13.3)",
+        // The one row whose rule the spec does not state. §13.3 fixes the mount
+        // model it follows from — one route per `http` trigger, at the `path:`
+        // and `method:` each one *defaults* — but no sentence and no Decision
+        // entry forbids two triggers landing on one pair, and the published
+        // schema accepts it. `check/triggers.rs::routes` reports that as a doc
+        // defect and says why the check is kept meanwhile; the citation here is
+        // deliberately not a section number, so this row cannot be read as
+        // evidence that the grammar says it.
+        rule: "two `http` triggers do not declare one route (compiler rule over 13.3's mount model)",
         pass: "check/triggers.rs",
         codes: &["duplicate-route"],
         evidence: Evidence::Fixture,
