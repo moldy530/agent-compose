@@ -5,17 +5,21 @@
 #   * **store-op nodes** — `load`, `remember` and `reread` below: deterministic,
 #     graph-invoked, schema-checked against `value_schema`, and under
 #     `--target local` backed by SQLite/local disk with no infrastructure at all;
-#   * **agent-attached** — `store.docs` and `store.prefs` on `agent.grounded`:
-#     codegen synthesizes LLM-facing tools from each store's kind and schema
-#     (grammar 11.5), and they appear in the model request the mock records.
+#   * **agent-attached** — `store.docs`, `store.prefs` and `store.artifacts` on
+#     `agent.grounded`: codegen synthesizes LLM-facing tools from each store's
+#     kind and schema (grammar 11.5), they appear in the model request the mock
+#     records, and a model that calls one reaches the same backends the nodes do.
+#     All three kinds are attached, so all three rows of 11.5's table are real.
 #
 # `agent_access:` is what makes the second surface worth a fixture of its own:
 # `store.docs` is `read`, so the synthesized surface is `docs_search` and NOT
-# `docs_upsert`, while `store.prefs` takes the `read_write` default and
-# synthesizes `prefs_get` **and** `prefs_set`. The tool list of the recorded
-# request is exactly that claim, checkable. The key itself is Decision D37 and
-# still PRD §10's first open question — the grammar accepts it (M0), and if the
-# PRD declines it this fixture drops the line and keeps everything else.
+# `docs_upsert`, while `store.notes` — the same **kind** — takes the `read_write`
+# default and gets both, and `store.prefs` gets `prefs_get` **and** `prefs_set`.
+# The tool list of the recorded request is exactly that claim, checkable, and the
+# two vector stores make it a comparison rather than an absence. The key itself
+# is Decision D37 and still PRD §10's first open question — the grammar accepts
+# it (M0), and if the PRD declines it this fixture drops the line and keeps
+# everything else.
 #
 # `embed.provider` is an `openai_compatible` connection because embeddings are
 # served by a provider that publishes the capability (grammar 11.2), and it is a
@@ -126,9 +130,30 @@ store.docs:
     source: { type: string }
   agent_access: read
 
+# The same kind as `store.docs` at the other `agent_access:`, which is what makes
+# the narrowing a comparison rather than an absence: one attachment list offers
+# `notes_upsert` and withholds `docs_upsert`. It is also the store a model can
+# both write and read in one node, so the arguments a synthesized tool carries —
+# including the `metadata:` an upsert supplies and the `filter:` a search matches
+# it with — are observable from what a later tool call answers, with nothing
+# staged behind it. `scope: execution` because it holds this run's own working
+# notes and nothing after the run has any business reading them.
+store.notes:
+  kind: vector
+  scope: execution
+  description: What the model wrote down while answering.
+  embed:
+    model: text-embedding-3-small
+    provider: provider.embeddings
+    dimensions: 8
+  metadata_schema:
+    source: { type: string }
+
 # The third kind (grammar 11.1): bulk content on local disk under
-# `--target local`. Nothing attaches it, so it synthesizes no tools; it is the
-# store-op surface only.
+# `--target local`. It is reached both ways — store-op nodes in `flow.ground`,
+# and the three tools grammar 11.5's third row synthesizes for an attached
+# `blob` (`artifacts_get`, `artifacts_list`, `artifacts_put`), which is the row
+# no other store here covers.
 store.artifacts:
   kind: blob
   scope: global
@@ -152,7 +177,7 @@ agent.grounded:
   prompt: |
     Answer the question. Search the documentation before answering, and record
     any preference the user states.
-  stores: [store.docs, store.prefs]
+  stores: [store.docs, store.notes, store.prefs, store.artifacts]
   input:
     question: { type: string }
     known: { type: boolean }

@@ -7,9 +7,12 @@
 # model id — which is what the mock's per-model queues key on, and therefore what
 # a transcript assertion can see.
 #
-# A `server_error` is deliberately NOT in `route_on:`: a condition outside the
-# declared list must fail the node rather than fail over, and a fixture that
-# listed everything could not tell the two apart.
+# A `server_error` is deliberately NOT in `model.default`'s `route_on:`: a
+# condition outside the declared list must fail the node rather than fail over,
+# and a route that listed everything could not tell the two apart. So the fourth
+# condition gets a route of its own — `model.resilient` below — and the two
+# together decide `route_on:` in both directions: every condition a route
+# declares fails over, and every condition it does not declare does not.
 version: "0.1"
 
 state:
@@ -42,6 +45,29 @@ model.default:
 agent.answerer:
   description: Answers one question.
   model: model.default
+  prompt: |
+    Answer the question in one sentence. Do not ask for clarification.
+  input:
+    question:
+      type: string
+  output:
+    answer:
+      type: string
+      min_length: 1
+
+# The same two members in the same order, declared on the one condition
+# `model.default` withholds. A 5xx is what `model.default` fails the node on and
+# what this one fails **over** on, from one scripted outcome — which is what
+# makes the two routes a decision about `route_on:` rather than about the shape
+# a 500 arrives in.
+model.resilient:
+  description: The same ladder, declared on `server_error` alone.
+  route: [model.smart, model.fast]
+  route_on: [server_error]
+
+agent.persistent:
+  description: Answers one question through a route that survives a 5xx.
+  model: model.resilient
   prompt: |
     Answer the question in one sentence. Do not ask for clarification.
   input:
@@ -89,6 +115,51 @@ flow.ask:
   nodes:
     ask:
       agent: agent.answerer
+      input:
+        question: "input.question"
+  edges:
+    - { from: start, to: ask }
+    - { from: ask, to: end }
+
+# The same route under a node `retry:`, which is the one place a trace can lose a
+# model call: an attempt that spends the whole ladder and fails has calls no
+# answer can carry out, and the attempt that succeeds carries only its own. Two
+# attempts over two members is four provider outcomes and one trace entry, which
+# is what makes "every call this node made" checkable.
+flow.ask_again:
+  description: Ask one question through a failover route, retrying the node.
+  inputs:
+    question:
+      type: string
+      min_length: 1
+  outputs:
+    answer:
+      type: string
+  nodes:
+    ask:
+      agent: agent.answerer
+      input:
+        question: "input.question"
+      retry: { max: 1, backoff: 10ms }
+  edges:
+    - { from: start, to: ask }
+    - { from: ask, to: end }
+
+# The same question through `model.resilient`, which is the only way a
+# `server_error` reaches a route that declares it. The node is named `ask` like
+# the others, so one trace assertion reads every flow of this fixture.
+flow.ask_resiliently:
+  description: Ask one question through a route declared on `server_error`.
+  inputs:
+    question:
+      type: string
+      min_length: 1
+  outputs:
+    answer:
+      type: string
+  nodes:
+    ask:
+      agent: agent.persistent
       input:
         question: "input.question"
   edges:

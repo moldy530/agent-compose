@@ -433,6 +433,15 @@ const CODEGEN: &[Criterion] = &[
                 Status::Live,
             ),
             ("agent_access_read_withholds_the_write_tool", Status::Live),
+            // The two rows above decide the tool *list*. This one decides the
+            // surface: a model that calls one of those tools reaches the same
+            // backend the store-op nodes reach, carrying the arguments it sent —
+            // which a list cannot show, and which is the half of "synthesized
+            // store tools" a composition actually depends on.
+            (
+                "an_agent_calling_a_synthesized_store_tool_reaches_the_backend_with_its_arguments",
+                Status::Live,
+            ),
         ],
     },
     Criterion {
@@ -447,10 +456,14 @@ const CODEGEN: &[Criterion] = &[
                 "a_condition_outside_route_on_fails_the_node_instead_of_failing_over",
                 Status::Live,
             ),
-            // The two conditions the first row does not stage. `route_on:` is a
-            // declared list, so a criterion met for one of its members and not
-            // the others would be met by an accident of which status the
-            // fixture happened to script.
+            // The three conditions the first row does not stage, each failing
+            // over through a route that declares it. `route_on:` is a declared
+            // list, so a criterion met for one of its members and not the others
+            // would be met by an accident of which status the fixture happened
+            // to script — and with this row grammar 12.2's whole enumeration is
+            // staged **positively**, so a classifier that stopped recognising a
+            // condition fails here instead of quietly turning the row above into
+            // the only place that condition appears.
             (
                 "every_declared_condition_is_recognized_from_the_shape_the_provider_answers_with",
                 Status::Live,
@@ -464,9 +477,15 @@ const CODEGEN: &[Criterion] = &[
                 Status::Live,
             ),
             // "recorded" is the load-bearing half of this phrase, and a record
-            // that survived only a successful run would not be one.
+            // that survived only a successful run would not be one — nor one
+            // that survived only the *winning attempt* of a retried node, which
+            // is the other half and the one the answer alone cannot carry.
             (
                 "an_exhausted_route_records_every_member_it_spent_in_the_failed_nodes_trace",
+                Status::Live,
+            ),
+            (
+                "a_node_that_succeeded_on_a_retry_records_what_its_earlier_attempt_called",
                 Status::Live,
             ),
         ],
@@ -558,7 +577,7 @@ const COMMANDS: &[Criterion] = &[
             // Fastify app" as which routes it mounts: the body rule of
             // Decision D117, and the completion webhook `start` fires.
             (
-                "a_request_with_an_empty_body_starts_an_execution_and_an_undecodable_one_does_not",
+                "a_request_with_an_empty_body_starts_an_execution_and_a_non_object_one_does_not",
                 Status::Live,
             ),
             (
