@@ -42,6 +42,16 @@
 // started before it was restarted. The sync-timeout upgrade continues the same
 // in-process execution rather than resuming a checkpointed one.
 //
+// **Nothing is evicted**, and that is a decision rather than an omission. The
+// map holds every execution this process started, with its outputs and its
+// trace, so a long-running `serve` grows with the number of requests it has
+// answered. The alternative is an eviction policy, and every policy this
+// milestone could write is a `404` for an execution that really ran — a caller
+// polling a status URL it was handed, told the run never existed. A retention
+// story needs somewhere for an evicted execution to *be*, which is the
+// checkpointer, so it is M3's to write; until then the boundary is stated here
+// and in the emitted `README.md` rather than approximated with a bound.
+//
 // # Resume, and the runtime it waits for
 //
 // `resume` exists, validates that the execution exists, and then says what it
@@ -198,7 +208,17 @@ async function start(
   // arrived without one presents `{}` too, and one that is present and is not a
   // JSON **object** — whatever media type it announced, see [`decodeBodies`] —
   // starts no execution (grammar 13.3, Decision D117).
-  const body = trigger.readsBody ? (request.body ?? {}) : {};
+  //
+  // The two cases are told apart by `undefined`, and only by it: a request the
+  // framework parsed **no** body for is the one way `request.body` is
+  // `undefined`, because [`decodeBodies`] answers every body it is handed with
+  // an object, the decoded value, or the undecodable text. So a body that is
+  // present and decodes to JSON `null` arrives here as `null` and is refused
+  // below with every other non-object — `?? {}` would make it the empty payload
+  // of a request that carried nothing, and start an execution D117 says starts
+  // none.
+  const decoded = trigger.readsBody ? request.body : undefined;
+  const body = decoded === undefined ? {} : decoded;
   if (typeof body !== "object" || body === null || Array.isArray(body)) {
     return reply.code(400).send({
       error: "the request body is not a JSON object, so there is nothing for the trigger's `input:` to read (grammar 13.3, Decision D117)",
