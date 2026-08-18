@@ -13,9 +13,9 @@
 //! | `reduce:` | channel | initial value | one write supplies |
 //! |---|---|---|---|
 //! | *absent* | `Annotation<T>` — LangGraph's `LastValue` | unset, or the declared `default:` | the whole value |
-//! | `last_wins` | reducer `(_left, right) => right` | unset, or the declared `default:` | the whole value |
-//! | `append` | reducer `(left, right) => left.concat([right])` | `[]`, or the declared `default:` | **one element** (Decision D58) |
-//! | `merge` | reducer `(left, right) => ({ …left, …right })` | `{}`, or the declared `default:` | a partial object |
+//! | `last_wins` | reducer `runtime.setReduce` | unset, or the declared `default:` | the whole value |
+//! | `append` | reducer `runtime.appendReduce` | `[]`, or the declared `default:` | **one element** (Decision D58) |
+//! | `merge` | reducer `runtime.mergeReduce` | `{}`, or the declared `default:` | a partial object |
 //!
 //! Two of those rows carry a decision worth stating outright:
 //!
@@ -61,23 +61,37 @@
 //!
 //! A reducer sees writes one at a time and can only be as ordered as the caller.
 //! The canonical write order of grammar 7.6.4 is imposed by the pass that
-//! *applies* the writes, and half of that pass has landed. **Clause 1** —
-//! the writers of a step ordered by ascending node id — holds today, inherited
-//! from the scheduler that calls the emitted node functions rather than imposed
-//! by anything this module emits, which is why
-//! `concurrent_writers_append_in_node_id_order_not_completion_order`
-//! (`crates/agent-compose/tests/compiled_graph_acceptance.rs`) asserts it over a
-//! compiled graph whose three orders — node id, declaration, completion — all
-//! disagree. **Clause 2** — a `map`'s instances by source-item index, occupying
-//! the map node's own place in that order — is the half still pending: `map` is
-//! emitted as a node that throws [`super::graph`]'s `Unimplemented`, so nothing
-//! here has dispatched instances to order yet.
+//! *applies* the writes, and both of its clauses now hold:
+//!
+//! * **Clause 1** — the writers of a step ordered by ascending node id — is
+//!   inherited from the scheduler that calls the emitted node functions rather
+//!   than imposed by anything this module emits, which is why
+//!   `concurrent_writers_append_in_node_id_order_not_completion_order`
+//!   (`crates/agent-compose/tests/compiled_graph_acceptance.rs`) asserts it over
+//!   a compiled graph whose three orders — node id, declaration, completion —
+//!   all disagree.
+//! * **Clause 2** — a `map`'s instances by source-item index, occupying the map
+//!   node's own place in that order — is imposed by the map node itself. Its
+//!   instances are not writers of the step: the node collects their results,
+//!   folds them in index order, and writes **one** entry per channel carrying
+//!   all of them (`runtime.OrderedWrites`). Every reducer emitted here therefore
+//!   goes through `./runtime.ts`, which unpacks that batch and otherwise behaves
+//!   exactly as the hand-written spelling did.
+//!
+//! One channel cannot be handed that batch, and it is the one this table gives
+//! no initial value: a **`last_wins` channel with no `default:`**. LangGraph
+//! keeps the first update to an empty channel *verbatim* rather than calling the
+//! reducer with it, so a batch arriving first would become the channel's value
+//! instead of being unpacked into it. The map node folds a `set` batch before it
+//! writes (`runtime.orderedUpdate`), which is why this module can leave the
+//! channel starting unset — the reading grammar 10.1 and Decision D78 require —
+//! rather than inventing an initial value to make a reducer run.
 //!
 //! What is fixed here either way is that each policy is **order-faithful**:
 //! `append` appends in the order it is called, `merge` lets the last call win a
-//! key, `last_wins` keeps the last call. A reducer that sorted or deduplicated on
-//! its own would make the canonical order unobservable and unfixable — including
-//! by the clause-2 pass that still has to arrive.
+//! key, `last_wins` keeps the last call — and a batch is replayed into the same
+//! call in index order. A reducer that sorted or deduplicated on its own would
+//! make the canonical order unobservable.
 
 use crate::ast::document::Reduce;
 use crate::ir::Ir;
@@ -274,16 +288,25 @@ fn annotation(channel: &crate::ir::Channel, schema: &str) -> String {
     let value = format!("z.infer<typeof {schema}>");
     let initial = initial(channel);
 
+    // Every reducer goes through `./runtime.ts`, because a `map` node writes one
+    // channel entry carrying **every** instance's contribution in source-item
+    // order (grammar 7.6.4 clause 2): the reducer is called once and unpacks the
+    // batch, which is the only shaping in which the order is the source array's
+    // rather than the scheduler's. A plain write is the same call with nothing to
+    // unpack, so the two spellings stay one function.
     let (types, reducer) = match channel.reduce {
         Some(Reduce::Append) => (
-            format!("{value}, {value}[number]"),
-            "(left, right) => left.concat([right])",
+            format!("{value}, runtime.Written<{value}[number]>"),
+            "(left, right) => runtime.appendReduce(left, right)",
         ),
         Some(Reduce::Merge) => (
-            format!("Partial<{value}>, Partial<{value}>"),
-            "(left, right) => ({ ...left, ...right })",
+            format!("Partial<{value}>, runtime.Written<Partial<{value}>>"),
+            "(left, right) => runtime.mergeReduce(left, right)",
         ),
-        Some(Reduce::LastWins) | None => (value.clone(), "(_left, right) => right"),
+        Some(Reduce::LastWins) | None => (
+            format!("{value}, runtime.Written<{value}>"),
+            "(left, right) => runtime.setReduce(left, right)",
+        ),
     };
 
     // An unreduced channel with no initial value is LangGraph's `LastValue`,
@@ -337,8 +360,8 @@ mod tests {
         let emitted = state_of("  draft: { type: string, default: \"\" }\n");
         assert!(
             emitted.contains(
-                "  draft: Annotation<z.infer<typeof stateDraft>>({\n    \
-                 reducer: (_left, right) => right,\n    \
+                "  draft: Annotation<z.infer<typeof stateDraft>, runtime.Written<z.infer<typeof stateDraft>>>({\n    \
+                 reducer: (left, right) => runtime.setReduce(left, right),\n    \
                  default: () => \"\",\n  }),\n"
             ),
             "{emitted}"
@@ -354,8 +377,8 @@ mod tests {
         );
         assert!(
             emitted.contains(
-                "  notes: Annotation<z.infer<typeof stateNotes>, z.infer<typeof stateNotes>[number]>({\n    \
-                 reducer: (left, right) => left.concat([right]),\n    \
+                "  notes: Annotation<z.infer<typeof stateNotes>, runtime.Written<z.infer<typeof stateNotes>[number]>>({\n    \
+                 reducer: (left, right) => runtime.appendReduce(left, right),\n    \
                  default: () => [],\n  }),\n"
             ),
             "{emitted}"
@@ -369,8 +392,8 @@ mod tests {
         );
         assert!(
             emitted.contains(
-                "  totals: Annotation<Partial<z.infer<typeof stateTotals>>, Partial<z.infer<typeof stateTotals>>>({\n    \
-                 reducer: (left, right) => ({ ...left, ...right }),\n    \
+                "  totals: Annotation<Partial<z.infer<typeof stateTotals>>, runtime.Written<Partial<z.infer<typeof stateTotals>>>>({\n    \
+                 reducer: (left, right) => runtime.mergeReduce(left, right),\n    \
                  default: () => ({}),\n  }),\n"
             ),
             "{emitted}"
@@ -419,12 +442,67 @@ mod tests {
         let emitted = state_of("  draft: { type: string, reduce: last_wins }\n");
         assert!(
             emitted.contains(
-                "  draft: Annotation<z.infer<typeof stateDraft>>({\n    \
-                 reducer: (_left, right) => right,\n  }),\n"
+                "  draft: Annotation<z.infer<typeof stateDraft>, runtime.Written<z.infer<typeof stateDraft>>>({\n    \
+                 reducer: (left, right) => runtime.setReduce(left, right),\n  }),\n"
             ),
             "{emitted}"
         );
         assert!(emitted.contains("`reduce: last_wins`"), "{emitted}");
+    }
+
+    /// The pairing `runtime.orderedUpdate` rests on, asserted where the initial
+    /// value is decided (grammar 7.6.4 clause 2, 10.1).
+    ///
+    /// A `map` node's contributions reach a channel as **one**
+    /// `runtime.OrderedWrites` batch that the channel's reducer unpacks — for
+    /// every policy but the one that cannot be handed a batch at all, which
+    /// `orderedUpdate` folds before it writes. LangGraph's
+    /// `BinaryOperatorAggregate.update` calls a reducer only while the channel
+    /// *holds* a value (the first update to an empty one is kept verbatim), so a
+    /// policy whose batch is **not** folded has to start at a value whatever the
+    /// composition declared — or the batch object itself becomes the channel's
+    /// value, read back by every `state.<channel>` expression and by the flow's
+    /// own `outputs:`.
+    ///
+    /// The guard and the invariant live in two modules and neither can see the
+    /// other, which is what this test is for. Every channel here declares **no**
+    /// `default:`, so what is measured is the policy's own identity element
+    /// rather than something the composition supplied; and the `match` is
+    /// exhaustive, so a new reduce policy is a compile error until someone says
+    /// which side of the pairing it is on.
+    #[test]
+    fn every_policy_a_map_batch_reaches_unfolded_starts_at_a_value() {
+        for reduce in [
+            None,
+            Some(Reduce::LastWins),
+            Some(Reduce::Append),
+            Some(Reduce::Merge),
+        ] {
+            // Which side of `runtime.orderedUpdate`'s `batch.reduce !== "set"`
+            // this policy's emitted reducer falls on.
+            let (folded, declaration) = match reduce {
+                None => (true, "  c: { type: string }\n"),
+                Some(Reduce::LastWins) => (true, "  c: { type: string, reduce: last_wins }\n"),
+                Some(Reduce::Append) => (
+                    false,
+                    "  c:\n    type: array\n    items: { type: string }\n    reduce: append\n",
+                ),
+                Some(Reduce::Merge) => (
+                    false,
+                    "  c:\n    type: object\n    properties: { a: { type: integer } }\n    reduce: merge\n",
+                ),
+            };
+            let emitted = state_of(declaration);
+            let starts_unset = !emitted.contains("    default: () =>");
+            assert_eq!(
+                folded, starts_unset,
+                "`reduce: {reduce:?}` is on both sides of the pairing at once. A policy \
+                 whose batch `runtime.orderedUpdate` does not fold must start at a \
+                 value, or the batch becomes the channel's value; a policy that starts \
+                 at one has no business being folded, since grammar 10.1 and Decision \
+                 D78 give an undefaulted channel no initial value to invent:\n{emitted}"
+            );
+        }
     }
 
     /// Grammar 10.4: the history channel is never declared and every graph has

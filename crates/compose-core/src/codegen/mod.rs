@@ -95,12 +95,11 @@
 //!
 //! # What is not here yet
 //!
-//! `map`→`Send`, subgraph instantiation, store ops, the `human` runtime and
-//! model failover are the remaining M1 bullets. A composition using one still
-//! **builds**, and its topology is still emitted in full — the edges, the
-//! budgets, the node's place in the graph — with an activity that throws naming
-//! the construct and the bullet that lands it ([`graph`]). Nothing answers a
-//! plausible value.
+//! Store ops, the `human` runtime and model failover are the remaining M1
+//! bullets. A composition using one still **builds**, and its topology is still
+//! emitted in full — the edges, the budgets, the node's place in the graph —
+//! with an activity that throws naming the construct and the bullet that lands
+//! it ([`graph`]). Nothing answers a plausible value.
 
 pub mod cel;
 pub mod env;

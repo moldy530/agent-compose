@@ -296,6 +296,13 @@ review the diff.
 /// host that wants the work itself to stop has to observe the signal. That is
 /// the one thing about registering a function which is neither in the grammar
 /// nor visible from the signature.
+///
+/// The idempotency section states the exception to it, because the two are the
+/// same call: a function reached as the sink of a **detached** dispatch runs on
+/// a signal nothing aborts (see `runMap` in `src/runtime.ts`), so a host that
+/// read the paragraph above and returned early on `signal.aborted` would be
+/// writing dead code in the one implementation where a lost call is a lost
+/// message.
 fn host_functions(ir: &Ir) -> String {
     let registered = super::graph::host_functions(ir);
     if registered.is_empty() {
@@ -322,12 +329,27 @@ fn host_functions(ir: &Ir) -> String {
         "```\n\n\
          ### What a node's `timeout:` means here\n\n\
          The second argument carries `context.signal`, which aborts when the node's\n\
-         `timeout:` budget runs out. Observing it is **optional for the node and\n\
-         necessary for the work**: the runtime races the deadline against the call, so\n\
-         the node fails on time and the run moves on whether or not the implementation\n\
-         looks — but nothing can unschedule a call already in flight. An implementation\n\
-         that ignores the signal keeps running after the node it belonged to has failed,\n\
-         and whatever it eventually returns is discarded.\n",
+         `timeout:` budget runs out — on every call but one, and that exception is the\n\
+         next section's. Observing it is **optional for the node and necessary for the\n\
+         work**: the runtime races the deadline against the call, so the node fails on\n\
+         time and the run moves on whether or not the implementation looks — but nothing\n\
+         can unschedule a call already in flight. An implementation that ignores the\n\
+         signal keeps running after the node it belonged to has failed, and whatever it\n\
+         eventually returns is discarded.\n\n\
+         ### When `context.idempotency_key` is set\n\n\
+         A function reached as the sink of a **detached** `map` dispatch is delivered\n\
+         at-least-once: the fan-out never waits for its outcome, so a retried map node\n\
+         issues the delivery again. `context.idempotency_key` is that dispatch's key\n\
+         (grammar 9.4) and it is stable across every attempt of the same item, so an\n\
+         implementation that records what it has already done under this key can drop a\n\
+         repeat. It is **absent on every other call**, where repeating a call is what a\n\
+         composition asked for.\n\n\
+         This is also the one call whose `context.signal` is not the map node's: a\n\
+         detached delivery is off that node's clock, because the fan-out never waited\n\
+         for it and a delivery the node's `max_concurrency` had merely delayed past the\n\
+         budget would otherwise be dropped instead of sent. A sink is cancelled by\n\
+         nothing, and its signal is there so that it has the same shape as every other\n\
+         invocation.\n",
     );
     text
 }
@@ -532,6 +554,35 @@ tool.rank:
         );
         assert!(
             contents.contains("keeps running after the node it belonged to has failed"),
+            "{contents}"
+        );
+        // The other thing on that second argument a host cannot learn from the
+        // signature: grammar 9.4's delivery surface for a `function:`-bound
+        // target. A sink that is delivered at-least-once and told nothing about
+        // it has no way to dedupe, which is the whole of what the key is for.
+        assert!(
+            contents.contains("### When `context.idempotency_key` is set"),
+            "{contents}"
+        );
+        assert!(
+            contents.contains("stable across every attempt of the same item"),
+            "{contents}"
+        );
+        assert!(
+            contents.contains("**absent on every other call**"),
+            "{contents}"
+        );
+        // …and the exception the paragraph above would otherwise state wrongly.
+        // A detached delivery runs on a signal nothing aborts (`runMap`), so a
+        // sink written to the timeout section's advice — return early when
+        // `signal.aborted` — would be dead code in the one implementation where
+        // a call not made is a message lost.
+        assert!(
+            contents.contains("on every call but one, and that exception is the"),
+            "{contents}"
+        );
+        assert!(
+            contents.contains("`context.signal` is not the map node's"),
             "{contents}"
         );
     }

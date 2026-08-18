@@ -35,8 +35,8 @@ export const channels = {
    * Unreduced: single-writer, and a write supplies the whole value.
    * Starts at `"approve"`.
    */
-  human_decision: Annotation<z.infer<typeof stateHumanDecision>>({
-    reducer: (_left, right) => right,
+  human_decision: Annotation<z.infer<typeof stateHumanDecision>, runtime.Written<z.infer<typeof stateHumanDecision>>>({
+    reducer: (left, right) => runtime.setReduce(left, right),
     default: () => "approve",
   }),
   /**
@@ -52,8 +52,8 @@ export const channels = {
    * `reduce: append`: a write supplies **one element**, appended in canonical write order (grammar 7.6.4, Decision D58).
    * Starts at `[]`.
    */
-  patches: Annotation<z.infer<typeof statePatches>, z.infer<typeof statePatches>[number]>({
-    reducer: (left, right) => left.concat([right]),
+  patches: Annotation<z.infer<typeof statePatches>, runtime.Written<z.infer<typeof statePatches>[number]>>({
+    reducer: (left, right) => runtime.appendReduce(left, right),
     default: () => [],
   }),
   /**
@@ -62,8 +62,8 @@ export const channels = {
    * Unreduced: single-writer, and a write supplies the whole value.
    * Starts at `""`.
    */
-  report_normalized: Annotation<z.infer<typeof stateReportNormalized>>({
-    reducer: (_left, right) => right,
+  report_normalized: Annotation<z.infer<typeof stateReportNormalized>, runtime.Written<z.infer<typeof stateReportNormalized>>>({
+    reducer: (left, right) => runtime.setReduce(left, right),
     default: () => "",
   }),
   /**
@@ -72,8 +72,8 @@ export const channels = {
    * Unreduced: single-writer, and a write supplies the whole value.
    * Starts at `""`.
    */
-  summary: Annotation<z.infer<typeof stateSummary>>({
-    reducer: (_left, right) => right,
+  summary: Annotation<z.infer<typeof stateSummary>, runtime.Written<z.infer<typeof stateSummary>>>({
+    reducer: (left, right) => runtime.setReduce(left, right),
     default: () => "",
   }),
   /**

@@ -109,7 +109,7 @@ const CODEGEN: &[Criterion] = &[
             ),
             (
                 "a_tagged_union_output_is_narrowed_per_variant_and_a_bad_tag_is_rejected",
-                Status::Pending("pending: codegen must emit subgraphs"),
+                Status::Live,
             ),
         ],
     },
@@ -273,25 +273,102 @@ const CODEGEN: &[Criterion] = &[
         tests: &[
             (
                 "a_homogeneous_map_dispatches_one_instance_per_item",
-                Status::Pending("pending: codegen must emit `map` as LangGraph `Send`"),
+                Status::Live,
             ),
             (
                 "a_routed_map_sends_each_variant_to_its_own_route",
-                Status::Pending("pending: codegen must emit discriminator-routed `map` dispatch"),
+                Status::Live,
             ),
             (
                 "appended_results_are_ordered_by_source_item_index",
-                Status::Pending("pending: codegen must emit index-tagged reducers"),
+                Status::Live,
+            ),
+            // The three rules of grammar 8.6 the two forms above do not reach:
+            // the `default:` catch-all over the unrouted variants, a sink route
+            // waited on like any other beside a `detach: true` one resolved at
+            // dispatch, and `on_item_error` dropping a failed item.
+            (
+                "a_sink_route_is_joined_and_a_detached_one_is_resolved_at_dispatch",
+                Status::Live,
+            ),
+            // Rule 6's other end: a dispatch of zero instances is a completion,
+            // not a stall — its outgoing edge fires as if every instance had
+            // finished.
+            (
+                "an_empty_fan_out_completes_and_its_downstream_edge_still_fires",
+                Status::Live,
+            ),
+            // A map whose target is a `flow.*` that itself fans out: the
+            // flattened instance path of grammar 9.4, the innermost
+            // `execution.item_index`, and channel values that stay inside their
+            // instance (grammar 10.1).
+            (
+                "a_nested_fan_out_keys_and_isolates_each_instance_by_its_whole_path",
+                Status::Live,
+            ),
+            // The same criterion over the *documented* project rather than a
+            // fixture: `examples/triage-fanout` is what PRD 5.6 is written
+            // about, and it reaches further than any fixture — a subgraph, a
+            // `function:` node, three routes including two `tool.*` sinks, a
+            // concurrent branch converging at equal depth, and an inline
+            // `exec:` node after the join.
+            (
+                "the_triage_fanout_example_routes_every_finding_and_joins_them_in_source_order",
+                Status::Live,
+            ),
+            // Rule 5's other two policies. `append` is the one every flow above
+            // writes; a `merge` channel and a `last_wins` channel with no
+            // `default:` are the shapes where "index-tagged" is decided by the
+            // reducer's *interface* rather than by its order alone — an unset
+            // channel never calls its reducer for the first write.
+            (
+                "a_merge_and_an_undefaulted_last_wins_channel_take_the_highest_indexed_write",
+                Status::Live,
+            ),
+            // The traversal ordinal of grammar 9.4, in a run rather than in a
+            // derivation: one map node inside a bounded cycle, and a detached
+            // sink that reports which key each of its two deliveries carried.
+            (
+                "each_traversal_of_a_map_delivers_its_detached_sink_a_key_of_its_own",
+                Status::Live,
+            ),
+            // Rule 10's `fail` half, which is the path a fan-out's record is
+            // easiest to lose on: the map node produced no answer, and the items
+            // that already ran — one write, one delivery to a sink — are
+            // accounted for only if the record survives the failure.
+            (
+                "a_fan_out_absorbed_by_its_own_on_error_still_records_every_dispatch",
+                Status::Live,
+            ),
+            // …and the same two obligations under the other way a map node
+            // fails, which is the harder one: its own `timeout:` (rule 9,
+            // grammar 9.2). The deadline is *raced*, so the map's promise is
+            // abandoned and carries nothing out — and a detached sink queued
+            // behind the instance the budget cut short still has to be
+            // delivered, on a clock that is not the node's.
+            (
+                "a_fan_out_cut_short_by_its_own_timeout_still_delivers_and_records_its_sink",
+                Status::Live,
             ),
         ],
     },
     Criterion {
         bullet: Bullet::Codegen,
         phrase: "subgraphs",
-        tests: &[(
-            "a_subgraph_runs_with_explicit_bindings_and_isolated_history",
-            Status::Pending("pending: codegen must emit subgraphs"),
-        )],
+        tests: &[
+            (
+                "a_subgraph_runs_with_explicit_bindings_and_isolated_history",
+                Status::Live,
+            ),
+            // The two keys the default instantiation does not exercise:
+            // `context: inherit`, which shares the caller's history in both
+            // directions, and `policy:`, which is grammar 9.3's level 1 for
+            // every node inside the instance.
+            (
+                "a_subflow_inherits_the_callers_history_and_takes_its_instantiation_policy",
+                Status::Live,
+            ),
+        ],
     },
     Criterion {
         bullet: Bullet::Codegen,

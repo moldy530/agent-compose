@@ -555,13 +555,14 @@ fn the_state_model_carries_every_channels_type_default_and_reduce_policy() {
     // channel starts at the policy's identity element rather than unset.
     assert!(
         state.contains(
-            "notes: Annotation<z.infer<typeof stateNotes>, z.infer<typeof stateNotes>[number]>({"
+            "notes: Annotation<z.infer<typeof stateNotes>, runtime.Written<z.infer<typeof stateNotes>[number]>>({"
         ),
-        "an `append` channel takes one element per write:\n{state}"
+        "an `append` channel takes one element per write — or a `map` node's whole \
+         ordered batch of them (grammar 7.6.4 clause 2):\n{state}"
     );
     assert!(
-        state.contains("reducer: (left, right) => left.concat([right]),"),
-        "and appends it in write order:\n{state}"
+        state.contains("reducer: (left, right) => runtime.appendReduce(left, right),"),
+        "and appends in write order:\n{state}"
     );
     assert!(
         state.contains("default: () => [],"),
@@ -684,13 +685,11 @@ fn state_channels_carry_their_declared_types_and_defaults() {
 /// The `z.discriminatedUnion` this needs is emitted, and `compose-core`'s
 /// `tests/generated_code_gates.rs` runs a corpus through it that includes this
 /// very refusal — a tag the union does not declare, rejected by both the emitted
-/// Zod and the JSON Schema the same lowering produces. An agent node fn now
-/// parses its answer with the emitted schema, which is what turns that refusal
-/// into a run failure; what is left is the *fixture's* first node, a `flow:`
-/// instantiation of `flow.normalize`, so this run cannot reach `classify` until
-/// subgraphs do.
+/// Zod and the JSON Schema the same lowering produces. An agent node fn parses
+/// its answer with the emitted schema, which is what turns that refusal into a
+/// run failure — reached here through the fixture's first node, a `flow:`
+/// instantiation of `flow.normalize`, so the subgraph is on the path too.
 #[test]
-#[ignore = "pending: codegen must emit subgraphs"]
 fn a_tagged_union_output_is_narrowed_per_variant_and_a_bad_tag_is_rejected() {
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue_all([
@@ -706,12 +705,14 @@ fn a_tagged_union_output_is_narrowed_per_variant_and_a_bad_tag_is_rejected() {
         ),
     ]);
 
-    let run = harness::run(
+    let Some(run) = harness::invoke(
         "fanout",
         "flow.triage",
         &[("report", "a report")],
         &provider,
-    );
+    ) else {
+        return;
+    };
     let failure = run.failed();
     assert!(
         failure.contains("unheard_of"),
@@ -2000,7 +2001,6 @@ fn a_skipped_node_routes_through_its_else_edge_and_writes_nothing() {
 /// A subgraph runs with explicit bindings in, name-based outputs back, and a
 /// conversation history of its own.
 #[test]
-#[ignore = "pending: codegen must emit subgraphs"]
 fn a_subgraph_runs_with_explicit_bindings_and_isolated_history() {
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue_all([
@@ -2012,12 +2012,14 @@ fn a_subgraph_runs_with_explicit_bindings_and_isolated_history() {
         Script::new(SONNET, Outcome::structured(json!({ "findings": [] }))),
     ]);
 
-    let run = harness::run(
+    let Some(run) = harness::invoke(
         "fanout",
         "flow.triage",
         &[("report", "a raw report")],
         &provider,
-    );
+    ) else {
+        return;
+    };
     run.succeeded();
 
     let recorded = provider.requests();
@@ -2504,7 +2506,6 @@ fn a_run_that_reaches_the_superstep_ceiling_says_which_bound_was_missing() {
 /// A homogeneous map dispatches one instance per item, bounded by
 /// `max_concurrency`, and joins before the downstream edge fires.
 #[test]
-#[ignore = "pending: codegen must emit `map` as LangGraph `Send`"]
 fn a_homogeneous_map_dispatches_one_instance_per_item() {
     let provider = MockProvider::start().expect("a loopback port");
     let tasks: Vec<Value> = (0..3)
@@ -2524,7 +2525,10 @@ fn a_homogeneous_map_dispatches_one_instance_per_item() {
         );
     }
 
-    let run = harness::run("fanout", "flow.spread", &[("goal", "ship it")], &provider);
+    let Some(run) = harness::invoke("fanout", "flow.spread", &[("goal", "ship it")], &provider)
+    else {
+        return;
+    };
     run.succeeded();
 
     assert_eq!(
@@ -2543,7 +2547,6 @@ fn a_homogeneous_map_dispatches_one_instance_per_item() {
 /// A discriminator-routed map sends each item to its own route, narrowed to that
 /// variant's payload (PRD 5.6).
 #[test]
-#[ignore = "pending: codegen must emit discriminator-routed `map` dispatch"]
 fn a_routed_map_sends_each_variant_to_its_own_route() {
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue_all([
@@ -2566,12 +2569,14 @@ fn a_routed_map_sends_each_variant_to_its_own_route() {
             .matching("unclear"),
     ]);
 
-    let run = harness::run(
+    let Some(run) = harness::invoke(
         "fanout",
         "flow.triage",
         &[("report", "a raw report")],
         &provider,
-    );
+    ) else {
+        return;
+    };
     run.succeeded();
 
     let outputs = run.outputs();
@@ -2593,7 +2598,6 @@ fn a_routed_map_sends_each_variant_to_its_own_route() {
 /// Appended results are ordered by source-item index, whatever order the
 /// instances complete in (PRD 5.6's replay guarantee).
 #[test]
-#[ignore = "pending: codegen must emit index-tagged reducers"]
 fn appended_results_are_ordered_by_source_item_index() {
     let provider = MockProvider::start().expect("a loopback port");
     let tasks: Vec<Value> = (0..3)
@@ -2616,7 +2620,10 @@ fn appended_results_are_ordered_by_source_item_index() {
         );
     }
 
-    let run = harness::run("fanout", "flow.spread", &[("goal", "ship it")], &provider);
+    let Some(run) = harness::invoke("fanout", "flow.spread", &[("goal", "ship it")], &provider)
+    else {
+        return;
+    };
     run.succeeded();
 
     assert_eq!(
@@ -2624,7 +2631,1094 @@ fn appended_results_are_ordered_by_source_item_index() {
         json!(["done-0", "done-1", "done-2"]),
         "appended values are reordered by source-item index before the join"
     );
+
+    // The record of the fan-out itself: one entry per source item, in index
+    // order, whatever order they finished in (PRD 5.6, 5.3).
+    let dispatched = run.entries("work")[0]["dispatches"].clone();
+    assert_eq!(
+        dispatched
+            .as_array()
+            .expect("a `map` node's trace entry records its dispatches")
+            .iter()
+            .map(|record| (record["index"].clone(), record["outcome"].clone()))
+            .collect::<Vec<_>>(),
+        (0..3)
+            .map(|index| (json!(index), json!("completed")))
+            .collect::<Vec<_>>()
+    );
 }
+
+/// The catch-all takes the variants nothing routes, a sink route is joined like
+/// any other, a detached one is resolved at dispatch, and a failed item is
+/// skipped (grammar 8.6 rules 4, 6, 7, 10).
+///
+/// Four items, one per rule, and the whole claim rests on the run **succeeding**:
+/// the `duplicate` item is dispatched to an agent whose call is deliberately
+/// *unscripted*, so a join that waited on it would fail the map node and take the
+/// run with it. That it does not is what "resolved at dispatch" means (Decision
+/// D94) — the map completed, its outgoing edge fired, and the delivery's outcome
+/// was never observed.
+#[test]
+fn a_sink_route_is_joined_and_a_detached_one_is_resolved_at_dispatch() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({
+                "findings": [
+                    { "kind": "auto_fixable", "file": "a.rs", "hint": "rename it" },
+                    { "kind": "needs_human", "summary": "unclear", "severity": "high" },
+                    { "kind": "duplicate", "of": "issue-7" },
+                    { "kind": "auto_fixable", "file": "b.rs", "hint": "widen it" },
+                ],
+            })),
+        ),
+        Script::new(HAIKU, Outcome::structured(json!({ "patch": "patch-a" }))).matching("a.rs"),
+        // `min_length: 1` on `agent.fixer`'s `patch` refuses this, so item 3
+        // fails — and `on_item_error: skip` drops it rather than the fan-out.
+        Script::new(HAIKU, Outcome::structured(json!({ "patch": "" }))).matching("b.rs"),
+    ]);
+
+    let Some(run) = harness::invoke(
+        "fanout",
+        "flow.sort",
+        &[("report", "the build is red")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+
+    let outputs = run.outputs();
+    assert_eq!(
+        outputs["drafts"],
+        json!(["patch-a"]),
+        "the skipped item contributed nothing, and the one that landed did"
+    );
+    assert_eq!(
+        outputs["tickets"],
+        json!(["queued"]),
+        "the sink route ran and was waited on: its result is in state"
+    );
+
+    let dispatched = run.entries("route")[0]["dispatches"].clone();
+    let records = dispatched
+        .as_array()
+        .expect("the map records what it dispatched");
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| (
+                record["index"].as_u64().expect("an index"),
+                record["route"].as_str().expect("a route").to_string(),
+                record["outcome"].as_str().expect("an outcome").to_string(),
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (0, "auto_fixable".to_string(), "completed".to_string()),
+            (1, "needs_human".to_string(), "completed".to_string()),
+            (2, "$default".to_string(), "detached".to_string()),
+            (3, "auto_fixable".to_string(), "skipped".to_string()),
+        ],
+        "every item is accounted for, in source-item order: {dispatched}"
+    );
+    assert_eq!(
+        records[2]["attempts"],
+        json!(0),
+        "a detached dispatch has no observed outcome, so `on_item_error` never \
+         applied to it (grammar 8.6 rule 7)"
+    );
+    assert!(
+        records[3]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("agent.fixer")),
+        "the skipped item says what was wrong with it: {}",
+        records[3]
+    );
+
+    // Grammar 9.4's form, for the one dispatch that delivers without observing
+    // an outcome: the execution id, then this dispatch's flattened instance
+    // path. `route` is at the root instance, so its frame is the whole path.
+    let execution = run.trace()[0]["step"].clone();
+    assert_eq!(execution, json!(1), "the trace opens at step 1");
+    let key = records[2]["idempotencyKey"]
+        .as_str()
+        .expect("a detached dispatch carries its key")
+        .to_string();
+    assert!(
+        key.ends_with("/route/0/2"),
+        "the key is `<execution id>/<node>/<traversal>/<item index>`: {key}"
+    );
+    assert!(
+        key.starts_with("exec_"),
+        "…opening with the execution's own id: {key}"
+    );
+    for record in records {
+        assert!(
+            record["idempotencyKey"]
+                .as_str()
+                .is_some_and(|held| held.ends_with(&format!(
+                    "/route/0/{}",
+                    record["index"].as_u64().expect("an index")
+                ))),
+            "every dispatch derives its own key: {record}"
+        );
+    }
+}
+
+/// A map whose target is a `flow.*` that itself fans out: two frames of instance
+/// path, an inner index of its own, and channel values that stay inside their
+/// instance (grammar 8.6, 9.4, 10.1).
+#[test]
+fn a_nested_fan_out_keys_and_isolates_each_instance_by_its_whole_path() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({
+                "tasks": [{ "steps": ["alpha", "beta"] }, { "steps": ["gamma"] }],
+            })),
+        ),
+        // Every outcome is narrowed by the one item it answers, because the six
+        // calls share two model ids and reach the server in scheduler order.
+        Script::new(HAIKU, Outcome::structured(json!({ "part": "made-alpha" }))).matching("alpha"),
+        Script::new(HAIKU, Outcome::structured(json!({ "part": "made-beta" }))).matching("beta"),
+        Script::new(HAIKU, Outcome::structured(json!({ "part": "made-gamma" }))).matching("gamma"),
+        Script::new(HAIKU, Outcome::structured(json!({ "line": "line-0" }))).matching("made-alpha"),
+        Script::new(HAIKU, Outcome::structured(json!({ "line": "line-1" }))).matching("made-gamma"),
+    ]);
+
+    let Some(run) = harness::invoke("fanout", "flow.nested", &[("goal", "ship it")], &provider)
+    else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(
+        run.outputs()["rolled"],
+        json!(["line-0", "line-1"]),
+        "each instance's `outputs:` crossed back in source-item order"
+    );
+
+    // Instance-local channel values (grammar 10.1): each `flow.subtask` instance
+    // appended to *its own* `parts`, so the second one rolled up one part rather
+    // than three. Nothing else in this run can produce that.
+    let turns: Vec<String> = provider
+        .requests()
+        .iter()
+        .filter_map(|request| {
+            request.body()["messages"][0]["content"]
+                .as_str()
+                .map(str::to_string)
+        })
+        .collect();
+    assert!(
+        turns.contains(&"{\"parts\":[\"made-alpha\",\"made-beta\"]}".to_string()),
+        "the first instance rolled up both of its own parts, in index order: {turns:?}"
+    );
+    assert!(
+        turns.contains(&"{\"parts\":[\"made-gamma\"]}".to_string()),
+        "…and the second saw only its own: {turns:?}"
+    );
+
+    // `execution.item_index` is the **innermost** map's (grammar 4.1): the
+    // second step of the first task is at index 1, and the only step of the
+    // second task is back at 0.
+    assert!(
+        turns.contains(&"{\"step\":\"beta\",\"at\":1}".to_string()),
+        "the second step of the first task is at index 1: {turns:?}"
+    );
+    assert!(
+        turns.contains(&"{\"step\":\"gamma\",\"at\":0}".to_string()),
+        "…and the only step of the second task is back at 0, because the index \
+         names the innermost dispatch and nothing above it: {turns:?}"
+    );
+
+    // Grammar 9.4's nesting, as the keys the two levels derive: the outer map's
+    // frame, then the inner one's, joined from the root instance down.
+    let outer = run.entries("work")[0]["dispatches"].clone();
+    let outer = outer.as_array().expect("the outer map dispatched");
+    let second = outer[1]["idempotencyKey"]
+        .as_str()
+        .expect("a key")
+        .to_string();
+    assert!(
+        second.ends_with("/work/0/1"),
+        "the outer dispatch's frame is its own node, traversal and index: {second}"
+    );
+    let inner = outer[1]["inner"]
+        .as_array()
+        .expect("a dispatched `flow.*` carries its instance's trace")
+        .iter()
+        .find(|entry| entry["node"] == "steps")
+        .expect("the instance ran its own map")
+        .clone();
+    let nested = inner["dispatches"][0]["idempotencyKey"]
+        .as_str()
+        .expect("a key")
+        .to_string();
+    assert_eq!(
+        nested,
+        format!("{second}/steps/0/0"),
+        "the inner dispatch's key is the outer path with its own frame appended \
+         — the flattened instance path of grammar 9.4"
+    );
+}
+
+/// A fan-out over an empty array completes immediately, writes nothing, and its
+/// outgoing edge fires exactly as if every instance had finished (rule 6).
+#[test]
+fn an_empty_fan_out_completes_and_its_downstream_edge_still_fires() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "tasks": [] })),
+    ));
+
+    let Some(run) = harness::invoke("fanout", "flow.nested", &[("goal", "ship it")], &provider)
+    else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(
+        run.outputs()["rolled"],
+        json!([]),
+        "the `append` channel is still at its identity element (grammar 10.1)"
+    );
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "the planner, and nothing dispatched"
+    );
+
+    let work = run.entries("work");
+    assert_eq!(work.len(), 1, "the map node ran");
+    assert_eq!(work[0]["dispatches"], json!([]));
+    assert_eq!(
+        work[0]["routing"]["targets"],
+        json!(["__end__"]),
+        "and its outgoing edge fired: a zero-instance dispatch is a completion"
+    );
+}
+
+/// The two reduce policies a fan-out may write besides `append`: a `merge`
+/// channel resolves each key to the **highest-indexed** item's write, and a
+/// `last_wins` channel takes that item's write outright (grammar 8.6 rule 5,
+/// 10.2).
+///
+/// `winner` declares **no** `default:`, which is the shape that makes this more
+/// than a restatement of the `append` tests. A channel with no initial value
+/// holds nothing until its first write, and LangGraph keeps the first update to
+/// an empty channel *verbatim* rather than passing it through the reducer — so a
+/// map that handed its ordered batch straight to the channel would leave the
+/// batch object there, and every read of `winner` would get an object where the
+/// composition declares a string. Nothing in a run says so except the value: it
+/// type-checks, it constructs, and the flow's own `outputs:` carry it out.
+///
+/// Completion order is the reverse of source order, so an implementation that
+/// folded in completion order would answer `w-A`/`who: A` here.
+#[test]
+fn a_merge_and_an_undefaulted_last_wins_channel_take_the_highest_indexed_write() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let tasks: Vec<Value> = ["A", "B", "C"]
+        .into_iter()
+        .map(|name| json!({ "title": format!("task-{name}"), "body": "do it" }))
+        .collect();
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "tasks": tasks })),
+    ));
+    // Item 0 answers last, item 2 first.
+    for (name, delay) in [("A", 300), ("B", 150), ("C", 0)] {
+        provider.enqueue(
+            Script::new(
+                HAIKU,
+                Outcome::structured(json!({
+                    "piece": { "who": name, "note": format!("note-{name}") },
+                    "label": format!("w-{name}"),
+                }))
+                .after(Duration::from_millis(delay)),
+            )
+            .matching(format!("task-{name}")),
+        );
+    }
+
+    let Some(run) = harness::invoke("fanout", "flow.tally", &[("goal", "ship it")], &provider)
+    else {
+        return;
+    };
+    run.succeeded();
+
+    let outputs = run.outputs();
+    assert_eq!(
+        outputs["winner"],
+        json!("w-C"),
+        "a `last_wins` channel with no `default:` holds the last write in \
+         canonical order — the value, not the batch it arrived in: {outputs}"
+    );
+    assert_eq!(
+        outputs["totals"],
+        json!({ "who": "C", "note": "note-C" }),
+        "and a `merge` channel resolves each key to the highest-indexed item's \
+         write, whatever order the instances finished in: {outputs}"
+    );
+    assert_eq!(
+        run.entries("score")[0]["writes"],
+        json!(["totals", "winner"]),
+        "the map records both channels it wrote"
+    );
+    assert!(provider.snapshot().is_drained());
+}
+
+/// A map inside a bounded cycle dispatches once per traversal, and the two
+/// traversals' detached deliveries carry **different** idempotency keys —
+/// grammar 9.4's traversal ordinal, and the first of the two properties it
+/// exists for ("distinct effects get distinct keys").
+///
+/// The keys are asserted where they land rather than only where they are
+/// derived: the sink is an `exec:` tool, and what it reports is the environment
+/// it was run with. Without the delivery half, a compiler could derive a perfect
+/// key, record it in the trace, and send a sink nothing to dedupe on — which is
+/// exactly the shape PRD 5.6 settles ("passed to the sink automatically, and
+/// sinks are documented to dedupe on it").
+#[test]
+fn each_traversal_of_a_map_delivers_its_detached_sink_a_key_of_its_own() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let sweep = |file: &str| {
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({
+                "findings": [
+                    { "kind": "auto_fixable", "file": file, "hint": "rename it" },
+                    { "kind": "needs_human", "summary": format!("look at {file}"), "severity": "high" },
+                ],
+            })),
+        )
+    };
+    provider.enqueue_all([
+        sweep("a.rs"),
+        Script::new(HAIKU, Outcome::structured(json!({ "patch": "patch-a" }))).matching("a.rs"),
+        sweep("b.rs"),
+        Script::new(HAIKU, Outcome::structured(json!({ "patch": "patch-b" }))).matching("b.rs"),
+    ]);
+
+    let scratch = harness::Scratch::new("audit");
+    let log = scratch.path().join("audit.log");
+    harness::shim(
+        scratch.path(),
+        "record-audit",
+        // What the sink was handed, one line per delivery: the grammar 9.4 key,
+        // out of the `IDEMPOTENCY_KEY` variable that section's delivery surface
+        // says an `exec:`-bound target receives it in.
+        "printf '%s\\n' \"$IDEMPOTENCY_KEY\" >> \"$AUDIT_LOG\"\nprintf 'logged'\n",
+    );
+
+    let mut environment = harness::environment(&provider);
+    environment.push(("AUDIT_LOG".to_string(), log.display().to_string()));
+    environment.push((
+        "PATH".to_string(),
+        format!(
+            "{}:{}",
+            scratch.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        ),
+    ));
+
+    let Some(run) = harness::invoke_with(
+        "fanout",
+        "flow.recheck",
+        &json!({ "report": "the build is red" }),
+        &environment,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(
+        run.outputs()["drafts"],
+        json!(["patch-a", "patch-b"]),
+        "one pass of the cycle appended each patch"
+    );
+
+    // Two traversals of one node, and the ordinal is what tells them apart.
+    let passes = run.entries("fan");
+    assert_eq!(passes.len(), 2, "the cycle ran the map twice");
+    let keys: Vec<String> = passes
+        .iter()
+        .map(|entry| {
+            entry["dispatches"][1]["idempotencyKey"]
+                .as_str()
+                .unwrap_or_else(|| panic!("the detached dispatch carries a key: {entry}"))
+                .to_string()
+        })
+        .collect();
+    assert!(
+        keys[0].ends_with("/fan/0/1") && keys[1].ends_with("/fan/1/1"),
+        "the traversal ordinal is the component that distinguishes them: {keys:?}"
+    );
+    assert_eq!(
+        passes[0]["dispatches"][1]["outcome"],
+        json!("detached"),
+        "the sink route is fire-and-forget: {}",
+        passes[0]
+    );
+
+    // …and what the sink was actually sent. The deliveries are not waited on, so
+    // the run reached quiescence without them — but a `spawn`ed child keeps the
+    // process alive, so both have landed by the time it exits.
+    let delivered: Vec<String> = std::fs::read_to_string(&log)
+        .expect("the detached sink ran and wrote what it was handed")
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        delivered, keys,
+        "each delivery carried its own dispatch's key, which is what a sink \
+         dedupes on (PRD 5.6, grammar 9.4)"
+    );
+}
+
+/// A fan-out its own `on_error:` absorbed still says what it dispatched
+/// (grammar 8.6 rule 10, PRD 5.3, 5.6).
+///
+/// This is the `fail` half of rule 10's idiom — "retry each item, and if one
+/// still fails, skip the fan-out" — and it is where a map node's record is worth
+/// the most and easiest to lose: the node produced no answer, so everything it
+/// knew has to travel out on the failure or not at all. The items that did run
+/// are the reason it matters. One of them wrote a patch that the skip then
+/// discarded, and one of them was **delivered to a sink**: the audit line is on
+/// disk, the enqueue is not undone by the node being skipped, and the dispatch
+/// record with its idempotency key is the only place a reader learns that it
+/// happened at all.
+///
+/// The failing item says `failed` rather than `skipped`, because `on_item_error`
+/// here is the default `fail` and nothing skipped it — what was skipped is the
+/// map node.
+#[test]
+fn a_fan_out_absorbed_by_its_own_on_error_still_records_every_dispatch() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({
+                "findings": [
+                    { "kind": "auto_fixable", "file": "a.rs", "hint": "rename it" },
+                    { "kind": "needs_human", "summary": "look at b.rs", "severity": "high" },
+                    { "kind": "auto_fixable", "file": "c.rs", "hint": "widen it" },
+                ],
+            })),
+        ),
+        Script::new(HAIKU, Outcome::structured(json!({ "patch": "patch-a" }))).matching("a.rs"),
+        // `min_length: 1` on `agent.fixer`'s `patch` refuses this, so item 2
+        // fails — and with `on_item_error` at its default `fail`, the map node
+        // fails with it.
+        Script::new(HAIKU, Outcome::structured(json!({ "patch": "" }))).matching("c.rs"),
+    ]);
+
+    let scratch = harness::Scratch::new("absorb");
+    let log = scratch.path().join("audit.log");
+    harness::shim(
+        scratch.path(),
+        "record-audit",
+        "printf '%s\\n' \"$IDEMPOTENCY_KEY\" >> \"$AUDIT_LOG\"\nprintf 'logged'\n",
+    );
+
+    let mut environment = harness::environment(&provider);
+    environment.push(("AUDIT_LOG".to_string(), log.display().to_string()));
+    environment.push((
+        "PATH".to_string(),
+        format!(
+            "{}:{}",
+            scratch.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        ),
+    ));
+
+    let Some(run) = harness::invoke_with(
+        "fanout",
+        "flow.absorb",
+        &json!({ "report": "the build is red" }),
+        &environment,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(
+        run.outputs()["drafts"],
+        json!([]),
+        "the map node was skipped, so none of its writes landed — including the \
+         one item that produced a patch (grammar 9.2)"
+    );
+
+    let entry = run.entries("fan")[0].clone();
+    assert_eq!(
+        entry["outcome"],
+        json!("skipped"),
+        "the map node's own `on_error: skip` absorbed the failed item: {entry}"
+    );
+    let records = entry["dispatches"]
+        .as_array()
+        .unwrap_or_else(|| {
+            panic!("a fan-out that failed still records what it dispatched: {entry}")
+        })
+        .clone();
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| (
+                record["index"].as_u64().expect("an index"),
+                record["route"].as_str().expect("a route").to_string(),
+                record["outcome"].as_str().expect("an outcome").to_string(),
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (0, "auto_fixable".to_string(), "completed".to_string()),
+            (1, "needs_human".to_string(), "detached".to_string()),
+            (2, "auto_fixable".to_string(), "failed".to_string()),
+        ],
+        "every item is accounted for, in source-item order, and the one that \
+         failed says so: {entry}"
+    );
+    assert!(
+        entry["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("item 2")),
+        "…and the node's own error names the item that failed it: {entry}"
+    );
+
+    // The effect that outlived the skip. A detached delivery is issued at
+    // dispatch and never unwound, so the record and its key are what tell a
+    // reader the sink was written to (PRD 5.6, grammar 9.4).
+    let key = records[1]["idempotencyKey"]
+        .as_str()
+        .expect("the detached dispatch carries its key")
+        .to_string();
+    assert!(
+        key.ends_with("/fan/0/1"),
+        "the key names the dispatch site: {key}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&log)
+            .expect("the detached sink ran")
+            .lines()
+            .collect::<Vec<_>>(),
+        [key.as_str()],
+        "the sink was really delivered, under exactly the key the record shows"
+    );
+}
+
+/// A fan-out its own **`timeout:`** cut short still delivers the sink it had
+/// queued, and still says what it dispatched (grammar 8.6 rules 7, 9, 9.2,
+/// PRD 5.3, 5.6).
+///
+/// A `map` takes a node policy like any other node, and grammar 9.3 level 3 puts
+/// one on every node a `defaults:` block covers — the emitted
+/// `examples/triage-fanout` carries `timeoutMs: 90000` on its `dispatch` node —
+/// so a fan-out under a deadline is the ordinary compiled shape rather than an
+/// exotic one. It is also the one shape where both of a fan-out's promises are
+/// hardest to keep, because a deadline is *raced* (grammar 9.2): the map's
+/// promise is abandoned where it stands, so nothing it was holding comes back.
+///
+/// Two things have to survive that, and `max_concurrency: 1` is what makes each
+/// decidable. The `auto_fixable` item takes the only permit and waits on an
+/// answer scripted to arrive long after the budget; the detached sink behind it
+/// is still in the **queue** when the budget runs out.
+///
+///   * **The delivery is issued anyway.** Its clock is its own rather than the
+///     node's, so it does not start against an already-aborted signal, throw
+///     before anything reaches the wire, and disappear into the catch that keeps
+///     a detached dispatch from failing the flow. That would be a message
+///     recorded as `detached` and never sent — the lost message PRD 5.6 trades
+///     at-least-once delivery and a dedupe key to avoid. The sink is an `exec:`
+///     tool that writes the `IDEMPOTENCY_KEY` it was handed to a file, so the
+///     claim is settled on disk rather than in a record.
+///   * **The record survives.** The item that was delivered had its effect, and
+///     with no answer and no `ItemFailure` the dispatch record is the only
+///     account of it there will ever be — while the run itself *succeeds*,
+///     because the node's `on_error: skip` absorbs the deadline.
+#[test]
+fn a_fan_out_cut_short_by_its_own_timeout_still_delivers_and_records_its_sink() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({
+                "findings": [
+                    { "kind": "auto_fixable", "file": "a.rs", "hint": "rename it" },
+                    { "kind": "needs_human", "summary": "look at b.rs", "severity": "high" },
+                ],
+            })),
+        ),
+        // Far longer than the node's 400ms budget, so the deadline is what ends
+        // the item rather than the answer.
+        Script::new(
+            HAIKU,
+            Outcome::structured(json!({ "patch": "patch-a" })).after(Duration::from_secs(5)),
+        )
+        .matching("a.rs"),
+    ]);
+
+    let scratch = harness::Scratch::new("expire");
+    let log = scratch.path().join("audit.log");
+    harness::shim(
+        scratch.path(),
+        "record-audit",
+        // The sink does a little work before it acknowledges, and that is what
+        // makes the difference observable. `spawn` is handed the delivery's
+        // signal, and an already-aborted one kills the child on the next tick —
+        // after it has started, so a sink that wrote its line and exited in the
+        // same instant would race that kill and settle nothing. Any real sink
+        // takes longer than a tick to do its work; this one says so out loud.
+        "sleep 0.3\nprintf '%s\\n' \"$IDEMPOTENCY_KEY\" >> \"$AUDIT_LOG\"\nprintf 'logged'\n",
+    );
+
+    let mut environment = harness::environment(&provider);
+    environment.push(("AUDIT_LOG".to_string(), log.display().to_string()));
+    environment.push((
+        "PATH".to_string(),
+        format!(
+            "{}:{}",
+            scratch.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        ),
+    ));
+
+    let Some(run) = harness::invoke_with(
+        "fanout",
+        "flow.expire",
+        &json!({ "report": "the build is red" }),
+        &environment,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(
+        run.outputs()["drafts"],
+        json!([]),
+        "the map node was skipped, so none of its writes landed (grammar 9.2)"
+    );
+
+    let entry = run.entries("fan")[0].clone();
+    assert_eq!(
+        entry["outcome"],
+        json!("skipped"),
+        "the node's own `on_error: skip` absorbed the deadline: {entry}"
+    );
+    assert!(
+        entry["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("timed out")),
+        "…and the error says what ended it: {entry}"
+    );
+
+    // The record the abandoned promise could not have carried. Only the detached
+    // dispatch is here: it is resolved at dispatch (D94), while the joined
+    // instance was still in flight when the budget expired and so had no outcome
+    // to report — the entry's own error is what accounts for that one.
+    let records = entry["dispatches"]
+        .as_array()
+        .unwrap_or_else(|| {
+            panic!("a fan-out its deadline cut short still records what it dispatched: {entry}")
+        })
+        .clone();
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| (
+                record["index"].as_u64().expect("an index"),
+                record["route"].as_str().expect("a route").to_string(),
+                record["outcome"].as_str().expect("an outcome").to_string(),
+            ))
+            .collect::<Vec<_>>(),
+        [(1, "needs_human".to_string(), "detached".to_string())],
+        "the dispatch that resolved is accounted for: {entry}"
+    );
+
+    // …and the delivery itself, which the bound had merely *delayed* past the
+    // deadline. It reaches the sink under exactly the key the record shows.
+    let key = records[0]["idempotencyKey"]
+        .as_str()
+        .expect("the detached dispatch carries its key")
+        .to_string();
+    assert!(
+        key.ends_with("/fan/0/1"),
+        "the key names the dispatch site: {key}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&log)
+            .expect(
+                "the detached sink ran: a delivery still queued for a permit when the node's \
+                 budget ran out is issued anyway (grammar 8.6 rule 7, PRD 5.6)"
+            )
+            .lines()
+            .collect::<Vec<_>>(),
+        [key.as_str()],
+        "the sink was delivered under the key the record shows"
+    );
+}
+
+/// `context: inherit` shares the caller's conversation with the instance in both
+/// directions, and the instantiation site's `policy:` is level 1 for the nodes
+/// inside it (grammar 8.5, 9.3, 10.4).
+#[test]
+fn a_subflow_inherits_the_callers_history_and_takes_its_instantiation_policy() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(SONNET, Outcome::structured(json!({ "findings": [] }))),
+        // `flow.normalize`'s `clean` declares no `retry:` of its own. The one it
+        // gets is the `again` node's `policy:`, which is level 1 for every node
+        // inside the instance — so this failure is retried rather than fatal.
+        Script::new(HAIKU, Outcome::rate_limit()).matching("a raw report"),
+        Script::new(
+            HAIKU,
+            Outcome::structured(json!({ "normalized": "a clean report" })),
+        )
+        .matching("a raw report"),
+        Script::new(HAIKU, Outcome::structured(json!({ "line": "closed" })))
+            .matching("Roll the parts"),
+    ]);
+
+    let Some(run) = harness::invoke(
+        "fanout",
+        "flow.continue",
+        &[("report", "a raw report")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(run.outputs()["normalized"], "a clean report");
+
+    let recorded = provider.requests();
+    assert_eq!(
+        recorded.len(),
+        4,
+        "the opener, two attempts at the subflow's node, and the closer"
+    );
+    assert!(recorded.iter().all(RecordedRequest::is_valid));
+    assert_eq!(
+        recorded[1].body()["messages"].as_array().map(Vec::len),
+        Some(3),
+        "the instance's own node sees the caller's exchange plus its own turn: {}",
+        recorded[1].body()["messages"]
+    );
+    assert_eq!(
+        recorded[3].body()["messages"].as_array().map(Vec::len),
+        Some(5),
+        "…and what the instance said came back, so the caller's next node sees \
+         both exchanges: {}",
+        recorded[3].body()["messages"]
+    );
+    assert_eq!(
+        run.entries("again")[0]["inner"]
+            .as_array()
+            .expect("the instance's own trace")
+            .iter()
+            .map(|entry| entry["node"].clone())
+            .collect::<Vec<_>>(),
+        [json!("clean")],
+        "the instance's routing record is nested under the node that ran it"
+    );
+    assert!(provider.snapshot().is_drained());
+}
+
+/// The documented fan-out example runs: a subgraph, a discriminated fan-out to
+/// fixer agents and two sinks, a concurrent branch, and a join whose result is
+/// in source-item order (PRD 5.6).
+///
+/// `examples/triage-fanout` is the project PRD 5.6 is written about, and running
+/// the *example* rather than a fixture is the only way an acceptance test speaks
+/// about what a reader is shown. It reaches further than any fixture does,
+/// because it is written for a reader rather than for a test: a `flow:` node into
+/// `flow.enrich`, a `function:` node over an `exec` tool, a four-item tagged
+/// union across three routes — two of them `tool.*` sinks the join waits on — a
+/// concurrent `http:` branch converging at equal depth, and an inline `exec:`
+/// node after it.
+///
+/// It **stops** at `approve`, which is a `human:` node — the one construct on its
+/// path this compiler release does not execute (PRD §7 M1 leaves the `human`
+/// runtime to `serve`). That is asserted rather than worked around: the run gets
+/// all the way there, the trace holds every step it took, and the node it stopped
+/// at names the construct and the bullet that lands it.
+///
+/// The fixer answering **item 0** is delayed past the one answering item 3, so
+/// the two patches complete in the reverse of source order. What `summarize` is
+/// then sent is the whole claim of PRD 5.6's replay guarantee, observed on the
+/// wire rather than inferred.
+#[test]
+fn the_triage_fanout_example_routes_every_finding_and_joins_them_in_source_order() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({
+                "findings": [
+                    { "kind": "auto_fixable", "file": "src/a.rs", "patch_hint": "rename it" },
+                    { "kind": "needs_human", "summary": "needs judgement", "severity": "high" },
+                    { "kind": "duplicate", "of": "the first finding" },
+                    { "kind": "auto_fixable", "file": "src/b.rs", "patch_hint": "widen it" },
+                ],
+            })),
+        ),
+        // Item 0 answers last. Completion order is the reverse of source order,
+        // which is the only arrangement under which the join means anything.
+        Script::new(
+            HAIKU,
+            Outcome::structured(json!({ "patch": "patch-a", "explanation": "renamed" }))
+                .after(Duration::from_millis(300)),
+        )
+        .matching("src/a.rs"),
+        Script::new(
+            HAIKU,
+            Outcome::structured(json!({ "patch": "patch-b", "explanation": "widened" })),
+        )
+        .matching("src/b.rs"),
+        Script::new(
+            HAIKU,
+            Outcome::structured(json!({ "summary": "one fix, one ticket" })),
+        )
+        .matching("Summarize the triage run"),
+    ]);
+
+    let shims = harness::Scratch::new("triage-shims");
+    harness::shim(
+        shims.path(),
+        "repo-grep",
+        "printf '{\"matches\":[\"src/a.rs:42:boom\"]}'\n",
+    );
+    harness::shim(
+        shims.path(),
+        "run-checks",
+        "printf 'two checks failed'\nexit 1\n",
+    );
+    let sinks = shims.path().join("sinks.jsonl");
+
+    let mut environment = harness::environment(&provider);
+    for (name, value) in [
+        ("ANTHROPIC_API_KEY", "mock-provider-key".to_string()),
+        ("LOCAL_LLM_KEY", "mock-provider-key".to_string()),
+        ("LOCAL_LLM_URL", provider.base_url()),
+        ("DEPLOY_ENV", "acceptance".to_string()),
+        ("QUEUE_HOST", "queue.invalid".to_string()),
+        ("QUEUE_TOKEN", "queue-token".to_string()),
+        ("TRIAGE_HOST", "triage.invalid".to_string()),
+        ("TRIAGE_TOKEN", "triage-token".to_string()),
+        ("REPO_ROOT", shims.path().display().to_string()),
+        ("RG_CONFIG_PATH", shims.path().display().to_string()),
+        ("SINK_LOG", sinks.display().to_string()),
+        (
+            "PATH",
+            format!(
+                "{}:{}",
+                shims.path().display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        ),
+    ] {
+        environment.push((name.to_string(), value));
+    }
+
+    let Some(run) = harness::invoke_entrypoint(
+        &harness::example("triage-fanout"),
+        "examples/triage-fanout",
+        "flow.triage",
+        &json!({ "report": "the parser panics", "pattern": "panic!" }),
+        &environment,
+        Some(ANSWER_THE_EXAMPLES_INFRASTRUCTURE),
+    ) else {
+        return;
+    };
+
+    // Everything up to the one construct this release does not execute.
+    let failure = run.failed();
+    assert!(
+        failure.contains("a `human` pause is not executed by this compiler release"),
+        "the run reaches `approve` and stops there, saying what it is: {failure}"
+    );
+    assert_eq!(
+        run.visited(),
+        [
+            "enrich",
+            "scan",
+            "classify",
+            "announce",
+            "dispatch",
+            "verify",
+            "summarize",
+            "remember",
+            "approve",
+        ],
+        "the whole path, with `dispatch` and `announce` concurrent in one step \
+         and `verify` running once after both"
+    );
+
+    // The two concurrent branches ran in the same step, and the convergence in
+    // the next one — the fan-out barrier is what put them there (grammar 7.6).
+    let step = |node: &str| run.entries(node)[0]["step"].clone();
+    assert_eq!(step("dispatch"), step("announce"));
+    assert_eq!(
+        step("verify").as_i64().expect("a step"),
+        step("dispatch").as_i64().expect("a step") + 1,
+    );
+
+    // Every finding reached its own route, in source-item order, and the two
+    // sink routes were waited on like any other (PRD 5.6).
+    let dispatched = run.entries("dispatch")[0]["dispatches"].clone();
+    assert_eq!(
+        dispatched
+            .as_array()
+            .expect("the map records what it dispatched")
+            .iter()
+            .map(|record| (
+                record["index"].clone(),
+                record["route"].clone(),
+                record["target"].clone(),
+                record["outcome"].clone(),
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (
+                json!(0),
+                json!("auto_fixable"),
+                json!("agent.fixer"),
+                json!("completed")
+            ),
+            (
+                json!(1),
+                json!("needs_human"),
+                json!("tool.review_queue"),
+                json!("completed")
+            ),
+            (
+                json!(2),
+                json!("$default"),
+                json!("tool.dead_letter"),
+                json!("completed")
+            ),
+            (
+                json!(3),
+                json!("auto_fixable"),
+                json!("agent.fixer"),
+                json!("completed")
+            ),
+        ],
+        "{dispatched}"
+    );
+
+    // The join's result, on the wire: `summarize` reads `state.patches`, and the
+    // fixer that answered *last* is the one whose patch is *first* — because the
+    // order is the source array's, never the providers' (grammar 7.6.4 clause 2).
+    let summarized = provider
+        .requests()
+        .into_iter()
+        .find(|request| {
+            request.body()["system"]
+                .as_str()
+                .is_some_and(|prompt| prompt.starts_with("Summarize the triage run"))
+        })
+        .expect("the summarizer ran");
+    let turns = summarized.body()["messages"].clone();
+    let asked = turns
+        .as_array()
+        .and_then(|turns| turns.last())
+        .expect("a request carries at least the node's own turn")["content"]
+        .as_str()
+        .expect("the bound input is the last user turn")
+        .to_string();
+    assert_eq!(
+        asked, "{\"report\":\"a normalized report\",\"patches\":[\"patch-a\",\"patch-b\"]}",
+        "the subgraph's output and the fan-out's, both read back from state"
+    );
+
+    // What the sinks were actually sent, recorded by the preamble that answered
+    // them: the narrowed payload of each variant, and nothing from another's.
+    let delivered: Vec<Value> = std::fs::read_to_string(&sinks)
+        .expect("the preamble logged what the example's infrastructure was sent")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("one JSON object per line"))
+        .collect();
+    let sent = |path: &str| -> Value {
+        delivered
+            .iter()
+            .find(|entry| entry["path"] == path)
+            .unwrap_or_else(|| panic!("nothing reached `{path}`: {delivered:#?}"))["body"]
+            .clone()
+    };
+    assert_eq!(
+        sent("/v1/normalize"),
+        json!({ "report": "the parser panics" }),
+        "the subgraph got its input through the instantiating node's bindings alone"
+    );
+    assert_eq!(
+        sent("/v1/tickets"),
+        json!({ "summary": "needs judgement", "severity": "high" }),
+        "the `needs_human` route is narrowed to its own variant's payload"
+    );
+    assert_eq!(
+        sent("/v1/dead-letter"),
+        json!({ "kind": "duplicate", "payload": "the first finding" }),
+        "…and the catch-all to the unrouted variant's"
+    );
+    assert_eq!(
+        sent("/v1/triage-started"),
+        json!({ "report": "a normalized report" }),
+        "the concurrent branch ran too"
+    );
+    assert!(provider.snapshot().is_drained());
+}
+
+/// The host preamble `examples/triage-fanout` needs to run without a network.
+///
+/// Two jobs, and both are the *host's* rather than the composition's. The
+/// example names no `base_url:`, so its provider resolves `https://api.anthropic.com`
+/// and the mock is where that goes — the same redirect
+/// `the_review_loop_example_runs_its_cycle_against_the_mock_provider` uses. And
+/// the four HTTPS endpoints it talks to are a normalizer, a ticket queue, a
+/// dead-letter queue and a webhook: infrastructure the example documents talking
+/// to and this milestone is not about. They are answered here, in their own
+/// declared shapes, and what each was sent is logged so a test can assert on the
+/// payloads a sink route delivered.
+const ANSWER_THE_EXAMPLES_INFRASTRUCTURE: &str = r#"import { appendFileSync } from "node:fs";
+import process from "node:process";
+
+const upstream = "https://api.anthropic.com";
+const mock = process.env["MOCK_BASE_URL"].replace(/\/+$/, "");
+const log = process.env["SINK_LOG"];
+
+// Each endpoint answers the shape the tool that calls it declares, at the status
+// it declares: `tool.review_queue` expects 201 and decodes two fields,
+// `flow.enrich`'s `fetch` expects 200 and decodes one.
+const answers = {
+  "/v1/normalize": [200, { report_normalized: "a normalized report" }],
+  "/v1/tickets": [201, { ticket_id: "T-1", queued: true }],
+  "/v1/dead-letter": [200, { accepted: true }],
+  "/v1/triage-started": [202, { started: true }],
+};
+
+const inner = globalThis.fetch;
+globalThis.fetch = async (resource, init) => {
+  const href =
+    typeof resource === "string"
+      ? resource
+      : resource instanceof URL
+        ? resource.href
+        : resource.url;
+  if (href.startsWith(upstream)) {
+    return inner(mock + href.slice(upstream.length), init);
+  }
+  const answer = answers[new URL(href).pathname];
+  if (answer === undefined) return inner(href, init);
+  appendFileSync(
+    log,
+    `${JSON.stringify({
+      path: new URL(href).pathname,
+      body: JSON.parse(init?.body ?? "null"),
+    })}\n`,
+  );
+  return new Response(JSON.stringify(answer[1]), {
+    status: answer[0],
+    headers: { "content-type": "application/json" },
+  });
+};
+"#;
 
 /// A node retries its model call per its declared policy, and the retries are
 /// visible as repeated calls.

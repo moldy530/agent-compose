@@ -1,12 +1,13 @@
 //! The generated-code checks of CLAUDE.md's *Validation strategy*, run against
 //! the **real** pinned JavaScript toolchain.
 //!
-//! Eleven gates. The first four are in increasing strength, each one existing
-//! because the one above it passes on code the one below it catches; the next two
-//! are about the schemas rather than the graph; the seventh is about a
-//! composition that has no generated project at all; and the last four are
-//! about what a binding does on the wire, which no amount of type-checking or
-//! graph construction reaches:
+//! Twelve gates. The first four are in increasing strength, each one existing
+//! because the one above it passes on code the one below it catches; the fifth
+//! is about a construct whose guarantees are only observable from inside the
+//! runtime; the next two are about the schemas rather than the graph; the eighth
+//! is about a composition that has no generated project at all; and the last
+//! four are about what a binding does on the wire, which no amount of
+//! type-checking or graph construction reaches:
 //!
 //! 1. **`tsc --noEmit`** — every golden project type-checks under its own strict
 //!    `tsconfig.json`, against installed `@langchain/langgraph`, `@langchain/core`
@@ -28,7 +29,21 @@
 //!    emitted `README.md` says loading the project is what checks its
 //!    environment (PRD 5.9); a `readEnvironment` that was declared and never
 //!    called would pass every gate above and make that sentence false.
-//! 5. **Schema-lowering agreement** — the corpus under
+//! 5. **The fan-out** — `map` dispatch, driven directly against a golden's own
+//!    `src/runtime.ts`. Nine of grammar 8.6's guarantees are invisible from
+//!    outside: how many instances were in flight at once — with and without a
+//!    detached route beside them — which item a `fail` names when two of them
+//!    fail, whether the join returned before a detached delivery did, what that
+//!    delivery handed its sink, that an exhausted item retry resolves as `fail`
+//!    does, how many attempts an item *made* when the node's deadline cut a
+//!    backoff short, what a fan-out that failed still records, that a batch
+//!    survives the **channel** its reducer belongs to and not only the reducer,
+//!    and that the ordering holds under a completion order that is the reverse
+//!    of the source's. A happy-path run produces the same outputs with every one
+//!    of them broken. It also decides what a node's own `timeout:` does to a
+//!    **subgraph** (grammar 9.2) — the one activity a deadline can stop rather
+//!    than merely stop waiting for.
+//! 6. **Schema-lowering agreement** — the corpus under
 //!    `tests/fixtures/schema-lowering/` is validated twice: against the JSON
 //!    Schema this compiler lowers to (Rust, the `jsonschema` crate) and against
 //!    the Zod the same module emits (Node). Grammar 3.8 is one table with two
@@ -38,14 +53,14 @@
 //!    the document carries **both** verdicts and names one of [`DIVERGENCES`],
 //!    so a difference is something a reader signed off on rather than something
 //!    a thin corpus failed to notice.
-//! 6. **What a provider would be handed** — `@langchain/core`'s own converter is
+//! 7. **What a provider would be handed** — `@langchain/core`'s own converter is
 //!    run over the emitted schemas, because `withStructuredOutput` sends JSON
 //!    Schema rather than the Zod it was given, and the conversion drops every
 //!    check spelled `.refine`. That is why PRD 9.16 sends the compiler's own
 //!    lowering instead, and this gate measures the road not taken — see
-//!    `codegen::schema`'s *What a provider is handed*. Gate 5 is what makes the
+//!    `codegen::schema`'s *What a provider is handed*. Gate 6 is what makes the
 //!    two columns agree; this is what says why a model is shown the one it is.
-//! 7. **The refusal's evidence** — `compose_core::codegen::diagnostics` refuses to
+//! 8. **The refusal's evidence** — `compose_core::codegen::diagnostics` refuses to
 //!    build a composition whose `state:` names a channel after a property every
 //!    JavaScript object carries (`constructor`). That refusal is an
 //!    over-refusal until something shows the runtime really cannot take the
@@ -54,25 +69,25 @@
 //!    it — and asks Node for `Object.getOwnPropertyNames(Object.prototype)`, so
 //!    the Rust-side list is checked against the object model rather than against
 //!    a memory of it.
-//! 8. **What a raw binding binds** — the single string-typed property of a
+//! 9. **What a raw binding binds** — the single string-typed property of a
 //!    `tool.*` takes *trimmed* raw stdout from an `exec:` implementation and the
 //!    raw response text from an `http:` one, which is grammar 6.1 stating one
 //!    exception once per surface with one word different between them. Both are
 //!    driven out of a golden's own runtime, over a payload with whitespace at
 //!    either end, so which reading this compiler took is a committed fact rather
 //!    than an accident of a shared decoder.
-//! 9. **A command that never reads its input** — grammar 8.2 writes a scalar
-//!    `input:` to the child's stdin, and `printf` exits without draining it. The
-//!    EPIPE that follows arrives as an `error` *event*, outside the promise the
-//!    node's own error policy is built on, so an unhandled one aborts the whole
-//!    process rather than failing the node. Nothing about a returned value is
-//!    wrong there — no value is returned — which is why it is a gate and not an
-//!    assertion.
-//! 10. **A declared `Content-Type`** — header names are case-insensitive
+//! 10. **A command that never reads its input** — grammar 8.2 writes a scalar
+//!     `input:` to the child's stdin, and `printf` exits without draining it.
+//!     The EPIPE that follows arrives as an `error` *event*, outside the promise
+//!     the node's own error policy is built on, so an unhandled one aborts the
+//!     whole process rather than failing the node. Nothing about a returned
+//!     value is wrong there — no value is returned — which is why it is a gate
+//!     and not an assertion.
+//! 11. **A declared `Content-Type`** — header names are case-insensitive
 //!     (grammar 6.1) and `fetch` composes its `Headers` by appending, so a
 //!     binding's own media type would ride out beside the runtime's instead of
 //!     replacing it. The server here is loopback and reports what it received.
-//! 11. **A bound input object on a `GET`** — the other half of the same
+//! 12. **A bound input object on a `GET`** — the other half of the same
 //!     sentence: without `query:`/`body:`, the object goes out as query
 //!     parameters rather than as a body. Which slot codegen fills is a golden's
 //!     to commit; this is what the runtime does with what it was handed.
@@ -596,6 +611,429 @@ fn the_run_channel_folds_a_steps_contributions_in_canonical_order() {
         .map(|entry| entry["node"].as_str().expect("a node id"))
         .collect();
     assert_eq!(nodes, ["draft", "review", "merge"]);
+}
+
+/// Gate 2i: what a fan-out does, decided from inside the runtime that does it
+/// (grammar 8.6, 7.6.4, 9.4).
+///
+/// The acceptance suite runs both fan-out forms through a compiled graph against
+/// scripted answers, which is where "the composition behaves" is settled. Five
+/// of grammar 8.6's guarantees are not observable from there, and each is a rule
+/// a wrong implementation would still pass a happy-path run with:
+///
+///   * **how many instances were in flight at once.** `max_concurrency` is a
+///     normative bound (Decision D28) and an unenforced one produces the same
+///     outputs, only faster and against a provider's rate limit;
+///   * **which item a `fail` names.** Two items failing at different times must
+///     report the **lowest-indexed** one, or two runs over one array fail about
+///     different items;
+///   * **whether the join returned before a detached delivery did.** "Resolved
+///     at dispatch" (Decision D94) is a statement about *when*, and an outputs
+///     assertion cannot see when;
+///   * **that an exhausted `on_item_error: { retry: … }` resolves as `fail`
+///     does** (rule 10), which needs an item that never answers;
+///   * **that the ordering survives a completion order that is the reverse of
+///     the source's**, at every one of the three reduce policies.
+///
+/// Five more are only reachable once the map node's **own policy** is in play,
+/// which is every compiled map: grammar 9.3 level 3 puts a `timeout:` and a
+/// `retry:` on every node a `defaults:` block covers, and the emitted
+/// `examples/triage-fanout` carries both on its `dispatch` node. The runner
+/// drives those through `runtime.runNode`, which is the seam a real map node
+/// runs through:
+///
+///   * **a detached delivery still queued for a permit when the budget runs
+///     out** is delivered anyway (rule 7, PRD 5.6) — its signal is its own, and
+///     one that started against the node's already-aborted signal would be
+///     recorded as `detached` and never sent;
+///   * **a node that returned no answer still says what it dispatched.** A
+///     deadline is raced, so the map's promise — and the `ItemFailure` its
+///     records would have ridden out on — is abandoned;
+///   * **the bound spans two executions of one node.** A detached delivery
+///     outlives its call, so a bound counted per call lets a cycle's second
+///     traversal, or the node's own `retry:`, reach twice the declared number;
+///   * **a dispatched `flow.*` that failed keeps its own trace** (grammar 8.5),
+///     which under `on_item_error: skip` is the only account of it there will
+///     ever be, because the run then succeeds;
+///   * **a subgraph is the one activity the budget can stop** (grammar 9.2). An
+///     instance is a run of its own, so the node's signal reaches its Pregel
+///     loop and it stops advancing — where an instance nothing aborted would run
+///     every node it had left *after* the node that started it had failed. The
+///     detached counterpart is asserted beside it, because Decision D94 puts
+///     that delivery off the node's clock and the same signal must not cross
+///     there.
+///
+/// `src/runtime.ts` is a compiler constant, byte-identical in every project this
+/// release builds, so driving it directly is driving what every project runs.
+#[test]
+fn the_fan_out_runtime_bounds_orders_and_resolves_every_dispatch() {
+    let Some(root) = installed() else {
+        return;
+    };
+    let project = staged(goldens::golden("triage-fanout"), root, "map-dispatch");
+    let output = Command::new("node")
+        .arg(root.join("map-dispatch.mjs"))
+        .arg(&project)
+        .output()
+        .expect("node runs");
+    assert!(
+        output.status.success(),
+        "the fan-out runtime did not run:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let observed: Value =
+        serde_json::from_slice(&output.stdout).expect("the runner prints its observations as JSON");
+
+    // Grammar 7.6.4 clause 2: one write per channel, carrying every instance's
+    // contribution in ascending source-item index — over a run whose completion
+    // order was exactly the reverse.
+    assert_eq!(
+        observed["orderedByIndex"],
+        serde_json::json!([
+            { "channel": "results", "reduce": "append", "values": ["done-0", "done-1", "done-2"] }
+        ])
+    );
+    assert_eq!(observed["orderedDispatches"], serde_json::json!([0, 1, 2]));
+
+    // Grammar 8.6 rule 1 and Decision D28: the node's bound, and a route that
+    // only ever tightens it.
+    assert_eq!(observed["nodeBound"], 2, "six items ran two at a time");
+    assert_eq!(observed["routedNodeBound"], 4);
+    assert_eq!(
+        observed["tightenedRouteBound"], 1,
+        "the route's own bound held while the map's left room"
+    );
+
+    // Rule 10: `skip` drops the item and the fan-out carries on, and the writes
+    // that landed are still in source-item order with the gaps closed up.
+    assert_eq!(
+        observed["skipped"],
+        serde_json::json!([
+            [0, "completed"],
+            [1, "skipped"],
+            [2, "completed"],
+            [3, "skipped"]
+        ])
+    );
+    assert_eq!(
+        observed["skippedChannels"],
+        serde_json::json!([
+            { "channel": "results", "reduce": "append", "values": ["done-0", "done-2"] }
+        ])
+    );
+    // …and under `fail`, the item reported is the lowest-indexed failure rather
+    // than the first one in time: item 3 failed immediately and item 1 waited.
+    // The failure carries the whole fan-out's account with it, because this is
+    // the path where the map node is about to be absorbed by its own `on_error:`
+    // and the items that ran already had their effects (PRD 5.3, 5.6). The two
+    // that failed say so: under `fail` nothing skipped them.
+    assert_eq!(
+        observed["failed"],
+        serde_json::json!({
+            "name": "ItemFailure",
+            "index": 1,
+            "attempts": 1,
+            "dispatches": [
+                [0, "completed"],
+                [1, "failed"],
+                [2, "completed"],
+                [3, "failed"]
+            ],
+        })
+    );
+    // A parameterized retry re-executes the whole instance…
+    assert_eq!(
+        observed["retried"],
+        serde_json::json!({ "attempts": 3, "tries": 3 })
+    );
+    // …and when it runs out, the item fails, resolving as `fail` does (rule 10).
+    assert_eq!(
+        observed["exhausted"],
+        serde_json::json!({ "name": "ItemFailure", "attempts": 2 })
+    );
+    // …but a deadline that ends the loop mid-backoff reports what the item
+    // *did*, not what its policy allowed: `max: 5` and one attempt made, because
+    // the node's signal aborted the first backoff (grammar 9.2). Both numbers a
+    // reader sees are that one — the failure's, and the dispatch record's.
+    assert_eq!(
+        observed["abortedMidBackoff"],
+        serde_json::json!({ "attempts": 1, "recorded": 1 })
+    );
+
+    // Decision D94: the join counted the detached dispatch the moment it was
+    // issued. The delivery finished *after* the map node had already returned,
+    // which is what "resolved at dispatch" means and what no output can show.
+    assert_eq!(
+        observed["detachOrder"],
+        serde_json::json!(["joined-0", "joined", "detached"])
+    );
+    assert_eq!(
+        observed["detachChannels"],
+        serde_json::json!([{ "channel": "results", "reduce": "append", "values": ["0"] }]),
+        "a detached dispatch writes no reduced state (grammar 8.6 rule 7)"
+    );
+    // Grammar 9.4: the execution id, then the frames of every node crossed from
+    // the root instance down — here an outer `flow:` node, then this map's own
+    // second traversal, then the item index.
+    assert_eq!(
+        observed["detachRecords"],
+        serde_json::json!([
+            { "index": 0, "outcome": "completed", "attempts": 1, "key": "exec_gate/outer/0/fan/1/0" },
+            { "index": 1, "outcome": "detached", "attempts": 0, "key": "exec_gate/outer/0/fan/1/1" }
+        ])
+    );
+
+    // Rule 6: a dispatch of zero instances writes nothing and completes — from
+    // an empty array, and from a producer that was skipped (rule 11).
+    assert_eq!(
+        observed["empty"],
+        serde_json::json!({ "channels": [], "dispatches": [] })
+    );
+    assert_eq!(
+        observed["skippedProducer"],
+        serde_json::json!({ "dispatches": 0 })
+    );
+
+    // Grammar 10.2, over both kinds of update: a plain write, and a map's batch
+    // replayed into the same reducer in index order.
+    assert_eq!(
+        observed["reducers"],
+        serde_json::json!({
+            "appendOne": ["a", "b"],
+            "appendBatch": ["a", "b", "c"],
+            "mergeOne": { "a": 1, "b": 2 },
+            "mergeBatch": { "a": 1, "b": 3, "c": 4 },
+            "setOne": "b",
+            "setBatch": "c",
+        })
+    );
+    // …and the same batches through the **channels** those reducers belong to,
+    // which is a different question: LangGraph keeps the first update to an
+    // empty channel verbatim instead of calling the reducer with it, so a
+    // channel with no initial value never gets the chance to unpack one. The
+    // `last_wins` row without a `default:` is the one that shape reaches
+    // (grammar 10.1, Decision D78), and `winner` holding the batch object
+    // rather than a string is what this row is here to refuse.
+    assert_eq!(
+        observed["batched"],
+        serde_json::json!({
+            "notes": ["n-A", "n-B", "n-C"],
+            "totals": { "who": "C", "note": "b" },
+            "latest": "l-C",
+            "winner": "w-C",
+        })
+    );
+
+    // PRD 5.6's replay interaction, on the wire: what a **detached** delivery
+    // hands its sink, on each of the three surfaces grammar 9.4 fixes — the
+    // `Idempotency-Key` header, the `IDEMPOTENCY_KEY` variable, the
+    // `idempotency_key` field of a host function's invocation context. The
+    // joined dispatch beside each carries nothing, because a key on a call whose
+    // outcome *is* observed would dedupe an effect meant to repeat; and a
+    // binding that declares the name itself wins, as it does for `content-type`.
+    assert_eq!(
+        observed["deliveredHeaders"],
+        serde_json::json!(["exec_gate/fan/0/1", null, "mine"])
+    );
+    assert_eq!(
+        observed["deliveredEnv"],
+        serde_json::json!({
+            "detached": "exec_gate/fan/0/1",
+            "joined": "",
+            "declared": "mine",
+            // An input field spelling the same variable is the one thing
+            // grammar 9.4 says the key is never part of — so the *validator*
+            // refuses that composition (`check::maps`, Decision D66, pinned by
+            // `invalid-check/detached-dispatch-collides-with-its-sinks-delivery-slot`),
+            // and a direct call that reaches this function anyway resolves it
+            // the same way: the delivery wins.
+            "collided": "exec_gate/fan/0/1",
+            // …and the variable this process was started with is not a key at
+            // all: the name grammar 9.4 fixes is a plain one, and a sink that
+            // deduped on an operator's unrelated variable would drop repeat
+            // calls a composition meant to repeat.
+            "ambient": "",
+        })
+    );
+    assert_eq!(
+        observed["deliveredContext"],
+        serde_json::json!(["exec_gate/fan/0/1", null])
+    );
+
+    // Grammar 8.6's key table: `max_concurrency` is a node-wide **admission**
+    // bound over every in-flight dispatch, detached included. Six items, half of
+    // them down a detached route bounded at 2 of its own — and still never more
+    // than the map's own 2 in flight, which is the whole promise a composition
+    // makes to a rate-limited provider.
+    // …and the hazard that comes with it: at a bound of 1 the delivery cannot be
+    // admitted until the joined instance ahead of it finishes, which is after
+    // the map node has returned. It is still delivered — a message a bound
+    // merely delayed past the join would otherwise be a message lost (D94).
+    //
+    // `aheadOfJoined` is that queue read from the other end, which is the end
+    // where the bound and grammar 8.6 rule 7 can contradict each other: rule 7
+    // says nothing a detached dispatch does can **delay** the enclosing flow
+    // instance, so the detached item is at index 0 and the joined item behind it.
+    // A delivery that took the only permit at index 0 and held it until it
+    // settled would make the join wait out the sink, and the answer here would
+    // read `["delivered", "joined", "returned"]`. `joinedBehindAHangingSink` is
+    // the same shape with a sink that never answers at all — the case where
+    // holding the permit does not delay the join but ends it, since a map node
+    // carrying no `timeout:` (grammar 9.3 level 4) has nothing to cut the wait
+    // short and the flow instance blocks for ever on a fire-and-forget delivery.
+    assert_eq!(
+        observed["detachedBound"],
+        serde_json::json!({
+            "declared": 2,
+            "peak": 2,
+            "queuedThenDelivered": ["joined", "returned", "delivered"],
+            "aheadOfJoined": ["joined", "returned", "delivered"],
+            "joinedBehindAHangingSink": "joined-returned",
+        })
+    );
+
+    // A map node under its own `timeout:`, driven through `runNode`. The
+    // delivery was still **queued** for a permit when the budget ran out — the
+    // joined instance ahead of it held the map's only one — and it was still
+    // delivered: it runs under a signal of its own, so it does not start against
+    // the node's already-aborted one, throw before anything reaches the wire,
+    // and disappear into the catch that keeps a detached dispatch from failing
+    // the flow. A record saying `detached` for a message nobody sent is the lost
+    // message grammar 8.6 rule 7 and PRD 5.6 trade dedupe-on-a-key to avoid.
+    assert_eq!(
+        observed["deadlineWhileQueued"],
+        serde_json::json!({
+            "outcome": "skipped",
+            "timedOut": true,
+            "attempted": ["exec_probe/queued/0/1"],
+            "delivered": ["exec_probe/queued/0/1"],
+        })
+    );
+    // …and the account the node still owes. A deadline is *raced* (grammar 9.2),
+    // so the map's promise is abandoned where it stands and neither its answer
+    // nor an `ItemFailure` ever arrives — yet item 0 completed and item 1 was
+    // delivered to a sink before the budget expired, and the record is the only
+    // place either is visible. Item 2 was still in flight, so it has no outcome
+    // to report and the entry's own error accounts for it.
+    assert_eq!(
+        observed["deadlineKeepsTheRecord"],
+        serde_json::json!({
+            "outcome": "skipped",
+            "dispatches": [[0, "completed"], [1, "detached"]],
+            "keys": ["exec_probe/partial/0/0", "exec_probe/partial/0/1"],
+        })
+    );
+
+    // Grammar 8.6's key table again, over the span the bound has to cover: a
+    // detached delivery outlives the call that issued it (D94), so permits
+    // counted per *call* are not a bound on the node at all. Both ways a node
+    // runs twice are driven — a second traversal of a bounded cycle, and the
+    // node's own `retry:` re-executing the whole fan-out — and each would reach
+    // 2 in flight against a declared 1 if the gates were rebuilt per call.
+    assert_eq!(
+        observed["admissionAcrossTraversals"],
+        serde_json::json!({ "declared": 1, "peak": 1 })
+    );
+    assert_eq!(
+        observed["admissionAcrossRetries"],
+        serde_json::json!({
+            "declared": 1,
+            "peak": 1,
+            // The node really did run its fan-out twice, and its own `on_error:`
+            // absorbed the second failure — otherwise "the bound held" would be
+            // a claim about one execution.
+            "attempts": 2,
+            "outcome": "skipped",
+        })
+    );
+
+    // The other half of a bound that spans executions. Permits outliving a call
+    // is what makes the bound real, and it is also the one way a detached
+    // delivery can still be in front of a joined instance: a later execution of
+    // the node knows nothing of the deliveries an earlier one left queued, and
+    // grammar 8.6 rule 7 says nothing a detached dispatch does can delay the
+    // enclosing flow instance. Two deliveries are issued at a bound of 1, so the
+    // second is queued on the *node* gate; the next execution's joined instance
+    // is then served ahead of it, waiting out only the delivery already running.
+    // Under a first-come queue this reads `delivered-1` before `joined`.
+    assert_eq!(
+        observed["joinAheadOfAQueuedDelivery"],
+        serde_json::json!(["delivered-0", "joined", "returned", "delivered-1"])
+    );
+
+    // Grammar 8.5: a dispatched `flow.*` that failed keeps the trace of its own
+    // instance. `on_item_error: skip` drops the item and the run **succeeds**,
+    // so every guard, budget and attempt inside that boundary is either on this
+    // record or nowhere at all (PRD 5.3).
+    assert_eq!(
+        observed["failedSubflowRecord"],
+        serde_json::json!({
+            "outcome": "skipped",
+            "inner": [{
+                "step": 1,
+                "flow": "flow.worker",
+                "node": "work",
+                "traversal": 0,
+                "outcome": "failed",
+                "attempts": 2,
+                "error": "Error: boom",
+            }],
+            "error": "SubflowFailure: the instance of `flow.worker` did not run to quiescence: Error: boom",
+        })
+    );
+
+    // Grammar 9.2 over a subgraph, which is the one activity a deadline can
+    // really stop. `runActivity` races every other kind and leaves it running,
+    // because a host function cannot be unscheduled — an instance can: it is a
+    // run of its own, and the signal reaches its Pregel loop. So the node's
+    // budget ends the *instance*, not only the node's wait for it: `two` never
+    // ran, and `one` — already in flight, and deaf to any signal on purpose —
+    // finished into a value nobody read, exactly as an abandoned host function
+    // does. Without the signal crossing, `effects` reads `["one", "two"]` and
+    // the instance would have gone on issuing effects, and holding the map
+    // node's admission permit, for as long as it had nodes left.
+    assert_eq!(
+        observed["subflowOnTheNodesClock"],
+        serde_json::json!({
+            "outcome": "skipped",
+            "timedOut": true,
+            "atReturn": [],
+            "effects": ["one"],
+            // …and the boundary the same signal must not cross: a **detached**
+            // dispatch is off the node's clock (D94), so its instance runs to
+            // quiescence after the map node has already given up on the joined
+            // item beside it.
+            "detached": { "outcome": "skipped", "effects": ["one", "two"] },
+        })
+    );
+
+    // Rules 2 and 4: a union may declare a variant tagged `default` and a
+    // `default:` catch-all beside it — routes are keyed by variant tag and
+    // `default:` is a map-block key, so the two never collide in the source.
+    // They must not collide in the record either: `selectRoute` searches the
+    // named routes first and gets it right, and two routes may share a target,
+    // so the tag is the only thing that could tell a reader which ran.
+    assert_eq!(
+        observed["defaultTagCollision"],
+        serde_json::json!([
+            [0, "default", "agent.named"],
+            [1, "$default", "agent.catchall"]
+        ])
+    );
+
+    // Grammar 9.3 level 1: the outermost instantiation site wins a field
+    // (Decision D79), an absent one is filled in from the inner site, and a
+    // `human` node takes neither `timeout` nor `retry` from it (Decision D102).
+    assert_eq!(
+        observed["policy"],
+        serde_json::json!({
+            "outermost": { "timeoutMs": 30_000 },
+            "filledIn": { "timeoutMs": 30_000, "onError": "skip" },
+            "none": null,
+            "exempt": { "onError": "skip" },
+            "plain": { "timeoutMs": 10_000, "onError": "fail" },
+        })
+    );
 }
 
 /// Gate 2e: what the single string-typed property of a `tool.*` binds, on each

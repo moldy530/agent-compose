@@ -572,6 +572,113 @@ flow.f:
     );
 }
 
+/// The accepting half of the delivery-slot rule, on the side of the *dispatch*:
+/// an `exec:` sink may declare an `idempotency_key` input field, and every
+/// dispatch of it whose outcome is **observed** may bind it. Grammar 9.4 gives a
+/// key to a detached dispatch and to nothing else, so a joined one leaves the
+/// `IDEMPOTENCY_KEY` variable to the field and there is no second writer for
+/// Decision D66 to refuse.
+#[test]
+fn a_joined_dispatch_binds_an_exec_sinks_own_idempotency_key_field() {
+    accepts(
+        "joined-dispatch-binds-an-idempotency-key-field",
+        r#"
+state:
+  findings:
+    type: array
+    max_items: 5
+    items: { type: string }
+tool.audit_log:
+  description: Append one finding to the audit log.
+  input:
+    finding: { type: string }
+    idempotency_key: { type: string }
+  output: {}
+  exec:
+    command: audit-log
+flow.f:
+  outputs: {}
+  nodes:
+    fan:
+      map:
+        over: "state.findings"
+        node: tool.audit_log
+        max_concurrency: 2
+        input:
+          finding: "item"
+          idempotency_key: "item"
+  edges:
+    - { from: start, to: fan }
+    - { from: fan, to: end }
+"#,
+    );
+}
+
+/// …and the accepting half on the side of the *target*: only one of grammar
+/// 9.4's three delivery surfaces shares a namespace with the sink's declared
+/// input. An `http:` target reads the key out of the `Idempotency-Key` **header**
+/// and a `function:` target out of its **invocation context**, both of which sit
+/// beside the input object — so a detached dispatch to either may bind a field
+/// of that name, and the rule stays the `exec:`-only rule grammar 6.1's
+/// environment makes it.
+#[test]
+fn a_detached_dispatch_to_a_sink_whose_key_rides_beside_its_input() {
+    accepts(
+        "detached-dispatch-keyed-beside-the-input",
+        r#"
+state:
+  findings:
+    type: array
+    max_items: 5
+    items: { type: string }
+tool.file_ticket:
+  description: File one finding as a ticket.
+  input:
+    finding: { type: string }
+    idempotency_key: { type: string }
+  output: {}
+  http:
+    method: POST
+    url: "https://example.invalid/tickets"
+    body:
+      title: "input.finding"
+      dedupe: "input.idempotency_key"
+tool.audit_log:
+  description: Append one finding to the audit log.
+  input:
+    finding: { type: string }
+    idempotency_key: { type: string }
+  output: {}
+  function: { name: audit_log }
+flow.f:
+  outputs: {}
+  nodes:
+    ticket:
+      map:
+        over: "state.findings"
+        node: tool.file_ticket
+        detach: true
+        max_concurrency: 2
+        input:
+          finding: "item"
+          idempotency_key: "item"
+    record:
+      map:
+        over: "state.findings"
+        node: tool.audit_log
+        detach: true
+        max_concurrency: 2
+        input:
+          finding: "item"
+          idempotency_key: "item"
+  edges:
+    - { from: start, to: ticket }
+    - { from: ticket, to: record }
+    - { from: record, to: end }
+"#,
+    );
+}
+
 /// The idiomatic subflow fan-in: a `map` dispatches a `flow.*`, whose node
 /// writes the channel the subflow's own `outputs:` materialize from, and whose
 /// result the dispatch remaps into an `append` channel of the dispatching flow

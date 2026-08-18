@@ -211,6 +211,12 @@ const GRAMMAR: &[Check] = &[
         evidence: Evidence::Fixture,
     },
     Check {
+        rule: "a detached dispatch's key is not part of its sink's declared input (9.4, D66)",
+        pass: "check/maps.rs",
+        codes: &["conflicting-keys"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
         rule: "the effective write map is injective (8.0, D93)",
         pass: "check/channels.rs",
         codes: &["conflicting-writes"],

@@ -23,7 +23,7 @@
 //! | [`expr`] | 4.1 | every CEL expression, at the surface it was written on: roots, paths, constructs, result type |
 //! | [`bindings`] | 8.0, 5.4, 11.5 | node input bindings against the target's declared input, name-based reads, `writes:` remaps and the injectivity of the effective write map, and what an agent's two attachment lists produce together |
 //! | [`channels`] | 7.5, 10 | write typing against the reduce policy, undefined channels, and a flow's `outputs:` against the channels it materializes from |
-//! | [`maps`] | 8.6 | `over` resolution and bounding, route narrowing and exhaustiveness, per-item bindings and the two `input:` forms, what a dispatch — detached or not — may write |
+//! | [`maps`] | 8.6 | `over` resolution and bounding, route narrowing and exhaustiveness, per-item bindings and the two `input:` forms, what a dispatch — detached or not — may write, and the environment slot a detached delivery shares with an `exec:` sink's input |
 //! | [`stores`] | 11 | store-op parameters and values against the op's row and the store's schemas, map-write keying, session-scope coherence |
 //! | [`providers`] | 11.2, 12 | `settings:` against the provider kind's published schema, and the three capability checks |
 //! | [`triggers`] | 13 | a trigger's `input:` against its flow's declared inputs, and what its payload can supply |

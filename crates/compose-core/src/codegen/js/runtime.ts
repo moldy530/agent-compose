@@ -26,6 +26,16 @@
 // contracts, and the one this compiler is held to is the grammar's — so the
 // budget is a deadline this module carries across attempts.
 //
+// # Where a fan-out and a subgraph run
+//
+// A `map` dispatches its instances **inside the map node's own task**
+// ([`runMap`]), and a `flow:` node instantiates its subflow as a separate run of
+// a separate compiled graph ([`runSubflow`]). Grammar 7.6's codegen note leaves
+// the shaping to M1 and fixes P1 and P2 instead; the reasons this is the shaping
+// that satisfies grammar 8.6 and 10.1 — and what a `Send` into the parent graph
+// cannot express — are the ledger in `codegen::graph`, which is where a reader
+// signs a difference off.
+//
 // # Why the model is called with `fetch`
 //
 // No provider SDK, and no `withStructuredOutput`. Three reasons, in the order
@@ -51,7 +61,7 @@
 import { spawn } from "node:child_process";
 import process from "node:process";
 
-import { Command, GraphRecursionError } from "@langchain/langgraph";
+import { Command, GraphRecursionError, isInterrupted } from "@langchain/langgraph";
 
 import { CelError, bind, evaluate, evaluateGuard, toJson } from "./cel.ts";
 import type { CelValue, Roots, Shape } from "./cel.ts";
@@ -113,6 +123,150 @@ export class Unimplemented extends Error {
     super(`${what} is not executed by this compiler release (PRD §7 M1: ${bullet})`);
     this.name = "Unimplemented";
   }
+}
+
+/**
+ * One dispatched `map` instance that did not complete (grammar 8.6 rule 10).
+ *
+ * Raised out of the map node when `on_item_error` resolves the item as `fail` —
+ * either because that is the policy or because a parameterized `retry:` ran out
+ * of attempts, which grammar 8.6 rule 10 says resolves as `fail` does. It is a
+ * failure of the **map node**, so the node's own `on_error:` is what absorbs it,
+ * and the item it names is the source-item index rather than a completion
+ * ordinal: two runs over one array fail about the same item.
+ */
+export class ItemFailure extends Error {
+  /** The source-item index, which is what identifies the item (PRD 5.6). */
+  readonly index: number;
+  /** The dispatch target the item went to. */
+  readonly target: string;
+  /** How many attempts the item's own policy made. */
+  readonly attempts: number;
+  /**
+   * What the **whole** fan-out did, in source-item order (PRD 5.3, 5.6).
+   *
+   * Carried on the failure for the reason [`carryEntry`] carries a trace entry:
+   * a map node that throws returns no answer, so the records it made have
+   * nowhere else to go — and this is the path where they matter most. The items
+   * that completed already had their effects, including any detached delivery
+   * this dispatch issued, and the failure alone says nothing about them.
+   */
+  readonly dispatches: readonly DispatchRecord[];
+
+  constructor(
+    node: string,
+    index: number,
+    target: string,
+    attempts: number,
+    cause: unknown,
+    dispatches: readonly DispatchRecord[] = [],
+  ) {
+    super(
+      `\`${node}\` item ${index} was dispatched to \`${target}\` and failed after ${attempts} attempt(s): ${describe(cause)}`,
+    );
+    this.name = "ItemFailure";
+    this.index = index;
+    this.target = target;
+    this.attempts = attempts;
+    this.cause = cause;
+    this.dispatches = dispatches;
+  }
+}
+
+/**
+ * A subflow instance that did not reach quiescence, or reached it holding no
+ * value for one of its `outputs:` (grammar 7.5, 7.6.3, 10.1).
+ *
+ * The subgraph boundary is where a failure would otherwise lose its context: the
+ * caller sees a node that failed, and what actually happened is a node three
+ * levels down. So the message names the instance and the error keeps the
+ * instance's own trace, which the `flow:` node then hands to its trace entry.
+ */
+export class SubflowFailure extends Error {
+  /** The flow that was instantiated. */
+  readonly flow: string;
+  /** Every routing decision the instance made before it stopped (PRD 5.3). */
+  readonly trace: readonly TraceEntry[];
+
+  constructor(flow: string, what: string, trace: readonly TraceEntry[], cause: unknown) {
+    super(`the instance of \`${flow}\` ${what}: ${describe(cause)}`);
+    this.name = "SubflowFailure";
+    this.flow = flow;
+    this.trace = trace;
+    this.cause = cause;
+  }
+}
+
+/**
+ * A result that does not match the schema its own contract declares (PRD 5.2).
+ *
+ * Structured output is load-bearing for routing, so the parse is where an answer
+ * is held to the contract — and what a reader needs from a failed one is *which*
+ * field and *what was there*. The emitted Zod says the first and, for two shapes
+ * that matter most, not the second: a discriminated union reports "Invalid
+ * discriminator value. Expected 'auto_fixable' | 'needs_human'" without ever
+ * naming the tag it was handed, and a closed object reports an unrecognized key
+ * without its value. Reading the document at each issue's own path is what makes
+ * the message actionable rather than merely correct (PRD G3).
+ */
+export class ResultMismatch extends Error {
+  /** What was being parsed, in diagnostic voice. */
+  readonly subject: string;
+
+  constructor(subject: string, value: unknown, issues: readonly ResultIssue[]) {
+    const described = issues
+      .map((issue) => {
+        const path = issue.path.map(String).join(".");
+        const found = valueAt(value, issue.path);
+        const at = path === "" ? "" : `${path}: `;
+        return found === undefined ? `${at}${issue.message}` : `${at}${issue.message} (found ${excerpt(found)})`;
+      })
+      .join("; ");
+    super(`${subject}: ${described}`);
+    this.name = "ResultMismatch";
+    this.subject = subject;
+  }
+}
+
+/** One issue a schema reported, in the shape both Zod and this module read. */
+interface ResultIssue {
+  readonly path: readonly PropertyKey[];
+  readonly message: string;
+}
+
+/** What a schema this module parses with has to be able to do. */
+export interface ResultSchema<T> {
+  safeParse(value: unknown): {
+    readonly success: boolean;
+    readonly data?: T;
+    readonly error?: { readonly issues: readonly ResultIssue[] };
+  };
+}
+
+/** The value a document holds at one issue's path, if it holds one. */
+function valueAt(value: unknown, path: readonly PropertyKey[]): unknown {
+  let held = value;
+  for (const step of path) {
+    if (held === null || typeof held !== "object") return undefined;
+    held = (held as Record<PropertyKey, unknown>)[step];
+  }
+  return held;
+}
+
+/** A value as a message quotes it: JSON, and short enough to read. */
+function excerpt(value: unknown): string {
+  const rendered = JSON.stringify(value) ?? String(value);
+  return rendered.length <= 120 ? rendered : `${rendered.slice(0, 117)}...`;
+}
+
+/**
+ * Parse one result with the schema its contract declares, or say what was wrong
+ * with it (PRD 5.2, and see [`ResultMismatch`]).
+ */
+export function parseResult<T>(schema: ResultSchema<T>, value: unknown, subject: string): T {
+  const parsed = schema.safeParse(value);
+  if (parsed.success) return parsed.data as T;
+  throw new ResultMismatch(subject, value, parsed.error?.issues ?? []);
 }
 
 /** A provider answered something other than a completion. */
@@ -181,14 +335,110 @@ export interface NodePolicy {
   readonly onError: ErrorStrategy;
 }
 
+/**
+ * Level **1** of grammar 9.3's chain: the `policy:` of the `flow:` node that
+ * instantiated the enclosing flow instance.
+ *
+ * It is carried in the instance's own `$run` rather than compiled into a node,
+ * because it is a property of the *instantiation site* and one flow may be
+ * instantiated from several of them — `flow.review_loop` under
+ * `policy: { timeout: 30s }` here and with nothing there is the same emitted
+ * node either way. `on_error` takes no `fallback` at this level: its target is a
+ * node id of the flow the declaring node sits in, and this level names no flow
+ * (§9.2, Decision D103).
+ */
+export interface InstancePolicy {
+  readonly retry?: RetryPolicy;
+  readonly timeoutMs?: number;
+  readonly onError?: "fail" | "skip";
+}
+
+/**
+ * Grammar 9.3 resolved for one node execution: its compiled levels 2–4, with
+ * level 1 laid over them where the instance carries one.
+ *
+ * Level 1 wins per field, which is what "highest precedence first" says — and a
+ * `human` node takes neither `timeout` nor `retry` from it, at this level as at
+ * every other (Decision D102), which is what `exempt` marks.
+ */
+export function effectivePolicy(
+  compiled: NodePolicy,
+  exempt: boolean,
+  override: InstancePolicy | undefined,
+): NodePolicy {
+  if (override === undefined) return compiled;
+  return {
+    ...(exempt ? {} : { retry: override.retry ?? compiled.retry }),
+    ...(exempt
+      ? {}
+      : { timeoutMs: override.timeoutMs ?? compiled.timeoutMs }),
+    onError: override.onError ?? compiled.onError,
+  };
+}
+
+/**
+ * A flow instance's run identity (grammar 4.1's `execution` root).
+ *
+ * `item_index` is the source-item index of the **innermost** enclosing `map`
+ * dispatch. It is absent everywhere else, which is a property of the *site*
+ * rather than of the composition — the same flow is a dispatch target at one
+ * instantiation and a root instance at another — so an expression that reads it
+ * outside a dispatch fails the execution rather than the build (Decision D115).
+ */
+export interface ExecutionIdentity {
+  readonly id: string;
+  readonly session_key: string;
+  readonly item_index?: number;
+}
+
 /** What one node execution needs from the world. */
 export interface RunContext {
   /** The flow instance's execution identity (grammar 4.1's `execution`). */
-  readonly execution: { readonly id: string; readonly session_key: string };
-  /** Aborted when the node's `timeout:` budget runs out. */
+  readonly execution: ExecutionIdentity;
+  /**
+   * Aborted when the node's `timeout:` budget runs out.
+   *
+   * With one deliberate exception: a **detached** `map` dispatch runs under a
+   * signal of its own, which nothing aborts. Its outcome is never observed
+   * (Decision D94), so the node's deadline has nothing to say about it — and a
+   * delivery the node's bound had merely delayed past that deadline would
+   * otherwise be dropped on the floor rather than sent. See [`runMap`].
+   */
   readonly signal: AbortSignal;
   /** How this attempt is addressed, for a message. */
   readonly node: string;
+  /**
+   * The idempotency key this effect carries to its receiver (grammar 9.4).
+   *
+   * Present at exactly one kind of call: a **detached** `map` dispatch to a
+   * `tool.*` — the sink of PRD 5.6, whose outcome is never observed and whose
+   * delivery is therefore at-least-once. Every other call leaves it absent,
+   * because grammar 9.4 fixes the carriers at two ("a detached `map` dispatch
+   * and a store write") and a key on a call that is not one of them would be a
+   * key a receiver dedupes on for effects that are *meant* to repeat.
+   *
+   * **The name is normative.** Grammar 9.4's delivery surface says a
+   * `function:`-bound target "receives it as the `idempotency_key` field of its
+   * invocation context", and the invocation context of a host function is this
+   * object ([`HostFunction`]) — so this field *is* that surface and is spelled
+   * the way the spec spells it rather than the way the rest of this file spells
+   * a name. The other two carriers are named there too, and see [`runHttp`] and
+   * [`runExec`] for the slot each puts it in.
+   */
+  readonly idempotency_key?: string;
+}
+
+/**
+ * The context a **detached** dispatch runs its sink under: this node's, plus
+ * the key grammar 8.6 rule 7 says the dispatch receives.
+ *
+ * Emitted at the dispatch site rather than applied to every scoped context in
+ * [`runMap`], because which dispatches carry a key is a property of the *route*
+ * and its target, and a compiled `graph.ts` is where a reader should be able to
+ * see which of its deliveries is keyed.
+ */
+export function delivering(context: RunContext, site: DispatchSite): RunContext {
+  return { ...context, idempotency_key: site.idempotencyKey };
 }
 
 const sleep = (ms: number, signal: AbortSignal): Promise<void> =>
@@ -263,6 +513,13 @@ export function backoffFor(policy: RetryPolicy, attempt: number): number {
  * discarded when it arrives. That is the whole of what a timeout can mean here,
  * and the generated `README.md` says so where a host reads about registering
  * one.
+ *
+ * **One activity is an exception**, and it is the one where "keeps running" is a
+ * whole graph rather than a call: a `flow:` node's instance, and a joined `map`
+ * dispatch to a `flow.*`. An instance is a run of its own, so `context.signal`
+ * is handed to it ([`Instantiation.signal`]) and LangGraph stops scheduling its
+ * supersteps — leaving one abandoned activity inside it, exactly as above,
+ * rather than every node the instance had left to run.
  */
 export async function runActivity<T>(
   flow: string,
@@ -979,6 +1236,43 @@ export function environmentName(field: string): string {
   return field.toUpperCase();
 }
 
+/**
+ * The variable a subprocess sink reads its idempotency key out of — the name
+ * grammar 9.4's delivery surface fixes for an `exec:`-bound target.
+ *
+ * The environment rather than the argument vector: `args:` is the author's exact
+ * command line and a runtime that appended to it would be changing the program's
+ * arguments — while the environment is the out-of-band channel a process already
+ * has.
+ *
+ * The name is a plain one, so [`runExec`] clears it out of the inherited
+ * environment first: a target receives it when this runtime delivered it, and
+ * not because the process happened to be started with a variable by that name.
+ *
+ * [`environmentName`] spells an input field by upper-casing it, so a target that
+ * declared an input field called `idempotency_key` would name this same
+ * variable. **No compiled graph reaches that**: grammar 9.4 says the key is
+ * "delivery metadata, never part of the target's declared input schema", and the
+ * validator refuses a detached dispatch to an `exec:` sink declaring one rather
+ * than letting either value be discarded in silence — the rule Decision D66
+ * already applies to the binding's own `env:` (`check::maps`). What is left for
+ * this function to settle is the order a *direct* call resolves it in, and it is
+ * 9.4's: the delivery is written **after** the input fields, and **before** the
+ * binding's own `env:` — the layer an author configures their wire from, which
+ * sits over the delivery exactly as a declared header sits over the emitted
+ * media type.
+ */
+export const IDEMPOTENCY_ENV = "IDEMPOTENCY_KEY";
+
+/**
+ * The header an HTTP sink reads its idempotency key out of — the name
+ * grammar 9.4's delivery surface fixes for an `http:`-bound target, and the one
+ * sinks already dedupe on. Header names are case-insensitive and [`headerSet`]
+ * folds them, so this is the spelling that reaches the wire rather than a
+ * second name for one header.
+ */
+export const IDEMPOTENCY_HEADER = "Idempotency-Key";
+
 /** Run one `exec:` binding (grammar 6.1, 8.2). */
 export async function runExec(
   binding: ExecBinding,
@@ -986,6 +1280,13 @@ export async function runExec(
   context: RunContext,
 ): Promise<unknown> {
   const environment: Record<string, string> = { ...(process.env as Record<string, string>) };
+  // The delivery slot starts empty, whatever the process was started with. The
+  // name grammar 9.4 fixes is a plain one, and a variable that happened to be in
+  // this process's environment would otherwise reach every `exec:` target in the
+  // composition as a key a sink dedupes on — silently dropping repeat calls that
+  // were meant to repeat. A target receives this variable when, and only when,
+  // this runtime delivered it (or the binding's own `env:` set it, below).
+  delete environment[IDEMPOTENCY_ENV];
   let stdin: string | undefined;
   if (typeof input === "string") {
     stdin = input;
@@ -994,6 +1295,18 @@ export async function runExec(
       environment[environmentName(field)] =
         typeof value === "string" ? value : JSON.stringify(value);
     }
+  }
+  // The key a detached delivery carries, where this call is one (grammar 8.6
+  // rule 7, 9.4). Under the declared `env:` for the same reason a declared
+  // header sits under the runtime's media type: what the binding wrote out is
+  // the author's statement about this process's environment, and an automatic
+  // addition that overwrote it would break a sink using its own scheme. Over the
+  // input fields, which no compiled graph puts here — the validator refuses a
+  // composition whose detached sink declares the slot (see [`IDEMPOTENCY_ENV`])
+  // — because a delivery a sink cannot dedupe on is the failure the key exists
+  // to prevent.
+  if (context.idempotency_key !== undefined) {
+    environment[IDEMPOTENCY_ENV] = context.idempotency_key;
   }
   for (const entry of binding.env) {
     environment[entry.name] = interpolate(entry.value);
@@ -1086,9 +1399,21 @@ export async function runHttp(
   // The body this runtime composes is JSON, so `application/json` is the media
   // type a binding that said nothing gets — and a binding that *did* say
   // something replaces it rather than adding to it. See [`headerSet`].
-  const headers = sendsBody
-    ? headerSet({ "content-type": "application/json" }, declared)
-    : headerSet(declared);
+  //
+  // The idempotency key rides in the same layering, one layer down from the
+  // binding's own headers (grammar 8.6 rule 7, 9.4). A **header** rather than a
+  // body field: the body of a `tool.*` request is the object its declared
+  // `input:` parsed, so a field injected into it would be a property the tool's
+  // own contract does not declare — and could collide with one it does. A
+  // header is out of band, and `Idempotency-Key` is the name sinks already
+  // dedupe on.
+  const headers = headerSet(
+    sendsBody ? { "content-type": "application/json" } : undefined,
+    context.idempotency_key === undefined
+      ? undefined
+      : { [IDEMPOTENCY_HEADER]: context.idempotency_key },
+    declared,
+  );
 
   const response = await fetch(url, {
     method: binding.method,
@@ -1158,7 +1483,15 @@ function decode(
 // The host function registry (grammar 6.1's escape hatch)
 // ---------------------------------------------------------------------------
 
-/** What a host-registered function is: arguments in, a result out. */
+/**
+ * What a host-registered function is: arguments in, a result out.
+ *
+ * `context` is the invocation context grammar 9.4's delivery surface names: a
+ * host function reached as the sink of a **detached** dispatch finds that
+ * dispatch's key in `context.idempotency_key`, and finds it absent on every
+ * other call. The generated `README.md` says so where a host reads about
+ * registering one.
+ */
 export type HostFunction = (args: unknown, context: RunContext) => unknown | Promise<unknown>;
 
 const REGISTRY = new Map<string, HostFunction>();
@@ -1364,8 +1697,96 @@ export interface TraceEntry {
   readonly attempts: number;
   readonly writes?: readonly string[];
   readonly routing?: RoutingDecision;
+  /**
+   * What a `map` node dispatched, one entry per source item in **index** order
+   * (grammar 8.6, PRD 5.6).
+   *
+   * Cardinality and destination are data in this design, so they are trace data
+   * too: which route each item took, whether the instance completed, was skipped
+   * by `on_item_error`, failed under it, or was resolved at dispatch by
+   * `detach: true`. Without it a fan-out is the one construct whose whole
+   * decision — how many, and to where — leaves no record at all.
+   *
+   * A map node that **failed** carries it too, whether the failure ended the run
+   * or its own `on_error:` absorbed it: the items that ran already had their
+   * effects, and that is the reading of a fan-out an operator most needs. See
+   * [`ItemFailure.dispatches`], which is how it gets out of a node that returned
+   * no answer, and [`plannedDispatches`], which is how it gets out of a node
+   * whose own `timeout:` fired before it could raise one. In that last case the
+   * entry holds the dispatches that had **resolved** — every detached delivery,
+   * and every joined instance that had settled — rather than one per source
+   * item: an instance the deadline caught mid-flight has no outcome to record,
+   * and the entry's `error` names the budget that ended it.
+   */
+  readonly dispatches?: readonly DispatchRecord[];
+  /**
+   * The trace of the subflow instance a `flow:` node ran (grammar 8.5).
+   *
+   * A subgraph's routing decisions are its own instance's, and a flat trace
+   * would either lose them or pretend they were the caller's. Nesting them keeps
+   * PRD 5.3's record complete across a module boundary without moving anyone's
+   * step numbers.
+   */
+  readonly inner?: readonly TraceEntry[];
   readonly error?: string;
   readonly fallback?: string;
+}
+
+/** What one dispatched `map` instance did (grammar 8.6, PRD 5.6). */
+export interface DispatchRecord {
+  /** The source-item index — what orders every write this instance made. */
+  readonly index: number;
+  /**
+   * The route's variant tag, `"$default"` for the catch-all, absent on the
+   * homogeneous form.
+   *
+   * The catch-all's name carries a sigil the identifier grammar cannot produce
+   * (§2.1: `lower , { lower | digit | "_" }`) because a union may declare a
+   * variant tagged `default` *and* a `default:` catch-all beside it — legal
+   * together, and resolved correctly by [`selectRoute`], which searches the
+   * named routes first. Spelling both `"default"` here would make the one
+   * distinction a reader has between them the target, and two routes may share
+   * a target.
+   */
+  readonly route?: string;
+  /** The component the item was dispatched to. */
+  readonly target: string;
+  /**
+   * What became of the item, which is what `on_item_error` decided (grammar 8.6
+   * rule 10): `skipped` is the policy dropping it and the fan-out carrying on,
+   * `failed` is `fail` — or a `retry:` out of attempts, which "resolves as
+   * `fail` does" — taking the map node down with it.
+   *
+   * `detached` is *resolved at dispatch*: the join counted it the moment the
+   * dispatch was issued and never learned its outcome (Decision D94), so no
+   * strategy ever applied to it.
+   */
+  readonly outcome: "completed" | "skipped" | "failed" | "detached";
+  /**
+   * How many attempts the item's policy **made** — not how many it allowed, so
+   * a node deadline that ended a backoff early is reported as the attempts that
+   * really happened. `0` for a detached dispatch, which has no observed outcome
+   * for `on_item_error` to have acted on.
+   */
+  readonly attempts: number;
+  /**
+   * The key this dispatch's effect site derives (grammar 9.4).
+   *
+   * A **detached** delivery carries it to its sink on the surface grammar 9.4
+   * fixes per binding kind — the `Idempotency-Key` header of an `http:`
+   * binding, the `IDEMPOTENCY_KEY` variable in an `exec:` binding's
+   * environment, the `idempotency_key` field of the context a `function:`
+   * binding is invoked with — which is what makes at-least-once delivery a
+   * defensible trade rather than a lost message (PRD 5.6). It is recorded for
+   * every dispatch because it is the same derivation either way, and because it
+   * is the one place the flattened instance path of a nested fan-out is
+   * observable at all.
+   */
+  readonly idempotencyKey: string;
+  /** The instance's own trace, when the target was a `flow.*`. */
+  readonly inner?: readonly TraceEntry[];
+  /** Why the item did not complete, when `on_item_error` skipped it. */
+  readonly error?: string;
 }
 
 /**
@@ -1388,11 +1809,82 @@ export function carryEntry<E>(error: E, entry: TraceEntry): E {
   return error;
 }
 
-/** The entry of the node this error aborted, if it came from one. */
+/**
+ * What a failed `map` node dispatched, recovered from the failure it raised.
+ *
+ * The `cause` chain is followed for the same reason [`abortedEntry`] follows it:
+ * `runActivity` wraps whatever the activity threw in a [`NodeFailure`], so the
+ * [`ItemFailure`] carrying the records is never the outermost error by the time
+ * a node's `on_error:` is deciding what to do with it.
+ */
+function dispatchesOf(error: unknown): readonly DispatchRecord[] | undefined {
+  for (let held: unknown = error; typeof held === "object" && held !== null; ) {
+    if (held instanceof ItemFailure) return held.dispatches;
+    held = (held as { cause?: unknown }).cause;
+  }
+  return undefined;
+}
+
+/**
+ * The trace of the subflow instance this error came out of, if it came out of
+ * one (grammar 8.5, PRD 5.3).
+ *
+ * The one account of what happened inside a module boundary, and the caller's
+ * own failure says nothing about it — so it is recovered wherever a failed
+ * instance is recorded: a `flow:` node's trace entry ([`runNode`]) and a
+ * dispatched instance's [`DispatchRecord`] ([`runMap`]). The `cause` chain is
+ * followed for the reason [`dispatchesOf`] follows it: `runActivity` wraps
+ * whatever the activity threw, so the [`SubflowFailure`] is rarely the outermost
+ * error by the time anyone asks.
+ */
+function traceOf(error: unknown): readonly TraceEntry[] | undefined {
+  for (let held: unknown = error; typeof held === "object" && held !== null; ) {
+    if (held instanceof SubflowFailure) return held.trace;
+    held = (held as { cause?: unknown }).cause;
+  }
+  return undefined;
+}
+
+/**
+ * What a `map` node dispatched, read off the **plan** rather than off an answer
+ * or a failure (grammar 8.6, PRD 5.3, 5.6).
+ *
+ * The last resort of the three, and the only one there is when a node's own
+ * `timeout:` fired: the deadline is raced ([`runActivity`]), so [`runMap`]'s
+ * promise is abandoned where it stands and neither its answer nor an
+ * [`ItemFailure`] ever arrives. The plan is [`runNode`]'s own object — it built
+ * it, outside the policy — and the map writes each dispatch into it as that
+ * dispatch resolves, so what survives here is every detached delivery (resolved
+ * at dispatch, D94) and every joined instance that had settled. An instance
+ * still in flight when the budget ran out has no outcome yet and so no record;
+ * the entry's own `error`, which names the node and its budget, is what accounts
+ * for it.
+ *
+ * Shaped rather than typed, because `runNode` holds a node's input as `unknown`:
+ * a map node's is a [`MapPlan`] and nothing else's is.
+ */
+function plannedDispatches(input: unknown): readonly DispatchRecord[] | undefined {
+  if (typeof input !== "object" || input === null) return undefined;
+  const plan = input as Partial<MapPlan>;
+  if (!Array.isArray(plan.instances) || !Array.isArray(plan.records)) return undefined;
+  if (plan.records.length === 0) return undefined;
+  return [...plan.records].sort((left, right) => left.index - right.index);
+}
+
+/**
+ * The entry of the node this error aborted, if it came from one.
+ *
+ * The `cause` chain is followed, because an error can be restated on the way out
+ * — `SuperstepCeiling` puts the original underneath itself — and the entry
+ * belongs to whichever error in that chain a node actually raised.
+ */
 export function abortedEntry(error: unknown): TraceEntry | undefined {
-  if (typeof error !== "object" || error === null) return undefined;
-  const held = (error as Record<symbol, unknown>)[ABORTED];
-  return held === undefined ? undefined : (held as TraceEntry);
+  for (let held: unknown = error; typeof held === "object" && held !== null; ) {
+    const entry = (held as Record<symbol, unknown>)[ABORTED];
+    if (entry !== undefined) return entry as TraceEntry;
+    held = (held as { cause?: unknown }).cause;
+  }
+  return undefined;
 }
 
 /**
@@ -1506,9 +1998,35 @@ export function failedTrace(state: unknown, error: unknown): readonly TraceEntry
 export interface RunChannel {
   readonly step: number;
   readonly input: Readonly<Record<string, unknown>>;
-  readonly execution: { readonly id: string; readonly session_key: string };
+  readonly execution: ExecutionIdentity;
   readonly iterations: Readonly<Record<string, number>>;
   readonly traversals: Readonly<Record<string, number>>;
+  /**
+   * The result of every node a `map.over` in this flow reads (grammar 8.6
+   * rule 11, 4.2).
+   *
+   * `over: plan.output.tasks` is the one place a node's result is read from
+   * *another* node's task — Decision D42 keeps every other surface off node
+   * outputs — and the producer ran in an earlier step, so its answer has to be
+   * somewhere. Only the nodes a map actually reads are kept, because a node
+   * output is arbitrarily large and this channel is copied into every superstep.
+   * A node that was **skipped** writes its key back as `undefined`, which is how
+   * grammar 8.6 rule 11's "dispatches zero instances" tells a producer that did
+   * not run this pass from a stale value it left on the last one.
+   */
+  readonly outputs: Readonly<Record<string, unknown>>;
+  /**
+   * The frames of every node crossed from the **root** flow instance down to
+   * this one, outermost first (grammar 9.4).
+   *
+   * Empty in the instance an invocation started; a `flow:` node appends
+   * `<node>/<traversal>` and a `map` dispatch `<node>/<traversal>/<index>`. It is
+   * what makes the idempotency key of a detached dispatch or a store write name
+   * *one* effect site rather than a node id two instances share.
+   */
+  readonly path: readonly string[];
+  /** Level 1 of grammar 9.3, if a `flow:` node instantiated this instance. */
+  readonly policy?: InstancePolicy;
   readonly trace: readonly TraceEntry[];
 }
 
@@ -1520,6 +2038,8 @@ export function emptyRun(): RunChannel {
     execution: { id: "", session_key: "" },
     iterations: {},
     traversals: {},
+    outputs: {},
+    path: [],
     trace: [],
   };
 }
@@ -1529,20 +2049,31 @@ export function emptyRun(): RunChannel {
  *
  * Concurrent nodes in one step each supply a partial update, and every field
  * merges in a way that does not depend on which of them the reducer sees first:
- * `step` takes the larger, the two counter maps merge key-wise (a node only ever
- * writes its own keys), and the trace is concatenated and then ordered by
+ * `step` takes the larger, the three key-wise maps merge key-wise (a node only
+ * ever writes its own keys), and the trace is concatenated and then ordered by
  * `(step, node)` — the canonical write order of grammar 7.6.4, read for the one
  * channel whose order is otherwise the scheduler's.
+ *
+ * `path` and `policy` are the instance's own identity rather than anything a
+ * node contributes: they are set once, in the state a flow instance is started
+ * from, and a partial update that carries neither leaves them alone.
  */
 export function mergeRun(left: RunChannel, right: Partial<RunChannel>): RunChannel {
   const trace = [...left.trace, ...(right.trace ?? [])];
   trace.sort((a, b) => a.step - b.step || (a.node < b.node ? -1 : a.node > b.node ? 1 : 0));
+  const policy = right.policy ?? left.policy;
   return {
     step: Math.max(left.step, right.step ?? 0),
     input: right.input ?? left.input,
     execution: right.execution ?? left.execution,
     iterations: { ...left.iterations, ...(right.iterations ?? {}) },
     traversals: { ...left.traversals, ...(right.traversals ?? {}) },
+    // Spread rather than `??`, so a skipped producer's `{ [node]: undefined }`
+    // *replaces* the value it left on an earlier pass instead of being read as
+    // "nothing to say" (grammar 8.6 rule 11).
+    outputs: { ...left.outputs, ...(right.outputs ?? {}) },
+    path: right.path ?? left.path,
+    ...(policy === undefined ? {} : { policy }),
     trace,
   };
 }
@@ -1559,6 +2090,102 @@ export interface WriteDescriptor {
   readonly field: string;
   readonly channel: string;
   readonly reduce: Reduce;
+}
+
+/**
+ * The writes a **`map`** node makes to one channel, already in the canonical
+ * order of grammar 7.6.4 clause 2 — source-item index, never completion order.
+ *
+ * A step's writers reach a channel one at a time and LangGraph's reducers are
+ * called once per writer, so a map's *N* instances cannot each be a writer: a
+ * fan-out of three appends would have to be three calls, and the order of those
+ * calls is the scheduler's rather than the source array's. PRD 5.6 calls
+ * unordered reduces a silent break of replay, so what the map node writes is one
+ * value carrying all *N* contributions in index order — the "index-tagged and
+ * reordered before the join" of PRD 5.6, arrived at as one write rather than as
+ * a sorting reducer. Every reducer this compiler emits unpacks it
+ * ([`appendReduce`], [`mergeReduce`], [`setReduce`]), so the map occupies its
+ * own place in clause 1's node-id ordering while its instances are ordered
+ * inside it by clause 2.
+ *
+ * It is a **class** rather than a tagged object because a composition's data is
+ * JSON: no `default:`, no model answer, and no `exec` result can be an instance
+ * of one, so `instanceof` cannot be spoofed by a value that merely looks like a
+ * batch.
+ */
+export class OrderedWrites {
+  /** The contributions, in ascending source-item index. */
+  readonly values: readonly unknown[];
+
+  constructor(values: readonly unknown[]) {
+    this.values = values;
+  }
+}
+
+/** What a channel's reducer may be handed: one write, or a `map`'s batch. */
+export type Written<T> = T | OrderedWrites;
+
+/** Whether this update is a `map` node's ordered batch rather than one write. */
+export function isOrdered(value: unknown): value is OrderedWrites {
+  return value instanceof OrderedWrites;
+}
+
+/**
+ * What a `map`'s contributions to one channel go to LangGraph **as**: a batch
+ * for the policies that unpack one, and the folded value for the one that
+ * cannot be handed a batch at all.
+ *
+ * A channel that starts **unset** never calls its reducer for the first write.
+ * LangGraph's `BinaryOperatorAggregate.update` keeps the first value verbatim
+ * while it holds nothing — `if (this.value === void 0) { this.value = first;
+ * newValues = newValues.slice(1); }` — so a batch arriving there would *become*
+ * the channel's value: an `OrderedWrites` object where a declared type says
+ * `string`, read back by every `state.<channel>` expression, every downstream
+ * write, and the flow's own `outputs:`.
+ *
+ * Exactly one policy can be in that position. `append` and `merge` start at the
+ * identity element their policy names (`[]`, `{}` — see `codegen::state`), so
+ * their channel always holds a value and their reducer is always called;
+ * `reduce: last_wins` with no `default:` starts unset, because grammar 10.1 and
+ * Decision D78 say a channel with no declared default does and reading one
+ * before its first write is an execution failure rather than a silent default.
+ * So the batch is folded here for `set`, and the fold is exactly what
+ * [`setReduce`] would have returned — the highest-indexed item's write
+ * (grammar 8.6 rule 5, 10.2). The value a run ends with is the same under
+ * either shaping; what changes is that it reaches the channel as the value.
+ *
+ * The half of that argument this function cannot see is the channel table, which
+ * `codegen::state` emits: the identity elements are what make "always called"
+ * true for `append` and `merge`, and a policy that stopped declaring one would
+ * turn an unfolded batch into a channel's value with nothing here to notice.
+ * `every_policy_a_map_batch_reaches_unfolded_starts_at_a_value`
+ * (`codegen::state`) is the pairing asserted where the initial value is decided.
+ */
+export function orderedUpdate(batch: ChannelWrite): unknown {
+  if (batch.reduce !== "set") return new OrderedWrites(batch.values);
+  return batch.values[batch.values.length - 1];
+}
+
+/** `reduce: append` — one element per write, in canonical order (D58). */
+export function appendReduce<T>(left: readonly T[], right: Written<T>): T[] {
+  return isOrdered(right) ? [...left, ...(right.values as readonly T[])] : [...left, right];
+}
+
+/** `reduce: merge` — shallow key-wise, so the last writer in order wins a key. */
+export function mergeReduce<T>(left: T, right: Written<T>): T {
+  if (!isOrdered(right)) return { ...left, ...right };
+  let value = left;
+  for (const one of right.values) value = { ...value, ...(one as T) };
+  return value;
+}
+
+/** `reduce: last_wins`, and a defaulted unreduced channel: the last write wins. */
+export function setReduce<T>(left: T, right: Written<T>): T {
+  if (!isOrdered(right)) return right;
+  // A map contributes a channel entry only when it has at least one write for
+  // it, so the batch is never empty — and `left` is what an empty one would
+  // have to leave behind anyway.
+  return right.values.length === 0 ? left : (right.values[right.values.length - 1] as T);
 }
 
 /** Read a state channel by name, failing the way Decision D78 says (grammar 10.1). */
@@ -1587,11 +2214,948 @@ export function flowInput(run: RunChannel, field: string, reader: string): unkno
 
 /** The value a channel holds once this write has landed, for a guard to read. */
 export function applyWrite(previous: unknown, value: unknown, reduce: Reduce): unknown {
-  if (reduce === "append") return [...((previous as unknown[]) ?? []), value];
+  if (reduce === "append") return appendReduce((previous as unknown[]) ?? [], value);
   if (reduce === "merge") {
-    return { ...((previous as Record<string, unknown>) ?? {}), ...(value as Record<string, unknown>) };
+    return mergeReduce((previous as Record<string, unknown>) ?? {}, value as Record<string, unknown>);
+  }
+  return setReduce(previous, value);
+}
+
+// ---------------------------------------------------------------------------
+// Subgraph instantiation (grammar 7.5, 8.5) and fan-out (grammar 8.6)
+// ---------------------------------------------------------------------------
+
+/**
+ * Anything that can be run to quiescence: a compiled flow, or one of them
+ * reached as a subflow.
+ *
+ * `signal` is LangGraph's own cancellation key (`RunnableConfig.signal`, which
+ * the Pregel runner races against each superstep), and it is here because a
+ * subgraph is the one activity this runtime can really *stop*: an aborted run
+ * stops scheduling tasks instead of carrying on to quiescence. Who supplies it
+ * is [`Instantiation.signal`].
+ */
+export interface Quiescible<S> {
+  stream(
+    initial: Record<string, unknown>,
+    options: { recursionLimit: number; signal?: AbortSignal },
+  ): Promise<AsyncIterable<S>>;
+}
+
+/**
+ * Run a compiled graph until it quiesces, keeping the last state each superstep
+ * produced.
+ *
+ * A stream rather than an invocation because of what a **failure** must leave
+ * behind: LangGraph's `invoke` is this loop with the last value kept, and an
+ * error thrown out of it discards the state it was keeping — the routing trace
+ * of PRD 5.3 with it. Taking the supersteps one at a time keeps every one that
+ * did complete, which is what a failure is then reported with. Both callers need
+ * that, which is why it is here rather than written twice.
+ *
+ * `signal` is the caller's deadline, when the caller has one: a `flow:` node and
+ * a joined `map` dispatch each run their instance inside a node budget, and a
+ * top-level run has no clock above it to pass. See [`Instantiation.signal`].
+ */
+export async function quiesce<S extends { $run: RunChannel }>(
+  graph: Quiescible<S>,
+  initial: Record<string, unknown>,
+  recursionLimit: number,
+  signal?: AbortSignal,
+): Promise<{ state?: S; error?: unknown }> {
+  let state: S | undefined;
+  try {
+    const supersteps = await graph.stream(initial, { recursionLimit, signal });
+    for await (const superstep of supersteps) {
+      // An interrupt is announced as a chunk of its own rather than as a state,
+      // and reading it as one would lose the run's.
+      if (!isInterrupted(superstep)) state = superstep;
+    }
+  } catch (error) {
+    return { state, error: restateCeiling(recursionLimit, error) };
+  }
+  return { state };
+}
+
+/**
+ * The instance path of the flow instance a `flow:` node is about to start
+ * (grammar 9.4).
+ *
+ * The frame is `<node id>/<traversal ordinal>`, where the ordinal is how many
+ * times this node has already begun executing in *its own* instance — so the
+ * second traversal of a bounded cycle instantiates a different effect site than
+ * the first, and a node-level `retry:` re-running the same attempt does not.
+ */
+export function instancePath(view: NodeView, node: string): readonly string[] {
+  return [...view.run.path, `${node}/${view.run.traversals[node] ?? 0}`];
+}
+
+/**
+ * Grammar 9.3 level 1 for the instance a `flow:` node starts: what already
+ * reached this instance, then what this site declares (Decision D79).
+ *
+ * **Outermost wins, per field.** A caller's hardening of a module it does not
+ * own cannot be undone by that module's own instantiation of a deeper one, so an
+ * inherited value is never replaced — only an absent one is filled in.
+ */
+export function instancePolicy(
+  inherited: InstancePolicy | undefined,
+  declared: InstancePolicy | undefined,
+): InstancePolicy | undefined {
+  if (inherited === undefined) return declared;
+  if (declared === undefined) return inherited;
+  const retry = inherited.retry ?? declared.retry;
+  const timeoutMs = inherited.timeoutMs ?? declared.timeoutMs;
+  const onError = inherited.onError ?? declared.onError;
+  return {
+    ...(retry === undefined ? {} : { retry }),
+    ...(timeoutMs === undefined ? {} : { timeoutMs }),
+    ...(onError === undefined ? {} : { onError }),
+  };
+}
+
+/** One compiled flow, as a `flow:` node or a `map` dispatch reaches it. */
+export interface SubflowBinding extends Quiescible<GraphStateLike> {
+  /** Its typed address (grammar 2.2). */
+  readonly address: string;
+  /** The fields its `outputs:` declares, each read from the channel of that name. */
+  readonly outputs: readonly string[];
+  /** The superstep ceiling one instance of it takes. */
+  readonly recursionLimit: number;
+}
+
+/** What one instantiation supplies to the instance it starts (grammar 7.5). */
+export interface Instantiation {
+  /**
+   * The subflow's `inputs:`, bound by the instantiating node.
+   *
+   * **Total, and the only thing that crosses**: a subgraph receives parent state
+   * exclusively through these (PRD 5.7, Decision D68). The instance's channels
+   * start at their own `default:`s, which is what makes a flow's behaviour
+   * independent of the caller that ran it (grammar 10.1).
+   */
+  readonly inputs: Record<string, unknown>;
+  /** The run identity the instance carries (grammar 4.1). */
+  readonly execution: ExecutionIdentity;
+  /** Its instance path, for anything nested inside it (grammar 9.4). */
+  readonly path: readonly string[];
+  /**
+   * The instantiating node's deadline, which crosses the boundary with it
+   * (grammar 9.2).
+   *
+   * A subgraph is the one activity a `timeout:` can really **stop**. Every other
+   * kind is either cooperative (`fetch` takes a signal, `spawn` is killed) or
+   * uncancellable (a host function), so [`runActivity`] races the budget and the
+   * node fails on time whatever the activity does — but an instance nothing
+   * aborted would run on to quiescence *after* the node that started it had
+   * already failed: issuing every effect its remaining nodes were going to
+   * issue, and holding the [`Admission`] permit a later execution of the same
+   * `map` node has to wait for. LangGraph stops scheduling supersteps when this
+   * aborts, so what is left in flight inside is one abandoned activity rather
+   * than the whole rest of the instance.
+   *
+   * A **detached** dispatch supplies it too, and it is the delivery's own signal
+   * — the one nothing aborts (Decision D94, and see [`runMap`]) — so an instance
+   * reached that way runs to quiescence exactly as its sink does.
+   */
+  readonly signal?: AbortSignal;
+  /** Level 1 of grammar 9.3 for every node inside it. */
+  readonly policy?: InstancePolicy;
+  /**
+   * The caller's conversation history, on a `context: inherit` instantiation
+   * (grammar 8.5, 10.4).
+   *
+   * Absent is `isolated`, which is the default and what a `map` dispatch always
+   * gets: the instance starts on a fresh history, and what it says there is
+   * discarded when it finishes (Decision D105).
+   */
+  readonly history?: readonly unknown[];
+}
+
+/**
+ * Instantiate one subflow and materialize its `outputs:` at quiescence
+ * (grammar 7.5, 7.6.3, 8.5).
+ *
+ * The instance is a **separate run of a separate compiled graph**, which is what
+ * gives it its own channel values: grammar 10.1 makes the channel set
+ * composition-global in shape and per-instance in value, and a subgraph added to
+ * the caller's graph would share the caller's values instead. Only two things
+ * cross the boundary, in each direction: the `inputs:` this instantiation bound,
+ * and the `outputs:` read back out of the instance's own channels.
+ *
+ * What crosses beside them is not data but a **clock**: the instantiating node's
+ * deadline ([`Instantiation.signal`]), so a `timeout:` on a `flow:` node — or on
+ * the `map` node a joined dispatch belongs to — ends the instance rather than
+ * only the node's wait for it.
+ */
+export async function runSubflow(
+  binding: SubflowBinding,
+  instance: Instantiation,
+): Promise<NodeAnswer> {
+  const seeded = instance.history ?? [];
+  const initial: Record<string, unknown> = {
+    $run: {
+      ...emptyRun(),
+      input: instance.inputs,
+      execution: instance.execution,
+      path: instance.path,
+      ...(instance.policy === undefined ? {} : { policy: instance.policy }),
+    },
+    ...(instance.history === undefined ? {} : { messages: [...seeded] }),
+  };
+
+  const { state, error } = await quiesce(
+    binding,
+    initial,
+    binding.recursionLimit,
+    instance.signal,
+  );
+  const trace = state?.$run.trace ?? [];
+  if (error !== undefined) {
+    throw new SubflowFailure(binding.address, "did not run to quiescence", trace, error);
+  }
+  if (state === undefined) {
+    // Unreachable: `streamMode: "values"` emits the state the instance started
+    // from before any node has run.
+    throw new SubflowFailure(
+      binding.address,
+      "produced no state",
+      trace,
+      new Error("the instance emitted no superstep"),
+    );
+  }
+
+  const held = state as unknown as Record<string, unknown>;
+  const output: Record<string, unknown> = {};
+  try {
+    for (const field of binding.outputs) {
+      output[field] = channelValue(
+        held,
+        field,
+        `\`${binding.address}\`'s output field \`${field}\``,
+      );
+    }
+  } catch (cause) {
+    throw new SubflowFailure(binding.address, "reached quiescence without an output", trace, cause);
+  }
+
+  // On `context: inherit`, what the instance *added* is what goes back to the
+  // caller's channel: the seeded turns are already there, and appending them
+  // again would double the conversation (grammar 8.5, 10.4).
+  const grown = held["messages"];
+  const added =
+    instance.history === undefined || !Array.isArray(grown) ? [] : grown.slice(seeded.length);
+  return {
+    output,
+    ...(added.length === 0 ? {} : { history: added }),
+    inner: trace,
+  };
+}
+
+/**
+ * A counting semaphore: `max_concurrency`, enforced (grammar 8.6 rule 1, D28).
+ *
+ * LangGraph's own `maxConcurrency` is a **run-level** config key — the Pregel
+ * runner reads it once per superstep and applies it to every task in that step —
+ * so it cannot say "this map at 8, its `auto_fixable` route at 4, and the
+ * `announce` node running beside them unbounded", which is exactly what D28
+ * declares. The bound is normative, so it is counted here.
+ *
+ * It is an **admission** bound: a permit is taken before a dispatch starts and
+ * held until it settles, so what the number bounds is how many of this map's
+ * instances are in flight at once — every one of them, detached included
+ * (grammar 8.6's key table). Which gate a dispatch takes its permit from is
+ * [`Admission`]'s: the bound is over a node, not over a call.
+ *
+ * **A joined waiter is served before a detached one**, which is grammar 8.6 rule
+ * 7's "nothing it does can *delay* the enclosing flow instance" enforced at the
+ * one place a detached dispatch could: the queue. A joined instance waiting
+ * behind a queued delivery waits out that delivery's whole duration, and the
+ * queue spans executions — [`Admission`] belongs to the node, so a bounded
+ * cycle's second traversal, or the node's own `retry:`, would otherwise line its
+ * instances up behind deliveries the previous traversal left in flight. Ordering
+ * the queue costs the delivery nothing: it still starts under a permit (the key
+ * table), just never ahead of work the join is waiting for. [`runMap`] keeps the
+ * other half — a delivery is not *issued* until this call's joined instances are
+ * admitted, because a permit already taken cannot be reordered.
+ *
+ * `permits > 0` implies both queues are empty, because [`release`] hands a
+ * permit straight to a waiter rather than returning it to the count — so the
+ * fast path cannot jump a detached dispatch over a waiting joined one.
+ */
+class Gate {
+  private permits: number;
+  /** Joined waiters: the dispatches the map node's join is waiting on. */
+  private readonly waiting: (() => void)[] = [];
+  /** Detached waiters, served only once no joined dispatch wants a permit. */
+  private readonly deferred: (() => void)[] = [];
+
+  constructor(permits: number) {
+    this.permits = Math.max(1, permits);
+  }
+
+  async acquire(kind: DispatchKind = "joined"): Promise<void> {
+    if (this.permits > 0) {
+      this.permits -= 1;
+      return;
+    }
+    await new Promise<void>((resolve) => {
+      (kind === "detached" ? this.deferred : this.waiting).push(resolve);
+    });
+  }
+
+  release(): void {
+    const next = this.waiting.shift() ?? this.deferred.shift();
+    if (next === undefined) {
+      this.permits += 1;
+    } else {
+      next();
+    }
+  }
+}
+
+/** Which half of grammar 8.6 rule 7 a dispatch queues under (see [`Gate`]). */
+type DispatchKind = "joined" | "detached";
+
+/**
+ * The permits one `map` **node** admits its dispatches against (grammar 8.6's
+ * key table, Decision D28).
+ *
+ * A gate built inside [`runMap`] would bound one *call*, and a dispatch can
+ * outlive the call that issued it: `detach: true` is resolved at dispatch (D94)
+ * and its delivery is still in flight when the map node returns. So a node-level
+ * `retry:` and a second traversal of a bounded cycle each start a fresh call
+ * while the previous one's deliveries hold permits nothing counts any more — and
+ * a map declaring 1 reaches 2 in flight, which is the number an author wrote it
+ * down to prevent. The gates therefore belong to the node, and every execution
+ * of it draws on the same ones.
+ *
+ * **Which node.** The enclosing flow *instance*'s, not the flow's: the key is
+ * the execution id, the instance path, and the node id ([`MapPlan.admission`]).
+ * Two concurrent instances of one dispatched subflow are two separate runs of
+ * that flow, each bounding its own map node, and a bound shared between them
+ * would serialize siblings an author asked to run side by side — and would
+ * deadlock outright on a flow that dispatches itself, where the outer instance
+ * holds a permit the inner one is waiting for.
+ *
+ * **Why it is counted.** The entry is retired when the last dispatch counted
+ * against it settles, so the table holds one entry per map node that is *doing
+ * something* rather than one per node the process ever ran. A delivery that
+ * never settles keeps its node's entry — and its permit — which is the same
+ * unbounded wait an abandoned host function is, and is bounded for the run by
+ * the node's own `timeout:` rather than by anything here.
+ *
+ * Spanning executions is also the one way a detached delivery can still be in
+ * front of a joined instance, so it is the reason [`Gate`] orders its queue: the
+ * call that *issued* the delivery cannot queue behind it ([`runMap`] admits its
+ * joined instances first), but a second traversal of a bounded cycle knows
+ * nothing of it. A delivery this table is still holding a permit for is served
+ * after every joined waiter, so the only one that can delay a later execution is
+ * one that already *started* — which is the abandoned-host-function wait above,
+ * and is what that execution's own `timeout:` is racing.
+ */
+interface Admission {
+  /** `max_concurrency:` — the node-wide bound (grammar 8.6 rule 1). */
+  readonly node: Gate;
+  /** A route's own bound, keyed by its position in the descriptor. */
+  readonly routes: Map<string, Gate>;
+  /** Dispatches counted against it: in flight, or still queued for a permit. */
+  outstanding: number;
+}
+
+/** Every map node with a dispatch outstanding, by [`MapPlan.admission`]. */
+const admissions = new Map<string, Admission>();
+
+/** One fresh set of permits, for the bounds this descriptor declares. */
+function permitsFor(map: MapDescriptor): Admission {
+  return { node: new Gate(map.maxConcurrency), routes: new Map(), outstanding: 0 };
+}
+
+/**
+ * The permits this dispatch of `map` is admitted against, counting its
+ * instances in.
+ *
+ * A plan of **zero** instances registers nothing: an entry with no dispatch to
+ * retire it is an entry that never goes away, and a map that dispatched nothing
+ * has nothing to bound.
+ */
+function admit(map: MapDescriptor, plan: MapPlan): Admission {
+  if (plan.instances.length === 0) return permitsFor(map);
+  let held = admissions.get(plan.admission);
+  if (held === undefined) {
+    held = permitsFor(map);
+    admissions.set(plan.admission, held);
+  }
+  held.outstanding += plan.instances.length;
+  return held;
+}
+
+/** One dispatch has settled; the node's permits go away with the last of them. */
+function retire(key: string, admission: Admission): void {
+  admission.outstanding -= 1;
+  if (admission.outstanding <= 0 && admissions.get(key) === admission) {
+    admissions.delete(key);
+  }
+}
+
+/** `on_item_error:` — per item, and map-wide (grammar 8.6 rule 10, D73). */
+export type ItemPolicy = "fail" | "skip" | { readonly retry: RetryPolicy };
+
+/** Where one dispatch sits, for everything nested inside it (grammar 9.4). */
+export interface DispatchSite {
+  /** The instance's run identity, carrying this dispatch's `item_index`. */
+  readonly execution: ExecutionIdentity;
+  /** Its instance path (grammar 9.4). */
+  readonly path: readonly string[];
+  /**
+   * The key a **detached** delivery carries, derived from the execution id and
+   * this dispatch's flattened instance path (grammar 9.4, PRD 5.6).
+   *
+   * Derived for every dispatch rather than only the detached ones: it costs a
+   * `join` and it is what a `store` write inside a dispatched `flow.*` will need
+   * from the same site. What *delivers* it is [`delivering`], at the one kind of
+   * dispatch grammar 9.4 names as a carrier.
+   */
+  readonly idempotencyKey: string;
+}
+
+/** One dispatch target of a `map` (grammar 8.6). */
+export interface MapRoute {
+  /**
+   * Its variant tag, `"$default"` for the catch-all, absent on `node:`.
+   *
+   * Read for the trace and for nothing else: which route an item takes is
+   * [`selectRoute`]'s, and the catch-all is a field of its own on
+   * [`MapDescriptor`] rather than an entry in `routes`. See
+   * [`DispatchRecord.route`] for why the catch-all's spelling is not one an
+   * author could have written.
+   */
+  readonly tag?: string;
+  /** The component it dispatches to. */
+  readonly target: string;
+  /** Its own bound, at most the map's (grammar 8.6 rule 1). */
+  readonly maxConcurrency: number;
+  /** `detach: true` — resolved at dispatch (grammar 8.6 rule 7, D94). */
+  readonly detach: boolean;
+  /**
+   * The shape the item is read through: **this route's variant payload**, not
+   * the union (grammar 8.6 rule 4).
+   */
+  readonly itemShape: Shape;
+  /** Build one instance's input from the item (grammar 8.6 rule 12). */
+  input(roots: Roots): unknown;
+  /** Run one instance. */
+  run(input: unknown, context: RunContext, site: DispatchSite): Promise<NodeAnswer>;
+  /** Where its result's fields go — reduced channels only (rule 5). */
+  readonly writes: readonly WriteDescriptor[];
+}
+
+/** Everything `./graph.ts` says about one `map` node (grammar 8.6). */
+export interface MapDescriptor {
+  /** The flow-local node id, which every frame and message is written from. */
+  readonly node: string;
+  /** `as:` — what the item is called in the per-item expressions. */
+  readonly as: string;
+  /** `over:` — the path expression, and the node whose result it reads. */
+  readonly source: {
+    readonly path: string;
+    readonly producer?: string;
+    readonly shape: Shape;
+  };
+  /** `max_concurrency:` — the node-wide admission bound (D28, and see [`Gate`]). */
+  readonly maxConcurrency: number;
+  /** `on_item_error:` — map-wide, and read from the `map:` block alone (rule 10). */
+  readonly onItemError: ItemPolicy;
+  /** `route_by:` — the literal discriminator field, on the routed form (rule 8). */
+  readonly routeBy?: string;
+  /** The named routes in declaration order, or the single homogeneous target. */
+  readonly routes: readonly MapRoute[];
+  /** `default:` — the catch-all (D30). */
+  readonly fallback?: MapRoute;
+}
+
+/** One instance a `map` will dispatch, decided before any of them runs. */
+interface PlannedInstance {
+  readonly index: number;
+  readonly route: MapRoute;
+  readonly input: unknown;
+  readonly site: DispatchSite;
+}
+
+/** What a `map` node's input phase answers: every dispatch, already bound. */
+export interface MapPlan {
+  readonly instances: readonly PlannedInstance[];
+  /**
+   * Which map node this is a dispatch of: the execution id, the enclosing
+   * instance's path, and the node id.
+   *
+   * What [`Admission`] is keyed by, and the reason it is derived here rather
+   * than in [`runMap`]: the plan is built once per node execution and reused
+   * across the node's own `retry:` attempts, and a later traversal of a bounded
+   * cycle builds a new plan with the same key — which is exactly the span the
+   * bound has to cover.
+   */
+  readonly admission: string;
+  /**
+   * What this node's dispatches resolved to, as they resolve.
+   *
+   * [`runMap`] answers with the whole account when it returns and carries it on
+   * an [`ItemFailure`] when an item fails it, and neither reaches [`runNode`]
+   * when the node's own `timeout:` fires: the deadline is *raced*, so the map's
+   * promise — and everything riding on it — is abandoned where it stands. The
+   * plan is the one thing both sides hold, so the records are written here too
+   * and `runNode` reads them off a node it never got an answer from.
+   *
+   * Reset at the start of every call, because a node retry re-executes the whole
+   * fan-out and the trace reports the attempt it made, not the sum of them.
+   * Every value that escapes is a copy: this array is cleared in place, and a
+   * trace entry an earlier traversal already holds must not empty out under it.
+   */
+  readonly records: DispatchRecord[];
+}
+
+/**
+ * Decide a `map`'s whole dispatch **before** anything runs: how many instances,
+ * which route each takes, and what each is passed (grammar 8.6 rules 4, 11, 12).
+ *
+ * This is the map's *input phase*, and it is separate from [`runMap`] for the
+ * reason `runNode` builds every node's input outside its policy: reading an
+ * absent value fails the **execution** (grammar 4.1, Decisions D110, D78), and
+ * neither `on_item_error` nor the map node's `on_error:` may absorb that. A
+ * per-item binding that reads a channel nothing has written is a broken
+ * composition, not a failed item.
+ */
+export function mapPlan(map: MapDescriptor, view: NodeView): MapPlan {
+  const traversal = view.run.traversals[map.node] ?? 0;
+  const items = mapSource(map, view);
+  const instances: PlannedInstance[] = items.map((item, index) => {
+    const route = selectRoute(map, item);
+    const execution: ExecutionIdentity = { ...view.run.execution, item_index: index };
+    const frame = `${map.node}/${traversal}/${index}`;
+    const path = [...view.run.path, frame];
+    const site: DispatchSite = {
+      execution,
+      path,
+      idempotencyKey: [view.run.execution.id, ...path].join("/"),
+    };
+    const roots: Roots = {
+      ...view.roots,
+      execution: bindRoot(execution, EXECUTION_SHAPE),
+      [map.as]: bindRoot(item, route.itemShape),
+    };
+    return { index, route, input: route.input(roots), site };
+  });
+  return {
+    instances,
+    admission: [view.run.execution.id, ...view.run.path, map.node].join("/"),
+    records: [],
+  };
+}
+
+/**
+ * The array `over` resolves to (grammar 4.2, 8.6 rule 11).
+ *
+ * A producer that was **skipped** on this pass has no result, and the map then
+ * dispatches zero instances — grammar 8.6 rule 11's last sentence, which rule 6
+ * makes a completion rather than a failure.
+ */
+function mapSource(map: MapDescriptor, view: NodeView): unknown[] {
+  let roots = view.roots;
+  const producer = map.source.producer;
+  if (producer !== undefined) {
+    const produced = view.run.outputs[producer];
+    if (produced === undefined) return [];
+    roots = {
+      ...roots,
+      [producer]: bindRoot({ output: produced }, { properties: { output: map.source.shape } }),
+    };
+  }
+  const value = toJson(evaluate(map.source.path, roots));
+  if (!Array.isArray(value)) {
+    // Unreachable over an artifact `build` accepted: `over` is resolved against
+    // the declared schemas and must land on an array (grammar 8.6 rule 1).
+    throw new Error(
+      `\`${map.node}\`'s \`over: ${map.source.path}\` did not resolve to an array (grammar 8.6 rule 1)`,
+    );
   }
   return value;
+}
+
+/**
+ * How one route is addressed inside its node's [`Admission`].
+ *
+ * By **position** in the descriptor rather than by `tag:`, because the tag is
+ * the author's spelling of a variant and the catch-all has one of its own: two
+ * routes whose tags collided would share a bound neither declared. The
+ * descriptor a compiled `graph.ts` passes is a module constant, so a route's
+ * position is the same on every traversal.
+ */
+function routeKey(map: MapDescriptor, route: MapRoute): string {
+  const at = map.routes.indexOf(route);
+  return at < 0 ? "*" : String(at);
+}
+
+/** Which route one item takes (grammar 8.6 rules 2, 4). */
+function selectRoute(map: MapDescriptor, item: unknown): MapRoute {
+  if (map.routeBy === undefined) {
+    return map.routes[0]!;
+  }
+  const tag = (item as Record<string, unknown> | null)?.[map.routeBy];
+  const named = map.routes.find((route) => route.tag === tag);
+  if (named !== undefined) return named;
+  if (map.fallback !== undefined) return map.fallback;
+  // Unreachable: exhaustiveness is a compile error, and the item's own schema
+  // admits no other tag (grammar 8.6 rule 4). An item that got here anyway is
+  // one the parse should have refused, so it says so rather than being dropped.
+  throw new Error(
+    `\`${map.node}\` has no route for \`${map.routeBy}: ${JSON.stringify(tag)}\` and no \`default:\` (grammar 8.6 rule 4)`,
+  );
+}
+
+/**
+ * Dispatch a `map`, join, and answer with the writes its instances made — in
+ * source-item order (grammar 8.6 rules 5, 6, 10, PRD 5.6).
+ *
+ * **The join is the node.** The map node completes when every instance has
+ * completed, been resolved by `on_item_error`, or been detached, which is
+ * grammar 7.6's fan-out barrier; because the node's own outgoing edges are
+ * evaluated in its own task after it completes (P1), the downstream edge fires
+ * exactly once, after the join, whatever order the instances finished in. A
+ * dispatch of **zero** instances completes immediately and writes nothing, and
+ * its edges fire as if every instance had finished (rule 6).
+ *
+ * **A detached dispatch is admitted, but never ahead of the join.** It takes a
+ * node permit before it starts, because `max_concurrency` bounds every in-flight
+ * dispatch (grammar 8.6's key table) — a map declaring 2 against a rate-limited
+ * provider would otherwise reach 2 + the detached route's bound. What the join
+ * never does is wait on its *outcome* (D94): the delivery is counted resolved
+ * the moment it is issued, and the map node returns while it is still in flight.
+ *
+ * Those two are a bound and a queue, and a queue is the one place the second can
+ * take the first back. A delivery that held a permit a joined instance was
+ * waiting for would *delay* the enclosing flow instance, which rule 7 says
+ * outright that a detached dispatch cannot do: at `max_concurrency: 1` a
+ * detached item ahead of a joined one made the map node wait out the sink, and a
+ * sink that never answered never released the permit at all — the join hung for
+ * ever on a delivery it is defined not to wait for. So a detached dispatch
+ * queues **behind every joined instance**, in both of the ways it could get
+ * ahead of one:
+ *
+ *   * it is not *issued* until every joined instance of this call has been
+ *     admitted. A permit is taken synchronously by whichever dispatch asks
+ *     first, and the loop below issues them in source-item order, so a detached
+ *     item at index 0 would otherwise hold the permit before the joined item at
+ *     index 1 had asked — no queue discipline can reorder a permit already
+ *     taken, so it is not taken;
+ *   * once issued it waits as a `"detached"` [`Gate`] waiter, which is served
+ *     only when no joined dispatch wants a permit. That covers the executions
+ *     this call cannot see: [`Admission`] belongs to the node, so a bounded
+ *     cycle's second traversal — or the node's own `retry:` — would otherwise
+ *     line its joined instances up behind deliveries this one left queued.
+ *
+ * Both halves of the key table then hold at once: a detached dispatch waits for
+ * a permit to *start*, and the join waits for none of it. Nothing is lost to the
+ * ordering either — a delivery that is merely *later* is still delivered, which
+ * is the distinction rule 7 and PRD 5.6 trade dedupe-on-a-key to keep. What
+ * survives is narrower and honest: a delivery that has already *started* and
+ * never settles still holds its permit, exactly as an abandoned host function
+ * holds a slot, and only a *later* execution of this node can meet it there
+ * ([`Admission`]).
+ *
+ * **A detached delivery is off the node's clock.** It runs under a signal of its
+ * own, never `context.signal`. That signal is the map node's `timeout:`
+ * (grammar 9.2), and a delivery still queued for a permit when the budget ran
+ * out would otherwise *start* against an already-aborted signal — [`runHttp`]
+ * hands it to `fetch` and [`runExec`] to `spawn`, so it would throw before
+ * anything reached the wire, be swallowed by the dispatch's own catch, and leave
+ * a record saying `detached` for a message that was never sent. That is the lost
+ * message grammar 8.6 rule 7 and PRD 5.6 trade dedupe-on-a-key to avoid, and the
+ * budget has nothing to say about it: a deadline bounds what the node *waits*
+ * for, and D94 is the statement that the node waits for none of this.
+ *
+ * **Order comes from the index, never from completion.** Results are collected
+ * per instance and folded into one [`ChannelWrite`] per channel afterwards, in
+ * ascending source-item index — so two runs over one array leave every channel
+ * holding the same value even when the provider answers them in the opposite
+ * order (grammar 7.6.4 clause 2, 10.2).
+ */
+export async function runMap(
+  map: MapDescriptor,
+  plan: MapPlan,
+  context: RunContext,
+): Promise<NodeAnswer> {
+  const admission = admit(map, plan);
+  const node = admission.node;
+  const gateOf = (route: MapRoute): Gate => {
+    const key = routeKey(map, route);
+    let gate = admission.routes.get(key);
+    if (gate === undefined) {
+      gate = new Gate(Math.min(route.maxConcurrency, map.maxConcurrency));
+      admission.routes.set(key, gate);
+    }
+    return gate;
+  };
+
+  // The plan's own account, which is the copy a node that never returns an
+  // answer is read from — so it starts this execution empty. Everything that
+  // leaves here is a copy of it, because it is cleared in place.
+  const records = plan.records;
+  records.length = 0;
+  const landed: { index: number; route: MapRoute; output: unknown }[] = [];
+  const failed: { index: number; target: string; attempts: number; error: unknown }[] = [];
+  const joined: Promise<void>[] = [];
+
+  // What a detached dispatch waits behind before it asks for a permit at all:
+  // every joined instance of this call, admitted (grammar 8.6 rule 7, and see
+  // *A detached dispatch is admitted, but never ahead of the join* above). The
+  // count is taken before anything runs, because the loop below issues the
+  // dispatches in source-item order and a detached item at index 0 would
+  // otherwise take the permit before the joined item at index 1 exists.
+  //
+  // A plan of no joined instances releases it immediately: there is nothing for
+  // a delivery to get ahead of, and a barrier nothing resolves would strand
+  // every delivery a fire-and-forget map exists to make.
+  let unadmitted = plan.instances.reduce(
+    (count, dispatch) => count + (dispatch.route.detach ? 0 : 1),
+    0,
+  );
+  let admitted = (): void => {};
+  const joinedAdmitted: Promise<void> =
+    unadmitted === 0
+      ? Promise.resolve()
+      : new Promise<void>((resolve) => {
+          admitted = () => {
+            unadmitted -= 1;
+            if (unadmitted === 0) resolve();
+          };
+        });
+
+  for (const instance of plan.instances) {
+    const { index, route, site } = instance;
+    const named = route.tag === undefined ? {} : { route: route.tag };
+    const scoped: RunContext = { ...context, execution: site.execution };
+
+    if (route.detach) {
+      // Resolved at dispatch (Decision D94): the record is written now, the
+      // delivery is issued now, and the join never learns what became of it.
+      records.push({
+        index,
+        ...named,
+        target: route.target,
+        outcome: "detached",
+        attempts: 0,
+        idempotencyKey: site.idempotencyKey,
+      });
+      const gate = gateOf(route);
+      // Its own signal, never the node's: see *A detached delivery is off the
+      // node's clock* above. One per delivery rather than one per call, so a
+      // fan-out of many sinks does not pile listeners onto a shared signal.
+      const delivery: RunContext = { ...scoped, signal: new AbortController().signal };
+      void (async () => {
+        // `max_concurrency` is an **admission** bound over every in-flight
+        // dispatch, detached included (grammar 8.6's key table, D28): a detached
+        // delivery waits for a node permit to *start*, exactly as a joined
+        // instance does. It waits for it **behind the join**, though — rule 7's
+        // "nothing it does can delay the enclosing flow instance" is a statement
+        // about the permit queue as much as about the outcome. Both gates are
+        // taken after the barrier and as a `"detached"` waiter, so a joined
+        // instance of this call never queues behind this delivery and a later
+        // execution of this node never queues behind it either.
+        await joinedAdmitted;
+        await gate.acquire("detached");
+        await node.acquire("detached");
+        try {
+          await route.run(instance.input, delivery, site);
+        } finally {
+          node.release();
+          gate.release();
+          retire(plan.admission, admission);
+        }
+      })().catch(() => {
+        // Nothing it does can fail the enclosing flow instance, which is what an
+        // author asks for by writing the key (grammar 8.6 rule 7). Swallowing it
+        // here is also what keeps an unhandled rejection from ending the process
+        // long after the map node completed.
+      });
+      continue;
+    }
+
+    const gate = gateOf(route);
+    joined.push(
+      (async () => {
+        // The route's gate first and the node's second — the same order every
+        // dispatch takes them in, detached or not, so there is nothing to
+        // deadlock on. A route whose own bound is spent queues on its own gate
+        // instead of holding a node permit another route could have used.
+        await gate.acquire();
+        await node.acquire();
+        // Both permits held: this instance can no longer be got in front of, so
+        // it is what a detached dispatch was waiting to be behind. Reported here
+        // rather than on completion — the barrier orders the *queue*, and making
+        // a delivery wait for the join to finish would hold back a message the
+        // map node is defined not to wait for (grammar 8.6 rule 7, D94).
+        admitted();
+        let attempts = 0;
+        try {
+          const answer = await attemptItem(map, instance, scoped);
+          attempts = answer.attempts;
+          landed.push({ index, route, output: answer.value.output });
+          records.push({
+            index,
+            ...named,
+            target: route.target,
+            outcome: "completed",
+            attempts,
+            idempotencyKey: site.idempotencyKey,
+            ...(answer.value.inner === undefined ? {} : { inner: answer.value.inner }),
+          });
+        } catch (error) {
+          attempts = error instanceof ItemAttempts ? error.attempts : 1;
+          const cause = error instanceof ItemAttempts ? error.cause : error;
+          failed.push({ index, target: route.target, attempts, error: cause });
+          // A dispatched `flow.*` that failed still made a trace, exactly as one
+          // that completed did, and under `on_item_error: skip` the run carries
+          // on and this record is the *only* account of what happened inside the
+          // boundary — every guard, every budget, every attempt (grammar 8.5,
+          // PRD 5.3). The attempt reported is the last one the item made, which
+          // is the attempt `attempts` counts and the error `error` describes.
+          const held = traceOf(cause);
+          records.push({
+            index,
+            ...named,
+            target: route.target,
+            // What the item's own policy did with it: `skip` dropped it and the
+            // fan-out carried on, while `fail` — and a `retry:` that ran out of
+            // attempts, which "resolves as `fail` does" (grammar 8.6 rule 10) —
+            // failed it. Reporting a failure as `skipped` would tell a reader
+            // the map absorbed an item it did not absorb.
+            outcome: map.onItemError === "skip" ? "skipped" : "failed",
+            attempts,
+            idempotencyKey: site.idempotencyKey,
+            ...(held === undefined ? {} : { inner: held }),
+            error: describe(cause),
+          });
+        } finally {
+          node.release();
+          gate.release();
+          retire(plan.admission, admission);
+        }
+      })(),
+    );
+  }
+
+  await Promise.all(joined);
+  // A copy, and the sort is on the copy: `plan.records` is cleared in place at
+  // the start of the next execution of this node, and a trace entry already
+  // holding it would empty out under a reader.
+  const dispatched = [...records].sort((left, right) => left.index - right.index);
+
+  // Exhausted retries resolve as `fail` does (grammar 8.6 rule 10), and the item
+  // reported is the **lowest-indexed** failure rather than the first in time:
+  // two runs over one array must fail about the same item.
+  if (map.onItemError !== "skip" && failed.length > 0) {
+    failed.sort((left, right) => left.index - right.index);
+    const first = failed[0]!;
+    // The records go out **on the failure**, because this is where the account
+    // of a fan-out matters most: the items that did run had their effects, and
+    // the node's own `on_error:` is about to absorb the one that did not
+    // (grammar 8.6 rule 10's "retry each item, and if one still fails, skip the
+    // fan-out"). `runNode` reads them back off the error onto the trace entry it
+    // builds, so a skipped or fallen-back map still says what it dispatched.
+    throw new ItemFailure(
+      map.node,
+      first.index,
+      first.target,
+      first.attempts,
+      first.error,
+      dispatched,
+    );
+  }
+
+  return { output: {}, channels: orderedChannels(landed), dispatches: dispatched };
+}
+
+/** A failed item, carrying how many attempts its policy made. */
+class ItemAttempts extends Error {
+  readonly attempts: number;
+
+  constructor(attempts: number, cause: unknown) {
+    super(describe(cause));
+    this.name = "ItemAttempts";
+    this.attempts = attempts;
+    this.cause = cause;
+  }
+}
+
+/**
+ * One item, under `on_item_error` (grammar 8.6 rule 10).
+ *
+ * A retry re-executes the **whole dispatched instance** from its entry as a
+ * fresh attempt, and nothing the instance path is built from changes — the item
+ * keeps its index — so every attempt derives the same idempotency key
+ * (grammar 9.4). The node's own deadline is the one clock: `context.signal` is
+ * the map node's, so an item's attempts are spent inside the map's `timeout:`
+ * rather than beside it.
+ */
+async function attemptItem(
+  map: MapDescriptor,
+  instance: PlannedInstance,
+  context: RunContext,
+): Promise<{ value: NodeAnswer; attempts: number }> {
+  const retry = typeof map.onItemError === "object" ? map.onItemError.retry : undefined;
+  const allowed = 1 + (retry?.max ?? 0);
+  // What the item *did*, not what its policy allowed — the same distinction
+  // `runActivity` draws for a node. The map node's deadline can end the loop
+  // mid-backoff, and a record saying five attempts were made against a provider
+  // the item reached once describes a run that did not happen.
+  let made = 0;
+  let last: unknown;
+  for (let attempt = 1; attempt <= allowed; attempt += 1) {
+    made = attempt;
+    try {
+      return { value: await instance.route.run(instance.input, context, instance.site), attempts: attempt };
+    } catch (error) {
+      last = error;
+      if (attempt === allowed) break;
+      try {
+        await sleep(backoffFor(retry!, attempt), context.signal);
+      } catch {
+        break;
+      }
+    }
+  }
+  throw new ItemAttempts(made, last);
+}
+
+/**
+ * The instances' results, folded into one write per channel in **source-item**
+ * order (grammar 7.6.4 clause 2).
+ *
+ * The channels themselves are ordered by name so that the update object a map
+ * hands LangGraph has the same key order on every run — the last thing between
+ * this and a replay that reproduces the live run exactly.
+ */
+function orderedChannels(
+  landed: readonly { index: number; route: MapRoute; output: unknown }[],
+): ChannelWrite[] {
+  const held = new Map<string, { reduce: Reduce; values: unknown[] }>();
+  for (const one of [...landed].sort((left, right) => left.index - right.index)) {
+    const fields = (one.output ?? {}) as Record<string, unknown>;
+    for (const write of one.route.writes) {
+      const value = fields[write.field];
+      // A field the result does not carry performs no write (Decision D110).
+      if (value === undefined) continue;
+      let channel = held.get(write.channel);
+      if (channel === undefined) {
+        channel = { reduce: write.reduce, values: [] };
+        held.set(write.channel, channel);
+      }
+      channel.values.push(value);
+    }
+  }
+  return [...held.entries()]
+    .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+    .map(([channel, { reduce, values }]) => ({ channel, reduce, values }));
 }
 
 // ---------------------------------------------------------------------------
@@ -1607,6 +3171,16 @@ export interface NodeView {
   readonly state: Readonly<Record<string, unknown>>;
   /** The compiler's own channel. */
   readonly run: RunChannel;
+  /**
+   * The roots a node's *configuration* reads: `input`, `state` and `execution`
+   * (grammar 4.1), already bound through their declared shapes.
+   *
+   * Carried on the view because two constructs need them after the input
+   * builder has run: a `map`'s per-item bindings extend them with the item and
+   * with the dispatch's own `execution.item_index`, and `over` extends them with
+   * the producing node's result.
+   */
+  readonly roots: Roots;
 }
 
 /** Everything `./graph.ts` says about one node (grammar 7.1, 8, 9). */
@@ -1636,18 +3210,54 @@ export interface NodeDescriptor {
    * own `retry:` policy can ask again about (PRD 5.2: the answer is rejected
    * before any edge is evaluated).
    */
-  run(
-    input: unknown,
-    context: RunContext,
-    view: NodeView,
-  ): Promise<{ output: unknown; history?: readonly MessageLike[] }>;
+  run(input: unknown, context: RunContext, view: NodeView): Promise<NodeAnswer>;
   readonly writes: readonly WriteDescriptor[];
   readonly edges: readonly EdgeDescriptor[];
+  /**
+   * Whether a `map.over` in this flow reads this node's result, so the result is
+   * kept in `$run.outputs` for the map's own step to read (grammar 8.6 rule 11).
+   */
+  readonly retains?: boolean;
+  /**
+   * Whether this node takes no `timeout` and no `retry` from grammar 9.3 level 1
+   * — a `human` node, and only a `human` node (Decision D102).
+   */
+  readonly exempt?: boolean;
+}
+
+/** What one node's activity produced. */
+export interface NodeAnswer {
+  /** Its result object, which `writes` maps into channels (grammar 8.0). */
+  readonly output: unknown;
+  /**
+   * What it contributes to the shared conversation history (grammar 10.4):
+   * the exchange an `agent:` node composed, or the turns a `context: inherit`
+   * subflow instance added to the caller's channel.
+   */
+  readonly history?: readonly unknown[];
+  /**
+   * Channel writes the activity made **itself**, already in canonical order — a
+   * `map` node's, whose writers are its instances rather than its own output
+   * (grammar 7.6.4 clause 2, 8.6 rule 5).
+   */
+  readonly channels?: readonly ChannelWrite[];
+  /** What a `map` dispatched, for the trace (PRD 5.3, 5.6). */
+  readonly dispatches?: readonly DispatchRecord[];
+  /** The trace of the subflow instance a `flow:` node ran (grammar 8.5). */
+  readonly inner?: readonly TraceEntry[];
+}
+
+/** One channel a `map` node writes, with every contribution in index order. */
+export interface ChannelWrite {
+  readonly channel: string;
+  readonly reduce: Reduce;
+  /** The instances' contributions, ascending by source-item index. */
+  readonly values: readonly unknown[];
 }
 
 /** The `execution` root, bound for an expression (grammar 4.1). */
 const EXECUTION_SHAPE = {
-  properties: { id: "string", session_key: "string" },
+  properties: { id: "string", session_key: "string", item_index: "int" },
 } as const;
 
 /**
@@ -1690,18 +3300,10 @@ export async function runNode(
   const run = state.$run;
   const step = run.step + 1;
   const traversal = run.traversals[descriptor.node] ?? 0;
-  const view: NodeView = { state, run };
 
-  const base: Partial<RunChannel> = {
-    step,
-    traversals: { [descriptor.node]: traversal + 1 },
-  };
-
-  let output: unknown;
-  let history: readonly MessageLike[] | undefined;
-  let attempts = 0;
-  let skipped = false;
-  let failure: NodeFailure | undefined;
+  // Grammar 9.3 level 1, laid over the levels the compiler resolved: the
+  // instantiating `flow:` node's `policy:`, which this instance carries.
+  const policy = effectivePolicy(descriptor.policy, descriptor.exempt === true, run.policy);
 
   // The roots a node's *configuration* reads: no `<node>.output` among them,
   // because a node never reads another's output (Decision D42).
@@ -1710,20 +3312,46 @@ export async function runNode(
     state: bindRoot(declared(state, descriptor.shapes.state), descriptor.shapes.state),
     execution: bindRoot(run.execution, EXECUTION_SHAPE),
   };
+  const view: NodeView = { state, run, roots: configuration };
+
+  const base: Partial<RunChannel> = {
+    step,
+    traversals: { [descriptor.node]: traversal + 1 },
+  };
+
+  let output: unknown;
+  let history: readonly unknown[] | undefined;
+  let channels: readonly ChannelWrite[] | undefined;
+  let dispatches: readonly DispatchRecord[] | undefined;
+  let inner: readonly TraceEntry[] | undefined;
+  let attempts = 0;
+  let skipped = false;
+  let failure: NodeFailure | undefined;
 
   /** This node's entry, for a failure that leaves nothing else behind. */
-  const aborted = (error: unknown, made: number, routing?: RoutingDecision): TraceEntry => ({
-    step,
-    flow: descriptor.flow,
-    node: descriptor.node,
-    traversal,
-    outcome: "failed",
-    attempts: made,
-    ...(routing === undefined ? {} : { routing }),
-    error: describe(error),
-  });
+  const aborted = (error: unknown, made: number, routing?: RoutingDecision): TraceEntry => {
+    // A subflow that failed still made a trace, and it is the only account of
+    // what happened inside the boundary (grammar 8.5, PRD 5.3).
+    const held = inner ?? traceOf(error);
+    const dispatched = dispatches ?? dispatchesOf(error) ?? plannedDispatches(input);
+    return {
+      step,
+      flow: descriptor.flow,
+      node: descriptor.node,
+      traversal,
+      outcome: "failed",
+      attempts: made,
+      ...(routing === undefined ? {} : { routing }),
+      ...(dispatched === undefined ? {} : { dispatches: dispatched }),
+      ...(held === undefined ? {} : { inner: held }),
+      error: describe(error),
+    };
+  };
 
   // Outside the `try` on purpose — see *Which errors `on_error` governs* above.
+  // A `map`'s whole dispatch is decided here too: which items, which routes, and
+  // what each instance is passed, so a per-item binding that reads an absent
+  // value fails the execution rather than one item (grammar 8.6, D110).
   let input: unknown;
   try {
     input = descriptor.input(configuration, view);
@@ -1736,16 +3364,29 @@ export async function runNode(
     const answer = await runActivity(
       descriptor.flow,
       descriptor.node,
-      descriptor.policy,
+      policy,
       run.execution,
       (context) => descriptor.run(input, context, view),
     );
     attempts = answer.attempts;
     output = answer.value.output;
     history = answer.value.history;
+    channels = answer.value.channels;
+    dispatches = answer.value.dispatches;
+    inner = answer.value.inner;
   } catch (error) {
-    const strategy = descriptor.policy.onError;
+    const strategy = policy.onError;
     failure = error instanceof NodeFailure ? error : undefined;
+    if (failure?.cause instanceof SubflowFailure) inner = failure.cause.trace;
+    // A `map` that failed still dispatched: the items that completed had their
+    // effects and the detached ones were delivered, and the records are the only
+    // account of them (PRD 5.3, 5.6). They ride out on the `ItemFailure`, which
+    // `runActivity` wrapped, so the chain is walked the way `inner` above is —
+    // and when the failure is the node's own **deadline** there is no
+    // `ItemFailure` to walk, because the deadline is raced and the map's promise
+    // was abandoned holding it. The plan is where the records are then read
+    // from, and is the reason a timed-out fan-out still says what it dispatched.
+    dispatches = dispatchesOf(error) ?? plannedDispatches(input);
     // `runActivity` wraps everything the activity threw in a `NodeFailure`
     // carrying the attempts it *made*, so the fallback is for an error that
     // reached here without one being made at all — and `0` is what that is.
@@ -1762,10 +3403,14 @@ export async function runNode(
         outcome: "failed",
         attempts,
         error: describe(error),
+        ...(dispatches === undefined ? {} : { dispatches }),
+        ...(inner === undefined ? {} : { inner }),
         fallback: strategy.fallback,
       };
       return new Command({
-        update: { $run: { ...base, trace: [entry] } },
+        update: {
+          $run: { ...base, ...retained(descriptor, undefined, true), trace: [entry] },
+        },
         goto: [strategy.fallback],
       });
     }
@@ -1784,6 +3429,22 @@ export async function runNode(
       update[write.channel] = value;
       localState[write.channel] = applyWrite(state[write.channel], value, write.reduce);
       written.push(write.channel);
+    }
+    // A `map`'s writers are its instances, so what it landed arrives already
+    // ordered by source-item index and goes to the channel as one batch its
+    // reducer unpacks — or as the folded value where the channel could not be
+    // handed a batch (grammar 7.6.4 clause 2, and see `orderedUpdate`).
+    for (const batch of channels ?? []) {
+      // A channel with no contribution at all is not a write: `orderedChannels`
+      // opens an entry only for a field an instance really produced, so this
+      // guards the invariant rather than naming a case.
+      if (batch.values.length === 0) continue;
+      update[batch.channel] = orderedUpdate(batch);
+      localState[batch.channel] = batch.values.reduce(
+        (held, value) => applyWrite(held, value, batch.reduce),
+        state[batch.channel],
+      );
+      written.push(batch.channel);
     }
     if (history !== undefined && history.length > 0) {
       update["messages"] = history;
@@ -1832,10 +3493,35 @@ export async function runNode(
     attempts,
     writes: written,
     routing,
+    ...(dispatches === undefined ? {} : { dispatches }),
+    ...(inner === undefined ? {} : { inner }),
     ...(failure === undefined ? {} : { error: failure.message }),
   };
-  update["$run"] = { ...base, iterations: routing.counters, trace: [entry] };
+  update["$run"] = {
+    ...base,
+    ...retained(descriptor, output, skipped),
+    iterations: routing.counters,
+    trace: [entry],
+  };
   return new Command({ update, goto: routing.targets });
+}
+
+/**
+ * What a node keeps in `$run.outputs` for a `map.over` in a later step to read
+ * (grammar 8.6 rule 11, and see [`RunChannel.outputs`]).
+ *
+ * A node no map reads keeps nothing. A node that was **skipped** — or that took
+ * a `fallback:`, which produced no result either — writes its key back holding
+ * `undefined`, so a map dispatches zero instances rather than fanning out over
+ * the array the producer left on an earlier traversal of the same cycle.
+ */
+function retained(
+  descriptor: NodeDescriptor,
+  output: unknown,
+  skipped: boolean,
+): Partial<RunChannel> {
+  if (descriptor.retains !== true) return {};
+  return { outputs: { [descriptor.node]: skipped ? undefined : output } };
 }
 
 function bindRoot(value: unknown, shape: Shape): CelValue {
