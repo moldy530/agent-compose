@@ -126,6 +126,7 @@ pub const FIXTURES: &[&str] = &[
     "agent-openai",
     "bounded-cycle",
     "fanout",
+    "flow-as-tool",
     "http-trigger",
     "model-failover",
     "provider-kinds",

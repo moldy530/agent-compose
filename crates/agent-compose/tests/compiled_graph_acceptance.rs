@@ -2041,6 +2041,109 @@ fn a_subgraph_runs_with_explicit_bindings_and_isolated_history() {
     );
 }
 
+/// A flow attached to an agent as a tool **reaches the model** with the contract
+/// grammar 5.4 gives it, and a call to it is refused by name.
+///
+/// Both halves are the same claim, and only the first is easy to lose. PRD 5.1
+/// makes the two call sites of a `flow.*` interchangeable and grammar 7.7
+/// clause 4 carries session coherence, sync interrupt-freedom and recursion
+/// through the attachment — so the compiler analyses flow-as-tool as a call
+/// everywhere, and an emitter that then dropped the tool would put an agent the
+/// validator accepted on the wire *without* it: no diagnostic at `validate`,
+/// none at `build`, and a model that cannot call what the composition attached.
+/// So what the provider was offered is the observable, read off the recorded
+/// request rather than off the emitted TypeScript.
+///
+/// The second half is what this release does when the model takes the offer: it
+/// says so, naming the construct, exactly as a `human` node does — a node that
+/// says what it does not do is not a node that pretends. The third run is the
+/// sentence that refusal points at: the same subflow at a `flow:` node
+/// (grammar 8.5) runs, so the advice is checked rather than asserted.
+#[test]
+fn a_flow_attached_as_a_tool_reaches_the_model_and_refuses_the_call() {
+    let provider = MockProvider::start().expect("a loopback port");
+    // One loop call, answered with a call to the attached flow. The loop offers
+    // the agent's tools and pins nothing, which is what makes `tool_calls` the
+    // legal answer here (see this file's header).
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::tool_calls(vec![ToolCall::new(
+            "condense",
+            json!({ "passage": "a long passage" }),
+        )]),
+    ));
+
+    let Some(run) = harness::invoke(
+        "flow-as-tool",
+        "flow.ask",
+        &[("question", "what does it say?")],
+        &provider,
+    ) else {
+        return;
+    };
+    let failure = run.failed();
+
+    let recorded = provider.requests();
+    assert_eq!(recorded.len(), 1);
+    let offered = &recorded[0];
+    assert!(offered.is_valid(), "{:?}", offered.failures());
+    assert_eq!(
+        offered.tools,
+        ["condense"],
+        "the attached flow is on the wire under its local name, and the loop \
+         call pins nothing beside it: {:?}",
+        offered.tools
+    );
+    let schema = offered
+        .body()
+        .get("tools")
+        .and_then(|tools| tools.get(0))
+        .and_then(|tool| tool.get("input_schema"))
+        .cloned()
+        .expect("the offered tool carries a parameter schema");
+    assert_eq!(
+        schema["properties"]["passage"]["minLength"],
+        json!(1),
+        "the flow's `inputs:` is the tool's parameter schema, constraints \
+         included (grammar 5.4): {schema}"
+    );
+    assert_eq!(
+        offered.body()["tools"][0]["description"],
+        "Condense one passage into a single line.",
+        "…and the flow's own `description:` is what the model selects on"
+    );
+
+    assert!(
+        failure.contains(
+            "`flow.condense` attached as a tool is not executed by this compiler release"
+        ),
+        "the call is refused naming the construct rather than answered with a \
+         plausible value: {failure}"
+    );
+    assert!(
+        failure.contains("the same flow reached from a `flow:` node runs"),
+        "…and names the call site that does run: {failure}"
+    );
+
+    // The sentence above, checked: the same subflow, instantiated at a `flow:`
+    // node, runs to its outputs.
+    provider.reset();
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "line": "it says one line" })),
+    ));
+    let Some(piped) = harness::invoke(
+        "flow-as-tool",
+        "flow.pipe",
+        &[("passage", "a long passage")],
+        &provider,
+    ) else {
+        return;
+    };
+    piped.succeeded();
+    assert_eq!(piped.outputs()["line"], "it says one line");
+}
+
 /// An edge guard routes on the source node's structured output, deterministically
 /// (PRD 5.3).
 ///
@@ -4552,6 +4655,35 @@ fn a_session_scoped_store_outlives_the_execution_that_wrote_it() {
          two would send that reader to look at a line already there (PRD G3): \
          {failure}"
     );
+    // …and it is a **usage** failure, which is what a caller branches on.
+    // Grammar 11.3 likens the check to env-ref presence (§4.3), and `main.rs`'s
+    // table puts that in the `2` column: `1` is "a run produced no answer" and
+    // `2` is "the command could not be run at all". Nothing ran here — the
+    // argument is missing, and no repetition of the same command can supply it —
+    // so a supervisor that retries `1` and reports `2` must be told `2`. The
+    // sibling below is the same mistake spelled differently, and the two
+    // agreeing is the whole claim.
+    assert_eq!(
+        refused.output.status.code(),
+        Some(2),
+        "a `--session` a flow needs and did not get is an argument to fix, not a \
+         run to retry: {failure}"
+    );
+    let mistyped = harness::run_into(
+        &project,
+        "stores",
+        "flow.remember",
+        &[("nope", "not a field of this flow")],
+        Some("session-a"),
+        &environment,
+    );
+    let mistyped_failure = mistyped.failed();
+    assert_eq!(
+        mistyped.output.status.code(),
+        Some(2),
+        "the neighbouring argument mistake grammar 13.2 names in the same \
+         sentence: {mistyped_failure}"
+    );
 }
 
 /// A declared `manual` trigger's `session_key:` remaps the `--session` the CLI
@@ -5835,6 +5967,51 @@ fn a_request_with_an_empty_body_starts_an_execution_and_a_non_object_one_does_no
     assert!(
         provider.snapshot().is_drained(),
         "two requests started two runs, and none of the refused bodies started a third"
+    );
+}
+
+/// A trigger that cannot read a request says **which** key it looked for.
+///
+/// The generated app is the first surface where a CEL diagnostic is read by
+/// somebody outside the composition: a caller who omitted a query parameter or a
+/// header gets the evaluator's own sentence back as a `400` body, and an index
+/// spelled `payload.query[…]` tells them everything about their mistake except
+/// the part they can act on. PRD G3 makes error UX a product feature, and the
+/// validator's column already spells a literal key — so the two interpreters
+/// naming one sub-path differently would be exactly the drift the shared corpus
+/// exists to prevent, in the half a corpus of values does not reach.
+///
+/// `/query-answers` is the route it is decided on because its binding is an
+/// index over a payload member the request controls: `payload.query['q']`,
+/// grammar 13.3's own spelling, sent with no `q` at all.
+#[test]
+fn a_trigger_that_cannot_read_a_request_names_the_key_it_looked_for() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let Some(served) = harness::serve("http-trigger", &provider) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+
+    let refused = app
+        .send(Request::post("/query-answers"))
+        .expect("the trigger's route answers");
+    assert_eq!(
+        refused.status, 400,
+        "a binding that cannot be read is a bad request, not a failed run: {:?}",
+        refused.body
+    );
+    assert_eq!(
+        refused.json()["error"].as_str(),
+        Some(
+            "the trigger `on_query_request` could not read this request: `payload.query[\"q\"]` is not present: nothing has supplied it"
+        ),
+        "the refusal names the trigger and the key that was missing: {:?}",
+        refused.body
+    );
+
+    assert!(
+        provider.requests().is_empty(),
+        "…and no execution started, so nothing reached the provider"
     );
 }
 

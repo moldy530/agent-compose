@@ -462,6 +462,30 @@ export interface FlowRun {
 }
 
 /**
+ * Why a flow that reaches a `scope: session` store refuses a run that arrived
+ * with no session identity (grammar 11.3, 13.2).
+ *
+ * One sentence in one place, because it is raised from two and the two must not
+ * drift: `src/cli.ts` raises it as a **usage** error, before a `run` starts
+ * anything, because a missing `--session` is an argument the caller has to add —
+ * the same class as an unknown `--input` name or an absent `${ENV}`, which
+ * grammar 11.3 says outright by likening this check to env-ref presence (§4.3);
+ * `runFlow` raises it for every other caller, where the key arrives per
+ * invocation.
+ *
+ * Named by the store rather than by the flow, because the store is what the
+ * author has to look at. And three ways a run arrives with none are named,
+ * because two of them are advice a reader has already taken: a declared
+ * `session_key:` that *evaluated* to the empty string — an absent header, a
+ * payload member that was not sent — is an identity-less run whose trigger does
+ * declare one, and a message offering only the two remedies would send that
+ * reader to look at a line that is already there (PRD G3).
+ */
+export function sessionRefusal(address: string, stores: readonly string[]): string {
+  return `\`${address}\` reaches ${stores.map((store) => `\`${store}\``).join(", ")}, which ${stores.length === 1 ? "is" : "are"} \`scope: session\`, so this run needs a session identity and arrived with none: pass \`--session <key>\` to \`agent-compose run\`, or declare \`session_key:\` on the trigger that starts it — and where one is declared, it answered the empty string for this invocation (grammar 11.3, 13.2)`;
+}
+
+/**
  * Run one flow to quiescence and materialize its outputs.
  *
  * This is the invocation surface `agent-compose run` and the generated `serve`
@@ -500,19 +524,13 @@ export async function runFlow(
   // Grammar 11.3, checked where the value first exists: a flow that reaches a
   // `scope: session` store keys off the identity its trigger supplies, and a run
   // started without one would silently address a partition named by the empty
-  // string. Named by the store rather than by the flow, because the store is
-  // what the author has to look at.
-  //
-  // Three ways a run arrives here and all three are named, because two of them
-  // are advice a reader has already taken. A declared `session_key:` that
-  // *evaluated* to the empty string — an absent header, a payload member that
-  // was not sent — is an identity-less run whose trigger does declare one, and a
-  // message offering only the two remedies would send that reader to look at a
-  // line that is already there (PRD G3).
+  // string. `src/cli.ts` decides the same thing one step earlier for a `run`,
+  // where the identity is a command-line argument; this is the guard for every
+  // caller it cannot stand in for — a `serve` request, an ejected invocation —
+  // where the key arrives per invocation and its absence really is a failure of
+  // that run rather than of the command.
   if (sessionKey === "" && flow.sessionStores.length > 0) {
-    throw new Error(
-      `\`${address}\` reaches ${flow.sessionStores.map((store) => `\`${store}\``).join(", ")}, which ${flow.sessionStores.length === 1 ? "is" : "are"} \`scope: session\`, so this run needs a session identity and arrived with none: pass \`--session <key>\` to \`agent-compose run\`, or declare \`session_key:\` on the trigger that starts it — and where one is declared, it answered the empty string for this invocation (grammar 11.3, 13.2)`,
-    );
+    throw new Error(sessionRefusal(address, flow.sessionStores));
   }
   const executionId = options.executionId ?? `exec_${globalThis.crypto.randomUUID()}`;
   // `runtime.quiesce` keeps the last state each superstep produced, which is

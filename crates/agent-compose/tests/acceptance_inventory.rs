@@ -376,6 +376,16 @@ const CODEGEN: &[Criterion] = &[
                 "a_retried_subflow_reports_the_instance_of_every_attempt",
                 Status::Live,
             ),
+            // The subgraph's *other* call site. PRD 5.1's flow-as-tool
+            // equivalence makes an agent's `tools:` entry a second way to reach
+            // the same module, and grammar 7.7 clause 4 analyses it as one — so
+            // what the provider is offered, and what a call to it does in a
+            // release that does not instantiate from there, belong to this
+            // criterion rather than to the agent's.
+            (
+                "a_flow_attached_as_a_tool_reaches_the_model_and_refuses_the_call",
+                Status::Live,
+            ),
         ],
     },
     Criterion {
@@ -598,6 +608,13 @@ const COMMANDS: &[Criterion] = &[
             ),
             (
                 "a_completion_webhook_fires_with_the_runs_report_and_only_when_a_url_was_given",
+                Status::Live,
+            ),
+            // …and what it answers a caller whose request the trigger's own
+            // bindings could not read, which is the first place a CEL
+            // diagnostic is read by somebody outside the composition (PRD G3).
+            (
+                "a_trigger_that_cannot_read_a_request_names_the_key_it_looked_for",
                 Status::Live,
             ),
             // And what the *command* answers when there is no app to serve.

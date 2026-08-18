@@ -49,12 +49,18 @@
 // that expression — over that one-member payload — is what turns the argument
 // into the identity a `scope: session` store partitions by (grammar 11.3). Left
 // undeclared it is `"payload.session"`, the argument itself.
+//
+// A flow that reaches a `scope: session` store cannot run without one, and
+// grammar 11.3 says where that is decided: "supplying the value is a run-time
+// requirement (`--session`), checked at run start like env-ref presence (§4.3)".
+// So it is decided here, beside the arguments — an invocation missing it is a
+// command that could not run (exit `2`), not a run that produced no answer.
 
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 
-import { type CompiledFlow, type FlowRun, flows, runFlow } from "./graph.ts";
+import { type CompiledFlow, type FlowRun, flows, runFlow, sessionRefusal } from "./graph.ts";
 import type * as runtime from "./runtime.ts";
 import { dataRoot } from "./stores.ts";
 import { httpTriggers, manualTriggers } from "./triggers.ts";
@@ -143,6 +149,7 @@ async function run(argv: readonly string[]): Promise<number> {
   const inputs = bindInputs(flow, options.repeated["input"] ?? []);
   const session = sessionOf(flow, options.single["session"] ?? "");
   const format = formatOf(options.single["format"]);
+  requireSession(address, flow, session);
 
   // Minted here rather than left to `runFlow`, because this command needs it on
   // both of its ways out: it is what makes the trace file's name unique (see
@@ -317,7 +324,8 @@ function bindInputs(flow: CompiledFlow, given: readonly string[]): Record<string
  * store, and a remap of nothing would answer with something — `'tenant-' +
  * payload.session` is `"tenant-"` for the run nobody gave a session — which is a
  * partition named after an identity that does not exist. So the empty argument
- * passes through as itself and `runFlow` refuses the run naming the store.
+ * passes through as itself and [`requireSession`] refuses the run naming the
+ * store.
  *
  * Which remap applies is not a choice: two `manual` triggers naming one flow may
  * not declare different `session_key:` expressions, and the compiler refuses a
@@ -338,6 +346,31 @@ function sessionOf(flow: CompiledFlow, given: string): string {
     }
   }
   return given;
+}
+
+/**
+ * Refuse a `run` whose flow needs a session identity and was given none
+ * (grammar 11.3, 13.2).
+ *
+ * A **usage** error, so the command exits `2` rather than `1`. The three
+ * failures grammar 13.2 puts in one sentence — an unknown argument name, a
+ * missing REQUIRED field, a value that does not fit — are already decided here
+ * for that reason, and this is the fourth of the same kind: an argument the
+ * caller has to add before anything can run. Grammar 11.3 says so itself,
+ * likening the check to env-ref presence (§4.3) — which is a `2` in this
+ * project's exit-code table, where `1` means a run produced no answer and `2`
+ * means the command could not be run at all. Nothing ran here, and a supervisor
+ * that retries `1` and reports `2` would otherwise retry an invocation that
+ * cannot succeed however many times it is repeated.
+ *
+ * `runFlow` keeps the same guard for the callers this one cannot stand in for: a
+ * `serve` request, whose session key is the request's rather than the command
+ * line's, and an ejected caller invoking a compiled flow directly. There it
+ * really is one run that failed.
+ */
+function requireSession(address: string, flow: CompiledFlow, session: string): void {
+  if (session !== "" || flow.sessionStores.length === 0) return;
+  throw new UsageError(sessionRefusal(address, flow.sessionStores));
 }
 
 /** One `--input` value, as the kind the field declares (grammar 13.2). */

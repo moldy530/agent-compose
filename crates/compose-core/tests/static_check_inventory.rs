@@ -250,6 +250,24 @@ const GRAMMAR: &[Check] = &[
         evidence: Evidence::Fixture,
     },
     Check {
+        // The third row whose rule the spec does not state, and for the same
+        // shape of reason as the two below. §11.5 states the collision rule for
+        // a synthesized name against an attached one, and states the *reason* —
+        // an attachment's name on the wire is its address's local name — but no
+        // sentence and no Decision entry says what `tool.condense` beside
+        // `flow.condense` on one agent means, and the published schema accepts
+        // it. §5.4's duplicate rule is about entries rather than names, and the
+        // parser raises that one. `check/bindings.rs::attached_tool_collisions`
+        // reports the gap as a doc defect and says why the check is kept
+        // meanwhile; the citation here is deliberately not a section number for
+        // the rule itself, so this row cannot be read as evidence that the
+        // grammar states it.
+        rule: "two attached tools do not share a local name (compiler rule over 5.4's attachment naming and 11.5's collision rule)",
+        pass: "check/bindings.rs",
+        codes: &["tool-name-collision"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
         rule: "a `method: GET` trigger does not read through `payload.body` (13.3, D117)",
         pass: "check/triggers.rs",
         codes: &["invalid-expression"],

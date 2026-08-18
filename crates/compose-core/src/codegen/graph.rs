@@ -101,6 +101,15 @@
 //! no per-kind default is consulted at all (PRD 5.8, Decision D87), which is
 //! what makes a project with production infrastructure in `deploy/staging.yml`
 //! still runnable with none.
+//!
+//! And it covers a `flow.*` in an agent's `tools:` — flow-as-tool, grammar 5.4.
+//! The tool is on the wire with the whole contract that section gives it, and
+//! its `invoke` is what refuses (see [`flow_tool`]). This one is worth naming
+//! because it is where the posture was once broken the other way: the entry was
+//! emitted as a source *comment* and no tool, so a composition the validator had
+//! analysed the attachment of — grammar 7.7 clause 4 carries session coherence,
+//! sync interrupt-freedom and recursion through it — reached the provider with
+//! the tool missing and nothing anywhere saying so.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
@@ -853,16 +862,15 @@ fn agents(
             text.push_str("  tools: [\n");
             for reference in &agent.tools {
                 let tool_address = reference.value.to_string();
-                let Some(tool) = ir.definitions.get(&tool_address) else {
+                let Some(attached) = ir.definitions.get(&tool_address) else {
                     continue;
                 };
-                let DefinitionBody::Tool(tool) = &tool.body else {
-                    // A `flow.*` in a tool list is flow-as-tool, which needs
-                    // subgraph instantiation — a later M1 bullet.
-                    text.push_str(&format!(
-                        "    // `{tool_address}` is a flow attached as a tool, which this \
-                         compiler release does not run.\n"
-                    ));
+                let DefinitionBody::Tool(tool) = &attached.body else {
+                    // A `flow.*` here is flow-as-tool (grammar 5.4): a real tool
+                    // on the wire, whose call this release does not serve.
+                    if let DefinitionBody::Flow(attached) = &attached.body {
+                        text.push_str(&flow_tool(ir, surfaces, &tool_address, attached));
+                    }
                     continue;
                 };
                 let local_name = tool_address
@@ -900,6 +908,66 @@ fn agents(
 
 /// Grammar 5's default for `max_tool_iterations:` (Decision D51, PRD §9.14).
 const DEFAULT_TOOL_ITERATIONS: i64 = 8;
+
+/// One `flow.*` in an agent's `tools:` — flow-as-tool (grammar 5.4, PRD 5.1).
+///
+/// The tool is **emitted**, with the name, description and parameter schema
+/// grammar 5.4 gives it: its local name is the name the model calls, its
+/// `description:` — which the validator requires exactly here — is the selection
+/// signal, and its `inputs:` is the parameter schema. Only the call is refused,
+/// by an `invoke` that throws `runtime.Unimplemented` naming the construct.
+///
+/// That is this module's posture for a construct it does not run, and the
+/// alternative it replaces is the one the header calls out by name: an agent
+/// whose `tools:` names a flow used to reach the provider with that tool simply
+/// *absent* — no diagnostic at `validate`, none at `build`, and a model that
+/// could not call what the composition attached. The compiler analyses the
+/// attachment as a call everywhere else — grammar 7.7 clause 4 carries session
+/// coherence, sync interrupt-freedom and recursion through it, and grammar
+/// 11.5's collision rule reserves its name against a store's — so dropping it at
+/// the last step was the emitter answering a plausible value.
+///
+/// What is still not here is the instantiation. A `flow:` node hands
+/// `runtime.runSubflow` an instance path and a policy off its `NodeView`
+/// (grammar 9.3, 9.4), and neither exists at a tool call: how many times a model
+/// calls a tool is the model's, so the effect site a nested store write derives
+/// its idempotency key from is not derivable the way a node's is, and where an
+/// instance's own trace joins the caller's is undecided. Those are questions for
+/// the PRD, not for this function to answer quietly.
+fn flow_tool(ir: &Ir, surfaces: &[schema::Surface<'_>], address: &str, flow: &Flow) -> String {
+    let local = address.split_once('.').map_or(address, |(_, rest)| rest);
+    let description = flow.description.as_ref().map_or_else(
+        // Unreachable over a composition `validate` accepted: grammar 5.4 makes
+        // `description:` REQUIRED of a flow in a `tools:` list, and
+        // `check::bindings` refuses one without. Said rather than unwrapped,
+        // because a panic here would be a `build` crash over a rule with a
+        // diagnostic of its own.
+        || format!("The flow `{address}`, attached as a tool."),
+        |description| description.value.clone(),
+    );
+    let parameters = flow_parameters(ir, surfaces, address);
+    let mut text = String::from("    {\n");
+    text.push_str(&format!("      name: {},\n", names::string(local)));
+    text.push_str(&format!("      address: {},\n", names::string(address)));
+    text.push_str(&format!(
+        "      description: {},\n",
+        names::string(&description)
+    ));
+    text.push_str(&format!(
+        "      schema: {},\n",
+        json_literal(&schema::json_fields(parameters.as_ref()), "      ")
+    ));
+    text.push_str(&format!(
+        "      invoke: () => {{\n        throw new runtime.Unimplemented({}, {});\n      }},\n",
+        names::string(&format!("`{address}` attached as a tool")),
+        names::string(
+            "a subflow instantiated from a model's tool call — the same flow \
+             reached from a `flow:` node runs (grammar 8.5, 5.4)"
+        )
+    ));
+    text.push_str("    },\n");
+    text
+}
 
 /// The tools an agent's attached stores synthesize (grammar 11.5, PRD 5.8).
 ///
@@ -3086,6 +3154,30 @@ export interface FlowRun {
 }
 
 /**
+ * Why a flow that reaches a `scope: session` store refuses a run that arrived
+ * with no session identity (grammar 11.3, 13.2).
+ *
+ * One sentence in one place, because it is raised from two and the two must not
+ * drift: `src/cli.ts` raises it as a **usage** error, before a `run` starts
+ * anything, because a missing `--session` is an argument the caller has to add —
+ * the same class as an unknown `--input` name or an absent `${ENV}`, which
+ * grammar 11.3 says outright by likening this check to env-ref presence (§4.3);
+ * `runFlow` raises it for every other caller, where the key arrives per
+ * invocation.
+ *
+ * Named by the store rather than by the flow, because the store is what the
+ * author has to look at. And three ways a run arrives with none are named,
+ * because two of them are advice a reader has already taken: a declared
+ * `session_key:` that *evaluated* to the empty string — an absent header, a
+ * payload member that was not sent — is an identity-less run whose trigger does
+ * declare one, and a message offering only the two remedies would send that
+ * reader to look at a line that is already there (PRD G3).
+ */
+export function sessionRefusal(address: string, stores: readonly string[]): string {
+  return `\`${address}\` reaches ${stores.map((store) => `\`${store}\``).join(", ")}, which ${stores.length === 1 ? "is" : "are"} \`scope: session\`, so this run needs a session identity and arrived with none: pass \`--session <key>\` to \`agent-compose run\`, or declare \`session_key:\` on the trigger that starts it — and where one is declared, it answered the empty string for this invocation (grammar 11.3, 13.2)`;
+}
+
+/**
  * Run one flow to quiescence and materialize its outputs.
  *
  * This is the invocation surface `agent-compose run` and the generated `serve`
@@ -3124,19 +3216,13 @@ export async function runFlow(
   // Grammar 11.3, checked where the value first exists: a flow that reaches a
   // `scope: session` store keys off the identity its trigger supplies, and a run
   // started without one would silently address a partition named by the empty
-  // string. Named by the store rather than by the flow, because the store is
-  // what the author has to look at.
-  //
-  // Three ways a run arrives here and all three are named, because two of them
-  // are advice a reader has already taken. A declared `session_key:` that
-  // *evaluated* to the empty string — an absent header, a payload member that
-  // was not sent — is an identity-less run whose trigger does declare one, and a
-  // message offering only the two remedies would send that reader to look at a
-  // line that is already there (PRD G3).
+  // string. `src/cli.ts` decides the same thing one step earlier for a `run`,
+  // where the identity is a command-line argument; this is the guard for every
+  // caller it cannot stand in for — a `serve` request, an ejected invocation —
+  // where the key arrives per invocation and its absence really is a failure of
+  // that run rather than of the command.
   if (sessionKey === "" && flow.sessionStores.length > 0) {
-    throw new Error(
-      `\`${address}\` reaches ${flow.sessionStores.map((store) => `\`${store}\``).join(", ")}, which ${flow.sessionStores.length === 1 ? "is" : "are"} \`scope: session\`, so this run needs a session identity and arrived with none: pass \`--session <key>\` to \`agent-compose run\`, or declare \`session_key:\` on the trigger that starts it — and where one is declared, it answered the empty string for this invocation (grammar 11.3, 13.2)`,
-    );
+    throw new Error(sessionRefusal(address, flow.sessionStores));
   }
   const executionId = options.executionId ?? `exec_${globalThis.crypto.randomUUID()}`;
   // `runtime.quiesce` keeps the last state each superstep produced, which is
@@ -3665,6 +3751,89 @@ flow.f:
         assert!(
             emitted.contains("ends: [END, \"rescue\"],"),
             "the control-transfer target is an end of the node that transfers to it:\n{emitted}"
+        );
+    }
+
+    /// A flow attached as a tool is **on the wire** with the contract grammar
+    /// 5.4 gives it, and only its call is refused.
+    ///
+    /// The two halves are one rule. A tool the compiler drops is a model that
+    /// cannot call what the composition attached and a run that says nothing
+    /// about it — no diagnostic at `validate`, none at `build`, and an agent the
+    /// validator analysed the attachment of (grammar 7.7 clause 4) reaching the
+    /// provider without it. So the name, the description grammar 5.4 requires
+    /// here, and the `inputs:` schema are all emitted; the `invoke` is where
+    /// this release says what it does not do.
+    #[test]
+    fn a_flow_attached_as_a_tool_is_offered_to_the_model_and_refuses_its_call() {
+        let emitted = emit(&format!(
+            r#"{PREAMBLE}
+agent.caller:
+  model: model.m
+  prompt: Answer.
+  output: {{ draft: {{ type: string }} }}
+  tools: [flow.helper, flow.bare]
+
+flow.helper:
+  description: Summarise one passage into a line.
+  inputs: {{ passage: {{ type: string, min_length: 1 }} }}
+  outputs: {{ draft: {{ type: string }} }}
+  nodes:
+    write: {{ agent: agent.reviewer }}
+  edges:
+    - {{ from: start, to: write }}
+    - {{ from: write, to: end }}
+
+flow.bare:
+  description: Answer with no arguments at all.
+  outputs: {{ draft: {{ type: string }} }}
+  nodes:
+    write: {{ agent: agent.reviewer }}
+  edges:
+    - {{ from: start, to: write }}
+    - {{ from: write, to: end }}
+
+flow.f:
+  inputs: {{ goal: {{ type: string }} }}
+  outputs: {{ draft: {{ type: string }} }}
+  nodes:
+    say: {{ agent: agent.caller }}
+  edges:
+    - {{ from: start, to: say }}
+    - {{ from: say, to: end }}
+"#
+        ));
+        // The local name is the name on the wire, and the address travels with
+        // it so a transcript says which flow was attached.
+        assert!(emitted.contains("      name: \"helper\","), "{emitted}");
+        assert!(
+            emitted.contains("      address: \"flow.helper\","),
+            "{emitted}"
+        );
+        // Grammar 5.4: the flow's own `description:` is the selection signal.
+        assert!(
+            emitted.contains("      description: \"Summarise one passage into a line.\","),
+            "{emitted}"
+        );
+        // …and its `inputs:` is the parameter schema, `min_length:` included.
+        assert!(emitted.contains("\"minLength\": 1"), "{emitted}");
+        assert!(
+            emitted
+                .contains("throw new runtime.Unimplemented(\"`flow.helper` attached as a tool\","),
+            "{emitted}"
+        );
+        // A flow with no `inputs:` is a no-argument tool rather than a panic:
+        // the empty parameter list is written nowhere, so there is no field map
+        // to look up (see `flow_parameters`).
+        assert!(emitted.contains("      name: \"bare\","), "{emitted}");
+        assert!(
+            emitted.contains("throw new runtime.Unimplemented(\"`flow.bare` attached as a tool\","),
+            "{emitted}"
+        );
+        assert!(
+            !emitted
+                .contains("is a flow attached as a tool, which this compiler release does not run"),
+            "the construct is emitted rather than commented away:\n{emitted}"
         );
     }
 

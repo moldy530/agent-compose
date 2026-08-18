@@ -212,7 +212,9 @@ use crate::check::model;
 use crate::diag::Spanned;
 use crate::ir::definition::DefinitionBody;
 use crate::ir::flow::NodeKind;
-use crate::ir::schema::{ArrayType, EnumType, FieldMap, ObjectType, Scalar, TypeForm, TypeNode};
+use crate::ir::schema::{
+    ArrayType, EnumType, Field, FieldMap, ObjectType, Scalar, TypeForm, TypeNode,
+};
 use crate::ir::{Channel, Ir};
 
 use super::names::{self, Names};
@@ -1437,9 +1439,20 @@ fn regex_expression(pattern: &str) -> String {
 /// A field map as JSON Schema draft 2020-12: a closed object.
 #[must_use]
 pub fn json_field_map(map: &FieldMap) -> Value {
+    json_fields(&map.fields)
+}
+
+/// The same object, for a surface held as fields rather than as a written map.
+///
+/// A flow's parameter surface is one: a flow with no `inputs:` has no field map
+/// anywhere — the empty parameter list is written nowhere — so the sites that
+/// resolve it answer with fields, and a flow attached as an agent tool
+/// (grammar 5.4) needs those fields as the tool's JSON Schema.
+#[must_use]
+pub fn json_fields(fields: &[Field]) -> Value {
     let mut properties = Map::new();
     let mut required = Vec::new();
-    for field in &map.fields {
+    for field in fields {
         let name = field.name.value.as_str();
         properties.insert(name.to_string(), json_type_node(&field.ty));
         if declared_default(&field.ty).is_none() {

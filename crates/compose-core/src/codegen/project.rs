@@ -355,8 +355,10 @@ report — what ran, which model served each call, what each store did, which
 edges were taken — on **stderr**, with the path of the file the whole trace was
 written to. `--format json` folds both into one document on stdout instead.
 `--session` is the session identity of PRD 5.8: a flow that reaches a
-`scope: session` store needs one, and a run without it fails at start naming the
-store. A declared `manual` trigger may remap it — its `session_key:` is CEL over
+`scope: session` store needs one, and a `run` without it is refused before
+anything starts, naming the store — an argument to add rather than a run to
+retry, so it exits `2` like an `--input` the flow does not declare. A declared
+`manual` trigger may remap it — its `session_key:` is CEL over
 a payload whose one member is this argument, and what that expression answers is
 the partition the run addresses (grammar 13.2). Declared on no trigger, the
 argument is the identity.

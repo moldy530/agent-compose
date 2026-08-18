@@ -20,6 +20,8 @@ import * as runtime from "./runtime.ts";
 import * as stores from "./stores.ts";
 import {
   agentShaperOutput,
+  flowCondenseInputs,
+  flowCondenseNodeReduceOutput,
   flowShapeInputs,
   flowShapeNodeAskOutput,
   flowShapeNodeNotifyOutput,
@@ -118,6 +120,20 @@ const stateShape: runtime.Shape = {
     "who": "string",
     "word": "string",
   },
+};
+
+/** `flow.condense` — the `input` root inside it (grammar 7.5). */
+const flowCondenseShape: runtime.Shape = {
+  "properties": {
+    "passage": "string"
+  }
+};
+
+/** `flow.condense` node `reduce` — the `reduce.output` root its guards read. */
+const flowCondenseNodeReduceShape: runtime.Shape = {
+  "properties": {
+    "latest": "string"
+  }
 };
 
 /** `flow.shape` — the `input` root inside it (grammar 7.5). */
@@ -457,8 +473,94 @@ const agentShaper: runtime.AgentBinding = {
       "type": "object"
     },
   },
-  tools: [],
+  tools: [
+    {
+      name: "condense",
+      address: "flow.condense",
+      description: "Condense a passage into the one line worth keeping.",
+      schema: {
+        "additionalProperties": false,
+        "properties": {
+          "passage": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "passage"
+        ],
+        "type": "object"
+      },
+      invoke: () => {
+        throw new runtime.Unimplemented("`flow.condense` attached as a tool", "a subflow instantiated from a model's tool call — the same flow reached from a `flow:` node runs (grammar 8.5, 5.4)");
+      },
+    },
+  ],
   maxToolIterations: 8,
+};
+
+// --- flow.condense ---
+
+/** `flow.condense` node `reduce` — an inline subprocess (grammar 8.2). */
+const flowCondenseNodeReduce: runtime.NodeDescriptor = {
+  flow: "flow.condense",
+  node: "reduce",
+  // Grammar 9.3, resolved: `retry` from the built-in, `timeout` from the built-in, `on_error` from the built-in.
+  policy: {
+    onError: "fail",
+  },
+  shapes: { input: flowCondenseShape, state: stateShape, output: flowCondenseNodeReduceShape },
+  input: () => ({}),
+  run: async (input, context) => ({
+    output: runtime.parseResult(
+      flowCondenseNodeReduceOutput,
+      await runtime.runExec({
+        command: ["true"],
+        args: [],
+        env: [],
+        expectExit: [0],
+        decoding: { envelope: [], decoded: ["latest"], empty: false },
+      }, input, context),
+      "the result of `flow.condense` node `reduce`",
+    ),
+  }),
+  writes: [
+    { field: "latest", channel: "latest", reduce: "set" },
+  ],
+  edges: [
+    { to: END },
+  ],
+};
+
+/** `flow.condense` — its nodes, its `start` edges, and the compiled graph. */
+function flowCondense() {
+  return new StateGraph(State)
+    .addNode("reduce", (state: GraphState) => runtime.runNode(flowCondenseNodeReduce, state), {
+      ends: [END],
+    })
+    .addEdge(START, "reduce")
+    .compile();
+}
+
+/**
+ * `flow.condense`, compiled once. Building it at import is also what checks it: a state model LangGraph refuses, or an edge to a node that is not registered, fails here rather than at the first invocation.
+ */
+const flowCondenseGraph = flowCondense();
+
+/**
+ * `flow.condense` as a module: what a `flow:` node instantiates and a `map` dispatches to (grammar 7.5, 8.5).
+ */
+const flowCondenseBinding: runtime.SubflowBinding = {
+  address: "flow.condense",
+  outputs: ["latest"],
+  recursionLimit: 26,
+  stream: (initial, options) =>
+    flowCondenseGraph.stream(initial, {
+      ...options,
+      streamMode: "values",
+      outputKeys: flowCondenseGraph.outputChannels,
+    }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
 };
 
 // --- flow.shape ---
@@ -714,6 +816,22 @@ export interface CompiledFlow {
  * flow rather than every triggered one.
  */
 export const flows: Readonly<Record<string, CompiledFlow>> = {
+  "flow.condense": {
+    address: "flow.condense",
+    inputs: ["passage"],
+    inputKinds: { "passage": "string", },
+    outputs: ["latest"],
+    sessionStores: [],
+    recursionLimit: 26,
+    parse: (inputs: unknown) =>
+      runtime.parseResult(flowCondenseInputs, inputs, "the `inputs:` of `flow.condense`") as Record<string, unknown>,
+    stream: (initial, options) =>
+      flowCondenseGraph.stream(initial, {
+        ...options,
+        streamMode: "values",
+        outputKeys: flowCondenseGraph.outputChannels,
+      }) as unknown as Promise<AsyncIterable<GraphState>>,
+  },
   "flow.shape": {
     address: "flow.shape",
     inputs: ["goal"],
@@ -740,6 +858,30 @@ export interface FlowRun {
   readonly trace: readonly runtime.TraceEntry[];
   /** The whole state at quiescence. */
   readonly state: GraphState;
+}
+
+/**
+ * Why a flow that reaches a `scope: session` store refuses a run that arrived
+ * with no session identity (grammar 11.3, 13.2).
+ *
+ * One sentence in one place, because it is raised from two and the two must not
+ * drift: `src/cli.ts` raises it as a **usage** error, before a `run` starts
+ * anything, because a missing `--session` is an argument the caller has to add —
+ * the same class as an unknown `--input` name or an absent `${ENV}`, which
+ * grammar 11.3 says outright by likening this check to env-ref presence (§4.3);
+ * `runFlow` raises it for every other caller, where the key arrives per
+ * invocation.
+ *
+ * Named by the store rather than by the flow, because the store is what the
+ * author has to look at. And three ways a run arrives with none are named,
+ * because two of them are advice a reader has already taken: a declared
+ * `session_key:` that *evaluated* to the empty string — an absent header, a
+ * payload member that was not sent — is an identity-less run whose trigger does
+ * declare one, and a message offering only the two remedies would send that
+ * reader to look at a line that is already there (PRD G3).
+ */
+export function sessionRefusal(address: string, stores: readonly string[]): string {
+  return `\`${address}\` reaches ${stores.map((store) => `\`${store}\``).join(", ")}, which ${stores.length === 1 ? "is" : "are"} \`scope: session\`, so this run needs a session identity and arrived with none: pass \`--session <key>\` to \`agent-compose run\`, or declare \`session_key:\` on the trigger that starts it — and where one is declared, it answered the empty string for this invocation (grammar 11.3, 13.2)`;
 }
 
 /**
@@ -781,19 +923,13 @@ export async function runFlow(
   // Grammar 11.3, checked where the value first exists: a flow that reaches a
   // `scope: session` store keys off the identity its trigger supplies, and a run
   // started without one would silently address a partition named by the empty
-  // string. Named by the store rather than by the flow, because the store is
-  // what the author has to look at.
-  //
-  // Three ways a run arrives here and all three are named, because two of them
-  // are advice a reader has already taken. A declared `session_key:` that
-  // *evaluated* to the empty string — an absent header, a payload member that
-  // was not sent — is an identity-less run whose trigger does declare one, and a
-  // message offering only the two remedies would send that reader to look at a
-  // line that is already there (PRD G3).
+  // string. `src/cli.ts` decides the same thing one step earlier for a `run`,
+  // where the identity is a command-line argument; this is the guard for every
+  // caller it cannot stand in for — a `serve` request, an ejected invocation —
+  // where the key arrives per invocation and its absence really is a failure of
+  // that run rather than of the command.
   if (sessionKey === "" && flow.sessionStores.length > 0) {
-    throw new Error(
-      `\`${address}\` reaches ${flow.sessionStores.map((store) => `\`${store}\``).join(", ")}, which ${flow.sessionStores.length === 1 ? "is" : "are"} \`scope: session\`, so this run needs a session identity and arrived with none: pass \`--session <key>\` to \`agent-compose run\`, or declare \`session_key:\` on the trigger that starts it — and where one is declared, it answered the empty string for this invocation (grammar 11.3, 13.2)`,
-    );
+    throw new Error(sessionRefusal(address, flow.sessionStores));
   }
   const executionId = options.executionId ?? `exec_${globalThis.crypto.randomUUID()}`;
   // `runtime.quiesce` keeps the last state each superstep produced, which is
