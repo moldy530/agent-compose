@@ -106,7 +106,11 @@ store.
 `serve` starts the app over the composition's declared `http` triggers and
 announces where it is listening as one JSON line on stdout. Executions are
 tracked in that process: durable execution and checkpointers are a later
-milestone, so a status route answers `404` for an id the process did not start.
+milestone, so a status route answers `404` for an id the process did not start —
+and every execution it *did* start, with its outputs and its trace, is held for
+the life of the process, so a long-running `serve` grows with the number of
+requests it has answered. Restarting it is the only way to reclaim that until
+the checkpointer arrives and an execution stops living in memory.
 
 ### On Node instead
 

@@ -106,7 +106,11 @@ store.
 `serve` starts the app over the composition's declared `http` triggers and
 announces where it is listening as one JSON line on stdout. Executions are
 tracked in that process: durable execution and checkpointers are a later
-milestone, so a status route answers `404` for an id the process did not start.
+milestone, so a status route answers `404` for an id the process did not start —
+and every execution it *did* start, with its outputs and its trace, is held for
+the life of the process, so a long-running `serve` grows with the number of
+requests it has answered. Restarting it is the only way to reclaim that until
+the checkpointer arrives and an execution stops living in memory.
 
 ### On Node instead
 
@@ -137,7 +141,7 @@ installed (PRD 5.8). What it writes lives under this directory:
 ```text
 .agent-compose/stores/<name>.sqlite                      a `kv` or `vector` store
 .agent-compose/blobs/<name>/<partition>/values/<key>     a `blob` store
-.agent-compose/traces/<flow>-<timestamp>.json            what `run` wrote out
+.agent-compose/traces/<flow>-<execution id>.json         what `run` wrote out
 ```
 
 `<partition>` is the store's declared `scope:` made concrete — `global`,
@@ -151,6 +155,27 @@ working directory, so a graph reads the same store wherever it was launched from
 One thing under the directory is not a store's: the traces above, which
 `agent-compose run` writes and names on stderr. The whole directory is listed in
 `.gitignore` — what a run produced is not what a build emitted.
+
+### One process at a time
+
+**Run one of these at a time against one project.** The local backends are the
+zero-infra ones: `kv` and `vector` are a SQLite database opened through a
+WebAssembly build over `node:fs`, which has no cross-process locking, so two
+`agent-compose run`s sharing a `session` or `global` store race for it and the
+loser fails the node with `SQLite3Error: database is locked`. It fails loudly
+rather than corrupting anything, and a `serve` process — which runs its
+executions in **one** process — is not affected. Concurrency across processes
+arrives with the production `storage_backends:` of a later milestone; until then
+`--target local` means one process, which is the same boundary the target draws
+everywhere else.
+
+**Nothing here is pruned.** A store keeps what was written to it until you
+delete the file, and that includes the idempotency ledger a keyed write leaves
+beside its effect (the `applied` table, one row per key) — so a long-lived
+`global` store's ledger grows with the number of writes ever made to it, and so
+does the traces directory. Retention is yours: everything under
+`.agent-compose/` is safe to remove between runs, and removing it is what "start
+clean" means.
 
 ## Pinned versions
 
