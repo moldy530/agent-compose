@@ -60,6 +60,35 @@ triggers:
       question: "payload.body.question"
     respond: async
 
+  # A body-bearing method whose bindings read the **query string**, so nothing
+  # about this route needs a body at all. That is what makes it the trigger
+  # Decision D117's other half is observable on: a `POST` sent with an empty body
+  # presents `payload.body` as `{}` and must start an execution, and a request
+  # that carries a body which is not a decodable JSON object must start none.
+  on_query_request:
+    type: http
+    flow: flow.direct
+    path: /query-answers
+    method: POST
+    input:
+      question: "payload.query['q']"
+    respond: async
+
+  # The completion webhook (grammar 13.3, PRD 5.11). It sits on a flow with no
+  # interrupt in it, so the run really finishes and the delivery carries a
+  # terminal report; and `callback:` is read from the body, which is the natural
+  # spelling and the one that makes "a request that named no URL gets no
+  # webhook" a case rather than a hypothetical.
+  on_callback_request:
+    type: http
+    flow: flow.direct
+    path: /callback-answers
+    method: POST
+    input:
+      question: "payload.body.question"
+    respond: async
+    callback: "payload.body.callback_url"
+
   # The third response shape (grammar 13.3, PRD §9.8): `sync` blocks for the
   # flow's outputs, and on `timeout:` expiry the response **upgrades** to the
   # async one — 202 with the execution id and a status URL — while the execution

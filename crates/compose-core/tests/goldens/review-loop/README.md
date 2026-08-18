@@ -128,6 +128,28 @@ script — so bun, npm and pnpm all resolve it to the same versions. The lockfil
 your installer writes is yours: `agent-compose build` never writes or removes
 one.
 
+## `route_on: [timeout]` needs a `timeout:`
+
+A model route fails over on the conditions its `route_on:` names, and three of
+them are things a provider says: a 429 is `rate_limit`, a 529 or a 503 is
+`overloaded`, any other 5xx is `server_error`. `timeout` is the one that is not.
+A provider that accepted the request and answers nothing says nothing at all, so
+the runtime has to decide when to stop waiting — and what it decides that
+against is the **node's own `timeout:`** (grammar 9.2), divided between the
+members that still have one after them. The first member of a two-member route
+under `timeout: 30s` is given 15 seconds; a member that does not answer inside
+its share fails over, and the last member keeps whatever is left, so the ladder
+never outlives the node's budget.
+
+A node that resolves **no** `timeout:` — none of its own, none from an
+instantiating `policy:`, none from `defaults:` — has declared no wall-clock bound
+at all (grammar 9.3's built-in level is "no retry, no timeout"), so there is
+nothing for a share to be a share of. Such a node waits on a silent provider for
+as long as it stays silent, exactly as it would with a single model, and the
+`timeout` in its `route_on:` never fires. A dropped connection, a refused socket
+and a name that does not resolve are a different case: the socket reports those,
+so they classify as `timeout` and fail over whether or not a budget is declared.
+
 ## Pinned versions
 
 A compiler release targets one LangGraph release (PRD 5.12). Upgrading is a

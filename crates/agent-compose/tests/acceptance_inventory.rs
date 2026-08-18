@@ -455,6 +455,20 @@ const CODEGEN: &[Criterion] = &[
                 "every_declared_condition_is_recognized_from_the_shape_the_provider_answers_with",
                 Status::Live,
             ),
+            // `timeout` twice, because it is two conditions wearing one name: a
+            // provider that *reports* a failure to answer, which the row above
+            // stages as a dropped connection, and a provider that reports
+            // nothing at all, which only a budget can end.
+            (
+                "a_route_member_that_answers_nothing_fails_over_inside_the_nodes_budget",
+                Status::Live,
+            ),
+            // "recorded" is the load-bearing half of this phrase, and a record
+            // that survived only a successful run would not be one.
+            (
+                "an_exhausted_route_records_every_member_it_spent_in_the_failed_nodes_trace",
+                Status::Live,
+            ),
         ],
     },
     // The emission has landed: the built project reads its `${ENV}` references
@@ -538,6 +552,22 @@ const COMMANDS: &[Criterion] = &[
             ),
             (
                 "resume_validates_the_execution_and_names_the_runtime_it_waits_for",
+                Status::Live,
+            ),
+            // What the app does with a request is as much a part of "generated
+            // Fastify app" as which routes it mounts: the body rule of
+            // Decision D117, and the completion webhook `start` fires.
+            (
+                "a_request_with_an_empty_body_starts_an_execution_and_an_undecodable_one_does_not",
+                Status::Live,
+            ),
+            (
+                "a_completion_webhook_fires_with_the_runs_report_and_only_when_a_url_was_given",
+                Status::Live,
+            ),
+            // And what the *command* answers when there is no app to serve.
+            (
+                "serve_answers_two_with_a_sentence_when_it_cannot_take_the_port",
                 Status::Live,
             ),
             (

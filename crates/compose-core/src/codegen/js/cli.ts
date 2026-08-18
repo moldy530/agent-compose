@@ -185,10 +185,23 @@ async function serveVerb(argv: readonly string[]): Promise<number> {
       "this composition declares no `http` triggers, so the generated app exposes no routes: declare one in `triggers:` (grammar 13.3)",
     );
   }
-  await serve({
-    ...(options.single["host"] === undefined ? {} : { host: options.single["host"] }),
-    ...(port === undefined ? {} : { port: Number(port) }),
-  });
+  const host = options.single["host"] ?? "127.0.0.1";
+  try {
+    await serve({
+      host,
+      ...(port === undefined ? {} : { port: Number(port) }),
+    });
+  } catch (error) {
+    // Everything that keeps the app from *starting* is the same kind of failure
+    // as a bad flag: the address is taken, the port needs a privilege this
+    // process does not have, the host does not resolve. Answering with a
+    // framework stack trace and `1` would report "a run produced no answer",
+    // which is the one thing that did not happen — nothing ran. So it is a `2`
+    // with a sentence, like every other command that could not be run.
+    throw new UsageError(
+      `the app could not listen on ${host}:${port ?? 0}: ${describe(error)}`,
+    );
+  }
   // The app owns the process from here: `serve` never returns on its own, and
   // the signal handlers it installed are what end it.
   await new Promise<void>(() => {});
@@ -308,9 +321,13 @@ function render(trace: readonly runtime.TraceEntry[]): string {
       // PRD 5.9's own phrasing: failover is data a reader can see, not
       // behaviour they have to infer from a provider's own logs.
       const served =
-        call.fallback === 0
-          ? `served by ${call.servedBy}`
-          : `served by ${call.servedBy}, fallback #${call.fallback}`;
+        call.servedBy === undefined
+          ? // Nothing answered it: the ladder ran out, and the member whose
+            // refusal ended it is what stands in for "served by".
+            `refused by ${call.refused?.model ?? "every member"}`
+          : call.fallback === 0
+            ? `served by ${call.servedBy}`
+            : `served by ${call.servedBy}, fallback #${call.fallback}`;
       const after =
         call.failovers.length === 0
           ? ""

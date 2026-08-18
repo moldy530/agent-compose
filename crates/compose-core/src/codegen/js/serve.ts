@@ -100,6 +100,7 @@ export interface ServeOptions {
 export function createApp(): FastifyInstance {
   const app = Fastify({ logger: false });
   const executions = new Map<string, Execution>();
+  decodeBodies(app);
 
   for (const trigger of httpTriggers) {
     app.route({
@@ -134,6 +135,51 @@ export function createApp(): FastifyInstance {
   return app;
 }
 
+/**
+ * One decoding rule for every request body, which is grammar 13.3's own
+ * (Decision D117).
+ *
+ * The framework's parsers are removed and replaced by a single one, because
+ * D117 states the rule over *bodies* rather than over media types and Fastify's
+ * default set does not decide it that way:
+ *
+ *  * a body-bearing method sent with an **empty** body presents `{}` and starts
+ *    an execution — where the stock `application/json` parser refuses the same
+ *    request `400 FST_ERR_CTP_EMPTY_JSON_BODY` before a handler runs, making
+ *    whether an execution starts turn on a `content-type:` header the grammar
+ *    gives no meaning to: the identical request sent without the header
+ *    presents `{}` and runs;
+ *  * a body that is present and is **not** a decodable JSON object is refused
+ *    at request time, which [`start`] does with one message for every way of
+ *    not being one — a media type nothing decodes (`415` from the stock set), a
+ *    body that is not JSON, and JSON that is not an object.
+ *
+ * What a framework does with a body it cannot decode, and what status it answers
+ * with, is part of what a compiled graph does — which is why `package.json` pins
+ * Fastify exactly — so the two rows above are settled here rather than inherited
+ * and described in a README.
+ */
+function decodeBodies(app: FastifyInstance): void {
+  app.removeAllContentTypeParsers();
+  app.addContentTypeParser("*", { parseAs: "string" }, (_request, body, done) => {
+    const text = typeof body === "string" ? body : String(body);
+    // Empty, or nothing but whitespace — which is the same request with a
+    // newline in it, and no caller means one as a payload.
+    if (text.trim() === "") {
+      done(null, {});
+      return;
+    }
+    try {
+      done(null, JSON.parse(text) as unknown);
+    } catch {
+      // Handed on as the text it is: what a body that does not decode answers
+      // is [`start`]'s to say, in the same sentence a decodable non-object
+      // gets, rather than two shapes of refusal for one rule.
+      done(null, text);
+    }
+  });
+}
+
 /** Start one execution for a trigger (grammar 13.3's `start`). */
 async function start(
   executions: Map<string, Execution>,
@@ -150,7 +196,8 @@ async function start(
 
   // A `GET` decodes no body and presents `{}`; a body-bearing method that
   // arrived without one presents `{}` too, and one that is present and is not a
-  // JSON **object** starts no execution (grammar 13.3, Decision D117).
+  // JSON **object** — whatever media type it announced, see [`decodeBodies`] —
+  // starts no execution (grammar 13.3, Decision D117).
   const body = trigger.readsBody ? (request.body ?? {}) : {};
   if (typeof body !== "object" || body === null || Array.isArray(body)) {
     return reply.code(400).send({

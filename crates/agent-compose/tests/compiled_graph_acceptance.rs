@@ -4428,6 +4428,129 @@ fn every_declared_condition_is_recognized_from_the_shape_the_provider_answers_wi
     }
 }
 
+/// `route_on: [timeout]` fires for a provider that answers **nothing**, inside
+/// the node's own `timeout:` budget (PRD 5.9, grammar 9.2, 12.2).
+///
+/// The other three conditions are things a provider says, and the test above
+/// stages each of them as a wire shape. This one is the condition nothing says:
+/// a member that accepted the request and is still holding it. There is no
+/// status to classify, so the only way the ladder can reach `model.fast` is for
+/// the runtime to give the first member a bounded share of the node's budget and
+/// give up on it when the share is spent.
+///
+/// The fixture's `flow.ask_promptly` declares `timeout: 4s` on its node and the
+/// route has two members, so the first gets ~2s; the script holds the first
+/// member's answer for far longer than the whole node budget, so a run that
+/// produces the fallback's answer **at all** is a run in which the share fired,
+/// and a run that produced it after the node's own deadline would not have
+/// produced it. The node budget is the ceiling either way: nothing here can make
+/// the ladder outlive grammar 9.2's bound.
+#[test]
+fn a_route_member_that_answers_nothing_fails_over_inside_the_nodes_budget() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        // Accepted, never answered — the mock closes long after this node's
+        // whole 4s budget, so nothing but the per-member share can end the wait.
+        Script::new(SONNET, Outcome::timeout(Duration::from_secs(30))),
+        Script::new(HAIKU, Outcome::structured(json!({ "answer": "in time" }))),
+    ]);
+
+    let Some(run) = harness::run(
+        "model-failover",
+        "flow.ask_promptly",
+        &[("question", "what is it?")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(run.outputs()["answer"], "in time");
+
+    let call = run
+        .entries("ask")
+        .into_iter()
+        .find_map(|entry| {
+            entry["models"]
+                .as_array()
+                .and_then(|calls| calls.first().cloned())
+        })
+        .expect("the model call is recorded");
+    assert_eq!(call["servedBy"], "model.fast", "{call}");
+    assert_eq!(call["fallback"], 1, "{call}");
+    assert_eq!(
+        call["failovers"][0]["condition"], "timeout",
+        "a provider that answered nothing in time is `route_on:`'s `timeout`: {call}"
+    );
+    assert_eq!(call["failovers"][0]["model"], "model.smart", "{call}");
+}
+
+/// A node that **failed** still records every model call it made (PRD 5.9).
+///
+/// The trace is what a reader opens when a run did not work, and the failover
+/// record is data rather than prose precisely so it can be read there. A route
+/// that spent every member made two real calls, and a record that survived only
+/// on the success path would leave the one run that needs it with nothing but
+/// the sentence inside the error.
+#[test]
+fn an_exhausted_route_records_every_member_it_spent_in_the_failed_nodes_trace() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(SONNET, Outcome::rate_limit()),
+        Script::new(HAIKU, Outcome::rate_limit()),
+    ]);
+
+    let Some(run) = harness::run(
+        "model-failover",
+        "flow.ask",
+        &[("question", "what is it?")],
+        &provider,
+    ) else {
+        return;
+    };
+    let failure = run.failed();
+    assert!(
+        failure.contains("model.smart") && failure.contains("model.fast"),
+        "the error names the route it spent: {failure}"
+    );
+
+    let entries = run.entries("ask");
+    let entry = entries.first().expect("the failed node has a trace entry");
+    assert_eq!(entry["outcome"], "failed", "{entry}");
+    let calls = entry["models"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a failed node still records its model calls: {entry}"));
+    assert_eq!(
+        calls.len(),
+        1,
+        "one call was made — one ladder, walked to its end: {entry}"
+    );
+    let refusals = calls[0]["failovers"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the refusals on the way are recorded: {entry}"));
+    assert_eq!(refusals.len(), 1, "{entry}");
+    assert_eq!(refusals[0]["model"], "model.smart", "{entry}");
+    assert_eq!(refusals[0]["condition"], "rate_limit", "{entry}");
+    // Nothing served this call — `failovers` holds the members that moved the
+    // ladder on, and the last member's refusal is what ended it, so that one is
+    // recorded as the refusal rather than as a failover that never happened.
+    assert!(
+        calls[0]["servedBy"].is_null() && calls[0]["fallback"].is_null(),
+        "a call nothing answered claims no member: {entry}"
+    );
+    assert_eq!(calls[0]["refused"]["model"], "model.fast", "{entry}");
+    assert_eq!(calls[0]["refused"]["condition"], "rate_limit", "{entry}");
+
+    let recorded = provider.requests();
+    assert_eq!(
+        recorded
+            .iter()
+            .map(|request| request.model.as_str())
+            .collect::<Vec<_>>(),
+        [SONNET, HAIKU],
+        "both members were really called"
+    );
+}
+
 /// A missing env ref fails at process start, naming the variable — never at the
 /// first model call, and never with a key baked into the generated code
 /// (PRD 5.9).
@@ -4870,6 +4993,203 @@ fn resume_validates_the_execution_and_names_the_runtime_it_waits_for() {
     assert!(
         error.contains("`human` node runtime") && error.contains("M2"),
         "the refusal names the runtime and the milestone: {error}"
+    );
+}
+
+/// An app that cannot start is a command that could not run: exit `2` with a
+/// sentence, not a framework stack trace.
+///
+/// `main.rs`'s exit-code table gives `1` one meaning — "a run produced no
+/// answer" — and an address already taken is not that: nothing ran. The port is
+/// held by this test, which is the one way to make the failure deterministic.
+#[test]
+fn serve_answers_two_with_a_sentence_when_it_cannot_take_the_port() {
+    let provider = MockProvider::start().expect("a loopback port");
+    // Held for the whole test: the app is refused the port because this socket
+    // still owns it.
+    let held = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let port = held.local_addr().expect("a bound address").port();
+
+    let Some(output) = harness::serve_refused("http-trigger", &provider, port) else {
+        return;
+    };
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "the command could not run at all: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("the app could not listen on 127.0.0.1:{port}")),
+        "…and says which address it could not have: {stderr}"
+    );
+}
+
+/// What the generated app does with a request **body** is grammar 13.3's rule,
+/// not the framework's default (Decision D117).
+///
+/// Three requests, one rule. A body-bearing method sent with an empty body
+/// presents `payload.body = {}` and starts an execution, which is the case a
+/// stock JSON parser refuses before a handler runs; the identical request sent
+/// with no `content-type` at all must do the same thing, because whether an
+/// execution starts cannot turn on a header the grammar gives no meaning to; and
+/// a body that is present and is not a decodable JSON object is refused at
+/// request time, starting nothing.
+///
+/// `/query-answers` is the route it is decided on because its bindings read the
+/// query string: a trigger that read the body would fail the read instead, which
+/// is D110's rule rather than this one.
+#[test]
+fn a_request_with_an_empty_body_starts_an_execution_and_an_undecodable_one_does_not() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(SONNET, Outcome::structured(json!({ "answer": "declared" }))),
+        Script::new(SONNET, Outcome::structured(json!({ "answer": "bare" }))),
+    ]);
+
+    let Some(served) = harness::serve("http-trigger", &provider) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+
+    let declared = app
+        .send(
+            Request::post("/query-answers?q=what-is-it")
+                .header("content-type", "application/json")
+                .bytes(Vec::new()),
+        )
+        .expect("the trigger's route answers");
+    assert_eq!(
+        declared.status, 202,
+        "an empty body presents `{{}}` and starts an execution: {:?}",
+        declared.body
+    );
+    let execution = declared.json()["execution_id"]
+        .as_str()
+        .expect("an execution id")
+        .to_string();
+    let finished = harness::settled(&app, &execution);
+    assert_eq!(finished["status"], "completed", "{finished}");
+    assert_eq!(finished["outputs"]["answer"], "declared");
+
+    let bare = app
+        .send(Request::post("/query-answers?q=what-is-it"))
+        .expect("the trigger's route answers");
+    assert_eq!(
+        bare.status, 202,
+        "…and so does the same request with no content type: {:?}",
+        bare.body
+    );
+    let second = bare.json()["execution_id"]
+        .as_str()
+        .expect("an execution id")
+        .to_string();
+    assert_eq!(
+        harness::settled(&app, &second)["outputs"]["answer"],
+        "bare",
+        "both requests really ran the flow"
+    );
+
+    let refused = app
+        .send(
+            Request::post("/query-answers?q=what-is-it")
+                .header("content-type", "application/json")
+                .bytes(b"{not json".to_vec()),
+        )
+        .expect("the trigger's route answers");
+    assert_eq!(
+        refused.status, 400,
+        "a body that does not decode starts no execution: {:?}",
+        refused.body
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.body).contains("not a JSON object"),
+        "…and says so in the app's own words: {:?}",
+        refused.body
+    );
+
+    assert!(
+        provider.snapshot().is_drained(),
+        "two requests started two runs, and the third started none"
+    );
+}
+
+/// The `callback:` completion webhook fires with the run's report, and only for
+/// a request that asked for one (grammar 13.3, PRD 5.11).
+///
+/// Both halves, because the second is what the first's implementation costs: the
+/// URL is read **after** the run rather than at the start, precisely so that
+/// `callback: "payload.body.callback_url"` — the grammar's own spelling — does
+/// not refuse every caller who did not want a webhook. A change that read it
+/// earlier would turn those callers into failed requests, and a test that only
+/// watched the delivery arrive would stay green through it.
+#[test]
+fn a_completion_webhook_fires_with_the_runs_report_and_only_when_a_url_was_given() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(SONNET, Outcome::structured(json!({ "answer": "notified" }))),
+        Script::new(SONNET, Outcome::structured(json!({ "answer": "quiet" }))),
+    ]);
+
+    let receiver = harness::Receiver::start().expect("a loopback receiver");
+    let Some(served) = harness::serve("http-trigger", &provider) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+
+    let started = app
+        .post_json(
+            "/callback-answers",
+            &json!({
+                "question": "what is it?",
+                "callback_url": format!("{}/done", receiver.base_url),
+            }),
+        )
+        .expect("the trigger's route answers");
+    assert_eq!(started.status, 202, "{:?}", started.body);
+    let execution = started.json()["execution_id"]
+        .as_str()
+        .expect("an execution id")
+        .to_string();
+    assert_eq!(harness::settled(&app, &execution)["status"], "completed");
+
+    let delivered = receiver.wait_for(1, Duration::from_secs(30));
+    let report = &delivered[0];
+    assert_eq!(report["execution_id"], execution, "{report}");
+    assert_eq!(report["status"], "completed", "{report}");
+    assert_eq!(report["outputs"]["answer"], "notified", "{report}");
+    assert!(
+        report["trace"]
+            .as_array()
+            .is_some_and(|trace| !trace.is_empty()),
+        "the delivery carries the whole report the status route holds: {report}"
+    );
+
+    // The same trigger, from a caller who named no URL: a request with no
+    // webhook rather than a request that could not be read.
+    let quiet = app
+        .post_json("/callback-answers", &json!({ "question": "what is it?" }))
+        .expect("the trigger's route answers");
+    assert_eq!(
+        quiet.status, 202,
+        "an absent `callback_url` is not a bad request: {:?}",
+        quiet.body
+    );
+    let second = quiet.json()["execution_id"]
+        .as_str()
+        .expect("an execution id")
+        .to_string();
+    let finished = harness::settled(&app, &second);
+    assert_eq!(finished["status"], "completed", "{finished}");
+    assert_eq!(finished["outputs"]["answer"], "quiet", "{finished}");
+    // The run has already settled, and a webhook fires immediately after: this
+    // is the window in which a delivery that should not happen would.
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        receiver.delivered().len(),
+        1,
+        "two executions, one webhook: {:?}",
+        receiver.delivered()
     );
 }
 

@@ -52,6 +52,31 @@ agent.answerer:
       type: string
       min_length: 1
 
+# The same route under a **budget**. `route_on:` names `timeout`, and a timeout
+# is the one condition a provider does not announce: a member that accepted the
+# request and answers nothing has to be given up on for the ladder to reach
+# `model.fast` at all. What the runtime gives up on it against is this node's own
+# `timeout:` — grammar 9.2's budget, divided between the members that still have
+# a successor — so the node here declares one and the fixture can spend it.
+flow.ask_promptly:
+  description: Ask one question through a failover route, under a deadline.
+  inputs:
+    question:
+      type: string
+      min_length: 1
+  outputs:
+    answer:
+      type: string
+  nodes:
+    ask:
+      agent: agent.answerer
+      input:
+        question: "input.question"
+      timeout: 4s
+  edges:
+    - { from: start, to: ask }
+    - { from: ask, to: end }
+
 flow.ask:
   description: Ask one question through a failover route.
   inputs:

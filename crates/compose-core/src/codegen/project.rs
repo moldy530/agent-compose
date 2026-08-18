@@ -246,6 +246,7 @@ pub fn readme(ir: &Ir) -> super::GeneratedFile {
     ));
     contents.push_str(README_BODY);
     contents.push_str(&store_data(ir));
+    contents.push_str(&route_timeouts(ir));
     contents.push_str(&host_functions(ir));
     contents.push_str(README_PINS);
 
@@ -428,6 +429,72 @@ working directory, so a graph reads the same store wherever it was launched from
 One thing under the directory is not a store's: the traces above, which
 `agent-compose run` writes and names on stderr. The whole directory is listed in
 `.gitignore` — what a run produced is not what a build emitted.
+"#;
+
+/// The section a composition with a `route_on: [timeout]` route gets.
+///
+/// Three of grammar 12.2's conditions are answers a provider sends, and the
+/// runtime classifies each from what came back. The fourth is the absence of an
+/// answer, and it is the only one whose behaviour depends on something the
+/// author writes somewhere else: a node's `timeout:`, which is the budget the
+/// ladder divides between the members that still have a successor (see
+/// `callModel` in `src/runtime.ts`). A composition with no `timeout:` anywhere
+/// has declared no wall-clock bound — grammar 9.3's built-in level is "no
+/// timeout" — so nothing measures the silence and the condition never fires.
+///
+/// That is not something the signature of a `route:` shows, and it is exactly
+/// the kind of thing a reader discovers at three in the morning, so it is
+/// written where they meet the key. Emitted only for a route that declares the
+/// condition, because for every other composition it would be advice about a
+/// key it does not have.
+fn route_timeouts(ir: &Ir) -> String {
+    let declared = ir.definitions.values().any(|definition| {
+        let crate::ir::definition::DefinitionBody::Model(crate::ir::definition::Model::Route(
+            route,
+        )) = &definition.body
+        else {
+            return false;
+        };
+        // An absent `route_on:` is grammar 12.2's default, which names
+        // `timeout` — so the section belongs to a route that said nothing as
+        // much as to one that said this.
+        route.route_on.as_ref().is_none_or(|conditions| {
+            conditions.iter().any(|condition| {
+                matches!(
+                    condition.value,
+                    crate::ast::definition::RouteCondition::Timeout
+                )
+            })
+        })
+    });
+    if !declared {
+        return String::new();
+    }
+    String::from(ROUTE_TIMEOUTS)
+}
+
+const ROUTE_TIMEOUTS: &str = r#"
+## `route_on: [timeout]` needs a `timeout:`
+
+A model route fails over on the conditions its `route_on:` names, and three of
+them are things a provider says: a 429 is `rate_limit`, a 529 or a 503 is
+`overloaded`, any other 5xx is `server_error`. `timeout` is the one that is not.
+A provider that accepted the request and answers nothing says nothing at all, so
+the runtime has to decide when to stop waiting — and what it decides that
+against is the **node's own `timeout:`** (grammar 9.2), divided between the
+members that still have one after them. The first member of a two-member route
+under `timeout: 30s` is given 15 seconds; a member that does not answer inside
+its share fails over, and the last member keeps whatever is left, so the ladder
+never outlives the node's budget.
+
+A node that resolves **no** `timeout:` — none of its own, none from an
+instantiating `policy:`, none from `defaults:` — has declared no wall-clock bound
+at all (grammar 9.3's built-in level is "no retry, no timeout"), so there is
+nothing for a share to be a share of. Such a node waits on a silent provider for
+as long as it stays silent, exactly as it would with a single model, and the
+`timeout` in its `route_on:` never fires. A dropped connection, a refused socket
+and a name that does not resolve are a different case: the socket reports those,
+so they classify as `timeout` and fail over whether or not a budget is declared.
 "#;
 
 /// The pins table's own heading, emitted after every conditional section.
@@ -792,6 +859,68 @@ store.prefs:
             section > contents.find("### On Node instead").expect("the fallback"),
             "…and after the launch instructions it is about"
         );
+    }
+
+    /// A route that can fail over on `timeout` is told what measures one.
+    ///
+    /// The condition is the only one whose behaviour depends on a key written
+    /// somewhere else — a node's `timeout:` — so a reader of a project with a
+    /// route in it finds that here rather than in a run that waited forever. A
+    /// project with no such route is not told about a key it does not have.
+    #[test]
+    fn a_route_that_fails_over_on_timeout_is_told_what_measures_one() {
+        let models = |route_on: &str| {
+            format!(
+                r#"version: "0.1"
+
+provider.p:
+  kind: anthropic
+  api_key: ${{K}}
+
+model.smart:
+  provider: provider.p
+  id: one
+
+model.fast:
+  provider: provider.p
+  id: two
+
+model.default:
+  route: [model.smart, model.fast]{route_on}
+"#
+            )
+        };
+
+        let plain = readme(&ir_of("version: \"0.1\"\n")).contents;
+        assert!(
+            !plain.contains("## `route_on: [timeout]` needs a `timeout:`"),
+            "a composition with no route is not told about one"
+        );
+        let narrowed = readme(&ir_of(&models("\n  route_on: [rate_limit]"))).contents;
+        assert!(
+            !narrowed.contains("## `route_on: [timeout]` needs a `timeout:`"),
+            "…nor is a route that declared the condition away: {narrowed}"
+        );
+
+        for route_on in ["", "\n  route_on: [overloaded, timeout]"] {
+            let contents = readme(&ir_of(&models(route_on))).contents;
+            let section = contents
+                .find("## `route_on: [timeout]` needs a `timeout:`")
+                .unwrap_or_else(|| {
+                    panic!("the section is emitted for `route_on:{route_on:?}`: {contents}")
+                });
+            assert!(
+                contents.contains("grammar 9.3's built-in level is \"no retry, no timeout\""),
+                "…and says what a node with no budget does: {contents}"
+            );
+            assert!(
+                section
+                    < contents
+                        .find("## Pinned versions")
+                        .expect("the pin table has a heading"),
+                "the section sits with the rest of what the project does"
+            );
+        }
     }
 
     /// The two pin tables and the README's table are one list. A dependency

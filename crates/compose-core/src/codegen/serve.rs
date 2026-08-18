@@ -15,6 +15,14 @@
 //! caller observes at the route. A caret here would let a release move that with
 //! no commit saying so.
 //!
+//! Which is also why the app does not simply *inherit* that behaviour: D117
+//! states its rule over bodies rather than over media types, and the stock
+//! parser set decides one of its two rows the other way — an empty body on a
+//! body-bearing method is a `400` there and an execution here. The app installs
+//! one parser of its own for every content type, so what a caller observes is
+//! the grammar's rule rather than a framework default the pin merely freezes
+//! (see `decodeBodies` in `js/serve.ts`).
+//!
 //! # What this milestone's app does not do
 //!
 //! Executions are tracked **in this process**: PRD §7 puts durable execution and

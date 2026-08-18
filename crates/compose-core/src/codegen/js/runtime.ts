@@ -301,6 +301,25 @@ export class ProviderUnreachable extends Error {
   }
 }
 
+/**
+ * A request a route member did not answer inside the share of the node's budget
+ * it was given (PRD 5.9's `timeout`, the other half of it).
+ *
+ * [`ProviderUnreachable`] is the failure a socket *reports* — a reset, a refused
+ * connection, a name that did not resolve. This is the one nothing reports: a
+ * provider that accepted the request and is still holding it. PRD 5.9's
+ * `timeout` condition is written about that case, and without a request-level
+ * budget there would be no moment at which to classify it — the node's own
+ * deadline would arrive first and end the node with a declared fallback never
+ * tried. See [`callModel`] for where the budget comes from.
+ */
+export class ProviderTimeout extends Error {
+  constructor(model: string, budgetMs: number) {
+    super(`\`${model}\` did not answer inside the ${budgetMs}ms this call was given`);
+    this.name = "ProviderTimeout";
+  }
+}
+
 // ---------------------------------------------------------------------------
 // The environment, read where it is used
 // ---------------------------------------------------------------------------
@@ -424,6 +443,17 @@ export interface RunContext {
    * otherwise be dropped on the floor rather than sent. See [`runMap`].
    */
   readonly signal: AbortSignal;
+  /**
+   * When [`signal`] is due to abort, as a `Date.now()` reading — present exactly
+   * when the node resolved a `timeout:` (grammar 9.2, 9.3).
+   *
+   * The signal alone says *that* the budget will run out and never *when*, and
+   * one activity has to divide the budget rather than merely observe it: a model
+   * route gives each member that has a successor a share of what is left, which
+   * is what makes PRD 5.9's `timeout` condition reachable for a provider that
+   * answers nothing at all. See [`callModel`].
+   */
+  readonly deadline?: number;
   /** How this attempt is addressed, for a message. */
   readonly node: string;
   /**
@@ -461,6 +491,24 @@ export interface RunContext {
    * what flows through it is appended by whoever runs an op.
    */
   readonly storeRecords?: StoreRecord[];
+  /**
+   * Where every model call this node makes is recorded (PRD 5.9).
+   *
+   * [`storeRecords`][`RunContext.storeRecords`]' sibling, and there for the same
+   * reason: an activity that **throws** returns no answer, so a record that
+   * travelled only on the answer would be missing from exactly the runs a reader
+   * opens the trace for — a route that spent every member, or a tool loop whose
+   * fourth call failed after three succeeded. Those calls really happened, and
+   * PRD 5.9 asks for failover to be recorded rather than inferred from a
+   * provider's own logs.
+   *
+   * [`callModel`] is what writes it, on both of its ways out. [`runNode`] reads
+   * it only when the activity threw: an answer that carries `models` carries
+   * them in an order the node decided (a `map`'s, which is source-item order),
+   * while what arrives here arrives in the order the calls were made, across
+   * every attempt the node's `retry:` policy made.
+   */
+  readonly modelCalls?: ModelCall[];
 }
 
 /**
@@ -563,10 +611,16 @@ export async function runActivity<T>(
   execution: RunContext["execution"],
   activity: (context: RunContext) => Promise<T>,
   storeRecords?: StoreRecord[],
+  modelCalls?: ModelCall[],
 ): Promise<{ value: T; attempts: number }> {
   const attempts = 1 + (policy.retry?.max ?? 0);
   const controller = new AbortController();
   const budget = policy.timeoutMs;
+  // Read once, beside the timer that enforces it, and shared by every attempt:
+  // grammar 9.2's budget bounds the node execution rather than an attempt, so
+  // an activity that divides it (see [`callModel`]) must divide the same one the
+  // timer below is counting down.
+  const deadline = budget === undefined ? undefined : Date.now() + budget;
   let expired = false;
   // What the node *did*, not what its policy allowed: a budget that ran out
   // during the second of three attempts made two, and a trace that reported
@@ -599,8 +653,10 @@ export async function runActivity<T>(
         const running = activity({
           execution,
           signal: controller.signal,
+          ...(deadline === undefined ? {} : { deadline }),
           node,
           ...(storeRecords === undefined ? {} : { storeRecords }),
+          ...(modelCalls === undefined ? {} : { modelCalls }),
         });
         // The loser of the race rejects with nobody awaiting it — an activity
         // that observes the abort, after the deadline has already answered for
@@ -719,16 +775,30 @@ function ladder(selection: ModelSelection): readonly ModelBinding[] {
 /**
  * One member's refusal, as the trace records it.
  *
- * The condition is what `route_on:` is written in, so a reader can see both that
- * the failover happened and that the composition asked for it.
+ * The condition is present when the refusal classifies as one of grammar 12.2's
+ * ([`classify`]) and absent when it does not — a 400, a body that is not JSON.
+ * A refusal that ends a call can be either; a refusal that moved the ladder on
+ * is always the first, which is what [`Failover`] narrows.
  */
-export interface Failover {
+export interface Refusal {
   /** The member that refused. */
   readonly model: string;
-  /** Which of grammar 12.2's conditions it refused with. */
-  readonly condition: RouteCondition;
+  /** Which of grammar 12.2's conditions it refused with, when it is one. */
+  readonly condition?: RouteCondition;
   /** What it said, for a reader who has to fix it. */
   readonly detail: string;
+}
+
+/**
+ * A refusal that moved the ladder on.
+ *
+ * The condition is what `route_on:` is written in, so a reader can see both that
+ * the failover happened and that the composition asked for it — a failover is by
+ * definition a refusal the route declared, so here the condition is never
+ * absent.
+ */
+export interface Failover extends Refusal {
+  readonly condition: RouteCondition;
 }
 
 /**
@@ -745,12 +815,23 @@ export interface Failover {
  * and no failovers: a trace that recorded only the interesting calls would leave
  * a reader unable to tell a call that did not fail over apart from a call
  * nothing recorded at all.
+ *
+ * **A call nothing answered is recorded too**, and it is the one a reader most
+ * often opens a trace for: a route that spent every member made a real call to
+ * each, and the failover that happened on the way is exactly the data PRD 5.9
+ * asks to be recorded rather than inferred. Such a record carries no `servedBy`
+ * and no `fallback` — nothing served it — and names the refusal that ended it in
+ * `refused`.
  */
 export interface ModelCall {
   readonly model: string;
-  readonly servedBy: string;
-  readonly fallback: number;
+  /** The member that answered. Absent when none did. */
+  readonly servedBy?: string;
+  /** Its ordinal in the route, `0` for the first. Absent with `servedBy`. */
+  readonly fallback?: number;
   readonly failovers: readonly Failover[];
+  /** What ended the call, when no member answered it. */
+  readonly refused?: Refusal;
 }
 
 /**
@@ -766,6 +847,7 @@ export interface ModelCall {
  * | HTTP 503, HTTP 529 | `overloaded` — the two spellings of an overloaded provider (Anthropic answers 529, the OpenAI surface 503) |
  * | any other 5xx | `server_error` |
  * | no answer at all: a dropped connection, a refused socket, a name that did not resolve | `timeout` |
+ * | no answer *yet*: the request outlived the budget this call was given ([`callModel`]) | `timeout` |
  * | anything else — a 4xx that is not 429, a body that is not JSON | **not a condition** |
  *
  * A failure that is not a condition, and a condition the route did not declare,
@@ -774,7 +856,7 @@ export interface ModelCall {
  * nothing.
  */
 export function classify(error: unknown): RouteCondition | undefined {
-  if (error instanceof ProviderUnreachable) return "timeout";
+  if (error instanceof ProviderUnreachable || error instanceof ProviderTimeout) return "timeout";
   if (!(error instanceof ProviderFailure)) return undefined;
   if (error.status === 429) return "rate_limit";
   if (error.status === 503 || error.status === 529) return "overloaded";
@@ -946,9 +1028,11 @@ async function send(
     });
     text = await response.text();
   } catch (error) {
-    // The node's own deadline reaches here as an abort, and it is not the
-    // provider's failure to answer: it is the budget grammar 9.2 gave the node,
-    // and failing over would spend what is left of it on a second provider.
+    // A deadline reaches here as an abort rather than as a socket failure, and
+    // it is not the provider's failure to answer — so it is raised as it came
+    // and [`callModel`] decides which deadline it was: the node's own budget
+    // (grammar 9.2), which ends the node, or this call's share of it, which is
+    // PRD 5.9's `timeout` and moves the ladder on.
     if (signal.aborted) throw error;
     throw new ProviderUnreachable(model.address, error);
   }
@@ -980,6 +1064,38 @@ export interface ModelResult {
  * The **last** member is not special-cased: when it refuses, its own error is
  * what the node sees, with the earlier refusals in the message so a reader is
  * not left wondering why one 429 ended a two-member route.
+ *
+ * # What `route_on: [timeout]` is measured against
+ *
+ * Three of grammar 12.2's four conditions are things a provider *says*. The
+ * fourth is a thing it does not say: PRD 5.9's `timeout` is the call that never
+ * comes back. A refused socket reports itself and reaches [`classify`] as a
+ * [`ProviderUnreachable`], but a provider that accepted the request and holds it
+ * reports nothing at all, so a ladder with no clock of its own would sit on the
+ * first member until the **node's** deadline ended the node — with a declared
+ * fallback never tried, which is the one outcome `route_on: [timeout]` is
+ * written to prevent.
+ *
+ * So each member that has a successor is given a **share of what is left of the
+ * node's budget**: `remaining / membersLeft`, taken when that member starts, and
+ * a member that does not answer inside its share fails over as a `timeout`
+ * ([`ProviderTimeout`]). Three properties make that the share rather than a
+ * number this runtime chose:
+ *
+ *  * it is a **division** of grammar 9.2's budget and never an extension of it —
+ *    the last member gets whatever remains and is bounded by the node's own
+ *    deadline, so the ladder cannot outlive the node;
+ *  * it is taken **only** when the route declares `timeout`, because a route
+ *    that did not is a route that wants its member to keep waiting;
+ *  * a **direct binding** is a ladder of one and is never sliced, so nothing
+ *    about a single-model composition changes.
+ *
+ * And a node with **no** `timeout:` has no budget to divide: grammar 9.3's
+ * built-in level is "no timeout", so there is no wall-clock bound to measure a
+ * provider's silence against, and a member that never answers is a node that
+ * never finishes — exactly as it is for a direct binding. A composition that
+ * wants `route_on: [timeout]` to fire has to say by when, which is what
+ * `timeout:` is; the emitted `README.md` says so where a reader meets the key.
  */
 export async function callModel(
   selection: ModelSelection,
@@ -989,7 +1105,7 @@ export async function callModel(
     readonly tools: readonly ToolSpec[];
     readonly pinned?: ToolSpec;
   },
-  signal: AbortSignal,
+  site: ModelSite,
 ): Promise<ModelResult> {
   const members = ladder(selection);
   const routeOn: readonly RouteCondition[] = isRoute(selection) ? selection.routeOn : [];
@@ -997,29 +1113,124 @@ export async function callModel(
 
   for (let ordinal = 0; ordinal < members.length; ordinal += 1) {
     const model = members[ordinal]!;
+    const share = requestBudget(site, routeOn, members.length - ordinal);
+    const bound = share === undefined ? undefined : bounded(site.signal, share);
     try {
-      const answer = await callDirect(model, request, signal);
-      return {
-        answer,
-        served: {
-          model: selection.address,
-          servedBy: model.address,
-          fallback: ordinal,
-          failovers: [...failovers],
-        },
+      const answer = await callDirect(model, request, bound?.signal ?? site.signal);
+      const served: ModelCall = {
+        model: selection.address,
+        servedBy: model.address,
+        fallback: ordinal,
+        failovers: [...failovers],
       };
-    } catch (error) {
+      site.modelCalls?.push(served);
+      return { answer, served };
+    } catch (raised) {
+      // The node's own deadline wins: it ends the node, and a call abandoned by
+      // it is not a provider that took too long. Only this call's own share
+      // becomes a condition the ladder acts on.
+      const error =
+        bound?.expired() === true && !site.signal.aborted
+          ? new ProviderTimeout(model.address, share!)
+          : raised;
       const condition = classify(error);
       const last = ordinal + 1 === members.length;
       if (condition === undefined || !routeOn.includes(condition) || last) {
+        // The call is recorded before it is raised: what a spent ladder did is
+        // the record a reader of a *failed* run needs, and a record that left
+        // only on the answer would never reach one (PRD 5.9).
+        site.modelCalls?.push({
+          model: selection.address,
+          failovers: [...failovers],
+          refused: {
+            model: model.address,
+            ...(condition === undefined ? {} : { condition }),
+            detail: describe(error),
+          },
+        });
         throw failoverContext(selection, failovers, error);
       }
       failovers.push({ model: model.address, condition, detail: describe(error) });
+    } finally {
+      bound?.release();
     }
   }
   // Unreachable: grammar 12.2 requires at least two members on a route and a
   // direct binding is a ladder of one, so the loop always answers or throws.
   throw new Error(`\`${selection.address}\` has no route member to call`);
+}
+
+/**
+ * What one model call is bounded by, and where its record goes.
+ *
+ * A [`RunContext`] is one, structurally: the call's clock is the node's clock
+ * ([`RunContext.signal`], [`RunContext.deadline`]) and its record belongs on the
+ * node's trace entry ([`RunContext.modelCalls`]). Stated as its own interface so
+ * this function asks for what it uses.
+ */
+export interface ModelSite {
+  /** Aborted when the node's `timeout:` budget runs out. */
+  readonly signal: AbortSignal;
+  /** That budget's expiry as a `Date.now()` reading. */
+  readonly deadline?: number;
+  /** Where this call is recorded, when the caller is collecting. */
+  readonly modelCalls?: ModelCall[];
+}
+
+/**
+ * This member's share of what is left of the node's budget, or `undefined` when
+ * nothing bounds it but the node's own deadline. See [`callModel`].
+ */
+function requestBudget(
+  site: ModelSite,
+  routeOn: readonly RouteCondition[],
+  membersLeft: number,
+): number | undefined {
+  // The last member — and every member of a route that did not declare
+  // `timeout` — waits as long as the node does.
+  if (membersLeft < 2 || !routeOn.includes("timeout")) return undefined;
+  if (site.deadline === undefined) return undefined;
+  const remaining = site.deadline - Date.now();
+  // A budget already spent needs no share of itself: the node's deadline is
+  // about to answer, and a 0ms request budget would report that as the
+  // provider's silence.
+  if (remaining <= 0) return undefined;
+  return Math.max(1, Math.floor(remaining / membersLeft));
+}
+
+/**
+ * A signal that follows `outer` and also aborts on its own budget.
+ *
+ * `AbortSignal.any` and `AbortSignal.timeout` would compose this in one line on
+ * both supported runtimes, and are not used for the same reason the rest of this
+ * module keeps its own timers: the caller has to be able to tell **which** of
+ * the two fired, and it has to be able to release the timer the moment the call
+ * answers rather than leaving one live per model call in a long tool loop.
+ */
+function bounded(
+  outer: AbortSignal,
+  budgetMs: number,
+): { readonly signal: AbortSignal; expired: () => boolean; release: () => void } {
+  const controller = new AbortController();
+  let expired = false;
+  const timer = setTimeout(() => {
+    expired = true;
+    controller.abort(new Error(`the ${budgetMs}ms budget of this model call was spent`));
+  }, budgetMs);
+  const follow = () => {
+    clearTimeout(timer);
+    controller.abort(outer.reason);
+  };
+  if (outer.aborted) follow();
+  else outer.addEventListener("abort", follow, { once: true });
+  return {
+    signal: controller.signal,
+    expired: () => expired,
+    release: () => {
+      clearTimeout(timer);
+      outer.removeEventListener("abort", follow);
+    },
+  };
 }
 
 /**
@@ -1415,6 +1626,9 @@ export async function callAgent(
   // Every call this node makes, in the order it made them (PRD 5.9). A tool
   // loop makes several, and which member of a route served each one is a
   // separate fact about each.
+  // The node's own channel ([`RunContext.modelCalls`]) is written by
+  // [`callModel`] rather than here, because a call the ladder *lost* has no
+  // answer to travel out on and this list only holds what came back.
   const models: ModelCall[] = [];
 
   if (agent.tools.length > 0) {
@@ -1426,12 +1640,12 @@ export async function callAgent(
         );
       }
       iterations += 1;
-      const { answer, served } = await callModel(
+      const { answer, served: by } = await callModel(
         agent.model,
         { system: agent.prompt, turns, tools: agent.tools },
-        context.signal,
+        context,
       );
-      models.push(served);
+      models.push(by);
       turns.push(replayed(agent, answer));
       if (answer.toolCalls.length === 0) break;
 
@@ -1453,7 +1667,7 @@ export async function callAgent(
   const { answer: final, served: finalServed } = await callModel(
     agent.model,
     { system: agent.prompt, turns, tools: agent.tools, pinned: agent.output },
-    context.signal,
+    context,
   );
   models.push(finalServed);
   if (final.structured === null) {
@@ -3356,7 +3570,15 @@ export async function runMap(
       // Its own signal, never the node's: see *A detached delivery is off the
       // node's clock* above. One per delivery rather than one per call, so a
       // fan-out of many sinks does not pile listeners onto a shared signal.
-      const delivery: RunContext = { ...scoped, signal: new AbortController().signal };
+      // Off the node's clock in **both** halves of it: the signal nothing
+      // aborts, and no `deadline` either — a delivery that inherited the node's
+      // expiry would hand a model route a share of a budget this delivery is
+      // defined not to be bounded by (see `RunContext.deadline`, `callModel`).
+      const delivery: RunContext = {
+        ...scoped,
+        signal: new AbortController().signal,
+        deadline: undefined,
+      };
       void (async () => {
         // `max_concurrency` is an **admission** bound over every in-flight
         // dispatch, detached included (grammar 8.6's key table, D28): a detached
@@ -3760,6 +3982,10 @@ export async function runNode(
   // (PRD 5.8). Owned here rather than by `runActivity` so a node that fails
   // still reports what it wrote before it did.
   const storeRecords: StoreRecord[] = [];
+  // And every model call, for the same reason and read the same way: only when
+  // the activity threw, because an answer that carries `models` carries them in
+  // the order the node decided (PRD 5.9, and see `RunContext.modelCalls`).
+  const modelCalls: ModelCall[] = [];
 
   /** This node's entry, for a failure that leaves nothing else behind. */
   const aborted = (error: unknown, made: number, routing?: RoutingDecision): TraceEntry => {
@@ -3803,6 +4029,7 @@ export async function runNode(
       run.execution,
       (context) => descriptor.run(input, context, view),
       storeRecords,
+      modelCalls,
     );
     attempts = answer.attempts;
     output = answer.value.output;
@@ -3824,6 +4051,11 @@ export async function runNode(
     // was abandoned holding it. The plan is where the records are then read
     // from, and is the reason a timed-out fan-out still says what it dispatched.
     dispatches = dispatchesOf(error) ?? plannedDispatches(input);
+    // Every model call this node made, which the failure carried out with it —
+    // an exhausted route's whole ladder, or the calls a tool loop made before
+    // the one that ended it (PRD 5.9, `RunContext.modelCalls`). `models` is
+    // still undefined here: the activity threw, so no answer set it.
+    if (modelCalls.length > 0) models = [...modelCalls];
     // `runActivity` wraps everything the activity threw in a `NodeFailure`
     // carrying the attempts it *made*, so the fallback is for an error that
     // reached here without one being made at all — and `0` is what that is.

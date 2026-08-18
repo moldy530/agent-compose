@@ -97,10 +97,12 @@
 #[path = "../../../compose-core/tests/support/toolchain.rs"]
 pub mod toolchain;
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 // `bun_command` beside `bun`: a test that needs the *runtime* and not the pinned
@@ -799,6 +801,27 @@ pub fn serve(name: &str, provider: &MockProvider) -> Option<Served> {
     Some(Served { child, base_url })
 }
 
+/// `agent-compose serve <fixture> --port <port>`, **waited on** rather than
+/// listened to.
+///
+/// [`serve`] reads a readiness line and hands back a live app, which is what a
+/// test of the served surface wants and exactly what a test of a *failed start*
+/// cannot use: there is no readiness line, and a harness waiting for one would
+/// hang instead of failing. So this one runs the command to completion and hands
+/// back what it wrote and how it exited.
+pub fn serve_refused(name: &str, provider: &MockProvider, port: u16) -> Option<Output> {
+    let out = scratch_project("serve-refused")?;
+    let mut command = agent_compose();
+    command
+        .arg("serve")
+        .arg(fixture(name))
+        .args(["--port", &port.to_string()])
+        .arg("--out")
+        .arg(&out);
+    seal(&mut command, &environment(provider));
+    Some(command.output().expect("the command runs"))
+}
+
 /// The states a status report can be asserted about: an execution has either
 /// finished, or stopped at an interrupt waiting for a resume.
 const SETTLED: &[&str] = &["completed", "interrupted", "failed"];
@@ -830,4 +853,132 @@ pub fn settled(app: &Client, execution: &str) -> Value {
         );
         std::thread::sleep(Duration::from_millis(25));
     }
+}
+
+/// Where a `callback:` webhook is delivered: a socket that answers `200` and
+/// keeps what it was posted.
+///
+/// The generated app POSTs its completion report to whatever URL the trigger's
+/// `callback:` CEL produced (grammar 13.3, PRD 5.11), and nothing else in this
+/// harness can receive one — [`MockProvider`] is a *provider* surface, and the
+/// served app is the thing under test. So this is the other end of the webhook:
+/// a listener a test points a `callback_url` at, which records every delivery in
+/// arrival order.
+///
+/// It answers `200` to anything and reads no route, because what is under test
+/// is which requests the app makes rather than what a receiver does with them.
+pub struct Receiver {
+    /// The base URL to build a `callback_url` from.
+    pub base_url: String,
+    delivered: Arc<Mutex<Vec<Value>>>,
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Receiver {
+    /// Bind a receiver on loopback.
+    pub fn start() -> std::io::Result<Self> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let base_url = format!("http://{}", listener.local_addr()?);
+        listener.set_nonblocking(true)?;
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let delivered = Arc::clone(&delivered);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            if let Some(body) = deliver(&mut stream) {
+                                delivered.lock().expect("the deliveries").push(body);
+                            }
+                        }
+                        // Nothing has connected yet; the stop flag is read
+                        // between polls, which is how the thread ends.
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            })
+        };
+        Ok(Self {
+            base_url,
+            delivered,
+            stop,
+            thread: Some(thread),
+        })
+    }
+
+    /// Every delivery so far, in arrival order.
+    pub fn delivered(&self) -> Vec<Value> {
+        self.delivered.lock().expect("the deliveries").clone()
+    }
+
+    /// Wait for `count` deliveries, or say what arrived instead.
+    ///
+    /// A webhook is fired *after* the run settles, so a test that read the list
+    /// straight after a `202` would be asserting about scheduling luck.
+    pub fn wait_for(&self, count: usize, budget: Duration) -> Vec<Value> {
+        let deadline = Instant::now() + budget;
+        loop {
+            let held = self.delivered();
+            if held.len() >= count {
+                return held;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "only {} of {count} webhook deliveries arrived: {held:?}",
+                held.len()
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+}
+
+impl Drop for Receiver {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Read one HTTP request off `stream`, answer it `200`, and hand back its body.
+fn deliver(stream: &mut TcpStream) -> Option<Value> {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("a read budget");
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 1024];
+    let mut head: Option<usize> = None;
+    let mut length = 0usize;
+    loop {
+        if head.is_none()
+            && let Some(at) = buffer.windows(4).position(|window| window == b"\r\n\r\n")
+        {
+            head = Some(at + 4);
+            let text = String::from_utf8_lossy(&buffer[..at]).to_lowercase();
+            length = text
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse().ok())
+                .unwrap_or(0);
+        }
+        if let Some(start) = head
+            && buffer.len() >= start + length
+        {
+            break;
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => buffer.extend_from_slice(&chunk[..read]),
+        }
+    }
+    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+    let start = head?;
+    serde_json::from_slice(&buffer[start..]).ok()
 }
