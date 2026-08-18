@@ -1,0 +1,48 @@
+# rule: two `http` triggers do not declare one route (grammar 13.3)
+# code: duplicate-route
+# message: the trigger `on_retry` declares the route `POST /ask`, which the trigger `on_ask` already declares
+# at: main.yml:35:11
+# label: main.yml:29:11 `on_ask` claims it here
+# help: the generated app mounts one route per `http` trigger and cannot dispatch one method and path two ways: give one of them its own `path:` or `method:` (grammar 13.3)
+#
+# The generated app mounts one route per declared `http` trigger, so a second
+# claim on one `method:`/`path:` pair is an app that refuses to start — a
+# guaranteed runtime failure both trigger objects show.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.a:
+  model: model.m
+  prompt: Do the thing.
+  input:
+    text: { type: string }
+  output:
+    result: { type: string }
+triggers:
+  on_ask:
+    type: http
+    flow: flow.f
+    path: /ask
+    input:
+      goal: "payload.body.goal"
+  on_retry:
+    type: http
+    flow: flow.f
+    path: /ask
+    input:
+      goal: "payload.body.goal"
+flow.f:
+  inputs:
+    goal: { type: string }
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.a
+      input: { text: "input.goal" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }

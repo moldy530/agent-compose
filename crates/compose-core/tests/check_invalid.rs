@@ -82,6 +82,7 @@ const CHECK_CODES: &[&str] = &[
     "non-dominating-source",
     "unsupported-detach",
     "conflicting-keys",
+    "duplicate-route",
 ];
 
 struct Anchor {

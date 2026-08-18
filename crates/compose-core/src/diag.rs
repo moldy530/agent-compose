@@ -437,6 +437,11 @@ pub enum DiagnosticCode {
     /// `detach: true` under a durably checkpointed target (grammar 8.6 rule 7,
     /// Decision D59).
     UnsupportedDetach,
+
+    // --- triggers (grammar 13.3) ------------------------------------------
+    /// Two `http` triggers declare one route: the same effective `path:` at the
+    /// same `method:` (grammar 13.3).
+    DuplicateRoute,
 }
 
 impl DiagnosticCode {
@@ -503,6 +508,7 @@ impl DiagnosticCode {
         Self::SyncTriggerInterrupt,
         Self::NonDominatingSource,
         Self::UnsupportedDetach,
+        Self::DuplicateRoute,
     ];
 
     /// The stable kebab-case spelling of this code.
@@ -563,6 +569,7 @@ impl DiagnosticCode {
             Self::SyncTriggerInterrupt => "sync-trigger-interrupt",
             Self::NonDominatingSource => "non-dominating-source",
             Self::UnsupportedDetach => "unsupported-detach",
+            Self::DuplicateRoute => "duplicate-route",
         }
     }
 }
@@ -795,7 +802,7 @@ mod tests {
         }
         assert_eq!(
             DiagnosticCode::ALL.len(),
-            DiagnosticCode::UnsupportedDetach as usize + 1,
+            DiagnosticCode::DuplicateRoute as usize + 1,
             "`DiagnosticCode::ALL` stops short of the last declared variant"
         );
     }

@@ -247,6 +247,12 @@ const GRAMMAR: &[Check] = &[
         evidence: Evidence::Fixture,
     },
     Check {
+        rule: "two `http` triggers do not declare one route (13.3)",
+        pass: "check/triggers.rs",
+        codes: &["duplicate-route"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
         rule: "every CEL surface: roots, paths, constructs, and result type (4.1)",
         pass: "cel/mod.rs, over check/expr.rs",
         codes: &[

@@ -19,12 +19,15 @@
 //! expression does with it: a `method: GET` trigger MUST NOT read *through*
 //! `payload.body`, which is `{}` on every request such a trigger can receive,
 //! so the read fails every time (grammar 13.3, Decision D117).
+//!
+//! One rule relates two triggers rather than reading inside one: two `http`
+//! triggers MUST NOT declare the same route ([`routes`]).
 
 use crate::ast::trigger::TriggerMethod;
 use crate::cel::ty::Type;
-use crate::diag::{Diagnostic, DiagnosticCode, Spanned};
+use crate::diag::{Diagnostic, DiagnosticCode, Span, Spanned};
 use crate::ir::binding::Bindings;
-use crate::ir::trigger::{Trigger, TriggerKind};
+use crate::ir::trigger::{HttpTrigger, Trigger, TriggerKind};
 
 use super::model::default_of;
 use super::{Ctx, expr, field_names, text};
@@ -38,6 +41,102 @@ pub(crate) fn check(ctx: &mut Ctx) {
     for trigger in triggers.entries.values() {
         one(ctx, trigger);
     }
+    routes(ctx);
+}
+
+/// Two `http` triggers declaring one route (grammar 13.3).
+///
+/// The generated app mounts one route per declared `http` trigger, at its
+/// effective `path:` and `method:` — the pair each one *defaults* rather than
+/// the pair each one writes, since `path:` defaults to `/triggers/<name>` and
+/// `method:` to `POST`. A router cannot dispatch one pair two ways, so a second
+/// trigger claiming the first's route makes the app refuse to start: every
+/// request to that route would have to run two flows, and no answer to "which
+/// one" is written anywhere. That is a guaranteed runtime failure visible in the
+/// two trigger objects, which the grammar's standing posture refuses at compile
+/// time naming the construct rather than shipping (§13.3's own reading of it,
+/// Decision D117).
+///
+/// **Exact pairs only.** A router's parameter syntax "passes through
+/// unexamined" (§13.3), so `/reviews/:id` beside `/reviews/:name` is a conflict
+/// this check does not see: deciding it means knowing that both are one segment
+/// pattern, which is a property of the router rather than of the grammar. What
+/// is decidable here is decided here, and the router still reports the rest.
+fn routes(ctx: &mut Ctx) {
+    let Some(triggers) = ctx.ir.triggers.as_ref() else {
+        return;
+    };
+    // Built first and pushed after, because the walk borrows the artifact the
+    // report is written into.
+    //
+    // The order walked is the IR's canonical one, which is by **name** rather
+    // than by file layout (Decision D55): the trigger reported is the later of
+    // the two by name and the earlier one is labelled. Two triggers can be
+    // declared in two files, so a report keyed to the order the files happened
+    // to be read in would move under an `imports:` reordering that changed
+    // nothing.
+    let mut claimed: Vec<(String, &'static str, &Trigger, &HttpTrigger)> = Vec::new();
+    let mut collisions: Vec<Diagnostic> = Vec::new();
+    for trigger in triggers.entries.values() {
+        let TriggerKind::Http(http) = &trigger.kind else {
+            continue;
+        };
+        let path = route_path(trigger, http);
+        let method = route_method(http);
+        if let Some((_, _, first, first_http)) = claimed
+            .iter()
+            .find(|(taken, at, _, _)| taken == &path && *at == method)
+        {
+            let name = text(&trigger.name);
+            let first_name = text(&first.name);
+            collisions.push(
+                Diagnostic::error(
+                    DiagnosticCode::DuplicateRoute,
+                    route_span(trigger, http),
+                    format!(
+                        "the trigger `{name}` declares the route `{method} {path}`, which the trigger `{first_name}` already declares"
+                    ),
+                )
+                .with_label(
+                    route_span(first, first_http),
+                    format!("`{first_name}` claims it here"),
+                )
+                .with_help(
+                    "the generated app mounts one route per `http` trigger and cannot dispatch one method and path two ways: give one of them its own `path:` or `method:` (grammar 13.3)",
+                ),
+            );
+        }
+        claimed.push((path, method, trigger, http));
+    }
+    for collision in collisions {
+        ctx.push(collision);
+    }
+}
+
+/// The route a trigger is mounted at, defaults applied (grammar 13.3).
+fn route_path(trigger: &Trigger, http: &HttpTrigger) -> String {
+    http.path.as_ref().map_or_else(
+        || format!("/triggers/{}", text(&trigger.name)),
+        |path| path.value.clone(),
+    )
+}
+
+/// The method a trigger is mounted at, defaulted to `POST` (grammar 13.3).
+const fn route_method(http: &HttpTrigger) -> &'static str {
+    match http.method {
+        Some(TriggerMethod::Get) => "GET",
+        Some(TriggerMethod::Put) => "PUT",
+        Some(TriggerMethod::Post) | None => "POST",
+    }
+}
+
+/// Where a route collision is pointed at: the `path:` that claims it, or the
+/// whole trigger when the path is the defaulted one and there is nothing else
+/// to underline.
+fn route_span(trigger: &Trigger, http: &HttpTrigger) -> Span {
+    http.path
+        .as_ref()
+        .map_or_else(|| trigger.span.clone(), |path| path.span.clone())
 }
 
 fn one(ctx: &mut Ctx, trigger: &Trigger) {
