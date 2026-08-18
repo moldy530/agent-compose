@@ -138,15 +138,24 @@ fn table(ir: &Ir) -> String {
             text.push_str(&format!("    timeoutMs: {timeout},\n"));
         }
         text.push_str(&format!("    readsBody: {},\n", trigger.reads_body));
-        text.push_str("    input: (payload) => ({\n");
-        for (field, expression) in &trigger.input {
-            text.push_str(&format!(
-                "      {}: runtime.toJson(runtime.evaluate({}, roots(payload))),\n",
-                names::string(field),
-                names::string(expression)
-            ));
+        if trigger.input.is_empty() {
+            text.push_str("    input: () => ({}),\n");
+        } else {
+            // The roots are bound **once** per request rather than once per
+            // binding: `runtime.bind` copies the value it is given, and a body
+            // read by three fields would otherwise be copied three times.
+            text.push_str(
+                "    input: (payload) => {\n      const bound = roots(payload);\n      return {\n",
+            );
+            for (field, expression) in &trigger.input {
+                text.push_str(&format!(
+                    "        {}: runtime.toJson(runtime.evaluate({}, bound)),\n",
+                    names::string(field),
+                    names::string(expression)
+                ));
+            }
+            text.push_str("      };\n    },\n");
         }
-        text.push_str("    }),\n");
         for (key, spelling, expression) in [
             ("sessionKey", "session_key", trigger.session_key.as_ref()),
             ("callback", "callback", trigger.callback.as_ref()),
@@ -314,7 +323,9 @@ flow.ask:
         assert!(emitted.contains("respond: \"async\","), "the default mode");
         assert!(emitted.contains("readsBody: true,"));
         assert!(
-            emitted.contains("\"question\": runtime.toJson(runtime.evaluate(\"payload.body.question\", roots(payload))),"),
+            emitted.contains(
+                "\"question\": runtime.toJson(runtime.evaluate(\"payload.body.question\", bound)),"
+            ),
             "{emitted}"
         );
         assert!(

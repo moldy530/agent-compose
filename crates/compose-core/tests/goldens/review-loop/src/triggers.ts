@@ -82,9 +82,12 @@ export const httpTriggers: readonly HttpTrigger[] = [
     method: "POST",
     respond: "async",
     readsBody: true,
-    input: (payload) => ({
-      "goal": runtime.toJson(runtime.evaluate("payload.body.goal", roots(payload))),
-    }),
+    input: (payload) => {
+      const bound = roots(payload);
+      return {
+        "goal": runtime.toJson(runtime.evaluate("payload.body.goal", bound)),
+      };
+    },
     sessionKey: (payload) => text("payload.headers['x-session-id']", payload, "`session_key` of the trigger `on_request`"),
     callback: (payload) => text("payload.body.callback_url", payload, "`callback` of the trigger `on_request`"),
   },

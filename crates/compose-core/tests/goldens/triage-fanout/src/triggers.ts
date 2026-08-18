@@ -82,10 +82,13 @@ export const httpTriggers: readonly HttpTrigger[] = [
     method: "POST",
     respond: "async",
     readsBody: true,
-    input: (payload) => ({
-      "report": runtime.toJson(runtime.evaluate("payload.body.report", roots(payload))),
-      "pattern": runtime.toJson(runtime.evaluate("payload.body.pattern", roots(payload))),
-    }),
+    input: (payload) => {
+      const bound = roots(payload);
+      return {
+        "report": runtime.toJson(runtime.evaluate("payload.body.report", bound)),
+        "pattern": runtime.toJson(runtime.evaluate("payload.body.pattern", bound)),
+      };
+    },
     sessionKey: (payload) => text("payload.body.project", payload, "`session_key` of the trigger `on_report`"),
     callback: (payload) => text("payload.body.callback_url", payload, "`callback` of the trigger `on_report`"),
   },
