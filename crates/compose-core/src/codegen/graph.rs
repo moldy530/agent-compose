@@ -120,7 +120,7 @@ use crate::ir::flow::{
     Edge, Flow, ItemError, Map, MapDispatch, Node, NodeKind, ToolImplementation,
 };
 use crate::ir::policy::Policy;
-use crate::ir::schema::{FieldMap, TypeForm, TypeNode};
+use crate::ir::schema::{Field, FieldMap, TypeForm, TypeNode};
 
 use super::names::{self, Names};
 use super::policy::{self, Strategy};
@@ -1509,7 +1509,7 @@ fn input_builder(
         // node: every field the subflow declares without a `default:` is bound
         // here, and nothing falls through by name (grammar 7.5, 8.5, D68).
         NodeKind::Flow { flow, .. } => {
-            let declared = surface_fields(surfaces, &format!("{}.inputs", flow.value));
+            let declared = flow_parameters(ir, surfaces, &flow.value.to_string());
             format!(
                 "  input: (roots) => {},\n",
                 bound_object(node.input.as_ref(), declared.as_ref(), "  ")
@@ -1617,14 +1617,15 @@ fn store_params(params: &crate::ir::flow::StoreParams) -> String {
 /// and a `map` dispatch's field-map form (grammar 8.6 rule 12) — because both
 /// are total by the same rule: a field the site bound is that expression, a
 /// field it left out carries its own `default:`, and there is no third case the
-/// validator lets through (D68).
-fn bound_object(input: Option<&NodeInput>, declared: &FieldMap, indent: &str) -> String {
+/// validator lets through (D68). A surface with no fields is `{}`: the object a
+/// flow declaring no `inputs:` is started with.
+fn bound_object(input: Option<&NodeInput>, declared: &[Field], indent: &str) -> String {
     let bindings = match input {
         Some(NodeInput::Fields { bindings }) => Some(bindings),
         _ => None,
     };
     let mut text = String::from("({\n");
-    for field in &declared.fields {
+    for field in declared {
         let name = field.name.value.as_str();
         let bound = bindings.and_then(|bindings| {
             bindings
@@ -2303,8 +2304,9 @@ fn dispatch_run(
 enum Contract<'ir> {
     /// A string-in agent: one unnamed value (Decision D14).
     StringIn,
-    /// A declared input object.
-    Fields(Cow<'ir, FieldMap>),
+    /// A declared input object, as the fields bound field by field. A flow with
+    /// no `inputs:` is this with no entries, not a missing contract.
+    Fields(Cow<'ir, [Field]>),
 }
 
 /// The input contract of one `agent.*`, `tool.*` or `flow.*` target.
@@ -2314,23 +2316,54 @@ fn target_contract<'ir>(ir: &Ir, surfaces: &[schema::Surface<'ir>], target: &str
     };
     match &definition.body {
         DefinitionBody::Agent(agent) if agent.input.is_none() => Contract::StringIn,
-        DefinitionBody::Agent(_) | DefinitionBody::Tool(_) => {
-            Contract::Fields(surface_fields(surfaces, &format!("{target}.input")))
-        }
-        DefinitionBody::Flow(flow) if flow.inputs.is_some() => {
-            Contract::Fields(surface_fields(surfaces, &format!("{target}.inputs")))
-        }
-        // A flow with no `inputs:` has the surface `inputs: {}` declares: a
-        // closed object with no properties (grammar 3.9), so an instance is
-        // started with an empty object.
-        DefinitionBody::Flow(_) => Contract::Fields(Cow::Owned(FieldMap {
-            surface: crate::ast::schema::Surface::Input,
-            fields: Vec::new(),
-            span: definition.span.clone(),
-        })),
+        DefinitionBody::Agent(_) | DefinitionBody::Tool(_) => Contract::Fields(fields_of(
+            surface_fields(surfaces, &format!("{target}.input")),
+        )),
+        DefinitionBody::Flow(_) => Contract::Fields(flow_parameters(ir, surfaces, target)),
         DefinitionBody::Provider(_) | DefinitionBody::Model(_) | DefinitionBody::Store(_) => {
             Contract::StringIn
         }
+    }
+}
+
+/// The parameter surface of one `flow.*`: what an instantiating site binds.
+///
+/// A flow with no `inputs:` has the surface `inputs: {}` declares — a closed
+/// object with no properties (grammar 3.9) — and it is *written nowhere*, so
+/// [`schema::surfaces`] emits no `<flow>.inputs` for it and there is no field
+/// map to look up. That is not an absence for each use site to discover: it is
+/// the empty parameter list, and an instance is started with an empty object.
+///
+/// Both module boundaries resolve their target's parameters here — a `flow:`
+/// node (grammar 8.5) and a `map` dispatch onto a flow (grammar 8.6 rule 12) —
+/// so an inputs-less subflow reads the same from either position. Answering
+/// only at the `map` boundary is how the `flow:` node position came to reach
+/// [`surface_fields`]'s panic on a composition `validate` accepts, which
+/// `a_flow_node_instantiates_a_subflow_that_declares_no_inputs` pins.
+fn flow_parameters<'ir>(
+    ir: &Ir,
+    surfaces: &[schema::Surface<'ir>],
+    address: &str,
+) -> Cow<'ir, [Field]> {
+    let declares_inputs =
+        ir.definitions
+            .get(address)
+            .is_some_and(|definition| match &definition.body {
+                DefinitionBody::Flow(flow) => flow.inputs.is_some(),
+                _ => false,
+            });
+    if declares_inputs {
+        fields_of(surface_fields(surfaces, &format!("{address}.inputs")))
+    } else {
+        Cow::Borrowed(&[])
+    }
+}
+
+/// A field map's entries, keeping whatever the map itself was borrowed as.
+fn fields_of(map: Cow<'_, FieldMap>) -> Cow<'_, [Field]> {
+    match map {
+        Cow::Borrowed(map) => Cow::Borrowed(&map.fields),
+        Cow::Owned(map) => Cow::Owned(map.fields),
     }
 }
 
@@ -4458,5 +4491,68 @@ flow.f:
         let binding = declaration(&emitted, "flowInnerBinding: runtime.SubflowBinding");
         assert!(binding.contains("address: \"flow.inner\","), "{binding}");
         assert!(binding.contains("outputs: [\"draft\"],"), "{binding}");
+    }
+
+    /// A flow that declares no `inputs:` is instantiable from **both** module
+    /// boundaries, and from either it is started with an empty object.
+    ///
+    /// `inputs:` is optional (grammar 7.5) and an inputs-less flow is ordinary —
+    /// `flow.tenant_recall` in the store acceptance fixture is one. Nothing
+    /// writes the surface down, so `schema::surfaces` emits no `<flow>.inputs`
+    /// for it; asking for that surface at a use site is what used to panic the
+    /// emitter (`no schema surface is emitted for ...`) on a composition
+    /// `validate` accepts clean, which is why the assertion below opens by
+    /// checking that it does.
+    #[test]
+    fn a_flow_node_instantiates_a_subflow_that_declares_no_inputs() {
+        let source = format!(
+            r#"{PREAMBLE}
+flow.inner:
+  outputs: {{ draft: {{ type: string }} }}
+  nodes:
+    only: {{ agent: agent.reviewer, input: {{ goal: "'fixed'", draft: "state.draft" }} }}
+  edges:
+    - {{ from: start, to: only }}
+    - {{ from: only, to: end }}
+
+flow.f:
+  inputs: {{ goals: {{ type: array, max_items: 4, items: {{ type: string }} }} }}
+  outputs: {{ draft: {{ type: string }} }}
+  nodes:
+    sub: {{ flow: flow.inner }}
+    each:
+      map:
+        over: input.goals
+        node: flow.inner
+        max_concurrency: 2
+        input: {{}}
+        writes: {{ draft: notes }}
+  edges:
+    - {{ from: start, to: sub }}
+    - {{ from: sub, to: each }}
+    - {{ from: each, to: end }}
+"#
+        );
+        let ir = ir_of(&source);
+        assert!(
+            crate::check(&ir).is_empty(),
+            "the composition validates clean, so `build` owes it a project: {:#?}",
+            crate::check(&ir)
+        );
+
+        let mut names = Names::of(&ir);
+        declare(&mut names, &ir);
+        let emitted = module(&ir, &names).contents;
+
+        assert!(
+            declaration(&emitted, "flowFNodeSub:").contains("input: (roots) => ({\n  }),"),
+            "a `flow:` node onto an inputs-less subflow binds the empty \
+             object:\n{emitted}"
+        );
+        assert!(
+            declaration(&emitted, "flowFNodeEachMap:").contains("input: (roots) => ({\n      }),"),
+            "…and so does a `map` dispatch onto the same flow, which is the \
+             position that already answered:\n{emitted}"
+        );
     }
 }
