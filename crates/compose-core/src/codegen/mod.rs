@@ -45,20 +45,25 @@
 //! package.json          the pinned dependency set (see `project::pins`)
 //! tsconfig.json         strict, NodeNext, no build step
 //! README.md             what this directory is, how to run it, how to eject
-//! .gitignore            the one directory a generated project acquires
+//! .gitignore            the two paths a generated project acquires
 //! src/cel.ts            the CEL evaluator the routers embed (PRD 5.5)
 //! src/env.ts            every `${ENV}` reference, and the process-start check
 //! src/runtime.ts        what a node does when it runs (grammar 8, 9)
+//! src/stores.ts         the local store backends (PRD 5.8, grammar 11)
 //! src/schemas.ts        every schema in the composition, as Zod (grammar 3.8)
 //! src/state.ts          the LangGraph state model (grammar 10)
 //! src/graph.ts          the compiled graph, and `runFlow`
-//! src/index.ts          the project's public surface
+//! src/triggers.ts       the declared `http` triggers (grammar 13.3)
+//! src/serve.ts          the generated app over them (PRD 5.11)
+//! src/cli.ts            the project's own `run`/`serve` command line
+//! src/index.ts          the project's public surface, and its entry point
 //! ```
 //!
-//! Two of those are **constants**: `src/cel.ts` and `src/runtime.ts` are
-//! byte-identical in every project a compiler release builds, which is what
-//! keeps a golden diff about the composition rather than about the machinery
-//! beside it. The other five are the composition, lowered.
+//! Five of those are **constants**: `src/cel.ts`, `src/runtime.ts`,
+//! `src/stores.ts`, `src/serve.ts` and `src/cli.ts` are byte-identical in every
+//! project a compiler release builds, which is what keeps a golden diff about
+//! the composition rather than about the machinery beside it. The rest are the
+//! composition, lowered.
 //!
 //! `src/` is **compiler-owned**: `build` removes files under it that it did not
 //! emit, and `build --check` reports them as drift. Nothing outside `src/` is
@@ -99,13 +104,20 @@
 //!
 //! # What is not here yet
 //!
-//! Store ops, the `human` runtime and model failover are the remaining M1
-//! bullets. A composition using one still **builds**, and its topology is still
+//! The `human` node runtime, which PRD §9's resolved question 4 schedules for
+//! M2. A composition using one still **builds**, and its topology is still
 //! emitted in full — the edges, the budgets, the node's place in the graph —
-//! with an activity that throws naming the construct and the bullet that lands
-//! it ([`graph`]). Nothing answers a plausible value.
+//! with an activity that throws naming the construct and the milestone that
+//! lands it ([`graph`]). Nothing answers a plausible value.
+//!
+//! The same posture covers the two places the deploy layer reaches past this
+//! release: a store bound to a production backend (grammar 14.2's `redis`,
+//! `pgvector`, `s3`, …) says so at the op rather than answering out of the wrong
+//! store, and `placements` is reserved grammar carried into the IR and executed
+//! by nothing (grammar 15). Both land in M3.
 
 pub mod cel;
+pub mod cli;
 pub mod env;
 pub mod graph;
 pub mod names;
@@ -114,7 +126,10 @@ pub mod policy;
 pub mod project;
 pub mod runtime;
 pub mod schema;
+pub mod serve;
 pub mod state;
+pub mod stores;
+pub mod trigger;
 
 use crate::diag::{Diagnostic, DiagnosticCode};
 use crate::ir::Ir;
@@ -208,9 +223,13 @@ pub fn emit(ir: &Ir) -> GeneratedProject {
         cel::module(ir),
         env::module(ir, &environment),
         runtime::module(ir),
+        stores::module(ir),
         schema::module(ir, &names),
         state::module(ir, &names),
         graph::module(ir, &names),
+        trigger::module(ir),
+        serve::module(ir),
+        cli::module(ir),
         project::index(ir),
     ])
 }
@@ -930,12 +949,16 @@ flow.f:
                 "README.md",
                 "package.json",
                 "src/cel.ts",
+                "src/cli.ts",
                 "src/env.ts",
                 "src/graph.ts",
                 "src/index.ts",
                 "src/runtime.ts",
                 "src/schemas.ts",
+                "src/serve.ts",
                 "src/state.ts",
+                "src/stores.ts",
+                "src/triggers.ts",
                 "tsconfig.json",
             ]
         );

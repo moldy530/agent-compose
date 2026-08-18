@@ -28,19 +28,17 @@
 //!   are properties of the emitted TypeScript, and a CLI that has not been
 //!   written yet is not what makes them true or false.
 //! * [`run`] shells out to `agent-compose run`, which is its own M1 deliverable
-//!   (PRD §7 M1's second bullet). Exactly one test uses it —
-//!   `run_executes_a_manual_trigger_and_prints_the_flow_outputs` — and it is
-//!   `#[ignore]`d until that command exists, which is what keeps "the CLI works"
-//!   an honest claim rather than one the graph tests answer on its behalf.
+//!   (PRD §7 M1's second bullet). The tests that use it are about **the command**
+//!   — that it validates, builds, checks the environment, launches the emitted
+//!   project and prints what it produced — which is what keeps "the CLI works" an
+//!   honest claim rather than one the graph tests answer on its behalf.
 //!
-//! `serve` is the same shape as `run`: not written yet, `#[ignore]`d, and shelled
-//! out to for real when it is.
+//! [`serve`] is the same shape: the real command, over the real emitted app.
 //!
 //! Every helper below reaches the **real** compiler and the **real** emitted
 //! project — there are no stubs here, deliberately: un-ignoring is the
 //! definition of done, and a harness of stubs would let a test pass against a
-//! stub. This paragraph is part of that contract, so a PR that lands `run` or
-//! `serve` edits it in the same commit that un-ignores their tests.
+//! stub.
 //!
 //! # Interface assumptions
 //!
@@ -50,9 +48,14 @@
 //! | call | command |
 //! |---|---|
 //! | [`build`] | `agent-compose build <entrypoint> --target <name> --out <dir>` |
-//! | [`invoke`] | `bun <driver> <project> <flow> <inputs.json> <trace.json>`, over the emitted `runFlow` |
-//! | [`run`] | `agent-compose run <entrypoint> <flow> --input k=v … [--session <key>]` |
-//! | [`serve`] | `agent-compose serve <entrypoint> --port 0`, announcing its address on stdout |
+//! | [`invoke`] | `bun <driver> <project> <flow> <inputs.json> <trace.json> <session>`, over the emitted `runFlow` |
+//! | [`run`] | `agent-compose run <entrypoint> <flow> --input k=v … [--session <key>] --out <dir>` |
+//! | [`serve`] | `agent-compose serve <entrypoint> --port 0 --out <dir>`, announcing its address on stdout |
+//!
+//! `--out` is the one flag the original table did not name, and both verbs take
+//! it for the reason [`scratch_project`] gives: a launch needs the pinned
+//! dependency set to resolve and a store's data to be this test's own, and both
+//! are properties of *where the project was built*.
 //!
 //! Both invocation forms print the flow's outputs as one JSON object on stdout
 //! (PRD 5.11's `run` is a CLI verb over a flow's declared output schema, so a
@@ -369,10 +372,44 @@ impl Run {
         );
         self.stderr()
     }
+
+    /// Every routing decision the run recorded, in step order (PRD 5.3).
+    ///
+    /// Read from the file the command **names on stderr**, which is the whole
+    /// point of it naming one: a trace grows with the run, so the terminal gets
+    /// a summary and a reader — a person or this harness — gets the file.
+    pub fn trace(&self) -> Vec<Value> {
+        let stderr = self.stderr();
+        let path = stderr
+            .lines()
+            .find_map(|line| line.strip_prefix("trace: "))
+            .unwrap_or_else(|| panic!("the run names where it wrote its trace\nstderr: {stderr}"))
+            .trim()
+            .to_string();
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("cannot read the trace at `{path}`: {error}"));
+        serde_json::from_str(&text).expect("the trace is a JSON array")
+    }
+
+    /// One node's trace entries, in step order.
+    pub fn entries(&self, node: &str) -> Vec<Value> {
+        self.trace()
+            .into_iter()
+            .filter(|entry| entry["node"] == node)
+            .collect()
+    }
 }
 
+/// The session identity every [`invoke`] supplies.
+///
+/// `runFlow` refuses a run whose flow reaches a `scope: session` store with no
+/// session key (grammar 11.3), and one of the worked examples has such a store —
+/// so the driver always supplies one. Which one it is says nothing: what a test
+/// asserts about a session-scoped store is that a write outlives the execution.
+pub const SESSION: &str = "acceptance-session";
+
 /// The driver [`invoke`] runs: it imports the emitted project and calls its own
-/// `runFlow`, which is the surface `run` and `serve` will be built on.
+/// `runFlow`, which is the surface `run` and `serve` are built on.
 fn driver() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/compiled_graph_acceptance/invoke-flow.mjs")
 }
@@ -404,11 +441,17 @@ pub fn build_under_toolchain(name: &str, purpose: &str) -> Option<(PathBuf, Outp
     build_entrypoint(&fixture(name), purpose)
 }
 
-/// The same, for any composition on disk — a fixture, or a worked [`example`].
+/// A directory beneath the installed toolchain for one built project.
 ///
-/// Each call gets its own directory: cargo runs the tests of one binary on
-/// parallel threads, and two of them writing one project would race.
-pub fn build_entrypoint(entrypoint: &Path, purpose: &str) -> Option<(PathBuf, Output)> {
+/// Everything that **runs** an emitted project builds into one of these, for two
+/// reasons that both matter. `node_modules` resolves by walking up, so a project
+/// built anywhere else could not import the pinned dependency set — and every
+/// call gets its own directory, because cargo runs the tests of one binary on
+/// parallel threads and two of them writing one project would race. It is also
+/// where a store's data lands (`.agent-compose/`), so a fresh directory is a
+/// fresh store: a `scope: global` store that carried a previous test's writes
+/// would make an assertion about a `search` depend on test order.
+pub fn scratch_project(purpose: &str) -> Option<PathBuf> {
     let root = installed()?;
     static NEXT: AtomicU32 = AtomicU32::new(0);
     let out = root.join("projects").join(format!(
@@ -417,6 +460,12 @@ pub fn build_entrypoint(entrypoint: &Path, purpose: &str) -> Option<(PathBuf, Ou
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
     let _ = std::fs::remove_dir_all(&out);
+    Some(out)
+}
+
+/// The same, for any composition on disk — a fixture, or a worked [`example`].
+pub fn build_entrypoint(entrypoint: &Path, purpose: &str) -> Option<(PathBuf, Output)> {
+    let out = scratch_project(purpose)?;
     let output = agent_compose()
         .arg("build")
         .arg(entrypoint)
@@ -516,7 +565,8 @@ pub fn invoke_entrypoint(
         .arg(&project)
         .arg(flow)
         .arg(&inputs_path)
-        .arg(&trace_path);
+        .arg(&trace_path)
+        .arg(SESSION);
     seal(&mut command, environment);
     let output = command.output().expect("bun runs");
     Some(Invocation {
@@ -595,7 +645,16 @@ impl Invocation {
 }
 
 /// `agent-compose run <fixture> <flow> --input k=v …`, pointed at the mock.
-pub fn run(name: &str, flow: &str, inputs: &[(&str, &str)], provider: &MockProvider) -> Run {
+///
+/// Answers `None` when Bun is absent and this is not CI, the same skip
+/// [`invoke`] takes: the command builds a project and then launches it, so it
+/// needs the same toolchain a compiled graph does.
+pub fn run(
+    name: &str,
+    flow: &str,
+    inputs: &[(&str, &str)],
+    provider: &MockProvider,
+) -> Option<Run> {
     run_with(name, flow, inputs, &environment(provider))
 }
 
@@ -606,12 +665,34 @@ pub fn run_with(
     flow: &str,
     inputs: &[(&str, &str)],
     environment: &[(String, String)],
+) -> Option<Run> {
+    let out = scratch_project("run")?;
+    Some(run_into(&out, name, flow, inputs, None, environment))
+}
+
+/// The same again, into a directory the **caller** owns.
+///
+/// Which is what a session-scoped store needs from this harness: a store's data
+/// lives under the built project (`.agent-compose/`), so two runs that are meant
+/// to see each other's writes have to be two runs of one directory. Everything
+/// else takes a fresh one.
+pub fn run_into(
+    out: &Path,
+    name: &str,
+    flow: &str,
+    inputs: &[(&str, &str)],
+    session: Option<&str>,
+    environment: &[(String, String)],
 ) -> Run {
     let mut command = agent_compose();
     command.arg("run").arg(fixture(name)).arg(flow);
     for (field, value) in inputs {
         command.arg("--input").arg(format!("{field}={value}"));
     }
+    if let Some(session) = session {
+        command.arg("--session").arg(session);
+    }
+    command.arg("--out").arg(out);
     seal(&mut command, environment);
     let output = command.output().expect("the command runs");
     Run { output }
@@ -674,12 +755,15 @@ impl Drop for Served {
 /// The environment is [`seal`]ed exactly as a `run`'s is: a served app resolves
 /// the same env refs at process start, so the two halves of the harness have to
 /// agree on what a fixture's refs may resolve from.
-pub fn serve(name: &str, provider: &MockProvider) -> Served {
+pub fn serve(name: &str, provider: &MockProvider) -> Option<Served> {
+    let out = scratch_project("serve")?;
     let mut command = agent_compose();
     command
         .arg("serve")
         .arg(fixture(name))
         .args(["--port", "0"])
+        .arg("--out")
+        .arg(&out)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     seal(&mut command, &environment(provider));
@@ -695,7 +779,7 @@ pub fn serve(name: &str, provider: &MockProvider) -> Served {
         .as_str()
         .unwrap_or_else(|| panic!("the readiness line names no base url: {announced}"))
         .to_string();
-    Served { child, base_url }
+    Some(Served { child, base_url })
 }
 
 /// The states a status report can be asserted about: an execution has either

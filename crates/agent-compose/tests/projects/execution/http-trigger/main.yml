@@ -60,6 +60,21 @@ triggers:
       question: "payload.body.question"
     respond: async
 
+  # The third response shape (grammar 13.3, PRD §9.8): `sync` blocks for the
+  # flow's outputs, and on `timeout:` expiry the response **upgrades** to the
+  # async one — 202 with the execution id and a status URL — while the execution
+  # carries on. `flow.direct` is interrupt-free, which is what a sync trigger
+  # requires; the budget is short so a test can spend it deliberately.
+  on_sync_request:
+    type: http
+    flow: flow.direct
+    path: /sync-answers
+    method: POST
+    input:
+      question: "payload.body.question"
+    respond: sync
+    timeout: 2s
+
 provider.mock:
   kind: anthropic
   api_key: ${MOCK_API_KEY}

@@ -1,11 +1,15 @@
 //! The connection loop and the routing table.
 //!
-//! Seven routes and nothing else. Two are provider surfaces, three more are the
-//! Azure spellings of one of them, and the rest is the control plane under
-//! `/_mock/`. Anything else is a 404 that says so in the harness's own voice,
-//! because a request to a path no provider serves is a codegen bug too — a base
-//! URL joined wrongly reaches a real provider's 404 in production and would
-//! reach silence here.
+//! Nine routes and nothing else. Two are model surfaces, three more are the
+//! Azure spellings of one of them, two are the embeddings surface a `vector`
+//! store's `embed:` reaches (grammar 11.2), and the rest is the control plane
+//! under `/_mock/`. Anything else is a 404 that says so in the harness's own
+//! voice, because a request to a path no provider serves is a codegen bug too —
+//! a base URL joined wrongly reaches a real provider's 404 in production and
+//! would reach silence here.
+//!
+//! The embeddings surface is the one route that answers without a script; see
+//! [`embeddings`] for why, and for what it answers instead.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -174,6 +178,10 @@ fn route(
             },
             arriving,
         ),
+        // The embeddings surface a `vector` store's `embed:` reaches
+        // (grammar 11.2). It is deliberately **not** a scripted surface: see
+        // [`embeddings`].
+        ("POST", "/v1/embeddings") | ("POST", "/openai/v1/embeddings") => embeddings(bytes),
         ("POST", "/_mock/enqueue") => enqueue(store, bytes),
         ("POST", "/_mock/reset") => {
             let discarded = store.reset();
@@ -186,7 +194,8 @@ fn route(
             json!({
                 "mock_provider": format!(
                     "no route for {method} {path}; this server serves /v1/messages, \
-                     /v1/chat/completions, the Azure chat-completions routes, and /_mock/*"
+                     /v1/chat/completions, the Azure chat-completions routes, \
+                     /v1/embeddings, and /_mock/*"
                 )
             }),
         )
@@ -387,6 +396,115 @@ fn control_error(reason: String) -> Answer {
 
 fn ok(body: Value) -> Wire {
     Wire::new(StatusCode::OK.as_u16(), body)
+}
+
+/// The width of an embedding this server answers with.
+///
+/// Small on purpose: nothing here is a language model, and a wider vector would
+/// only make a transcript harder to read. A store that declares
+/// `dimensions:` asserts against what it is answered (grammar 11.2), so a
+/// fixture reaching this surface declares this number or none at all.
+pub(crate) const EMBEDDING_DIMENSIONS: usize = 8;
+
+/// The embeddings surface, and the one part of this server that is **not**
+/// scripted (grammar 11.2, PRD 5.8).
+///
+/// Every other route is a model call: a compiled graph's request is validated
+/// against what a real provider would accept, and the answer comes from a script
+/// a test enqueued. An embedding is neither. It is not a decision the graph
+/// makes — `vector` ops embed whatever text they were given, and a test asserts
+/// about the *search*, not about the vector — and a scripted queue would make
+/// every store test enqueue answers it never reads.
+///
+/// So the answer is **deterministic in the text**: a small vector derived from
+/// the input, so that identical texts embed identically, different texts embed
+/// differently, and a similar text scores higher against its own document than
+/// against an unrelated one. That is exactly the property a `search` test needs,
+/// and it holds without a language model in the loop.
+///
+/// The request is still held to the surface's shape — a `model` and an `input`
+/// list of strings — because a compiled graph that sent something else would be
+/// a codegen bug this harness exists to catch.
+fn embeddings(bytes: &[u8]) -> Answer {
+    let Ok(body) = serde_json::from_slice::<Value>(bytes) else {
+        return Wire::new(
+            StatusCode::BAD_REQUEST.as_u16(),
+            json!({ "mock_provider": "the embeddings request body is not JSON" }),
+        )
+        .harness(MISMATCH)
+        .answer();
+    };
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if model.is_empty() {
+        return Wire::new(
+            StatusCode::BAD_REQUEST.as_u16(),
+            json!({ "mock_provider": "an embeddings request names a `model`" }),
+        )
+        .harness(MISMATCH)
+        .answer();
+    }
+    let Some(inputs) = body.get("input").and_then(Value::as_array) else {
+        return Wire::new(
+            StatusCode::BAD_REQUEST.as_u16(),
+            json!({
+                "mock_provider": "an embeddings request carries `input` as a list of strings"
+            }),
+        )
+        .harness(MISMATCH)
+        .answer();
+    };
+    let mut data = Vec::new();
+    for (index, input) in inputs.iter().enumerate() {
+        let Some(text) = input.as_str() else {
+            return Wire::new(
+                StatusCode::BAD_REQUEST.as_u16(),
+                json!({ "mock_provider": "every `input` entry is a string" }),
+            )
+            .harness(MISMATCH)
+            .answer();
+        };
+        data.push(json!({
+            "object": "embedding",
+            "index": index,
+            "embedding": embedding(text),
+        }));
+    }
+    ok(json!({
+        "object": "list",
+        "model": model,
+        "data": data,
+        "usage": { "prompt_tokens": 0, "total_tokens": 0 },
+    }))
+    .answer()
+}
+
+/// One text as a vector: a bag of its lowercased word characters.
+///
+/// Deterministic, and *meaningful* in the one way a search test asks it to be —
+/// two texts that share words point in a similar direction, and two that share
+/// none do not. A hash would be deterministic and would make every pair equally
+/// distant, which would leave a `search` test asserting about ordering it could
+/// not predict.
+fn embedding(text: &str) -> Vec<f64> {
+    let mut vector = vec![0.0_f64; EMBEDDING_DIMENSIONS];
+    for word in text
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+    {
+        let lowered = word.to_lowercase();
+        // FNV-1a over the word, folded into one of the dimensions.
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in lowered.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        let slot = usize::try_from(hash % EMBEDDING_DIMENSIONS as u64).unwrap_or(0);
+        vector[slot] += 1.0;
+    }
+    vector
 }
 
 /// Request headers, lowercased and sorted, with repeats joined the way HTTP

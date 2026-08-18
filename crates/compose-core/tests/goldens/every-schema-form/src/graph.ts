@@ -17,13 +17,13 @@
 import { END, START, StateGraph } from "@langchain/langgraph";
 
 import * as runtime from "./runtime.ts";
+import * as stores from "./stores.ts";
 import {
   agentShaperOutput,
   flowShapeInputs,
   flowShapeNodeAskOutput,
   flowShapeNodeNotifyOutput,
   flowShapeNodeProbeOutput,
-  flowShapeNodeRecallOutput,
   toolDispatchInput,
   toolDispatchOutput,
   toolFileTicketInput,
@@ -228,6 +228,44 @@ const modelM: runtime.ModelBinding = {
   id: "a-model",
   provider: providerP,
   settings: {},
+};
+
+/**
+ * `store.docs` — a `vector` store with `scope: global`, on the `sqlite_vec` backend (the `local` target substitutes local storage for every store unconditionally) (grammar 11.1, 11.3).
+ */
+const storeDocs: stores.StoreBinding = {
+  address: "store.docs",
+  name: "docs",
+  kind: "vector",
+  scope: "global",
+  description: "Documents to ground against.",
+  metadata: true,
+  embed: {
+    store: "store.docs",
+    model: "text-embedding-3-small",
+    provider: providerP,
+    dimensions: 8,
+  },
+  backend: {
+    provider: "sqlite_vec",
+    from: "the `local` target substitutes local storage for every store unconditionally",
+  },
+};
+
+/**
+ * `store.notes` — a `kv` store with `scope: execution`, on the `sqlite` backend (the `local` target substitutes local storage for every store unconditionally) (grammar 11.1, 11.3).
+ */
+const storeNotes: stores.StoreBinding = {
+  address: "store.notes",
+  name: "notes",
+  kind: "kv",
+  scope: "execution",
+  description: "What has been noted.",
+  metadata: false,
+  backend: {
+    provider: "sqlite",
+    from: "the `local` target substitutes local storage for every store unconditionally",
+  },
 };
 
 /**
@@ -447,6 +485,7 @@ const flowShapeNodeShape: runtime.NodeDescriptor = {
     return {
       output: runtime.parseResult(agentShaperOutput, answer.output, "the answer of `agent.shaper`"),
       history: answer.history,
+      models: answer.models,
     };
   },
   writes: [
@@ -470,7 +509,7 @@ const flowShapeNodeAsk: runtime.NodeDescriptor = {
   shapes: { input: flowShapeShape, state: stateShape, output: flowShapeNodeAskShape },
   input: () => null,
   run: () => {
-    throw new runtime.Unimplemented("a `human` pause", "`agent-compose serve` (generated Fastify app for http triggers: start/resume/status)");
+    throw new runtime.Unimplemented("a `human` pause", "the `human` node runtime, which PRD §9's resolved question 4 schedules for M2");
   },
   writes: [],
   edges: [
@@ -553,10 +592,19 @@ const flowShapeNodeRecall: runtime.NodeDescriptor = {
     onError: "fail",
   },
   shapes: { input: flowShapeShape, state: stateShape, output: flowShapeNodeRecallShape },
-  input: () => null,
-  run: () => {
-    throw new runtime.Unimplemented("a `search` on `store.docs`", "store-op nodes + synthesized store tools with SQLite/local-disk backends");
-  },
+  input: (roots) => ({
+    query: String(runtime.toJson(runtime.evaluate("state.latest", roots))),
+    topK: 3,
+  }),
+  run: async (input, context, view) => ({
+    output: await stores.runStoreOp(
+      storeDocs,
+      "search",
+      input as stores.StoreParams,
+      context,
+      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "recall")].join("/") },
+    ),
+  }),
   writes: [],
   edges: [
     { to: END },
@@ -605,14 +653,39 @@ const flowShapeBinding: runtime.SubflowBinding = {
     }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
 };
 
+/**
+ * How a declared flow input reads a command-line value (grammar 13.2).
+ *
+ * `json` is every structured shape — an object, an array, a tagged union — for
+ * which the one honest reading of a shell argument is the document it spells.
+ */
+export type InputKind = "string" | "integer" | "number" | "boolean" | "json";
+
 /** One compiled flow: what it takes, what it answers, and how to run it. */
 export interface CompiledFlow {
   /** Its typed address (grammar 2.2). */
   readonly address: string;
   /** The fields its `inputs:` declares (grammar 7.5). */
   readonly inputs: readonly string[];
+  /**
+   * What each declared input *is*, so a `--input k=v` argument can be read as
+   * the type the field declares rather than reaching Zod as text (grammar 13.2).
+   */
+  readonly inputKinds: Readonly<Record<string, InputKind>>;
   /** The fields its `outputs:` declares, each read from the channel of that name. */
   readonly outputs: readonly string[];
+  /**
+   * The `scope: session` stores this flow **reaches**, under the relation
+   * grammar 7.7 fixes — its own nodes, its maps' dispatch targets, the flows it
+   * instantiates, and the stores of every agent it reaches.
+   *
+   * A run of this flow needs a session identity exactly when this list is not
+   * empty (grammar 11.3): a declared trigger supplies it through `session_key:`,
+   * and the CLI through `--session`. Checked at run start rather than at
+   * validate, for the reason env-ref presence is: the value does not exist until
+   * the invocation does.
+   */
+  readonly sessionStores: readonly string[];
   /** The superstep ceiling a run of it takes by default. */
   readonly recursionLimit: number;
   /** Parse an invocation's inputs against the flow's own schema (grammar 13.2). */
@@ -644,7 +717,9 @@ export const flows: Readonly<Record<string, CompiledFlow>> = {
   "flow.shape": {
     address: "flow.shape",
     inputs: ["goal"],
+    inputKinds: { "goal": "string", },
     outputs: ["draft", "notes"],
+    sessionStores: [],
     recursionLimit: 30,
     parse: (inputs: unknown) => flowShapeInputs.parse(inputs) as Record<string, unknown>,
     stream: (initial, options) =>
@@ -701,23 +776,38 @@ export async function runFlow(
   }
   const parsed = flow.parse(inputs);
   const ceiling = options.recursionLimit ?? flow.recursionLimit;
+  const sessionKey = options.sessionKey ?? "";
+  // Grammar 11.3, checked where the value first exists: a flow that reaches a
+  // `scope: session` store keys off the identity its trigger supplies, and a run
+  // started without one would silently address a partition named by the empty
+  // string. Named by the store rather than by the flow, because the store is
+  // what the author has to look at.
+  if (sessionKey === "" && flow.sessionStores.length > 0) {
+    throw new Error(
+      `\`${address}\` reaches ${flow.sessionStores.map((store) => `\`${store}\``).join(", ")}, which ${flow.sessionStores.length === 1 ? "is" : "are"} \`scope: session\`, so this run needs a session identity: pass \`--session <key>\` to \`agent-compose run\`, or declare \`session_key:\` on the trigger that starts it (grammar 11.3, 13.2)`,
+    );
+  }
+  const executionId = options.executionId ?? `exec_${globalThis.crypto.randomUUID()}`;
   // `runtime.quiesce` keeps the last state each superstep produced, which is
   // what makes a failure's trace survive; the one failure it restates on the way
   // out is LangGraph stopping the run at the ceiling.
-  const { state, error } = await runtime.quiesce(
-    flow,
-    {
-      $run: {
-        ...runtime.emptyRun(),
-        input: parsed,
-        execution: {
-          id: options.executionId ?? `exec_${globalThis.crypto.randomUUID()}`,
-          session_key: options.sessionKey ?? "",
+  const { state, error } = await runtime
+    .quiesce(
+      flow,
+      {
+        $run: {
+          ...runtime.emptyRun(),
+          input: parsed,
+          execution: { id: executionId, session_key: sessionKey },
         },
       },
-    },
-    ceiling,
-  );
+      ceiling,
+    )
+    // `scope: execution` means what it says: whatever this run's own stores held
+    // is released when the run ends, however it ended (PRD 5.8, grammar 11.1).
+    // A `serve` process runs many executions, so a store that stayed open would
+    // be both a leak and a lifetime the composition did not declare.
+    .finally(() => stores.releaseExecution(executionId));
   if (error !== undefined) {
     throw new runtime.FlowFailure(
       address,

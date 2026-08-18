@@ -97,6 +97,20 @@ pub const PINS: &[(&str, &str)] = &[
     // `^3.25.32 || ^4.2.0`; the 4 line is the one whose format constructors
     // (`z.email()`, `z.iso.datetime()`) this compiler emits.
     ("zod", "4.4.3"),
+    // The HTTP framework PRD 5.11 names for the `http` trigger surface ("a
+    // generated Fastify app wrapping the compiled graph"). Pinned exactly for
+    // the same reason LangGraph is: what a framework answers for a body it
+    // cannot decode is behaviour grammar 13.3 and Decision D117 state, so a
+    // release that changed it would change what a compiled graph does.
+    ("fastify", "5.12.0"),
+    // SQLite, for the `kv` and `vector` backends of PRD 5.8's zero-infra
+    // guarantee. A WebAssembly build with no dependencies, no native step and no
+    // install script — which is what makes it the *portable* SQLite: `bun:sqlite`
+    // is a Bun-only specifier PRD §9.18 forbids in generated code, and
+    // `node:sqlite` is a Node builtin Bun does not implement, so neither can be
+    // the one driver an emitted project uses on both runtimes. See
+    // `super::stores` for the trade that buys.
+    ("node-sqlite3-wasm", "0.8.60"),
 ];
 
 /// The development dependencies: the type gate and the runtime's own types.
@@ -253,11 +267,15 @@ const README_BODY: &str = r#"
 |---|---|
 | `src/cel.ts` | the CEL evaluator the routers embed (PRD 5.5) |
 | `src/env.ts` | every `${ENV}` reference the composition makes, and `readEnvironment()`, the presence check over them |
-| `src/runtime.ts` | what every node does when it runs: the retry/timeout/error policy of grammar 9, the provider surfaces, the `exec`/`http` wrappers, and the router |
+| `src/runtime.ts` | what every node does when it runs: the retry/timeout/error policy of grammar 9, the provider surfaces, the model failover ladder, the `exec`/`http` wrappers, and the router |
+| `src/stores.ts` | the local store backends: SQLite for `kv` and `vector`, a directory of files for `blob` (PRD 5.8) |
 | `src/schemas.ts` | every schema the composition declares, as Zod |
 | `src/state.ts` | the graph's state model: one channel per `state:` channel, the implicit conversation history, and `$run` — what the runtime keeps beside them |
 | `src/graph.ts` | the compiled graph: one node per flow node, the `flows` registry, and `runFlow` |
-| `src/index.ts` | the project's public surface, and the one caller of `readEnvironment()` |
+| `src/triggers.ts` | the composition's declared `http` triggers: their routes, their response modes, and the CEL that reads a request payload |
+| `src/serve.ts` | the app over those triggers: start, status and resume (PRD 5.11) |
+| `src/cli.ts` | this project's own command line, which `agent-compose run` and `agent-compose serve` launch |
+| `src/index.ts` | the project's public surface, the one caller of `readEnvironment()`, and the entry point the command line hangs off |
 
 ## Running a flow
 
@@ -318,6 +336,49 @@ bun install          # installs the pinned dependency set
 bun run typecheck    # tsc --noEmit, the type gate
 bun src/index.ts
 ```
+
+`bun src/index.ts` with no arguments starts nothing: loading the project is the
+environment check, and there is nothing else a bare launch could mean. With a
+verb it is this project's command line, which is exactly what `agent-compose
+run` and `agent-compose serve` launch:
+
+```sh
+bun src/index.ts run flow.<name> --input goal=... [--session <key>] [--format json]
+bun src/index.ts serve --port 8787
+```
+
+`run` prints the flow's `outputs:` as one JSON object on **stdout** and its
+report — what ran, which model served each call, what each store did, which
+edges were taken — on **stderr**, with the path of the file the whole trace was
+written to. `--format json` folds both into one document on stdout instead.
+`--session` is the session identity of PRD 5.8: a flow that reaches a
+`scope: session` store needs one, and a run without it fails at start naming the
+store.
+
+`serve` starts the app over the composition's declared `http` triggers and
+announces where it is listening as one JSON line on stdout. Executions are
+tracked in that process: durable execution and checkpointers are a later
+milestone, so a status route answers `404` for an id the process did not start.
+
+## Where a store keeps its data
+
+`--target local` substitutes SQLite and local disk for every store
+unconditionally, so a composition with a `store.*` in it runs with nothing
+installed (PRD 5.8). What it writes lives under this directory:
+
+```text
+.agent-compose/stores/<name>.sqlite                      a `kv` or `vector` store
+.agent-compose/blobs/<name>/<partition>/values/<key>     a `blob` store
+.agent-compose/traces/<flow>-<timestamp>.json            what `run` wrote out
+```
+
+`<partition>` is the store's declared `scope:` made concrete — `global`,
+`session/<session key>`, or `execution/<execution id>` — so one file holds every
+session and a read never sees another's. A `scope: execution` store is held in
+memory and released when the run ends, which is what "dies with the run" means.
+`AGENT_COMPOSE_DATA_DIR` moves the whole directory; the paths under it stay the
+same. It is derived from this project's own location rather than from the
+working directory, so a graph reads the same store wherever it was launched from.
 
 ### On Node instead
 
@@ -441,10 +502,12 @@ pub fn gitignore(ir: &Ir) -> super::GeneratedFile {
 const GITIGNORE: &str = "\
 #
 # A generated project is meant to be committed — `build --check` in CI is what
-# that buys (PRD §8). These two are the exceptions: one is an install artifact,
-# and the other is the thing the spec deliberately never contains.
+# that buys (PRD §8). These three are the exceptions: an install artifact, the
+# thing the spec deliberately never contains, and the data this project's own
+# stores keep (PRD 5.8).
 node_modules/
 .env
+.agent-compose/
 ";
 
 /// `src/index.ts`.
@@ -459,10 +522,10 @@ pub fn index(ir: &Ir) -> super::GeneratedFile {
 }
 
 const INDEX: &str = r#"//
-// The project's public surface. Everything a consumer of this graph needs —
-// the schemas, the state model, the graph itself, `runFlow`, and the
-// environment it requires — is re-exported here, so an ejected project has one
-// entry point and `run`/`serve` have one module to import.
+// The project's public surface, and its entry point. Everything a consumer of
+// this graph needs — the schemas, the state model, the graph itself, `runFlow`,
+// and the environment it requires — is re-exported here, so an ejected project
+// has one entry point and `run`/`serve` have one module to launch.
 //
 // It is also where the env-ref presence check of PRD 5.9 runs. `readEnvironment`
 // is called at module scope, so loading this module is what "process start"
@@ -473,6 +536,32 @@ const INDEX: &str = r#"//
 // is what keeps a build on one machine reproducible on another and keeps a
 // credential out of every file it writes (PRD 5.9: refs "survive into the IR
 // unresolved").
+//
+// # Running it, rather than importing it
+//
+// Launched **as a program** it is this project's command line (`./cli.ts`):
+//
+// ```sh
+// bun src/index.ts run flow.<name> --input k=v
+// bun src/index.ts serve --port 8787
+// ```
+//
+// `agent-compose run` and `agent-compose serve` launch exactly that, so the
+// command a reader is given in README.md is the command the compiler runs. With
+// no verb it starts nothing: loading the project is the environment check and
+// there is nothing else for a bare launch to mean.
+//
+// The dispatch is guarded on this being the **entry** module: importing the
+// barrel from a host script must not turn that script's own arguments into a
+// verb. The guard compares `import.meta.url` against the entry path through
+// `pathToFileURL`, which both supported runtimes answer the same way — rather
+// than through the one-word property Bun has had for longer than Node, which a
+// generated module may not reach for (PRD §9.18). `./cli.ts` is loaded only when
+// there is a verb, so an import pays for neither the command line nor the HTTP
+// framework behind `serve`.
+
+import process from "node:process";
+import { pathToFileURL } from "node:url";
 
 import { readEnvironment } from "./env.ts";
 
@@ -482,6 +571,12 @@ export * from "./schemas.ts";
 export * from "./state.ts";
 
 readEnvironment();
+
+const entry = process.argv[1];
+if (entry !== undefined && pathToFileURL(entry).href === import.meta.url && process.argv.length > 2) {
+  const { runMain } = await import("./cli.ts");
+  await runMain(process.argv.slice(2));
+}
 "#;
 
 #[cfg(test)]

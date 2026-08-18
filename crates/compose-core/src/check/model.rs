@@ -37,7 +37,7 @@
 use std::sync::Arc;
 
 use crate::ast::common::{Ident, Literal};
-use crate::ast::definition::StoreKind;
+use crate::ast::definition::{AgentAccess, StoreKind};
 use crate::ast::flow::StoreOp;
 use crate::ast::schema::{Number, ScalarKind, Surface};
 use crate::cel::ty::{ObjectShape, Origin, Property, Type, UnionShape, UnionVariant};
@@ -860,6 +860,164 @@ pub(crate) fn store_output(
         // against its kind's row before the IR exists (grammar 11.4).
         _ => field_map(Vec::new(), span),
     }
+}
+
+/// The tools an agent-attached store synthesizes, in grammar 11.5's own order.
+///
+/// The table is 11.5's, read through `agent_access:` (Decision D37): `read`
+/// grants the reading ops and `read_write` — the default — adds the writing one.
+pub(crate) fn store_tools(kind: StoreKind, access: AgentAccess) -> &'static [StoreOp] {
+    match (kind, access) {
+        (StoreKind::Kv, AgentAccess::Read) => &[StoreOp::Get],
+        (StoreKind::Kv, AgentAccess::ReadWrite) => &[StoreOp::Get, StoreOp::Set],
+        (StoreKind::Vector, AgentAccess::Read) => &[StoreOp::Search],
+        (StoreKind::Vector, AgentAccess::ReadWrite) => &[StoreOp::Search, StoreOp::Upsert],
+        (StoreKind::Blob, AgentAccess::Read) => &[StoreOp::Get, StoreOp::List],
+        (StoreKind::Blob, AgentAccess::ReadWrite) => &[StoreOp::Get, StoreOp::List, StoreOp::Put],
+    }
+}
+
+/// The name a synthesized tool takes: `<store's local name>_<op>` (grammar 11.5).
+pub(crate) fn store_tool_name(local: &str, op: StoreOp) -> String {
+    format!("{local}_{}", op.as_str())
+}
+
+/// The **arguments** one synthesized store tool takes (grammar 11.5, 11.4).
+///
+/// Grammar 11.5 fixes the tool *names* and leaves their argument schemas to
+/// codegen, so this is the compiler's answer and the reasoning is worth stating
+/// once: a synthesized tool is its op's own row in §11.4 with the CEL positions
+/// replaced by values the model supplies. Two consequences follow, and both are
+/// deliberate.
+///
+/// * The parameters §11.4 marks optional carry a `default:` here rather than
+///   being required, because that is how this schema language spells optional at
+///   a declaration surface (grammar 3.6) — so a model may leave a `filter:` out
+///   and mean "no filter" rather than having to invent an empty object.
+/// * Two parameters of the node surface are **not** offered to the model.
+///   `top_k`/`limit` are, because §11.4 requires them and how many results to
+///   ask for is the caller's question — but `content_type:` is not: grammar 8.8
+///   puts it in the row of *literals* rather than expressions, so it is a media
+///   type the author writes down, and a model choosing what media type a stored
+///   object claims to be is exactly the authority `agent_access:` exists to
+///   withhold. A store whose blobs need one writes a `store:` node.
+///
+/// A `vector` store that declares no `metadata_schema:` has no metadata at all
+/// (Decision D114), so its `filter:` and `metadata:` have no legal key and the
+/// parameter is absent rather than an object that can only ever be empty.
+pub(crate) fn store_tool_input(
+    kind: StoreKind,
+    op: StoreOp,
+    value_schema: Option<&FieldMap>,
+    metadata_schema: Option<&FieldMap>,
+    span: &Span,
+) -> FieldMap {
+    let string = || scalar_node(ScalarKind::String, span);
+    let mut fields: Vec<(&str, TypeNode)> = Vec::new();
+    match (kind, op) {
+        (StoreKind::Kv, StoreOp::Get)
+        | (StoreKind::Blob, StoreOp::Get)
+        | (StoreKind::Vector, StoreOp::Delete)
+        | (StoreKind::Kv, StoreOp::Delete)
+        | (StoreKind::Blob, StoreOp::Delete) => {
+            fields.push(("key", string()));
+        }
+        (StoreKind::Kv, StoreOp::Set) => {
+            fields.push(("key", string()));
+            fields.push((
+                "value",
+                object_node_of(
+                    value_schema
+                        .cloned()
+                        .unwrap_or_else(|| field_map(Vec::new(), span)),
+                    span,
+                ),
+            ));
+        }
+        (StoreKind::Blob, StoreOp::Put) => {
+            fields.push(("key", string()));
+            fields.push(("value", string()));
+        }
+        (StoreKind::Vector, StoreOp::Search) => {
+            fields.push(("query", string()));
+            fields.push(("top_k", bounded_integer(1, 100, span)));
+            if let Some(metadata) = metadata_schema {
+                // A filter is a **partial** match over the metadata — naming
+                // every declared key would not be filtering — so every property
+                // is optional and the whole object defaults to none of them.
+                fields.push(("filter", partial_object(metadata.clone(), span)));
+            }
+        }
+        (StoreKind::Vector, StoreOp::Upsert) => {
+            fields.push(("key", string()));
+            fields.push(("value", string()));
+            if let Some(metadata) = metadata_schema {
+                // The metadata a stored document carries is the store's
+                // declared shape, whole: an upsert that filled in half of it
+                // would leave a document no `filter:` over the rest can find.
+                fields.push(("metadata", object_node_of(metadata.clone(), span)));
+            }
+        }
+        (_, StoreOp::List) => {
+            fields.push(("prefix", defaulted_string(span)));
+            fields.push(("limit", bounded_integer(1, 1000, span)));
+        }
+        _ => {}
+    }
+    let mut map = field_map(fields, span);
+    // A tool's arguments are an input surface, which is what makes a `default:`
+    // on one of them legal (grammar 3.9).
+    map.surface = Surface::Input;
+    map
+}
+
+/// `{ type: object, properties: <fields> }` over an already-built field map.
+fn object_node_of(properties: FieldMap, span: &Span) -> TypeNode {
+    node(
+        TypeForm::Object(ObjectType {
+            properties,
+            optional: Vec::new(),
+            default: None,
+        }),
+        span,
+    )
+}
+
+/// The same object with **every** property optional and `default: {}` — a
+/// partial match rather than a value of the shape.
+fn partial_object(properties: FieldMap, span: &Span) -> TypeNode {
+    let optional = properties
+        .fields
+        .iter()
+        .map(|field| Spanned::new(field.name.value.clone(), span.clone()))
+        .collect();
+    node(
+        TypeForm::Object(ObjectType {
+            properties,
+            optional,
+            default: Some(Spanned::new(Literal::Mapping(Vec::new()), span.clone())),
+        }),
+        span,
+    )
+}
+
+/// `{ type: string, default: "" }` — an optional string parameter.
+fn defaulted_string(span: &Span) -> TypeNode {
+    let mut ty = scalar_node(ScalarKind::String, span);
+    if let TypeForm::Scalar(scalar) = &mut ty.form {
+        scalar.default = Some(Spanned::new(Literal::String(String::new()), span.clone()));
+    }
+    ty
+}
+
+/// `{ type: integer, minimum: <low>, maximum: <high> }`.
+fn bounded_integer(low: i64, high: i64, span: &Span) -> TypeNode {
+    let mut ty = scalar_node(ScalarKind::Integer, span);
+    if let TypeForm::Scalar(scalar) = &mut ty.form {
+        scalar.minimum = Some(crate::ast::schema::Number::Int(low));
+        scalar.maximum = Some(crate::ast::schema::Number::Int(high));
+    }
+    ty
 }
 
 #[cfg(test)]

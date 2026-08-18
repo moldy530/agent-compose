@@ -51,6 +51,38 @@ state:
     type: string
     default: ""
 
+  # What `flow.ground` reads back out of the vector and blob backends. Every one
+  # of these declares a default no op ever produces, so a stubbed backend that
+  # answered nothing could not pass.
+  stored_id:
+    type: string
+    default: nothing was indexed
+  blob_found:
+    type: boolean
+    default: false
+  blob_value:
+    type: string
+    default: nothing was stored
+  blob_keys:
+    description: The keys `listing` found, which is what a `list` answers.
+    type: array
+    max_items: 10
+    items:
+      type: string
+    default: []
+
+  # …and what `flow.remember` reads out of the session-scoped one, which is the
+  # store whose whole point is surviving the execution that wrote it.
+  seen_before:
+    type: boolean
+    default: false
+  recalled:
+    type: object
+    properties:
+      note:
+        type: string
+    default: { note: "" }
+
 provider.mock:
   kind: anthropic
   api_key: ${MOCK_API_KEY}
@@ -77,6 +109,11 @@ store.prefs:
     verbosity:
       enum: [low, high]
 
+# `dimensions:` is asserted against what the provider answers (grammar 11.2), and
+# `crates/mock-provider`'s embeddings surface answers an 8-wide vector — small on
+# purpose, because nothing there is a language model. Declaring the width the
+# harness really produces is what puts that assertion on the path a run takes;
+# declaring 1536 here would only mean this fixture never reached a vector op.
 store.docs:
   kind: vector
   scope: global
@@ -84,10 +121,30 @@ store.docs:
   embed:
     model: text-embedding-3-small
     provider: provider.embeddings
-    dimensions: 1536
+    dimensions: 8
   metadata_schema:
     source: { type: string }
   agent_access: read
+
+# The third kind (grammar 11.1): bulk content on local disk under
+# `--target local`. Nothing attaches it, so it synthesizes no tools; it is the
+# store-op surface only.
+store.artifacts:
+  kind: blob
+  scope: global
+  description: What a run wrote down, by name.
+
+# `scope: session` is the one lifetime that outlives an execution, and this is
+# the store that proves it: two runs sharing a `--session` see each other's
+# writes, and a run with no session identity at all is refused at start naming
+# this store (grammar 11.3, 13.2).
+store.memory:
+  kind: kv
+  scope: session
+  description: What this session has been told.
+  value_schema:
+    note:
+      type: string
 
 agent.grounded:
   description: Answers a question using the documentation it can search.
@@ -158,3 +215,115 @@ flow.answer:
     - { from: ask, to: remember }
     - { from: remember, to: reread }
     - { from: reread, to: end }
+
+# The other two kinds, end to end, with no model in the loop: a `vector` upsert
+# and the search that finds it back, and a `blob` written, read and listed.
+#
+# `find` writes nothing. A node's result is readable only from an edge guard and
+# a `map.over` (D42), so what a `search` answered is asserted from the **trace**
+# instead — which is the record PRD 5.8 asks a read to leave behind, and the one
+# place a `matches` row is observable at all.
+flow.ground:
+  description: Index one document, search for it, and round-trip a blob.
+  inputs:
+    text:
+      type: string
+      min_length: 1
+  outputs:
+    stored_id:
+      type: string
+    blob_found:
+      type: boolean
+    blob_value:
+      type: string
+    blob_keys:
+      type: array
+      max_items: 10
+      items:
+        type: string
+  nodes:
+    index:
+      store: store.docs
+      op: upsert
+      key: "'doc-1'"
+      value: "input.text"
+      metadata:
+        source: "'fixture'"
+      writes:
+        id: stored_id
+
+    find:
+      store: store.docs
+      op: search
+      query: "input.text"
+      top_k: 3
+      filter:
+        source: "'fixture'"
+
+    keep:
+      store: store.artifacts
+      op: put
+      key: "'note.txt'"
+      value: "input.text"
+      content_type: text/plain
+
+    reread:
+      store: store.artifacts
+      op: get
+      key: "'note.txt'"
+      writes:
+        found: blob_found
+        value: blob_value
+
+    listing:
+      store: store.artifacts
+      op: list
+      prefix: "'note'"
+      limit: 10
+      writes:
+        keys: blob_keys
+
+  edges:
+    - { from: start, to: index }
+    - { from: index, to: find }
+    - { from: find, to: keep }
+    - { from: keep, to: reread }
+    - { from: reread, to: listing }
+    - { from: listing, to: end }
+
+# Cross-session memory, declaratively (PRD 5.8): the read happens before the
+# write, so a second run under the same session key sees what the first left.
+flow.remember:
+  description: Recall what this session was told, then record what it says now.
+  inputs:
+    note:
+      type: string
+      min_length: 1
+  outputs:
+    seen_before:
+      type: boolean
+    recalled:
+      type: object
+      properties:
+        note:
+          type: string
+  nodes:
+    recall:
+      store: store.memory
+      op: get
+      key: "execution.session_key"
+      writes:
+        found: seen_before
+        value: recalled
+
+    save:
+      store: store.memory
+      op: set
+      key: "execution.session_key"
+      value:
+        note: "input.note"
+
+  edges:
+    - { from: start, to: recall }
+    - { from: recall, to: save }
+    - { from: save, to: end }

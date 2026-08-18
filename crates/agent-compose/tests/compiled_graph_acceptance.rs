@@ -3464,6 +3464,11 @@ fn a_subflow_inherits_the_callers_history_and_takes_its_instantiation_policy() {
 fn the_triage_fanout_example_routes_every_finding_and_joins_them_in_source_order() {
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue_all([
+        // `agent.triage` attaches `store.docs`, so it has a tool — the
+        // synthesized `docs_search` of grammar 11.5 — and an agent with tools
+        // makes a loop call before the pinned one. This is that call, and the
+        // model here searches nothing.
+        Script::new(SONNET, Outcome::text("I have what I need.")),
         Script::new(
             SONNET,
             Outcome::structured(json!({
@@ -3971,7 +3976,6 @@ registerFunction("rank_candidates", async () => {
 /// inside the same flow (`reread`) and materializes both halves of that read as
 /// flow outputs — the miss before the write and the hit after it.
 #[test]
-#[ignore = "pending: codegen must emit store-op nodes over the SQLite/local-disk backends"]
 fn a_store_op_node_reads_and_writes_the_local_backend() {
     let provider = MockProvider::start().expect("a loopback port");
     // `agent.grounded` has stores attached, so its tools open a loop: the first
@@ -3986,12 +3990,14 @@ fn a_store_op_node_reads_and_writes_the_local_backend() {
         ),
     ]);
 
-    let run = harness::run(
+    let Some(run) = harness::run(
         "stores",
         "flow.answer",
         &[("question", "what is it?")],
         &provider,
-    );
+    ) else {
+        return;
+    };
     run.succeeded();
     let outputs = run.outputs();
     assert_eq!(outputs["answer"], "an answer");
@@ -4030,7 +4036,6 @@ fn a_store_op_node_reads_and_writes_the_local_backend() {
 /// tools, so they open the same loop an agent's `tools:` list does, and the
 /// pinned output call that ends it is a different request.
 #[test]
-#[ignore = "pending: codegen must synthesize store tools"]
 fn an_attached_store_synthesizes_its_tool_surface_in_the_model_request() {
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue_all([
@@ -4041,13 +4046,15 @@ fn an_attached_store_synthesizes_its_tool_surface_in_the_model_request() {
         ),
     ]);
 
-    harness::run(
+    let Some(run) = harness::run(
         "stores",
         "flow.answer",
         &[("question", "what is it?")],
         &provider,
-    )
-    .succeeded();
+    ) else {
+        return;
+    };
+    run.succeeded();
 
     let call = &provider.requests()[0];
     assert!(call.is_valid(), "{:?}", call.failures());
@@ -4074,7 +4081,6 @@ fn an_attached_store_synthesizes_its_tool_surface_in_the_model_request() {
 /// what survives either way is the criterion the inventory names, which is that
 /// an attached store synthesizes a tool surface at all.
 #[test]
-#[ignore = "pending: codegen must synthesize store tools"]
 fn agent_access_read_withholds_the_write_tool() {
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue_all([
@@ -4085,13 +4091,15 @@ fn agent_access_read_withholds_the_write_tool() {
         ),
     ]);
 
-    harness::run(
+    let Some(run) = harness::run(
         "stores",
         "flow.answer",
         &[("question", "what is it?")],
         &provider,
-    )
-    .succeeded();
+    ) else {
+        return;
+    };
+    run.succeeded();
 
     let call = &provider.requests()[0];
     assert!(
@@ -4106,10 +4114,163 @@ fn agent_access_read_withholds_the_write_tool() {
     );
 }
 
+/// The other two kinds, over the backends PRD 5.8 promises with no
+/// infrastructure: a `vector` store indexed and searched, and a `blob` written,
+/// read back and listed.
+///
+/// The vector half is the one that needs a **provider**: grammar 11.2 makes
+/// `embed.provider` the connection that turns text into a vector, so a `search`
+/// is a store op with a real HTTP round trip inside it. `crates/mock-provider`
+/// answers that surface deterministically (it is the one route there that is not
+/// scripted), which is what makes "the document I just indexed is the one the
+/// search finds" an assertion rather than a coin flip.
+///
+/// What the search answered is read off the **trace**, because that is the only
+/// place it is observable: a node's result is readable from an edge guard and a
+/// `map.over` and nowhere else (Decision D42), and PRD 5.8 says a store read is
+/// recorded — so the record is both the mechanism and the evidence.
+#[test]
+fn a_vector_and_a_blob_store_round_trip_through_the_local_backends() {
+    let provider = MockProvider::start().expect("a loopback port");
+
+    let Some(run) = harness::run(
+        "stores",
+        "flow.ground",
+        &[("text", "the quick brown fox")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    let outputs = run.outputs();
+
+    // The blob round trip. Every channel here declares a default the ops never
+    // produce, so a backend that did nothing could not answer this.
+    assert_eq!(outputs["stored_id"], "doc-1");
+    assert_eq!(outputs["blob_found"], json!(true));
+    assert_eq!(outputs["blob_value"], "the quick brown fox");
+    assert_eq!(outputs["blob_keys"], json!(["note.txt"]));
+
+    // …and the vector one, from the record the read left behind.
+    let searched = run.entries("find");
+    let matches = searched[0]["stores"][0]["answer"]["matches"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a `search` records what it answered: {}", searched[0]));
+    assert_eq!(matches.len(), 1, "{matches:?}");
+    assert_eq!(matches[0]["id"], "doc-1");
+    assert_eq!(matches[0]["text"], "the quick brown fox");
+    assert_eq!(
+        matches[0]["metadata"]["source"], "fixture",
+        "a store that declares a `metadata_schema:` carries it on every match \
+         (Decision D114)"
+    );
+    assert!(
+        matches[0]["score"]
+            .as_f64()
+            .is_some_and(|score| score > 0.5),
+        "the document scores against its own text: {}",
+        matches[0]
+    );
+
+    // Both halves of the replay discipline, in the record itself (PRD 5.8): a
+    // read keeps what it answered, and a write keeps the idempotency key of
+    // grammar 9.4 plus whether the backend had already applied it.
+    let indexed = run.entries("index");
+    let write = &indexed[0]["stores"][0];
+    assert_eq!(write["effect"], "write");
+    assert_eq!(write["deduped"], json!(false));
+    assert!(
+        write["idempotencyKey"]
+            .as_str()
+            .is_some_and(|key: &str| key.ends_with("/index/0")),
+        "the key is the execution id and the store node's flattened instance \
+         path (grammar 9.4): {write}"
+    );
+    assert_eq!(searched[0]["stores"][0]["effect"], "read");
+}
+
+/// A `scope: session` store outlives the execution that wrote it, and a run with
+/// no session identity is refused at start naming the store (PRD 5.8,
+/// grammar 11.3, 13.2).
+///
+/// Two runs of one built project, because that is where a store's data lives:
+/// cross-session memory is a session-scoped store plus a trigger-supplied
+/// session key, and nothing else. The third run is the negative half — the same
+/// flow with no `--session` at all, which grammar 13.2 says fails at start
+/// naming the store rather than silently addressing an unnamed partition.
+#[test]
+fn a_session_scoped_store_outlives_the_execution_that_wrote_it() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let Some(project) = harness::scratch_project("session") else {
+        return;
+    };
+    let environment = harness::environment(&provider);
+
+    let first = harness::run_into(
+        &project,
+        "stores",
+        "flow.remember",
+        &[("note", "the first thing")],
+        Some("session-a"),
+        &environment,
+    );
+    first.succeeded();
+    assert_eq!(
+        first.outputs()["seen_before"],
+        json!(false),
+        "a session with nothing in it yet"
+    );
+
+    let second = harness::run_into(
+        &project,
+        "stores",
+        "flow.remember",
+        &[("note", "the second thing")],
+        Some("session-a"),
+        &environment,
+    );
+    second.succeeded();
+    assert_eq!(
+        second.outputs()["seen_before"],
+        json!(true),
+        "the first run's write survived its execution"
+    );
+    assert_eq!(second.outputs()["recalled"]["note"], "the first thing");
+
+    // A different session key is a different partition, not a different store.
+    let other = harness::run_into(
+        &project,
+        "stores",
+        "flow.remember",
+        &[("note", "somebody else's")],
+        Some("session-b"),
+        &environment,
+    );
+    other.succeeded();
+    assert_eq!(
+        other.outputs()["seen_before"],
+        json!(false),
+        "one session does not read another's"
+    );
+
+    let refused = harness::run_into(
+        &project,
+        "stores",
+        "flow.remember",
+        &[("note", "nowhere to put it")],
+        None,
+        &environment,
+    );
+    let failure = refused.failed();
+    assert!(
+        failure.contains("store.memory") && failure.contains("scope: session"),
+        "the refusal names the store, which is what the author has to look at: {failure}"
+    );
+}
+
 /// A route fails over to its next member on a declared condition, and the trace
 /// records that it did (PRD 5.9).
 #[test]
-#[ignore = "pending: codegen must emit model routing with trace-recorded failover"]
 fn a_route_fails_over_to_its_next_member_and_the_trace_records_it() {
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue_all([
@@ -4117,12 +4278,14 @@ fn a_route_fails_over_to_its_next_member_and_the_trace_records_it() {
         Script::new(HAIKU, Outcome::structured(json!({ "answer": "42" }))),
     ]);
 
-    let run = harness::run(
+    let Some(run) = harness::run(
         "model-failover",
         "flow.ask",
         &[("question", "what is it?")],
         &provider,
-    );
+    ) else {
+        return;
+    };
     run.succeeded();
     assert_eq!(run.outputs()["answer"], "42");
 
@@ -4145,19 +4308,20 @@ fn a_route_fails_over_to_its_next_member_and_the_trace_records_it() {
 /// A failure condition outside `route_on:` fails the node instead of failing
 /// over — otherwise the declaration would mean nothing.
 #[test]
-#[ignore = "pending: codegen must emit model routing with trace-recorded failover"]
 fn a_condition_outside_route_on_fails_the_node_instead_of_failing_over() {
     let provider = MockProvider::start().expect("a loopback port");
     // `model.default` routes on rate_limit, overloaded, and timeout — not on
     // server_error.
     provider.enqueue(Script::new(SONNET, Outcome::server_error()));
 
-    let run = harness::run(
+    let Some(run) = harness::run(
         "model-failover",
         "flow.ask",
         &[("question", "what is it?")],
         &provider,
-    );
+    ) else {
+        return;
+    };
     run.failed();
 
     let recorded = provider.requests();
@@ -4277,7 +4441,6 @@ fn build_is_byte_identical_for_byte_identical_input() {
 
 /// `agent-compose run` executes a manual trigger and prints the flow's outputs.
 #[test]
-#[ignore = "pending: `agent-compose run` must exist"]
 fn run_executes_a_manual_trigger_and_prints_the_flow_outputs() {
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue(Script::new(
@@ -4287,12 +4450,14 @@ fn run_executes_a_manual_trigger_and_prints_the_flow_outputs() {
 
     // No `triggers:` section declares this flow: the implicit manual entry
     // exists for every flow (D64), which is what `run` invokes.
-    let run = harness::run(
+    let Some(run) = harness::run(
         "agent-anthropic",
         "flow.review",
         &[("goal", "ship it"), ("draft", "a draft")],
         &provider,
-    );
+    ) else {
+        return;
+    };
     run.succeeded();
     assert_eq!(run.outputs()["verdict"], "approve");
 
@@ -4304,7 +4469,8 @@ fn run_executes_a_manual_trigger_and_prints_the_flow_outputs() {
         "flow.review",
         &[("goal", ""), ("draft", "a draft")],
         &provider,
-    );
+    )
+    .expect("the toolchain answered once already");
     let failure = bad.failed();
     assert!(failure.contains("goal"), "{failure}");
 }
@@ -4318,7 +4484,6 @@ fn run_executes_a_manual_trigger_and_prints_the_flow_outputs() {
 /// PRD §7 M1's, while the `human` node runtime the other half needs is scheduled
 /// for M2 (PRD §9, resolved question 4).
 #[test]
-#[ignore = "pending: `agent-compose serve` must exist"]
 fn serve_exposes_start_and_status_for_an_http_trigger() {
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue(Script::new(
@@ -4326,7 +4491,9 @@ fn serve_exposes_start_and_status_for_an_http_trigger() {
         Outcome::structured(json!({ "answer": "an answer" })),
     ));
 
-    let served = harness::serve("http-trigger", &provider);
+    let Some(served) = harness::serve("http-trigger", &provider) else {
+        return;
+    };
     let app = Client::new(&served.base_url).expect("a client for the generated app");
 
     // Start: `respond: async` answers with an execution id immediately.
@@ -4360,13 +4527,124 @@ fn serve_exposes_start_and_status_for_an_http_trigger() {
     assert!(provider.snapshot().is_drained(), "the run used its script");
 }
 
+/// `respond: sync` blocks for the flow's outputs, and on timeout expiry the
+/// response **upgrades to async** while the execution continues (grammar 13.3,
+/// PRD §9.8).
+///
+/// Both halves, over one trigger, because the upgrade only means anything beside
+/// the answer it replaces: a run that finishes inside the budget is a `200`
+/// carrying the outputs, and one that does not is a `202` carrying the execution
+/// id and a status URL — with nothing cancelled, which the status read after it
+/// is what proves. The scripted delay is what spends the budget: the trigger
+/// declares `timeout: 2s`, the second call's model answer is held longer than
+/// that, and the run completes on its own afterwards.
+#[test]
+fn serve_answers_a_sync_trigger_and_upgrades_when_its_timeout_expires() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(SONNET, Outcome::structured(json!({ "answer": "at once" }))),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "answer": "eventually" })).after(Duration::from_secs(4)),
+        ),
+    ]);
+
+    let Some(served) = harness::serve("http-trigger", &provider) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+
+    let answered = app
+        .post_json("/sync-answers", &json!({ "question": "what is it?" }))
+        .expect("the trigger's route answers");
+    assert_eq!(answered.status, 200, "{:?}", answered.body);
+    let body = answered.json();
+    assert_eq!(body["status"], "completed");
+    assert_eq!(body["outputs"]["answer"], "at once");
+
+    let upgraded = app
+        .post_json("/sync-answers", &json!({ "question": "what is it?" }))
+        .expect("the trigger's route answers");
+    assert_eq!(
+        upgraded.status, 202,
+        "the budget is the *response's*, so its expiry changes the answer rather \
+         than the run: {:?}",
+        upgraded.body
+    );
+    let body = upgraded.json();
+    let execution = body["execution_id"]
+        .as_str()
+        .expect("an execution id")
+        .to_string();
+    assert_eq!(body["status_url"], format!("/executions/{execution}"));
+
+    // Nothing was cancelled: the execution the upgrade handed back finishes.
+    let finished = harness::settled(&app, &execution);
+    assert_eq!(finished["status"], "completed");
+    assert_eq!(finished["outputs"]["answer"], "eventually");
+}
+
+/// `resume` validates that the execution exists, and then names the runtime it
+/// waits for (PRD §9, resolved question 4).
+///
+/// The half of the third verb this milestone can decide. `resume` is routed and
+/// reachable, an id this process never started is a `404`, and an id it did is a
+/// `501` naming the `human` node runtime — because an interrupt is the only
+/// thing there is to resume from and M2 owns that runtime. The companion test
+/// below is the other half, which needs the interrupt itself.
+#[test]
+fn resume_validates_the_execution_and_names_the_runtime_it_waits_for() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "answer": "an answer" })),
+    ));
+
+    let Some(served) = harness::serve("http-trigger", &provider) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+
+    // An id this process never started is not a resume this release cannot
+    // perform — it is a resume of nothing, and the two are told apart.
+    let unknown = app
+        .post_json("/executions/exec_nothing/resume", &json!({}))
+        .expect("the resume route answers");
+    assert_eq!(unknown.status, 404, "{:?}", unknown.body);
+
+    let started = app
+        .post_json("/direct-answers", &json!({ "question": "what is it?" }))
+        .expect("the trigger's route answers");
+    let execution = started.json()["execution_id"]
+        .as_str()
+        .expect("an execution id")
+        .to_string();
+    harness::settled(&app, &execution);
+
+    let refused = app
+        .post_json(
+            &format!("/executions/{execution}/resume"),
+            &json!({ "decision": "approve" }),
+        )
+        .expect("the resume route answers");
+    assert_eq!(refused.status, 501, "{:?}", refused.body);
+    let error = refused.json()["error"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        error.contains("`human` node runtime") && error.contains("M2"),
+        "the refusal names the runtime and the milestone: {error}"
+    );
+}
+
 /// The third verb: `resume` against the interrupting `human` node's schema.
 ///
 /// Kept apart from start/status because it cannot be decided without the `human`
 /// node runtime, which PRD §9's resolved question 4 puts in M2 — so this is the
 /// one row of the M1 inventory whose blocker is not `serve` itself.
 #[test]
-#[ignore = "pending: `agent-compose serve` must exist, and the `human` node runtime with it"]
+#[ignore = "pending: the `human` node runtime, which PRD §9's resolved question 4 schedules for M2"]
 fn serve_resumes_an_interrupted_execution_against_the_human_nodes_schema() {
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue(Script::new(
@@ -4374,7 +4652,9 @@ fn serve_resumes_an_interrupted_execution_against_the_human_nodes_schema() {
         Outcome::structured(json!({ "answer": "an answer" })),
     ));
 
-    let served = harness::serve("http-trigger", &provider);
+    let Some(served) = harness::serve("http-trigger", &provider) else {
+        return;
+    };
     let app = Client::new(&served.base_url).expect("a client for the generated app");
 
     // Start: `respond: async` answers with an execution id immediately.

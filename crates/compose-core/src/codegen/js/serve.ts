@@ -1,0 +1,369 @@
+//
+// The generated app: the graph as an HTTP endpoint (PRD 5.11, grammar 13.3).
+//
+// `./triggers.ts` is the composition's own trigger table — one entry per
+// declared `http` trigger, with its route, its method, its response mode and the
+// CEL that turns a request payload into the flow's inputs. This module is what
+// that table becomes: a Fastify app exposing PRD 5.11's three verbs.
+//
+// | verb | route | what it does |
+// |---|---|---|
+// | start | the trigger's own `path:`, at its own `method:` | validates the payload, starts an execution, and answers per `respond:` |
+// | status | `GET /executions/:id` | the execution's state, and its outputs once it has them |
+// | resume | `POST /executions/:id/resume` | delivers a human's answer to an interrupted execution |
+//
+// It is byte-identical in every project this compiler release builds, like
+// `./runtime.ts`: what differs between two projects is `./triggers.ts`.
+//
+// # Why Fastify
+//
+// PRD 5.11 names it ("`http` → a generated Fastify app wrapping the compiled
+// graph"), and the emitted `package.json` pins it exactly for the reason every
+// other pin is exact (PRD 5.12): a framework that changed how a body is decoded,
+// or what an unparseable one answers, would change what a compiled graph does
+// with no commit saying so.
+//
+// # `respond:` (grammar 13.3, PRD §9.8)
+//
+// * **`async`** — the default. The execution starts, the route answers `202`
+//   with an execution id and a status URL immediately, and the optional
+//   `callback:` webhook fires when the run finishes.
+// * **`sync`** — the route waits for the run, up to the trigger's mandatory
+//   `timeout:`. On expiry the response **upgrades to async**: `202` with the same
+//   execution id and status URL, while the execution carries on. Nothing is
+//   cancelled and no work is lost, which is the whole of what the upgrade is for.
+//
+// # What an execution is here, and what it is not
+//
+// Executions are tracked **in this process**: a `Map` from id to the run's state
+// and the promise it settles. That is what this milestone can honestly offer —
+// durable execution and checkpointers are M3 (PRD §7) — and it is why a status
+// route answers `404` for an id this process never started, including one it
+// started before it was restarted. The sync-timeout upgrade continues the same
+// in-process execution rather than resuming a checkpointed one.
+//
+// # Resume, and the runtime it waits for
+//
+// `resume` exists, validates that the execution exists, and then says what it
+// cannot do: an interrupt is the only thing there is to resume from, and `human`
+// nodes are grammar in v0 whose runtime PRD §9's resolved question 4 schedules
+// for M2. So an unknown id is a `404` and a known one is a `501` naming that,
+// rather than a route that pretends to have delivered a payload nothing was
+// waiting for.
+
+import process from "node:process";
+
+import Fastify from "fastify";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+
+import { type CompiledFlow, flows, runFlow } from "./graph.ts";
+import type * as runtime from "./runtime.ts";
+import { type HttpTrigger, httpTriggers } from "./triggers.ts";
+
+/** What an execution this process started is doing (PRD 5.11). */
+export type ExecutionStatus = "running" | "completed" | "failed" | "interrupted";
+
+/** One execution, tracked in this process for as long as the process lives. */
+interface Execution {
+  readonly id: string;
+  readonly flow: string;
+  readonly trigger: string;
+  status: ExecutionStatus;
+  outputs?: Record<string, unknown>;
+  trace?: readonly runtime.TraceEntry[];
+  error?: string;
+  /** Resolves when the run has stopped, however it stopped. */
+  settled: Promise<void>;
+}
+
+/** The payload shape grammar 13.3 fixes, as one request presents it. */
+export interface Payload {
+  readonly body: unknown;
+  readonly query: Readonly<Record<string, string>>;
+  readonly headers: Readonly<Record<string, string>>;
+  readonly path: string;
+  readonly method: string;
+}
+
+/** How the app is built and what it is told about itself. */
+export interface ServeOptions {
+  readonly host?: string;
+  readonly port?: number;
+}
+
+/**
+ * Build the app over this composition's declared `http` triggers.
+ *
+ * Exported so an ejected project can mount the same routes inside a server of
+ * its own — the app is the composition's invocation surface, not this file's.
+ */
+export function createApp(): FastifyInstance {
+  const app = Fastify({ logger: false });
+  const executions = new Map<string, Execution>();
+
+  for (const trigger of httpTriggers) {
+    app.route({
+      method: trigger.method,
+      url: trigger.path,
+      handler: (request, reply) => start(executions, trigger, request, reply),
+    });
+  }
+
+  app.get("/executions/:id", (request, reply) => {
+    const id = (request.params as { id: string }).id;
+    const execution = executions.get(id);
+    if (execution === undefined) return unknownExecution(reply, id);
+    return reply.code(200).send(report(execution));
+  });
+
+  app.post("/executions/:id/resume", (request, reply) => {
+    const id = (request.params as { id: string }).id;
+    const execution = executions.get(id);
+    // The existence check first: a resume against an id this process never
+    // started is a different mistake from a resume this release cannot perform,
+    // and answering both the same way would hide the first.
+    if (execution === undefined) return unknownExecution(reply, id);
+    return reply.code(501).send({
+      execution_id: id,
+      status: execution.status,
+      error:
+        "resuming an execution needs the `human` node runtime, which this compiler release does not execute: `human` nodes are grammar in v0 and PRD §9's resolved question 4 schedules the runtime for M2. An interrupt is the only thing there is to resume from, so nothing is waiting for this payload",
+    });
+  });
+
+  return app;
+}
+
+/** Start one execution for a trigger (grammar 13.3's `start`). */
+async function start(
+  executions: Map<string, Execution>,
+  trigger: HttpTrigger,
+  request: FastifyRequest,
+  reply: FastifyReply,
+): Promise<unknown> {
+  const flow = flows[trigger.flow];
+  if (flow === undefined) {
+    return reply
+      .code(500)
+      .send({ error: `\`${trigger.flow}\` is not a flow of this composition` });
+  }
+
+  // A `GET` decodes no body and presents `{}`; a body-bearing method that
+  // arrived without one presents `{}` too, and one that is present and is not a
+  // JSON **object** starts no execution (grammar 13.3, Decision D117).
+  const body = trigger.readsBody ? (request.body ?? {}) : {};
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    return reply.code(400).send({
+      error: "the request body is not a JSON object, so there is nothing for the trigger's `input:` to read (grammar 13.3, Decision D117)",
+    });
+  }
+
+  const payload: Payload = {
+    body,
+    query: strings(request.query),
+    headers: strings(request.headers),
+    path: request.url.split("?")[0] ?? request.url,
+    method: request.method,
+  };
+
+  let inputs: Record<string, unknown>;
+  let sessionKey = "";
+  try {
+    inputs = trigger.input(payload);
+    if (trigger.sessionKey !== undefined) sessionKey = trigger.sessionKey(payload);
+  } catch (error) {
+    return reply.code(400).send({
+      error: `the trigger \`${trigger.name}\` could not read this request: ${message(error)}`,
+    });
+  }
+
+  // The payload is held to the flow's own `inputs:` before an execution exists,
+  // which is what makes a bad request a `400` rather than a failed run: the same
+  // schema `runFlow` parses with, asked one step earlier (grammar 13.1).
+  try {
+    flow.parse(inputs);
+  } catch (error) {
+    return reply.code(400).send({
+      error: `the request does not fit the \`inputs:\` of \`${trigger.flow}\`: ${message(error)}`,
+    });
+  }
+
+  const execution = register(executions, flow, trigger, inputs, sessionKey, payload);
+
+  if (trigger.respond === "sync") {
+    const budget = trigger.timeoutMs ?? DEFAULT_SYNC_TIMEOUT_MS;
+    const finished = await within(execution.settled, budget);
+    if (finished) {
+      if (execution.status === "completed") {
+        return reply
+          .code(200)
+          .send({ execution_id: execution.id, status: execution.status, outputs: execution.outputs });
+      }
+      return reply
+        .code(500)
+        .send({ execution_id: execution.id, status: execution.status, error: execution.error });
+    }
+    // The upgrade of grammar 13.3: the budget is the *response's*, not the
+    // run's, so the execution carries on and the caller is handed the id and the
+    // status URL it now needs.
+    return accepted(reply, execution);
+  }
+  return accepted(reply, execution);
+}
+
+/** The `60s` grammar 13.3 defaults a sync trigger's response budget to. */
+const DEFAULT_SYNC_TIMEOUT_MS = 60_000;
+
+/** Start the run, and record what it does when it stops. */
+function register(
+  executions: Map<string, Execution>,
+  flow: CompiledFlow,
+  trigger: HttpTrigger,
+  inputs: Record<string, unknown>,
+  sessionKey: string,
+  payload: Payload,
+): Execution {
+  const id = `exec_${globalThis.crypto.randomUUID()}`;
+  const execution: Execution = {
+    id,
+    flow: flow.address,
+    trigger: trigger.name,
+    status: "running",
+    // Replaced immediately below. The record has to exist before the run does,
+    // because the run's own handlers write into it.
+    settled: Promise.resolve(),
+  };
+  execution.settled = runFlow(flow.address, inputs, { executionId: id, sessionKey })
+    .then((run) => {
+      execution.status = "completed";
+      execution.outputs = run.outputs;
+      execution.trace = run.trace;
+    })
+    .catch((error: unknown) => {
+      execution.status = "failed";
+      execution.error = message(error);
+      const trace = (error as { trace?: readonly runtime.TraceEntry[] }).trace;
+      if (trace !== undefined) execution.trace = trace;
+    })
+    .then(async () => {
+      // `callback:` is read **here** rather than at the start, and the
+      // difference is grammar 13.3's: a completion webhook is optional, and a
+      // request that carried no URL for one is a request with no webhook rather
+      // than a bad request. Evaluating it at the start would make
+      // `callback: "payload.body.callback_url"` — the natural spelling, and the
+      // one the grammar's own example uses — refuse every caller who did not
+      // want a callback (grammar 4.1, Decision D110).
+      if (trigger.callback === undefined) return;
+      let url: string;
+      try {
+        url = trigger.callback(payload);
+      } catch {
+        return;
+      }
+      await notify(url, execution);
+    });
+  executions.set(id, execution);
+  return execution;
+}
+
+/** The completion webhook of an `async` trigger (grammar 13.3). */
+async function notify(callback: string, execution: Execution): Promise<void> {
+  try {
+    await fetch(callback, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(report(execution)),
+    });
+  } catch {
+    // A webhook that cannot be delivered is not the execution's failure: the run
+    // already produced its answer, and the status route still holds it.
+  }
+}
+
+/** What both the status route and the callback report about an execution. */
+function report(execution: Execution): Record<string, unknown> {
+  return {
+    execution_id: execution.id,
+    flow: execution.flow,
+    trigger: execution.trigger,
+    status: execution.status,
+    ...(execution.outputs === undefined ? {} : { outputs: execution.outputs }),
+    ...(execution.error === undefined ? {} : { error: execution.error }),
+    ...(execution.trace === undefined ? {} : { trace: execution.trace }),
+  };
+}
+
+function accepted(reply: FastifyReply, execution: Execution): unknown {
+  return reply.code(202).send({
+    execution_id: execution.id,
+    status: execution.status,
+    status_url: `/executions/${execution.id}`,
+  });
+}
+
+function unknownExecution(reply: FastifyReply, id: string): unknown {
+  return reply
+    .code(404)
+    .send({ error: `no execution \`${id}\` was started by this process` });
+}
+
+/**
+ * Whether `settled` finished inside `budget`.
+ *
+ * The timer is cleared either way, and it is `unref`ed where the runtime offers
+ * it, so a pending budget never keeps the process alive past the work it was
+ * bounding.
+ */
+function within(settled: Promise<void>, budget: number): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    const timer: unknown = setTimeout(() => resolve(false), budget);
+    if (typeof (timer as { unref?: () => void }).unref === "function") {
+      (timer as { unref: () => void }).unref();
+    }
+    void settled.then(() => {
+      clearTimeout(timer as Parameters<typeof clearTimeout>[0]);
+      resolve(true);
+    });
+  });
+}
+
+/** A header or query bag, as the map of strings grammar 13.3 declares. */
+function strings(held: unknown): Record<string, string> {
+  const flattened: Record<string, string> = {};
+  for (const [name, value] of Object.entries((held ?? {}) as Record<string, unknown>)) {
+    if (value === undefined || value === null) continue;
+    // A repeated header or query parameter arrives as a list; the payload's
+    // declared type is a map of **string**, so the values are joined the way an
+    // HTTP field with repeated values is written.
+    flattened[name] = Array.isArray(value) ? value.map(String).join(", ") : String(value);
+  }
+  return flattened;
+}
+
+function message(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Start the app and announce where it is listening.
+ *
+ * The readiness line is one JSON object on stdout, before anything else is
+ * written there — `{"base_url":"http://127.0.0.1:8787"}` — so a caller that asked
+ * for `--port 0` learns which port it got without guessing and without racing.
+ */
+export async function serve(options: ServeOptions = {}): Promise<FastifyInstance> {
+  const app = createApp();
+  const host = options.host ?? "127.0.0.1";
+  const port = options.port ?? 0;
+  await app.listen({ host, port });
+  const address = app.server.address();
+  const bound = typeof address === "object" && address !== null ? address.port : port;
+  const shown = host === "0.0.0.0" || host === "::" ? "127.0.0.1" : host;
+  process.stdout.write(`${JSON.stringify({ base_url: `http://${shown}:${bound}` })}\n`);
+  for (const signal of ["SIGINT", "SIGTERM"] as const) {
+    process.on(signal, () => {
+      void app.close().then(() => process.exit(0));
+    });
+  }
+  return app;
+}

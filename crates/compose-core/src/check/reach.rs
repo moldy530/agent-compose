@@ -85,16 +85,22 @@ pub(crate) struct Reached {
 }
 
 /// Everything a flow reaches (grammar 7.7).
-pub(crate) fn reached(ctx: &Ctx, flow: &str) -> Reached {
+///
+/// Takes the artifact rather than a check context, because the relation is a
+/// property of the composition and two of its readers are not the validator:
+/// `codegen::graph` asks which `scope: session` stores a flow reaches so a run
+/// can be refused at start without one (grammar 11.3), and a check asks the same
+/// question of the same walk.
+pub(crate) fn reached(ir: &Ir, flow: &str) -> Reached {
     let mut found = Reached::default();
     let mut seen = BTreeSet::new();
-    walk(ctx, flow, &mut seen, &mut found);
+    walk(ir, flow, &mut seen, &mut found);
     found
 }
 
 /// The store addresses a flow reaches (grammar 7.7, 11.3).
-pub(crate) fn stores_of(ctx: &Ctx, flow: &str) -> BTreeSet<String> {
-    reached(ctx, flow).stores
+pub(crate) fn stores_of(ir: &Ir, flow: &str) -> BTreeSet<String> {
+    reached(ir, flow).stores
 }
 
 /// The traversal itself: a worklist of flow addresses, each visited once.
@@ -103,13 +109,13 @@ pub(crate) fn stores_of(ctx: &Ctx, flow: &str) -> BTreeSet<String> {
 /// nodes — so the order the pending addresses come off the list is not
 /// observable, and `seen` is read on the way *out* of the list rather than on the
 /// way in: an address may be queued twice and is walked once.
-fn walk(ctx: &Ctx, address: &str, seen: &mut BTreeSet<String>, found: &mut Reached) {
+fn walk(ir: &Ir, address: &str, seen: &mut BTreeSet<String>, found: &mut Reached) {
     let mut pending: Vec<String> = vec![address.to_string()];
     while let Some(address) = pending.pop() {
         if !seen.insert(address.clone()) {
             continue;
         }
-        let Some(flow) = ctx.flow_named(&address) else {
+        let Some(flow) = flow_at(ir, &address) else {
             continue;
         };
         for node in &flow.nodes {
@@ -126,14 +132,14 @@ fn walk(ctx: &Ctx, address: &str, seen: &mut BTreeSet<String>, found: &mut Reach
                     );
                 }
                 NodeKind::Agent { agent } => {
-                    agent_reaches(ctx, &agent.value.to_string(), &mut pending, found);
+                    agent_reaches(ir, &agent.value.to_string(), &mut pending, found);
                 }
                 NodeKind::Flow { flow, .. } => pending.push(flow.value.to_string()),
                 NodeKind::Map { map } => {
                     for target in targets(&map.dispatch) {
                         match target.value.namespace {
                             Namespace::Agent => {
-                                agent_reaches(ctx, &target.value.to_string(), &mut pending, found);
+                                agent_reaches(ir, &target.value.to_string(), &mut pending, found);
                             }
                             Namespace::Flow => pending.push(target.value.to_string()),
                             _ => {}
@@ -149,8 +155,8 @@ fn walk(ctx: &Ctx, address: &str, seen: &mut BTreeSet<String>, found: &mut Reach
 /// An agent reaches the stores it attaches and everything its `flow.*` tools
 /// reach — flow-as-tool attachment is a call (grammar 7.7 clauses 3, 4). The
 /// flows go on the caller's worklist rather than down a second stack.
-fn agent_reaches(ctx: &Ctx, address: &str, pending: &mut Vec<String>, found: &mut Reached) {
-    let Some(agent) = agent_at(ctx, address) else {
+fn agent_reaches(ir: &Ir, address: &str, pending: &mut Vec<String>, found: &mut Reached) {
+    let Some(agent) = agent_at(ir, address) else {
         return;
     };
     for store in &agent.stores {
@@ -164,8 +170,8 @@ fn agent_reaches(ctx: &Ctx, address: &str, pending: &mut Vec<String>, found: &mu
 }
 
 /// The agent definition at this address.
-fn agent_at<'a>(ctx: &Ctx<'a>, address: &str) -> Option<&'a Agent> {
-    match ctx.ir.definitions.get(address).map(|found| &found.body) {
+fn agent_at<'a>(ir: &'a Ir, address: &str) -> Option<&'a Agent> {
+    match ir.definitions.get(address).map(|found| &found.body) {
         Some(DefinitionBody::Agent(agent)) => Some(agent),
         _ => None,
     }
@@ -193,7 +199,7 @@ pub(crate) fn calls(ctx: &Ctx, address: &str) -> Vec<Call> {
         return calls;
     };
     let from_agent = |calls: &mut Vec<Call>, agent: &str| {
-        let Some(agent) = agent_at(ctx, agent) else {
+        let Some(agent) = agent_at(ctx.ir, agent) else {
             return;
         };
         for tool in &agent.tools {

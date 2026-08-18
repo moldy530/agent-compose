@@ -15,11 +15,15 @@ The LangGraph TypeScript project `agent-compose build` produced from `main.yml`,
 |---|---|
 | `src/cel.ts` | the CEL evaluator the routers embed (PRD 5.5) |
 | `src/env.ts` | every `${ENV}` reference the composition makes, and `readEnvironment()`, the presence check over them |
-| `src/runtime.ts` | what every node does when it runs: the retry/timeout/error policy of grammar 9, the provider surfaces, the `exec`/`http` wrappers, and the router |
+| `src/runtime.ts` | what every node does when it runs: the retry/timeout/error policy of grammar 9, the provider surfaces, the model failover ladder, the `exec`/`http` wrappers, and the router |
+| `src/stores.ts` | the local store backends: SQLite for `kv` and `vector`, a directory of files for `blob` (PRD 5.8) |
 | `src/schemas.ts` | every schema the composition declares, as Zod |
 | `src/state.ts` | the graph's state model: one channel per `state:` channel, the implicit conversation history, and `$run` — what the runtime keeps beside them |
 | `src/graph.ts` | the compiled graph: one node per flow node, the `flows` registry, and `runFlow` |
-| `src/index.ts` | the project's public surface, and the one caller of `readEnvironment()` |
+| `src/triggers.ts` | the composition's declared `http` triggers: their routes, their response modes, and the CEL that reads a request payload |
+| `src/serve.ts` | the app over those triggers: start, status and resume (PRD 5.11) |
+| `src/cli.ts` | this project's own command line, which `agent-compose run` and `agent-compose serve` launch |
+| `src/index.ts` | the project's public surface, the one caller of `readEnvironment()`, and the entry point the command line hangs off |
 
 ## Running a flow
 
@@ -81,6 +85,49 @@ bun run typecheck    # tsc --noEmit, the type gate
 bun src/index.ts
 ```
 
+`bun src/index.ts` with no arguments starts nothing: loading the project is the
+environment check, and there is nothing else a bare launch could mean. With a
+verb it is this project's command line, which is exactly what `agent-compose
+run` and `agent-compose serve` launch:
+
+```sh
+bun src/index.ts run flow.<name> --input goal=... [--session <key>] [--format json]
+bun src/index.ts serve --port 8787
+```
+
+`run` prints the flow's `outputs:` as one JSON object on **stdout** and its
+report — what ran, which model served each call, what each store did, which
+edges were taken — on **stderr**, with the path of the file the whole trace was
+written to. `--format json` folds both into one document on stdout instead.
+`--session` is the session identity of PRD 5.8: a flow that reaches a
+`scope: session` store needs one, and a run without it fails at start naming the
+store.
+
+`serve` starts the app over the composition's declared `http` triggers and
+announces where it is listening as one JSON line on stdout. Executions are
+tracked in that process: durable execution and checkpointers are a later
+milestone, so a status route answers `404` for an id the process did not start.
+
+## Where a store keeps its data
+
+`--target local` substitutes SQLite and local disk for every store
+unconditionally, so a composition with a `store.*` in it runs with nothing
+installed (PRD 5.8). What it writes lives under this directory:
+
+```text
+.agent-compose/stores/<name>.sqlite                      a `kv` or `vector` store
+.agent-compose/blobs/<name>/<partition>/values/<key>     a `blob` store
+.agent-compose/traces/<flow>-<timestamp>.json            what `run` wrote out
+```
+
+`<partition>` is the store's declared `scope:` made concrete — `global`,
+`session/<session key>`, or `execution/<execution id>` — so one file holds every
+session and a read never sees another's. A `scope: execution` store is held in
+memory and released when the run ends, which is what "dies with the run" means.
+`AGENT_COMPOSE_DATA_DIR` moves the whole directory; the paths under it stay the
+same. It is derived from this project's own location rather than from the
+working directory, so a graph reads the same store wherever it was launched from.
+
 ### On Node instead
 
 Node **>=22.18.0** is a supported fallback, and nothing here is written for one
@@ -112,6 +159,8 @@ review the diff.
 | `@langchain/langgraph` | `1.4.10` |
 | `@langchain/core` | `1.2.8` |
 | `zod` | `4.4.3` |
+| `fastify` | `5.12.0` |
+| `node-sqlite3-wasm` | `0.8.60` |
 | `@types/node` | `22.20.1` |
 | `typescript` | `7.0.2` |
 

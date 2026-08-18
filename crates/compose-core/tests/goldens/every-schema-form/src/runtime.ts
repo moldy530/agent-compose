@@ -126,7 +126,7 @@ export class NoViableRoute extends Error {
 /** A construct this compiler release parses, validates, and does not yet run. */
 export class Unimplemented extends Error {
   constructor(what: string, bullet: string) {
-    super(`${what} is not executed by this compiler release (PRD §7 M1: ${bullet})`);
+    super(`${what} is not executed by this compiler release: ${bullet}`);
     this.name = "Unimplemented";
   }
 }
@@ -288,6 +288,25 @@ export class ProviderFailure extends Error {
   }
 }
 
+/**
+ * A request that never got an answer at all (PRD 5.9's `timeout`).
+ *
+ * Told apart from [`ProviderFailure`] because the two are different failover
+ * conditions and from a `SyntaxError` because that one is not a condition: a
+ * body that is not JSON is a response generated code must **reject**, and
+ * failing over to the next route member would be asking a second provider about
+ * the first one's malformed answer. So the socket is wrapped where it is used
+ * ([`send`]) rather than classified by guessing at whatever `fetch` rejected
+ * with, which differs between the two supported runtimes.
+ */
+export class ProviderUnreachable extends Error {
+  constructor(model: string, cause: unknown) {
+    super(`\`${model}\` answered nothing: ${describe(cause)}`);
+    this.name = "ProviderUnreachable";
+    this.cause = cause;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // The environment, read where it is used
 // ---------------------------------------------------------------------------
@@ -432,6 +451,22 @@ export interface RunContext {
    * [`runExec`] for the slot each puts it in.
    */
   readonly idempotency_key?: string;
+  /**
+   * Where a store op writes what it did, for this node's trace entry (PRD 5.8).
+   *
+   * The array is the **node execution's**, created by [`runNode`] and handed to
+   * every attempt, because both surfaces of a store reach a store from inside an
+   * activity and neither can return a record on its own: a store-op node answers
+   * with the op's result, and an agent's synthesized store tool answers the
+   * model. Reads land here because PRD 5.8 makes them recorded effects — "replay
+   * consumes history, not the live store" — and writes land here because the
+   * idempotency key they carried, and whether the backend had already seen it,
+   * are the whole of what at-least-once delivery means at this store.
+   *
+   * Mutable behind a `readonly` field on purpose: the field is the channel, and
+   * what flows through it is appended by whoever runs an op.
+   */
+  readonly storeRecords?: StoreRecord[];
 }
 
 /**
@@ -533,6 +568,7 @@ export async function runActivity<T>(
   policy: NodePolicy,
   execution: RunContext["execution"],
   activity: (context: RunContext) => Promise<T>,
+  storeRecords?: StoreRecord[],
 ): Promise<{ value: T; attempts: number }> {
   const attempts = 1 + (policy.retry?.max ?? 0);
   const controller = new AbortController();
@@ -566,7 +602,12 @@ export async function runActivity<T>(
       if (expired) break;
       made = attempt;
       try {
-        const running = activity({ execution, signal: controller.signal, node });
+        const running = activity({
+          execution,
+          signal: controller.signal,
+          node,
+          ...(storeRecords === undefined ? {} : { storeRecords }),
+        });
         // The loser of the race rejects with nobody awaiting it — an activity
         // that observes the abort, after the deadline has already answered for
         // the node — and in Node an unhandled rejection ends the process. This
@@ -648,6 +689,103 @@ export interface ModelBinding {
   readonly id: string;
   readonly provider: ProviderBinding;
   readonly settings: Readonly<Record<string, unknown>>;
+}
+
+/**
+ * A `model.*` in its **route** form: an ordered failover ladder (grammar 12.2,
+ * PRD 5.9).
+ *
+ * Members are direct bindings — grammar 12.2 forbids a nested route, which is
+ * what keeps "served by `model.fast`, fallback #1" a flat, unambiguous ordinal
+ * (Decision D39). `routeOn` is non-empty for the same reason `route_on: []` is a
+ * compile error: a route that never fails over is a direct model.
+ */
+export interface ModelRoute {
+  readonly address: string;
+  readonly route: readonly ModelBinding[];
+  readonly routeOn: readonly RouteCondition[];
+}
+
+/** What an agent's `model:` resolves to: one binding, or a ladder. */
+export type ModelSelection = ModelBinding | ModelRoute;
+
+/** Grammar 12.2's `route_on:` vocabulary — infrastructure conditions only. */
+export type RouteCondition = "rate_limit" | "overloaded" | "timeout" | "server_error";
+
+/** Whether this selection is the route form. */
+function isRoute(selection: ModelSelection): selection is ModelRoute {
+  return Array.isArray((selection as ModelRoute).route);
+}
+
+/** The ladder a selection is tried in: a route's members, or the one binding. */
+function ladder(selection: ModelSelection): readonly ModelBinding[] {
+  return isRoute(selection) ? selection.route : [selection];
+}
+
+/**
+ * One member's refusal, as the trace records it.
+ *
+ * The condition is what `route_on:` is written in, so a reader can see both that
+ * the failover happened and that the composition asked for it.
+ */
+export interface Failover {
+  /** The member that refused. */
+  readonly model: string;
+  /** Which of grammar 12.2's conditions it refused with. */
+  readonly condition: RouteCondition;
+  /** What it said, for a reader who has to fix it. */
+  readonly detail: string;
+}
+
+/**
+ * What one model call did, as the trace records it (PRD 5.9).
+ *
+ * PRD 5.9 asks for failover to be "deterministic runtime behavior recorded in
+ * the trace (`served by model.fast, fallback #1`)", and this is that record:
+ * the `model.*` the agent named, the member that answered, its ordinal in the
+ * route — `0` for the first member, so a `fallback` of `1` reads as "fallback
+ * #1" — and every member that refused on the way, with the condition it refused
+ * with.
+ *
+ * A direct binding produces one too, with `model === servedBy`, `fallback: 0`
+ * and no failovers: a trace that recorded only the interesting calls would leave
+ * a reader unable to tell a call that did not fail over apart from a call
+ * nothing recorded at all.
+ */
+export interface ModelCall {
+  readonly model: string;
+  readonly servedBy: string;
+  readonly fallback: number;
+  readonly failovers: readonly Failover[];
+}
+
+/**
+ * Which of grammar 12.2's conditions a failure is, or `undefined` when it is
+ * none of them.
+ *
+ * The classification is the whole of what `route_on:` selects over, so it is
+ * stated once, here:
+ *
+ * | what happened | condition |
+ * |---|---|
+ * | HTTP 429 | `rate_limit` |
+ * | HTTP 503, HTTP 529 | `overloaded` — the two spellings of an overloaded provider (Anthropic answers 529, the OpenAI surface 503) |
+ * | any other 5xx | `server_error` |
+ * | no answer at all: a dropped connection, a refused socket, a name that did not resolve | `timeout` |
+ * | anything else — a 4xx that is not 429, a body that is not JSON | **not a condition** |
+ *
+ * A failure that is not a condition, and a condition the route did not declare,
+ * both fail the node rather than moving to the next member: `route_on:` is a
+ * declaration, and a runtime that failed over on everything would make it mean
+ * nothing.
+ */
+export function classify(error: unknown): RouteCondition | undefined {
+  if (error instanceof ProviderUnreachable) return "timeout";
+  if (!(error instanceof ProviderFailure)) return undefined;
+  if (error.status === 429) return "rate_limit";
+  if (error.status === 503 || error.status === 529) return "overloaded";
+  if (error.status >= 500 && error.status <= 599) return "server_error";
+  return undefined;
 }
 
 /** A JSON Schema, as `codegen::schema`'s JSON column publishes it. */
@@ -800,21 +938,121 @@ async function send(
   body: unknown,
   signal: AbortSignal,
 ): Promise<Record<string, unknown>> {
-  const response = await fetch(url, {
-    method: "POST",
-    headers: headerSet({ "content-type": "application/json" }, headers, model.provider.headers),
-    body: JSON.stringify(body),
-    signal,
-  });
-  const text = await response.text();
+  // The type is spelled from `fetch` itself rather than as `Response`: the
+  // global type comes from the runtime's own library types, and naming it here
+  // would tie this module to one of them.
+  let response: Awaited<ReturnType<typeof fetch>>;
+  let text: string;
+  try {
+    response = await fetch(url, {
+      method: "POST",
+      headers: headerSet({ "content-type": "application/json" }, headers, model.provider.headers),
+      body: JSON.stringify(body),
+      signal,
+    });
+    text = await response.text();
+  } catch (error) {
+    // The node's own deadline reaches here as an abort, and it is not the
+    // provider's failure to answer: it is the budget grammar 9.2 gave the node,
+    // and failing over would spend what is left of it on a second provider.
+    if (signal.aborted) throw error;
+    throw new ProviderUnreachable(model.address, error);
+  }
   if (!response.ok) {
     throw new ProviderFailure(model.address, response.status, text);
   }
   return JSON.parse(text) as Record<string, unknown>;
 }
 
-/** One model call, rendered for whichever surface the provider kind reaches. */
+/** What one model call answered, and which member of its route answered it. */
+export interface ModelResult {
+  readonly answer: ModelAnswer;
+  readonly served: ModelCall;
+}
+
+/**
+ * One model call: the failover ladder, then the surface the answering member's
+ * provider kind reaches (PRD 5.9, grammar 12.2).
+ *
+ * A direct binding is a ladder of one, so there is a single path through here
+ * and a single shape of record out of it. Each member is tried in **declaration
+ * order** — the order is the composition's, and a route that reordered itself
+ * would not be deterministic — and a member that refuses moves the call on
+ * exactly when two things hold: the failure classifies as one of grammar 12.2's
+ * conditions ([`classify`]), and that condition is in this route's `route_on:`.
+ * Anything else is raised, which is what makes `route_on:` a declaration rather
+ * than a description.
+ *
+ * The **last** member is not special-cased: when it refuses, its own error is
+ * what the node sees, with the earlier refusals in the message so a reader is
+ * not left wondering why one 429 ended a two-member route.
+ */
 export async function callModel(
+  selection: ModelSelection,
+  request: {
+    readonly system: string;
+    readonly turns: readonly Turn[];
+    readonly tools: readonly ToolSpec[];
+    readonly pinned?: ToolSpec;
+  },
+  signal: AbortSignal,
+): Promise<ModelResult> {
+  const members = ladder(selection);
+  const routeOn: readonly RouteCondition[] = isRoute(selection) ? selection.routeOn : [];
+  const failovers: Failover[] = [];
+
+  for (let ordinal = 0; ordinal < members.length; ordinal += 1) {
+    const model = members[ordinal]!;
+    try {
+      const answer = await callDirect(model, request, signal);
+      return {
+        answer,
+        served: {
+          model: selection.address,
+          servedBy: model.address,
+          fallback: ordinal,
+          failovers: [...failovers],
+        },
+      };
+    } catch (error) {
+      const condition = classify(error);
+      const last = ordinal + 1 === members.length;
+      if (condition === undefined || !routeOn.includes(condition) || last) {
+        throw failoverContext(selection, failovers, error);
+      }
+      failovers.push({ model: model.address, condition, detail: describe(error) });
+    }
+  }
+  // Unreachable: grammar 12.2 requires at least two members on a route and a
+  // direct binding is a ladder of one, so the loop always answers or throws.
+  throw new Error(`\`${selection.address}\` has no route member to call`);
+}
+
+/**
+ * The error a spent route raises: the failure that ended it, with what the
+ * members before it did.
+ *
+ * The refusals are on the message rather than only in the trace because this is
+ * what a node failure prints, and "`model.smart` answered 429" alone would
+ * describe a route as though it were a binding.
+ */
+function failoverContext(
+  selection: ModelSelection,
+  failovers: readonly Failover[],
+  error: unknown,
+): unknown {
+  if (failovers.length === 0) return error;
+  const tried = failovers
+    .map((one) => `\`${one.model}\` (${one.condition})`)
+    .join(", ");
+  return new Error(
+    `\`${selection.address}\` spent its route: ${tried} failed over, and the next member also refused: ${describe(error)}`,
+    { cause: error },
+  );
+}
+
+/** One call to one direct binding, on whichever surface its kind reaches. */
+async function callDirect(
   model: ModelBinding,
   request: {
     readonly system: string;
@@ -984,19 +1222,7 @@ async function callChatCompletions(
   }
 
   const provider = model.provider;
-  const headers: Record<string, string> = {};
-  if (provider.kind === "azure_openai") {
-    headers["api-key"] = provider.apiKey ?? "";
-  } else {
-    headers["authorization"] = `Bearer ${provider.apiKey ?? ""}`;
-    if (provider.organization !== undefined) {
-      headers["openai-organization"] = provider.organization;
-    }
-  }
-  const query =
-    provider.kind === "azure_openai" && provider.apiVersion !== undefined
-      ? `?api-version=${encodeURIComponent(provider.apiVersion)}`
-      : "";
+  const { headers, query } = openAiRequest(provider);
   const path = provider.kind === "azure_openai" ? "/openai/v1/chat/completions" : "/v1/chat/completions";
 
   const answer = await send(model, `${baseUrl(provider)}${path}${query}`, headers, body, signal);
@@ -1024,6 +1250,121 @@ async function callChatCompletions(
   };
 }
 
+/**
+ * How a request reaches an OpenAI-shaped surface: its auth header, and the
+ * query an Azure connection needs.
+ *
+ * Shared by the two such surfaces this runtime speaks — Chat Completions and
+ * Embeddings — because the difference between them is the route and the body,
+ * never how a connection authenticates.
+ */
+function openAiRequest(provider: ProviderBinding): {
+  headers: Record<string, string>;
+  query: string;
+} {
+  const headers: Record<string, string> = {};
+  if (provider.kind === "azure_openai") {
+    headers["api-key"] = provider.apiKey ?? "";
+  } else {
+    headers["authorization"] = `Bearer ${provider.apiKey ?? ""}`;
+    if (provider.organization !== undefined) {
+      headers["openai-organization"] = provider.organization;
+    }
+  }
+  const query =
+    provider.kind === "azure_openai" && provider.apiVersion !== undefined
+      ? `?api-version=${encodeURIComponent(provider.apiVersion)}`
+      : "";
+  return { headers, query };
+}
+
+// ---------------------------------------------------------------------------
+// Embeddings: what turns a vector store's text into a vector (grammar 11.2)
+// ---------------------------------------------------------------------------
+
+/**
+ * A vector store's `embed:` block, resolved (grammar 11.2, Decision D116).
+ *
+ * `provider` is the connection that **computes** the vectors and is a
+ * `provider.*` like any other; where the vectors *live* is the store's
+ * `backend:`, which is a different question and the one that forks per target.
+ */
+export interface EmbedBinding {
+  /** The store this embeds for, for a message. */
+  readonly store: string;
+  /** `model:` — a provider-native embedding model id (Decision D36). */
+  readonly model: string;
+  /** `provider:` — the connection that serves the embeddings. */
+  readonly provider: ProviderBinding;
+  /** `dimensions:` — asserted against what the provider answers with. */
+  readonly dimensions?: number;
+}
+
+/**
+ * Embed one batch of texts, in order (grammar 11.2).
+ *
+ * The wire is OpenAI's `/v1/embeddings`, which is the surface every provider
+ * kind the capability table marks as embedding-capable speaks — `anthropic` is
+ * marked as not, and the validator refuses an `embed.provider` naming one, so
+ * reaching here with one is a binding that lost its kind between the spec and
+ * the process.
+ *
+ * `dimensions:` is **checked** rather than merely forwarded: grammar 11.2 says
+ * it is "asserted against the backend's index", and a store whose declared width
+ * silently disagreed with what the provider answered would fill an index with
+ * vectors no later search could compare against.
+ */
+export async function callEmbeddings(
+  embed: EmbedBinding,
+  texts: readonly string[],
+  signal: AbortSignal,
+): Promise<number[][]> {
+  const provider = embed.provider;
+  if (provider.kind === "anthropic" || provider.kind === "bedrock" || provider.kind === "vertex") {
+    throw new Error(
+      `\`${embed.store}\` embeds through \`${provider.address}\`, whose \`${provider.kind}\` plugin this compiler release cannot reach for embeddings: name a provider of kind \`openai\`, \`openai_compatible\` or \`azure_openai\` (grammar 11.2)`,
+    );
+  }
+  const { headers, query } = openAiRequest(provider);
+  const path = provider.kind === "azure_openai" ? "/openai/v1/embeddings" : "/v1/embeddings";
+  // `send` reports a refusal as a `ProviderFailure` naming its subject, which
+  // here is the store rather than a model: an embeddings call belongs to a
+  // store's `embed:` block and nothing about a `model.*` is involved.
+  const answer = await send(
+    { address: embed.store, id: embed.model, provider, settings: {} },
+    `${baseUrl(provider)}${path}${query}`,
+    headers,
+    { model: embed.model, input: [...texts] },
+    signal,
+  );
+  const data = (answer["data"] ?? []) as Record<string, unknown>[];
+  if (data.length !== texts.length) {
+    throw new Error(
+      `\`${embed.store}\` asked \`${provider.address}\` to embed ${texts.length} text(s) and was answered ${data.length}`,
+    );
+  }
+  // The API is documented to answer in request order, and it also carries an
+  // `index` on every row; sorting by it is what makes the promise this code
+  // relies on the *response's* rather than the documentation's.
+  const ordered = [...data].sort(
+    (left, right) => Number(left["index"] ?? 0) - Number(right["index"] ?? 0),
+  );
+  return ordered.map((row, position) => {
+    const vector = row["embedding"];
+    if (!Array.isArray(vector) || vector.some((value) => typeof value !== "number")) {
+      throw new Error(
+        `\`${embed.store}\` was answered an embedding that is not a list of numbers (row ${position})`,
+      );
+    }
+    if (embed.dimensions !== undefined && vector.length !== embed.dimensions) {
+      throw new Error(
+        `\`${embed.store}\` declares \`dimensions: ${embed.dimensions}\` and \`${provider.address}\` answered a vector of ${vector.length}`,
+      );
+    }
+    return vector as number[];
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Agents: the intra-agent tool loop (grammar 5, PRD §9.14)
 // ---------------------------------------------------------------------------
@@ -1038,7 +1379,8 @@ export interface AgentTool extends ToolSpec {
 export interface AgentBinding {
   readonly address: string;
   readonly prompt: string;
-  readonly model: ModelBinding;
+  /** Its `model:` — a direct binding or a failover route (grammar 12.2). */
+  readonly model: ModelSelection;
   readonly output: ToolSpec;
   readonly tools: readonly AgentTool[];
   readonly maxToolIterations: number;
@@ -1072,10 +1414,14 @@ export async function callAgent(
   input: unknown,
   history: readonly Turn[],
   context: RunContext,
-): Promise<{ output: unknown; history: MessageLike[] }> {
+): Promise<{ output: unknown; history: MessageLike[]; models: readonly ModelCall[] }> {
   const rendered = typeof input === "string" ? input : JSON.stringify(input);
   const turn: Turn = { role: "user", text: rendered };
   const turns: Turn[] = [...history, turn];
+  // Every call this node makes, in the order it made them (PRD 5.9). A tool
+  // loop makes several, and which member of a route served each one is a
+  // separate fact about each.
+  const models: ModelCall[] = [];
 
   if (agent.tools.length > 0) {
     let iterations = 0;
@@ -1086,11 +1432,12 @@ export async function callAgent(
         );
       }
       iterations += 1;
-      const answer = await callModel(
+      const { answer, served } = await callModel(
         agent.model,
         { system: agent.prompt, turns, tools: agent.tools },
         context.signal,
       );
+      models.push(served);
       turns.push(replayed(agent, answer));
       if (answer.toolCalls.length === 0) break;
 
@@ -1109,11 +1456,12 @@ export async function callAgent(
     }
   }
 
-  const final = await callModel(
+  const { answer: final, served: finalServed } = await callModel(
     agent.model,
     { system: agent.prompt, turns, tools: agent.tools, pinned: agent.output },
     context.signal,
   );
+  models.push(finalServed);
   if (final.structured === null) {
     // Why there is no answer, where the surface said: a stated refusal first,
     // and otherwise the stop reason, which is what tells a `max_tokens` cut from
@@ -1135,6 +1483,7 @@ export async function callAgent(
       { role: "user", content: rendered },
       { role: "assistant", content: JSON.stringify(final.structured) },
     ],
+    models,
   };
 }
 
@@ -1734,8 +2083,60 @@ export interface TraceEntry {
    * step numbers.
    */
   readonly inner?: readonly TraceEntry[];
+  /**
+   * Every store op this node performed, in the order it performed them
+   * (PRD 5.8).
+   *
+   * Both consumption surfaces land here: a `store:` node's own op, and every op
+   * an agent's synthesized store tools ran inside its tool loop — which PRD 5.8
+   * asks to be "recorded as tool calls", and a tool call this graph made is a
+   * thing the trace has to hold rather than only the provider transcript.
+   */
+  readonly stores?: readonly StoreRecord[];
+  /**
+   * Every model call this node made, and which member of its route served it
+   * (PRD 5.9).
+   *
+   * "Served by `model.fast`, fallback #1" is PRD 5.9's own phrasing of what a
+   * trace must carry, so failover is data rather than behaviour a reader has to
+   * infer from a provider's logs. See [`ModelCall`].
+   */
+  readonly models?: readonly ModelCall[];
   readonly error?: string;
   readonly fallback?: string;
+}
+
+/**
+ * One store op, as the trace records it (PRD 5.8).
+ *
+ * Reads and writes are both here and are told apart by `effect`, because the
+ * two are recorded for different reasons. A **read** is recorded because PRD 5.8
+ * makes store ops effects whose reads replay from history rather than from the
+ * live store: the answer is kept so a replay has something to consume. A
+ * **write** is recorded because it is at-least-once — it carries the
+ * idempotency key of grammar 9.4, and `deduped` says whether the backend had
+ * already applied that key, which is the difference between "this run wrote it"
+ * and "an earlier attempt of this same effect did".
+ */
+export interface StoreRecord {
+  /** The store's typed address (grammar 2.2). */
+  readonly store: string;
+  /** The op, spelled as grammar 11.4 spells it. */
+  readonly op: string;
+  /** Which half of the replay discipline this record belongs to. */
+  readonly effect: "read" | "write";
+  /** Which consumption surface ran it (PRD 5.8's two modes). */
+  readonly via: "node" | "tool";
+  /** The store's lifetime, and with it which partition was addressed. */
+  readonly scope: "execution" | "session" | "global";
+  /** The key the op addressed, on the ops that address one. */
+  readonly key?: string;
+  /** What a read answered — the history a replay consumes. */
+  readonly answer?: unknown;
+  /** A write's idempotency key (grammar 9.4). */
+  readonly idempotencyKey?: string;
+  /** Whether the backend had already applied that key (at-least-once). */
+  readonly deduped?: boolean;
 }
 
 /** What one dispatched `map` instance did (grammar 8.6, PRD 5.6). */
@@ -2907,7 +3308,12 @@ export async function runMap(
   // leaves here is a copy of it, because it is cleared in place.
   const records = plan.records;
   records.length = 0;
-  const landed: { index: number; route: MapRoute; output: unknown }[] = [];
+  const landed: {
+    index: number;
+    route: MapRoute;
+    output: unknown;
+    models?: readonly ModelCall[];
+  }[] = [];
   const failed: { index: number; target: string; attempts: number; error: unknown }[] = [];
   const joined: Promise<void>[] = [];
 
@@ -3005,7 +3411,17 @@ export async function runMap(
         try {
           const answer = await attemptItem(map, instance, scoped);
           attempts = answer.attempts;
-          landed.push({ index, route, output: answer.value.output });
+          landed.push({
+            index,
+            route,
+            output: answer.value.output,
+            // Which member of a route served each of this instance's model
+            // calls is a fact about *this* run (PRD 5.9), and a dispatched
+            // instance has no trace entry of its own — so the map node's entry
+            // is where it belongs, in source-item order like everything else a
+            // fan-out reports.
+            ...(answer.value.models === undefined ? {} : { models: answer.value.models }),
+          });
           records.push({
             index,
             ...named,
@@ -3078,7 +3494,15 @@ export async function runMap(
     );
   }
 
-  return { output: {}, channels: orderedChannels(landed), dispatches: dispatched };
+  const models = [...landed]
+    .sort((left, right) => left.index - right.index)
+    .flatMap((one) => one.models ?? []);
+  return {
+    output: {},
+    channels: orderedChannels(landed),
+    dispatches: dispatched,
+    ...(models.length === 0 ? {} : { models }),
+  };
 }
 
 /** A failed item, carrying how many attempts its policy made. */
@@ -3251,6 +3675,8 @@ export interface NodeAnswer {
   readonly dispatches?: readonly DispatchRecord[];
   /** The trace of the subflow instance a `flow:` node ran (grammar 8.5). */
   readonly inner?: readonly TraceEntry[];
+  /** Which member of its route served each model call (PRD 5.9). */
+  readonly models?: readonly ModelCall[];
 }
 
 /** One channel a `map` node writes, with every contribution in index order. */
@@ -3330,9 +3756,16 @@ export async function runNode(
   let channels: readonly ChannelWrite[] | undefined;
   let dispatches: readonly DispatchRecord[] | undefined;
   let inner: readonly TraceEntry[] | undefined;
+  let models: readonly ModelCall[] | undefined;
   let attempts = 0;
   let skipped = false;
   let failure: NodeFailure | undefined;
+  // Every store op this node performs, across every attempt its policy makes:
+  // an effect that happened is an effect that happened, and a record that kept
+  // only the last attempt's would describe a run the store did not see
+  // (PRD 5.8). Owned here rather than by `runActivity` so a node that fails
+  // still reports what it wrote before it did.
+  const storeRecords: StoreRecord[] = [];
 
   /** This node's entry, for a failure that leaves nothing else behind. */
   const aborted = (error: unknown, made: number, routing?: RoutingDecision): TraceEntry => {
@@ -3350,6 +3783,8 @@ export async function runNode(
       ...(routing === undefined ? {} : { routing }),
       ...(dispatched === undefined ? {} : { dispatches: dispatched }),
       ...(held === undefined ? {} : { inner: held }),
+      ...(storeRecords.length === 0 ? {} : { stores: [...storeRecords] }),
+      ...(models === undefined ? {} : { models }),
       error: describe(error),
     };
   };
@@ -3373,6 +3808,7 @@ export async function runNode(
       policy,
       run.execution,
       (context) => descriptor.run(input, context, view),
+      storeRecords,
     );
     attempts = answer.attempts;
     output = answer.value.output;
@@ -3380,6 +3816,7 @@ export async function runNode(
     channels = answer.value.channels;
     dispatches = answer.value.dispatches;
     inner = answer.value.inner;
+    models = answer.value.models;
   } catch (error) {
     const strategy = policy.onError;
     failure = error instanceof NodeFailure ? error : undefined;
@@ -3411,6 +3848,8 @@ export async function runNode(
         error: describe(error),
         ...(dispatches === undefined ? {} : { dispatches }),
         ...(inner === undefined ? {} : { inner }),
+        ...(storeRecords.length === 0 ? {} : { stores: [...storeRecords] }),
+        ...(models === undefined ? {} : { models }),
         fallback: strategy.fallback,
       };
       return new Command({
@@ -3501,6 +3940,8 @@ export async function runNode(
     routing,
     ...(dispatches === undefined ? {} : { dispatches }),
     ...(inner === undefined ? {} : { inner }),
+    ...(storeRecords.length === 0 ? {} : { stores: [...storeRecords] }),
+    ...(models === undefined ? {} : { models }),
     ...(failure === undefined ? {} : { error: failure.message }),
   };
   update["$run"] = {

@@ -95,7 +95,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ast::common::{Address, ControlTarget, EdgeSource, EdgeTarget, Interpolated};
-use crate::ast::definition::ProviderKind;
+use crate::ast::definition::{ProviderKind, StoreKind};
 use crate::ast::flow::FlowContext;
 // The SCC decomposition grammar 7.4 is checked over, reused rather than
 // reimplemented: the ceiling below is sized from the same clause-1 reading the
@@ -157,7 +157,11 @@ pub fn declare(names: &mut Names, ir: &Ir) {
                     }
                 }
             }
-            DefinitionBody::Store(_) => {}
+            // A store's binding is a `const` of its own, and it is the value a
+            // store-op node and a synthesized tool both reach (grammar 11).
+            DefinitionBody::Store(_) => {
+                names.declare(address);
+            }
         }
     }
     // A key of the emitter's own rather than `state.shape`, which a channel
@@ -187,8 +191,9 @@ pub fn module(ir: &Ir, names: &Names) -> super::GeneratedFile {
     body.push_str(&shapes(ir, names, &surfaces));
     body.push_str(&providers(ir, names));
     body.push_str(&models(ir, names));
+    body.push_str(&stores(ir, names));
     body.push_str(&tools(ir, names, &surfaces, &mut imported));
-    body.push_str(&agents(ir, names, &surfaces));
+    body.push_str(&agents(ir, names, &surfaces, &mut imported));
 
     let mut registry: Vec<(String, String)> = Vec::new();
     for (address, definition) in &ir.definitions {
@@ -208,6 +213,7 @@ pub fn module(ir: &Ir, names: &Names) -> super::GeneratedFile {
 
     contents.push_str("\nimport { END, START, StateGraph } from \"@langchain/langgraph\";\n");
     contents.push_str("\nimport * as runtime from \"./runtime.ts\";\n");
+    contents.push_str("import * as stores from \"./stores.ts\";\n");
     imported.sort();
     imported.dedup();
     if !imported.is_empty() {
@@ -421,46 +427,26 @@ const fn provider_kind(kind: ProviderKind) -> &'static str {
     }
 }
 
+/// Every `model.*`, direct bindings first and routes after them.
+///
+/// The order is load-bearing rather than cosmetic: a route's members are the
+/// `const`s it names, and `model.default` sorts before `model.fast` in the IR's
+/// address order — so emitting in that order would produce a module that
+/// references a binding before its declaration and throws at import. Two passes
+/// is the whole of the fix, and grammar 12.2 makes it sufficient: a route's
+/// members are direct models, never other routes (Decision D39).
 fn models(ir: &Ir, names: &Names) -> String {
     let mut text = String::new();
     for (address, definition) in &ir.definitions {
-        let DefinitionBody::Model(model) = &definition.body else {
+        let DefinitionBody::Model(Model::Direct(direct)) = &definition.body else {
             continue;
-        };
-        let (bound, note) = match model {
-            Model::Direct(direct) => (direct, String::new()),
-            Model::Route(route) => {
-                // Failover is a later M1 bullet ("model routing with
-                // trace-recorded failover"). A route binds its **first** member
-                // — the one a live call reaches first either way — so a
-                // composition that declares one runs rather than refusing to
-                // build, and the note says what is missing rather than leaving
-                // a reader to infer it from behaviour.
-                let first = route.route.first().expect("a route has members");
-                let Some(member) = ir.definitions.get(&first.value.to_string()) else {
-                    continue;
-                };
-                let DefinitionBody::Model(Model::Direct(direct)) = &member.body else {
-                    continue;
-                };
-                (
-                    direct,
-                    format!(
-                        " This is `{}`, the first member of the route `{address}` declares: \
-                         failover is not executed by this compiler release (PRD §7 M1: \
-                         model routing with trace-recorded failover), so a condition in \
-                         `route_on:` fails the node rather than moving to the next member.",
-                        first.value
-                    ),
-                )
-            }
         };
         text.push('\n');
         text.push_str(&names::doc(
             "",
             &[format!(
-                "`{address}` — `{}` on `{}` (grammar 12.2).{note}",
-                bound.id.value, bound.provider.value
+                "`{address}` — `{}` on `{}` (grammar 12.2).",
+                direct.id.value, direct.provider.value
             )],
         ));
         text.push_str(&format!(
@@ -468,16 +454,16 @@ fn models(ir: &Ir, names: &Names) -> String {
             names.value(address)
         ));
         text.push_str(&format!("  address: {},\n", names::string(address)));
-        text.push_str(&format!("  id: {},\n", names::string(&bound.id.value)));
+        text.push_str(&format!("  id: {},\n", names::string(&direct.id.value)));
         text.push_str(&format!(
             "  provider: {},\n",
-            names.value(&bound.provider.value.to_string())
+            names.value(&direct.provider.value.to_string())
         ));
-        if bound.settings.is_empty() {
+        if direct.settings.is_empty() {
             text.push_str("  settings: {},\n");
         } else {
             text.push_str("  settings: {\n");
-            for (key, value) in &bound.settings {
+            for (key, value) in &direct.settings {
                 text.push_str(&format!(
                     "    {}: {},\n",
                     names::string(key),
@@ -488,7 +474,225 @@ fn models(ir: &Ir, names: &Names) -> String {
         }
         text.push_str("};\n");
     }
+
+    for (address, definition) in &ir.definitions {
+        let DefinitionBody::Model(Model::Route(route)) = &definition.body else {
+            continue;
+        };
+        let conditions: Vec<String> = route
+            .route_on
+            .as_ref()
+            .map(|declared| {
+                declared
+                    .iter()
+                    .map(|condition| condition.value.as_str().to_string())
+                    .collect()
+            })
+            // Grammar 12.2's default, written out rather than left to the
+            // runtime: `route_on:` decides which failures fail over, and a
+            // default a reader cannot see in the emitted binding is one they
+            // would have to look up.
+            .unwrap_or_else(|| {
+                DEFAULT_ROUTE_ON
+                    .iter()
+                    .map(|condition| (*condition).to_string())
+                    .collect()
+            });
+        text.push('\n');
+        text.push_str(&names::doc(
+            "",
+            &[format!(
+                "`{address}` — an ordered failover route over {} (grammar 12.2, PRD 5.9). \
+                 A member that refuses with one of the conditions below moves the call to \
+                 the next; anything else fails the node, and which member served a call is \
+                 recorded in the trace.",
+                crate::parse::reader::list(
+                    route
+                        .route
+                        .iter()
+                        .map(|member| member.value.to_string())
+                        .collect::<Vec<_>>()
+                )
+            )],
+        ));
+        text.push_str(&format!(
+            "const {}: runtime.ModelRoute = {{\n",
+            names.value(address)
+        ));
+        text.push_str(&format!("  address: {},\n", names::string(address)));
+        text.push_str(&format!(
+            "  route: [{}],\n",
+            route
+                .route
+                .iter()
+                .map(|member| names.value(&member.value.to_string()).to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        text.push_str(&format!(
+            "  routeOn: [{}],\n",
+            conditions
+                .iter()
+                .map(|condition| names::string(condition))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        text.push_str("};\n");
+    }
     text
+}
+
+/// Grammar 12.2's `route_on:` default.
+const DEFAULT_ROUTE_ON: &[&str] = &["rate_limit", "overloaded", "timeout"];
+
+// ---------------------------------------------------------------------------
+// Stores (grammar 11)
+// ---------------------------------------------------------------------------
+
+/// Every `store.*`, as the binding `src/stores.ts` runs ops against.
+///
+/// One `const` per store rather than one per usage, because PRD 5.8's whole
+/// point is that a store is **one definition with two consumption surfaces**: a
+/// `store:` node and a synthesized tool address the same binding, so a
+/// `scope: execution` store an agent wrote through is the same store the next
+/// node reads.
+fn stores(ir: &Ir, names: &Names) -> String {
+    let mut text = String::new();
+    for (address, definition) in &ir.definitions {
+        let DefinitionBody::Store(store) = &definition.body else {
+            continue;
+        };
+        let local = address
+            .split_once('.')
+            .map_or(address.as_str(), |(_, rest)| rest);
+        let backend = backend_of(ir, store);
+        text.push('\n');
+        text.push_str(&names::doc(
+            "",
+            &[format!(
+                "`{address}` — a `{}` store with `scope: {}`, on the `{}` backend ({}) \
+                 (grammar 11.1, 11.3).",
+                store.kind.as_str(),
+                store.scope.as_str(),
+                backend.provider,
+                backend.from
+            )],
+        ));
+        text.push_str(&format!(
+            "const {}: stores.StoreBinding = {{\n",
+            names.value(address)
+        ));
+        text.push_str(&format!("  address: {},\n", names::string(address)));
+        text.push_str(&format!("  name: {},\n", names::string(local)));
+        text.push_str(&format!(
+            "  kind: {},\n",
+            names::string(store.kind.as_str())
+        ));
+        text.push_str(&format!(
+            "  scope: {},\n",
+            names::string(store.scope.as_str())
+        ));
+        if let Some(description) = &store.description {
+            text.push_str(&format!(
+                "  description: {},\n",
+                names::string(&description.value)
+            ));
+        }
+        // Absent and `{}` are different declarations, and this is the field the
+        // difference reaches the runtime through: a store with no
+        // `metadata_schema:` derives matches with no `metadata` at all
+        // (Decision D114).
+        text.push_str(&format!(
+            "  metadata: {},\n",
+            store.metadata_schema.is_some()
+        ));
+        if let Some(embed) = &store.embed {
+            text.push_str("  embed: {\n");
+            text.push_str(&format!("    store: {},\n", names::string(address)));
+            text.push_str(&format!(
+                "    model: {},\n",
+                names::string(&embed.model.value)
+            ));
+            text.push_str(&format!(
+                "    provider: {},\n",
+                names.value(&embed.provider.value.to_string())
+            ));
+            if let Some(dimensions) = embed.dimensions {
+                text.push_str(&format!("    dimensions: {dimensions},\n"));
+            }
+            text.push_str("  },\n");
+        }
+        text.push_str("  backend: {\n");
+        text.push_str(&format!(
+            "    provider: {},\n",
+            names::string(backend.provider)
+        ));
+        text.push_str(&format!("    from: {},\n", names::string(&backend.from)));
+        text.push_str("  },\n");
+        text.push_str("};\n");
+    }
+    text
+}
+
+/// Which backend a store resolved to under the active target, and why.
+struct Backend {
+    provider: &'static str,
+    from: String,
+}
+
+/// Grammar 11.3's resolution order, run at compile time.
+///
+/// `--target local` substitutes local storage for **every** store
+/// unconditionally, so under it no alias and no per-kind default is consulted at
+/// all (PRD 5.8, Decision D87) — which is what makes a project with production
+/// infrastructure in `deploy/staging.yml` still buildable and runnable with none.
+/// Under any other target the order is the grammar's: explicit alias, then the
+/// per-kind `defaults:`, then the target built-in, which is the same local
+/// storage because it is the only backend this compiler release implements.
+fn backend_of(ir: &Ir, store: &crate::ir::definition::Store) -> Backend {
+    let built_in = match store.kind {
+        StoreKind::Kv => "sqlite",
+        StoreKind::Vector => "sqlite_vec",
+        StoreKind::Blob => "local_fs",
+    };
+    if ir.target == crate::DEFAULT_TARGET {
+        return Backend {
+            provider: built_in,
+            from: "the `local` target substitutes local storage for every store unconditionally"
+                .to_string(),
+        };
+    }
+    let backends = ir.deploy.storage_backends.as_ref();
+    if let Some(alias) = &store.backend
+        && let Some(config) =
+            backends.and_then(|backends| backends.aliases.get(alias.value.as_str()))
+    {
+        return Backend {
+            provider: config.provider.as_str(),
+            from: format!(
+                "the alias `{}`, defined by the `{}` target",
+                alias.value, ir.target
+            ),
+        };
+    }
+    if let Some(config) = backends.and_then(|backends| backends.defaults.get(store.kind.as_str())) {
+        return Backend {
+            provider: config.provider.as_str(),
+            from: format!(
+                "the `{}` default of the `{}` target",
+                store.kind.as_str(),
+                ir.target
+            ),
+        };
+    }
+    Backend {
+        provider: built_in,
+        from: format!(
+            "the built-in for `kind: {}`, which the `{}` target does not override",
+            store.kind.as_str(),
+            ir.target
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -579,7 +783,12 @@ fn tools(
 // Agents (grammar 5)
 // ---------------------------------------------------------------------------
 
-fn agents(ir: &Ir, names: &Names, surfaces: &[schema::Surface<'_>]) -> String {
+fn agents(
+    ir: &Ir,
+    names: &Names,
+    surfaces: &[schema::Surface<'_>],
+    imported: &mut Vec<String>,
+) -> String {
     let mut text = String::new();
     for (address, definition) in &ir.definitions {
         let DefinitionBody::Agent(agent) = &definition.body else {
@@ -627,7 +836,7 @@ fn agents(ir: &Ir, names: &Names, surfaces: &[schema::Surface<'_>]) -> String {
             json_literal(&schema::json_field_map(output.as_ref()), "    ")
         ));
         text.push_str("  },\n");
-        if agent.tools.is_empty() {
+        if agent.tools.is_empty() && agent.stores.is_empty() {
             text.push_str("  tools: [],\n");
         } else {
             text.push_str("  tools: [\n");
@@ -666,6 +875,7 @@ fn agents(ir: &Ir, names: &Names, surfaces: &[schema::Surface<'_>]) -> String {
                 text.push_str(&format!("      invoke: {},\n", names.value(&tool_address)));
                 text.push_str("    },\n");
             }
+            text.push_str(&store_tools(ir, names, surfaces, agent, imported));
             text.push_str("  ],\n");
         }
         text.push_str(&format!(
@@ -680,6 +890,98 @@ fn agents(ir: &Ir, names: &Names, surfaces: &[schema::Surface<'_>]) -> String {
 /// Grammar 5's default for `max_tool_iterations:` (Decision D51, PRD §9.14).
 const DEFAULT_TOOL_ITERATIONS: i64 = 8;
 
+/// The tools an agent's attached stores synthesize (grammar 11.5, PRD 5.8).
+///
+/// One `AgentTool` per row of grammar 11.5's table, read through the store's
+/// `agent_access:` — so a store declared `read` offers its reading ops and not
+/// its writing one, which is the least-privilege knob Decision D37 adds and PRD
+/// §9.13 accepts. The arguments are parsed against the emitted Zod for the tool's
+/// own surface before the store sees them, which is the same schema the JSON
+/// column below constrains the model with: constrain == parse, exactly as for an
+/// agent's own output (PRD §9.16).
+///
+/// They are **appended** to the declared tools rather than merged into them, so
+/// a transcript reads in the order the composition declares: `tools:` first,
+/// then `stores:` in their own declaration order.
+fn store_tools(
+    ir: &Ir,
+    names: &Names,
+    surfaces: &[schema::Surface<'_>],
+    agent: &Agent,
+    imported: &mut Vec<String>,
+) -> String {
+    let mut text = String::new();
+    for reference in &agent.stores {
+        let address = reference.value.to_string();
+        let Some(definition) = ir.definitions.get(&address) else {
+            continue;
+        };
+        let DefinitionBody::Store(store) = &definition.body else {
+            continue;
+        };
+        let local = address
+            .split_once('.')
+            .map_or(address.as_str(), |(_, rest)| rest);
+        let access = store
+            .agent_access
+            .unwrap_or(crate::ast::definition::AgentAccess::ReadWrite);
+        for op in crate::check::model::store_tools(store.kind, access) {
+            let name = crate::check::model::store_tool_name(local, *op);
+            let path = format!("{address}.tool.{}.input", op.as_str());
+            let schema_name = names.value(&path).to_string();
+            imported.push(schema_name.clone());
+            let arguments = surface_fields(surfaces, &path);
+            text.push_str("    {\n");
+            text.push_str(&format!("      name: {},\n", names::string(&name)));
+            text.push_str(&format!("      address: {},\n", names::string(&address)));
+            text.push_str(&format!(
+                "      description: {},\n",
+                names::string(&store_tool_description(store, &address, *op))
+            ));
+            text.push_str(&format!(
+                "      schema: {},\n",
+                json_literal(&schema::json_field_map(arguments.as_ref()), "      ")
+            ));
+            text.push_str(&format!(
+                "      invoke: async (args, context) =>\n        stores.runStoreTool(\n          \
+                 {},\n          {},\n          runtime.parseResult({schema_name}, args, {}) as Record<string, unknown>,\n          \
+                 context,\n        ),\n",
+                names.value(&address),
+                names::string(op.as_str()),
+                names::string(&format!("the arguments `{name}` was called with"))
+            ));
+            text.push_str("    },\n");
+        }
+    }
+    text
+}
+
+/// What a synthesized store tool tells the model it does.
+///
+/// The store's own `description:` is the LLM-facing half grammar 11.1 asks for,
+/// and the op supplies the verb: a model choosing between `docs_search` and
+/// `prefs_get` is choosing between two stores, and a description that named only
+/// the op would leave it guessing which.
+fn store_tool_description(
+    store: &crate::ir::definition::Store,
+    address: &str,
+    op: crate::ast::flow::StoreOp,
+) -> String {
+    let what = match op {
+        crate::ast::flow::StoreOp::Get => "Read one stored value by key from",
+        crate::ast::flow::StoreOp::Set => "Store a value under a key in",
+        crate::ast::flow::StoreOp::Delete => "Delete the value at a key in",
+        crate::ast::flow::StoreOp::List => "List the keys of",
+        crate::ast::flow::StoreOp::Search => "Search by meaning in",
+        crate::ast::flow::StoreOp::Upsert => "Add or replace a document in",
+        crate::ast::flow::StoreOp::Put => "Store an object under a key in",
+    };
+    match &store.description {
+        Some(description) => format!("{what} `{address}`. {}", description.value.trim()),
+        None => format!("{what} `{address}`."),
+    }
+}
+
 /// The name the agent's output schema is offered to the model under.
 ///
 /// `<local name>_output`, which is what makes a transcript readable — except
@@ -687,7 +989,7 @@ const DEFAULT_TOOL_ITERATIONS: i64 = 8;
 /// would be one tool on the wire and the pinned choice would be ambiguous.
 fn output_tool_name(ir: &Ir, agent: &Agent, local: &str) -> String {
     let mut name = format!("{local}_output");
-    let attached: Vec<String> = agent
+    let mut attached: Vec<String> = agent
         .tools
         .iter()
         .filter_map(|reference| {
@@ -699,6 +1001,27 @@ fn output_tool_name(ir: &Ir, agent: &Agent, local: &str) -> String {
             })
         })
         .collect();
+    // The synthesized store tools are on the wire beside the declared ones
+    // (grammar 11.5), so they are names the pinned output tool has to avoid too:
+    // two tools of one name would make the pinned choice ambiguous.
+    for reference in &agent.stores {
+        let address = reference.value.to_string();
+        let Some(definition) = ir.definitions.get(&address) else {
+            continue;
+        };
+        let DefinitionBody::Store(store) = &definition.body else {
+            continue;
+        };
+        let store_local = address
+            .split_once('.')
+            .map_or(address.as_str(), |(_, rest)| rest);
+        let access = store
+            .agent_access
+            .unwrap_or(crate::ast::definition::AgentAccess::ReadWrite);
+        for op in crate::check::model::store_tools(store.kind, access) {
+            attached.push(crate::check::model::store_tool_name(store_local, *op));
+        }
+    }
     let mut ordinal = 2;
     while attached.iter().any(|tool| tool == &name) {
         name = format!("{local}_output_{ordinal}");
@@ -1190,9 +1513,91 @@ fn input_builder(
             "  input: (_roots, view) => runtime.mapPlan({}, view),\n",
             names.value(&format!("{address}.node.{id}.map"))
         ),
-        NodeKind::Human { .. } | NodeKind::Store { .. } => "  input: () => null,\n".to_string(),
+        // A store op's parameters are its own row in grammar 11.4, and six of
+        // the nine are CEL over `input`/`state`/`execution` (grammar 8.8). They
+        // are evaluated **here**, in the node's input phase, for the reason
+        // every node's input is built here: an expression that cannot be
+        // evaluated fails the execution rather than the activity, and neither
+        // `skip` nor a `fallback:` may absorb that (Decisions D78, D110).
+        NodeKind::Store { params, .. } => store_params(params),
+        NodeKind::Human { .. } => "  input: () => null,\n".to_string(),
     }
     .to_string()
+}
+
+/// One store op's parameters, as the object `stores.runStoreOp` takes.
+///
+/// The three literals of grammar 8.8 — `top_k`, `limit`, `content_type` — are
+/// written out as literals rather than evaluated: a store op's bound is a
+/// written-down number, readable without running the graph, exactly as a
+/// fan-out's is a schema bound.
+fn store_params(params: &crate::ir::flow::StoreParams) -> String {
+    let mut text = String::from("  input: (roots) => ({\n");
+    for (key, expression) in [
+        ("key", params.key.as_ref()),
+        ("query", params.query.as_ref()),
+        ("prefix", params.prefix.as_ref()),
+    ] {
+        let Some(expression) = expression else {
+            continue;
+        };
+        text.push_str(&format!(
+            "    {key}: String(runtime.toJson(runtime.evaluate({}, roots))),\n",
+            names::string(expression.value.as_str())
+        ));
+    }
+    match &params.value {
+        // A `vector upsert`'s and a `blob put`'s value is one expression: the
+        // text, or the content.
+        Some(crate::ir::flow::StoreValue::Expression { value }) => {
+            text.push_str(&format!(
+                "    value: String(runtime.toJson(runtime.evaluate({}, roots))),\n",
+                names::string(value.value.as_str())
+            ));
+        }
+        // A `kv set`'s is a field map checked against the store's `value_schema`.
+        Some(crate::ir::flow::StoreValue::Fields { bindings }) => {
+            text.push_str("    value: {\n");
+            for binding in &bindings.entries {
+                text.push_str(&format!(
+                    "      {}: runtime.toJson(runtime.evaluate({}, roots)),\n",
+                    names::string(&binding.name.value),
+                    names::string(binding.value.value.as_str())
+                ));
+            }
+            text.push_str("    },\n");
+        }
+        None => {}
+    }
+    for (key, map) in [
+        ("filter", params.filter.as_ref()),
+        ("metadata", params.metadata.as_ref()),
+    ] {
+        let Some(map) = map else { continue };
+        text.push_str(&format!("    {key}: {{\n"));
+        for binding in &map.entries {
+            text.push_str(&format!(
+                "      {}: runtime.toJson(runtime.evaluate({}, roots)),\n",
+                names::string(&binding.name.value),
+                names::string(binding.value.value.as_str())
+            ));
+        }
+        text.push_str("    },\n");
+    }
+    if let Some(top_k) = params.top_k {
+        text.push_str(&format!("    topK: {top_k},\n"));
+    }
+    if let Some(limit) = params.limit {
+        text.push_str(&format!("    limit: {limit},\n"));
+    }
+    if let Some(content_type) = &params.content_type {
+        text.push_str(&format!(
+            "    contentType: {},\n",
+            names::string(&content_type.value)
+        ));
+    }
+    text.push_str("  }),\n");
+    text
 }
 
 /// An object built field by field from a binding map, over a declared surface.
@@ -1328,11 +1733,16 @@ fn activity(
     imported: &mut Vec<String>,
 ) -> String {
     let id = node.id.value.as_str();
-    let output_schema = output_path(ir, address, node).map(|path| {
-        let name = names.value(&path).to_string();
-        imported.push(name.clone());
-        name
-    });
+    // A store-op node parses nothing — see its arm below — so its derived row is
+    // not imported: an import a module never reads would be noise in every
+    // golden that has a store in it.
+    let output_schema = output_path(ir, address, node)
+        .filter(|_| !matches!(node.kind, NodeKind::Store { .. }))
+        .map(|path| {
+            let name = names.value(&path).to_string();
+            imported.push(name.clone());
+            name
+        });
 
     match &node.kind {
         NodeKind::Agent { agent } => {
@@ -1344,7 +1754,8 @@ fn activity(
                  runtime.historyTurns(view.state[\"messages\"] as unknown[]),\n      context,\n    );\n    \
                  return {{\n      \
                  output: runtime.parseResult({schema}, answer.output, {subject}),\n      \
-                 history: answer.history,\n    \
+                 history: answer.history,\n      \
+                 models: answer.models,\n    \
                  }};\n  }},\n",
                 subject = names::string(&format!("the answer of `{}`", agent.value))
             )
@@ -1435,11 +1846,23 @@ fn activity(
         ),
         NodeKind::Human { .. } => unimplemented_run(
             "a `human` pause",
-            "`agent-compose serve` (generated Fastify app for http triggers: start/resume/status)",
+            "the `human` node runtime, which PRD §9's resolved question 4 schedules for M2",
         ),
-        NodeKind::Store { store, op, .. } => unimplemented_run(
-            &format!("a `{}` on `{}`", op.as_str(), store.value),
-            "store-op nodes + synthesized store tools with SQLite/local-disk backends",
+        // The result is **not** parsed against the emitted Zod for the derived
+        // row. That schema describes a shape this compiler's own runtime builds
+        // rather than a contract with something outside the process, and the one
+        // field grammar 11.4 marks optional — `value` on a `get` that missed —
+        // is required in it, so a parse would refuse exactly the answer
+        // Decision D110 says a miss gives.
+        NodeKind::Store { store, op, .. } => format!(
+            "  run: async (input, context, view) => ({{\n    \
+             output: await stores.runStoreOp(\n      {},\n      {},\n      \
+             input as stores.StoreParams,\n      context,\n      \
+             {{ via: \"node\", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, {})].join(\"/\") }},\n    \
+             ),\n  }}),\n",
+            names.value(&store.value.to_string()),
+            names::string(op.as_str()),
+            names::string(id)
         ),
     }
 }
@@ -1817,10 +2240,13 @@ fn dispatch_run(
             // when it completes, and there is no key to say otherwise
             // (grammar 10.4, Decision D105).
             format!(
-                "{indent}run: async (input, context) => ({{\n{indent}  \
-                 output: runtime.parseResult(\n{indent}    {schema},\n{indent}    \
-                 (await runtime.callAgent({binding}, input, [], context)).output,\n{indent}    {subject},\n{indent}  ),\n{indent}\
-                 }}),\n",
+                "{indent}run: async (input, context) => {{\n{indent}  \
+                 const answer = await runtime.callAgent({binding}, input, [], context);\n{indent}  \
+                 return {{\n{indent}    \
+                 output: runtime.parseResult({schema}, answer.output, {subject}),\n{indent}    \
+                 models: answer.models,\n{indent}  \
+                 }};\n{indent}\
+                 }},\n",
                 subject = names::string(&format!("the answer of `{target}`"))
             )
         }
@@ -2378,12 +2804,40 @@ fn registry_source(
                     .join(", "))
                 .unwrap_or_default()
         ));
+        text.push_str("    inputKinds: {");
+        let kinds: Vec<String> = flow
+            .inputs
+            .as_ref()
+            .map(|inputs| {
+                inputs
+                    .fields
+                    .iter()
+                    .map(|field| {
+                        format!(
+                            " {}: {},",
+                            names::string(field.name.value.as_str()),
+                            names::string(input_kind(&field.ty))
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        text.push_str(&kinds.join(""));
+        text.push_str(if kinds.is_empty() { "},\n" } else { " },\n" });
         text.push_str(&format!(
             "    outputs: [{}],\n",
             flow.outputs
                 .fields
                 .iter()
                 .map(|field| names::string(field.name.value.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        text.push_str(&format!(
+            "    sessionStores: [{}],\n",
+            session_stores(ir, address)
+                .iter()
+                .map(|store| names::string(store))
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
@@ -2416,6 +2870,40 @@ fn registry_source(
     text.push_str("};\n");
     text.push_str(RUN_FLOW);
     text
+}
+
+/// How a `--input` value is read for one declared field (grammar 13.2).
+fn input_kind(ty: &TypeNode) -> &'static str {
+    match &ty.form {
+        TypeForm::Scalar(scalar) => match scalar.kind {
+            crate::ast::schema::ScalarKind::String => "string",
+            crate::ast::schema::ScalarKind::Integer => "integer",
+            crate::ast::schema::ScalarKind::Number => "number",
+            crate::ast::schema::ScalarKind::Boolean => "boolean",
+        },
+        // An enum is a closed set of strings (Decision D9), so its argument is
+        // one of them written out — text, not a JSON document.
+        TypeForm::Enum(_) => "string",
+        TypeForm::Object(_) | TypeForm::Array(_) | TypeForm::Union(_) => "json",
+    }
+}
+
+/// The `scope: session` stores a flow reaches (grammar 7.7, 11.3).
+///
+/// The same relation the validator's session-coherence check quantifies over,
+/// read here rather than restated: two spellings of one traversal is how they
+/// come to disagree about which flows need a session key (Decision D86).
+fn session_stores(ir: &Ir, address: &str) -> Vec<String> {
+    crate::check::reach::stores_of(ir, address)
+        .into_iter()
+        .filter(|store| {
+            matches!(
+                ir.definitions.get(store).map(|definition| &definition.body),
+                Some(DefinitionBody::Store(store))
+                    if store.scope == crate::ast::definition::StoreScope::Session
+            )
+        })
+        .collect()
 }
 
 /// The passes a cycle carrying no counting bound is given, per node in it.
@@ -2472,14 +2960,39 @@ fn recursion_limit(flow: &Flow) -> i64 {
 }
 
 const REGISTRY_DOC: &str = r#"
+/**
+ * How a declared flow input reads a command-line value (grammar 13.2).
+ *
+ * `json` is every structured shape — an object, an array, a tagged union — for
+ * which the one honest reading of a shell argument is the document it spells.
+ */
+export type InputKind = "string" | "integer" | "number" | "boolean" | "json";
+
 /** One compiled flow: what it takes, what it answers, and how to run it. */
 export interface CompiledFlow {
   /** Its typed address (grammar 2.2). */
   readonly address: string;
   /** The fields its `inputs:` declares (grammar 7.5). */
   readonly inputs: readonly string[];
+  /**
+   * What each declared input *is*, so a `--input k=v` argument can be read as
+   * the type the field declares rather than reaching Zod as text (grammar 13.2).
+   */
+  readonly inputKinds: Readonly<Record<string, InputKind>>;
   /** The fields its `outputs:` declares, each read from the channel of that name. */
   readonly outputs: readonly string[];
+  /**
+   * The `scope: session` stores this flow **reaches**, under the relation
+   * grammar 7.7 fixes — its own nodes, its maps' dispatch targets, the flows it
+   * instantiates, and the stores of every agent it reaches.
+   *
+   * A run of this flow needs a session identity exactly when this list is not
+   * empty (grammar 11.3): a declared trigger supplies it through `session_key:`,
+   * and the CLI through `--session`. Checked at run start rather than at
+   * validate, for the reason env-ref presence is: the value does not exist until
+   * the invocation does.
+   */
+  readonly sessionStores: readonly string[];
   /** The superstep ceiling a run of it takes by default. */
   readonly recursionLimit: number;
   /** Parse an invocation's inputs against the flow's own schema (grammar 13.2). */
@@ -2555,23 +3068,38 @@ export async function runFlow(
   }
   const parsed = flow.parse(inputs);
   const ceiling = options.recursionLimit ?? flow.recursionLimit;
+  const sessionKey = options.sessionKey ?? "";
+  // Grammar 11.3, checked where the value first exists: a flow that reaches a
+  // `scope: session` store keys off the identity its trigger supplies, and a run
+  // started without one would silently address a partition named by the empty
+  // string. Named by the store rather than by the flow, because the store is
+  // what the author has to look at.
+  if (sessionKey === "" && flow.sessionStores.length > 0) {
+    throw new Error(
+      `\`${address}\` reaches ${flow.sessionStores.map((store) => `\`${store}\``).join(", ")}, which ${flow.sessionStores.length === 1 ? "is" : "are"} \`scope: session\`, so this run needs a session identity: pass \`--session <key>\` to \`agent-compose run\`, or declare \`session_key:\` on the trigger that starts it (grammar 11.3, 13.2)`,
+    );
+  }
+  const executionId = options.executionId ?? `exec_${globalThis.crypto.randomUUID()}`;
   // `runtime.quiesce` keeps the last state each superstep produced, which is
   // what makes a failure's trace survive; the one failure it restates on the way
   // out is LangGraph stopping the run at the ceiling.
-  const { state, error } = await runtime.quiesce(
-    flow,
-    {
-      $run: {
-        ...runtime.emptyRun(),
-        input: parsed,
-        execution: {
-          id: options.executionId ?? `exec_${globalThis.crypto.randomUUID()}`,
-          session_key: options.sessionKey ?? "",
+  const { state, error } = await runtime
+    .quiesce(
+      flow,
+      {
+        $run: {
+          ...runtime.emptyRun(),
+          input: parsed,
+          execution: { id: executionId, session_key: sessionKey },
         },
       },
-    },
-    ceiling,
-  );
+      ceiling,
+    )
+    // `scope: execution` means what it says: whatever this run's own stores held
+    // is released when the run ends, however it ended (PRD 5.8, grammar 11.1).
+    // A `serve` process runs many executions, so a store that stayed open would
+    // be both a leak and a lifetime the composition did not declare.
+    .finally(() => stores.releaseExecution(executionId));
   if (error !== undefined) {
     throw new runtime.FlowFailure(
       address,
@@ -3081,10 +3609,15 @@ flow.f:
         );
     }
 
-    /// A `model.*` route binds its first member, and the note says failover is
-    /// not what this release does with the rest.
+    /// A `model.*` route is an ordered ladder over its members, and it is
+    /// emitted **after** every direct binding it names.
+    ///
+    /// The order is the load-bearing half. `model.default` sorts before
+    /// `model.fast` and `model.smart` in the IR's address order, so a single
+    /// pass would emit a `const` that references two declared later — a module
+    /// that type-checks and throws at import, past every gate a build has.
     #[test]
-    fn a_route_binds_its_first_member_and_says_what_is_missing() {
+    fn a_route_is_an_ordered_ladder_emitted_after_its_members() {
         let emitted = emit(&format!(
             r#"{PREAMBLE}
 model.fast:
@@ -3110,14 +3643,58 @@ flow.f:
 "#
         ));
         let routed = emitted
-            .split("const modelDefault: runtime.ModelBinding")
+            .split("const modelDefault: runtime.ModelRoute = {")
             .nth(1)
             .expect("the route is emitted");
-        assert!(routed.contains("id: \"some-model\","), "{routed}");
         assert!(
-            emitted.contains("failover is not executed by this compiler release"),
+            routed.contains("route: [modelM, modelFast],"),
+            "the members are the route's own order: {routed}"
+        );
+        assert!(
+            routed.contains("routeOn: [\"rate_limit\", \"overloaded\", \"timeout\"],"),
+            "grammar 12.2's default is written out: {routed}"
+        );
+        assert!(
+            emitted.find("const modelFast: runtime.ModelBinding")
+                < emitted.find("const modelDefault: runtime.ModelRoute"),
+            "a route references its members, so it is declared after them:\n{emitted}"
+        );
+        assert!(emitted.contains("  model: modelDefault,\n"), "{emitted}");
+    }
+
+    /// A declared `route_on:` replaces the default rather than extending it.
+    #[test]
+    fn a_declared_route_on_is_what_the_ladder_fails_over_on() {
+        let emitted = emit(&format!(
+            r#"{PREAMBLE}
+model.fast:
+  provider: provider.p
+  id: another-model
+
+model.default:
+  route: [model.m, model.fast]
+  route_on: [server_error]
+
+agent.routed:
+  model: model.default
+  prompt: Answer.
+  output: {{ draft: {{ type: string }} }}
+
+flow.f:
+  inputs: {{ goal: {{ type: string }} }}
+  outputs: {{ draft: {{ type: string }} }}
+  nodes:
+    say: {{ agent: agent.routed, input: "input.goal" }}
+  edges:
+    - {{ from: start, to: say }}
+    - {{ from: say, to: end }}
+"#
+        ));
+        assert!(
+            emitted.contains("routeOn: [\"server_error\"],"),
             "{emitted}"
         );
+        assert!(!emitted.contains("\"rate_limit\""), "{emitted}");
     }
 
     /// The output schema is offered under `<agent>_output` — except where the

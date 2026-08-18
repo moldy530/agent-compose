@@ -206,6 +206,7 @@ use std::borrow::Cow;
 use serde_json::{Map, Value, json};
 
 use crate::ast::common::Ident;
+use crate::ast::definition::AgentAccess;
 use crate::ast::schema::{Number, ScalarKind, StringFormat};
 use crate::check::model;
 use crate::diag::Spanned;
@@ -273,6 +274,7 @@ pub enum Body<'ir> {
 /// grammar rule is exactly the drift this function exists to prevent.
 #[must_use]
 pub fn surfaces(ir: &Ir) -> Vec<Surface<'_>> {
+    let attached = attached_stores(ir);
     let mut surfaces = Vec::new();
     for (address, definition) in &ir.definitions {
         match &definition.body {
@@ -425,6 +427,36 @@ pub fn surfaces(ir: &Ir) -> Vec<Surface<'_>> {
                         body: borrowed(metadata),
                     });
                 }
+                // The synthesized tool surface of grammar 11.5, which exists
+                // exactly when some agent attaches this store: an unattached
+                // store synthesizes nothing, so a schema for it would be a
+                // schema nothing is parsed against. Which ops are here is
+                // `agent_access:`'s (Decision D37).
+                if attached.contains(address) {
+                    let local = address
+                        .split_once('.')
+                        .map_or(address.as_str(), |(_, rest)| rest);
+                    let access = store.agent_access.unwrap_or(AgentAccess::ReadWrite);
+                    for op in model::store_tools(store.kind, access) {
+                        surfaces.push(Surface {
+                            path: format!("{address}.tool.{}.input", op.as_str()),
+                            about: format!(
+                                "`{address}` — the arguments of its synthesized `{}` tool, which \
+                                 is its `{}` row of grammar 11.4 with the expressions replaced by \
+                                 what the model supplies (grammar 11.5).",
+                                model::store_tool_name(local, *op),
+                                op.as_str()
+                            ),
+                            body: owned(model::store_tool_input(
+                                store.kind,
+                                *op,
+                                store.value_schema.as_ref(),
+                                store.metadata_schema.as_ref(),
+                                &definition.span,
+                            )),
+                        });
+                    }
+                }
             }
             DefinitionBody::Provider(_) | DefinitionBody::Model(_) => {}
         }
@@ -441,6 +473,24 @@ pub fn surfaces(ir: &Ir) -> Vec<Surface<'_>> {
     }
 
     surfaces
+}
+
+/// Every `store.*` some agent attaches (grammar 5.4, 11.5).
+///
+/// The tool surface a store synthesizes exists because an *agent* listed it, not
+/// because the store was defined, so this is what decides whether a store has
+/// one at all.
+fn attached_stores(ir: &Ir) -> std::collections::BTreeSet<String> {
+    let mut found = std::collections::BTreeSet::new();
+    for definition in ir.definitions.values() {
+        let DefinitionBody::Agent(agent) = &definition.body else {
+            continue;
+        };
+        for store in &agent.stores {
+            found.insert(store.value.to_string());
+        }
+    }
+    found
 }
 
 /// A field map the composition wrote, as a [`Body`].

@@ -176,7 +176,7 @@ fn interrupt_freedom(ctx: &mut Ctx) {
             continue;
         }
         let flow = trigger.flow.value.to_string();
-        let reached = reach::reached(ctx, &flow);
+        let reached = reach::reached(ctx.ir, &flow);
         let Some(((holder, node), at)) = reached.humans.iter().next() else {
             continue;
         };

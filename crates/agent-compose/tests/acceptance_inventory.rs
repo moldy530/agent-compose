@@ -412,18 +412,27 @@ const CODEGEN: &[Criterion] = &[
         tests: &[
             (
                 "a_store_op_node_reads_and_writes_the_local_backend",
-                Status::Pending(
-                    "pending: codegen must emit store-op nodes over the SQLite/local-disk backends",
-                ),
+                Status::Live,
+            ),
+            // The other two kinds, which the `kv` round trip above does not
+            // reach: a `vector` store — whose ops embed through a real provider
+            // connection (grammar 11.2) — and a `blob` store on local disk.
+            (
+                "a_vector_and_a_blob_store_round_trip_through_the_local_backends",
+                Status::Live,
+            ),
+            // The lifetime that outlives an execution, which is the whole of
+            // PRD 5.8's cross-session memory story — and the run-start refusal
+            // that keeps it honest when no session identity was supplied.
+            (
+                "a_session_scoped_store_outlives_the_execution_that_wrote_it",
+                Status::Live,
             ),
             (
                 "an_attached_store_synthesizes_its_tool_surface_in_the_model_request",
-                Status::Pending("pending: codegen must synthesize store tools"),
+                Status::Live,
             ),
-            (
-                "agent_access_read_withholds_the_write_tool",
-                Status::Pending("pending: codegen must synthesize store tools"),
-            ),
+            ("agent_access_read_withholds_the_write_tool", Status::Live),
         ],
     },
     Criterion {
@@ -432,15 +441,11 @@ const CODEGEN: &[Criterion] = &[
         tests: &[
             (
                 "a_route_fails_over_to_its_next_member_and_the_trace_records_it",
-                Status::Pending(
-                    "pending: codegen must emit model routing with trace-recorded failover",
-                ),
+                Status::Live,
             ),
             (
                 "a_condition_outside_route_on_fails_the_node_instead_of_failing_over",
-                Status::Pending(
-                    "pending: codegen must emit model routing with trace-recorded failover",
-                ),
+                Status::Live,
             ),
         ],
     },
@@ -475,30 +480,38 @@ const COMMANDS: &[Criterion] = &[
         phrase: "`agent-compose run` (manual trigger)",
         tests: &[(
             "run_executes_a_manual_trigger_and_prints_the_flow_outputs",
-            Status::Pending("pending: `agent-compose run` must exist"),
+            Status::Live,
         )],
     },
-    // Two tests, because the criterion's three verbs do not unlock together.
+    // Four tests, because the criterion's three verbs do not unlock together.
     // PRD §7 M1 puts `serve` — start, resume and status — in this milestone,
     // while PRD §9's resolved question 4 says the `human` node runtime "may land
     // M2". Only `resume` needs that runtime: an interrupt is what there is to
     // resume from. So start/status is decided over the `http-trigger` fixture's
-    // interrupt-free flow and is `serve`'s to unlock, and resume is decided over
-    // its `human` flow and names the runtime it waits on. Keeping them in one
-    // test would have forced the `serve` PR either to ship an M2-scheduled
-    // feature or to edit this inventory — the drift it exists to prevent.
+    // interrupt-free flow and is `serve`'s to unlock — as is `respond: sync` and
+    // its timeout upgrade, and the half of `resume` that is about the route
+    // existing and validating what it was given. What is left pending is the one
+    // claim that needs an interrupt to resume *from*, and it names it.
     Criterion {
         bullet: Bullet::Commands,
         phrase: "`agent-compose serve` (generated Fastify app for http triggers: start/resume/status)",
         tests: &[
             (
                 "serve_exposes_start_and_status_for_an_http_trigger",
-                Status::Pending("pending: `agent-compose serve` must exist"),
+                Status::Live,
+            ),
+            (
+                "serve_answers_a_sync_trigger_and_upgrades_when_its_timeout_expires",
+                Status::Live,
+            ),
+            (
+                "resume_validates_the_execution_and_names_the_runtime_it_waits_for",
+                Status::Live,
             ),
             (
                 "serve_resumes_an_interrupted_execution_against_the_human_nodes_schema",
                 Status::Pending(
-                    "pending: `agent-compose serve` must exist, and the `human` node runtime with it",
+                    "pending: the `human` node runtime, which PRD §9's resolved question 4 schedules for M2",
                 ),
             ),
         ],
