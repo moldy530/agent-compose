@@ -1,0 +1,12 @@
+# rule: `pattern:` is RE2 syntax (grammar 3.3, Decision D12)
+# code: invalid-value
+# message: `pattern` in state channel `brace` is not a valid regular expression: repetition quantifier expects a valid decimal
+# at: 12:35
+# help: `pattern:` is RE2 — no backreferences and no lookaround (grammar 3.3, Decision D12)
+#
+# A pattern no engine can parse is not a composition that is well formed and
+# unlucky in its target: it is one `validate` refuses. What is left to the
+# target pass is the narrower question of what a JavaScript regular expression
+# can hold (`codegen::pattern`).
+state:
+  brace: { type: string, pattern: "^a{$" }

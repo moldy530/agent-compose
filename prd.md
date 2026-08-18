@@ -216,7 +216,7 @@ store.docs:
 
   - **Resolution**: explicit alias → per-kind `defaults:` → target built-in. `--target local` substitutes SQLite/local disk for every store unconditionally — the zero-infra guarantee.
   - **Per-target invariant**: `--target <name>` loads `deploy/<name>.yml`. Only the deploy layer (storage_backends, placements, event_sources) forks per environment; `agents/`, `flows/`, `stores/`, `tools/` never do. Terraform-workspace discipline: env differences live in one layer.
-  - **Compile-time validation**: provider config blocks are checked against provider-published schemas; an alias referenced by a store but undefined in the active target is a compile error naming the target; capability checks (e.g. `vector` store → vector-capable provider) apply at the alias definition. Provider config takes `${ENV_VAR}` references only — the spec never contains credentials (syntax checked at `validate`; presence checked at `build`/`serve`).
+  - **Compile-time validation**: provider config blocks are checked against provider-published schemas; an alias referenced by a store but undefined in the active target is a compile error naming the target; capability checks (e.g. `vector` store → vector-capable provider) apply at the alias definition. Provider config takes `${ENV_VAR}` references only — the spec never contains credentials (syntax checked at `validate`; presence checked at launch — see 5.9).
   - Rejected alternatives, for the record: address-keyed override maps in deploy.yml (action-at-a-distance) and inline provider config on stores (bakes env-specific choices into logical files, forking them per environment).
 - **Replay discipline**: store ops are effects (activities). Reads are recorded — replay consumes history, not the live store. Writes are at-least-once with idempotency keys derived from `execution_id + node + item_index` — the third application of the **execution-derived idempotency key** principle (detach sinks 5.6, event dedupe 5.11), now a named cross-cutting rule.
 - **Compile checks**: schema-checked ops against `value_schema`/`metadata_schema`; store writes inside a `map` require an item-derived key or a keyed `kv` write — unkeyed blob/global writes from concurrent instances are a validation error; `session`-scoped store usage in a flow with no session-keyed trigger is a validation error.
@@ -262,7 +262,7 @@ model.default:
 
 **Secrets** (extends the credentials rule of 5.8):
 - Config takes `${ENV_VAR}` references only, never literals. **Env refs survive into the IR unresolved** — resolution happens at process start in generated code, never at compile — so the flat IR stays committable/diffable and generated code never contains a key.
-- `validate` checks ref syntax; `build`/`serve`/`run` check presence and fail fast naming the missing variable.
+- `validate` and `build` check ref syntax only — an artifact must be buildable anywhere, including CI boxes holding no secrets (least-privilege distribution in 5.10 depends on this). Presence is a launch-time check: generated code verifies its environment at process start, and `run`/`serve` fail fast before invoking the graph, naming the missing variable (§9.15).
 - **Least-privilege distribution**: under `--target distributed` (5.10), an isolated node's deployment receives only the env vars its resolved providers/backends reference — computable statically from the IR, since every secret is a named ref. Blast-radius containment for keys falls out of the design.
 
 ### 5.10 Cloud & distribution — placement annotations, not distributed edges
@@ -428,6 +428,7 @@ Formerly open, now settled — rationale lives in the referenced sections:
 12. **Compiler implementation** → Rust single-binary CLI (parse/resolve/validate/codegen); CEL via the Rust `cel` crate at validate time and a JS evaluator at runtime, kept in lockstep by a shared conformance corpus (5.5, 5.12).
 13. **`agent_access` on store attachment** → accepted: a `stores:` entry may narrow the synthesized tool surface to read-only (`agent_access: read`; default `read_write`). One enum buys declarative least-privilege for store tools, the same posture placement isolation takes for compute (5.8, 5.10; grammar D37).
 14. **`max_tool_iterations` on agents** → accepted, default 8: the intra-agent tool loop was the one remaining unbounded loop in a compiled graph; a declarative bound completes the static-termination story that 5.4 starts (5.4, 5.5; grammar D51).
+15. **Env-ref presence checking** → launch-time, not build-time. 5.8/5.9 originally said `build` checks presence while the M1 milestone said process start; the artifact-portability posture decides it — a build must succeed anywhere, including CI holding no secrets, or committable IRs and least-privilege distribution (5.10) break. Generated code verifies its environment at process start; `run`/`serve` fail fast before invoking the graph. `validate` and `build` check syntax only (5.8, 5.9).
 
 ## 10. Open Questions
 

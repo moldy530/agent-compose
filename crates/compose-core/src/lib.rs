@@ -1,8 +1,8 @@
-//! Compiler core for `agent-compose`: parsing, resolution, validation, and
-//! the flat IR. The CLI in the `agent-compose` crate is a thin wrapper over
+//! Compiler core for `agent-compose`: parsing, resolution, validation, the flat
+//! IR, and codegen. The CLI in the `agent-compose` crate is a thin wrapper over
 //! this library.
 //!
-//! What exists today is the front half of the pipeline:
+//! The pipeline, in order:
 //!
 //! * [`diag`] — the [`Diagnostic`](diag::Diagnostic) type every pass reports
 //!   through, with stable machine-readable codes and byte/line/column spans;
@@ -20,7 +20,10 @@
 //! * [`check`] — the validator: schema compatibility, bindings and wiring,
 //!   fan-out shapes, store ops, provider settings and capabilities, trigger
 //!   bindings, and the graph analyses — routing exhaustiveness, cycle
-//!   termination, convergence, reachability, recursion, and interrupt-freedom.
+//!   termination, convergence, reachability, recursion, and interrupt-freedom;
+//! * [`codegen`] — [`emit`], the pure function from a validated artifact to a
+//!   deterministic set of `(path, contents)` files: a LangGraph TypeScript
+//!   project, pinned per compiler release (PRD 5.12).
 //!
 //! Everything the parser reports is decidable from a single file, and
 //! everything the resolver reports is decidable from names, files, and
@@ -31,13 +34,19 @@
 //! — every static check PRD §7 M0 promises, mapped to the pass that decides it
 //! and the diagnostic codes it reports through.
 //!
+//! [`codegen`] reports nothing at all: everything it could refuse, [`check`] has
+//! already refused with a span to point at, so `build` validates first and emits
+//! only on a clean report.
+//!
 //! The CLI over all of it is the `agent-compose` crate: `agent-compose validate
 //! <path> [--target <name>] [--format human|json]`, which is the product's core
-//! loop (PRD §7 M0).
+//! loop (PRD §7 M0), and `agent-compose build <path> [--target <name>]
+//! [--out <dir>] [--check]`, which is codegen (PRD §7 M1).
 
 pub mod ast;
 pub mod cel;
 pub mod check;
+pub mod codegen;
 pub mod diag;
 pub mod ir;
 pub mod parse;
@@ -45,6 +54,8 @@ pub mod resolve;
 pub mod yaml;
 
 pub use check::check;
+pub use codegen::diagnostics as target_diagnostics;
+pub use codegen::{COMPILER_VERSION, GeneratedFile, GeneratedProject, emit};
 pub use diag::{Diagnostic, DiagnosticCode, Diagnostics, Severity, Span, Spanned};
 pub use ir::{IR_VERSION, Ir};
 pub use parse::{ParsedFile, parse_file, parse_str};

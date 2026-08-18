@@ -1,2 +1,8 @@
 /target
 /.claude/worktrees/
+
+# The pinned JavaScript toolchain the generated-code gates install, and the
+# scratch copies of the golden projects they type-check. Both are rebuilt by
+# `cargo test`; the lockfile beside them is committed.
+/crates/compose-core/tests/toolchain/node_modules/
+/crates/compose-core/tests/toolchain/projects/

@@ -1,0 +1,19 @@
+# A composition `validate` accepts and `build` cannot compile.
+#
+# `constructor` is a legal grammar 2.1 identifier and grammar 2.5 reserves only
+# the seven roots, so `state:` may declare a channel called that. The emitted
+# `channels` object is keyed by the channel's own name (grammar 10.3) and
+# LangGraph reads it with a plain property lookup — which every JavaScript
+# object answers for `constructor` out of `Object.prototype`. The project would
+# type-check and load, and then fail at `new StateGraph(State)` with
+# `this.channels[key].equals is not a function`: past every gate a build has.
+#
+# `construct` and `constructors` are the controls: neighbours that a check
+# matching on a prefix, or on "looks like a JavaScript word", would take with
+# it.
+version: "0.1"
+
+state:
+  construct:    { type: string }
+  constructors: { type: string }
+  constructor:  { type: string, default: "ctor" }

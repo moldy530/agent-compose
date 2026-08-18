@@ -18,6 +18,21 @@ jobs:
           toolchain: 1.94.1
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # `cargo test` runs the generated-code gates
+      # (`crates/compose-core/tests/generated_code_gates.rs`): every golden
+      # project is type-checked with the pinned TypeScript and constructed under
+      # the pinned LangGraph, against real installed dependencies. Those gates
+      # FAIL rather than skip when Node is absent — `CI` is set here, which is the
+      # switch — so this step is what keeps "the suite is green" meaning "the
+      # emitted TypeScript compiles and runs" (CLAUDE.md).
+      #
+      # 22.18 is the floor: it is where Node stopped flagging type stripping,
+      # which is what lets a generated project run with no build step.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.18'
+          cache: npm
+          cache-dependency-path: crates/compose-core/tests/toolchain/package-lock.json
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy

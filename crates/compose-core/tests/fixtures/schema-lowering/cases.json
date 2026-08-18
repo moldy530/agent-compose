@@ -1,0 +1,659 @@
+[
+  {
+    "golden": "review-loop",
+    "surface": "agent.reviewer.output",
+    "about": "a closed object over an enum and a string (grammar 3.1, 3.3)",
+    "documents": [
+      { "why": "both declared properties, at their declared types", "valid": true, "document": { "verdict": "approve", "feedback": "" } },
+      { "why": "the other enum variant", "valid": true, "document": { "verdict": "revise", "feedback": "tighten it" } },
+      { "why": "a value the enum does not declare", "valid": false, "document": { "verdict": "escalate", "feedback": "" } },
+      { "why": "a required property is missing", "valid": false, "document": { "verdict": "approve" } },
+      { "why": "an undeclared property: objects are closed (D8)", "valid": false, "document": { "verdict": "approve", "feedback": "", "note": "extra" } },
+      { "why": "a property at the wrong type", "valid": false, "document": { "verdict": "approve", "feedback": 3 } }
+    ]
+  },
+  {
+    "golden": "review-loop",
+    "surface": "tool.web_search.input",
+    "about": "string length, integer bounds, and a defaulted property (grammar 3.3, 3.6)",
+    "documents": [
+      { "why": "both properties supplied", "valid": true, "document": { "query": "agent-compose", "max_results": 3 } },
+      { "why": "the defaulted property omitted: a default makes it optional", "valid": true, "document": { "query": "agent-compose" } },
+      { "why": "`min_length: 1` refuses the empty string", "valid": false, "document": { "query": "", "max_results": 3 } },
+      { "why": "`minimum: 1` refuses zero", "valid": false, "document": { "query": "x", "max_results": 0 } },
+      { "why": "`maximum: 10` refuses eleven", "valid": false, "document": { "query": "x", "max_results": 11 } },
+      { "why": "an integer property refuses a fractional number", "valid": false, "document": { "query": "x", "max_results": 2.5 } },
+      { "why": "an integer-valued float is an integer", "valid": true, "document": { "query": "x", "max_results": 3.0 } }
+    ]
+  },
+  {
+    "golden": "review-loop",
+    "surface": "tool.web_search.output",
+    "about": "a bounded array of nested closed objects, with a `format` (grammar 3.4, 3.5)",
+    "documents": [
+      { "why": "one well-formed result", "valid": true, "document": { "results": [ { "title": "t", "url": "https://example.test/a", "snippet": "s" } ] } },
+      { "why": "an empty array is within the bound", "valid": true, "document": { "results": [] } },
+      { "why": "the nested object is closed too", "valid": false, "document": { "results": [ { "title": "t", "url": "https://example.test/a", "snippet": "s", "rank": 1 } ] } },
+      { "why": "a nested required property is missing", "valid": false, "document": { "results": [ { "title": "t", "url": "https://example.test/a" } ] } },
+      { "why": "`format: uri` refuses a bare word", "valid": false, "document": { "results": [ { "title": "t", "url": "not a url", "snippet": "s" } ] } },
+      { "why": "the array itself must be an array", "valid": false, "document": { "results": "one" } }
+    ]
+  },
+  {
+    "golden": "triage-fanout",
+    "surface": "agent.triage.output",
+    "about": "a discriminated union inside a bounded array (grammar 3.7, PRD 5.6)",
+    "documents": [
+      { "why": "one variant, fully supplied", "valid": true, "document": { "findings": [ { "kind": "auto_fixable", "file": "src/a.rs", "patch_hint": "swap the branches" } ] } },
+      { "why": "another variant, with its own enum", "valid": true, "document": { "findings": [ { "kind": "needs_human", "summary": "unclear", "severity": "high" } ] } },
+      { "why": "several variants in one array", "valid": true, "document": { "findings": [ { "kind": "duplicate", "of": "a" }, { "kind": "duplicate", "of": "b" } ] } },
+      { "why": "a tag the union does not declare", "valid": false, "document": { "findings": [ { "kind": "unheard_of", "file": "a.rs" } ] } },
+      { "why": "the payload of a different variant under this tag", "valid": false, "document": { "findings": [ { "kind": "auto_fixable", "summary": "unclear", "severity": "high" } ] } },
+      { "why": "the discriminator is missing", "valid": false, "document": { "findings": [ { "file": "src/a.rs", "patch_hint": "x" } ] } },
+      { "why": "a variant is closed like any object", "valid": false, "document": { "findings": [ { "kind": "duplicate", "of": "a", "why": "same stack" } ] } },
+      { "why": "an enum inside a variant is still an enum", "valid": false, "document": { "findings": [ { "kind": "needs_human", "summary": "unclear", "severity": "urgent" } ] } }
+    ]
+  },
+  {
+    "golden": "triage-fanout",
+    "surface": "store.docs.metadata_schema",
+    "about": "`format: date-time` reached through a nested surface (grammar 3.3, 11.1)",
+    "documents": [
+      { "why": "an RFC 3339 timestamp", "valid": true, "document": { "source": "docs/a.md", "updated_at": "2026-08-16T09:30:00Z" } },
+      { "why": "an offset instead of `Z`", "valid": true, "document": { "source": "docs/a.md", "updated_at": "2026-08-16T09:30:00+02:00" } },
+      { "why": "a date alone is not a date-time", "valid": false, "document": { "source": "docs/a.md", "updated_at": "2026-08-16" } },
+      { "why": "not a timestamp at all", "valid": false, "document": { "source": "docs/a.md", "updated_at": "yesterday" } }
+    ]
+  },
+  {
+    "golden": "triage-fanout",
+    "surface": "store.triage_memory.value_schema",
+    "about": "an integer with an inclusive lower bound (grammar 3.3)",
+    "documents": [
+      { "why": "the bound is inclusive", "valid": true, "document": { "last_report": "r", "patch_count": 0 } },
+      { "why": "above the bound", "valid": true, "document": { "last_report": "r", "patch_count": 12 } },
+      { "why": "below the bound", "valid": false, "document": { "last_report": "r", "patch_count": -1 } },
+      { "why": "a boolean is not an integer", "valid": false, "document": { "last_report": "r", "patch_count": true } }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "state.round",
+    "about": "`type: integer` — including where the two columns cannot agree, because the target cannot hold the number",
+    "documents": [
+      { "why": "an integer at the inclusive bound", "valid": true, "document": 0 },
+      { "why": "an ordinary integer", "valid": true, "document": 42 },
+      { "why": "an integer-valued float is an integer in JSON Schema and in Zod", "valid": true, "document": 3.0 },
+      { "why": "a fraction is not", "valid": false, "document": 2.5 },
+      { "why": "`minimum: 0` refuses a negative", "valid": false, "document": -1 },
+      { "why": "the largest integer JavaScript can count with", "valid": true, "document": 9007199254740991 },
+      {
+        "why": "one past it: JSON Schema says integer, `z.number().int()` says not one it can trust",
+        "valid": true,
+        "zod": false,
+        "divergence": "integer-beyond-the-safe-range",
+        "document": 9007199254740993
+      },
+      {
+        "why": "and far past it, where the value is exactly representable but no longer countable",
+        "valid": true,
+        "zod": false,
+        "divergence": "integer-beyond-the-safe-range",
+        "document": 1e30
+      }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "state.at",
+    "about": "`format: date-time` — RFC 3339 `date-time`, which is where `z.iso.datetime()` and JSON Schema part company",
+    "documents": [
+      { "why": "the canonical spelling", "valid": true, "document": "2026-08-16T09:30:00Z" },
+      { "why": "RFC 3339 §5.6 admits the lower-case separator and offset", "valid": true, "document": "2026-08-16t09:30:00z" },
+      { "why": "the offset alone in lower case", "valid": true, "document": "2026-08-16T09:30:00z" },
+      { "why": "a numeric offset east", "valid": true, "document": "2026-08-16T09:30:00+02:00" },
+      { "why": "and west, with minutes", "valid": true, "document": "2026-08-16T09:30:00-05:30" },
+      { "why": "fractional seconds", "valid": true, "document": "2026-08-16T09:30:00.250Z" },
+      { "why": "year zero is a date", "valid": true, "document": "0000-01-01T00:00:00Z" },
+      { "why": "the date half is calendar-checked: February has 29 days in a leap year", "valid": true, "document": "2024-02-29T00:00:00Z" },
+      { "why": "a century is not a leap year unless it is a multiple of 400", "valid": true, "document": "2000-02-29T00:00:00Z" },
+      { "why": "1900 is not", "valid": false, "document": "1900-02-29T00:00:00Z" },
+      { "why": "nor is 2026", "valid": false, "document": "2026-02-29T00:00:00Z" },
+      { "why": "no month has 30 days in February", "valid": false, "document": "2026-02-30T00:00:00Z" },
+      { "why": "month 13 does not exist", "valid": false, "document": "2026-13-01T00:00:00Z" },
+      { "why": "hour 24 does not exist", "valid": false, "document": "2026-08-16T24:00:00Z" },
+      { "why": "the offset is required", "valid": false, "document": "2026-08-16T09:30:00" },
+      { "why": "a space is not the separator", "valid": false, "document": "2026-08-16 09:30:00Z" },
+      { "why": "a date alone is not a date-time", "valid": false, "document": "2026-08-16" },
+      { "why": "neither is a time alone", "valid": false, "document": "T09:30:00Z" },
+      { "why": "an offset's hour is two digits", "valid": false, "document": "2026-08-16T09:30:00+2:00" },
+      { "why": "and below 24", "valid": false, "document": "2026-08-16T09:30:00+24:00" },
+      { "why": "a fraction with no digits is not a fraction", "valid": false, "document": "2026-08-16T09:30:00.Z" },
+      { "why": "not a timestamp at all", "valid": false, "document": "not a value" },
+      { "why": "the empty string is not one either", "valid": false, "document": "" },
+      { "why": "a leap second at the minute it happens", "valid": true, "document": "2026-08-16T23:59:60Z" },
+      { "why": "and at that minute expressed in another zone", "valid": true, "document": "2026-08-16T00:59:60+01:00" },
+      {
+        "why": "a leap second at a minute that never has one",
+        "valid": false,
+        "zod": true,
+        "divergence": "leap-second-away-from-midnight",
+        "document": "2026-08-16T12:00:60Z"
+      },
+      {
+        "why": "the same, written with an explicit zero offset",
+        "valid": false,
+        "zod": true,
+        "divergence": "leap-second-away-from-midnight",
+        "document": "2026-08-16T12:00:60+00:00"
+      }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "state.on_day",
+    "about": "`format: date` — an RFC 3339 `full-date`, calendar-checked",
+    "documents": [
+      { "why": "a calendar date", "valid": true, "document": "2026-08-16" },
+      { "why": "a leap day in a leap year", "valid": true, "document": "2024-02-29" },
+      { "why": "a leap day in a multiple-of-400 century", "valid": true, "document": "2000-02-29" },
+      { "why": "year zero", "valid": true, "document": "0000-01-01" },
+      { "why": "1900 is a century that is not a leap year", "valid": false, "document": "1900-02-29" },
+      { "why": "2026 is not a leap year", "valid": false, "document": "2026-02-29" },
+      { "why": "February never has 30 days", "valid": false, "document": "2026-02-30" },
+      { "why": "month 13 does not exist", "valid": false, "document": "2026-13-01" },
+      { "why": "nor does month 0", "valid": false, "document": "2026-00-01" },
+      { "why": "nor day 0", "valid": false, "document": "2026-01-00" },
+      { "why": "January has 31 days", "valid": false, "document": "2026-01-32" },
+      { "why": "the fields are zero-padded", "valid": false, "document": "2026-8-16" },
+      { "why": "the separators are required", "valid": false, "document": "20260816" },
+      { "why": "a trailing space is not part of a date", "valid": false, "document": "2026-08-16 " },
+      { "why": "a date-time is not a date", "valid": false, "document": "2026-08-16T09:30:00Z" }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "state.at_time",
+    "about": "`format: time` — RFC 3339 `full-time`, which requires an offset",
+    "documents": [
+      { "why": "`Z` is an offset", "valid": true, "document": "09:30:00Z" },
+      { "why": "so is its lower-case spelling", "valid": true, "document": "09:30:00z" },
+      { "why": "and so is `+02:00`", "valid": true, "document": "09:30:00+02:00" },
+      { "why": "fractional seconds are allowed", "valid": true, "document": "09:30:00.250Z" },
+      { "why": "no offset is not a full-time", "valid": false, "document": "09:30:00" },
+      { "why": "the hour is out of range", "valid": false, "document": "25:30:00Z" },
+      { "why": "so is the minute", "valid": false, "document": "09:60:00Z" },
+      { "why": "the fields are zero-padded", "valid": false, "document": "9:30:00Z" },
+      { "why": "an offset's hour is below 24", "valid": false, "document": "09:30:00+24:00" },
+      { "why": "not a time at all", "valid": false, "document": "half past nine" },
+      { "why": "a leap second at the minute it happens", "valid": true, "document": "23:59:60Z" },
+      { "why": "and at that minute in another zone", "valid": true, "document": "00:59:60+01:00" },
+      {
+        "why": "a leap second at a minute that never has one",
+        "valid": false,
+        "zod": true,
+        "divergence": "leap-second-away-from-midnight",
+        "document": "12:00:60Z"
+      }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "state.lasting",
+    "about": "`format: duration` — ISO 8601 in the emitted column, and RFC 3339's appendix-A subset of it in the published one",
+    "documents": [
+      { "why": "a day and two hours", "valid": true, "document": "P1DT2H" },
+      { "why": "seconds alone", "valid": true, "document": "PT30S" },
+      { "why": "every designator, in order", "valid": true, "document": "P1Y2M3DT4H5M6S" },
+      { "why": "weeks are their own form", "valid": true, "document": "P1W" },
+      { "why": "a date part and a time part with nothing skipped between them", "valid": true, "document": "P1YT1S" },
+      { "why": "`P` alone designates nothing", "valid": false, "document": "P" },
+      { "why": "nor does `PT`", "valid": false, "document": "PT" },
+      { "why": "a `T` with no time component", "valid": false, "document": "P1DT" },
+      { "why": "the designator is required", "valid": false, "document": "1D" },
+      { "why": "a time component outside the time part", "valid": false, "document": "P1S" },
+      { "why": "English is not ISO 8601", "valid": false, "document": "1 day" },
+      { "why": "a fraction on a component that is not the smallest one is not ISO 8601 either", "valid": false, "document": "P0.5DT1H" },
+      {
+        "why": "years and days with the months between them skipped: RFC 3339's appendix-A productions nest, so it has no spelling for one, and ISO 8601 does",
+        "valid": false,
+        "zod": true,
+        "divergence": "duration-is-iso-8601-not-rfc-3339",
+        "document": "P1Y1D"
+      },
+      {
+        "why": "and the same shape in the time part",
+        "valid": false,
+        "zod": true,
+        "divergence": "duration-is-iso-8601-not-rfc-3339",
+        "document": "PT1H1S"
+      },
+      {
+        "why": "a decimal fraction on the smallest component: ISO 8601 admits one and RFC 3339's `dur-second = 1*DIGIT \"S\"` does not",
+        "valid": false,
+        "zod": true,
+        "divergence": "duration-is-iso-8601-not-rfc-3339",
+        "document": "PT1.5S"
+      },
+      {
+        "why": "and with ISO 8601's other decimal separator",
+        "valid": false,
+        "zod": true,
+        "divergence": "duration-is-iso-8601-not-rfc-3339",
+        "document": "PT1,5S"
+      }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "state.who",
+    "about": "`format: email` — an RFC 5322 `addr-spec`, which is a good deal wider than `z.email()`",
+    "documents": [
+      { "why": "an ordinary address", "valid": true, "document": "someone@example.test" },
+      { "why": "a single-label domain is a domain", "valid": true, "document": "a@b" },
+      { "why": "dots and a plus in the local part", "valid": true, "document": "a.b+c@example.test" },
+      { "why": "every `atext` punctuation character", "valid": true, "document": "a!#$%&'*+-/=?^_`{|}~@example.test" },
+      { "why": "a quoted local part, where a space is legal", "valid": true, "document": "\"quoted local\"@example.test" },
+      { "why": "a quoted local part may hold the `@` that does not split it", "valid": true, "document": "\"a@b\"@example.test" },
+      { "why": "an IPv4 address literal", "valid": true, "document": "a@[192.0.2.1]" },
+      { "why": "an IPv6 address literal", "valid": true, "document": "a@[IPv6:::1]" },
+      { "why": "a dotted-quad domain is also a legal host name", "valid": true, "document": "a@192.0.2.1" },
+      { "why": "several labels", "valid": true, "document": "a@b.c.d.e.test" },
+      { "why": "a punycode domain whose payload decodes", "valid": true, "document": "a@xn--bcher-kva.test" },
+      { "why": "a non-ASCII local part is `atext`", "valid": true, "document": "üser@example.test" },
+      { "why": "a non-ASCII domain is not a host name; it has to be punycoded", "valid": false, "document": "a@exämple.test" },
+      { "why": "an address literal that is not an address", "valid": false, "document": "a@[999.0.2.1]" },
+      { "why": "no domain", "valid": false, "document": "someone@" },
+      { "why": "no local part", "valid": false, "document": "@example.test" },
+      { "why": "no at sign", "valid": false, "document": "someone" },
+      { "why": "an unquoted space", "valid": false, "document": "a b@example.test" },
+      { "why": "two at signs leave `a@` as the local part, which is not `atext`", "valid": false, "document": "a@@example.test" },
+      { "why": "a trailing root dot is not part of a host name", "valid": false, "document": "a@example.test." },
+      { "why": "a label may not start with a hyphen", "valid": false, "document": "a@-bad.test" },
+      { "why": "nor end with one", "valid": false, "document": "a@bad-.test" },
+      { "why": "an underscore is not a host-name character", "valid": false, "document": "a@ex_ample.test" },
+      { "why": "hyphens in the third and fourth positions are reserved for `xn--`", "valid": false, "document": "a@ab--cd.test" },
+      { "why": "an empty atom between two dots", "valid": false, "document": "a..b@example.test" },
+      { "why": "a leading dot leaves an empty atom", "valid": false, "document": ".a@example.test" },
+      { "why": "so does a trailing one", "valid": false, "document": "a.@example.test" },
+      { "why": "a local part is at most 64 characters", "valid": false, "document": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@example.test" },
+      {
+        "why": "a display name wrapping an address is a `name-addr`, not the `Mailbox` JSON Schema names",
+        "valid": true,
+        "zod": false,
+        "divergence": "display-name-is-not-an-addr-spec",
+        "document": "Name <a@example.test>"
+      },
+      {
+        "why": "a syntactically well-formed `xn--` label whose payload is not punycode",
+        "valid": false,
+        "zod": true,
+        "divergence": "punycode-payload-undecoded",
+        "document": "a@xn--a.test"
+      }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "state.where",
+    "about": "`format: uri` — an absolute RFC 3986 URI, which is not what `new URL()` means",
+    "documents": [
+      { "why": "an absolute https URL with a query", "valid": true, "document": "https://example.test/a?b=c" },
+      { "why": "every optional part at once", "valid": true, "document": "https://user:pw@example.test:8080/a/b?c=d#e" },
+      { "why": "an IP-literal authority", "valid": true, "document": "https://[2001:db8::1]/a" },
+      { "why": "a fragment may hold a `?`", "valid": true, "document": "https://example.test/#frag?x" },
+      { "why": "the scheme is case-insensitive", "valid": true, "document": "HTTP://EXAMPLE.TEST" },
+      { "why": "an empty authority and an empty path is still a URI", "valid": true, "document": "https://" },
+      { "why": "a scheme and nothing else", "valid": true, "document": "a:" },
+      { "why": "an opaque path", "valid": true, "document": "a:b" },
+      { "why": "another scheme entirely", "valid": true, "document": "mailto:someone@example.test" },
+      { "why": "and a non-hierarchical one", "valid": true, "document": "urn:isbn:0451450523" },
+      { "why": "a percent-encoded space", "valid": true, "document": "https://example.test/a%20b" },
+      { "why": "a raw space is not a URI character", "valid": false, "document": "https://example.test/a b" },
+      { "why": "neither is a non-ASCII one", "valid": false, "document": "http://example.test/é" },
+      { "why": "a truncated percent-encoding", "valid": false, "document": "https://example.test/a%2" },
+      { "why": "a backslash is not a URI character", "valid": false, "document": "https://example.test/a\\b" },
+      { "why": "nor is a pipe", "valid": false, "document": "https://example.test/a|b" },
+      { "why": "a non-ASCII authority has to be punycoded", "valid": false, "document": "https://exämple.test/" },
+      { "why": "a bare host is not a URI", "valid": false, "document": "example.test" },
+      { "why": "a relative reference is not a URI", "valid": false, "document": "/relative" },
+      { "why": "nor is a protocol-relative one", "valid": false, "document": "//example.test/a" },
+      { "why": "a scheme may not start with a digit", "valid": false, "document": "1http://example.test" },
+      { "why": "not a URI at all", "valid": false, "document": "not a uri" }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "state.which",
+    "about": "`format: uuid`",
+    "documents": [
+      { "why": "a version 4 UUID", "valid": true, "document": "3f2504e0-4f89-41d3-9a0c-0305e82c3301" },
+      { "why": "the nil UUID", "valid": true, "document": "00000000-0000-0000-0000-000000000000" },
+      { "why": "upper case is the same UUID", "valid": true, "document": "3F2504E0-4F89-41D3-9A0C-0305E82C3301" },
+      { "why": "a Microsoft GUID: the variant nibble is `c`, which RFC 9562's layout does not define and its string production does not constrain. `z.uuid()` refuses it, which is why `format: uuid` is written out rather than borrowed from that constructor", "valid": true, "document": "123e4567-e89b-12d3-c456-426614174000" },
+      { "why": "the other reserved variant nibble", "valid": true, "document": "123e4567-e89b-12d3-d456-426614174000" },
+      { "why": "version nibble 0, which no RFC 9562 version uses", "valid": true, "document": "123e4567-e89b-02d3-a456-426614174000" },
+      { "why": "version nibble 9, which no RFC 9562 version uses either", "valid": true, "document": "123e4567-e89b-92d3-a456-426614174000" },
+      { "why": "a hyphen out of place", "valid": false, "document": "3f2504e04f8941d39a0c0305e82c3301" },
+      { "why": "one hex digit too many", "valid": false, "document": "3f2504e0-4f89-41d3-9a0c-0305e82c33011" },
+      { "why": "`g` is not a hex digit", "valid": false, "document": "3f2504e0-4f89-41d3-9a0c-0305e82c330g" },
+      { "why": "the braced Microsoft spelling is a different string representation", "valid": false, "document": "{3f2504e0-4f89-41d3-9a0c-0305e82c3301}" },
+      { "why": "and so is the URN form", "valid": false, "document": "urn:uuid:3f2504e0-4f89-41d3-9a0c-0305e82c3301" },
+      { "why": "surrounding space is not trimmed", "valid": false, "document": " 3f2504e0-4f89-41d3-9a0c-0305e82c3301" },
+      { "why": "one hex digit short", "valid": false, "document": "3f2504e0-4f89-41d3-9a0c-0305e82c330" },
+      { "why": "not a UUID", "valid": false, "document": "nope" }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "state.host",
+    "about": "`format: hostname` — an RFC 1123 host name, where `z.hostname()` is looser than JSON Schema",
+    "documents": [
+      { "why": "a dotted hostname", "valid": true, "document": "api.example.test" },
+      { "why": "a single label", "valid": true, "document": "localhost" },
+      { "why": "one character is a label", "valid": true, "document": "x" },
+      { "why": "so is one digit", "valid": true, "document": "1" },
+      { "why": "a dotted quad is a legal host name", "valid": true, "document": "192.0.2.1" },
+      { "why": "many labels", "valid": true, "document": "a.b.c.d.e.f" },
+      { "why": "a 63-character label is the longest one", "valid": true, "document": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.test" },
+      { "why": "a punycode label whose payload decodes", "valid": true, "document": "xn--bcher-kva.test" },
+      { "why": "64 characters is one too many", "valid": false, "document": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.test" },
+      { "why": "the trailing root dot is not part of the name", "valid": false, "document": "example.test." },
+      { "why": "a label may not start with a hyphen", "valid": false, "document": "-bad.example.test" },
+      { "why": "nor end with one", "valid": false, "document": "bad-.example.test" },
+      { "why": "an underscore is not a host-name character", "valid": false, "document": "a_b.test" },
+      { "why": "hyphens in the third and fourth positions are reserved for `xn--`", "valid": false, "document": "ab--cd.test" },
+      { "why": "the `xn--` prefix is lower case", "valid": false, "document": "XN--bcher-kva.test" },
+      { "why": "a non-ASCII label has to be punycoded", "valid": false, "document": "exämple.test" },
+      { "why": "an empty label", "valid": false, "document": "example..test" },
+      { "why": "a leading dot is an empty label too", "valid": false, "document": ".example.test" },
+      { "why": "a space is not a hostname", "valid": false, "document": "not a host" },
+      { "why": "the empty string is not a hostname", "valid": false, "document": "" },
+      {
+        "why": "a syntactically well-formed `xn--` label whose payload is not punycode",
+        "valid": false,
+        "zod": true,
+        "divergence": "punycode-payload-undecoded",
+        "document": "xn--a.test"
+      }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "state.v4",
+    "about": "`format: ipv4`",
+    "documents": [
+      { "why": "a documentation address", "valid": true, "document": "192.0.2.1" },
+      { "why": "the unspecified address", "valid": true, "document": "0.0.0.0" },
+      { "why": "the broadcast address", "valid": true, "document": "255.255.255.255" },
+      { "why": "a leading zero is not a dotted quad", "valid": false, "document": "192.0.2.001" },
+      { "why": "an octet out of range", "valid": false, "document": "192.0.2.256" },
+      { "why": "three octets is not an address", "valid": false, "document": "192.0.2" }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "state.v6",
+    "about": "`format: ipv6`",
+    "documents": [
+      { "why": "a documentation address", "valid": true, "document": "2001:db8::1" },
+      { "why": "the loopback address", "valid": true, "document": "::1" },
+      { "why": "an IPv4-mapped address", "valid": true, "document": "::ffff:192.0.2.1" },
+      { "why": "upper case is the same address", "valid": true, "document": "2001:DB8::1" },
+      { "why": "two elisions", "valid": false, "document": "2001::db8::1" },
+      { "why": "an IPv4 address is not an IPv6 one", "valid": false, "document": "192.0.2.1" }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "state.slug",
+    "about": "`pattern` (RE2, Decision D12) beside the length bounds",
+    "documents": [
+      { "why": "lowercase with a hyphen", "valid": true, "document": "a-slug-2" },
+      { "why": "uppercase is not in the class", "valid": false, "document": "A-Slug" },
+      { "why": "it may not start with a digit", "valid": false, "document": "2slug" },
+      { "why": "`max_length: 64`", "valid": false, "document": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "state.mark",
+    "about": "`min_length`/`max_length` alone: both columns count Unicode code points, which is not what `.min()`/`.max()` count (grammar 3.4)",
+    "documents": [
+      { "why": "two characters is the lower bound", "valid": true, "document": "ab" },
+      { "why": "and four is the upper one", "valid": true, "document": "abcd" },
+      { "why": "one is below `min_length: 2`", "valid": false, "document": "a" },
+      { "why": "five is above `max_length: 4`", "valid": false, "document": "abcde" },
+      { "why": "one astral character is one code point, so it is below `min_length: 2` — `.min(2)` counts its two UTF-16 code units and would have accepted it", "valid": false, "document": "😀" },
+      { "why": "three astral characters are three code points, within `max_length: 4` — `.max(4)` counts their six code units and would have refused them", "valid": true, "document": "😀😀😀" },
+      { "why": "five are five code points, above the bound in both columns", "valid": false, "document": "😀😀😀😀😀" },
+      { "why": "a length bound is still a string check", "valid": false, "document": 12 }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "state.glyph",
+    "about": "`.` in a `pattern`: one code unit to the emitted JavaScript literal and one code point to the engine that reads the published schema, and a different set of line terminators excluded by each",
+    "documents": [
+      { "why": "one character, and the pattern is anchored to exactly one", "valid": true, "document": "a" },
+      { "why": "two is not one", "valid": false, "document": "ab" },
+      { "why": "and the empty string has none", "valid": false, "document": "" },
+      { "why": "a tab is not a line terminator in either column", "valid": true, "document": "\t" },
+      { "why": "one astral character is one code point and two UTF-16 code units, so a flagless `/^.$/` matches only half of it. The `u` flag that would fix it refuses escapes RE2 accepts, which is why `codegen::pattern` does not add one", "valid": true, "zod": false, "divergence": "dot-matches-a-code-unit", "document": "😀" },
+      { "why": "the one line terminator both columns exclude: ECMAScript's `.` stops at `\\n`, and so do RE2's and the validating engine's. It is what makes the three below a difference about *which* terminators rather than about terminators at all", "valid": false, "document": "\n" },
+      { "why": "a carriage return is a line terminator to ECMAScript and an ordinary character to the engine reading the published schema, so the emitted `/^.$/` refuses a document that schema accepts. No flag closes this one: `s` would make `.` match the `\\n` above, which is a different pattern from the one the author wrote", "valid": true, "zod": false, "divergence": "dot-excludes-a-line-terminator", "document": "\r" },
+      { "why": "U+2028 LINE SEPARATOR, the same way — written as an escape because the character itself is invisible here", "valid": true, "zod": false, "divergence": "dot-excludes-a-line-terminator", "document": "\u2028" },
+      { "why": "and U+2029 PARAGRAPH SEPARATOR", "valid": true, "zod": false, "divergence": "dot-excludes-a-line-terminator", "document": "\u2029" },
+      { "why": "a pattern is still a string check", "valid": false, "document": 1 }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "state.word",
+    "about": "`\\b` in a `pattern`: a word boundary over ASCII word characters in the emitted JavaScript literal, and over Unicode ones in the engine that reads the published schema",
+    "documents": [
+      { "why": "the word on its own, boundaries at both ends", "valid": true, "document": "cat" },
+      { "why": "a `pattern` is an unanchored search in both columns", "valid": true, "document": "the cat sat" },
+      { "why": "`!` is a non-word character in both columns, so the boundary holds", "valid": true, "document": "cat!" },
+      { "why": "an ASCII digit is a word character in both columns, so there is no boundary after `cat`", "valid": false, "document": "cat1" },
+      { "why": "`é` is a word character to the validating engine and not to ECMAScript, so the boundary holds only in the emitted column. This is `\\w`'s divergence in the one place the ECMAScript translation cannot reach: it rewrites the classes and leaves the boundary alone", "valid": false, "zod": true, "divergence": "word-boundary-is-unicode-aware", "document": "caté" },
+      { "why": "the same, on the leading boundary", "valid": false, "zod": true, "divergence": "word-boundary-is-unicode-aware", "document": "écat" },
+      { "why": "and outside Latin: `中` is a word character to the validating engine only", "valid": false, "zod": true, "divergence": "word-boundary-is-unicode-aware", "document": "cat中" },
+      { "why": "a pattern is still a string check", "valid": false, "document": 1 }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "state.digits",
+    "about": "the escapes and repetitions a `pattern` carries across, and what `\\d` means in each column",
+    "documents": [
+      { "why": "the counted repetitions match", "valid": true, "document": "123-4567" },
+      { "why": "one digit short", "valid": false, "document": "12-4567" },
+      { "why": "the pattern is anchored", "valid": false, "document": "x123-4567" },
+      { "why": "a JSON Schema `pattern` is ECMAScript, so `\\d` is `[0-9]` in both columns", "valid": false, "document": "١٢٣-٤٥٦٧" }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "state.anything",
+    "about": "the degenerate `pattern: \"\"`, which is `/(?:)/` and not the line comment `//`",
+    "documents": [
+      { "why": "an empty pattern matches everywhere, including in the empty string", "valid": true, "document": "" },
+      { "why": "and in anything else", "valid": true, "document": "anything at all" },
+      { "why": "it is still a string check", "valid": false, "document": 1 }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "state.tags",
+    "about": "`min_items`, `max_items` and `unique_items` on one array (grammar 3.5)",
+    "documents": [
+      { "why": "distinct elements within the bounds", "valid": true, "document": ["a", "b"] },
+      { "why": "`min_items: 1` refuses the empty array", "valid": false, "document": [] },
+      { "why": "`unique_items: true` refuses a repeat", "valid": false, "document": ["a", "a"] },
+      { "why": "`max_items: 8` refuses nine", "valid": false, "document": ["a", "b", "c", "d", "e", "f", "g", "h", "i"] }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "state.authors",
+    "about": "`unique_items` over an object item type: JSON Schema compares instances, not encodings (grammar 3.5)",
+    "documents": [
+      { "why": "two different authors", "valid": true, "document": [{ "name": "a", "rank": 1 }, { "name": "b", "rank": 2 }] },
+      { "why": "same name, different rank: not the same instance", "valid": true, "document": [{ "name": "a", "rank": 1 }, { "name": "a", "rank": 2 }] },
+      { "why": "the same instance twice", "valid": false, "document": [{ "name": "a", "rank": 1 }, { "name": "a", "rank": 1 }] },
+      {
+        "why": "the same instance twice, its keys written in opposite orders: `uniqueItems` compares instances, so this is one item — and the emitted helper compares encodings, which decides it the same way only because `.strict()` rebuilds each object in shape order before `.refine` sees it (see `codegen::schema`). This is the document that fails if a Zod release ever stops doing that",
+        "valid": false,
+        "document": [{ "name": "a", "rank": 1 }, { "name": "a", "rank": 1 }],
+        "as_written": "[{\"name\":\"a\",\"rank\":1},{\"rank\":1,\"name\":\"a\"}]"
+      },
+      { "why": "`max_items: 4` refuses five", "valid": false, "document": [{ "name": "a", "rank": 1 }, { "name": "b", "rank": 2 }, { "name": "c", "rank": 3 }, { "name": "d", "rank": 4 }, { "name": "e", "rank": 5 }] },
+      { "why": "an item at the wrong shape", "valid": false, "document": [{ "name": "a" }] }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "state.visits",
+    "about": "`unique_items` over items carrying a `default:`, which is where comparing parsed elements and comparing instances part company (grammar 3.5, 3.6)",
+    "documents": [
+      { "why": "two different pages", "valid": true, "document": [{ "page": "/" }, { "page": "/help" }] },
+      { "why": "one page reached two ways: the defaulted property is written out on both, and differs", "valid": true, "document": [{ "page": "/", "via": "link" }, { "page": "/", "via": "direct" }] },
+      { "why": "the same instance twice", "valid": false, "document": [{ "page": "/" }, { "page": "/" }] },
+      { "why": "one item omits `via` and the other writes out the value `via` defaults to: two instances to JSON Schema, and one object each by the time `.refine` sees them, because the parse has filled the first one in", "valid": true, "zod": false, "divergence": "omitted-default-is-the-same-item", "document": [{ "page": "/" }, { "page": "/", "via": "direct" }] },
+      { "why": "`max_items: 4` refuses five", "valid": false, "document": [{ "page": "/a" }, { "page": "/b" }, { "page": "/c" }, { "page": "/d" }, { "page": "/e" }] },
+      { "why": "an item missing the property that is not defaulted", "valid": false, "document": [{ "via": "direct" }] },
+      { "why": "items are closed like any object (D8)", "valid": false, "document": [{ "page": "/", "via": "direct", "extra": 1 }] }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "state.ratio",
+    "about": "the exclusive numeric bounds (grammar 3.3)",
+    "documents": [
+      { "why": "strictly between", "valid": true, "document": 0.5 },
+      { "why": "the lower bound is exclusive", "valid": false, "document": 0 },
+      { "why": "the upper bound is exclusive", "valid": false, "document": 1 }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "state.step",
+    "about": "`multiple_of` on a fractional step (grammar 3.3)",
+    "documents": [
+      { "why": "a multiple of the step", "valid": true, "document": 1.5 },
+      { "why": "zero is a multiple of everything", "valid": true, "document": 0 },
+      { "why": "not a multiple", "valid": false, "document": 0.3 },
+      { "why": "outside the range", "valid": false, "document": 2 }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "state.cadence",
+    "about": "`multiple_of` on a step no double holds exactly, and unbounded — where the two columns divide differently (grammar 3.3)",
+    "documents": [
+      { "why": "zero is a multiple of everything", "valid": true, "document": 0 },
+      { "why": "the step itself", "valid": true, "document": 0.3 },
+      { "why": "three of them: `0.9 / 0.3` is `2.9999999999999996` in doubles, which both columns still call a multiple", "valid": true, "document": 0.9 },
+      { "why": "a large multiple that is still exact enough to divide", "valid": true, "document": 100.2 },
+      { "why": "half a step off", "valid": false, "document": 0.5 },
+      { "why": "and a whole unit off", "valid": false, "document": 1 },
+      { "why": "a large value whose quotient is still precise enough to fail", "valid": false, "document": 1e14 },
+      {
+        "why": "past a quotient of 2^51 the emitted tolerance covers a whole step, so nothing can fail there",
+        "valid": false,
+        "zod": true,
+        "divergence": "multiple-of-under-a-scaled-tolerance",
+        "document": 1e15
+      }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "state.origin",
+    "about": "a discriminated union in the property position rather than as `items:` (grammar 3.7)",
+    "documents": [
+      { "why": "one variant", "valid": true, "document": { "source": { "kind": "upload", "filename": "a.txt" } } },
+      { "why": "the other, with its own constraints", "valid": true, "document": { "source": { "kind": "crawl", "url": "https://example.test/a", "depth": 0 } } },
+      { "why": "a tag the union does not declare", "valid": false, "document": { "source": { "kind": "paste", "text": "x" } } },
+      { "why": "a variant's own constraint still applies", "valid": false, "document": { "source": { "kind": "crawl", "url": "not a uri", "depth": 0 } } }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "state.author",
+    "about": "`optional:` on a nested object (Decision D7)",
+    "documents": [
+      { "why": "only the required property", "valid": true, "document": { "name": "someone" } },
+      { "why": "an optional one supplied", "valid": true, "document": { "name": "someone", "email": "someone@example.test" } },
+      { "why": "the required one missing", "valid": false, "document": { "email": "someone@example.test" } },
+      { "why": "an optional property is still type-checked when present", "valid": false, "document": { "name": "someone", "email": "not an email" } }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "tool.ping.input",
+    "about": "an empty field map: a closed object with no properties (grammar 3.1)",
+    "documents": [
+      { "why": "nothing at all", "valid": true, "document": {} },
+      { "why": "closed means closed", "valid": false, "document": { "anything": 1 } }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "flow.shape.node.recall.output",
+    "about": "a store op's derived result: `search` over a `vector` store, bounded by the node's own `top_k` (grammar 11.4, Decision D34)",
+    "documents": [
+      {
+        "why": "one match carrying the store's `metadata_schema`",
+        "valid": true,
+        "document": { "matches": [{ "id": "a", "score": 0.5, "text": "hit", "metadata": { "source": "docs", "updated_at": "2026-08-17T09:30:00Z" } }] }
+      },
+      { "why": "no match at all is still the shape", "valid": true, "document": { "matches": [] } },
+      {
+        "why": "`top_k: 3` is the array's bound, so four is out of range",
+        "valid": false,
+        "document": { "matches": [
+          { "id": "a", "score": 0.5, "text": "1", "metadata": { "source": "d", "updated_at": "2026-08-17T09:30:00Z" } },
+          { "id": "b", "score": 0.4, "text": "2", "metadata": { "source": "d", "updated_at": "2026-08-17T09:30:00Z" } },
+          { "id": "c", "score": 0.3, "text": "3", "metadata": { "source": "d", "updated_at": "2026-08-17T09:30:00Z" } },
+          { "id": "d", "score": 0.2, "text": "4", "metadata": { "source": "d", "updated_at": "2026-08-17T09:30:00Z" } }
+        ] }
+      },
+      {
+        "why": "the store's own metadata constraint still applies inside the derived shape",
+        "valid": false,
+        "document": { "matches": [{ "id": "a", "score": 0.5, "text": "hit", "metadata": { "source": "docs", "updated_at": "yesterday" } }] }
+      },
+      {
+        "why": "a match is missing `metadata`, which this store declares",
+        "valid": false,
+        "document": { "matches": [{ "id": "a", "score": 0.5, "text": "hit" }] }
+      }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "flow.shape.node.probe.output",
+    "about": "the kind default of an inline `exec:` node that declares no `output:` (grammar 8.2)",
+    "documents": [
+      { "why": "the envelope the default names", "valid": true, "document": { "exit_code": 0, "stdout": "ok\n" } },
+      { "why": "a non-zero status is still the envelope's shape", "valid": true, "document": { "exit_code": 2, "stdout": "" } },
+      { "why": "`exit_code` is an integer, not the string a shell prints", "valid": false, "document": { "exit_code": "0", "stdout": "" } },
+      { "why": "both fields are required: the default declares no optional half", "valid": false, "document": { "exit_code": 0 } },
+      { "why": "a synthesized field map is closed like any other (D8)", "valid": false, "document": { "exit_code": 0, "stdout": "", "stderr": "" } }
+    ]
+  },
+  {
+    "golden": "every-schema-form",
+    "surface": "flow.shape.node.notify.output",
+    "about": "the kind default of an inline `http:` node that declares no `output:` (grammar 8.3)",
+    "documents": [
+      { "why": "the envelope the default names", "valid": true, "document": { "status": 200, "body": "{}" } },
+      { "why": "`body` is the raw text, whatever the response carried", "valid": true, "document": { "status": 204, "body": "" } },
+      { "why": "`status` is an integer", "valid": false, "document": { "status": "200", "body": "" } },
+      { "why": "`body` is not decoded, so an object is the wrong type here", "valid": false, "document": { "status": 200, "body": { "ok": true } } },
+      { "why": "both fields are required", "valid": false, "document": { "status": 200 } }
+    ]
+  }
+]

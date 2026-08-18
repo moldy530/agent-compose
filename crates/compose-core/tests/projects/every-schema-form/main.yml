@@ -1,0 +1,266 @@
+# A codegen shape fixture: every form of grammar 3, every reduce policy of
+# grammar 10.2, and every `format:` of grammar 3.3, in one composition.
+#
+# `examples/` is the worked reference and is written to be *read*; this file is
+# written to be *emitted*. Between them the two examples reach maybe half of the
+# schema language, so a golden built only from them would leave `z.hostname()`,
+# `z.iso.duration()`, a `merge` channel's `Partial<…>`, a `unique_items` refine
+# and an empty field map unchecked against the real Zod — every one of which is a
+# spelling this compiler could get wrong in a way only a type-checker or a parse
+# would notice.
+#
+# It is deliberately the smallest graph that carries all of it: one flow, one
+# agent, one store, one tool. What is being covered here is the schema language,
+# not the topology.
+version: "0.1"
+
+state:
+  # Unreduced, no default: LangGraph's `LastValue`, unset until written (D78).
+  draft: { type: string }
+  # Unreduced with a default, which needs an initial value and so a reducer.
+  round: { type: integer, default: 1, minimum: 0, multiple_of: 1 }
+  # The three declared policies.
+  notes:
+    description: One element per write, in canonical write order.
+    type: array
+    max_items: 32
+    items: { type: string }
+    reduce: append
+  totals:
+    description: Partial until every property has been supplied (D101).
+    type: object
+    properties:
+      fixed: { type: integer }
+      skipped: { type: integer }
+    reduce: merge
+  latest: { type: string, reduce: last_wins, default: "" }
+  # A merge channel with a default is total from step 0.
+  seen:
+    type: object
+    properties:
+      count: { type: integer, minimum: 0 }
+    reduce: merge
+    default: { count: 0 }
+
+  # Every `format:` of grammar 3.3, on an input surface so a `default:` is legal
+  # beside one where it is interesting.
+  at:        { type: string, format: date-time }
+  on_day:    { type: string, format: date }
+  at_time:   { type: string, format: time }
+  lasting:   { type: string, format: duration }
+  who:       { type: string, format: email }
+  where:     { type: string, format: uri }
+  which:     { type: string, format: uuid }
+  host:      { type: string, format: hostname }
+  v4:        { type: string, format: ipv4 }
+  v6:        { type: string, format: ipv6 }
+
+  # The rest of the constraint vocabulary.
+  slug:      { type: string, pattern: "^[a-z][a-z0-9-]*$", min_length: 1, max_length: 64 }
+  # RE2 is not a subset of ECMAScript, so `pattern:` is a lowering rather than a
+  # copy: these two are the corners of it. `\d` and a counted repetition are the
+  # vocabulary that transfers, and `\d` means the ASCII digits in *both* columns
+  # — a JSON Schema `pattern` is ECMAScript by definition. The empty pattern is
+  # the degenerate one: `//` is a line comment, so it emits `/(?:)/`.
+  digits:    { type: string, pattern: "^\\d{3}-\\d{4}$" }
+  anything:  { type: string, pattern: "" }
+  # A `.` is where the two columns cannot agree, in two independent ways. The
+  # emitted literal carries no `u` flag, so `.` is one UTF-16 code unit there and
+  # one code point in the validator's engine (`dot-matches-a-code-unit`); and
+  # ECMAScript's `.` excludes every line terminator where RE2's and the
+  # validator's exclude `\n` alone (`dot-excludes-a-line-terminator`), which no
+  # flag would fix.
+  glyph:     { type: string, pattern: "^.$" }
+  # `\b` is the other one. Both engines have a word boundary and they disagree
+  # about what a word character is at it: ECMAScript's is ASCII, the validating
+  # engine keeps Rust's Unicode one — which is exactly what `\w`, `\d` and `\s`
+  # do *not* do, because the translation that makes those agree rewrites the
+  # classes and leaves the boundary alone. Declared as
+  # `word-boundary-is-unicode-aware`.
+  word:      { type: string, pattern: "\\bcat\\b" }
+  # The length bounds, on a channel with no `pattern:` to hide them behind:
+  # `minLength`/`maxLength` count code points, which is neither what `.min()`
+  # nor what `.max()` counts, so one astral character tells the two spellings
+  # apart in both directions.
+  mark:      { type: string, min_length: 2, max_length: 4 }
+  ratio:     { type: number, exclusive_minimum: 0, exclusive_maximum: 1 }
+  step:      { type: number, minimum: -1.5, maximum: 1.5, multiple_of: 0.5 }
+  # `multiple_of` on a step binary floating point cannot hold, with no bound to
+  # keep the quotient small. `step` above is exact in both columns twice over —
+  # 0.5 is a power of two and `maximum: 1.5` caps the quotient at 3 — so it
+  # cannot reach the place the two columns divide: the JSON column divides
+  # exactly (`0.3` is 3/10) and `.multipleOf(0.3)` divides in doubles and admits
+  # a tolerance that scales with the quotient. Declared as
+  # `multiple-of-under-a-scaled-tolerance`.
+  cadence:   { type: number, multiple_of: 0.3 }
+  urgent:    { type: boolean, default: false }
+  mood:      { enum: [calm, brisk], default: calm }
+  tags:
+    type: array
+    min_items: 1
+    max_items: 8
+    unique_items: true
+    items: { type: string }
+  # `unique_items` over something other than a scalar. JSON Schema's
+  # `uniqueItems` compares *instances*, so two objects carrying the same
+  # properties are one item however their keys were ordered — which is a
+  # different rule from "different JSON text" and the one the emitted helper
+  # has to implement.
+  authors:
+    type: array
+    max_items: 4
+    unique_items: true
+    items:
+      type: object
+      properties:
+        name: { type: string }
+        rank: { type: integer }
+  # `unique_items` over items one of whose properties carries a `default:`. Two
+  # items that differ only in omitting it are two instances to JSON Schema and
+  # one value after the parse fills it in, which is the one shape where the two
+  # columns cannot agree — declared as `omitted-default-is-the-same-item`.
+  visits:
+    type: array
+    max_items: 4
+    unique_items: true
+    items:
+      type: object
+      properties:
+        page: { type: string }
+        via:  { type: string, default: direct }
+  author:
+    type: object
+    properties:
+      name:  { type: string }
+      email: { type: string, format: email }
+      home:  { type: string, format: uri }
+    optional: [email, home]
+  # A union as a property type rather than as an array's `items:`, which is the
+  # other legal position (grammar 3.7).
+  origin:
+    type: object
+    properties:
+      source:
+        discriminator: kind
+        variants:
+          upload: { filename: { type: string } }
+          crawl:  { url: { type: string, format: uri }, depth: { type: integer, minimum: 0 } }
+
+provider.p:
+  kind: openai_compatible
+  api_key: ${SHAPES_KEY}
+  base_url: ${SHAPES_URL}
+
+model.m:
+  provider: provider.p
+  id: a-model
+
+# An empty input and an empty output: both legal on a tool, and both a closed
+# object with no properties (grammar 3.1, 3.9).
+tool.ping:
+  description: Has an effect and no arguments.
+  input: {}
+  output: {}
+  exec:
+    command: "true"
+
+store.notes:
+  kind: kv
+  scope: execution
+  description: What has been noted.
+  value_schema:
+    body:   { type: string }
+    weight: { type: number, minimum: 0 }
+
+store.docs:
+  kind: vector
+  scope: global
+  description: Documents to ground against.
+  embed:
+    model: text-embedding-3-small
+    provider: provider.p
+    dimensions: 8
+  metadata_schema:
+    source:     { type: string }
+    updated_at: { type: string, format: date-time }
+
+agent.shaper:
+  description: Produces one of everything.
+  model: model.m
+  prompt: Produce a shape.
+  input:
+    goal: { type: string, description: What to shape. }
+  output:
+    draft: { type: string, min_length: 1 }
+    findings:
+      description: A union inside a bounded array, the fan-out shape.
+      type: array
+      max_items: 16
+      items:
+        discriminator: kind
+        variants:
+          auto_fixable:
+            file:       { type: string }
+            confidence: { type: number, minimum: 0, maximum: 1 }
+          needs_human:
+            summary:  { type: string }
+            severity: { enum: [low, high, critical] }
+    author:
+      type: object
+      properties:
+        name:  { type: string }
+        email: { type: string, format: email }
+      optional: [email]
+
+flow.shape:
+  description: One pass over the shaper.
+  inputs:
+    goal: { type: string, min_length: 1 }
+  outputs:
+    draft: { type: string }
+    notes:
+      type: array
+      max_items: 32
+      items: { type: string }
+  nodes:
+    shape:
+      agent: agent.shaper
+      input:
+        goal: "input.goal"
+    ask:
+      human:
+        input:
+          draft: { type: string }
+        output:
+          decision: { enum: [approve, reject] }
+    # Two inline nodes that declare no `output:`. That is not "no result
+    # schema": it is the kind default — `{exit_code, stdout}` for `exec:`
+    # (grammar 8.2) and `{status, body}` for `http:` (grammar 8.3) — which the
+    # validator resolves and the emitter therefore has to emit. Nothing in
+    # `examples/` reaches this shape: every inline node there writes `output:`
+    # out.
+    probe:
+      exec:
+        command: "true"
+    notify:
+      http:
+        method: POST
+        url: "https://example.test/notify"
+        body:
+          latest: "state.latest"
+    # A store op's result is derived from the op and the store rather than
+    # written anywhere (grammar 11.4, Decision D34), and `search` is the richest
+    # row: an array of matches bounded by this node's own `top_k`, each carrying
+    # the store's `metadata_schema` inline.
+    recall:
+      store: store.docs
+      op: search
+      query: "state.latest"
+      top_k: 3
+  edges:
+    - { from: start, to: shape }
+    - { from: shape, to: ask }
+    - { from: ask, to: probe }
+    - { from: probe, to: notify }
+    - { from: notify, to: recall }
+    - { from: recall, to: end }

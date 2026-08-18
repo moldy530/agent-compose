@@ -36,6 +36,13 @@ serde_json = "1"
 # grammar 4.1 puts on the supported surface; `chrono` is off because no surface
 # in this grammar produces a timestamp or a duration value.
 cel = { version = "=0.14.3", default-features = false, features = ["regex"] }
+# The RE2 front-end, used for `pattern:` only (grammar 3.3, Decision D12).
+# Codegen has to decide whether a pattern can be a *JavaScript* regular
+# expression before it emits one, and that is a question about the pattern's
+# constructs rather than about the strings it matches — an AST, not an engine.
+# `regex` already carries this crate, so it is a name for something the tree
+# holds either way rather than a new dependency.
+regex-syntax = { version = "0.8", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 # Schema-conformance harness only: the compiler itself does not depend on a

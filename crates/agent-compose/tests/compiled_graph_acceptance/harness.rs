@@ -16,14 +16,19 @@
 //! can get wrong in ways an output assertion cannot see, and the mock refuses
 //! anything a real provider would refuse (see `crates/mock-provider`).
 //!
-//! # These commands do not exist yet
+//! # Which of these commands exist
 //!
-//! `build`, `run`, and `serve` are M1's own deliverables (PRD §7 M1). Every
-//! helper below shells out to the **real** CLI, so today they fail with clap's
-//! "unrecognized subcommand" and the tests that call them are `#[ignore]`d with
-//! the reason naming what must land first. That is deliberate: un-ignoring is
-//! the definition of done, and a harness of stubs would let a test pass against
-//! a stub.
+//! `build`, `run`, and `serve` are M1's own deliverables (PRD §7 M1), and they
+//! land one at a time. **`build` exists**: [`build`] shells out to it and the
+//! tests that call it run. `run` and `serve` do not yet, so [`run`] and
+//! [`serve`] still fail with clap's "unrecognized subcommand" and every test
+//! calling them is `#[ignore]`d with the reason naming what must land first.
+//!
+//! Every helper below shells out to the **real** CLI either way — there are no
+//! stubs here, deliberately: un-ignoring is the definition of done, and a
+//! harness of stubs would let a test pass against a stub. This paragraph is part
+//! of that contract, so a PR that lands `run` or `serve` edits it in the same
+//! commit that un-ignores their tests.
 //!
 //! # Interface assumptions
 //!

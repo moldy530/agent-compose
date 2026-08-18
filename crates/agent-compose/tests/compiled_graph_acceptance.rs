@@ -508,8 +508,120 @@ fn a_scripted_delay_makes_completion_order_differ_from_item_order() {
 }
 
 // ---------------------------------------------------------------------------
-// PRD §7 M1, bullet 1 — "IR → deterministic LangGraph TypeScript". Pending.
+// PRD §7 M1, bullet 1 — "IR → deterministic LangGraph TypeScript".
+// The state model has landed; everything below it is pending.
 // ---------------------------------------------------------------------------
+
+/// Every `state:` channel reaches the emitted state model with its declared
+/// type, its `default:` as an initial value, and its `reduce:` policy as a
+/// reducer (grammar 10.1, 10.2, 7.6.4).
+///
+/// This is the emission half of "state models", decided through the real
+/// command. The other half — that those channel specs *behave* — is
+/// `compose-core`'s `tests/generated_code_gates.rs`, which invokes the compiled
+/// graph under the pinned LangGraph and compares the state at quiescence against
+/// what the policies say (`the_emitted_state_model_reduces_the_way_its_policies_say`).
+/// What neither can reach from here is the third half, which
+/// `state_channels_carry_their_declared_types_and_defaults` names: a *flow*
+/// returning them, which needs `agent-compose run`.
+#[test]
+fn the_state_model_carries_every_channels_type_default_and_reduce_policy() {
+    let built = harness::build("agent-anthropic", "local");
+    built.succeeded();
+    let state = built.read("src/state.ts");
+    let schemas = built.read("src/schemas.ts");
+
+    // Two defaulted channels of different types: the typed default is the
+    // literal the spec wrote, not its string spelling.
+    assert!(
+        state.contains("default: () => \"approve\","),
+        "the enum channel's `default: approve` is its initial value:\n{state}"
+    );
+    assert!(
+        state.contains("default: () => 1,"),
+        "the integer channel's default is the number `1`, not `\"1\"`:\n{state}"
+    );
+    assert!(
+        state.contains("default: () => \"none yet\","),
+        "the string channel's default is its initial value:\n{state}"
+    );
+
+    // `reduce: append` is the one policy whose update type differs from the
+    // channel type: a write supplies one element (grammar 10.2, D58), and the
+    // channel starts at the policy's identity element rather than unset.
+    assert!(
+        state.contains(
+            "notes: Annotation<z.infer<typeof stateNotes>, z.infer<typeof stateNotes>[number]>({"
+        ),
+        "an `append` channel takes one element per write:\n{state}"
+    );
+    assert!(
+        state.contains("reducer: (left, right) => left.concat([right]),"),
+        "and appends it in write order:\n{state}"
+    );
+    assert!(
+        state.contains("default: () => [],"),
+        "starting from the empty array:\n{state}"
+    );
+
+    // The declared type is the schema, not a restatement of it.
+    assert!(
+        schemas.contains("export const stateVerdict = z.enum([\"approve\", \"revise\"])"),
+        "the channel's type is lowered per grammar 3.8:\n{schemas}"
+    );
+    assert!(
+        schemas.contains(".default(\"approve\");"),
+        "carrying its `default:` into the schema as well as into the channel:\n{schemas}"
+    );
+    assert!(
+        schemas.contains("export const stateNotes = z.array(z.string()).max(8)"),
+        "including the array's bound:\n{schemas}"
+    );
+}
+
+/// A tagged union reaches the emitted schemas as a `z.discriminatedUnion` whose
+/// variants are narrowed one by one and closed (PRD 5.2, grammar 3.7).
+///
+/// The emission half of the same criterion, over the shape the fan-out example
+/// is built on. That the schema then *refuses* a tag it does not declare is
+/// `compose-core`'s `the_emitted_zod_agrees_with_the_json_schema_lowering`, which
+/// runs exactly that document through both columns of grammar 3.8's table; that
+/// the refusal becomes a *run* failure naming the tag is what
+/// `a_tagged_union_output_is_narrowed_per_variant_and_a_bad_tag_is_rejected`
+/// waits on a node function for.
+#[test]
+fn a_tagged_union_output_is_emitted_as_a_discriminated_union_narrowed_per_variant() {
+    let built = harness::build("fanout", "local");
+    built.succeeded();
+    let schemas = built.read("src/schemas.ts");
+
+    assert!(
+        schemas.contains("z.discriminatedUnion(\"kind\", ["),
+        "the union is discriminated on its declared tag field:\n{schemas}"
+    );
+    for (tag, field) in [
+        ("auto_fixable", "hint: z.string()"),
+        ("needs_human", "severity: z.enum(["),
+    ] {
+        let variant = format!("kind: z.literal(\"{tag}\"),");
+        assert!(
+            schemas.contains(&variant),
+            "the variant `{tag}` is pinned to its tag:\n{schemas}"
+        );
+        let payload = schemas
+            .split(&variant)
+            .nth(1)
+            .expect("the variant was just found");
+        let payload = payload
+            .split("}).strict()")
+            .next()
+            .expect("a closed variant");
+        assert!(
+            payload.contains(field),
+            "and carries its own payload `{field}`, not another variant's:\n{payload}"
+        );
+    }
+}
 
 /// State channels carry their declared types, defaults, and reduce policies into
 /// the running graph.
@@ -521,8 +633,14 @@ fn a_scripted_delay_makes_completion_order_differ_from_item_order() {
 /// `none yet` are the defaults. `round` and `notes` are written by nothing, so
 /// the only thing that can produce them is the declaration: an `integer`
 /// default, and an `append` channel's identity element (grammar 10.1).
+///
+/// `build` now emits that state model, and `compose-core`'s
+/// `tests/generated_code_gates.rs` constructs it under the pinned LangGraph on
+/// every `cargo test`. What this test adds is the half only a run can show — that
+/// the declared defaults are what a flow *returns* — so its reason names the
+/// command it waits on rather than the emission that has landed.
 #[test]
-#[ignore = "pending: `agent-compose build` must emit the state model, and `run` must execute it"]
+#[ignore = "pending: `agent-compose run` must execute the emitted graph"]
 fn state_channels_carry_their_declared_types_and_defaults() {
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue(Script::new(
@@ -558,8 +676,15 @@ fn state_channels_carry_their_declared_types_and_defaults() {
 
 /// A tagged-union output is narrowed per variant, and a response carrying a tag
 /// the schema does not declare is rejected before any edge is evaluated.
+///
+/// The `z.discriminatedUnion` this needs is emitted, and `compose-core`'s
+/// `tests/generated_code_gates.rs` runs a corpus through it that includes this
+/// very refusal — a tag the union does not declare, rejected by both the emitted
+/// Zod and the JSON Schema the same lowering produces. What is left is the node
+/// function that parses a model's answer with it, which is what makes the
+/// refusal a *run* failure naming the tag.
 #[test]
-#[ignore = "pending: codegen must emit Zod discriminated unions for tagged-union outputs"]
+#[ignore = "pending: an agent node fn must parse its answer with the emitted union schema"]
 fn a_tagged_union_output_is_narrowed_per_variant_and_a_bad_tag_is_rejected() {
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue_all([
@@ -1371,8 +1496,15 @@ fn a_condition_outside_route_on_fails_the_node_instead_of_failing_over() {
 /// A missing env ref fails at process start, naming the variable — never at the
 /// first model call, and never with a key baked into the generated code
 /// (PRD 5.9).
+///
+/// The emitted `src/env.ts` already does this, and
+/// `compose-core`'s `the_generated_project_checks_its_environment_when_it_is_loaded`
+/// decides it on every `cargo test` by loading a built project with the
+/// variables removed. What this one adds is the *run*: that the check is what a
+/// started execution hits, before the first model call — which needs a command
+/// that starts one.
 #[test]
-#[ignore = "pending: generated code must check env-ref presence at process start"]
+#[ignore = "pending: `agent-compose run` must execute the emitted graph"]
 fn a_missing_env_ref_fails_at_process_start_naming_the_variable() {
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue(Script::new(SONNET, Outcome::text("never reached")));
@@ -1400,12 +1532,12 @@ fn a_missing_env_ref_fails_at_process_start_naming_the_variable() {
 }
 
 // ---------------------------------------------------------------------------
-// PRD §7 M1, bullet 2 — build, run, serve, golden files. Pending.
+// PRD §7 M1, bullet 2 — build, run, serve, golden files.
+// `build` has landed, goldens with it; `run` and `serve` are pending.
 // ---------------------------------------------------------------------------
 
 /// `agent-compose build` writes a TypeScript project for the selected target.
 #[test]
-#[ignore = "pending: `agent-compose build` must exist"]
 fn build_writes_a_typescript_project_for_the_target() {
     for name in harness::FIXTURES {
         let built = harness::build(name, "local");
@@ -1437,11 +1569,12 @@ fn build_writes_a_typescript_project_for_the_target() {
 ///
 /// This is the machine-checkable half of "golden-file codegen tests". The other
 /// half — goldens committed to the repository and reviewed in PRs like any other
-/// code (CLAUDE.md) — belongs to the codegen PR that has output to commit; what
-/// makes those goldens *mean* anything is the determinism asserted here, because
-/// a regeneration diff is only signal if identical input regenerates identically.
+/// code (CLAUDE.md) — lives in `compose-core`'s
+/// `tests/generated_project_goldens.rs`, where the emitted bytes for both worked
+/// examples are committed under `tests/goldens/`. What makes those goldens *mean*
+/// anything is the determinism asserted here, because a regeneration diff is only
+/// signal if identical input regenerates identically.
 #[test]
-#[ignore = "pending: `agent-compose build` must exist"]
 fn build_is_byte_identical_for_byte_identical_input() {
     for name in harness::FIXTURES {
         let first = harness::build(name, "local");
@@ -1608,8 +1741,24 @@ fn serve_resumes_an_interrupted_execution_against_the_human_nodes_schema() {
 
 /// Every generated project type-checks and constructs its graph under the pinned
 /// LangGraph version (CLAUDE.md, *Generated-code checks*).
+///
+/// Two things about this test changed when `build` landed, and both are
+/// interface assumptions the harness header says a codegen PR may fix here:
+///
+/// * the module is `src/graph.ts`, not `./graph.js`. The emitted project has **no
+///   build step** — Node has stripped types natively since 22.18, so the
+///   TypeScript in `src/` is what runs — and a `.js` at the root would have had
+///   to come from a `tsc` emit `--noEmit` never performs. See the generated
+///   `README.md`, which documents the layout.
+/// * the reason names what is actually missing. `build` exists, the pinned
+///   toolchain exists, and `compose-core`'s `tests/generated_code_gates.rs`
+///   already runs *this* pair of checks — `tsc --noEmit` and construction under
+///   the pinned LangGraph — over the committed golden corpus on every `cargo
+///   test`. What is left is the subject: `src/graph.ts` builds no topology yet,
+///   so "constructs its graph" is not a claim this milestone can make until the
+///   flows are assembled into it.
 #[test]
-#[ignore = "pending: `agent-compose build` must exist, and the pinned LangGraph toolchain with it"]
+#[ignore = "pending: codegen must assemble the flows into `src/graph.ts`"]
 fn every_generated_project_type_checks_and_constructs_its_graph() {
     for name in harness::FIXTURES {
         let built = harness::build(name, "local");
@@ -1641,7 +1790,11 @@ fn every_generated_project_type_checks_and_constructs_its_graph() {
         // model LangGraph refuses, or an edge to a node that is not registered,
         // is a runtime error at build time and a green `tsc` either way.
         let construct = std::process::Command::new("node")
-            .args(["--input-type=module", "-e", "await import('./graph.js');"])
+            .args([
+                "--input-type=module",
+                "-e",
+                "const graph = await import('./src/graph.ts'); graph.createBuilder().compile();",
+            ])
             .current_dir(built.root())
             .output()
             .expect("node runs");

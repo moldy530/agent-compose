@@ -66,20 +66,44 @@ enum Status {
 /// PRD §7 M1's first bullet, decomposed into the ten items its own sentence
 /// lists, in order.
 const CODEGEN: &[Criterion] = &[
+    // Four tests, because this criterion splits three ways and only the first
+    // two are decidable now.
+    //
+    // The **emission** half has landed and is claimed here: `build` writes the
+    // state model and the Zod discriminated unions, and the two live rows decide
+    // that through the real command. The **execution** half — that those channel
+    // specs reduce the way their policies say, and that the union refuses a tag
+    // it does not declare — is decided on every `cargo test` by `compose-core`'s
+    // `tests/generated_code_gates.rs`, which invokes the compiled graph under the
+    // pinned LangGraph and runs the schema corpus through both columns of grammar
+    // 3.8's table. It is not a row here because this file maps
+    // `tests/compiled_graph_acceptance.rs`, and pointing a row at another crate's
+    // test would make the status column mean two different things.
+    //
+    // What is left pending is the half that needs a *flow*: the declared defaults
+    // read back as a flow's outputs, and a bad tag failing a run by name. Both
+    // wait on commands this milestone has not built, which is what their reasons
+    // say.
     Criterion {
         bullet: Bullet::Codegen,
         phrase: "state models (incl. tagged unions via Zod)",
         tests: &[
             (
+                "the_state_model_carries_every_channels_type_default_and_reduce_policy",
+                Status::Live,
+            ),
+            (
+                "a_tagged_union_output_is_emitted_as_a_discriminated_union_narrowed_per_variant",
+                Status::Live,
+            ),
+            (
                 "state_channels_carry_their_declared_types_and_defaults",
-                Status::Pending(
-                    "pending: `agent-compose build` must emit the state model, and `run` must execute it",
-                ),
+                Status::Pending("pending: `agent-compose run` must execute the emitted graph"),
             ),
             (
                 "a_tagged_union_output_is_narrowed_per_variant_and_a_bad_tag_is_rejected",
                 Status::Pending(
-                    "pending: codegen must emit Zod discriminated unions for tagged-union outputs",
+                    "pending: an agent node fn must parse its answer with the emitted union schema",
                 ),
             ),
         ],
@@ -199,12 +223,18 @@ const CODEGEN: &[Criterion] = &[
             ),
         ],
     },
+    // The emission has landed: the built project reads its `${ENV}` references
+    // when it is loaded and refuses to start without them, and `compose-core`'s
+    // `the_generated_project_checks_its_environment_when_it_is_loaded` decides
+    // that on every `cargo test` against a real `node src/index.ts`. The row is
+    // still pending because this file's test asserts it of a *run*, and the
+    // reason says the command it waits on rather than the feature it has.
     Criterion {
         bullet: Bullet::Codegen,
         phrase: "env-ref presence checks at process start",
         tests: &[(
             "a_missing_env_ref_fails_at_process_start_naming_the_variable",
-            Status::Pending("pending: generated code must check env-ref presence at process start"),
+            Status::Pending("pending: `agent-compose run` must execute the emitted graph"),
         )],
     },
 ];
@@ -216,7 +246,7 @@ const COMMANDS: &[Criterion] = &[
         phrase: "`agent-compose build`",
         tests: &[(
             "build_writes_a_typescript_project_for_the_target",
-            Status::Pending("pending: `agent-compose build` must exist"),
+            Status::Live,
         )],
     },
     Criterion {
@@ -252,12 +282,18 @@ const COMMANDS: &[Criterion] = &[
             ),
         ],
     },
+    // The committed half of this criterion — "goldens are reviewed in PRs like
+    // any other code" — lives in `compose-core`'s
+    // `tests/generated_project_goldens.rs`, over `tests/goldens/`. The row points
+    // at the acceptance test because that is what this file maps, and because the
+    // determinism it asserts through the real command is what makes a committed
+    // golden mean anything.
     Criterion {
         bullet: Bullet::Commands,
         phrase: "golden-file codegen tests",
         tests: &[(
             "build_is_byte_identical_for_byte_identical_input",
-            Status::Pending("pending: `agent-compose build` must exist"),
+            Status::Live,
         )],
     },
 ];
@@ -316,11 +352,15 @@ const STRATEGY: &[Criterion] = &[
     Criterion {
         bullet: Bullet::Strategy,
         phrase: "every golden fixture must type-check (`tsc`) and construct its graph under the pinned LangGraph version",
+        // `build` and the pinned toolchain both landed, and `compose-core`'s
+        // `tests/generated_code_gates.rs` already runs this criterion's two
+        // checks — `tsc --noEmit` and construction under the pinned LangGraph —
+        // over the committed golden corpus on every `cargo test`. The row stays
+        // pending because its *subject* has not landed: `src/graph.ts` builds no
+        // topology yet, so "constructs its graph" is not yet a claim to make.
         tests: &[(
             "every_generated_project_type_checks_and_constructs_its_graph",
-            Status::Pending(
-                "pending: `agent-compose build` must exist, and the pinned LangGraph toolchain with it",
-            ),
+            Status::Pending("pending: codegen must assemble the flows into `src/graph.ts`"),
         )],
     },
     Criterion {

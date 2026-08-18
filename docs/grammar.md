@@ -803,9 +803,11 @@ is most likely to guess at:
   class for PRD 5.9's reason — every LLM configuration in a project stays
   greppable in one file.
 
-Env refs **survive unresolved into the IR**. `validate` checks syntax only;
-`build`/`serve`/`run` check presence and fail fast naming the missing variable
-(PRD 5.9).
+Env refs **survive unresolved into the IR**. `validate` and `build` check
+syntax only — an artifact is buildable anywhere, including environments holding
+no secrets. Presence is a launch-time check: generated code verifies its
+environment at process start, and `run`/`serve` fail fast before invoking the
+graph, naming the missing variable (PRD 5.9, §9.15).
 
 ### 4.4 Durations
 
