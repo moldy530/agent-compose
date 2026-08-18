@@ -130,12 +130,17 @@ async function run(argv: readonly string[]): Promise<number> {
   const session = options.single["session"] ?? "";
   const format = formatOf(options.single["format"]);
 
+  // Minted here rather than left to `runFlow`, because this command needs it on
+  // both of its ways out: it is what makes the trace file's name unique (see
+  // [`writeTrace`]), and a failed run has no `FlowRun` to read one back off.
+  const execution = `exec_${globalThis.crypto.randomUUID()}`;
+
   let produced: FlowRun;
   try {
-    produced = await runFlow(address, inputs, { sessionKey: session });
+    produced = await runFlow(address, inputs, { executionId: execution, sessionKey: session });
   } catch (error) {
     const trace = (error as { trace?: readonly runtime.TraceEntry[] }).trace ?? [];
-    const written = writeTrace(address, trace);
+    const written = writeTrace(address, execution, trace);
     if (format === "json") {
       process.stdout.write(
         `${JSON.stringify({ flow: address, status: "failed", error: describe(error), trace }, null, 2)}\n`,
@@ -152,7 +157,7 @@ async function run(argv: readonly string[]): Promise<number> {
     return 1;
   }
 
-  const written = writeTrace(address, produced.trace);
+  const written = writeTrace(address, execution, produced.trace);
   if (format === "json") {
     process.stdout.write(
       `${JSON.stringify(
@@ -297,8 +302,19 @@ function formatOf(given: string | undefined): Format {
  *
  * A trace is the routing record PRD 5.3 asks for and it grows with the run, so
  * the terminal gets a summary and the file gets everything.
+ *
+ * The name is the flow's and the **execution id**, not a timestamp: two runs of
+ * one flow started together — which is what a shell loop and a CI matrix both
+ * do — land in the same millisecond often enough that a `Date.now()` name is a
+ * run silently overwriting another's record while both print the same path. The
+ * id is unique per execution by construction, and it is also the one thing that
+ * ties the file to the run that wrote it.
  */
-function writeTrace(address: string, trace: readonly runtime.TraceEntry[]): string | undefined {
+function writeTrace(
+  address: string,
+  execution: string,
+  trace: readonly runtime.TraceEntry[],
+): string | undefined {
   // A run that failed before it started made no routing decisions, and an empty
   // file named as a trace would be a file a reader opens for nothing.
   if (trace.length === 0) return undefined;
@@ -307,7 +323,7 @@ function writeTrace(address: string, trace: readonly runtime.TraceEntry[]): stri
     fs.mkdirSync(directory, { recursive: true });
     const file = path.join(
       directory,
-      `${address.replace(/[^A-Za-z0-9_.-]/g, "_")}-${Date.now()}.json`,
+      `${address.replace(/[^A-Za-z0-9_.-]/g, "_")}-${execution.replace(/[^A-Za-z0-9_.-]/g, "_")}.json`,
     );
     fs.writeFileSync(file, `${JSON.stringify(trace, null, 1)}\n`);
     return file;
