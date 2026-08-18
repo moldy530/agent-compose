@@ -248,9 +248,14 @@ impl Drop for Scratch {
 
 /// What `validate` said about a project.
 pub fn validate(name: &str, target: &str) -> Output {
+    validate_entrypoint(&fixture(name), target)
+}
+
+/// The same, for any composition on disk.
+pub fn validate_entrypoint(entrypoint: &Path, target: &str) -> Output {
     agent_compose()
         .arg("validate")
-        .arg(fixture(name))
+        .arg(entrypoint)
         .args(["--target", target])
         .env("NO_COLOR", "1")
         .output()
@@ -753,14 +758,77 @@ pub fn seal(command: &mut Command, environment: &[(String, String)]) {
 }
 
 /// A served project, killed when the test ends.
+///
+/// **The whole tree, not the command.** `agent-compose serve` is one process and
+/// the app is another — the emitted project, launched by it — so a harness that
+/// killed the command alone would leave the app listening, holding its port and
+/// its project directory, reparented to init and never told to stop. That is not
+/// a slow cleanup; it is a leak per served test, on every `cargo test`, and it
+/// makes the suite non-hermetic on a runner that is reused. So [`serve`] puts
+/// the command in a **process group of its own** and this kills the group.
+///
+/// `SIGKILL` rather than a graceful `SIGTERM`, because what is being asserted
+/// about a served app is asserted before this runs: a graceful stop would be a
+/// second thing to wait for and would make the end of every serve test a race
+/// with the app's own shutdown. The command forwards `SIGTERM` on its own — the
+/// test that pins it is
+/// `stopping_serve_stops_the_app_it_started`, which is where that behaviour is
+/// decided rather than here.
 pub struct Served {
     child: Child,
+    /// Whether the command has already been waited on, and its pid with it.
+    ///
+    /// A reaped pid is not this process's any more — the number is the system's
+    /// to hand out again — so nothing is signalled once this is set. A test that
+    /// stops the command itself is the only thing that sets it.
+    reaped: bool,
     /// Where the generated app is listening.
     pub base_url: String,
 }
 
+impl Served {
+    /// Send one signal to the command **alone**, leaving the group to the app.
+    ///
+    /// Which is the whole point where it is used: a signal delivered to the
+    /// command and not to the app is how "the command hands its signals on" is
+    /// asked as a question rather than assumed.
+    #[cfg(unix)]
+    pub fn signal(&self, signal: libc::c_int) {
+        assert!(!self.reaped, "the command has already been waited on");
+        // SAFETY: a pid this process spawned and has not reaped.
+        unsafe {
+            libc::kill(
+                libc::pid_t::try_from(self.child.id()).expect("a pid"),
+                signal,
+            );
+        }
+    }
+
+    /// Wait for the command to exit and answer with its status.
+    pub fn wait(&mut self) -> std::process::ExitStatus {
+        let status = self.child.wait().expect("the command is waited on");
+        self.reaped = true;
+        status
+    }
+}
+
 impl Drop for Served {
     fn drop(&mut self) {
+        if self.reaped {
+            return;
+        }
+        #[cfg(unix)]
+        {
+            // The negated pid is the group [`serve`] spawned the command into,
+            // so this reaches the emitted app as well as the command that
+            // launched it. `ESRCH` — a group whose members are already gone — is
+            // an expected answer and is ignored like every other.
+            if let Ok(pid) = libc::pid_t::try_from(self.child.id()) {
+                // SAFETY: `pid` is this process's own child, unreaped until the
+                // `wait` below, so its group is still its own.
+                unsafe { libc::kill(-pid, libc::SIGKILL) };
+            }
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -774,6 +842,10 @@ impl Drop for Served {
 /// The environment is [`seal`]ed exactly as a `run`'s is: a served app resolves
 /// the same env refs at process start, so the two halves of the harness have to
 /// agree on what a fixture's refs may resolve from.
+///
+/// The command is spawned into a **process group of its own**, which is what
+/// lets [`Served::drop`] end the app the command launched rather than only the
+/// command — see there.
 pub fn serve(name: &str, provider: &MockProvider) -> Option<Served> {
     let out = scratch_project("serve")?;
     let mut command = agent_compose();
@@ -785,6 +857,11 @@ pub fn serve(name: &str, provider: &MockProvider) -> Option<Served> {
         .arg(&out)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     seal(&mut command, &environment(provider));
     let mut child = command.spawn().expect("the command runs");
     let stdout = child.stdout.take().expect("stdout is piped");
@@ -798,7 +875,11 @@ pub fn serve(name: &str, provider: &MockProvider) -> Option<Served> {
         .as_str()
         .unwrap_or_else(|| panic!("the readiness line names no base url: {announced}"))
         .to_string();
-    Some(Served { child, base_url })
+    Some(Served {
+        child,
+        reaped: false,
+        base_url,
+    })
 }
 
 /// `agent-compose serve <fixture> --port <port>`, **waited on** rather than
@@ -810,11 +891,25 @@ pub fn serve(name: &str, provider: &MockProvider) -> Option<Served> {
 /// hang instead of failing. So this one runs the command to completion and hands
 /// back what it wrote and how it exited.
 pub fn serve_refused(name: &str, provider: &MockProvider, port: u16) -> Option<Output> {
+    serve_refused_entrypoint(&fixture(name), provider, port)
+}
+
+/// The same, for any composition on disk.
+///
+/// Which is what a *route* collision needs and a fixture cannot give: the
+/// composition it takes is one the app refuses to mount, so a fixture of it
+/// would be a project the rest of the suite builds, type-checks and can never
+/// serve. The compositions written for this are written where they are read.
+pub fn serve_refused_entrypoint(
+    entrypoint: &Path,
+    provider: &MockProvider,
+    port: u16,
+) -> Option<Output> {
     let out = scratch_project("serve-refused")?;
     let mut command = agent_compose();
     command
         .arg("serve")
-        .arg(fixture(name))
+        .arg(entrypoint)
         .args(["--port", &port.to_string()])
         .arg("--out")
         .arg(&out);

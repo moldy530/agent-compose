@@ -4545,6 +4545,145 @@ fn a_session_scoped_store_outlives_the_execution_that_wrote_it() {
     );
 }
 
+/// A retried `flow:` node reports **every** instance it ran, so a store write an
+/// earlier attempt really made is in the trace beside the duplicate the backend
+/// refused (PRD 5.3, 5.8, grammar 8.5, 9.4).
+///
+/// The gap this closes is not "one entry is missing". An attempt of a `flow:`
+/// node is a whole instance — its own nodes, its own routing decisions, its own
+/// effects — and a report that kept only the last one describes an execution
+/// that never wrote anything: what survives is a `save` marked `deduped`, with
+/// nothing in the trace it could be a duplicate *of*, and a `set` whose value is
+/// in the store with no record of the write that put it there.
+///
+/// Both ways out of the retry are decided, over one pair of flows, because the
+/// two are different code paths — the one that recovers joins the failed
+/// attempts to the answer's instance, and the one that does not has no answer to
+/// join to:
+///
+/// * the model fails the first attempt's `confirm` and answers the second, so
+///   the node completes with two attempts; and
+/// * the model fails both, so the node fails with two.
+///
+/// The store record is what makes each an assertion about *effects* rather than
+/// about entry counts: `save` runs before `confirm` in the instance, so it
+/// really happened on the attempt that failed, and grammar 9.4 derives the same
+/// idempotency key on the next one — which is the same key, and `deduped` only
+/// on the second.
+#[test]
+fn a_retried_subflow_reports_the_instance_of_every_attempt() {
+    // The attempt that recovers.
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(SONNET, Outcome::server_error()),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "line": "written down" })),
+        ),
+    ]);
+    let Some(recovered) = harness::invoke(
+        "stores",
+        "flow.reingest",
+        &[("note", "a thing to remember")],
+        &provider,
+    ) else {
+        return;
+    };
+    recovered.succeeded();
+    assert_eq!(recovered.outputs()["ingested"], "written down");
+
+    let entries = recovered.entries("sub");
+    assert_eq!(entries.len(), 1, "one node, one entry: {entries:?}");
+    let entry = &entries[0];
+    assert_eq!(entry["outcome"], "completed", "{entry}");
+    assert_eq!(entry["attempts"], json!(2), "{entry}");
+
+    let inner = entry["inner"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the node reports the instances it ran: {entry}"));
+    assert_eq!(
+        inner
+            .iter()
+            .map(|held| (held["node"].clone(), held["outcome"].clone()))
+            .collect::<Vec<_>>(),
+        [
+            (json!("save"), json!("completed")),
+            (json!("confirm"), json!("failed")),
+            (json!("save"), json!("completed")),
+            (json!("confirm"), json!("completed")),
+        ],
+        "the failed attempt's whole instance, then the one that answered: {entry}"
+    );
+
+    let writes: Vec<&Value> = inner
+        .iter()
+        .filter_map(|held| held["stores"].as_array())
+        .flatten()
+        .collect();
+    assert_eq!(writes.len(), 2, "both attempts wrote: {entry}");
+    assert_eq!(writes[0]["store"], "store.memory", "{}", writes[0]);
+    assert_eq!(writes[0]["op"], "set", "{}", writes[0]);
+    assert_eq!(
+        writes[0]["deduped"],
+        json!(false),
+        "the first attempt's write is the one that happened: {}",
+        writes[0]
+    );
+    assert_eq!(
+        writes[1]["deduped"],
+        json!(true),
+        "…and the second is the duplicate the backend refused: {}",
+        writes[1]
+    );
+    assert_eq!(
+        writes[0]["idempotencyKey"], writes[1]["idempotencyKey"],
+        "the key a retry re-derives is the same key (grammar 9.4): {entry}"
+    );
+    assert!(
+        provider.snapshot().is_drained(),
+        "both attempts reached the model"
+    );
+
+    // The attempt that does not recover: the node fails, and the account of what
+    // ran inside the boundary is all this trace has.
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(SONNET, Outcome::server_error()),
+        Script::new(SONNET, Outcome::server_error()),
+    ]);
+    let Some(exhausted) = harness::invoke(
+        "stores",
+        "flow.reingest",
+        &[("note", "a thing to remember")],
+        &provider,
+    ) else {
+        return;
+    };
+    exhausted.failed();
+
+    let entries = exhausted.entries("sub");
+    assert_eq!(entries.len(), 1, "one node, one entry: {entries:?}");
+    let entry = &entries[0];
+    assert_eq!(entry["outcome"], "failed", "{entry}");
+    assert_eq!(entry["attempts"], json!(2), "{entry}");
+    assert_eq!(
+        entry["inner"]
+            .as_array()
+            .unwrap_or_else(|| panic!("a failed node reports its instances too: {entry}"))
+            .iter()
+            .map(|held| (held["node"].clone(), held["outcome"].clone()))
+            .collect::<Vec<_>>(),
+        [
+            (json!("save"), json!("completed")),
+            (json!("confirm"), json!("failed")),
+            (json!("save"), json!("completed")),
+            (json!("confirm"), json!("failed")),
+        ],
+        "neither attempt's instance is dropped because the node failed: {entry}"
+    );
+    assert!(provider.snapshot().is_drained());
+}
+
 /// A route fails over to its next member on a declared condition, and the trace
 /// records that it did (PRD 5.9).
 #[test]
@@ -5653,6 +5792,168 @@ fn serve_resumes_an_interrupted_execution_against_the_human_nodes_schema() {
     assert_eq!(finished["status"], "completed");
     assert_eq!(finished["outputs"]["answer"], "an answer");
     assert_eq!(finished["outputs"]["decision"], "approve");
+}
+
+/// A route collision the **compiler cannot decide** is reported by the app as
+/// the collision it is, rather than as a failure to take the address.
+///
+/// `check/triggers.rs::routes` refuses every pair it can decide — two triggers
+/// on one `method:`/`path:`, and a trigger claiming one of the app's own
+/// `/executions/…` routes — but grammar 13.3 has the router read a path's
+/// parameters "unexamined", so `/reviews/:id` beside `/reviews/:name` is two
+/// distinct strings to the compiler and one route to the router. That residue is
+/// the app's to report, and what it says is the point: the address is fine,
+/// nothing about `127.0.0.1` failed, and a reader sent to look at a port would
+/// find nothing wrong with it.
+///
+/// Written here rather than as a fixture because the composition it needs is one
+/// no app can mount: a fixture of it would be a project the rest of this suite
+/// builds and can never serve. It still reaches the real compiler — `validate`
+/// accepts it, which is half the claim — and the real emitted app.
+#[test]
+fn serve_names_the_route_collision_the_compiler_could_not_see() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let scratch = harness::Scratch::new("route-collision");
+    let entrypoint = scratch.path().join("main.yml");
+    std::fs::write(
+        &entrypoint,
+        r#"version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${MOCK_API_KEY}
+  base_url: ${MOCK_BASE_URL}
+model.m:
+  provider: provider.p
+  id: claude-sonnet-4-6
+agent.a:
+  model: model.m
+  prompt: Do the thing.
+  input:
+    text: { type: string }
+  output:
+    result: { type: string }
+triggers:
+  by_id:
+    type: http
+    flow: flow.f
+    method: GET
+    path: /reviews/:id
+    input:
+      goal: "payload.query['goal']"
+  by_name:
+    type: http
+    flow: flow.f
+    method: GET
+    path: /reviews/:name
+    input:
+      goal: "payload.query['goal']"
+flow.f:
+  inputs:
+    goal: { type: string }
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.a
+      input: { text: "input.goal" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }
+"#,
+    )
+    .expect("the scratch area is writable");
+
+    // Half the claim: the compiler has nothing to say about this composition —
+    // two different strings, and the check is exact-pairs-only by design.
+    let validated = harness::validate_entrypoint(&entrypoint, "local");
+    assert!(
+        validated.status.success(),
+        "two paths that differ only in a parameter's name are two paths to the compiler: {}",
+        String::from_utf8_lossy(&validated.stderr)
+    );
+
+    let Some(output) = harness::serve_refused_entrypoint(&entrypoint, &provider, 0) else {
+        return;
+    };
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "the command could not run at all: {stderr}"
+    );
+    assert!(
+        stderr.contains("the app could not mount its routes"),
+        "…and says the routes are what failed: {stderr}"
+    );
+    assert!(
+        !stderr.contains("could not listen on"),
+        "…and not that the address was refused, which it was not: {stderr}"
+    );
+}
+
+/// Stopping `agent-compose serve` stops the app it started.
+///
+/// The command is not the server: it launches the emitted project, which is the
+/// process that holds the listening socket, and then waits on it. So a `SIGTERM`
+/// delivered to the command alone decides whether stopping the command means
+/// anything — a command that only ended itself would leave the app listening on
+/// the same port, reparented, answering requests an operator believes they
+/// stopped, and holding the data directory of a project they believe is gone.
+///
+/// Asked as three observations rather than by reading the process table: the app
+/// answers, the command is signalled and exits, and the address stops answering.
+/// The third is the claim; the first is what makes it about the signal rather
+/// than about an app that never started.
+///
+/// `SIGTERM` is sent to the command's **pid**, not to its process group — the
+/// harness puts each served command in a group of its own precisely so this can
+/// be a pid-directed question. A group-directed signal would reach the app on
+/// its own and decide nothing.
+#[test]
+#[cfg(unix)]
+fn stopping_serve_stops_the_app_it_started() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let Some(mut served) = harness::serve("http-trigger", &provider) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+
+    // The app is up: an id nothing started is a `404` from the status route,
+    // which is an answer and is what this needs.
+    let answered = app
+        .get("/executions/exec_nothing-started-this")
+        .expect("the app answers before it is stopped");
+    assert_eq!(answered.status, 404, "{:?}", answered.body);
+
+    served.signal(libc::SIGTERM);
+    let status = served.wait();
+    // `0`, and that is the whole chain working rather than an accident: the
+    // command forwards the signal, the emitted app's own handler closes the app
+    // and exits `0` (`serve()` in `src/serve.ts`), and the command answers with
+    // the child's code unchanged — which is the exit-code table `run` and
+    // `serve` share. A stop that was asked for is not a failure to report.
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "the command answers with the app's own code: {status:?}"
+    );
+
+    // …and the address stops answering. Polled rather than asserted once,
+    // because the app closes its socket on its own clock — what is being pinned
+    // is that it closes it at all, not how fast.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match app.get("/executions/exec_nothing-started-this") {
+            Err(_) => break,
+            Ok(answer) => assert!(
+                std::time::Instant::now() < deadline,
+                "the app was still listening {}s after the command it was launched by exited, \
+                 answering {}: nothing forwarded the signal to it",
+                10,
+                answer.status
+            ),
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// Every generated project type-checks and constructs its graph under the pinned

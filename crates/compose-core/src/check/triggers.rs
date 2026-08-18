@@ -20,9 +20,11 @@
 //! `payload.body`, which is `{}` on every request such a trigger can receive,
 //! so the read fails every time (grammar 13.3, Decision D117).
 //!
-//! One rule relates two triggers rather than reading inside one: two `http`
-//! triggers MUST NOT declare the same route ([`routes`]). It is the one rule in
-//! this file the normative spec does not state — see there.
+//! One rule is about a trigger's route rather than about what it reads: an
+//! `http` trigger's `method:`/`path:` pair MUST be free — unclaimed by another
+//! trigger, and not one of the two the generated app mounts for itself
+//! ([`routes`]). Half of it is the one rule in this file the normative spec does
+//! not state — see there.
 
 use crate::ast::trigger::TriggerMethod;
 use crate::cel::ty::Type;
@@ -45,29 +47,34 @@ pub(crate) fn check(ctx: &mut Ctx) {
     routes(ctx);
 }
 
-/// Two `http` triggers declaring one route.
+/// An `http` trigger claiming a route that is already claimed.
 ///
 /// The generated app mounts one route per declared `http` trigger, at its
 /// effective `path:` and `method:` — the pair each one *defaults* rather than
 /// the pair each one writes, since `path:` defaults to `/triggers/<name>` and
-/// `method:` to `POST` (§13.3's table). A router cannot dispatch one pair two
-/// ways, so a second trigger claiming the first's route makes the app refuse to
-/// start — Fastify answers `FST_ERR_DUPLICATED_ROUTE` at `listen` — and every
-/// request to that route would have to run two flows, with no answer to "which
-/// one" written anywhere. That is a guaranteed runtime failure visible in the
-/// two trigger objects, and refusing one of those at compile time naming the
-/// construct is the standing posture §7.6.3 takes on a guaranteed dead end and
-/// §13.3 takes on a `GET` reading `payload.body`.
+/// `method:` to `POST` (§13.3's table). It also mounts two of its own, at fixed
+/// addresses and whatever the composition says, because §13.3 has it expose
+/// `status` and `resume` beside the per-trigger `start`
+/// ([`crate::codegen::serve::RESERVED_ROUTES`]). A router cannot dispatch one
+/// pair two ways, so a *second* claim on one of those pairs — by another
+/// trigger, or by the app itself — makes the app refuse to start: Fastify
+/// answers `FST_ERR_DUPLICATED_ROUTE` at `listen`, and had it not, every request
+/// to that route would have to run two things with no answer to "which one"
+/// written anywhere. That is a guaranteed runtime failure visible in the trigger
+/// object, and refusing it at compile time naming the construct is the standing
+/// posture §7.6.3 takes on a guaranteed dead end and §13.3 takes on a `GET`
+/// reading `payload.body`.
 ///
-/// # This rule is the compiler's, not yet the spec's
+/// # Half of this rule is the compiler's, not yet the spec's
 ///
-/// **`docs/grammar.md` does not state it.** §13.3 fixes the mount model this is
+/// The **reserved** half follows from a sentence §13.3 writes: the app exposes
+/// those routes, so they are taken, and a trigger cannot have one. The
+/// **trigger-against-trigger** half does not. §13.3 fixes the mount model it is
 /// derived from — `path:` is "route of the generated app", it defaults to
-/// `/triggers/<name>`, `method:` defaults to `POST`, and "generated apps expose
-/// `start`, `resume`, and `status` routes" — but says nothing about two triggers
-/// landing on one pair, no Decision entry covers it (D117 is `payload.body` on a
-/// bodyless request), and `schemas/agent-compose.schema.json` accepts it. So a
-/// spec that an editor validates green is refused here.
+/// `/triggers/<name>`, `method:` defaults to `POST` — but says nothing about two
+/// triggers landing on one pair, no Decision entry covers it (D117 is
+/// `payload.body` on a bodyless request), and `schemas/agent-compose.schema.json`
+/// accepts it. So a spec that an editor validates green is refused here.
 ///
 /// That direction is the one Appendix B sanctions — "a file that passes the
 /// schema and fails `validate` is normal and expected", and the schema cannot
@@ -82,7 +89,9 @@ pub(crate) fn check(ctx: &mut Ctx) {
 /// unexamined" (§13.3), so `/reviews/:id` beside `/reviews/:name` is a conflict
 /// this check does not see: deciding it means knowing that both are one segment
 /// pattern, which is a property of the router rather than of the grammar. What
-/// is decidable here is decided here, and the router still reports the rest.
+/// is decidable here is decided here, and the router still reports the rest —
+/// which `src/cli.ts` now reports as the route collision it is rather than as a
+/// failure to take the address.
 fn routes(ctx: &mut Ctx) {
     let Some(triggers) = ctx.ir.triggers.as_ref() else {
         return;
@@ -104,6 +113,30 @@ fn routes(ctx: &mut Ctx) {
         };
         let path = route_path(trigger, http);
         let method = route_method(http);
+        if crate::codegen::serve::RESERVED_ROUTES
+            .iter()
+            .any(|(verb, reserved)| *verb == method && *reserved == path)
+        {
+            let name = text(&trigger.name);
+            collisions.push(
+                Diagnostic::error(
+                    DiagnosticCode::DuplicateRoute,
+                    route_span(trigger, http),
+                    format!(
+                        "the trigger `{name}` declares the route `{method} {path}`, which the generated app mounts for itself"
+                    ),
+                )
+                .with_help(format!(
+                    "a generated app mounts `status` and `resume` for itself, beside each trigger's `start` (grammar 13.3) — {} — and cannot dispatch one method and path two ways: give the trigger its own `path:`",
+                    crate::parse::reader::list(
+                        crate::codegen::serve::RESERVED_ROUTES
+                            .iter()
+                            .map(|(verb, reserved)| format!("{verb} {reserved}"))
+                            .collect::<Vec<_>>()
+                    )
+                )),
+            );
+        }
         if let Some((_, _, first, first_http)) = claimed
             .iter()
             .find(|(taken, at, _, _)| taken == &path && *at == method)

@@ -87,6 +87,13 @@ state:
         type: string
     default: { note: "" }
 
+  # What `flow.ingest`'s model says it wrote down. The channel exists so the
+  # subflow has an output to hand back; what it is asserted about is the trace,
+  # not the string.
+  ingested:
+    type: string
+    default: ""
+
 provider.mock:
   kind: anthropic
   api_key: ${MOCK_API_KEY}
@@ -352,3 +359,78 @@ flow.remember:
     - { from: start, to: recall }
     - { from: recall, to: save }
     - { from: save, to: end }
+
+# A store write inside a **retried subflow**, which is where a trace can lose an
+# effect that really happened (PRD 5.3, 5.8).
+#
+# A `flow:` node's attempt is a whole instance, and a retried one runs two: the
+# first writes and fails somewhere after, the second re-derives the same
+# idempotency key (grammar 9.4) and the backend dedupes it. Both instances have a
+# trace, and only a report carrying both says what the execution did — the second
+# alone reads as a run that wrote nothing and re-issued a duplicate with nothing
+# to have duplicated.
+#
+# `agent.scribe` is what fails: the model answers with a status the route does
+# not fail over on (there is no `route:` here at all), so the node fails after
+# `save` has already had its effect. Which attempt fails is the script's to
+# decide, so the same pair of flows decides both the retry that recovers and the
+# retry that does not.
+agent.scribe:
+  description: Confirms in one line what was written down.
+  model: model.smart
+  prompt: Confirm the note in one line.
+  input:
+    note: { type: string }
+  output:
+    line:
+      type: string
+      min_length: 1
+
+flow.ingest:
+  description: Write a note to the session store, then have the model confirm it.
+  inputs:
+    note:
+      type: string
+      min_length: 1
+  outputs:
+    ingested:
+      type: string
+  nodes:
+    save:
+      store: store.memory
+      op: set
+      key: "execution.session_key"
+      value:
+        note: "input.note"
+
+    confirm:
+      agent: agent.scribe
+      input:
+        note: "input.note"
+      writes:
+        line: ingested
+
+  edges:
+    - { from: start, to: save }
+    - { from: save, to: confirm }
+    - { from: confirm, to: end }
+
+flow.reingest:
+  description: Instantiate `flow.ingest` under a `retry:`, so an attempt is an instance.
+  inputs:
+    note:
+      type: string
+      min_length: 1
+  outputs:
+    ingested:
+      type: string
+  nodes:
+    sub:
+      flow: flow.ingest
+      input:
+        note: "input.note"
+      retry: { max: 1, backoff: 10ms }
+
+  edges:
+    - { from: start, to: sub }
+    - { from: sub, to: end }

@@ -203,6 +203,21 @@ async function serveVerb(argv: readonly string[]): Promise<number> {
     // framework stack trace and `1` would report "a run produced no answer",
     // which is the one thing that did not happen — nothing ran. So it is a `2`
     // with a sentence, like every other command that could not be run.
+    //
+    // One of them is not about the address at all, and saying it was would send
+    // a reader to look at a port that is fine. Routes are registered when the
+    // app is made ready, which `listen` does, so a **route collision** arrives
+    // here too — and it is the composition's, not the machine's: two `http`
+    // triggers whose paths the compiler could not tell apart (a parameter's
+    // *name* differs, and grammar 13.3 has the router read parameters
+    // unexamined), or one claiming a route the app mounts for itself. The
+    // compiler refuses every collision it can decide; this is what the router
+    // decides, reported as what it is.
+    if ((error as { code?: unknown } | null)?.code === "FST_ERR_DUPLICATED_ROUTE") {
+      throw new UsageError(
+        `the app could not mount its routes: ${describe(error)}. Two routes of this composition are one route to the router — an \`http\` trigger's \`path:\` and \`method:\`, or one of the app's own \`GET /executions/:id\` and \`POST /executions/:id/resume\` — so give one of them a path the other cannot be read as (grammar 13.3)`,
+      );
+    }
     throw new UsageError(
       `the app could not listen on ${host}:${port ?? 0}: ${describe(error)}`,
     );

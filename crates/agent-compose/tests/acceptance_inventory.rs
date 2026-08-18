@@ -368,6 +368,14 @@ const CODEGEN: &[Criterion] = &[
                 "a_subflow_inherits_the_callers_history_and_takes_its_instantiation_policy",
                 Status::Live,
             ),
+            // An instantiation under a `retry:` is more than one instance, and
+            // each is a run with effects and a trace of its own — so what the
+            // boundary reports is a claim about the subgraph rather than about
+            // the policy above it, and it belongs to this criterion.
+            (
+                "a_retried_subflow_reports_the_instance_of_every_attempt",
+                Status::Live,
+            ),
         ],
     },
     Criterion {
@@ -589,6 +597,17 @@ const COMMANDS: &[Criterion] = &[
                 "serve_answers_two_with_a_sentence_when_it_cannot_take_the_port",
                 Status::Live,
             ),
+            // …and what it answers for the one collision the compiler cannot
+            // decide, which is a route rather than an address.
+            (
+                "serve_names_the_route_collision_the_compiler_could_not_see",
+                Status::Live,
+            ),
+            // …and what it does when there is one and it is asked to stop. The
+            // command is not the server — it launches the emitted project and
+            // waits on it — so "the app is served by this command" is only true
+            // if ending the command ends the app.
+            ("stopping_serve_stops_the_app_it_started", Status::Live),
             (
                 "serve_resumes_an_interrupted_execution_against_the_human_nodes_schema",
                 Status::Pending(

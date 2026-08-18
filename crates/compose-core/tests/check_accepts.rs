@@ -1217,6 +1217,72 @@ flow.f:
     );
 }
 
+/// A route the app's own routes only *look* like stays legal (grammar 13.3).
+///
+/// The accepting half of `invalid-check/an-http-trigger-claims-a-route-the-app-mounts`,
+/// and the reason it is written out rather than assumed: the app mounts exactly
+/// `GET /executions/:id` and `POST /executions/:id/resume`, so a check that
+/// matched a *prefix*, or matched the path without the method, would refuse
+/// every one of these — a longer path under the same prefix, a shorter one, the
+/// reserved path at another method, and the `POST` one at the `GET` one's
+/// address. Each is a route the router can tell apart from the app's, and none
+/// of them is the app's.
+#[test]
+fn a_trigger_route_beside_the_apps_own_routes() {
+    accepts(
+        "routes-beside-reserved",
+        r#"
+agent.a:
+  model: model.m
+  prompt: Do it.
+  input:
+    text: { type: string }
+  output:
+    result: { type: string }
+triggers:
+  detail:
+    type: http
+    flow: flow.f
+    method: GET
+    path: /executions/:id/detail
+    input:
+      goal: "payload.query['goal']"
+  index:
+    type: http
+    flow: flow.f
+    method: GET
+    path: /executions
+    input:
+      goal: "payload.query['goal']"
+  replace:
+    type: http
+    flow: flow.f
+    method: PUT
+    path: /executions/:id
+    input:
+      goal: "payload.body.goal"
+  restart:
+    type: http
+    flow: flow.f
+    method: GET
+    path: /executions/:id/resume
+    input:
+      goal: "payload.query['goal']"
+flow.f:
+  inputs:
+    goal: { type: string }
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.a
+      input: { text: "input.goal" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }
+"#,
+    );
+}
+
 /// A property with a `default:` is optional **at its surface** — a binding need
 /// not supply it, and grammar 8.0's step 4 then does — so the value the
 /// declaration describes carries it either way and the channel stays readable

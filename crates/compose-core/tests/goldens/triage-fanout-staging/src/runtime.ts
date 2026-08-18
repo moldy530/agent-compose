@@ -620,6 +620,7 @@ export async function runActivity<T>(
   activity: (context: RunContext) => Promise<T>,
   storeRecords?: StoreRecord[],
   modelCalls?: ModelCall[],
+  innerTraces?: TraceEntry[],
 ): Promise<{ value: T; attempts: number }> {
   const attempts = 1 + (policy.retry?.max ?? 0);
   const controller = new AbortController();
@@ -677,6 +678,21 @@ export async function runActivity<T>(
         return { value, attempts: attempt };
       } catch (error) {
         last = error;
+        // A `flow:` node's attempt is a whole instance, and the instance ran
+        // whatever it ran before it failed: nodes, routing decisions, store
+        // writes (PRD 5.3, 5.8). Its trace rides out on the [`SubflowFailure`]
+        // and is the only account of that attempt — a later attempt starts a
+        // *new* instance with a trace of its own, so a node that kept the last
+        // one would report a run where the earlier attempt's effects never
+        // happened, and the write the store deduped would have nothing in the
+        // trace to have been a duplicate of. Collected here, beside
+        // `storeRecords` and `modelCalls`, for exactly their reason and read by
+        // [`runNode`] the same way. Every failed attempt is collected, the last
+        // one included: whichever way the node leaves, this is the whole of what
+        // ran inside the boundary.
+        if (innerTraces !== undefined && error instanceof SubflowFailure) {
+          innerTraces.push(...error.trace);
+        }
         if (expired) break;
         if (attempt === attempts) break;
         const delay = backoffFor(policy.retry!, attempt);
@@ -3035,7 +3051,18 @@ export async function runSubflow(
   );
   const trace = state?.$run.trace ?? [];
   if (error !== undefined) {
-    throw new SubflowFailure(binding.address, "did not run to quiescence", trace, error);
+    // The node that stopped the instance is part of the account of it, and it is
+    // the part a reader looks for first: it never reached the reducer, so the
+    // committed state does not have it. [`failedTrace`] recovers it from the
+    // error the way [`runFlow`] does for a top-level run — the boundary is a
+    // module boundary, not a reason to report less about what happened inside
+    // it (grammar 8.5, PRD 5.3).
+    throw new SubflowFailure(
+      binding.address,
+      "did not run to quiescence",
+      failedTrace(state, error),
+      error,
+    );
   }
   if (state === undefined) {
     // Unreachable: `streamMode: "values"` emits the state the instance started
@@ -3947,6 +3974,34 @@ function merged(
 }
 
 /**
+ * Every instance a `flow:` node ran, in the order it ran them (grammar 8.5,
+ * PRD 5.3).
+ *
+ * [`merged`]'s counterpart for subflow traces, and it is a plain concatenation
+ * rather than a set difference because the two inputs are disjoint by
+ * construction: `collected` holds one trace per attempt that **failed** inside
+ * the boundary, gathered by [`runActivity`] from each attempt's
+ * [`SubflowFailure`], and `answered` is the trace of the instance that
+ * succeeded — which no failure carried. There is at most one of the second, and
+ * it goes last because it ran last.
+ *
+ * The entries of two attempts sit in one list, as a retried node's model calls
+ * and store records do, and a reader tells them apart the way the node's own
+ * `attempts` count says to: an instance starts at `step: 0`, so a second `step:
+ * 0` entry for the same node is the next attempt beginning. Nesting them per
+ * attempt instead would put the attempt boundary in the trace's *shape*, and
+ * every reader of `inner` — including a run that did not retry — would have to
+ * learn it.
+ */
+function joined(
+  collected: readonly TraceEntry[],
+  answered: readonly TraceEntry[] | undefined,
+): readonly TraceEntry[] | undefined {
+  if (collected.length === 0) return answered;
+  return answered === undefined ? [...collected] : [...collected, ...answered];
+}
+
+/**
  * Run one node: its input, its activity, its writes, and its routing decision —
  * in one LangGraph task, which is what makes grammar 7.6's P1 (a node's edges
  * are evaluated only after it has completed) structural rather than asserted.
@@ -4025,6 +4080,13 @@ export async function runNode(
   // when there is one — is what puts the calls it carried in the order the node
   // decided (PRD 5.9, and see `RunContext.modelCalls` and `merged`).
   const modelCalls: ModelCall[] = [];
+  // And every instance a `flow:` node's attempts ran, for the third time the
+  // same reason: an attempt that failed inside the boundary still ran an
+  // instance, and its trace is the only account of what that instance did
+  // (grammar 8.5, PRD 5.3). `runActivity` fills this from the `SubflowFailure`
+  // each failed attempt threw; the instance that *succeeded* is carried by the
+  // answer instead, and the two are joined below.
+  const innerTraces: TraceEntry[] = [];
 
   /** This node's entry, for a failure that leaves nothing else behind. */
   const aborted = (error: unknown, made: number, routing?: RoutingDecision): TraceEntry => {
@@ -4069,13 +4131,20 @@ export async function runNode(
       (context) => descriptor.run(input, context, view),
       storeRecords,
       modelCalls,
+      innerTraces,
     );
     attempts = answer.attempts;
     output = answer.value.output;
     history = answer.value.history;
     channels = answer.value.channels;
     dispatches = answer.value.dispatches;
-    inner = answer.value.inner;
+    // Every instance this node ran, in the order it ran them: the attempts that
+    // failed inside the boundary first — `runActivity` collected each one's
+    // trace — and the one that answered last, because it happened last. A node
+    // that reported only the answer's would describe an execution in which the
+    // earlier instances never ran, while their writes are in `stores` above and
+    // their model calls in `models` below (PRD 5.3).
+    inner = joined(innerTraces, answer.value.inner);
     // Every model call this node execution made, which is more than the answer
     // can carry (PRD 5.9, `RunContext.modelCalls`). An answer holds the calls it
     // *ordered* — a `map`'s in source-item order — and by construction only the
@@ -4093,7 +4162,12 @@ export async function runNode(
   } catch (error) {
     const strategy = policy.onError;
     failure = error instanceof NodeFailure ? error : undefined;
-    if (failure?.cause instanceof SubflowFailure) inner = failure.cause.trace;
+    // The same join as the success path, with nothing to join to: every attempt
+    // that failed inside the boundary put its instance's trace in `innerTraces`,
+    // the one that ended the node included. A `SubflowFailure` reached only
+    // through a chain — a `map`'s item, wrapped in an `ItemFailure` — is not one
+    // of this node's own attempts and is left to `traceOf` in [`aborted`].
+    inner = joined(innerTraces, undefined);
     // A `map` that failed still dispatched: the items that completed had their
     // effects and the detached ones were delivered, and the records are the only
     // account of them (PRD 5.3, 5.6). They ride out on the `ItemFailure`, which

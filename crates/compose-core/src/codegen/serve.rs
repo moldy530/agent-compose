@@ -38,6 +38,26 @@ use crate::ir::Ir;
 /// The app's source, carried in the compiler and emitted verbatim.
 const SOURCE: &str = include_str!("js/serve.ts");
 
+/// The routes the app mounts for **itself**, whatever the composition declares
+/// (grammar 13.3: "generated apps expose `start`, `resume`, and `status`
+/// routes").
+///
+/// `start` is per trigger and is the one of the three a composition names. The
+/// other two are the app's own, at fixed addresses, and they are mounted
+/// unconditionally — so an `http` trigger that claims one of these pairs is a
+/// second declaration of a route the app already has, and the app refuses to
+/// start with `FST_ERR_DUPLICATED_ROUTE` exactly as two colliding triggers make
+/// it refuse.
+///
+/// Named here, beside the source they are mounted from, so the check that
+/// refuses such a trigger (`check::triggers::routes`) and the app cannot drift
+/// apart: `the_reserved_routes_are_the_ones_the_app_mounts` below reads this
+/// list back out of `SOURCE`.
+pub const RESERVED_ROUTES: &[(&str, &str)] = &[
+    ("GET", "/executions/:id"),
+    ("POST", "/executions/:id/resume"),
+];
+
 /// `src/serve.ts`.
 #[must_use]
 pub fn module(ir: &Ir) -> super::GeneratedFile {
@@ -68,5 +88,35 @@ mod tests {
         assert!(SOURCE.contains("app.get(\"/executions/:id\""));
         assert!(SOURCE.contains("app.post(\"/executions/:id/resume\""));
         assert!(SOURCE.contains("url: trigger.path"));
+    }
+
+    /// [`RESERVED_ROUTES`] is what the app really mounts.
+    ///
+    /// The compiler refuses a trigger that claims one of these pairs, and a
+    /// refusal keyed to a list the app had moved on from would refuse a legal
+    /// composition — or, worse, stop refusing an illegal one. So the list is
+    /// read back out of the source it describes: an app that renames or drops a
+    /// route fails here, at the constant, rather than at a route collision
+    /// nobody expected.
+    #[test]
+    fn the_reserved_routes_are_the_ones_the_app_mounts() {
+        let mounted: Vec<(&str, &str)> = SOURCE
+            .lines()
+            .filter_map(|line| {
+                let rest = line.trim_start().strip_prefix("app.")?;
+                let (verb, rest) = rest.split_once("(\"")?;
+                let (path, _) = rest.split_once('"')?;
+                match verb {
+                    "get" => Some(("GET", path)),
+                    "post" => Some(("POST", path)),
+                    "put" => Some(("PUT", path)),
+                    _ => None,
+                }
+            })
+            .collect();
+        assert_eq!(
+            mounted, RESERVED_ROUTES,
+            "the app mounts these fixed routes; `RESERVED_ROUTES` says it mounts {RESERVED_ROUTES:?}"
+        );
     }
 }

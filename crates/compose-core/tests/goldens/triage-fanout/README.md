@@ -104,13 +104,20 @@ written to. `--format json` folds both into one document on stdout instead.
 store.
 
 `serve` starts the app over the composition's declared `http` triggers and
-announces where it is listening as one JSON line on stdout. Executions are
+announces where it is listening as one JSON line on stdout. Beside them it
+mounts two routes of its own — `GET /executions/:id` for an execution's status
+and `POST /executions/:id/resume` — so those two are the app's and a trigger
+cannot declare either: the compiler refuses one that does. Executions are
 tracked in that process: durable execution and checkpointers are a later
 milestone, so a status route answers `404` for an id the process did not start —
 and every execution it *did* start, with its outputs and its trace, is held for
 the life of the process, so a long-running `serve` grows with the number of
 requests it has answered. Restarting it is the only way to reclaim that until
 the checkpointer arrives and an execution stops living in memory.
+
+Stopping it stops the graph: `agent-compose serve` passes `SIGINT` and `SIGTERM`
+on to this project, which closes the app and exits, so a supervisor that signals
+the command is not left with a listener behind it.
 
 ### On Node instead
 
