@@ -29,3 +29,8 @@ serde_json = "1"
 # expresses the third. `Command::cargo_bin` also builds and locates the binary
 # under test, which is what makes the tests runnable with a bare `cargo test`.
 assert_cmd = "2"
+# The M1 acceptance harness (`tests/compiled_graph_acceptance.rs`): the scripted provider a
+# compiled graph runs against, with no API keys and no network. A dev-dependency
+# rather than a dependency — the shipped binary never talks to it, and the
+# single static binary of PRD 5.12 must not carry an HTTP stack it does not use.
+mock-provider = { workspace = true }

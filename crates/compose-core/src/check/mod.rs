@@ -8,7 +8,7 @@
 //! holds together.
 //!
 //! The rules fall into two families by the *evidence* they need, and the split
-//! is the one Appendix B draws. `crates/compose-core/tests/m0_inventory.rs`
+//! is the one Appendix B draws. `crates/compose-core/tests/static_check_inventory.rs`
 //! is the whole account in executable form: each check, its pass, and the codes
 //! it reports through.
 //!

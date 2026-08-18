@@ -27,7 +27,7 @@
 //! addresses. Everything [`check`] reports needs the whole artifact: its
 //! schemas and expressions, or its graphs. `docs/grammar.md` Appendix B is the
 //! normative account of the split, and
-//! `crates/compose-core/tests/m0_inventory.rs` is that account made executable
+//! `crates/compose-core/tests/static_check_inventory.rs` is that account made executable
 //! — every static check PRD §7 M0 promises, mapped to the pass that decides it
 //! and the diagnostic codes it reports through.
 //!

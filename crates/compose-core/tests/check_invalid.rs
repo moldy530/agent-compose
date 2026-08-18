@@ -48,7 +48,7 @@ use compose_core::{Diagnostic, resolve_with_target};
 /// unit-tested against the table instead —
 /// `every_v0_kind_serves_structured_output` and
 /// `every_v0_kind_publishes_the_same_inference_capabilities`, which `Evidence`
-/// in `tests/m0_inventory.rs` reads as the second rule's evidence in place of a
+/// in `tests/static_check_inventory.rs` reads as the second rule's evidence in place of a
 /// fixture — and the third rule reading that table, `embed.provider`, is pinned
 /// here. Their shared code, `missing-capability`, is therefore covered below by
 /// that third rule alone.

@@ -1,0 +1,177 @@
+# M1 acceptance fixture: agent nodes on the Anthropic surface.
+#
+# Two flows, one manual invocation each, and the split between them is the point.
+#
+#   * `flow.review` runs `agent.reviewer`, which has **no tools**. Its model call
+#     is therefore a single one — the output schema offered as a tool and pinned
+#     with `tool_choice` (PRD 5.2) — so a test that scripts one structured answer
+#     has nothing else in the transcript to explain away. It is also the exact
+#     twin of `agent-openai`'s reviewer, which is what makes "the provider kind
+#     is the only difference" an assertion rather than a claim.
+#   * `flow.research` runs `agent.researcher`, which carries `tools:` and the
+#     `max_tool_iterations` bound on the loop they open (D51 — an open question,
+#     see PRD §10 item 2). An agent with tools cannot have its answer pinned on
+#     the *first* call, because a pinned tool choice is a promise that the pinned
+#     tool is what gets called and the tool loop would be dead; so this is the
+#     fixture whose transcript has more than one call in it, and the reviewer
+#     above is kept free of tools so the rest of the suite does not.
+#
+# `tool.lookup` is an `exec` binding over `printf` for a reason: the tool loop
+# has to be runnable in CI with no infrastructure, and its output is a single
+# string property, so the raw stdout binds to it (grammar 6.1) and the result is
+# the same on every machine.
+#
+# Every provider here declares `base_url: ${MOCK_BASE_URL}`. That is what lets
+# the acceptance harness point a compiled graph at the mock provider without the
+# spec differing between a scripted run and a real one (PRD 5.9: env refs survive
+# unresolved into the IR and resolve at process start). `examples/` cannot serve
+# as an acceptance fixture for exactly this reason: its `provider.anthropic`
+# names no base URL, so a graph built from it talks to Anthropic.
+version: "0.1"
+
+# Four channels, and the two halves of "state channels carry their declared
+# types, defaults, and reduce policies" are deliberately kept apart. `verdict`
+# and `feedback` are *written* by the agent, and every value the acceptance suite
+# scripts for them differs from the default declared here — so an assertion on
+# them can only pass if the write happened. `round` and `notes` are written by
+# nothing, so what a run returns for them is the declaration itself: an integer
+# default, and an `append` channel's identity element (grammar 10.1). Without
+# that split, a build that ignored `default:` entirely would be indistinguishable
+# from one that honoured it.
+state:
+  verdict:
+    description: The reviewer's verdict, written by name from its output.
+    enum: [approve, revise]
+    default: approve
+  feedback:
+    description: The reviewer's feedback, written by name from its output.
+    type: string
+    default: none yet
+  round:
+    description: Which review round this is. Nothing here writes it.
+    type: integer
+    default: 1
+  notes:
+    description: Side notes, appended. Nothing here writes it either.
+    type: array
+    max_items: 8
+    items:
+      type: string
+    reduce: append
+
+provider.mock:
+  kind: anthropic
+  api_key: ${MOCK_API_KEY}
+  base_url: ${MOCK_BASE_URL}
+
+model.smart:
+  provider: provider.mock
+  id: claude-sonnet-4-6
+  settings:
+    max_tokens: 4096
+
+tool.lookup:
+  description: Look up one fact the draft depends on.
+  input:
+    query:
+      description: What to look up.
+      type: string
+      min_length: 1
+  output:
+    snippet:
+      description: The one fact found, as text.
+      type: string
+  exec:
+    command: printf
+    args: ["a looked-up snippet"]
+
+agent.reviewer:
+  description: Reviews a draft against a goal and returns a routable verdict.
+  model: model.smart
+  prompt: |
+    You are a meticulous technical reviewer.
+
+    Approve only when the draft fully satisfies the goal. Otherwise ask for a
+    revision and list every required change.
+  input:
+    goal:
+      description: What the draft must accomplish.
+      type: string
+    draft:
+      description: The draft under review.
+      type: string
+  output:
+    verdict:
+      description: The routable decision.
+      enum: [approve, revise]
+    feedback:
+      description: Required changes; empty when approving.
+      type: string
+
+agent.researcher:
+  description: Looks a fact up before answering, which is what opens the tool loop.
+  model: model.smart
+  prompt: |
+    You are a researcher.
+
+    Look up whatever the goal depends on before you answer, then report what you
+    found.
+  tools: [tool.lookup]
+  max_tool_iterations: 2
+  input:
+    goal:
+      description: What the answer must accomplish.
+      type: string
+  output:
+    feedback:
+      description: What was found, as text.
+      type: string
+
+flow.review:
+  description: Review one draft and return the verdict.
+  inputs:
+    goal:
+      type: string
+      min_length: 1
+    draft:
+      type: string
+      min_length: 1
+  outputs:
+    verdict:
+      enum: [approve, revise]
+    feedback:
+      type: string
+    round:
+      type: integer
+    notes:
+      type: array
+      max_items: 8
+      items:
+        type: string
+  nodes:
+    review:
+      agent: agent.reviewer
+      input:
+        goal: "input.goal"
+        draft: "input.draft"
+  edges:
+    - { from: start, to: review }
+    - { from: review, to: end }
+
+flow.research:
+  description: Look one fact up and return what the researcher reported.
+  inputs:
+    goal:
+      type: string
+      min_length: 1
+  outputs:
+    feedback:
+      type: string
+  nodes:
+    research:
+      agent: agent.researcher
+      input:
+        goal: "input.goal"
+  edges:
+    - { from: start, to: research }
+    - { from: research, to: end }

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/compose-core", "crates/agent-compose"]
+members = ["crates/compose-core", "crates/agent-compose", "crates/mock-provider"]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,4 +10,5 @@ repository = "https://github.com/moldy530/agent-compose"
 
 [workspace.dependencies]
 compose-core = { path = "crates/compose-core" }
+mock-provider = { path = "crates/mock-provider" }
 clap = { version = "4", features = ["derive"] }

@@ -1,0 +1,71 @@
+# M1 acceptance fixture: an ordered failover route (PRD 5.9).
+#
+# `model.default` is a route, not a binding: on a `rate_limit`, an `overloaded`,
+# or a `timeout` from `model.smart`, the compiled graph must try `model.fast` and
+# record that it did ("served by model.fast, fallback #1"). The two members sit
+# on the same provider, so the only thing that changes between attempts is the
+# model id — which is what the mock's per-model queues key on, and therefore what
+# a transcript assertion can see.
+#
+# A `server_error` is deliberately NOT in `route_on:`: a condition outside the
+# declared list must fail the node rather than fail over, and a fixture that
+# listed everything could not tell the two apart.
+version: "0.1"
+
+state:
+  answer:
+    type: string
+    default: ""
+
+provider.mock:
+  kind: anthropic
+  api_key: ${MOCK_API_KEY}
+  base_url: ${MOCK_BASE_URL}
+
+model.smart:
+  provider: provider.mock
+  id: claude-sonnet-4-6
+  settings:
+    max_tokens: 4096
+
+model.fast:
+  provider: provider.mock
+  id: claude-haiku-4-5
+  settings:
+    max_tokens: 2000
+
+model.default:
+  description: Ordered fallback; the fixture's model calls all go through here.
+  route: [model.smart, model.fast]
+  route_on: [rate_limit, overloaded, timeout]
+
+agent.answerer:
+  description: Answers one question.
+  model: model.default
+  prompt: |
+    Answer the question in one sentence. Do not ask for clarification.
+  input:
+    question:
+      type: string
+  output:
+    answer:
+      type: string
+      min_length: 1
+
+flow.ask:
+  description: Ask one question through a failover route.
+  inputs:
+    question:
+      type: string
+      min_length: 1
+  outputs:
+    answer:
+      type: string
+  nodes:
+    ask:
+      agent: agent.answerer
+      input:
+        question: "input.question"
+  edges:
+    - { from: start, to: ask }
+    - { from: ask, to: end }
