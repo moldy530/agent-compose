@@ -96,8 +96,26 @@
 // These backends are the local, zero-infra ones, and they assume the project is
 // one process: SQLite here is a WebAssembly build over `node:fs` with no
 // cross-process locking, so two `agent-compose run`s sharing a session-scoped
-// store are outside what this release promises. That is the same boundary PRD
-// 5.10 draws — `--target local` is one process — and production backends are M3.
+// store are outside what this release promises — the second one's op fails the
+// node with `SQLite3Error: database is locked` rather than corrupting anything.
+// That is the same boundary PRD 5.10 draws — `--target local` is one process —
+// and production backends are M3. The emitted `README.md` says so where a reader
+// meets the data directory, because `agent-compose run` is the surface where
+// running two at once is the obvious thing to try.
+//
+// # Retention
+//
+// Nothing here is pruned, and for a `session` or `global` store that is the
+// point: what was written stays until the file is deleted. The one part of that
+// which is not the composition's own data is the **idempotency ledger** — the
+// `applied` table, one row per keyed write — which is a durable structure
+// serving an at-least-once guarantee, and which therefore grows with the number
+// of keyed writes a store has ever taken. It cannot be trimmed by age here: a
+// key's row is what makes a retry of that effect site answer instead of writing
+// twice, and this release has no checkpointer that could say when an execution
+// is past replaying (M3 owns durable execution). So the ledger's lifetime is the
+// store file's, retention is deleting the directory, and the emitted `README.md`
+// says that where it says where the data lives.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -868,6 +886,13 @@ function record(context: RunContext, entry: StoreRecord): void {
  * by, and they are exactly the op's own parameter row (grammar 11.4) with the
  * CEL positions replaced by values the model supplied. The mapping is here
  * rather than in `./graph.ts` because it is the same for every store of a kind.
+ *
+ * One parameter of the catalog is **not** here, and its absence is the rule
+ * rather than an omission: a `blob put`'s `content_type:` is a literal on the
+ * node surface (grammar 8.8) rather than an expression, so grammar 11.5's
+ * synthesized `put` offers `key` and `value` alone and the schema this parses
+ * against is `.strict()`. A model has no way to send one, and a line reading for
+ * it would be a mapping no call can reach.
  */
 export async function runStoreTool(
   store: StoreBinding,
@@ -888,7 +913,6 @@ export async function runStoreTool(
     ...(args["metadata"] === undefined
       ? {}
       : { metadata: args["metadata"] as Record<string, unknown> }),
-    ...(args["content_type"] === undefined ? {} : { contentType: String(args["content_type"]) }),
   };
   return await runStoreOp(store, op, params, context, { via: "tool" });
 }
