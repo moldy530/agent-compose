@@ -31,6 +31,7 @@
 //   stores/<name>.sqlite            one database per `kv`/`vector` store
 //   blobs/<name>/<partition>/values/<encoded key>
 //   blobs/<name>/<partition>/types/<encoded key>     the `content_type:` of a `put`
+//   blobs/<name>/<partition>/applied/<key digest>    the idempotency ledger
 // ```
 //
 // `<partition>` is the store's scope made concrete: `global`, `session/<encoded
@@ -117,6 +118,7 @@
 // store file's, retention is deleting the directory, and the emitted `README.md`
 // says that where it says where the data lives.
 
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
@@ -694,14 +696,12 @@ function tabular(
       }
       // Ties break by key, which is what makes two searches over one store
       // answer in one order: a fan-out reading a store must not depend on which
-      // rows SQLite happened to hand back first.
+      // rows SQLite happened to hand back first. By the same key order the rows
+      // arrived in ([`byUtf8Bytes`]), so one module has one answer to "which key
+      // comes first".
       scored.sort((left, right) =>
         right.score === left.score
-          ? left.id < right.id
-            ? -1
-            : left.id > right.id
-              ? 1
-              : 0
+          ? byUtf8Bytes(left.id, right.id)
           : right.score - left.score,
       );
       return {
@@ -717,6 +717,60 @@ function tabular(
     default:
       throw new Error(`\`${store.address}\` is \`kind: ${store.kind}\` and takes no \`${op}\``);
   }
+}
+
+/** One row of the `blob` backend's idempotency ledger (grammar 9.4). */
+interface LedgerEntry {
+  /** The key this row was applied under — see [`markerName`]. */
+  readonly key: string;
+  /** The op it was applied by, which is what the SQLite ledger's column holds. */
+  readonly op: StoreOp;
+  /** What that op answered, which is what a later attempt is answered with. */
+  readonly row: Record<string, unknown>;
+}
+
+/**
+ * A ledger row's file name: the digest of the key rather than the key.
+ *
+ * A blob **value** key is percent-encoded and refused when it is too long for a
+ * file name ([`blobName`]), because `list` reads those names back and has to
+ * answer with the keys that were written. Nothing reads these back: this
+ * directory is a set of markers, asked only "is this key in it". So the name can
+ * be a digest, and it has to be — an idempotency key of grammar 9.4 is a path
+ * through the execution (`<execution>/<node>/<attempt>/…`, one frame per
+ * enclosing `map`), which is composed rather than written and grows without a
+ * bound the author controls. Encoding it directly makes a deep enough fan-out
+ * fail with `ENAMETOOLONG` **after** the effect has landed and before the marker
+ * that would dedupe it — the one ordering that turns a retry into a second
+ * write. The key itself is written *inside* the row, so a reader of the ledger
+ * still sees what was applied.
+ */
+function markerName(idempotencyKey: string): string {
+  return crypto.createHash("sha256").update(idempotencyKey, "utf8").digest("hex");
+}
+
+/**
+ * Compare two keys the way SQLite's `ORDER BY key` does: by UTF-8 bytes.
+ *
+ * `list` is one op of grammar 11.4's catalogue and the two backends answer it
+ * from different machinery — a `SELECT … ORDER BY key` for `kv` and `vector`, a
+ * sort of file names for `blob`. JavaScript's own `<` on strings compares UTF-16
+ * **code units**, which orders a surrogate pair (U+1F600 → 0xD83D …) *before*
+ * U+FF00, while UTF-8 bytes order it after. Each backend would be internally
+ * deterministic and the two would still disagree — and with `limit:`, which
+ * grammar 11.4 makes required, disagree about which keys come back at all. So
+ * the file-name sort is the SQL one, spelled out.
+ */
+function byUtf8Bytes(left: string, right: string): number {
+  const encoder = new TextEncoder();
+  const a = encoder.encode(left);
+  const b = encoder.encode(right);
+  const shared = Math.min(a.length, b.length);
+  for (let index = 0; index < shared; index += 1) {
+    const difference = a[index]! - b[index]!;
+    if (difference !== 0) return difference;
+  }
+  return a.length - b.length;
 }
 
 /** The `blob` rows of grammar 11.4's catalog, over a directory of files. */
@@ -736,9 +790,10 @@ function blobOp(
   if (store.scope === "execution") remember(execution.id, root);
 
   if (idempotencyKey !== undefined) {
-    const marker = path.join(ledger, encodeKey(idempotencyKey));
+    const marker = path.join(ledger, markerName(idempotencyKey));
     if (fs.existsSync(marker)) {
-      return { row: JSON.parse(fs.readFileSync(marker, "utf8")) as Record<string, unknown>, deduped: true };
+      const held = JSON.parse(fs.readFileSync(marker, "utf8")) as LedgerEntry;
+      return { row: held.row, deduped: true };
     }
     const row = blobEffect(store, op, params, values, types);
     // Published by rename, which is atomic: a marker a reader finds is a marker
@@ -748,7 +803,8 @@ function blobOp(
     // process that dies between the effect and the marker leaves behind.
     fs.mkdirSync(ledger, { recursive: true });
     const staged = `${marker}.${process.pid}.partial`;
-    fs.writeFileSync(staged, JSON.stringify(row));
+    const entry: LedgerEntry = { key: idempotencyKey, op, row };
+    fs.writeFileSync(staged, JSON.stringify(entry));
     fs.renameSync(staged, marker);
     return { row, deduped: false };
   }
@@ -796,7 +852,7 @@ function blobEffect(
         .readdirSync(values)
         .map(decodeKey)
         .filter((key) => key.startsWith(prefix))
-        .sort();
+        .sort(byUtf8Bytes);
       return { keys: keys.slice(0, limit) };
     }
     default:

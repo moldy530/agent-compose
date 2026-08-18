@@ -156,6 +156,62 @@ const answer = {};
   );
 }
 
+// --- `list` answers one key order, whichever backend holds the keys ----------
+
+{
+  // Grammar 11.4 fixes no order for `list`, but it is one row of one catalogue
+  // and the two backends answer it from different machinery: SQLite's
+  // `ORDER BY key`, which compares UTF-8 bytes, and a sort of file names, which
+  // in JavaScript compares UTF-16 code units. The two disagree above the BMP —
+  // U+FF00 is `EF BC 80` and U+1F600 is `F0 9F 98 80`, so bytes put U+FF00
+  // first, while the surrogate `D83D` puts U+1F600 first — and with the
+  // `limit:` grammar 11.4 requires, that is not a different order but a
+  // different answer.
+  const written = ["zz", "＀", "\u{1F600}"];
+  const kv = binding("ordered", "kv", "global");
+  const blobs = binding("ordered_blobs", "blob", "global");
+  const run = context("exec_order");
+  for (const [index, key] of written.entries()) {
+    await stores.runStoreOp(kv, "set", { key, value: { n: index } }, run, node(`o/${index}`));
+    await stores.runStoreOp(blobs, "put", { key, value: String(index) }, run, node(`ob/${index}`));
+  }
+  answer.kvOrder = (await stores.runStoreOp(kv, "list", { limit: 10 }, run, node())).keys;
+  answer.blobOrder = (await stores.runStoreOp(blobs, "list", { limit: 10 }, run, node())).keys;
+  answer.kvOrderLimited = (await stores.runStoreOp(kv, "list", { limit: 2 }, run, node())).keys;
+  answer.blobOrderLimited = (await stores.runStoreOp(blobs, "list", { limit: 2 }, run, node())).keys;
+}
+
+// --- a keyed `blob` write whose idempotency key is a deep instance path -------
+
+{
+  // Grammar 9.4's key is **composed** — the execution, the node, the attempt,
+  // and one frame per enclosing `map` — so its length is a property of the graph
+  // rather than of anything an author typed. The `blob` backend records it in a
+  // ledger of one file per key, and a name is capped at 255 bytes, so a key long
+  // enough to exceed that has to be recorded some other way: the alternative is
+  // an `ENAMETOOLONG` raised **after** the effect landed and before the marker
+  // that dedupes it, which turns the next attempt into a second write.
+  const store = binding("deep", "blob", "global");
+  const run = context("exec_deep");
+  const frames = Array.from({ length: 12 }, (_, index) => `node_with_a_fairly_long_name_${index}/0`);
+  const key = `exec_deep/${frames.join("/")}`;
+  answer.deepKeyLength = key.length;
+  answer.deepWrite = await stores.runStoreOp(store, "put", { key: "deep.txt", value: "first" }, run, node(key));
+  // The retry of that same effect site: deduped rather than applied twice, which
+  // is only possible if the first attempt's ledger entry was written.
+  answer.deepRewrite = await stores.runStoreOp(
+    store,
+    "put",
+    { key: "deep.txt", value: "REWRITTEN" },
+    run,
+    node(key),
+  );
+  answer.deepValue = await stores.runStoreOp(store, "get", { key: "deep.txt" }, run, node());
+  answer.deepDeduped = run.storeRecords
+    .filter((record) => record.idempotencyKey === key)
+    .map((record) => record.deduped);
+}
+
 // --- `session`: one file, one partition per key ------------------------------
 
 {

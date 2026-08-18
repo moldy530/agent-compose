@@ -1563,6 +1563,58 @@ fn the_local_backends_behaved(answer: &Value) {
          of grammar 11.4's catalogue, two backends"
     );
 
+    // …and in the same **order**, which is the half of that claim a prefix over
+    // one astral character does not decide. SQLite compares UTF-8 bytes and a
+    // JavaScript sort compares UTF-16 code units, and above the BMP the two
+    // disagree: bytes put U+FF00 (`EF BC 80`) before U+1F600 (`F0 9F 98 80`),
+    // while the surrogate `D83D` puts U+1F600 first. Grammar 11.4 fixes no
+    // order, so neither is wrong on its own — but `list` is one op of one
+    // catalogue, and with the `limit:` the row requires the two would answer
+    // one store's worth of content with different keys.
+    assert_eq!(
+        answer["kvOrder"],
+        json!(["zz", "\u{FF00}", "\u{1F600}"]),
+        "SQLite's `ORDER BY key` is UTF-8 byte order"
+    );
+    assert_eq!(
+        answer["blobOrder"], answer["kvOrder"],
+        "and the `blob` backend sorts its file names the same way"
+    );
+    assert_eq!(
+        answer["kvOrderLimited"],
+        json!(["zz", "\u{FF00}"]),
+        "which is what `limit:` truncates"
+    );
+    assert_eq!(
+        answer["blobOrderLimited"], answer["kvOrderLimited"],
+        "so a `limit:` answers the same keys from either backend"
+    );
+
+    // A keyed `blob` write whose grammar 9.4 key is longer than a file name.
+    // The key is composed from the execution and one frame per enclosing `map`,
+    // so its length is the graph's; a ledger that made it a file name directly
+    // would fail here *after* applying the effect, leaving the retry below to
+    // apply it a second time.
+    assert!(
+        answer["deepKeyLength"]
+            .as_u64()
+            .is_some_and(|length| length > 255),
+        "the probe's key has to be longer than a file name for this to be the \
+         case it is about: {}",
+        answer["deepKeyLength"]
+    );
+    assert_eq!(answer["deepWrite"], json!({ "key": "deep.txt" }));
+    assert_eq!(
+        answer["deepValue"]["value"], "first",
+        "the retry under the same key answered what the first attempt answered \
+         and did not overwrite it"
+    );
+    assert_eq!(
+        answer["deepDeduped"],
+        json!([false, true]),
+        "…which is the ledger doing its job, not the write failing"
+    );
+
     // The records a trace entry carries (PRD 5.8): a read keeps its answer, a
     // write keeps its key and whether the backend had seen it.
     let records = answer["records"]
