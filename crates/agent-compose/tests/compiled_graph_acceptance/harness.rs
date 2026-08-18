@@ -684,6 +684,20 @@ pub fn run_into(
     session: Option<&str>,
     environment: &[(String, String)],
 ) -> Run {
+    run_formatted(out, name, flow, inputs, session, None, environment)
+}
+
+/// The same, choosing the report format — the one flag that changes what a run
+/// writes on which stream.
+pub fn run_formatted(
+    out: &Path,
+    name: &str,
+    flow: &str,
+    inputs: &[(&str, &str)],
+    session: Option<&str>,
+    format: Option<&str>,
+    environment: &[(String, String)],
+) -> Run {
     let mut command = agent_compose();
     command.arg("run").arg(fixture(name)).arg(flow);
     for (field, value) in inputs {
@@ -691,6 +705,9 @@ pub fn run_into(
     }
     if let Some(session) = session {
         command.arg("--session").arg(session);
+    }
+    if let Some(format) = format {
+        command.arg("--format").arg(format);
     }
     command.arg("--out").arg(out);
     seal(&mut command, environment);

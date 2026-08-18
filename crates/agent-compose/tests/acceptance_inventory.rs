@@ -458,10 +458,20 @@ const CODEGEN: &[Criterion] = &[
     Criterion {
         bullet: Bullet::Codegen,
         phrase: "env-ref presence checks at process start",
-        tests: &[(
-            "a_missing_env_ref_fails_at_process_start_naming_the_variable",
-            Status::Live,
-        )],
+        tests: &[
+            (
+                "a_missing_env_ref_fails_at_process_start_naming_the_variable",
+                Status::Live,
+            ),
+            // PRD §9.15's other half: `run`/`serve` fail fast *before* invoking
+            // the graph, which is a different check with a different message —
+            // the compiler names every reference and the site each is written
+            // at, without a runtime having been started at all.
+            (
+                "run_refuses_before_it_launches_when_a_variable_is_missing",
+                Status::Live,
+            ),
+        ],
     },
 ];
 
@@ -478,10 +488,24 @@ const COMMANDS: &[Criterion] = &[
     Criterion {
         bullet: Bullet::Commands,
         phrase: "`agent-compose run` (manual trigger)",
-        tests: &[(
-            "run_executes_a_manual_trigger_and_prints_the_flow_outputs",
-            Status::Live,
-        )],
+        tests: &[
+            (
+                "run_executes_a_manual_trigger_and_prints_the_flow_outputs",
+                Status::Live,
+            ),
+            // What the other report format answers with: the whole record on
+            // stdout, which is the shape a caller that parses one stream reads.
+            (
+                "run_reports_its_whole_record_under_the_json_format",
+                Status::Live,
+            ),
+            // …and the precondition of *starting* something that has nothing to
+            // do with the composition: the pinned dependency set.
+            (
+                "run_says_what_is_missing_when_the_dependency_set_is_not_installed",
+                Status::Live,
+            ),
+        ],
     },
     // Four tests, because the criterion's three verbs do not unlock together.
     // PRD §7 M1 puts `serve` — start, resume and status — in this milestone,

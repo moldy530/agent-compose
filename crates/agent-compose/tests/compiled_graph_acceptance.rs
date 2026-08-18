@@ -4475,6 +4475,147 @@ fn run_executes_a_manual_trigger_and_prints_the_flow_outputs() {
     assert!(failure.contains("goal"), "{failure}");
 }
 
+/// `--format json` folds the answer and the report into one document on stdout,
+/// and leaves stderr empty.
+///
+/// The default format splits them — outputs on stdout, what ran on stderr — so
+/// this is the shape a caller that parses one stream reads, and the two are
+/// asserted together because "the report format changed the report" is only a
+/// claim beside what the other format does.
+#[test]
+fn run_reports_its_whole_record_under_the_json_format() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "verdict": "approve", "feedback": "" })),
+    ));
+
+    let Some(project) = harness::scratch_project("run-json") else {
+        return;
+    };
+    let run = harness::run_formatted(
+        &project,
+        "agent-anthropic",
+        "flow.review",
+        &[("goal", "ship it"), ("draft", "a draft")],
+        None,
+        Some("json"),
+        &harness::environment(&provider),
+    );
+    run.succeeded();
+    assert_eq!(
+        run.stderr(),
+        "",
+        "under `--format json` the whole answer is the document on stdout"
+    );
+
+    let answered = run.outputs();
+    assert_eq!(answered["flow"], "flow.review");
+    assert_eq!(answered["status"], "completed");
+    assert_eq!(answered["outputs"]["verdict"], "approve");
+    // The routing record of PRD 5.3, in the same document rather than in a file
+    // a second reader would have to find.
+    let trace = answered["trace"]
+        .as_array()
+        .expect("the record carries the run's trace");
+    assert_eq!(
+        trace
+            .iter()
+            .map(|entry| entry["node"].clone())
+            .collect::<Vec<_>>(),
+        [json!("review")]
+    );
+    assert!(
+        answered["trace_path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with(".json")),
+        "…and still says where the file went: {answered}"
+    );
+}
+
+/// `run` refuses **before** it launches when a variable the composition
+/// references is unset, naming the variable and where it is written
+/// (PRD §9.15).
+///
+/// The emitted project checks its own environment at process start, which is
+/// what covers a project run by hand and what
+/// `a_missing_env_ref_fails_at_process_start_naming_the_variable` decides. This
+/// is the other half of the same sentence — "`run`/`serve` fail fast before
+/// invoking the graph" — and it is a different check with a different message:
+/// the compiler knows every reference statically, so it names all of them and
+/// the site each is written at, without a runtime having been started at all.
+#[test]
+fn run_refuses_before_it_launches_when_a_variable_is_missing() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(SONNET, Outcome::text("never reached")));
+
+    let environment: Vec<(String, String)> = harness::environment(&provider)
+        .into_iter()
+        .filter(|(name, _)| name != harness::API_KEY)
+        .collect();
+    let Some(project) = harness::scratch_project("run-unset") else {
+        return;
+    };
+    let run = harness::run_into(
+        &project,
+        "agent-anthropic",
+        "flow.review",
+        &[("goal", "ship it"), ("draft", "a draft")],
+        None,
+        &environment,
+    );
+    let failure = run.failed();
+    assert!(
+        failure.contains(harness::API_KEY) && failure.contains("provider.mock.api_key"),
+        "the refusal names the variable and the site that references it: {failure}"
+    );
+    assert!(
+        provider.requests().is_empty(),
+        "nothing was launched, so nothing was called"
+    );
+    // …and the project was still **built**: a build reads no environment
+    // (PRD 5.9), so the refusal is about starting rather than about compiling.
+    assert!(
+        project.join("src/graph.ts").is_file(),
+        "the build happened and the launch did not"
+    );
+}
+
+/// `run` says what is missing when the pinned dependency set is not installed.
+///
+/// An emitted project is source rather than a bundle: it imports LangGraph, Zod
+/// and the rest of the pinned set by name. A launch into a directory with no
+/// `node_modules` above it would otherwise fail inside the runtime with a
+/// resolution error naming a package, which tells a reader nothing about the
+/// step they skipped.
+#[test]
+fn run_says_what_is_missing_when_the_dependency_set_is_not_installed() {
+    // The runtime and not the install: this run is meant to stop *before* it
+    // resolves a package, and the message it stops with is only this one when
+    // there was a runtime to launch. Same skip-locally, fail-in-CI rule as
+    // everything else here.
+    if harness::bun_command().is_none() {
+        return;
+    }
+    let provider = MockProvider::start().expect("a loopback port");
+    let elsewhere = harness::Scratch::new("uninstalled");
+
+    let run = harness::run_into(
+        &elsewhere.path().join("project"),
+        "agent-anthropic",
+        "flow.review",
+        &[("goal", "ship it"), ("draft", "a draft")],
+        None,
+        &harness::environment(&provider),
+    );
+    let failure = run.failed();
+    assert!(
+        failure.contains("bun install") && failure.contains("not installed"),
+        "the refusal names the step rather than a package: {failure}"
+    );
+    assert!(provider.requests().is_empty());
+}
+
 /// `agent-compose serve` exposes start and status for an `http` trigger.
 ///
 /// Two of the criterion's three verbs, over the fixture's interrupt-free flow

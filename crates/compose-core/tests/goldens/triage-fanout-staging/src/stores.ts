@@ -319,8 +319,18 @@ function sqlite(): Promise<SqliteModule> {
   return driver;
 }
 
-/** Every open database, by the cache key [`handleKey`] derives. */
-const DATABASES = new Map<string, Database>();
+/**
+ * Every open database, by the cache key [`handleKey`] derives.
+ *
+ * The map holds the **promise** rather than the handle, because opening one is
+ * asynchronous — the driver is imported on first use — and a `map` dispatches
+ * its instances concurrently (grammar 8.6). Two instances reaching one store in
+ * the same turn would otherwise both find nothing cached, both open the file,
+ * and leave one handle behind unclosed with writes going through the other.
+ * Caching the promise makes the second caller wait for the first's answer, which
+ * is the whole of the fix.
+ */
+const DATABASES = new Map<string, Promise<Database>>();
 
 /** What an execution has opened, so [`releaseExecution`] can let it go. */
 const PER_EXECUTION = new Map<string, Set<string>>();
@@ -349,26 +359,36 @@ CREATE TABLE IF NOT EXISTS applied (
 `;
 
 /** The database a store's op runs against, opened and migrated on first use. */
-async function open(store: StoreBinding, execution: runtime.ExecutionIdentity): Promise<Database> {
+function open(store: StoreBinding, execution: runtime.ExecutionIdentity): Promise<Database> {
   const cacheKey = handleKey(store, execution);
   const held = DATABASES.get(cacheKey);
   if (held !== undefined) return held;
 
-  const { Database } = await sqlite();
-  let opened: Database;
-  if (store.scope === "execution" || store.backend.provider === "memory") {
-    // Nothing on disk: an execution-scoped store dies with the run, and
-    // `provider: memory` says so outright.
-    opened = new Database(":memory:");
-  } else {
-    const directory = path.join(dataRoot(), "stores");
-    fs.mkdirSync(directory, { recursive: true });
-    opened = new Database(path.join(directory, `${encodeKey(store.name)}.sqlite`));
-  }
-  opened.exec(SCHEMA);
-  DATABASES.set(cacheKey, opened);
+  const opening = (async () => {
+    const { Database } = await sqlite();
+    let opened: Database;
+    if (store.scope === "execution" || store.backend.provider === "memory") {
+      // Nothing on disk: an execution-scoped store dies with the run, and
+      // `provider: memory` says so outright.
+      opened = new Database(":memory:");
+    } else {
+      const directory = path.join(dataRoot(), "stores");
+      fs.mkdirSync(directory, { recursive: true });
+      opened = new Database(path.join(directory, `${encodeKey(store.name)}.sqlite`));
+    }
+    opened.exec(SCHEMA);
+    return opened;
+  })();
+  // Registered before the first `await` inside it, so a concurrent caller finds
+  // this promise rather than opening a second handle. A failed open is dropped
+  // from the cache so the next op tries again instead of inheriting the failure
+  // forever.
+  DATABASES.set(cacheKey, opening);
+  void opening.catch(() => {
+    if (DATABASES.get(cacheKey) === opening) DATABASES.delete(cacheKey);
+  });
   if (store.scope === "execution") remember(execution.id, cacheKey);
-  return opened;
+  return opening;
 }
 
 /** Note a resource this execution owns, so its end can release it. */
@@ -397,11 +417,21 @@ export function releaseExecution(id: string): void {
     const database = DATABASES.get(resource);
     if (database !== undefined) {
       DATABASES.delete(resource);
-      try {
-        database.close();
-      } catch {
-        // A database that is already closed is one that is already released.
-      }
+      // The handle is behind a promise (see [`DATABASES`]), so the close is
+      // scheduled rather than performed: an op still in flight when the run
+      // ended is the one case, and letting it finish beats closing the file
+      // underneath it. Both rejections are swallowed — an open that failed has
+      // nothing to close, and a close that failed released it anyway.
+      void database.then(
+        (held) => {
+          try {
+            held.close();
+          } catch {
+            // A database that is already closed is one that is already released.
+          }
+        },
+        () => {},
+      );
       continue;
     }
     // Anything else this execution owned is a directory of blobs.
@@ -464,7 +494,15 @@ export async function runStoreOp(
   // leaves nothing for the next one to trip over.
   const idempotencyKey = writes(op) ? site.idempotencyKey : undefined;
 
-  const answer = await perform(store, op, params, scopeKey, execution, idempotencyKey);
+  const answer = await perform(
+    store,
+    op,
+    params,
+    scopeKey,
+    execution,
+    idempotencyKey,
+    context.signal,
+  );
   record(context, {
     store: store.address,
     op,
@@ -499,6 +537,7 @@ async function perform(
   scopeKey: string,
   execution: runtime.ExecutionIdentity,
   idempotencyKey: string | undefined,
+  signal: AbortSignal,
 ): Promise<Applied> {
   if (store.kind === "blob") {
     return blobOp(store, op, params, scopeKey, execution, idempotencyKey);
@@ -509,7 +548,13 @@ async function perform(
   // it, where it would hold a write lock across a round trip.
   const vector =
     store.kind === "vector" && (op === "upsert" || op === "search")
-      ? await embed(store, op === "search" ? required(params.query, "query", store) : String(params.value ?? ""))
+      ? await embed(
+          store,
+          op === "search"
+            ? required(params.query, "query", store)
+            : String(params.value ?? ""),
+          signal,
+        )
       : undefined;
 
   return transact(database, () => {
@@ -767,29 +812,22 @@ function cosine(left: readonly number[], right: readonly number[]): number {
   return dot / (Math.sqrt(leftNorm) * Math.sqrt(rightNorm));
 }
 
-/** One text, as a vector, through the store's own `embed:` (grammar 11.2). */
-async function embed(store: StoreBinding, text: string): Promise<number[]> {
+/**
+ * One text, as a vector, through the store's own `embed:` (grammar 11.2).
+ *
+ * `signal` is the **node's**, handed down from the op's own context: an
+ * embedding is a network request made inside an activity, so a node whose
+ * `timeout:` budget runs out should stop waiting on the socket rather than leave
+ * it open behind an abandoned promise (grammar 9.2, and see
+ * `runtime.runActivity`).
+ */
+async function embed(store: StoreBinding, text: string, signal: AbortSignal): Promise<number[]> {
   const binding = store.embed;
   if (binding === undefined) {
     throw new Error(`\`${store.address}\` is \`kind: vector\` and declares no \`embed:\``);
   }
-  // The embedding call is its own request with no node deadline to inherit here
-  // beyond the one the activity already races: `runActivity` bounds the node,
-  // and this signal is the same one the model calls use.
-  const [vector] = await runtime.callEmbeddings(binding, [text], embeddingSignal());
+  const [vector] = await runtime.callEmbeddings(binding, [text], signal);
   return vector ?? [];
-}
-
-/**
- * The signal an embedding request runs under.
- *
- * A store op is reached from inside an activity, whose deadline is raced by
- * `runActivity` rather than handed down here: a node that runs out of budget
- * fails on time whatever this request does. Never-aborting is therefore the
- * honest shape — the alternative would be a second, unrelated clock.
- */
-function embeddingSignal(): AbortSignal {
-  return new AbortController().signal;
 }
 
 /** Append one record to the node's trace entry, when the node is collecting. */
