@@ -141,7 +141,11 @@ async function run(argv: readonly string[]): Promise<number> {
     );
   }
 
-  const options = parse(rest, ["input"]);
+  const options = parse("run", rest, {
+    input: "repeatable",
+    session: "single",
+    format: "single",
+  });
   const inputs = bindInputs(flow, options.repeated["input"] ?? []);
   const session = sessionOf(flow, options.single["session"] ?? "");
   const format = formatOf(options.single["format"]);
@@ -213,7 +217,7 @@ async function run(argv: readonly string[]): Promise<number> {
 
 /** `serve [--host <host>] [--port <port>]`. */
 async function serveVerb(argv: readonly string[]): Promise<number> {
-  const options = parse(argv, []);
+  const options = parse("serve", argv, { host: "single", port: "single" });
   const port = options.single["port"];
   if (port !== undefined && !/^[0-9]+$/.test(port)) {
     throw new UsageError(`\`--port ${port}\` is not a port number`);
@@ -367,10 +371,27 @@ function coerce(flow: CompiledFlow, field: string, text: string): unknown {
   }
 }
 
-/** The flags this command line takes: `--name value`, some repeatable. */
+/** Whether an option may be given more than once. */
+type Arity = "single" | "repeatable";
+
+/**
+ * The flags one verb takes: `--name value`, some repeatable.
+ *
+ * The verb declares **every** option it takes, and a `--name` outside that list
+ * is a usage error rather than an entry nothing ever reads. That is D50's
+ * posture — a typo is a diagnostic, never a silent no-op — applied to the one
+ * surface the compiler does not stand in front of: `agent-compose run` is
+ * shielded by its own argument parser, but an ejected project's command line is
+ * this function, and `--fromat json` answering with human output and exit `0`
+ * is a caller parsing the wrong document with nothing to tell it so.
+ *
+ * The options are declared in the order the README documents them, because that
+ * order is what the refusal lists back.
+ */
 function parse(
+  verb: string,
   argv: readonly string[],
-  repeatable: readonly string[],
+  options: Readonly<Record<string, Arity>>,
 ): { single: Record<string, string>; repeated: Record<string, string[]> } {
   const single: Record<string, string> = {};
   const repeated: Record<string, string[]> = {};
@@ -380,10 +401,21 @@ function parse(
       throw new UsageError(`\`${argument}\` is not an option: every argument after the verb is \`--name value\``);
     }
     const name = argument.slice(2);
+    // `Object.hasOwn` rather than a lookup: every object carries `constructor`
+    // and `toString`, so `--constructor x` would read an inherited function as
+    // this option's arity and be accepted as one — the same property-versus-key
+    // confusion the compiler refuses a *channel* named `constructor` over.
+    const arity = Object.hasOwn(options, name) ? options[name] : undefined;
+    if (arity === undefined) {
+      const taken = Object.keys(options).map((option) => `\`--${option}\``);
+      throw new UsageError(
+        `\`--${name}\` is not an option of \`${verb}\`: it takes ${taken.length === 0 ? "no options" : taken.join(", ")} (see README.md)`,
+      );
+    }
     const value = argv[index + 1];
     if (value === undefined) throw new UsageError(`\`--${name}\` takes a value`);
     index += 1;
-    if (repeatable.includes(name)) {
+    if (arity === "repeatable") {
       (repeated[name] ??= []).push(value);
     } else {
       single[name] = value;

@@ -2,15 +2,16 @@
 //! the **real** pinned JavaScript toolchain — under **Bun**, which PRD §9.18
 //! makes the default runtime and package manager of every emitted project.
 //!
-//! Sixteen gates. The first four are in increasing strength, each one existing
+//! Seventeen gates. The first four are in increasing strength, each one existing
 //! because the one above it passes on code the one below it catches; the fifth
 //! is about a construct whose guarantees are only observable from inside the
 //! runtime; the next two are about the schemas rather than the graph; the eighth
 //! is about a composition that has no generated project at all; the next four
 //! are about what a binding does on the wire, which no amount of type-checking or
 //! graph construction reaches; the three after those are about the *other*
-//! runtime — the Node fallback the same decision keeps supported — and the last
-//! is about the storage underneath a `store.*`:
+//! runtime — the Node fallback the same decision keeps supported; the sixteenth
+//! is about the storage underneath a `store.*`; and the last is about the
+//! argument parser every launch of an emitted project goes through:
 //!
 //! 1. **`bun run typecheck`** — every golden project type-checks under its own
 //!    strict `tsconfig.json`, against installed `@langchain/langgraph`,
@@ -143,6 +144,14 @@
 //!     wrong. Gate 13 runs the same runner under Node, because a WebAssembly
 //!     SQLite over `node:fs` is exactly the dependency that could answer the two
 //!     engines differently.
+//! 17. **The project's own command line** — `bun src/index.ts run … --fromat
+//!     json` and `serve --prot 8787`: a flag neither verb declares, on the
+//!     surface PRD 5.12's eject path leaves as the *only* way to launch the
+//!     project. `agent-compose run` never sends one — clap refuses it first — so
+//!     nothing else in the suite reaches this parser, and an option it accepted
+//!     and never read would be a caller asking for the JSON record, getting
+//!     human output, and being told `0`. D50's rule, asserted where the compiler
+//!     is no longer standing in front of it.
 //!
 //! # The toolchain fixture
 //!
@@ -187,7 +196,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
-use goldens::{GOLDENS, Golden, artifact, emitted, files_under, goldens_root};
+use goldens::{GOLDENS, Golden, artifact, emitted, files_under, golden, goldens_root};
 use serde_json::{Value, json};
 use toolchain::{bun, installed, required, runner, runs};
 
@@ -1883,6 +1892,92 @@ fn the_generated_project_checks_its_environment_when_it_is_loaded() {
         checked > 0,
         "no golden references an environment variable, so nothing exercised the check"
     );
+}
+
+/// Gate 17: the project's own command line refuses an option its verb does not
+/// take.
+///
+/// `agent-compose run` is shielded by its own argument parser and sends only the
+/// flags it knows; the emitted command line is what PRD 5.12's eject path leaves
+/// a reader with, and it is the only launch surface an ejected project has. A
+/// `--name` it accepted and never read would be a caller asking for the JSON
+/// record and getting human output at exit `0`, with nothing anywhere to say so
+/// — which is D50's rule ("a typo in `retrry:` must be a diagnostic, not a
+/// silently ignored key") broken on the one surface the compiler does not stand
+/// in front of.
+///
+/// Both verbs, because their option lists are declared separately and a list
+/// that went stale on one of them is exactly what this catches. The refusal must
+/// also *list what the verb takes*: a reader who mistyped `--format` is one
+/// character from the answer, and PRD G3 makes saying so part of the product.
+#[test]
+fn the_generated_command_line_refuses_an_option_its_verb_does_not_take() {
+    let Some(root) = installed() else {
+        return;
+    };
+    let golden = golden("review-loop");
+    let project = staged(golden, root, "usage");
+    let references = compose_core::codegen::env::References::of(&artifact(golden));
+
+    let launch = |arguments: &[&str]| {
+        let mut command = bun();
+        command.arg(project.join("src/index.ts"));
+        command.args(arguments);
+        for name in references.names() {
+            command.env(name, "supplied");
+        }
+        command.output().expect("bun runs")
+    };
+
+    for (arguments, verb, mistyped, listed) in [
+        (
+            ["run", "flow.review_loop", "--fromat", "json"].as_slice(),
+            "run",
+            "--fromat",
+            ["`--input`", "`--session`", "`--format`"].as_slice(),
+        ),
+        (
+            ["serve", "--prot", "8787"].as_slice(),
+            "serve",
+            "--prot",
+            ["`--host`", "`--port`"].as_slice(),
+        ),
+        // The option table is an object, and every object carries
+        // `constructor`. A membership test spelled as a lookup reads that
+        // inherited function as an arity and takes the flag — the same
+        // property-versus-key confusion `build` refuses a channel named
+        // `constructor` over (gate 8), one layer out.
+        (
+            ["run", "flow.review_loop", "--constructor", "x"].as_slice(),
+            "run",
+            "--constructor",
+            ["`--input`", "`--session`", "`--format`"].as_slice(),
+        ),
+    ] {
+        let output = launch(arguments);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "`{arguments:?}` is a command that could not run, which is exit 2:\n{}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "…and nothing ran, so stdout carries no answer: {}",
+            String::from_utf8_lossy(&output.stdout),
+        );
+        let complaint = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            complaint.contains(&format!("`{mistyped}` is not an option of `{verb}`")),
+            "the refusal names the flag and the verb:\n{complaint}"
+        );
+        for option in listed {
+            assert!(
+                complaint.contains(option),
+                "…and lists {option}, which the verb does take:\n{complaint}"
+            );
+        }
+    }
 }
 
 /// Every declared divergence is exercised, and every cited one is declared.
