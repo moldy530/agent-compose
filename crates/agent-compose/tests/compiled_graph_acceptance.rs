@@ -4298,10 +4298,36 @@ fn a_route_fails_over_to_its_next_member_and_the_trace_records_it() {
         [SONNET, HAIKU],
         "the route was tried in order"
     );
-    let trace = run.stderr();
+    // PRD 5.9 asks for failover to be "deterministic runtime behavior recorded
+    // in the trace (`served by model.fast, fallback #1`)", so the assertion is
+    // against the record rather than against the sentence the terminal prints:
+    // the `model.*` the agent named, the member that answered, its ordinal, and
+    // the condition the member it replaced refused with.
+    let entries = run.entries("ask");
+    let calls: Vec<&Value> = entries
+        .iter()
+        .filter_map(|entry| entry["models"].as_array())
+        .flatten()
+        .collect();
+    assert_eq!(calls.len(), 1, "one model call was made: {entries:?}");
+    let call = calls[0];
+    assert_eq!(call["model"], "model.default", "{call}");
+    assert_eq!(call["servedBy"], "model.fast", "{call}");
+    assert_eq!(call["fallback"], 1, "served by fallback #1: {call}");
+    let failovers = call["failovers"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the refusals on the way are recorded: {call}"));
+    assert_eq!(failovers.len(), 1, "{call}");
+    assert_eq!(failovers[0]["model"], "model.smart", "{call}");
+    assert_eq!(
+        failovers[0]["condition"], "rate_limit",
+        "the record names the `route_on:` condition, not just that something failed: {call}"
+    );
+
+    let rendered = run.stderr();
     assert!(
-        trace.contains("model.fast"),
-        "failover is trace data, not silent behaviour (PRD 5.9): {trace}"
+        rendered.contains("served by model.fast, fallback #1"),
+        "the human report is PRD 5.9's own sentence: {rendered}"
     );
 }
 
@@ -4322,7 +4348,7 @@ fn a_condition_outside_route_on_fails_the_node_instead_of_failing_over() {
     ) else {
         return;
     };
-    run.failed();
+    let failure = run.failed();
 
     let recorded = provider.requests();
     assert_eq!(
@@ -4332,6 +4358,74 @@ fn a_condition_outside_route_on_fails_the_node_instead_of_failing_over() {
         recorded.iter().map(|call| &call.model).collect::<Vec<_>>()
     );
     assert_eq!(recorded[0].model, SONNET);
+    // And it failed for the reason the fixture staged, rather than for some
+    // earlier reason that would have made the one-request assertion vacuous.
+    assert!(
+        failure.contains("500") && !failure.contains("model.fast"),
+        "the run failed on the refusal itself, and named no fallback: {failure}"
+    );
+}
+
+/// The rest of `route_on:`'s vocabulary, each against the wire shape it names
+/// (grammar 12.2, PRD 5.9).
+///
+/// `rate_limit` has its own test above because it is the one that also decides
+/// what the trace records. These two are about *classification*: an
+/// `overloaded` is a status the surface chooses (529 on Anthropic, 503 on
+/// OpenAI), and a `timeout` is not a status at all — it is a request that never
+/// gets an answer, which reaches the ladder as a transport failure rather than
+/// as a refusal the provider wrote. A ladder that classified either one as
+/// something outside `route_on:` would fail the node, so a run that produces the
+/// fallback's answer is the assertion.
+///
+/// Both run in one project: the ladder is per model call, so two conditions need
+/// two runs, and building once keeps this a test about failover rather than
+/// about the toolchain.
+#[test]
+fn every_declared_condition_is_recognized_from_the_shape_the_provider_answers_with() {
+    let Some(project) = harness::scratch_project("failover-conditions") else {
+        return;
+    };
+    for (condition, staged) in [
+        ("overloaded", Outcome::overloaded()),
+        ("timeout", Outcome::timeout(Duration::from_millis(50))),
+    ] {
+        let provider = MockProvider::start().expect("a loopback port");
+        provider.enqueue_all([
+            Script::new(SONNET, staged),
+            Script::new(HAIKU, Outcome::structured(json!({ "answer": condition }))),
+        ]);
+
+        let run = harness::run_into(
+            &project,
+            "model-failover",
+            "flow.ask",
+            &[("question", "what is it?")],
+            None,
+            &harness::environment(&provider),
+        );
+        run.succeeded();
+        assert_eq!(
+            run.outputs()["answer"],
+            condition,
+            "the fallback's answer is what the run produced, so the ladder went on"
+        );
+
+        let call = run
+            .entries("ask")
+            .into_iter()
+            .find_map(|entry| {
+                entry["models"]
+                    .as_array()
+                    .and_then(|calls| calls.first().cloned())
+            })
+            .unwrap_or_else(|| panic!("the model call is recorded ({condition})"));
+        assert_eq!(call["servedBy"], "model.fast", "{call}");
+        assert_eq!(
+            call["failovers"][0]["condition"], condition,
+            "the refusal is classified as the condition `route_on:` names it by: {call}"
+        );
+    }
 }
 
 /// A missing env ref fails at process start, naming the variable — never at the

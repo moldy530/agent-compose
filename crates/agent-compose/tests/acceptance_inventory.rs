@@ -447,6 +447,14 @@ const CODEGEN: &[Criterion] = &[
                 "a_condition_outside_route_on_fails_the_node_instead_of_failing_over",
                 Status::Live,
             ),
+            // The two conditions the first row does not stage. `route_on:` is a
+            // declared list, so a criterion met for one of its members and not
+            // the others would be met by an accident of which status the
+            // fixture happened to script.
+            (
+                "every_declared_condition_is_recognized_from_the_shape_the_provider_answers_with",
+                Status::Live,
+            ),
         ],
     },
     // The emission has landed: the built project reads its `${ENV}` references
