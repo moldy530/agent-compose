@@ -245,7 +245,9 @@ pub fn readme(ir: &Ir) -> super::GeneratedFile {
         ir.entrypoint, ir.target
     ));
     contents.push_str(README_BODY);
+    contents.push_str(&store_data(ir));
     contents.push_str(&host_functions(ir));
+    contents.push_str(README_PINS);
 
     let mut pins = String::from("\n| package | version |\n|---|---|\n");
     for (package, version) in PINS.iter().chain(DEV_PINS) {
@@ -360,6 +362,49 @@ announces where it is listening as one JSON line on stdout. Executions are
 tracked in that process: durable execution and checkpointers are a later
 milestone, so a status route answers `404` for an id the process did not start.
 
+### On Node instead
+
+Node **>=22.18.0** is a supported fallback, and nothing here is written for one
+runtime: no emitted module reaches for a `Bun` global or a `bun:` import, which
+is a gate on the compiler rather than a promise in a README. 22.18 is the floor
+because that is where Node stopped flagging type stripping, and it is what
+`engines.node` in `package.json` declares:
+
+```sh
+npm install          # or: pnpm install
+npm run typecheck
+node src/index.ts
+```
+
+The manifest pins every dependency exactly and asks for nothing
+installer-specific — no `packageManager` field, no lockfile, no install-time
+script — so bun, npm and pnpm all resolve it to the same versions. The lockfile
+your installer writes is yours: `agent-compose build` never writes or removes
+one.
+"#;
+
+/// The section a composition declaring a `store.*` gets.
+///
+/// A store is the one construct that leaves something behind on disk, and where
+/// it leaves it is a promise this project keeps rather than a detail of
+/// `src/stores.ts`: a reader who wants to inspect, back up or delete what a run
+/// stored has to be told the layout. A composition with no store gets no
+/// section, exactly as one using no `function:` binding gets no host-function
+/// section.
+fn store_data(ir: &Ir) -> String {
+    let stores = ir.definitions.values().any(|definition| {
+        matches!(
+            definition.body,
+            crate::ir::definition::DefinitionBody::Store(_)
+        )
+    });
+    if !stores {
+        return String::new();
+    }
+    String::from(STORE_DATA)
+}
+
+const STORE_DATA: &str = r#"
 ## Where a store keeps its data
 
 `--target local` substitutes SQLite and local disk for every store
@@ -380,26 +425,13 @@ memory and released when the run ends, which is what "dies with the run" means.
 same. It is derived from this project's own location rather than from the
 working directory, so a graph reads the same store wherever it was launched from.
 
-### On Node instead
+One thing under the directory is not a store's: the traces above, which
+`agent-compose run` writes and names on stderr. The whole directory is listed in
+`.gitignore` — what a run produced is not what a build emitted.
+"#;
 
-Node **>=22.18.0** is a supported fallback, and nothing here is written for one
-runtime: no emitted module reaches for a `Bun` global or a `bun:` import, which
-is a gate on the compiler rather than a promise in a README. 22.18 is the floor
-because that is where Node stopped flagging type stripping, and it is what
-`engines.node` in `package.json` declares:
-
-```sh
-npm install          # or: pnpm install
-npm run typecheck
-node src/index.ts
-```
-
-The manifest pins every dependency exactly and asks for nothing
-installer-specific — no `packageManager` field, no lockfile, no install-time
-script — so bun, npm and pnpm all resolve it to the same versions. The lockfile
-your installer writes is yours: `agent-compose build` never writes or removes
-one.
-
+/// The pins table's own heading, emitted after every conditional section.
+const README_PINS: &str = r#"
 ## Pinned versions
 
 A compiler release targets one LangGraph release (PRD 5.12). Upgrading is a
@@ -703,6 +735,63 @@ mod tests {
         );
         // …and the manifest field that would contradict all of it.
         assert!(contents.contains("no `packageManager` field"), "{contents}");
+    }
+
+    /// A composition with a `store.*` is told where its data goes, and one
+    /// without gets no section — the same rule the host-function section
+    /// follows.
+    ///
+    /// A store is the one construct that leaves something behind on disk, so a
+    /// reader who wants to inspect, back up or delete what a run stored has to
+    /// be told the layout. The ordering is asserted too: the section is the
+    /// project's, and it belongs with the rest of what the project does rather
+    /// than after the version table nobody reads to the end of.
+    #[test]
+    fn a_composition_with_a_store_is_told_where_its_data_goes() {
+        let plain = readme(&ir_of("version: \"0.1\"\n")).contents;
+        assert!(
+            !plain.contains("## Where a store keeps its data"),
+            "a composition with no store keeps nothing"
+        );
+
+        let contents = readme(&ir_of(
+            r#"version: "0.1"
+
+store.prefs:
+  kind: kv
+  scope: session
+  description: What this session was told.
+  value_schema:
+    theme: { type: string }
+"#,
+        ))
+        .contents;
+        let section = contents
+            .find("## Where a store keeps its data")
+            .expect("the section is emitted");
+        assert!(
+            contents.contains(".agent-compose/stores/<name>.sqlite"),
+            "{contents}"
+        );
+        assert!(
+            contents.contains("session/<session key>"),
+            "the partition a `scope:` becomes: {contents}"
+        );
+        assert!(
+            contents.contains("AGENT_COMPOSE_DATA_DIR"),
+            "…and the one variable that moves it: {contents}"
+        );
+        assert!(
+            section
+                < contents
+                    .find("## Pinned versions")
+                    .expect("the pin table has a heading"),
+            "the section sits with the rest of what the project does"
+        );
+        assert!(
+            section > contents.find("### On Node instead").expect("the fallback"),
+            "…and after the launch instructions it is about"
+        );
     }
 
     /// The two pin tables and the README's table are one list. A dependency

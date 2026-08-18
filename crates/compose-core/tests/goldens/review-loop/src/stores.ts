@@ -337,9 +337,11 @@ const PER_EXECUTION = new Map<string, Set<string>>();
 
 /** Which database a store's op addresses. */
 function handleKey(store: StoreBinding, execution: runtime.ExecutionIdentity): string {
-  // ` ` cannot appear in a store name (grammar 2.1) or in an execution id,
-  // so the two halves cannot be confused for one another.
-  return store.scope === "execution" ? `${store.name} ${execution.id}` : store.name;
+  // U+0000 cannot appear in a store name (grammar 2.1) or in an execution id,
+  // so the two halves cannot be confused for one another. It is written as an
+  // escape rather than as itself: a source file carrying a raw NUL is a file
+  // every diff tool calls binary, and these are meant to be read.
+  return store.scope === "execution" ? `${store.name}\u0000${execution.id}` : store.name;
 }
 
 const SCHEMA = `

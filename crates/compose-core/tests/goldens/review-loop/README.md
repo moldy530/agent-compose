@@ -108,26 +108,6 @@ announces where it is listening as one JSON line on stdout. Executions are
 tracked in that process: durable execution and checkpointers are a later
 milestone, so a status route answers `404` for an id the process did not start.
 
-## Where a store keeps its data
-
-`--target local` substitutes SQLite and local disk for every store
-unconditionally, so a composition with a `store.*` in it runs with nothing
-installed (PRD 5.8). What it writes lives under this directory:
-
-```text
-.agent-compose/stores/<name>.sqlite                      a `kv` or `vector` store
-.agent-compose/blobs/<name>/<partition>/values/<key>     a `blob` store
-.agent-compose/traces/<flow>-<timestamp>.json            what `run` wrote out
-```
-
-`<partition>` is the store's declared `scope:` made concrete — `global`,
-`session/<session key>`, or `execution/<execution id>` — so one file holds every
-session and a read never sees another's. A `scope: execution` store is held in
-memory and released when the run ends, which is what "dies with the run" means.
-`AGENT_COMPOSE_DATA_DIR` moves the whole directory; the paths under it stay the
-same. It is derived from this project's own location rather than from the
-working directory, so a graph reads the same store wherever it was launched from.
-
 ### On Node instead
 
 Node **>=22.18.0** is a supported fallback, and nothing here is written for one

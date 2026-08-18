@@ -108,6 +108,26 @@ announces where it is listening as one JSON line on stdout. Executions are
 tracked in that process: durable execution and checkpointers are a later
 milestone, so a status route answers `404` for an id the process did not start.
 
+### On Node instead
+
+Node **>=22.18.0** is a supported fallback, and nothing here is written for one
+runtime: no emitted module reaches for a `Bun` global or a `bun:` import, which
+is a gate on the compiler rather than a promise in a README. 22.18 is the floor
+because that is where Node stopped flagging type stripping, and it is what
+`engines.node` in `package.json` declares:
+
+```sh
+npm install          # or: pnpm install
+npm run typecheck
+node src/index.ts
+```
+
+The manifest pins every dependency exactly and asks for nothing
+installer-specific — no `packageManager` field, no lockfile, no install-time
+script — so bun, npm and pnpm all resolve it to the same versions. The lockfile
+your installer writes is yours: `agent-compose build` never writes or removes
+one.
+
 ## Where a store keeps its data
 
 `--target local` substitutes SQLite and local disk for every store
@@ -128,25 +148,9 @@ memory and released when the run ends, which is what "dies with the run" means.
 same. It is derived from this project's own location rather than from the
 working directory, so a graph reads the same store wherever it was launched from.
 
-### On Node instead
-
-Node **>=22.18.0** is a supported fallback, and nothing here is written for one
-runtime: no emitted module reaches for a `Bun` global or a `bun:` import, which
-is a gate on the compiler rather than a promise in a README. 22.18 is the floor
-because that is where Node stopped flagging type stripping, and it is what
-`engines.node` in `package.json` declares:
-
-```sh
-npm install          # or: pnpm install
-npm run typecheck
-node src/index.ts
-```
-
-The manifest pins every dependency exactly and asks for nothing
-installer-specific — no `packageManager` field, no lockfile, no install-time
-script — so bun, npm and pnpm all resolve it to the same versions. The lockfile
-your installer writes is yours: `agent-compose build` never writes or removes
-one.
+One thing under the directory is not a store's: the traces above, which
+`agent-compose run` writes and names on stderr. The whole directory is listed in
+`.gitignore` — what a run produced is not what a build emitted.
 
 ## Pinned versions
 
