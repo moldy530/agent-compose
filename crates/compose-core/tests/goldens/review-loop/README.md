@@ -101,7 +101,10 @@ edges were taken — on **stderr**, with the path of the file the whole trace wa
 written to. `--format json` folds both into one document on stdout instead.
 `--session` is the session identity of PRD 5.8: a flow that reaches a
 `scope: session` store needs one, and a run without it fails at start naming the
-store.
+store. A declared `manual` trigger may remap it — its `session_key:` is CEL over
+a payload whose one member is this argument, and what that expression answers is
+the partition the run addresses (grammar 13.2). Declared on no trigger, the
+argument is the identity.
 
 `serve` starts the app over the composition's declared `http` triggers and
 announces where it is listening as one JSON line on stdout. Beside them it

@@ -554,6 +554,14 @@ const COMMANDS: &[Criterion] = &[
                 "run_says_what_is_missing_when_the_dependency_set_is_not_installed",
                 Status::Live,
             ),
+            // The one key a *declared* manual trigger adds to the entry that
+            // exists without it (grammar 13.2): the `session_key:` remap of
+            // `--session`, which decides the partition a session-scoped store
+            // op addresses.
+            (
+                "a_declared_manual_trigger_remaps_the_session_the_cli_was_given",
+                Status::Live,
+            ),
         ],
     },
     // Four tests, because the criterion's three verbs do not unlock together.

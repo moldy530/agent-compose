@@ -1281,7 +1281,8 @@ export const flows: Readonly<Record<string, CompiledFlow>> = {
     outputs: ["report_normalized"],
     sessionStores: [],
     recursionLimit: 26,
-    parse: (inputs: unknown) => flowEnrichInputs.parse(inputs) as Record<string, unknown>,
+    parse: (inputs: unknown) =>
+      runtime.parseResult(flowEnrichInputs, inputs, "the `inputs:` of `flow.enrich`") as Record<string, unknown>,
     stream: (initial, options) =>
       flowEnrichGraph.stream(initial, {
         ...options,
@@ -1296,7 +1297,8 @@ export const flows: Readonly<Record<string, CompiledFlow>> = {
     outputs: ["summary", "patches"],
     sessionStores: ["store.triage_memory"],
     recursionLimit: 36,
-    parse: (inputs: unknown) => flowTriageInputs.parse(inputs) as Record<string, unknown>,
+    parse: (inputs: unknown) =>
+      runtime.parseResult(flowTriageInputs, inputs, "the `inputs:` of `flow.triage`") as Record<string, unknown>,
     stream: (initial, options) =>
       flowTriageGraph.stream(initial, {
         ...options,

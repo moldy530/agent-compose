@@ -4545,6 +4545,80 @@ fn a_session_scoped_store_outlives_the_execution_that_wrote_it() {
     );
 }
 
+/// A declared `manual` trigger's `session_key:` remaps the `--session` the CLI
+/// was given, and the run addresses the partition it names (grammar 13.2, 11.3).
+///
+/// The remap is the one thing declaring a `manual` trigger adds — §13's preamble:
+/// writing it out "lets it carry a `description:` or a `session_key:` remap; it
+/// neither enables nor restricts anything the CLI would otherwise do" — so a
+/// compiler that accepted the key and emitted nothing would leave a composition
+/// that namespaces sessions per tenant silently sharing one partition, with
+/// every run reporting success.
+///
+/// Which is why this is three runs rather than two. The first writes through
+/// `flow.remember`, which **no** trigger names, so its session identity is the
+/// argument itself: the note lands at `tenant/s1`. The second reads through
+/// `flow.tenant_recall`, whose trigger declares `session_key: "tenant/" +
+/// payload.session`, and finds it while passing `--session s1` — which it can
+/// only do if the expression ran. The third is the control: the same argument
+/// through the untriggered flow finds nothing, so the second run's hit is the
+/// remap's doing rather than two spellings of one partition.
+#[test]
+fn a_declared_manual_trigger_remaps_the_session_the_cli_was_given() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let Some(project) = harness::scratch_project("session-remap") else {
+        return;
+    };
+    let environment = harness::environment(&provider);
+
+    let raw = harness::run_into(
+        &project,
+        "stores",
+        "flow.remember",
+        &[("note", "written where the remap points")],
+        Some("tenant/s1"),
+        &environment,
+    );
+    raw.succeeded();
+    assert_eq!(raw.outputs()["seen_before"], json!(false));
+
+    let remapped = harness::run_into(
+        &project,
+        "stores",
+        "flow.tenant_recall",
+        &[],
+        Some("s1"),
+        &environment,
+    );
+    remapped.succeeded();
+    assert_eq!(
+        remapped.outputs()["seen_before"],
+        json!(true),
+        "`--session s1` reached `tenant/s1`, which is what the trigger's \
+         `session_key:` says it addresses"
+    );
+    assert_eq!(
+        remapped.outputs()["recalled"]["note"],
+        "written where the remap points"
+    );
+
+    let unremapped = harness::run_into(
+        &project,
+        "stores",
+        "flow.remember",
+        &[("note", "somewhere else entirely")],
+        Some("s1"),
+        &environment,
+    );
+    unremapped.succeeded();
+    assert_eq!(
+        unremapped.outputs()["seen_before"],
+        json!(false),
+        "the same argument through a flow no trigger names addresses `s1` itself, \
+         so the run above found what it found by evaluating the remap"
+    );
+}
+
 /// A retried `flow:` node reports **every** instance it ran, so a store write an
 /// earlier attempt really made is in the trace beside the duplicate the backend
 /// refused (PRD 5.3, 5.8, grammar 8.5, 9.4).
@@ -5202,15 +5276,47 @@ fn run_executes_a_manual_trigger_and_prints_the_flow_outputs() {
     // An input the schema refuses is refused at run start, naming the field
     // (grammar 13.2) — the same check a declared trigger's bindings get at
     // compile time.
-    let bad = harness::run(
-        "agent-anthropic",
-        "flow.review",
-        &[("goal", ""), ("draft", "a draft")],
-        &provider,
-    )
-    .expect("the toolchain answered once already");
-    let failure = bad.failed();
-    assert!(failure.contains("goal"), "{failure}");
+    //
+    // Grammar 13.2 puts three failures in one sentence — "an unknown argument
+    // name, a missing REQUIRED field, or a value that does not fit the declared
+    // type fails the run naming the field" — so all three are asserted, and each
+    // is asserted on *what it says* rather than on the field name appearing
+    // somewhere: a schema library's own multi-line dump contains the field name
+    // too, and PRD G3 makes the difference between that and a sentence the
+    // product feature.
+    let refusals = [
+        (
+            vec![("goal", ""), ("draft", "a draft")],
+            "the `inputs:` of `flow.review`: goal: expected at least 1 character (found \"\")",
+            "a value the declared type refuses",
+        ),
+        (
+            vec![("draft", "a draft")],
+            "the `inputs:` of `flow.review`: goal: Invalid input: expected string, received undefined",
+            "a REQUIRED field nobody passed",
+        ),
+        (
+            vec![("goal", "ship it"), ("draft", "a draft"), ("nope", "x")],
+            "`nope` is not an input of `flow.review`: it declares goal, draft",
+            "an argument name the flow does not declare",
+        ),
+    ];
+    for (inputs, expected, what) in refusals {
+        let bad = harness::run("agent-anthropic", "flow.review", &inputs, &provider)
+            .expect("the toolchain answered once already");
+        let failure = bad.failed();
+        assert_eq!(
+            failure.trim_end(),
+            format!("error: {expected}"),
+            "{what} is refused by naming the field and what was wrong with it"
+        );
+        assert_eq!(
+            bad.output.status.code(),
+            Some(2),
+            "…and all three are one kind of failure: a command that could not \
+             run, rather than a run that produced no answer"
+        );
+    }
 }
 
 /// `--format json` folds the answer and the report into one document on stdout,
@@ -5268,6 +5374,64 @@ fn run_reports_its_whole_record_under_the_json_format() {
             .as_str()
             .is_some_and(|path| path.ends_with(".json")),
         "…and still says where the file went: {answered}"
+    );
+    let execution = answered["execution_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the record names the execution it reports: {answered}"));
+    assert!(
+        answered["trace_path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with(&format!("-{execution}.json"))),
+        "…which is what the trace file is named after, so one record ties the \
+         two together: {answered}"
+    );
+
+    // A run that produced **no** answer answers with the same record, and this
+    // is the one a reader most needs the file for: the whole trace of a failure
+    // is longer than the summary, and under this format there is no stderr line
+    // naming it. A route that spent every member is a failure with a trace to
+    // have.
+    let spent = MockProvider::start().expect("a loopback port");
+    spent.enqueue_all([
+        Script::new(SONNET, Outcome::rate_limit()),
+        Script::new(HAIKU, Outcome::rate_limit()),
+    ]);
+    let Some(project) = harness::scratch_project("run-json-failed") else {
+        return;
+    };
+    let failed = harness::run_formatted(
+        &project,
+        "model-failover",
+        "flow.ask",
+        &[("question", "what is it?")],
+        None,
+        Some("json"),
+        &harness::environment(&spent),
+    );
+    failed.failed();
+    let record = failed.outputs();
+    assert_eq!(record["flow"], "flow.ask");
+    assert_eq!(record["status"], "failed");
+    assert!(
+        record["error"]
+            .as_str()
+            .is_some_and(|text| text.contains("model.smart")),
+        "the record carries what went wrong: {record}"
+    );
+    assert!(
+        !record["trace"].as_array().is_none_or(Vec::is_empty),
+        "…and the trace the run did make: {record}"
+    );
+    let written = record["trace_path"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a failed run names the file its trace went to: {record}"));
+    let held: Value = serde_json::from_str(
+        &std::fs::read_to_string(written).expect("the path names a file that exists"),
+    )
+    .expect("the trace file holds the trace");
+    assert_eq!(
+        held, record["trace"],
+        "and the file holds what the record does"
     );
 }
 
@@ -5401,6 +5565,15 @@ fn serve_exposes_start_and_status_for_an_http_trigger() {
     assert_eq!(
         refused.status, 400,
         "an empty question is not the flow's declared input"
+    );
+    assert_eq!(
+        refused.json()["error"].as_str(),
+        Some(
+            "the request does not fit the `inputs:` of `flow.direct`: question: expected at least 1 character (found \"\")"
+        ),
+        "…and the body says which field and what was wrong with it, rather than \
+         handing back a schema library's own dump (PRD G3): {:?}",
+        refused.body
     );
 
     assert!(provider.snapshot().is_drained(), "the run used its script");

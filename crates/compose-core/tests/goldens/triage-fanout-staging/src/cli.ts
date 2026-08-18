@@ -40,6 +40,21 @@
 // boolean takes `true`, an object or array takes JSON — and a value that cannot
 // be read that way fails the run naming the field rather than reaching Zod as a
 // string and failing about a type the author never wrote.
+//
+// Grammar 13.2 puts three failures in one sentence — "an unknown argument name,
+// a missing REQUIRED field, or a value that does not fit the declared type fails
+// the run naming the field" — so all three are one kind of failure here: the
+// arguments are held to the flow's own schema **before** the run starts, and a
+// set that does not fit is a command that could not run (exit `2`) rather than a
+// run that produced no answer.
+//
+// # `--session` and the remap a `manual` trigger may declare
+//
+// `--session <key>` is the manual payload's one member (grammar 13.2). A
+// declared `manual` trigger naming this flow may carry a `session_key:`, and
+// that expression — over that one-member payload — is what turns the argument
+// into the identity a `scope: session` store partitions by (grammar 11.3). Left
+// undeclared it is `"payload.session"`, the argument itself.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -48,6 +63,7 @@ import process from "node:process";
 import { type CompiledFlow, type FlowRun, flows, runFlow } from "./graph.ts";
 import type * as runtime from "./runtime.ts";
 import { dataRoot } from "./stores.ts";
+import { httpTriggers, manualTriggers } from "./triggers.ts";
 
 /** What a `--format` selects. */
 type Format = "human" | "json";
@@ -127,7 +143,7 @@ async function run(argv: readonly string[]): Promise<number> {
 
   const options = parse(rest, ["input"]);
   const inputs = bindInputs(flow, options.repeated["input"] ?? []);
-  const session = options.single["session"] ?? "";
+  const session = sessionOf(flow, options.single["session"] ?? "");
   const format = formatOf(options.single["format"]);
 
   // Minted here rather than left to `runFlow`, because this command needs it on
@@ -142,8 +158,22 @@ async function run(argv: readonly string[]): Promise<number> {
     const trace = (error as { trace?: readonly runtime.TraceEntry[] }).trace ?? [];
     const written = writeTrace(address, execution, trace);
     if (format === "json") {
+      // The same record the completed run answers with, `error` where its
+      // `outputs` would be — the trace file's path included, because a run that
+      // failed is the one a reader most wants the whole trace for.
       process.stdout.write(
-        `${JSON.stringify({ flow: address, status: "failed", error: describe(error), trace }, null, 2)}\n`,
+        `${JSON.stringify(
+          {
+            flow: address,
+            execution_id: execution,
+            status: "failed",
+            error: describe(error),
+            trace,
+            ...(written === undefined ? {} : { trace_path: written }),
+          },
+          null,
+          2,
+        )}\n`,
       );
     } else {
       process.stderr.write(render(trace));
@@ -163,6 +193,7 @@ async function run(argv: readonly string[]): Promise<number> {
       `${JSON.stringify(
         {
           flow: address,
+          execution_id: execution,
           status: "completed",
           outputs: produced.outputs,
           trace: produced.trace,
@@ -188,9 +219,10 @@ async function serveVerb(argv: readonly string[]): Promise<number> {
     throw new UsageError(`\`--port ${port}\` is not a port number`);
   }
   // Loaded here rather than imported at the top, so a `run` never pays for the
-  // HTTP framework and a project used as a library never loads it at all.
+  // HTTP framework and a project used as a library never loads it at all. Only
+  // the app: `./triggers.ts` is the composition's own table and is imported
+  // above, because `run` reads it too.
   const { serve } = await import("./serve.ts");
-  const { httpTriggers } = await import("./triggers.ts");
   if (httpTriggers.length === 0) {
     throw new UsageError(
       "this composition declares no `http` triggers, so the generated app exposes no routes: declare one in `triggers:` (grammar 13.3)",
@@ -253,7 +285,61 @@ function bindInputs(flow: CompiledFlow, given: readonly string[]): Record<string
     }
     inputs[field] = coerce(flow, field, text);
   }
+  // …and then the whole set against the flow's own `inputs:` schema, which is
+  // what decides the other two failures grammar 13.2 names in the same sentence
+  // as the unknown-argument one above: a REQUIRED field nobody passed, and a
+  // value the field's declared type refuses past the kind it was read as (an
+  // `enum` variant that is not one, a string below its `min_length`, a JSON
+  // document whose properties are not the declared ones). `runFlow` parses with
+  // the same schema and would refuse the same set — but as a *run* that produced
+  // no answer, which is not what happened: nothing ran. Asked here, all three
+  // are one usage error naming the field.
+  try {
+    flow.parse(inputs);
+  } catch (error) {
+    // `CompiledFlow.parse` reports through `runtime.parseResult`, whose message
+    // is already the sentence this wants; the class name it would carry through
+    // [`describe`] belongs to a stack trace rather than to a usage line.
+    throw new UsageError(error instanceof Error ? error.message : String(error));
+  }
   return inputs;
+}
+
+/**
+ * The session identity this run addresses (grammar 13.2, 11.3).
+ *
+ * `--session <key>` is the whole manual payload — "the manual payload has
+ * exactly one member — `payload.session`" — and a declared `manual` trigger
+ * naming this flow may remap it through `session_key:`. Left undeclared, the key
+ * is its own `"payload.session"` default and the argument is the identity, so
+ * there is nothing to evaluate.
+ *
+ * **An argument that was not passed is not remapped.** `--session` is what
+ * grammar 13.2 makes mandatory for a run whose flow reaches a session-scoped
+ * store, and a remap of nothing would answer with something — `'tenant-' +
+ * payload.session` is `"tenant-"` for the run nobody gave a session — which is a
+ * partition named after an identity that does not exist. So the empty argument
+ * passes through as itself and `runFlow` refuses the run naming the store.
+ *
+ * Which remap applies is not a choice: two `manual` triggers naming one flow may
+ * not declare different `session_key:` expressions, and the compiler refuses a
+ * composition where they do.
+ */
+function sessionOf(flow: CompiledFlow, given: string): string {
+  if (given === "") return "";
+  for (const trigger of manualTriggers) {
+    if (trigger.flow !== flow.address) continue;
+    const remap = trigger.sessionKey;
+    if (remap === undefined) continue;
+    try {
+      return remap(given);
+    } catch (error) {
+      throw new UsageError(
+        `\`--session ${given}\` could not be read as this run's session identity: ${describe(error)}`,
+      );
+    }
+  }
+  return given;
 }
 
 /** One `--input` value, as the kind the field declares (grammar 13.2). */

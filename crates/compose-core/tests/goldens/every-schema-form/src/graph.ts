@@ -721,7 +721,8 @@ export const flows: Readonly<Record<string, CompiledFlow>> = {
     outputs: ["draft", "notes"],
     sessionStores: [],
     recursionLimit: 30,
-    parse: (inputs: unknown) => flowShapeInputs.parse(inputs) as Record<string, unknown>,
+    parse: (inputs: unknown) =>
+      runtime.parseResult(flowShapeInputs, inputs, "the `inputs:` of `flow.shape`") as Record<string, unknown>,
     stream: (initial, options) =>
       flowShapeGraph.stream(initial, {
         ...options,

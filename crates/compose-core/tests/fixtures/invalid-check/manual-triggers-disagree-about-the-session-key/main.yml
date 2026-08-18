@@ -1,0 +1,41 @@
+# rule: two `manual` triggers naming one flow agree about `session_key:` (grammar 13.2, 13 preamble)
+# code: conflicting-session-key
+# message: the trigger `tenant_cli` declares `session_key: "tenant/" + payload.session` for `flow.f`, and the trigger `cli` declares `session_key: payload.session` for the same flow
+# at: main.yml:30:18
+# label: main.yml:25:18 `cli` declares it here
+# help: `agent-compose run` names a flow rather than a trigger, so one flow has one CLI entry and one session identity: give the two triggers the same `session_key:`, leave it off the one that has no opinion, or point one at another flow (grammar 13.2)
+#
+# §13.2 makes a `manual` trigger's `session_key:` a legal remap of the CLI's
+# `--session`, and §13's preamble makes the entry it remaps a property of the
+# **flow**: `agent-compose run flow.f` names a flow, and implicit invocation
+# "contributes no entry to the IR's trigger table and has no name". So two
+# `manual` triggers on one flow describe one entry, and two different remaps on
+# it are two answers to "which partition does this run address" — which the
+# emitted `src/cli.ts` would have to resolve by picking one.
+#
+# Declaring no `session_key:` at all is not a third answer: the key defaults to
+# `"payload.session"`, the argument itself, so a trigger that leaves it out asks
+# for whatever the entry already has and never conflicts. Only two written
+# expressions can disagree.
+version: "0.1"
+triggers:
+  cli:
+    type: manual
+    flow: flow.f
+    session_key: "payload.session"
+
+  tenant_cli:
+    type: manual
+    flow: flow.f
+    session_key: '"tenant/" + payload.session'
+
+flow.f:
+  inputs:
+    goal: { type: string }
+  outputs: {}
+  nodes:
+    n:
+      exec: { command: printf, args: ["ok"] }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }

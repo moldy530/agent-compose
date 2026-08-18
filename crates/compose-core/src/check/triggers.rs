@@ -20,11 +20,13 @@
 //! `payload.body`, which is `{}` on every request such a trigger can receive,
 //! so the read fails every time (grammar 13.3, Decision D117).
 //!
-//! One rule is about a trigger's route rather than about what it reads: an
-//! `http` trigger's `method:`/`path:` pair MUST be free — unclaimed by another
-//! trigger, and not one of the two the generated app mounts for itself
-//! ([`routes`]). Half of it is the one rule in this file the normative spec does
-//! not state — see there.
+//! Two rules are about the entry a trigger declares rather than about what it
+//! reads. An `http` trigger's `method:`/`path:` pair MUST be free — unclaimed by
+//! another trigger, and not one of the two the generated app mounts for itself
+//! ([`routes`]). And two `manual` triggers naming one flow MUST NOT declare
+//! different `session_key:` expressions, because the CLI entry they describe is
+//! one entry ([`manual_session_keys`]). Both are rules the normative spec does
+//! not state — see each for why it is kept and reported as a doc defect.
 
 use crate::ast::trigger::TriggerMethod;
 use crate::cel::ty::Type;
@@ -45,6 +47,86 @@ pub(crate) fn check(ctx: &mut Ctx) {
         one(ctx, trigger);
     }
     routes(ctx);
+    manual_session_keys(ctx);
+}
+
+/// Two `manual` triggers naming one flow that disagree about `session_key:`
+/// (grammar 13.2).
+///
+/// A `manual` trigger declares no route. What it does declare — the only key
+/// that changes what running its flow *does* — is a `session_key:` **remap** of
+/// the CLI's `--session`, over a payload whose one member is that argument. The
+/// CLI entry it describes is per **flow**: `agent-compose run flow.f` names a
+/// flow, never a trigger, and §13's preamble makes the entry universal and
+/// unnamed ("it contributes no entry to the IR's trigger table and has no
+/// name"). So two `manual` triggers naming one flow describe one entry, and two
+/// different `session_key:` expressions on it are two answers to "which
+/// partition does this run address" with nothing to choose between them.
+///
+/// Declaring **no** `session_key:` is not a third answer: the key defaults to
+/// `"payload.session"`, which is the argument itself, so a trigger that leaves
+/// it out asks for whatever the entry already has. Only two *written*
+/// expressions can disagree, and they disagree when their sources differ as
+/// written — two spellings of one meaning are still two spellings, and this
+/// check does not interpret CEL.
+///
+/// # This rule is the compiler's, not yet the spec's
+///
+/// Like the trigger-against-trigger half of [`routes`], and for the same reason:
+/// §13.2 makes the remap legal and §13's preamble makes the entry per flow, but
+/// no sentence and no Decision entry says what two of them on one flow mean, and
+/// `schemas/agent-compose.schema.json` accepts it. Refused here because the
+/// alternative is an emitted CLI silently picking one — the posture D50, D61 and
+/// D113 refuse everywhere else in this grammar. Reported as a doc defect: the
+/// grammar wants a sentence in §13.2, and this check is written to be exactly
+/// what that sentence would say.
+fn manual_session_keys(ctx: &mut Ctx) {
+    let Some(triggers) = ctx.ir.triggers.as_ref() else {
+        return;
+    };
+    // The walk is the IR's canonical order — by name (Decision D55) — so the
+    // trigger reported is the later of the two by name and the earlier one is
+    // labelled, whichever files they were declared in.
+    let mut declared: Vec<(String, &Trigger, &Spanned<crate::ast::common::Cel>)> = Vec::new();
+    let mut conflicts: Vec<Diagnostic> = Vec::new();
+    for trigger in triggers.entries.values() {
+        if !matches!(trigger.kind, TriggerKind::Manual) {
+            continue;
+        }
+        let Some(key) = trigger.session_key.as_ref() else {
+            continue;
+        };
+        let flow = trigger.flow.value.to_string();
+        if let Some((_, first, first_key)) = declared
+            .iter()
+            .find(|(named, _, other)| named == &flow && other.value.as_str() != key.value.as_str())
+        {
+            let name = text(&trigger.name);
+            let first_name = text(&first.name);
+            conflicts.push(
+                Diagnostic::error(
+                    DiagnosticCode::ConflictingSessionKey,
+                    key.span.clone(),
+                    format!(
+                        "the trigger `{name}` declares `session_key: {}` for `{flow}`, and the trigger `{first_name}` declares `session_key: {}` for the same flow",
+                        key.value.as_str(),
+                        first_key.value.as_str()
+                    ),
+                )
+                .with_label(
+                    first_key.span.clone(),
+                    format!("`{first_name}` declares it here"),
+                )
+                .with_help(
+                    "`agent-compose run` names a flow rather than a trigger, so one flow has one CLI entry and one session identity: give the two triggers the same `session_key:`, leave it off the one that has no opinion, or point one at another flow (grammar 13.2)",
+                ),
+            );
+        }
+        declared.push((flow, trigger, key));
+    }
+    for conflict in conflicts {
+        ctx.push(conflict);
+    }
 }
 
 /// An `http` trigger claiming a route that is already claimed.

@@ -246,12 +246,15 @@ async function start(
 
   // The payload is held to the flow's own `inputs:` before an execution exists,
   // which is what makes a bad request a `400` rather than a failed run: the same
-  // schema `runFlow` parses with, asked one step earlier (grammar 13.1).
+  // schema `runFlow` parses with, asked one step earlier (grammar 13.1). The
+  // message already names the flow's `inputs:` and the field inside it that did
+  // not fit — `CompiledFlow.parse` reports through `runtime.parseResult` — so
+  // this says what the *request* did and leaves the naming to it.
   try {
     flow.parse(inputs);
   } catch (error) {
     return reply.code(400).send({
-      error: `the request does not fit the \`inputs:\` of \`${trigger.flow}\`: ${message(error)}`,
+      error: `the request does not fit ${message(error)}`,
     });
   }
 

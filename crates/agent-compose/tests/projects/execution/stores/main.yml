@@ -360,6 +360,41 @@ flow.remember:
     - { from: recall, to: save }
     - { from: save, to: end }
 
+# The one key a declared `manual` trigger carries that changes what a CLI run
+# **does** (grammar 13.2, §13's preamble: declaring the trigger "lets it carry a
+# `description:` or a `session_key:` remap"). `flow.remember` above is reached
+# through the *implicit* entry and keys off `--session` itself; this flow is
+# reached through a declared one that remaps it, and it only reads — so which
+# partition a run addressed is the whole of what it answers.
+triggers:
+  tenant_cli:
+    type: manual
+    flow: flow.tenant_recall
+    session_key: '"tenant/" + payload.session'
+
+flow.tenant_recall:
+  description: Recall this session's note, under a trigger that remaps `--session`.
+  outputs:
+    seen_before:
+      type: boolean
+    recalled:
+      type: object
+      properties:
+        note:
+          type: string
+  nodes:
+    recall:
+      store: store.memory
+      op: get
+      key: "execution.session_key"
+      writes:
+        found: seen_before
+        value: recalled
+
+  edges:
+    - { from: start, to: recall }
+    - { from: recall, to: end }
+
 # A store write inside a **retried subflow**, which is where a trace can lose an
 # effect that really happened (PRD 5.3, 5.8).
 #

@@ -1283,6 +1283,77 @@ flow.f:
     );
 }
 
+/// The accepting half of
+/// `invalid-check/manual-triggers-disagree-about-the-session-key`, which is
+/// where the rule could go wrong in the other direction. Four `manual` triggers
+/// here and none of them conflicts:
+///
+/// * `cli` and `also_cli` name one flow and declare the **same** remap, which is
+///   one answer written twice rather than two answers;
+/// * `quiet_cli` names that same flow and declares **no** `session_key:` — the
+///   key's `"payload.session"` default, which is a trigger with no opinion about
+///   an entry rather than a third answer for it (grammar 13.1's table);
+/// * `other_cli` declares a different remap for a **different** flow, which is a
+///   different CLI entry entirely.
+///
+/// A rule that compared any two `manual` triggers, or read an undeclared
+/// `session_key:` as a declaration of the default, would refuse all of this.
+#[test]
+fn manual_triggers_that_agree_or_are_silent_about_the_session_key() {
+    accepts(
+        "manual-session-keys",
+        r#"
+store.memory:
+  kind: kv
+  scope: session
+  value_schema:
+    text: { type: string }
+triggers:
+  cli:
+    type: manual
+    flow: flow.f
+    session_key: '"tenant/" + payload.session'
+  also_cli:
+    type: manual
+    flow: flow.f
+    session_key: '"tenant/" + payload.session'
+  quiet_cli:
+    type: manual
+    flow: flow.f
+  other_cli:
+    type: manual
+    flow: flow.g
+    session_key: '"other/" + payload.session'
+flow.f:
+  inputs:
+    goal: { type: string }
+  outputs: {}
+  nodes:
+    n:
+      store: store.memory
+      op: set
+      key: "input.goal"
+      value: { text: "input.goal" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }
+flow.g:
+  inputs:
+    goal: { type: string }
+  outputs: {}
+  nodes:
+    n:
+      store: store.memory
+      op: set
+      key: "input.goal"
+      value: { text: "input.goal" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }
+"#,
+    );
+}
+
 /// A property with a `default:` is optional **at its surface** — a binding need
 /// not supply it, and grammar 8.0's step 4 then does — so the value the
 /// declaration describes carries it either way and the channel stays readable

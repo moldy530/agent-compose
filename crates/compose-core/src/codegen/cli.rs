@@ -17,13 +17,24 @@
 //! Grammar 13.2 defers one check to run start — "an unknown argument name, a
 //! missing REQUIRED field, or a value that does not fit the declared type fails
 //! the run naming the field" — for the same reason env-ref presence is deferred:
-//! the values do not exist until the command runs. Two halves of it are here.
-//! The argument *name* is checked against the flow's declared inputs, and the
-//! *value* is read as the field's declared kind before Zod sees it, so an
-//! integer field handed `three` fails naming the field rather than failing about
-//! a string the author never wrote. The rest — a missing required field, a value
-//! out of range — is the emitted Zod's, which is the same schema a declared
-//! trigger's bindings are checked against at compile time.
+//! the values do not exist until the command runs. All three are decided here,
+//! and reported as one kind of failure because the sentence makes them one. The
+//! argument *name* is checked against the flow's declared inputs; the *value* is
+//! read as the field's declared kind before the schema sees it, so an integer
+//! field handed `three` fails naming the field rather than failing about a
+//! string the author never wrote; and the whole set is then parsed against the
+//! flow's own `inputs:` — the same schema a declared trigger's bindings are
+//! checked against at compile time — through `runtime.parseResult`, so a missing
+//! required field or a value out of range is a sentence naming the field rather
+//! than a schema library's dump (PRD G3).
+//!
+//! # `--session` and the remap a declared `manual` trigger may carry
+//!
+//! The other run-time argument is the manual payload's one member (grammar
+//! 13.2). A declared `manual` trigger naming the flow may remap it through
+//! `session_key:`, and [`super::trigger`] emits that expression into the table
+//! this reads — which is what keeps the key from being one the compiler accepts
+//! and nothing evaluates.
 
 use crate::ir::Ir;
 

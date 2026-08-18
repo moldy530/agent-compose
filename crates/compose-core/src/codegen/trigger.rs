@@ -7,18 +7,24 @@
 //! one request payload into the flow's inputs, its session identity, and its
 //! completion webhook.
 //!
-//! # Why only `http`
+//! # The two tables
 //!
-//! The other three trigger types contribute no route.
+//! Beside the routes there is a second, much smaller table: one entry per
+//! declared **`manual`** trigger. A `manual` trigger is not a route and enables
+//! nothing — every flow is runnable from the CLI whether or not a trigger names
+//! it (Decision D64), so `src/cli.ts` reads the flow registry to decide *what*
+//! it may run. What a declared `manual` trigger does carry is the one key
+//! grammar 13.2 makes a property of the CLI entry rather than of the flow: a
+//! `session_key:` **remap**, over a payload whose single member is the
+//! `--session` argument. Undeclared, the CLI entry keys off `--session` itself
+//! (`"payload.session"`, the key's own default); declared, that expression is
+//! what turns the argument into the session identity a `scope: session` store
+//! partitions by (grammar 11.3). Emitting the table is what keeps a declared
+//! remap from being a key the compiler accepts and nothing evaluates.
 //!
-//! * **`manual`** is not a route at all, and declaring one enables nothing:
-//!   every flow is runnable from the CLI whether or not a trigger names it
-//!   (Decision D64), so `src/cli.ts` reads the flow registry rather than this
-//!   table. A declared `manual` trigger's `session_key:` is its own `"payload.session"`
-//!   default, which is `--session`.
-//! * **`schedule`** and **`event`** are reserved grammar (grammar 15): parsed,
-//!   type-checked and carried into the IR, executed by nothing in v0. Emitting a
-//!   route for one would be a route nothing ever calls.
+//! `schedule` and `event` are reserved grammar (grammar 15): parsed,
+//! type-checked and carried into the IR, executed by nothing in v0. Emitting a
+//! route for one would be a route nothing ever calls.
 //!
 //! # The payload is bound through a declared shape
 //!
@@ -51,10 +57,14 @@ pub fn module(ir: &Ir) -> super::GeneratedFile {
 const PREAMBLE: &str = r#"//
 // The composition's declared triggers (grammar 13, PRD 5.11).
 //
-// `./serve.ts` is the app; this is the table it serves. Only `http` triggers
-// appear here: `manual` invocation is a property of the CLI rather than a
-// declared route (Decision D64), and `schedule` and `event` are reserved grammar
-// that executes as a no-op in v0 (grammar 15).
+// `./serve.ts` is the app; `httpTriggers` is the table it serves. Beside it,
+// `manualTriggers` is what `./cli.ts` reads: a `manual` trigger declares no
+// route — invocation from the CLI is universal and needs no trigger (Decision
+// D64) — but it may declare the `session_key:` that remaps `--session` into the
+// session identity a `scope: session` store partitions by (grammar 13.2, 11.3).
+//
+// `schedule` and `event` are reserved grammar that executes as a no-op in v0
+// (grammar 15), and neither appears in either table.
 
 import * as runtime from "./runtime.ts";
 
@@ -104,24 +114,90 @@ export interface HttpTrigger {
   callback?(payload: unknown): string;
 }
 
-/** The roots one trigger expression is evaluated against. */
+/**
+ * The payload shape grammar 13.2 fixes for a `manual` trigger: one member.
+ *
+ * "The manual payload has exactly one member — `payload.session`, the CLI's
+ * `--session <key>`", which is also what the validator types a manual trigger's
+ * `session_key:` against.
+ */
+const manualPayload: runtime.Shape = { properties: { session: "string" } };
+
+/** The roots an `http` trigger's expressions are evaluated against. */
 function roots(payload: unknown): runtime.Roots {
   return { payload: runtime.bind(payload, httpPayload) };
 }
 
+/** The roots a `manual` trigger's `session_key:` is evaluated against. */
+function manualRoots(session: string): runtime.Roots {
+  return { payload: runtime.bind({ session }, manualPayload) };
+}
+
 /** One trigger expression whose declared result type is `string`. */
-function text(source: string, payload: unknown, site: string): string {
-  const answer = runtime.toJson(runtime.evaluate(source, roots(payload)));
+function text(source: string, bound: runtime.Roots, site: string): string {
+  const answer = runtime.toJson(runtime.evaluate(source, bound));
   if (typeof answer !== "string") {
     throw new runtime.CelError(`${site} answered ${JSON.stringify(answer)} rather than a string`);
   }
   return answer;
 }
 
+/**
+ * One declared `manual` trigger (grammar 13.2).
+ *
+ * It contributes no route and gates nothing: `./cli.ts` runs any flow this
+ * composition declares, named or not (Decision D64). The entry exists for the
+ * one key that changes what a CLI run *does* — `session_key:`.
+ */
+export interface ManualTrigger {
+  /** The trigger's own name, which is what a diagnostic and a report call it. */
+  readonly name: string;
+  /** `flow:` — the CLI entry this trigger describes. */
+  readonly flow: string;
+  /**
+   * `session_key:` — the declared remap of `--session`, when there is one.
+   *
+   * Absent where the trigger declares none, which is the key's own
+   * `"payload.session"` default: the argument *is* the identity, and evaluating
+   * an expression to say so would answer what was passed in.
+   */
+  sessionKey?(session: string): string;
+}
+
 "#;
 
-/// The table itself.
+/// Both tables: the routes `./serve.ts` mounts, then the CLI entries
+/// `./cli.ts` reads.
 fn table(ir: &Ir) -> String {
+    let mut text = http_table(ir);
+    text.push('\n');
+    text.push_str(&manual_table(ir));
+    text
+}
+
+/// The `manual` entries, in the IR's canonical order (Decision D55).
+fn manual_table(ir: &Ir) -> String {
+    let mut text = String::from("export const manualTriggers: readonly ManualTrigger[] = [\n");
+    for trigger in manual(ir) {
+        let name = trigger.name;
+        text.push_str("  {\n");
+        text.push_str(&format!("    name: {},\n", names::string(name)));
+        text.push_str(&format!("    flow: {},\n", names::string(&trigger.flow)));
+        if let Some(expression) = trigger.session_key {
+            text.push_str(&format!(
+                "    sessionKey: (session) => text({}, manualRoots(session), {}),\n",
+                names::string(expression),
+                names::string(&format!("`session_key` of the trigger `{name}`"))
+            ));
+        }
+        text.push_str("  },\n");
+    }
+    text.push_str("];\n");
+    text
+}
+
+/// The route table.
+fn http_table(ir: &Ir) -> String {
     let mut text = String::from("export const httpTriggers: readonly HttpTrigger[] = [\n");
     for trigger in triggers(ir) {
         let name = trigger.name;
@@ -164,7 +240,7 @@ fn table(ir: &Ir) -> String {
                 continue;
             };
             text.push_str(&format!(
-                "    {key}: (payload) => text({}, payload, {}),\n",
+                "    {key}: (payload) => text({}, roots(payload), {}),\n",
                 names::string(expression),
                 names::string(&format!("`{spelling}` of the trigger `{name}`"))
             ));
@@ -173,6 +249,30 @@ fn table(ir: &Ir) -> String {
     }
     text.push_str("];\n");
     text
+}
+
+/// One `manual` trigger, lowered to what the emitted table says about it.
+struct EmittedManual<'ir> {
+    name: &'ir str,
+    flow: String,
+    session_key: Option<&'ir str>,
+}
+
+/// The declared `manual` triggers, in the IR's canonical order.
+fn manual(ir: &Ir) -> Vec<EmittedManual<'_>> {
+    let Some(section) = ir.triggers.as_ref() else {
+        return Vec::new();
+    };
+    section
+        .entries
+        .values()
+        .filter(|trigger| matches!(trigger.kind, TriggerKind::Manual))
+        .map(|trigger| EmittedManual {
+            name: trigger.name.value.as_str(),
+            flow: trigger.flow.value.to_string(),
+            session_key: trigger.session_key.as_ref().map(|key| key.value.as_str()),
+        })
+        .collect()
 }
 
 /// One `http` trigger, lowered to what the emitted table says about it.
@@ -310,6 +410,10 @@ flow.ask:
     fn a_project_with_no_triggers_emits_an_empty_table() {
         let emitted = module(&ir_of("version: \"0.1\"\n")).contents;
         assert!(emitted.contains("export const httpTriggers: readonly HttpTrigger[] = [\n];\n"));
+        assert!(
+            emitted.contains("export const manualTriggers: readonly ManualTrigger[] = [\n];\n"),
+            "{emitted}"
+        );
     }
 
     /// Every key grammar 13.3 makes a property of the route, and the defaults
@@ -328,10 +432,12 @@ flow.ask:
             ),
             "{emitted}"
         );
-        assert!(
-            emitted.contains("sessionKey: (payload) => text(\"payload.headers['x-session-id']\"")
-        );
-        assert!(emitted.contains("callback: (payload) => text(\"payload.body.callback_url\""));
+        assert!(emitted.contains(
+            "sessionKey: (payload) => text(\"payload.headers['x-session-id']\", roots(payload),"
+        ));
+        assert!(emitted.contains(
+            "callback: (payload) => text(\"payload.body.callback_url\", roots(payload),"
+        ));
 
         // The sync one: its budget is a number of milliseconds, and a `GET`
         // decodes no body (Decision D117).
@@ -340,8 +446,13 @@ flow.ask:
         assert!(emitted.contains("method: \"GET\","));
         assert!(emitted.contains("readsBody: false,"));
 
-        // A `manual` trigger contributes no route (Decision D64).
-        assert!(!emitted.contains("\"cli\""), "{emitted}");
+        // A `manual` trigger contributes no *route* (Decision D64): it appears
+        // in the other table, and with no `path:`, `method:` or `input:`.
+        let routes = emitted
+            .split("export const manualTriggers")
+            .next()
+            .expect("the route table comes first");
+        assert!(!routes.contains("\"cli\""), "{emitted}");
     }
 
     /// A sync trigger that declares no `timeout:` takes grammar 13.3's default.
@@ -350,5 +461,37 @@ flow.ask:
         let source = PROJECT.replace("    timeout: 5s\n", "");
         let emitted = module(&ir_of(&source)).contents;
         assert!(emitted.contains("timeoutMs: 60000,"), "{emitted}");
+    }
+
+    /// A `manual` trigger that declares no `session_key:` carries no remap: the
+    /// key's default is `--session` itself (grammar 13.2).
+    #[test]
+    fn a_manual_trigger_with_no_session_key_carries_no_remap() {
+        let emitted = module(&ir_of(PROJECT)).contents;
+        assert!(
+            emitted.contains(
+                "export const manualTriggers: readonly ManualTrigger[] = [\n  \
+                 {\n    name: \"cli\",\n    flow: \"flow.ask\",\n  },\n];\n"
+            ),
+            "{emitted}"
+        );
+    }
+
+    /// …and one that declares a remap emits it, over the manual payload whose
+    /// single member is the CLI's `--session` (grammar 13.2).
+    #[test]
+    fn a_manual_trigger_emits_the_session_key_it_declares() {
+        let source = PROJECT.replace(
+            "  cli:\n    type: manual\n    flow: flow.ask\n",
+            "  cli:\n    type: manual\n    flow: flow.ask\n    session_key: \"'tenant-' + payload.session\"\n",
+        );
+        let emitted = module(&ir_of(&source)).contents;
+        assert!(
+            emitted.contains(
+                "    sessionKey: (session) => text(\"'tenant-' + payload.session\", \
+                 manualRoots(session), \"`session_key` of the trigger `cli`\"),\n"
+            ),
+            "{emitted}"
+        );
     }
 }

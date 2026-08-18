@@ -2857,8 +2857,16 @@ fn registry_source(
             Some(_) => {
                 let schema = names.value(&format!("{address}.inputs")).to_string();
                 imported.push(schema.clone());
+                // Through `runtime.parseResult` rather than the schema's own
+                // `.parse`, for the reason every other result is: the message is
+                // what a caller acts on. This is the surface an invocation
+                // arrives at — `--input k=v` from the CLI, one decoded payload
+                // from the app — and grammar 13.2 asks it to fail "naming the
+                // field", which a schema library's own multi-line dump does only
+                // in the sense that the name is somewhere inside it (PRD G3).
                 format!(
-                    "    parse: (inputs: unknown) => {schema}.parse(inputs) as Record<string, unknown>,\n"
+                    "    parse: (inputs: unknown) =>\n      runtime.parseResult({schema}, inputs, {}) as Record<string, unknown>,\n",
+                    names::string(&format!("the `inputs:` of `{address}`"))
                 )
             }
             // A flow with no `inputs:` takes none, so an invocation supplies

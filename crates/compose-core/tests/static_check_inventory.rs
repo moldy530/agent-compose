@@ -174,12 +174,14 @@ const M0: &[Check] = &[
 /// The validator-owned rules `docs/grammar.md` Appendix B names that PRD §7 M0's
 /// sentence does not enumerate individually.
 ///
-/// One row is the exception and labels itself: half of `duplicate-route` — the
-/// half about two triggers rather than about the routes the app mounts for
-/// itself — is a rule the compiler applies that the grammar does not state, kept
-/// because the failure it refuses is guaranteed, and reported as a doc defect at
-/// its own row and in `check/triggers.rs::routes`. A reader auditing this list
-/// against the grammar should find every other row there.
+/// Two rows are the exception and label themselves. Half of `duplicate-route` —
+/// the half about two triggers rather than about the routes the app mounts for
+/// itself — and the whole of `conflicting-session-key` are rules the compiler
+/// applies that the grammar does not state, kept because each refuses an
+/// ambiguity the emitted project would otherwise resolve by picking, and
+/// reported as doc defects at their own rows and in `check/triggers.rs::routes`
+/// and `::manual_session_keys`. A reader auditing this list against the grammar
+/// should find every other row there.
 const GRAMMAR: &[Check] = &[
     Check {
         rule: "balanced convergence (7.6.2, D112)",
@@ -268,6 +270,23 @@ const GRAMMAR: &[Check] = &[
         rule: "an `http` trigger's route is free: unclaimed by another trigger (compiler rule over 13.3's mount model), and not one the generated app mounts for itself (13.3)",
         pass: "check/triggers.rs",
         codes: &["duplicate-route"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        // The second row whose rule the spec does not state, and for the same
+        // shape of reason as the one above. §13.2 makes a `manual` trigger's
+        // `session_key:` a legal *remap* of the CLI's `--session`, and §13's
+        // preamble makes the entry it remaps per **flow** ("it contributes no
+        // entry to the IR's trigger table and has no name") — but no sentence
+        // and no Decision entry says what two `manual` triggers on one flow
+        // declaring two different remaps mean, and the published schema accepts
+        // it. `check/triggers.rs::manual_session_keys` reports that as a doc
+        // defect and says why the check is kept meanwhile; the citation here is
+        // deliberately not a section number for the rule itself, so this row
+        // cannot be read as evidence that the grammar states it.
+        rule: "two `manual` triggers naming one flow agree about `session_key:` (compiler rule over 13.2's remap and 13's per-flow CLI entry)",
+        pass: "check/triggers.rs",
+        codes: &["conflicting-session-key"],
         evidence: Evidence::Fixture,
     },
     Check {
