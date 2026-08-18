@@ -31,18 +31,37 @@
 //! never see it. Widening it is how this file grows: every constraint keyword
 //! added to the generator is one more thing the two columns have to agree about
 //! on inputs nobody chose.
+//!
+//! # Why one JavaScript engine
+//!
+//! The JS column runs under **Bun** only, and that is a decision rather than an
+//! oversight. PRD §9.18 keeps Node a supported fallback, and what an emitted
+//! `format:` regex or `src/cel.ts`'s `BigInt` arithmetic answers really does
+//! belong to the engine — but the axis this file explores is the *Rust* column
+//! against the JS one over shapes nobody wrote, not one engine against another.
+//! The engine axis is covered where it is cheap and total: gate 15 of
+//! `tests/generated_code_gates.rs` answers both hand-written corpora — every
+//! spelling grammar 3.8 and grammar 4.1 have — under Node as well. Adding a
+//! second runtime here would double a twelve-seed build-and-run and need a second
+//! dependency install in a binary cargo already runs in parallel with those
+//! gates, which is a worse trade than the gap it closes. Revisit it together with
+//! gate 15's own *What is deliberately not re-run here*.
 
 #[path = "support/goldens.rs"]
 mod goldens;
+#[path = "support/toolchain.rs"]
+mod toolchain;
 
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::OnceLock;
 
 use compose_core::codegen::{cel as codegen_cel, schema as codegen_schema};
 use serde_json::{Value, json};
+// The JS column runs under Bun against the same install the gates use, so both
+// suites answer it with one pinned dependency set under one runtime, and the
+// skip-locally/fail-in-CI rule is stated once. See `support/toolchain.rs`.
+use toolchain::installed;
 
 /// How many seeds a plain `cargo test` runs.
 ///
@@ -380,47 +399,6 @@ fn guard(rng: &mut Rng, channels: &[Channel]) -> String {
 // The two columns
 // ---------------------------------------------------------------------------
 
-/// The toolchain the JS column runs under; `None` when Node is absent and this
-/// is not CI (the rule `tests/generated_code_gates.rs` states).
-fn installed() -> Option<&'static Path> {
-    static TOOLCHAIN: OnceLock<Option<PathBuf>> = OnceLock::new();
-    TOOLCHAIN
-        .get_or_init(|| {
-            let runs = |program: &str| {
-                Command::new(program)
-                    .arg("--version")
-                    .output()
-                    .is_ok_and(|output| output.status.success())
-            };
-            let required = std::env::var_os("CI").is_some_and(|value| !value.is_empty());
-            if !runs("node") || !runs("npm") {
-                assert!(
-                    !required,
-                    "`node` and `npm` are required: the property harness answers every generated \
-                     case with both columns (CLAUDE.md)."
-                );
-                eprintln!(
-                    "warning: skipping the property harness — `node`/`npm` are not on PATH. \
-                     They are required in CI (`CI` is set there) and this run is not CI."
-                );
-                return None;
-            }
-            let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/toolchain");
-            let install = Command::new("npm")
-                .args(["ci", "--no-audit", "--no-fund"])
-                .current_dir(&root)
-                .output()
-                .expect("npm runs");
-            assert!(
-                install.status.success(),
-                "the pinned toolchain did not install:\n{}",
-                String::from_utf8_lossy(&install.stderr),
-            );
-            Some(root)
-        })
-        .as_deref()
-}
-
 /// Emit one generated composition into a project the JS column can import.
 fn project(root: &Path, purpose: &str, seed: u64, source: &str) -> (PathBuf, compose_core::Ir) {
     let scratch = std::env::temp_dir().join(format!(
@@ -570,7 +548,7 @@ fn the_two_schema_columns_answer_generated_documents_the_same_way() {
             }));
         }
 
-        let answered = answer(root, &out, &json!({ "schemas": cases }));
+        let answered = answer(&out, &json!({ "schemas": cases }));
         let verdicts: Vec<Vec<bool>> =
             serde_json::from_value(answered["schemas"].clone()).expect("one verdict per document");
 
@@ -651,7 +629,7 @@ fn the_two_cel_implementations_answer_generated_guards_the_same_way() {
             sources.push(source);
         }
 
-        let answered = answer(root, &out, &json!({ "expressions": cases }));
+        let answered = answer(&out, &json!({ "expressions": cases }));
         let verdicts = answered["expressions"]
             .as_array()
             .expect("one verdict per expression");
@@ -687,19 +665,18 @@ fn the_two_cel_implementations_answer_generated_guards_the_same_way() {
 }
 
 /// Run the JS column over one generated project.
-fn answer(root: &Path, project: &Path, cases: &Value) -> Value {
+fn answer(project: &Path, cases: &Value) -> Value {
     let path = project.join("property-cases.json");
     fs::write(
         &path,
         serde_json::to_string(cases).expect("the cases serialize"),
     )
     .expect("the scratch area is writable");
-    let output = Command::new("node")
-        .arg(root.join("property-conformance.mjs"))
+    let output = toolchain::runner("property-conformance.mjs")
         .arg(project)
         .arg(&path)
         .output()
-        .expect("node runs");
+        .expect("bun runs");
     assert!(
         output.status.success(),
         "the property runner failed:\n{}",

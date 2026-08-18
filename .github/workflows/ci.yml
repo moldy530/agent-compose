@@ -31,10 +31,40 @@ jobs:
       #     (`crates/compose-core/tests/property_conformance.rs`) — both columns of
       #     each pinned pair answering generated cases.
       #
-      # All three FAIL rather than skip when Node is absent — `CI` is set here,
-      # which is the switch — so this step is what keeps "the suite is green"
-      # meaning "the emitted TypeScript compiles, and the graph it makes runs"
-      # (CLAUDE.md).
+      # All three run under **Bun**, which PRD 9.18 makes the default runtime and
+      # package manager of every generated project, and all three FAIL rather than
+      # skip when it is absent — `CI` is set here, which is the switch — so these
+      # two steps are what keep "the suite is green" meaning "the emitted
+      # TypeScript compiles, and the graph it makes runs" (CLAUDE.md).
+      #
+      # Bun is pinned exactly, for the reason `codegen::project` pins the
+      # dependency set exactly (PRD 5.12): a runtime that moved under CI would
+      # change what a green suite means without a commit saying so. Upgrading is a
+      # PR of its own — bump the version here, run the suite, and read the
+      # acceptance diff — on the same cadence as a LangGraph repin, and never as a
+      # drive-by in a PR about something else. 1.3.14 was the current stable when
+      # this pin was written.
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      # `setup-bun` caches the runtime it downloads, not the packages that runtime
+      # installs, so the package cache is declared here — the counterpart of
+      # `setup-node`'s `cache: npm` below, keyed on the lockfile the gates install
+      # from.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: bun-install-${{ runner.os }}-${{ hashFiles('crates/compose-core/tests/toolchain/bun.lock') }}
+          restore-keys: bun-install-${{ runner.os }}-
+      # Node is the **fallback** runtime PRD 9.18 keeps supported, and gates 13
+      # and 15 of the generated-code gates are the only things that check it:
+      # `npm ci` from the committed `package-lock.json`, then a golden
+      # type-checked, constructed and run under Node (13), and both shared
+      # conformance corpora answered by that engine (15), because a schema's
+      # `format:` and the emitted CEL evaluator are a `RegExp` and a `BigInt`
+      # rather than anything a type-check sees. They fail here for the same reason
+      # Bun does — an unchecked fallback is a promise the emitted README goes on
+      # making.
       #
       # 22.18 is the floor: it is where Node stopped flagging type stripping,
       # which is what lets a generated project run with no build step.

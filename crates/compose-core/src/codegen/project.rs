@@ -16,22 +16,60 @@
 //! is why the goldens carry the compiler version in their headers — a release
 //! that repins *should* produce a reviewable diff over every generated file.
 //!
+//! # Bun by default, Node as the fallback
+//!
+//! PRD §9.18: **Bun is the default runtime and package manager** everywhere an
+//! emitted project is installed, launched, or gated — `bun install`, `bun run
+//! typecheck`, `bun src/index.ts` — and that is what the emitted `README.md`
+//! documents first. `agent-compose run` and `agent-compose serve` launch an
+//! emitted project the same way, so the command a reader is shown here is the
+//! command those verbs run.
+//!
+//! **Node >= 22.18 stays a supported fallback**, and the manifest is where that
+//! promise is written down: [`NODE_ENGINE`] keeps the floor in `engines`, and
+//! `@types/node` is pinned to the same major (see [`DEV_PINS`]). The promise is
+//! only worth the line if the emitted modules can honour it, so **no generated
+//! file may reach for a Bun-only API** — no `Bun` global, no `bun:` specifier —
+//! and `tests/generated_code_gates.rs` holds both ends of that: gate 13 installs
+//! a golden with npm and type-checks, constructs and runs it under Node, and
+//! gate 14 reads every emitted module and refuses an import that is not
+//! relative, a `node:` builtin, or one of [`PINS`].
+//!
 //! # Package-manager neutrality
 //!
-//! The manifest is plain: no `packageManager` field, no lockfile, no
+//! Defaulting to Bun is a statement about the documented commands, not about the
+//! manifest, which stays plain: no `packageManager` field, no lockfile, no
 //! install-time scripts, no workspace protocol, and no dependency that needs a
-//! native build. `npm install`, `pnpm install`, and `bun install` all resolve it
+//! native build. `bun install`, `npm install`, and `pnpm install` all resolve it
 //! to the same versions, because every version is exact.
-//! `tests/generated_code_gates.rs` installs with npm and runs the type gate,
-//! which is one installer rather than three; the neutrality claim is about what
-//! the manifest *contains*, and is checked by
+//!
+//! `packageManager` is the field that would name Bun, and it is deliberately not
+//! emitted. It is corepack's, corepack manages npm/pnpm/yarn and not Bun, so the
+//! field would be an instruction to a tool that cannot honour it — while pinning
+//! every generated project to one Bun release that nothing here has tested and
+//! that a reader could not change without the compiler rewriting it. Nothing is
+//! bought: what makes an install deterministic is already in the manifest, which
+//! is exact versions and no install-time behaviour. The neutrality claim is about
+//! what the manifest *contains*, and is checked by
 //! `the_manifest_stays_package_manager_neutral` in this module's own `tests`.
+//!
+//! A lockfile is not emitted either, under Bun as under npm: `src/` is the
+//! compiler's and the rest of the directory is the reader's (see the emitted
+//! `.gitignore`), and a `bun.lock` the compiler kept rewriting would be a
+//! resolution the reader could never pin. `tests/toolchain/bun.lock` is the
+//! *gates'* lockfile, a different artifact for a different reason: the gates have
+//! to check one fixed resolution.
 //!
 //! # `src/index.ts`
 //!
 //! A barrel over the modules, which is what makes the generated project usable
 //! as a library — the eject path (PRD 5.12) and, later, what `run` and `serve`
-//! import — and the one emitted module with a side effect: it calls
+//! import. When those verbs land they launch this module the way the README's
+//! first block does, `bun src/index.ts`, and fall back to `node src/index.ts`
+//! where Bun is absent; neither verb may add a launch surface the README does not
+//! already document, because an emitted project has to be runnable by hand.
+//!
+//! It is also the one emitted module with a side effect: it calls
 //! [`super::env`]'s `readEnvironment()` at module scope, which is where PRD
 //! 5.9's "resolution happens at process start in generated code" happens.
 //! Loading the project is the check.
@@ -66,13 +104,20 @@ pub const PINS: &[(&str, &str)] = &[
 /// `typescript` is a checker here, never a compiler — the emitted project has no
 /// build step (see [`super`]). `@types/node` is pinned to the **22** line, which
 /// is the oldest runtime [`NODE_ENGINE`] admits: types from a newer major would
-/// describe APIs the minimum supported Node does not have.
+/// describe APIs the minimum supported Node does not have. It is the right
+/// declaration under Bun too, and for the same reason: Bun implements the
+/// `node:` builtins the emitted modules import, and typing them against a newer
+/// Node would let a module compile against an API the fallback runtime lacks.
 pub const DEV_PINS: &[(&str, &str)] = &[("@types/node", "22.20.1"), ("typescript", "7.0.2")];
 
-/// The Node versions a generated project runs on.
+/// The Node versions a generated project runs on, which is the **fallback**
+/// floor rather than the default runtime — that is Bun (PRD §9.18).
 ///
 /// 22.18 is where type stripping stopped being flagged, which is what lets
-/// `node src/index.ts` run a TypeScript file with no build step.
+/// `node src/index.ts` run a TypeScript file with no build step. Bun needs no
+/// floor declared beside it: it runs TypeScript at every release this compiler
+/// has been built against, and `engines` is advice `bun install` does not
+/// enforce, so a range here would constrain the fallback and nothing else.
 pub const NODE_ENGINE: &str = ">=22.18.0";
 
 /// The package name every generated project takes.
@@ -142,8 +187,8 @@ pub fn tsconfig_json(ir: &Ir) -> super::GeneratedFile {
 }
 
 const TSCONFIG: &str = r#"//
-// `tsc --noEmit` is a gate, not a build: Node runs the TypeScript in `src/`
-// directly (see README.md), so nothing here emits.
+// `tsc --noEmit` is a gate, not a build: Bun runs the TypeScript in `src/`
+// directly, and so does Node (see README.md), so nothing here emits.
 {
   "compilerOptions": {
     "target": "ES2023",
@@ -160,7 +205,8 @@ const TSCONFIG: &str = r#"//
     "isolatedModules": true,
     "verbatimModuleSyntax": true,
 
-    // Relative imports name `.ts` files, because that is what Node resolves
+    // Relative imports name `.ts` files, which is what both supported runtimes
+    // resolve: Bun takes the extension as written, and it is what Node resolves
     // when it strips types. `rewriteRelativeImportExtensions` is what keeps
     // them buildable by anyone who later chooses to emit JavaScript.
     "allowImportingTsExtensions": true,
@@ -263,17 +309,35 @@ its files refuses rather than overwriting what is there.
 
 ## Running it
 
-There is no build step. Node has stripped types natively since 22.18, so the
-TypeScript in `src/` is what runs:
+There is no build step: the TypeScript in `src/` is what runs. Bun is the
+default — it is the runtime and the installer this project is documented,
+tested and gated against:
 
 ```sh
-npm install          # or: pnpm install, or: bun install
-npm run typecheck    # tsc --noEmit, the type gate
+bun install          # installs the pinned dependency set
+bun run typecheck    # tsc --noEmit, the type gate
+bun src/index.ts
+```
+
+### On Node instead
+
+Node **>=22.18.0** is a supported fallback, and nothing here is written for one
+runtime: no emitted module reaches for a `Bun` global or a `bun:` import, which
+is a gate on the compiler rather than a promise in a README. 22.18 is the floor
+because that is where Node stopped flagging type stripping, and it is what
+`engines.node` in `package.json` declares:
+
+```sh
+npm install          # or: pnpm install
+npm run typecheck
 node src/index.ts
 ```
 
 The manifest pins every dependency exactly and asks for nothing
-installer-specific, so npm, pnpm and bun all resolve it to the same versions.
+installer-specific — no `packageManager` field, no lockfile, no install-time
+script — so bun, npm and pnpm all resolve it to the same versions. The lockfile
+your installer writes is yours: `agent-compose build` never writes or removes
+one.
 
 ## Pinned versions
 
@@ -357,9 +421,10 @@ fn host_functions(ir: &Ir) -> String {
 const README_TAIL: &str = r#"
 ## Ejecting
 
-Copy this directory somewhere else and stop regenerating it. It is a plain Node
-project — no toolchain of ours is required to build, run, or publish it — which
-is the eject path PRD 5.12 asks for.
+Copy this directory somewhere else and stop regenerating it. It is a plain
+TypeScript project that runs on Bun and on Node — no toolchain of ours is
+required to build, run, or publish it — which is the eject path PRD 5.12 asks
+for.
 "#;
 
 /// `.gitignore`.
@@ -401,8 +466,9 @@ const INDEX: &str = r#"//
 //
 // It is also where the env-ref presence check of PRD 5.9 runs. `readEnvironment`
 // is called at module scope, so loading this module is what "process start"
-// means for this project: any `node src/index.ts`, and any import of it, throws
-// naming every missing variable before a graph is built or a model is called.
+// means for this project: any `bun src/index.ts` or `node src/index.ts`, and any
+// import of it, throws naming every missing variable before a graph is built or
+// a model is called.
 // The compiler never runs it — `agent-compose build` reads no environment, which
 // is what keeps a build on one machine reproducible on another and keeps a
 // credential out of every file it writes (PRD 5.9: refs "survive into the IR
@@ -465,6 +531,14 @@ mod tests {
 
     /// The neutrality claim of the module docs, as an assertion: nothing in the
     /// manifest names an installer or asks one to run anything at install time.
+    ///
+    /// `packageManager` is the interesting one now that Bun is the default
+    /// (PRD §9.18). Defaulting to Bun is a claim about the documented commands,
+    /// not about the manifest: the field is corepack's, corepack does not manage
+    /// Bun, and emitting `packageManager: "bun@x.y.z"` would pin every generated
+    /// project to a Bun release nothing here tests while buying no determinism
+    /// the exact version pins do not already give. So the list below is not a
+    /// leftover from a neutral era — it is what keeps the default a default.
     #[test]
     fn the_manifest_stays_package_manager_neutral() {
         let parsed: serde_json::Value = serde_json::from_str(&manifest()).expect("strict JSON");
@@ -489,6 +563,51 @@ mod tests {
                 "`{lifecycle}` runs at install time"
             );
         }
+    }
+
+    /// The emitted README launches with Bun and keeps Node as the fallback
+    /// (PRD §9.18).
+    ///
+    /// Which command a reader is shown *first* is the whole of what "default"
+    /// means for a directory that carries no launcher of its own, so the order
+    /// is asserted rather than the mere presence of both. The Node half is
+    /// asserted too: it is the promise gate 13 of `tests/generated_code_gates.rs`
+    /// keeps, and a README that quietly dropped it would leave that gate
+    /// checking something nobody had been told about.
+    #[test]
+    fn the_readme_launches_with_bun_and_documents_the_node_fallback() {
+        let contents = readme(&ir_of("version: \"0.1\"\n")).contents;
+
+        let bun = contents
+            .find("bun src/index.ts")
+            .expect("the default launch");
+        let node = contents
+            .find("node src/index.ts")
+            .expect("the fallback launch");
+        assert!(
+            bun < node,
+            "the fallback is documented before the default: {contents}"
+        );
+
+        let install = contents.find("bun install").expect("the default install");
+        assert!(
+            install < contents.find("npm install").expect("the fallback install"),
+            "{contents}"
+        );
+
+        assert!(contents.contains("### On Node instead"), "{contents}");
+        assert!(
+            contents.contains(&format!("Node **{NODE_ENGINE}** is a supported fallback")),
+            "the README's floor is not the one `engines.node` declares: {contents}"
+        );
+        // The one sentence that makes the fallback checkable rather than
+        // aspirational, and the reason gate 14 exists.
+        assert!(
+            contents.contains("no emitted module reaches for a `Bun` global or a `bun:` import"),
+            "{contents}"
+        );
+        // …and the manifest field that would contradict all of it.
+        assert!(contents.contains("no `packageManager` field"), "{contents}");
     }
 
     /// The two pin tables and the README's table are one list. A dependency

@@ -34,9 +34,10 @@
 //!
 //! Plain JSON data files, one loader per implementation: the **fixtures**
 //! import nothing and describe nothing but data, so the corpus stays portable
-//! to a runner written in another language — `crates/agent-compose/tests/
-//! compiled_graph_acceptance/cel-conformance.mjs` is the second one, over the
-//! evaluator a generated project embeds.
+//! to a runner written in another language — `tests/toolchain/cel-conformance.mjs`
+//! is the second one, over the evaluator a generated project embeds, and it is
+//! run under both of PRD §9.18's runtimes because that evaluator's answers are a
+//! JavaScript engine's.
 //!
 //! The runner does reach into this crate for one thing:
 //! [`compose_core::cel::evaluation_context`], the context the Rust column

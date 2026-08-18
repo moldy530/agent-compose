@@ -68,20 +68,24 @@
 //!
 //! ## Why there is no build step
 //!
-//! The emitted project is run by Node directly: `node src/index.ts`. Node has
-//! stripped types natively since 22.18, so a `.ts` file is a runnable module,
-//! and TypeScript is a **checker** here rather than a compiler. Consequences,
-//! all of them deliberate:
+//! The emitted project is run directly from source: `bun src/index.ts` under the
+//! default runtime (PRD §9.18), `node src/index.ts` under the fallback. Bun runs
+//! TypeScript natively and Node has stripped types since 22.18, so a `.ts` file
+//! is a runnable module on both, and TypeScript is a **checker** here rather than
+//! a compiler. Consequences, all of them deliberate:
 //!
 //! * relative imports are written with their real `.ts` extension, which is what
-//!   Node resolves and what `allowImportingTsExtensions` makes legal;
-//! * `agent-compose run` and `serve` spawn `node` on the sources, so there is no
-//!   stale-`dist/` failure mode and no second artifact to keep in step;
+//!   both runtimes resolve and what `allowImportingTsExtensions` makes legal;
+//! * `agent-compose run` and `serve` spawn the **default runtime** on the
+//!   sources — the same `bun src/index.ts` the emitted `README.md` documents
+//!   first — so there is no stale-`dist/` failure mode and no second artifact to
+//!   keep in step;
 //! * `tsc --noEmit` is the type gate and nothing else, so a project that fails to
 //!   type-check still fails loudly in CI while never being on a run's critical
 //!   path;
-//! * ejecting (PRD 5.12) is copying the directory: it is already a plain Node
-//!   project with no toolchain of ours in it.
+//! * ejecting (PRD 5.12) is copying the directory: it is already a plain
+//!   TypeScript project with no toolchain of ours in it, and no module in it
+//!   reaches for an API only one runtime has (`generated_code_gates.rs` gate 14).
 //!
 //! # Generated-file headers
 //!

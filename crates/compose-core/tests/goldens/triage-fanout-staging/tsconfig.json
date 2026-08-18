@@ -5,8 +5,8 @@
 // is the single source of truth (PRD 5.12); to own this code instead, copy
 // the whole directory out and stop regenerating it.
 //
-// `tsc --noEmit` is a gate, not a build: Node runs the TypeScript in `src/`
-// directly (see README.md), so nothing here emits.
+// `tsc --noEmit` is a gate, not a build: Bun runs the TypeScript in `src/`
+// directly, and so does Node (see README.md), so nothing here emits.
 {
   "compilerOptions": {
     "target": "ES2023",
@@ -23,7 +23,8 @@
     "isolatedModules": true,
     "verbatimModuleSyntax": true,
 
-    // Relative imports name `.ts` files, because that is what Node resolves
+    // Relative imports name `.ts` files, which is what both supported runtimes
+    // resolve: Bun takes the extension as written, and it is what Node resolves
     // when it strips types. `rewriteRelativeImportExtensions` is what keeps
     // them buildable by anyone who later chooses to emit JavaScript.
     "allowImportingTsExtensions": true,

@@ -2,7 +2,11 @@
 /.claude/worktrees/
 
 # The pinned JavaScript toolchain the generated-code gates install, and the
-# scratch copies of the golden projects they type-check. Both are rebuilt by
-# `cargo test`; the lockfile beside them is committed.
+# scratch copies of the golden projects they type-check. `node-fallback/` is the
+# second install of the same pins, the npm one gates 13 and 15 run under Node —
+# it also holds the staged copies of the runners those gates spawn, so a runner's
+# own imports resolve in it rather than in the Bun install. All three are rebuilt
+# by `cargo test`; the two lockfiles beside them are committed.
 /crates/compose-core/tests/toolchain/node_modules/
 /crates/compose-core/tests/toolchain/projects/
+/crates/compose-core/tests/toolchain/node-fallback/

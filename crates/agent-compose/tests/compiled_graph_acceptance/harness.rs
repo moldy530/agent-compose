@@ -50,7 +50,7 @@
 //! | call | command |
 //! |---|---|
 //! | [`build`] | `agent-compose build <entrypoint> --target <name> --out <dir>` |
-//! | [`invoke`] | `node <driver> <project> <flow> <inputs.json> <trace.json>`, over the emitted `runFlow` |
+//! | [`invoke`] | `bun <driver> <project> <flow> <inputs.json> <trace.json>`, over the emitted `runFlow` |
 //! | [`run`] | `agent-compose run <entrypoint> <flow> --input k=v … [--session <key>]` |
 //! | [`serve`] | `agent-compose serve <entrypoint> --port 0`, announcing its address on stdout |
 //!
@@ -60,21 +60,29 @@
 //! `serve` prints its bound address the way `mock-provider` does, because a test
 //! that has to guess a port cannot run in parallel with another one.
 //!
-//! # The Node toolchain
+//! # The JavaScript toolchain
 //!
-//! [`invoke`] needs the pinned dependency set installed. It reuses
-//! `compose-core`'s committed toolchain fixture — the same `package.json` and
-//! `package-lock.json` `tests/generated_code_gates.rs` installs, which
-//! `the_toolchain_fixture_pins_what_the_emitter_pins` holds to the emitter's own
-//! pins — and builds each fixture into a directory beneath it, so Node resolves
-//! `node_modules` by walking up. One `npm ci` per test binary serves every
-//! fixture, because the emitted dependency set is a compiler constant rather
-//! than a per-project one.
+//! [`invoke`] runs a compiled graph under **Bun**, which PRD §9.18 makes the
+//! default runtime of every emitted project: an acceptance suite is the claim
+//! that a compiled graph behaves, and it has to make that claim about the runtime
+//! a reader is told to use. `compose-core`'s `tests/generated_code_gates.rs` is
+//! where the Node fallback is checked — gate 13 runs a golden under it and gate 15
+//! answers both shared corpora with it — on goldens rather than here, because the
+//! fallback is a property of the emitted modules, not of any one composition.
+//!
+//! It needs the pinned dependency set installed, and reuses `compose-core`'s
+//! committed toolchain fixture — the same `package.json` and `bun.lock` the gates
+//! install, which `the_toolchain_fixture_pins_what_the_emitter_pins` holds to the
+//! emitter's own pins — building each fixture into a directory beneath it, so
+//! `node_modules` resolves by walking up. One install per test binary serves
+//! every fixture, because the emitted dependency set is a compiler constant
+//! rather than a per-project one. Both the install and the search that finds
+//! `bun` are `compose-core`'s `tests/support/toolchain.rs`, included here by path
+//! so the two suites cannot end up checking different toolchains.
 //!
 //! **In CI a missing toolchain fails; on a developer machine it skips**, which is
-//! the rule `tests/generated_code_gates.rs` already follows and for the same
-//! reason: CI is where "the suite is green" has to mean "the compiled graph
-//! ran".
+//! the rule that module states and for the same reason: CI is where "the suite is
+//! green" has to mean "the compiled graph ran".
 
 #![allow(
     dead_code,
@@ -83,12 +91,20 @@
     from the compiler's point of view until that bullet lands"
 )]
 
+#[path = "../../../compose-core/tests/support/toolchain.rs"]
+pub mod toolchain;
+
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
+
+// `bun_command` beside `bun`: a test that needs the *runtime* and not the pinned
+// install — the CEL conformance driver imports one dependency-free emitted module
+// — takes the runtime directly rather than installing a dependency set it never
+// resolves, and still gets the skip-locally, fail-in-CI rule `toolchain` states.
+pub use toolchain::{bun, bun_command, installed};
 
 use mock_provider::{Client, MockProvider};
 use serde_json::Value;
@@ -355,64 +371,6 @@ impl Run {
     }
 }
 
-/// Where the pinned Node toolchain and the fixtures built against it live.
-///
-/// `compose-core`'s committed fixture, reused rather than copied: one
-/// `package.json`, one `package-lock.json`, and one assertion
-/// (`the_toolchain_fixture_pins_what_the_emitter_pins`) keeping them equal to
-/// what `build` emits.
-fn toolchain() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("crates/")
-        .join("compose-core/tests/toolchain")
-}
-
-/// Whether a missing Node toolchain fails the run rather than skipping it.
-fn node_required() -> bool {
-    std::env::var_os("CI").is_some_and(|value| !value.is_empty())
-}
-
-/// The installed toolchain, or `None` when Node is absent and this is not CI.
-fn installed() -> Option<&'static Path> {
-    static TOOLCHAIN: OnceLock<Option<PathBuf>> = OnceLock::new();
-    TOOLCHAIN
-        .get_or_init(|| {
-            let runs = |program: &str| {
-                Command::new(program)
-                    .arg("--version")
-                    .output()
-                    .is_ok_and(|output| output.status.success())
-            };
-            if !runs("node") || !runs("npm") {
-                assert!(
-                    !node_required(),
-                    "`node` and `npm` are required: the acceptance suite runs compiled graphs \
-                     (PRD §7 M1). CI installs them; see .github/workflows/ci.yml."
-                );
-                eprintln!(
-                    "warning: skipping the compiled-graph runs — `node`/`npm` are not on PATH. \
-                     They are required in CI (`CI` is set there) and this run is not CI."
-                );
-                return None;
-            }
-            let root = toolchain();
-            let install = Command::new("npm")
-                .args(["ci", "--no-audit", "--no-fund"])
-                .current_dir(&root)
-                .output()
-                .expect("npm runs");
-            assert!(
-                install.status.success(),
-                "the pinned toolchain did not install:\n{}\n{}",
-                String::from_utf8_lossy(&install.stdout),
-                String::from_utf8_lossy(&install.stderr),
-            );
-            Some(root)
-        })
-        .as_deref()
-}
-
 /// The driver [`invoke`] runs: it imports the emitted project and calls its own
 /// `runFlow`, which is the surface `run` and `serve` will be built on.
 fn driver() -> PathBuf {
@@ -477,9 +435,9 @@ pub fn build_entrypoint(entrypoint: &Path, purpose: &str) -> Option<(PathBuf, Ou
 /// emitted one, the provider is the scripted one, and what comes back is the
 /// flow's own `outputs:` plus the routing trace the run recorded (PRD 5.3).
 ///
-/// Answers `None` when the Node toolchain is absent and this is not CI, which is
-/// the same skip `tests/generated_code_gates.rs` takes; a test that gets `None`
-/// has nothing to assert and returns.
+/// Answers `None` when Bun is absent and this is not CI, which is the same skip
+/// `tests/generated_code_gates.rs` takes; a test that gets `None` has nothing to
+/// assert and returns.
 pub fn invoke(
     name: &str,
     flow: &str,
@@ -552,7 +510,7 @@ pub fn invoke_entrypoint(
     .expect("the project directory is writable");
     let trace_path = project.join("invoke-trace.json");
 
-    let mut command = Command::new("node");
+    let mut command = bun();
     command
         .arg(driver())
         .arg(&project)
@@ -560,7 +518,7 @@ pub fn invoke_entrypoint(
         .arg(&inputs_path)
         .arg(&trace_path);
     seal(&mut command, environment);
-    let output = command.output().expect("node runs");
+    let output = command.output().expect("bun runs");
     Some(Invocation {
         run: Run { output },
         trace: trace_path,
@@ -660,9 +618,9 @@ pub fn run_with(
 }
 
 /// The variables that survive [`seal`], because they are the machine and not
-/// the composition: a generated project runs under `node` and an `exec` node
-/// runs a command, so both need `PATH`, and `node`/`npm` read `HOME` for their
-/// caches.
+/// the composition: a generated project runs under `bun` and an `exec` node
+/// runs a command, so both need `PATH`, and `bun` reads `HOME` for its install
+/// cache.
 pub const MACHINE: &[&str] = &["PATH", "HOME"];
 
 /// Give `command` the environment this call names, and nothing else.
@@ -680,7 +638,7 @@ pub const MACHINE: &[&str] = &["PATH", "HOME"];
 /// `validate` and `build` are left alone: env refs survive *unresolved* into the
 /// IR and into generated code (PRD 5.9), so a compile-time command reads none of
 /// them, and clearing the environment around a build that may yet shell out to
-/// the Node toolchain would buy nothing for it.
+/// the JavaScript toolchain would buy nothing for it.
 pub fn seal(command: &mut Command, environment: &[(String, String)]) {
     command.env_clear();
     for passed_through in MACHINE {

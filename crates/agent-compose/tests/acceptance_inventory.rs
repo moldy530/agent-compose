@@ -447,7 +447,7 @@ const CODEGEN: &[Criterion] = &[
     // The emission has landed: the built project reads its `${ENV}` references
     // when it is loaded and refuses to start without them, and `compose-core`'s
     // `the_generated_project_checks_its_environment_when_it_is_loaded` decides
-    // that on every `cargo test` against a real `node src/index.ts`. The row is
+    // that on every `cargo test` against a real `bun src/index.ts`. The row is
     // still pending because this file's test asserts it of a *run*, and the
     // reason says the command it waits on rather than the feature it has.
     Criterion {

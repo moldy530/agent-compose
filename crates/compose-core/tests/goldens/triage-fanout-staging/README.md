@@ -71,17 +71,35 @@ its files refuses rather than overwriting what is there.
 
 ## Running it
 
-There is no build step. Node has stripped types natively since 22.18, so the
-TypeScript in `src/` is what runs:
+There is no build step: the TypeScript in `src/` is what runs. Bun is the
+default — it is the runtime and the installer this project is documented,
+tested and gated against:
 
 ```sh
-npm install          # or: pnpm install, or: bun install
-npm run typecheck    # tsc --noEmit, the type gate
+bun install          # installs the pinned dependency set
+bun run typecheck    # tsc --noEmit, the type gate
+bun src/index.ts
+```
+
+### On Node instead
+
+Node **>=22.18.0** is a supported fallback, and nothing here is written for one
+runtime: no emitted module reaches for a `Bun` global or a `bun:` import, which
+is a gate on the compiler rather than a promise in a README. 22.18 is the floor
+because that is where Node stopped flagging type stripping, and it is what
+`engines.node` in `package.json` declares:
+
+```sh
+npm install          # or: pnpm install
+npm run typecheck
 node src/index.ts
 ```
 
 The manifest pins every dependency exactly and asks for nothing
-installer-specific, so npm, pnpm and bun all resolve it to the same versions.
+installer-specific — no `packageManager` field, no lockfile, no install-time
+script — so bun, npm and pnpm all resolve it to the same versions. The lockfile
+your installer writes is yours: `agent-compose build` never writes or removes
+one.
 
 ## Pinned versions
 
@@ -99,6 +117,7 @@ review the diff.
 
 ## Ejecting
 
-Copy this directory somewhere else and stop regenerating it. It is a plain Node
-project — no toolchain of ours is required to build, run, or publish it — which
-is the eject path PRD 5.12 asks for.
+Copy this directory somewhere else and stop regenerating it. It is a plain
+TypeScript project that runs on Bun and on Node — no toolchain of ours is
+required to build, run, or publish it — which is the eject path PRD 5.12 asks
+for.

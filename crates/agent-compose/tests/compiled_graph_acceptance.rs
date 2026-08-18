@@ -2106,12 +2106,30 @@ fn an_edge_guard_routes_on_the_source_nodes_structured_output() {
 /// the corpus is the mitigation. The Rust side already runs in
 /// `crates/compose-core/tests/cel_conformance.rs`; this is the other half, over
 /// the **same files**, run against the evaluator a
-/// built project embeds (`src/cel.ts`). The driver is committed beside this suite
-/// rather than written inline, because it carries a JSON reader that keeps `1`
-/// and `1.0` apart — the distinction the corpus's int64 cases exist to pin, and
-/// one `JSON.parse` throws away.
+/// built project embeds (`src/cel.ts`). The driver is committed rather than
+/// written inline, because it carries a JSON reader that keeps `1` and `1.0`
+/// apart — the distinction the corpus's int64 cases exist to pin, and one
+/// `JSON.parse` throws away.
+///
+/// This is the **Bun** column, which is the runtime PRD §9.18 makes a generated
+/// project's default. The same driver is run over the same corpus under the Node
+/// fallback by gate 15 of `crates/compose-core/tests/generated_code_gates.rs`,
+/// which is why it lives in the shared toolchain fixture rather than beside this
+/// file: what an evaluator built on `BigInt` and `RegExp` answers is the engine's,
+/// so one runtime alone would leave the other's readers unchecked.
+///
+/// It takes the runtime rather than the install ([`harness::bun_command`] rather
+/// than [`harness::installed`]) because that is all it needs: the driver imports
+/// `src/cel.ts` and nothing else, and that module has no imports of its own. What
+/// it must not do is take neither — [`harness::bun`] panics when Bun is absent,
+/// and a machine without it is owed the skip `support/toolchain.rs` documents
+/// rather than one test out of step with the rest of this binary.
 #[test]
 fn the_generated_cel_evaluator_agrees_with_the_validator_on_the_conformance_corpus() {
+    let Some(mut bun) = harness::bun_command() else {
+        return;
+    };
+
     let built = harness::build("bounded-cycle", "local");
     built.succeeded();
 
@@ -2119,15 +2137,14 @@ fn the_generated_cel_evaluator_agrees_with_the_validator_on_the_conformance_corp
         .parent()
         .expect("crates/")
         .join("compose-core/tests/fixtures/cel-conformance");
-    let driver = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/compiled_graph_acceptance/cel-conformance.mjs");
+    let driver = harness::toolchain::root().join("cel-conformance.mjs");
 
-    let output = std::process::Command::new("node")
+    let output = bun
         .arg(&driver)
         .arg(built.root())
         .arg(&corpus)
         .output()
-        .expect("node runs the generated evaluator");
+        .expect("bun runs the generated evaluator");
     assert!(
         output.status.success(),
         "the conformance driver failed: {}",
@@ -4407,9 +4424,10 @@ fn serve_resumes_an_interrupted_execution_against_the_human_nodes_schema() {
 /// interface assumptions the harness header says a codegen PR may fix here:
 ///
 /// * the module is `src/graph.ts`, not `./graph.js`. The emitted project has **no
-///   build step** — Node has stripped types natively since 22.18, so the
-///   TypeScript in `src/` is what runs — and a `.js` at the root would have had
-///   to come from a `tsc` emit `--noEmit` never performs. See the generated
+///   build step** — Bun, which PRD §9.18 makes the default runtime and which is
+///   what this test launches, runs the TypeScript in `src/` as it is written, and
+///   so does the Node fallback since 22.18 — and a `.js` at the root would have
+///   had to come from a `tsc` emit `--noEmit` never performs. See the generated
 ///   `README.md`, which documents the layout.
 /// * the reason names what is actually missing. `build` exists, the pinned
 ///   toolchain exists, and `compose-core`'s `tests/generated_code_gates.rs`
@@ -4430,17 +4448,11 @@ fn every_generated_project_type_checks_and_constructs_its_graph() {
             String::from_utf8_lossy(&built.stderr)
         );
 
-        let typecheck = std::process::Command::new(
-            project
-                .parent()
-                .and_then(Path::parent)
-                .expect("the toolchain root")
-                .join("node_modules/.bin/tsc"),
-        )
-        .args(["--noEmit", "-p", "."])
-        .current_dir(&project)
-        .output()
-        .expect("tsc runs");
+        let typecheck = harness::bun()
+            .args(["run", "typecheck"])
+            .current_dir(&project)
+            .output()
+            .expect("bun runs");
         assert!(
             typecheck.status.success(),
             "`{name}` does not type-check:\n{}",
@@ -4451,9 +4463,8 @@ fn every_generated_project_type_checks_and_constructs_its_graph() {
         // an edge to a node that is not registered, or a node reachable only
         // through a control-transfer position that `ends` did not declare, is a
         // runtime error at construction and a green `tsc` either way.
-        let construct = std::process::Command::new("node")
+        let construct = harness::bun()
             .args([
-                "--input-type=module",
                 "-e",
                 "const graph = await import('./src/graph.ts');\
                  graph.createBuilder();\
@@ -4464,7 +4475,7 @@ fn every_generated_project_type_checks_and_constructs_its_graph() {
             ])
             .current_dir(&project)
             .output()
-            .expect("node runs");
+            .expect("bun runs");
         assert!(
             construct.status.success(),
             "`{name}`'s graph does not construct: {}",
