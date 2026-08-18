@@ -251,7 +251,7 @@ fn main() -> ExitCode {
                 }
                 .to_string(),
             );
-            launch(&path, &target, &out, format, &arguments)
+            launch(&path, "run", &target, &out, format, &arguments)
         }
         Command::Serve {
             path,
@@ -269,7 +269,7 @@ fn main() -> ExitCode {
                 "--port".to_string(),
                 port.to_string(),
             ];
-            launch(&path, &target, &out, format, &arguments)
+            launch(&path, "serve", &target, &out, format, &arguments)
         }
     }
 }
@@ -290,12 +290,16 @@ fn main() -> ExitCode {
 /// answers, which is when the composition was refused and nothing was launched.
 fn launch(
     entrypoint: &Path,
+    command: &str,
     target: &str,
     out: &Path,
     format: Format,
     arguments: &[String],
 ) -> ExitCode {
-    if let Err(reason) = usable(entrypoint, "run") {
+    // The verb is the caller's, not this function's: both commands come through
+    // here, and a `serve` told that "`run` takes a spec entrypoint" names a
+    // command the caller did not type.
+    if let Err(reason) = usable(entrypoint, command) {
         return fail(&reason);
     }
 

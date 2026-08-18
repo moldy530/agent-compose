@@ -388,6 +388,34 @@ fn an_unreadable_entrypoint_exits_two() {
         "error: `examples` is not a file: `validate` takes a spec entrypoint, conventionally `main.yml`\n"
     );
     assert_eq!(code(&output), 2);
+
+    // The same precondition, named by the verb the caller typed. `run` and
+    // `serve` share the code path that checks it, and a `serve` told that
+    // "`run` takes a spec entrypoint" would name a command nobody ran.
+    for (command, rest) in [
+        // `run` takes a flow beside the entrypoint; nothing gets as far as
+        // reading it, but clap still requires it to be there.
+        ("run", vec!["flow.nothing"]),
+        ("serve", vec![]),
+        ("build", vec![]),
+    ] {
+        let output = Command::cargo_bin("agent-compose")
+            .expect("the binary under test is built")
+            .current_dir(repo_root())
+            .env("NO_COLOR", "1")
+            .arg(command)
+            .arg("examples")
+            .args(&rest)
+            .output()
+            .expect("the command runs");
+        assert_eq!(
+            stderr(&output),
+            format!(
+                "error: `examples` is not a file: `{command}` takes a spec entrypoint, conventionally `main.yml`\n"
+            )
+        );
+        assert_eq!(code(&output), 2);
+    }
 }
 
 /// A usage error is the same class, and clap already exits `2` for one.
