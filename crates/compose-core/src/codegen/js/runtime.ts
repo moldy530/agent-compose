@@ -3242,15 +3242,33 @@ export function carryEntry<E>(error: E, entry: TraceEntry): E {
  * `runActivity` wraps whatever the activity threw in a [`NodeFailure`], so the
  * [`ItemFailure`] carrying the records is never the outermost error by the time
  * a node's `on_error:` is deciding what to do with it.
+ *
+ * **Two boundaries stop the walk**, and they are the two module boundaries a
+ * failure can cross on its way here. Below either one is a fan-out some *other*
+ * instance ran, already on that instance's own entries — inside the trace the
+ * caller carries — and walking past one would stamp a child's fan-out onto the
+ * caller's entry, where `docs/trace.md` §3 says only a `map` node has one.
+ *
+ * This is where the two recoveries differ, and deliberately: [`traceOf`]
+ * *returns* at a [`SubflowFailure`], because the trace it holds is exactly what
+ * the `flow:` node calling it owes its entry — while the records under one
+ * belong to the child's own `map` node and to nothing above it.
  */
 function dispatchesOf(error: unknown): readonly DispatchRecord[] | undefined {
   for (let held: unknown = error; typeof held === "object" && held !== null; ) {
     if (held instanceof ItemFailure) return held.dispatches;
-    // A flow-as-tool call is a module boundary, and what a `map` inside the
-    // instance dispatched is the *instance's* — already on its own entries,
-    // inside the trace this call's dispatch record carries. Walking past it
-    // would put a subflow's fan-out on the **agent** node's entry, where
-    // `docs/trace.md` §3 says only a `map` node has one (see [`ToolFailure`]).
+    // A subflow instance is the first boundary: a `flow:` node whose child holds
+    // a `map` that failed would otherwise take the **child's** dispatch records
+    // onto its own entry, and a `flow:` node dispatches nothing (see
+    // [`SubflowFailure`]). [`traceOf`] meets the same error and *answers* with
+    // it — the trace is what the caller owes its `inner`, and these records are
+    // already inside it.
+    if (held instanceof SubflowFailure) return undefined;
+    // A flow-as-tool call is the second, for the same reason one construct over:
+    // what a `map` inside the instance dispatched is the *instance's* — already
+    // on its own entries, inside the trace this call's dispatch record carries.
+    // Walking past it would put a subflow's fan-out on the **agent** node's
+    // entry (see [`ToolFailure`]).
     if (held instanceof ToolFailure) return undefined;
     held = (held as { cause?: unknown }).cause;
   }

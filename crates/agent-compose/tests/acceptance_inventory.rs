@@ -334,6 +334,14 @@ const CODEGEN: &[Criterion] = &[
                 "a_dispatched_instances_trace_stays_under_its_own_record",
                 Status::Live,
             ),
+            // …and the same boundary read the other way round, at the other
+            // module boundary: a `flow:` node whose child's fan-out failed
+            // carries the child's whole trace and none of its dispatch records,
+            // because only a `map` node has that key (`docs/trace.md` §3).
+            (
+                "a_child_instances_fan_out_stays_inside_the_flow_nodes_inner_trace",
+                Status::Live,
+            ),
             // The same criterion over the *documented* project rather than a
             // fixture: `examples/triage-fanout` is what PRD 5.6 is written
             // about, and it reaches further than any fixture — a subgraph, a

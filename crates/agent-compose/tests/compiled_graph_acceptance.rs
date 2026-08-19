@@ -3931,6 +3931,94 @@ fn a_dispatched_instances_trace_stays_under_its_own_record() {
     );
 }
 
+/// A child instance's fan-out stays on the **child's** entries, and a `flow:`
+/// node that ran it carries no `dispatches` of its own.
+///
+/// The mirror of the test above, across the other module boundary. `docs/trace.md`
+/// §3 gives `dispatches` to `map` nodes — "a node that is not a `map` never
+/// carries the key" — and a `flow:` node dispatches nothing: it runs one
+/// instance, whose whole account is its `inner`, the failing `map` entry and
+/// that entry's own records included.
+///
+/// The path that breaks it is a `cause` chain read one boundary too far. A child
+/// whose fan-out failed raises an `ItemFailure` carrying the records, its map
+/// node's failure wraps that, the instance's `SubflowFailure` wraps *that*, and
+/// the caller's own failure wraps the lot — so a walk looking for an
+/// `ItemFailure` and not stopping at the subflow boundary finds the child's
+/// records and files them under the caller. The trace then reports one fan-out
+/// twice, in two places that mean different things, and claims the outer node
+/// dispatched instances it never had.
+#[test]
+fn a_child_instances_fan_out_stays_inside_the_flow_nodes_inner_trace() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({
+                "tasks": [
+                    { "title": "first", "body": "do alpha" },
+                    { "title": "second", "body": "do beta" },
+                ],
+            })),
+        ),
+        Script::new(HAIKU, Outcome::structured(json!({ "result": "did-alpha" })))
+            .matching("do alpha"),
+        // `agent.worker` declares `result: { min_length: 1 }`, so item 1 fails
+        // its own contract — and with `on_item_error` and the map node's
+        // `on_error` both at their default `fail`, the child instance fails.
+        Script::new(HAIKU, Outcome::structured(json!({ "result": "" }))).matching("do beta"),
+    ]);
+
+    let Some(run) = harness::invoke("fanout", "flow.enclose", &[("goal", "ship it")], &provider)
+    else {
+        return;
+    };
+    run.failed();
+
+    let entries = run.entries("inside");
+    let [entry] = entries.as_slice() else {
+        panic!("one `flow:` node, one entry: {entries:?}");
+    };
+    assert_eq!(entry["outcome"], json!("failed"), "{entry}");
+
+    // The one this test exists for.
+    assert!(
+        entry.get("dispatches").is_none(),
+        "a `flow:` node dispatched nothing, so it carries no `dispatches`: the \
+         records under its child's failure are the **child's** map node's \
+         (`docs/trace.md` §3): {entry}"
+    );
+    assert!(
+        entry.get("toolDispatches").is_none(),
+        "…and no model dispatched anything here either: {entry}"
+    );
+
+    // …and the records really are reported, one boundary in, on the entry that
+    // owns them.
+    let inner = entry["inner"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a failed instance still carries its trace: {entry}"));
+    let child = inner
+        .iter()
+        .find(|held| held["node"] == "work")
+        .unwrap_or_else(|| panic!("the child's map node has an entry: {entry}"));
+    assert_eq!(child["outcome"], json!("failed"), "{child}");
+    let records = child["dispatches"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a failed map still says what it dispatched: {child}"));
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| (
+                record["index"].as_u64().expect("an index"),
+                record["outcome"].as_str().expect("an outcome").to_string(),
+            ))
+            .collect::<Vec<_>>(),
+        [(0, "completed".to_string()), (1, "failed".to_string())],
+        "one record per source item, on the node that made them: {child}"
+    );
+}
+
 /// A fan-out over an empty array completes immediately, writes nothing, and its
 /// outgoing edge fires exactly as if every instance had finished (rule 6).
 #[test]
