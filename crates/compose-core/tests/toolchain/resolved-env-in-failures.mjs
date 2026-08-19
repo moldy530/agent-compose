@@ -20,9 +20,14 @@
 // whichever half it happened to run. What is asserted is the same for both — the
 // secret is not in the message, and the reference is.
 //
+// A fourth message is probed for the opposite reason: a reference that is not
+// set at all is worded by this runtime, precisely, and the three restatements
+// above must not stand in front of it. See `unsetUrl`/`unsetCwd` below.
+//
 // Usage: node resolved-env-in-failures.mjs <generated project directory>
-// Output: { "secret": …, "exec": …, "http": …, "provider": … } as JSON, each
-// message being the one a node's `error` would have carried.
+// Output: { "secret": …, "exec": …, "http": …, "provider": …, "unsetUrl": …,
+// "unsetCwd": … } as JSON, each message being the one a node's `error` would
+// have carried.
 
 import path from "node:path";
 import process from "node:process";
@@ -107,4 +112,55 @@ const provider = await refusal(() =>
   ),
 );
 
-process.stdout.write(JSON.stringify({ secret: SECRET, exec, http, provider }));
+// The other fault at the same two sites, and the reason both are probed here:
+// a reference that is **not set** at all. `environmentValue` words that one
+// itself — `` `REPO_ROOT` is not set (referenced by …) `` — and it is the whole
+// diagnosis, so the restatements above must not swallow it. They would if the
+// interpolation happened inside the guarded region: an unset `url:` reference
+// throwing inside `runHttp`'s `try` reappears as "is not a URL once its
+// `${ENV}` references are resolved", which is false — nothing resolved — and
+// identical to what a reference *set* to a non-URL produces, so `TraceEntry.error`
+// could no longer tell the two apart. An unset `cwd:` reference throwing inside
+// `runExec`'s `new Promise` executor reappears as "`<command>` could not be
+// run", which names the command for a fault in the working directory.
+//
+// `cwd:` rather than `command:` for the `exec:` half on purpose: it is the
+// interpolation furthest from the resolved ones, and the goldens' `env.ts` puts
+// real references there (`tool.repo_grep.exec.cwd`).
+delete process.env["UNSET_ENDPOINT"];
+delete process.env["UNSET_ROOT"];
+
+const unsetUrl = await refusal(() =>
+  runtime.runHttp(
+    {
+      method: "GET",
+      url: [{ env: "UNSET_ENDPOINT", site: "`tool.probe` `http.url`" }, "/reports"],
+      headers: [],
+      expectStatus: "2xx",
+      decoding: { envelope: [], decoded: ["ok"], empty: false },
+    },
+    {},
+    context,
+  ),
+);
+
+const unsetCwd = await refusal(() =>
+  runtime.runExec(
+    {
+      // Resolvable, and a command that exists: the only thing wrong here is the
+      // working directory, so a message about anything else is a misattribution.
+      command: ["echo"],
+      args: [],
+      cwd: [{ env: "UNSET_ROOT", site: "`tool.probe` `exec.cwd`" }],
+      env: [],
+      expectExit: [0],
+      decoding: { envelope: ["exit_code", "stdout"], decoded: [], empty: false },
+    },
+    undefined,
+    context,
+  ),
+);
+
+process.stdout.write(
+  JSON.stringify({ secret: SECRET, exec, http, provider, unsetUrl, unsetCwd }),
+);

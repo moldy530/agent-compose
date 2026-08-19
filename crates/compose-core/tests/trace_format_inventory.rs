@@ -30,6 +30,19 @@
 //! field gets a row in the table of its own section.** A field explained only in
 //! surrounding prose fails here, and the fix is a row.
 //!
+//! Scoping narrows that false-positive class rather than closing it, and the
+//! residual is worth naming. [`row_names`] accepts the token anywhere in any row
+//! of the section, so a **new top-level field** whose name collides with an
+//! inline-object member already spelled inside another row of the same section
+//! would pass undetected: §4.1's `budget` row writes out `key`, `used` and `max`
+//! in prose — which is what documents those nested fields — so a
+//! newly-declared `EdgeDecision.max` would find that row. Requiring the token in
+//! the row's *first* cell would close it and would also demand a row per nested
+//! member, which is a heavier document than the one this format wants; the
+//! collision needs a new field named exactly like an existing member of the same
+//! record, so the trade is deliberate. This is inherent to checking prose, and
+//! it is the reason the check is worth as much as the document's own discipline.
+//!
 //! One class of field is held to a **second** section besides its own: a field
 //! that carries free diagnostic text needs a row in §11.1 as well, because that
 //! is where an operator reads which fields can hold bytes this process did not
@@ -408,6 +421,9 @@ fn introduces<'a>(sections: &'a [Section], name: &str) -> Vec<&'a Section> {
 /// discussion is exactly what leaves a reader unable to tell presence from
 /// meaning. The pipe is the test: `docs/trace.md` writes every record type's
 /// fields as one table.
+///
+/// Anywhere in the row rather than in its first cell, which is what documents a
+/// nested member — see this file's header for the false positive that leaves.
 fn row_names(section: &Section, token: &str) -> bool {
     section
         .body
@@ -941,6 +957,61 @@ fn a_failure_the_platform_worded_is_restated_rather_than_quoted() {
             !body.contains(unguarded),
             "`{site}` calls `{unguarded}…` with nothing catching it, so {what} \
              (`docs/trace.md` §11.2)"
+        );
+    }
+}
+
+/// …and a restatement covers only the failure it is written for.
+///
+/// The restatements above stand between the platform's message and
+/// `TraceEntry.error`, and each is written for one fault. A reference that is
+/// **not set** is a different fault, worded by this runtime itself and precisely
+/// — `` `REPO_ROOT` is not set (referenced by `tool.repo_grep` `exec.cwd`) `` —
+/// and it is raised by [`environmentValue`] from inside `interpolate`. Resolve
+/// inside the guarded region and that message is replaced:
+///
+///   * `runHttp` would report an unset `url:` reference as "is not a URL once
+///     its `${ENV}` references are resolved", which is false — nothing resolved
+///     — and is word for word what a reference *set* to a non-URL produces, so a
+///     reader of the trace can no longer tell the two apart;
+///   * `runExec` would report an unset `cwd:` reference as "`<command>` could
+///     not be run", naming the command for a fault in the working directory.
+///
+/// Where each resolution sits is therefore part of the format, not a detail of
+/// the function: it decides what `TraceEntry.error` says. Asserted on the
+/// source because the messages themselves are gated by
+/// `tests/generated_code_gates.rs`'s
+/// `no_failure_the_platform_worded_carries_a_resolved_env_value`, which needs an
+/// install, and this rule is cheap enough to hold on every run.
+#[test]
+fn an_unset_reference_is_resolved_outside_the_region_that_restates_a_failure() {
+    let source = runtime();
+    for (site, header, hoisted, guarded, what) in [
+        (
+            "runHttp",
+            "export async function runHttp(",
+            "const resolved = interpolate(binding.url);",
+            "new URL(interpolate(",
+            "an unset `url:` reference is restated as a URL that does not parse",
+        ),
+        (
+            "runExec",
+            "export async function runExec(",
+            "const cwd = binding.cwd === undefined ? undefined : interpolate(binding.cwd);",
+            "cwd: binding.cwd === undefined ? undefined : interpolate(binding.cwd),",
+            "an unset `cwd:` reference is restated as a command that could not be run",
+        ),
+    ] {
+        let body = function_body(&source, header);
+        assert!(
+            body.contains(hoisted),
+            "`{site}` no longer resolves its `${{ENV}}` references as `{hoisted}`, \
+             ahead of the region that restates a failure; {what}"
+        );
+        assert!(
+            !body.contains(guarded),
+            "`{site}` resolves its `${{ENV}}` references at `{guarded}`, inside the \
+             region that restates a failure, so {what}"
         );
     }
 }

@@ -1152,6 +1152,18 @@ fn the_fan_out_runtime_bounds_orders_and_resolves_every_dispatch() {
             "keys": ["exec_probe/partial/0/0", "exec_probe/partial/0/1"],
         })
     );
+    // …and the bound on that recovery, which is what keeps it honest. Reading
+    // records off a node's **input** is the one path that does not start from
+    // something the node produced, and `runNode` takes it for every node that
+    // failed — so a plan has to be recognised by something a composition cannot
+    // write. `instances` and `records` are field names grammar 2.1 allows, and a
+    // node declaring an `input:` with both arrays fails here holding the
+    // composition's own data; `docs/trace.md` §3 says only a `map` node's entry
+    // carries `dispatches` and §5 says its elements are `DispatchRecord`s.
+    assert_eq!(
+        observed["aPlanShapedInputIsNotAPlan"],
+        serde_json::json!({ "outcome": "skipped", "dispatches": null })
+    );
 
     // Grammar 8.6's key table again, over the span the bound has to cover: a
     // detached delivery outlives the call that issued it (D94), so permits
@@ -1401,6 +1413,11 @@ fn the_unread_input_was_survived(answer: &Value) {
 /// parse. Each embeds the resolved string in the message the *engine* composes,
 /// so each is caught and restated.
 ///
+/// A fourth message rides along for the opposite reason: an `${ENV}` reference
+/// that is **not set** is worded by this runtime, precisely, and a restatement
+/// standing in front of that one would replace a diagnosis with a
+/// misattribution. See [`the_unset_reference_was_named_rather_than_restated`].
+///
 /// A gate rather than a source-level check — that half is
 /// `tests/trace_format_inventory.rs`'s
 /// `a_failure_the_platform_worded_is_restated_rather_than_quoted` — because the
@@ -1460,6 +1477,56 @@ fn the_resolved_values_stayed_out_of_the_messages(answer: &Value) {
             message.contains(names),
             "…and the `{surface}` failure has to name `{names}`, or a reader is told \
              something failed and nothing about what to fix: {message}"
+        );
+    }
+    the_unset_reference_was_named_rather_than_restated(answer);
+}
+
+/// The other fault at two of the same sites: a reference that is not set at all.
+///
+/// A restatement stands between the platform's message and `TraceEntry.error`,
+/// and a restatement that also stands in front of *this* message replaces a
+/// precise diagnosis with a false one. `runHttp` interpolating inside its `try`
+/// would report an unset `${ENV}` as "is not a URL once its `${ENV}` references
+/// are resolved" — when nothing resolved — and would word it identically to a
+/// reference that *is* set to a non-URL, so a reader of the trace could no
+/// longer tell the two apart. `runExec` interpolating its `cwd:` inside the
+/// `new Promise` executor would report an unset working directory as
+/// "`<command>` could not be run", naming the command for a fault that is not
+/// the command's.
+///
+/// Both halves are asserted for the reason the loop above asserts two: the
+/// variable's name has to be **there**, and the restatement has to be **gone**.
+/// A check for the name alone would pass on a message that carried both.
+fn the_unset_reference_was_named_rather_than_restated(answer: &Value) {
+    for (surface, names, site, restatement) in [
+        (
+            "unsetUrl",
+            "`UNSET_ENDPOINT` is not set",
+            "`tool.probe` `http.url`",
+            "is not a URL once",
+        ),
+        (
+            "unsetCwd",
+            "`UNSET_ROOT` is not set",
+            "`tool.probe` `exec.cwd`",
+            "could not be run",
+        ),
+    ] {
+        let message = answer[surface]
+            .as_str()
+            .unwrap_or_else(|| panic!("the runner reports the `{surface}` failure: {answer}"));
+        assert!(
+            message.contains(names) && message.contains(site),
+            "an unset reference is diagnosed by naming it and the surface that \
+             referenced it — `{names} (referenced by {site})` — which is the whole of \
+             what a reader has to fix (PRD G3): {message}"
+        );
+        assert!(
+            !message.contains(restatement),
+            "…and `{surface}` restates it as `…{restatement}…`, which is a different \
+             fault from the one that happened, and the same words a reference that \
+             *is* set produces: {message}"
         );
     }
 }

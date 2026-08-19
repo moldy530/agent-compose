@@ -61,9 +61,11 @@ entries; they differ in what surrounds them.
 | the trace **file** | one JSON object — the whole [envelope](#2-the-envelope) — under the project's data directory | `trace_version`, at the head of the envelope |
 | `serve` status | `GET /executions/:id` and the `callback:` webhook body, whose `trace` is the array of entries | `trace_version`, beside `trace` |
 
-The rule that spans them: **wherever a `trace` appears, the `trace_version` that
-describes it appears beside it.** A `serve` report for a run that is still going
-carries neither.
+The rule that spans them: **on all three surfaces above, wherever a `trace`
+appears, the `trace_version` that describes it appears beside it.** A `serve`
+report for a run that is still going carries neither. In process there is no
+document to put a version in, so the constant `TRACE_VERSION` is where an
+in-process caller of `runFlow` reads the same number (§11).
 
 ### 1.1 `run --format json`
 
@@ -164,7 +166,7 @@ retries are attempts at one execution, and `attempts` is where they are recorded
 | `traversal` | integer | always | How many times this node had **already** begun executing in this flow instance — `0` on the first, `1` on the second traversal of a bounded cycle. It is grammar §9.4's traversal ordinal, the same number the instance path is built from. |
 | `outcome` | `"completed"` \| `"skipped"` \| `"failed"` | always | See §3.2. |
 | `attempts` | integer | always | How many attempts the node's `retry:` policy **made**, not how many it allowed (grammar §9.1) — a budget that ran out during the second of three made two. `0` when the node never ran: an input binding that could not be evaluated fails the execution before any attempt (grammar §4.1, §10.1). |
-| `writes` | array of strings | `"completed"`, `"skipped"` | The state channels this node wrote, by name (grammar §10.1). Empty on a skipped node, which writes nothing. Absent on a failed entry: a node that failed produced no output to write from, and where the failure ended the run the superstep it died in lands nothing at all (§9). |
+| `writes` | array of strings | `"completed"`, `"skipped"` | The state channels this node wrote, by name (grammar §10.1). Empty on a skipped node, which writes nothing — and on a **completed** node that landed no channel: one whose `writes:` maps nothing, and one whose result omitted every field that is mapped (grammar §8.0, Decision D110). An empty array is therefore not a statement about `outcome`; read `outcome` for that. Absent on a failed entry: a node that failed produced no output to write from, and where the failure ended the run the superstep it died in lands nothing at all (§9). |
 | `routing` | [routing decision](#4-routing-decisions) | `"completed"`, `"skipped"`; conditionally on `"failed"` | What this node's outgoing edges answered. See §4 and §9. |
 | `dispatches` | array of [dispatch records](#5-dispatch-records) | `map` nodes | What a fan-out dispatched, one record per source item in **index** order (grammar §8.6, PRD 5.6). A map over an **empty** array records `[]` — present and empty. Absent rather than empty on a map that resolved nothing to *report*: one whose input binding failed before the plan was built, and one whose own `timeout:` caught every joined instance mid-flight (§5.2). See §5. |
 | `inner` | array of entries | `flow:` nodes | The trace of the subflow instance this node ran (grammar §8.5). See §8. |
@@ -313,7 +315,7 @@ different statement, and §5.2 is where it is made.
 |---|---|---|---|
 | `index` | integer | always | The source-item index, which is what identifies the item and orders every write it made (PRD 5.6, grammar §7.6.4 clause 2). |
 | `route` | string | routed maps | The **route** the item was dispatched through: its variant tag, or `"$default"` for the `default:` catch-all (grammar §8.6 rule 4, Decision D30). Absent on the homogeneous form, which has one target and no tags. The catch-all's sigil is not a name an author could have written, because a union may declare a variant *called* `default` beside a `default:` catch-all. |
-| `variant` | string | routed maps | The **discriminator value the item carried** — the value at the map's `route_by:` field. On a named route it repeats `route`; on the catch-all it is the only record of which variant fell through, since `route` names the catch-all rather than the variant. It is always one of the union's declared variant tags: the item was parsed against its producer's declared schema before any of this ran (PRD 5.2). |
+| `variant` | string | routed maps | The **discriminator value the item carried** — the value at the map's `route_by:` field. On a named route it repeats `route`; on the catch-all it is the only record of which variant fell through, since `route` names the catch-all rather than the variant. It is always one of the union's declared variant tags, and that is also what makes the key present on **every** record a routed map files: the item was parsed against its producer's declared schema before any of this ran (PRD 5.2), so its discriminator is one of those tags. An item whose discriminator is not a string — which no artifact `build` accepted can produce — is left unrecorded rather than rendered, since a number written as a string would be a `variant` that is not a declared tag. |
 | `target` | string | always | The component the item was dispatched to, as a typed address. |
 | `outcome` | `"completed"` \| `"skipped"` \| `"failed"` \| `"detached"` | always | See §5.1. |
 | `attempts` | integer | always | How many attempts the item's `on_item_error: { retry: … }` policy **made** (grammar §8.6 rule 10). `0` for a detached dispatch, which has no observed outcome for a policy to have acted on. |
@@ -662,7 +664,10 @@ The version number alone is a promise; two tests make it a checkable one:
 * **`FlowRun.trace` as a TypeScript type.** An in-process caller of the emitted
   `runFlow` receives the same entries as JavaScript objects. The *data* is this
   format; the declarations in `src/runtime.ts` are generated code, and an ejected
-  project owns them.
+  project owns them. There is no envelope on this path and so no `trace_version`
+  beside the entries: `src/runtime.ts` exports the constant `TRACE_VERSION`,
+  which holds the same number §1's three surfaces publish, and it is what a
+  caller that pins a version reads.
 * **The trace file's path and name.** `<flow>-<execution id>.json` under the
   project's data directory is where a run puts it, and `trace_path` is how a
   caller learns where; the layout under `.agent-compose/` is the emitted

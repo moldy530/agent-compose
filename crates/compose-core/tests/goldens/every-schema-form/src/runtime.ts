@@ -1962,10 +1962,19 @@ export async function runExec(
 
   const command = interpolate(binding.command);
   const args = binding.args.map((argument) => interpolate(argument));
+  // Resolved **here**, beside the command and the args, rather than in the
+  // executor below. A `cwd:` whose `${ENV}` reference is unset makes
+  // [`environmentValue`] throw, and a throw inside a `new Promise` executor is a
+  // rejection — which the catch below restates as "`<command>` could not be
+  // run", a message that names the command for a fault in the working
+  // directory. Out here the precise `` `REPO_ROOT` is not set (referenced by
+  // …) `` propagates as raised, and the catch keeps its one meaning: the
+  // platform declined to start a command whose inputs all resolved.
+  const cwd = binding.cwd === undefined ? undefined : interpolate(binding.cwd);
   const spawned = new Promise<{ code: number; stdout: string; stderr: string }>(
     (resolve, reject) => {
       const child = spawn(command, args, {
-        cwd: binding.cwd === undefined ? undefined : interpolate(binding.cwd),
+        cwd,
         env: environment,
         signal: context.signal,
       });
@@ -2076,9 +2085,19 @@ export async function runHttp(
   request: { readonly query?: Record<string, unknown>; readonly body?: unknown },
   context: RunContext,
 ): Promise<unknown> {
+  // Resolved **before** the `try`, not inside it. A `url:` whose `${ENV}`
+  // reference is unset makes [`environmentValue`] throw, and inside the `try`
+  // that throw would be restated as "is not a URL once its `${ENV}` references
+  // are resolved" — a message asserting something false, since the references
+  // were never resolved at all, and one indistinguishable from the message a
+  // reference that *is* set to a non-URL produces. Out here the precise
+  // `` `SIGNED_ENDPOINT` is not set (referenced by …) `` propagates as raised,
+  // and the `catch` keeps its one meaning: everything resolved, and what it
+  // resolved to is not a URL.
+  const resolved = interpolate(binding.url);
   let url: URL;
   try {
-    url = new URL(interpolate(binding.url));
+    url = new URL(resolved);
   } catch {
     // The platform's own parse failure quotes the **resolved** string — Bun says
     // `"secret/reports" cannot be parsed as a URL` — and grammar 4.3 class 2
@@ -2567,7 +2586,11 @@ export interface DispatchRecord {
    * The discriminator value the item itself carried, on the routed form
    * (grammar 8.6 rule 8).
    *
-   * Present exactly when the `map` declares `route_by:`, and recorded because
+   * Present on every record a `map` that declares `route_by:` files, and on no
+   * other. "Every" holds through [`variantOf`], which leaves a discriminator
+   * that is not a string unrecorded rather than rendering it: an item carrying
+   * one is an item the parse should have refused, and no artifact `build`
+   * accepted produces one. Recorded rather than read back off [`route`], because
    * [`route`] is not always the same fact. PRD §7 M2 asks for "which map variant
    * a discriminator chose" as trace data, and a route's tag answers that only
    * while a *named* route was selected: an item the `default:` catch-all took is
@@ -2704,13 +2727,21 @@ function traceOf(error: unknown): readonly TraceEntry[] | undefined {
  * the entry's own `error`, which names the node and its budget, is what accounts
  * for it.
  *
- * Shaped rather than typed, because `runNode` holds a node's input as `unknown`:
- * a map node's is a [`MapPlan`] and nothing else's is.
+ * Recognised by its **brand** rather than by its shape, because `runNode` holds
+ * every node's input as `unknown` and reaches here for *any* node that failed.
+ * A structural test — an object carrying `instances` and `records` arrays — is
+ * one a node that is not a map can pass: `instances` and `records` are legal
+ * field names (grammar 2.1), so a composition declaring an `input:` with both
+ * would, on failure, have its own data attached to its entry as `dispatches`,
+ * where `docs/trace.md` §3 says only a `map` node has one and §5 says the
+ * elements are [`DispatchRecord`]s. The brand is [`MAP_PLAN`], which only
+ * [`mapPlan`] sets, so the only object that answers here is one this runtime
+ * built for a map.
  */
 function plannedDispatches(input: unknown): readonly DispatchRecord[] | undefined {
   if (typeof input !== "object" || input === null) return undefined;
-  const plan = input as Partial<MapPlan>;
-  if (!Array.isArray(plan.instances) || !Array.isArray(plan.records)) return undefined;
+  if ((input as Record<symbol, unknown>)[MAP_PLAN] !== true) return undefined;
+  const plan = input as MapPlan;
   if (plan.records.length === 0) return undefined;
   return [...plan.records].sort((left, right) => left.index - right.index);
 }
@@ -3539,7 +3570,15 @@ interface PlannedInstance {
   readonly site: DispatchSite;
 }
 
-/** What a `map` node's input phase answers: every dispatch, already bound. */
+/**
+ * What a `map` node's input phase answers: every dispatch, already bound.
+ *
+ * Every plan also carries [`MAP_PLAN`], which is what [`plannedDispatches`]
+ * recognises one by. Not declared here on purpose: it is set with
+ * `Object.defineProperty` the way [`carryEntry`] sets [`ABORTED`], so no
+ * consumer of this type is shown a member it would have to spell a symbol to
+ * construct.
+ */
 export interface MapPlan {
   readonly instances: readonly PlannedInstance[];
   /**
@@ -3570,6 +3609,16 @@ export interface MapPlan {
    */
   readonly records: DispatchRecord[];
 }
+
+/**
+ * What marks an object as a [`MapPlan`], for [`plannedDispatches`] to read.
+ *
+ * `Symbol.for` and non-enumerable for the two reasons [`ABORTED`] is both: a
+ * composition can spell any field name grammar 2.1 allows, and cannot spell
+ * this; and a plan carrying one still serializes and logs the way the same
+ * object without one does.
+ */
+const MAP_PLAN = Symbol.for("agent-compose.mapPlan");
 
 /**
  * Decide a `map`'s whole dispatch **before** anything runs: how many instances,
@@ -3609,11 +3658,13 @@ export function mapPlan(map: MapDescriptor, view: NodeView): MapPlan {
       site,
     };
   });
-  return {
+  const plan: MapPlan = {
     instances,
     admission: [view.run.execution.id, ...view.run.path, map.node].join("/"),
     records: [],
   };
+  Object.defineProperty(plan, MAP_PLAN, { value: true, enumerable: false });
+  return plan;
 }
 
 /**
