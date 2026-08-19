@@ -4562,6 +4562,28 @@ export class HumanAbandoned extends Error {
   }
 }
 
+/**
+ * A second pause opened under an id the board is still holding a waiting one at
+ * (see [`hold`]).
+ *
+ * Not something a composition can ask for and not an outcome a run can route on:
+ * it is the runtime's own invariant, raised at the moment it breaks so that the
+ * failure is a named error rather than an execution that waits for ever on a
+ * pause no surface can reach.
+ */
+export class WaitBoardInvariant extends Error {
+  /** The id both pauses answer to (grammar 9.4's instance path, flattened). */
+  readonly wait: string;
+
+  constructor(wait: string) {
+    super(
+      `the pause at \`${wait}\` is still waiting, so a second pause cannot be opened under that id: an instance re-executed at a site abandons what the last one left parked there first`,
+    );
+    this.name = "WaitBoardInvariant";
+    this.wait = wait;
+  }
+}
+
 /** Why a resume was refused, or that it was taken. */
 export type ResumeOutcome =
   | { readonly ok: true; readonly wait: HumanWait }
@@ -4748,7 +4770,7 @@ export function watchHumanPauses(execution: string, listener: () => void): () =>
  *     soon as it settles — a sibling branch of that instance can still be
  *     parked. The next attempt re-runs the instance at the *same* site, so a
  *     pause left over would share its id with the one the new attempt opens
- *     there;
+ *     there — which [`hold`] refuses rather than resolving;
  *   * [`attemptItem`]'s ladder, which is the same seam for `on_item_error:
  *     { retry: … }`: an item's attempts all run at one dispatch site.
  *
@@ -4777,6 +4799,36 @@ export function abandonPausesUnder(execution: string, site: string): void {
 /** Tell everyone watching that this execution's set of open pauses has moved. */
 function announce(board: WaitBoard): void {
   for (const watcher of [...board.watchers]) watcher();
+}
+
+/**
+ * Put one pause on the board under its id, **refusing to displace a predecessor
+ * that is still waiting**.
+ *
+ * A wait id is an instance path and a path is re-run: both retry ladders
+ * ([`runActivity`], [`attemptItem`]) re-execute an instance at the site its
+ * predecessor ran at, so the id a new pause opens under is one the board may
+ * already hold. Every such seam abandons what it left behind first
+ * ([`abandonPausesUnder`]), which is what makes the entry it overwrites a
+ * *settled* one — and this is where that stops being a convention held at three
+ * call sites and becomes the board's own rule. A displaced pause that was still
+ * waiting is a task parked on a promise nothing can settle any more: it is off
+ * the board, so no resume can reach it, no `releaseHumanWaits` can abandon it,
+ * and the `map` permit and store handles its instance holds are never given
+ * back. The failure mode is a run that hangs, which is the one shape a test
+ * cannot tell from a slow one — so the board raises here instead, at the moment
+ * the invariant breaks and naming the id it broke at.
+ *
+ * Unreachable by construction, and stated all the same: it is a bug in the
+ * runtime rather than anything a composition can ask for, which is why it is not
+ * one of the settlements ([`Settlement`]) and carries a class of its own.
+ */
+function hold(board: WaitBoard, id: string, pause: Held): void {
+  const standing = board.held.get(id);
+  if (standing !== undefined && standing.settled === undefined) {
+    throw new WaitBoardInvariant(id);
+  }
+  board.held.set(id, pause);
 }
 
 /**
@@ -4963,10 +5015,12 @@ export async function runHuman(
       // is an instance path, and a path is re-run: both retry ladders
       // ([`runActivity`], [`attemptItem`]) re-execute an instance at the site
       // its predecessor ran at, so the board can hold a *successor* pause under
-      // this very id. They abandon the predecessor first, and this is the half
-      // that makes that a guarantee rather than an ordering: a stale closure —
-      // this promise's expiry timer, above all — settles the wait it belongs to
-      // or nothing at all, never whichever wait happens to answer to its id.
+      // this very id once the predecessor is settled — which [`hold`] is what
+      // makes true of every successor. This is the other half of the same rule,
+      // and the half an ordering cannot supply: a stale closure — this promise's
+      // expiry timer, above all — can still be in flight when its own entry is
+      // abandoned and replaced, and it settles the wait it belongs to or nothing
+      // at all, never whichever wait happens to answer to its id.
       if (mine.settled !== undefined) return false;
       mine.settled = outcome;
       // Whichever side settled it, the budget is over: the timer and everything
@@ -5004,7 +5058,7 @@ export async function runHuman(
       parse: (payload) => descriptor.parse(payload),
       settle: (outcome, value) => settle(outcome, value),
     };
-    board.held.set(id, mine);
+    hold(board, id, mine);
     announce(board);
 
     if (descriptor.timeoutMs !== undefined) {

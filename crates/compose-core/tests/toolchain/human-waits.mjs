@@ -24,13 +24,14 @@
 // `on_error: skip` — the first absorbed, the other two not, because neither of
 // them is a thing the activity did.
 //
-// Three sections are about one id being used twice. A retry ladder re-executes
-// an instance at the site its predecessor ran at, so the pause a failed attempt
-// left parked and the pause the next attempt opens are two waits under one id —
-// and the shape that produces one needs a branch of an instance to fail while a
-// sibling of it is parked, which is a scheduling no composition can ask for.
-// Both halves of the rule are driven: each of the two ladders abandons what it
-// left behind, and a settlement reaches the pause it belongs to and no other.
+// Four sections are about one id being used twice. A retry ladder re-executes an
+// instance at the site its predecessor ran at, so the pause a failed attempt left
+// parked and the pause the next attempt opens are two waits under one id — and
+// the shape that produces one needs a branch of an instance to fail while a
+// sibling of it is parked, which is a scheduling no composition can ask for. All
+// three halves of the rule are driven: each of the two ladders abandons what it
+// left behind, the board refuses a pause that would displace an unsettled one at
+// all, and a settlement reaches the pause it belongs to and no other.
 //
 // `src/runtime.ts` is a compiler constant, byte-identical in every project, so
 // driving it directly is driving what every project runs.
@@ -385,19 +386,45 @@ const observed = {};
 
 // …and the half of that which is not an ordering: a settlement reaches the pause
 // it belongs to and no other. A wait id is an instance path and a path is re-run,
-// so the board can hold a *successor* pause under an id a stale closure still
-// remembers — and the stale closure with the longest reach is an expiry timer.
-// Driven by displacing a pause without abandoning it, which is the state a ladder
-// that forgot to would leave: the earlier wait's budget runs out, and what it
-// must settle is itself.
+// so once a ladder has abandoned what it left parked the board holds a
+// *successor* pause under an id a stale closure still remembers — and the stale
+// closure with the longest reach is an expiry timer, which can already be in
+// flight when its own entry is settled and replaced.
+//
+// The timer is fired by hand rather than by the clock, because "the callback runs
+// after the entry it belongs to was settled and replaced" is an interleaving no
+// sleep can schedule: `setTimeout` is swapped for the length of the first pause
+// so the callback it was handed can be kept and run at the chosen moment. What
+// the section decides is *what that callback does* — settle itself, or whatever
+// now answers to its id.
 {
   const execution = "exec_successor";
   runtime.openHumanWaits(execution, true);
-  const stale = park(execution, ["wrap", "0"], { timeoutMs: 20, onTimeout: "escalate" });
+
+  const budget = 20;
+  let expire;
+  const realSetTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = (fn, ms, ...rest) => {
+    if (ms !== budget) return realSetTimeout(fn, ms, ...rest);
+    expire = fn;
+    // A handle `clearTimeout` accepts, attached to nothing: the callback is this
+    // section's to run, and running it is the whole point.
+    return realSetTimeout(() => {}, 0);
+  };
+  const stale = park(execution, ["wrap", "0"], { timeoutMs: budget, onTimeout: "escalate" });
+  await settle();
+  globalThis.setTimeout = realSetTimeout;
+
+  // What every ladder does before re-executing an instance at a site — and what
+  // the board now refuses to let one skip (see the section below).
+  runtime.abandonPausesUnder(execution, "wrap/0");
   await settle();
   const live = park(execution, ["wrap", "0"]);
   await settle();
-  await until(() => stale.state !== "pending");
+
+  // The stale budget, running out one settlement too late.
+  expire?.();
+  await settle();
 
   const open = runtime.pausesUnder(execution, "wrap/0");
   const published = runtime.humanWaits(execution).map((wait) => wait.id);
@@ -410,6 +437,42 @@ const observed = {};
     published,
     taken: { ok: taken.ok, wait: taken.wait?.id },
     live: live.state,
+  };
+  runtime.releaseHumanWaits(execution);
+}
+
+// …and the ordering itself, which is the board's own rule rather than a
+// convention three call sites keep. A pause opened under an id the board is
+// still holding an **unsettled** wait at would take that wait off the board with
+// nothing left able to reach it: no resume can address it, no
+// `abandonPausesUnder` or `releaseHumanWaits` can find it, and the task holding
+// it is parked on a promise nothing can settle — a run that hangs, which is the
+// one failure a test cannot tell from a slow machine. The board refuses instead,
+// at the moment the invariant breaks, and the standing pause is untouched: still
+// published, still open, and still what an answer reaches.
+{
+  const execution = "exec_displacing";
+  runtime.openHumanWaits(execution, true);
+  const standing = park(execution, ["wrap", "0"]);
+  await settle();
+  const displacing = park(execution, ["wrap", "0"]);
+  await settle();
+
+  // Read before the answer: what the refusal must have left behind is a board
+  // still holding the standing pause, not one the delivery below put back.
+  const published = runtime.humanWaits(execution).map((wait) => wait.id);
+  const open = runtime.pausesUnder(execution, "wrap/0");
+  const taken = runtime.deliverHumanAnswer(execution, "wrap/0/sign/0", { decision: "approve" });
+  await settle();
+
+  observed.displacing = {
+    refused: displacing.state,
+    said: displacing.value,
+    published,
+    open,
+    taken: { ok: taken.ok, wait: taken.wait?.id },
+    standing: standing.state,
+    output: standing.value?.output,
   };
   runtime.releaseHumanWaits(execution);
 }

@@ -1296,10 +1296,12 @@ fn the_fan_out_runtime_bounds_orders_and_resolves_every_dispatch() {
 /// (grammar 8.7, 9.2, PRD 5.11).
 ///
 /// The acceptance suite answers, expires and addresses pauses through a served
-/// app, which is where the composition's behaviour is decided. Ten claims are
+/// app, which is where the composition's behaviour is decided. Eleven claims are
 /// not decidable there — eight because the case that breaks them is a task
-/// **nobody is awaiting**, and two because every composition that can reach one
-/// declares an `on_error:` the orderings agree on:
+/// **nobody is awaiting**, one because the case that breaks it is a bug in the
+/// runtime rather than anything a composition can ask for, and two because every
+/// composition that can reach one declares an `on_error:` the orderings agree
+/// on:
 ///
 ///   * **a pause is addressed by, and belongs to, an instance path.** A node
 ///     holds the pauses its own path is a prefix of, which is the whole of what
@@ -1318,8 +1320,17 @@ fn the_fan_out_runtime_bounds_orders_and_resolves_every_dispatch() {
 ///   * **a settlement reaches its own pause and no other.** A wait id is an
 ///     instance path and a path is re-run, so the board can hold a successor
 ///     under an id a stale expiry timer still remembers. What breaks it is a
-///     timer firing after its entry was displaced — a state reachable only by
-///     displacing one;
+///     timer firing after its entry was settled and replaced — an interleaving
+///     of one abandonment, one re-park and one callback that no served run can
+///     be asked for;
+///   * **the board refuses to displace a wait that is still waiting.** The
+///     abandon-first ordering the two ladders keep is the board's own rule
+///     rather than a convention held at their call sites: a pause that silently
+///     displaced an unsettled one would leave a task parked on a promise no
+///     resume, abandonment or release could reach — a run that hangs, which is
+///     the one failure indistinguishable from a slow machine. Unreachable from
+///     any composition by construction, which is exactly why it is asserted
+///     here;
 ///   * **an abandonment is not an activity outcome.** `on_error:` governs what
 ///     the model, the process or the request did; a pause nobody is waiting for
 ///     any more is the run's own unwinding, and a `skip` that absorbed one would
@@ -1466,20 +1477,62 @@ fn the_wait_board_behaved(observed: &Value) {
     // pause it belongs to and no other. A wait id is an instance path and a path
     // is re-run, so a stale closure — an expiry timer above all — can outlive the
     // entry it settles and find a *successor* answering to its id. Driven by
-    // displacing a pause without abandoning it: the earlier wait's budget runs
-    // out and what it must settle is itself, leaving the live question published,
-    // answerable, and answered. A settlement that went by id instead reports the
-    // live pause `expired`, publishes nothing, and refuses the honest answer.
+    // abandoning a pause, opening its successor at the same site, and only then
+    // firing the budget the abandoned one had armed: what it must settle is
+    // itself, which is nothing, leaving the live question published, answerable,
+    // and answered. A settlement that went by id instead reports the live pause
+    // `expired`, publishes nothing, and refuses the honest answer.
     assert_eq!(
         observed["successor"],
         json!({
-            "stale": "HumanExpiry",
+            "stale": "HumanAbandoned",
             "open_after_the_stale_budget_ran_out": 1,
             "published": ["wrap/0/sign/0"],
             "taken": { "ok": true, "wait": "wrap/0/sign/0" },
             "live": "resolved",
         }),
         "a stale pause's expiry settled the wait that succeeded it: {observed}"
+    );
+
+    // …and the ordering that section relies on is the board's rule rather than a
+    // convention: a pause opened under an id an **unsettled** wait still answers
+    // to is refused outright. Silently displacing it would take that wait off the
+    // board with nothing able to reach it — no resume, no abandonment, no release
+    // — leaving its task parked on a promise nothing can settle, which is a run
+    // that hangs rather than a run that fails. The standing pause is untouched by
+    // the refusal: published, open, and what the answer reaches.
+    assert_eq!(
+        observed["displacing"]["refused"],
+        json!("WaitBoardInvariant"),
+        "the board displaced a pause that was still waiting: {observed}"
+    );
+    assert!(
+        observed["displacing"]["said"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("`wrap/0/sign/0` is still waiting"),
+        "the refusal names the id it broke at: {observed}"
+    );
+    assert_eq!(
+        observed["displacing"]["published"],
+        json!(["wrap/0/sign/0"]),
+        "{observed}"
+    );
+    assert_eq!(observed["displacing"]["open"], json!(1), "{observed}");
+    assert_eq!(
+        observed["displacing"]["taken"],
+        json!({ "ok": true, "wait": "wrap/0/sign/0" }),
+        "{observed}"
+    );
+    assert_eq!(
+        observed["displacing"]["standing"],
+        json!("resolved"),
+        "the pause that was already there is the one the answer reached: {observed}"
+    );
+    assert_eq!(
+        observed["displacing"]["output"],
+        json!({ "decision": "approve" }),
+        "{observed}"
     );
 
     // An abandonment is an unwinding rather than an outcome, so it passes the
