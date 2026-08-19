@@ -680,8 +680,24 @@ const COMMANDS: &[Criterion] = &[
                 "an_expired_wait_takes_its_route_and_refuses_the_answer_that_arrives_after_it",
                 Status::Live,
             ),
+            // …and the other target `on_timeout:` takes, which is not a node at
+            // all: `end` retires the branch the wait was holding, so nothing is
+            // scheduled after the budget spends and the execution nonetheless
+            // completes (grammar 8.7, 7.6.3).
+            (
+                "a_wait_that_expires_into_end_retires_its_branch_and_completes_the_execution",
+                Status::Live,
+            ),
             (
                 "two_pauses_in_one_execution_are_addressed_by_their_instance_paths",
+                Status::Live,
+            ),
+            // …and the other axis a wait id is built on, which a fan-out cannot
+            // reach: one `human` node inside a bounded cycle, whose two pauses
+            // are the same site at two traversals and are told apart by grammar
+            // 9.4's ordinal alone.
+            (
+                "a_second_traversals_pause_is_addressed_apart_from_the_first",
                 Status::Live,
             ),
             // …and the other half of "several waits at once": two executions,

@@ -8,7 +8,7 @@
 # responses, so a start returns an execution id and the status route is how a
 # caller learns the rest.
 #
-# Five flows, because the verbs and the ways a pause can end do not all become
+# Seven flows, because the verbs and the ways a pause can end do not all become
 # testable at once:
 #
 #   * `flow.direct` has no `human` node in it, so start and status are decidable
@@ -19,10 +19,20 @@
 #     spend, whose `on_timeout:` route is taken **instead of** the node's own
 #     edges (grammar 8.7, 9.2), and which then keeps the execution alive long
 #     enough for a late resume to be refused as the expiry it is;
+#   * `flow.lapsing` is that same expiry at the *other* target `on_timeout:`
+#     admits — `end`, which retires the branch rather than routing it onward
+#     (grammar 8.7, 7.6.3). Nothing runs after the budget spends, and the
+#     execution nonetheless **completes**: a wait that ran out is not a failed
+#     run;
 #   * `flow.batch` is the case that makes a pause need an address: a `map`
 #     dispatching a flow that contains a `human` node, so one execution holds
 #     several pauses at once and each resume has to name which it answers
 #     (grammar 9.4's instance path);
+#   * `flow.revisiting` is the other half of that addressing, on the axis a
+#     `map` does not reach: one `human` node inside a **bounded cycle**, whose
+#     two pauses are one node at two traversals. Their ids differ by grammar
+#     9.4's traversal ordinal — `sign/0` then `sign/1` — which is what lets a
+#     resume answer the second question without answering the first again;
 #   * `flow.patient` is the case Decision D102 is about one construct further
 #     out: a `flow:` node with a short `timeout:` of its own wrapping a subflow
 #     that pauses. The enclosing budget must not cut the wait short (§9.2's
@@ -51,6 +61,12 @@ state:
   # Written only by the node `flow.expiring`'s `on_timeout:` transfers to, so a
   # value here is proof the expiry route ran rather than the node's own edges.
   escalated:
+    type: string
+    default: ""
+  # Written only by the node on the far side of `flow.lapsing`'s sign-off, so an
+  # empty value there is proof `on_timeout: end` retired the branch instead of
+  # the node's own edge carrying it on.
+  signed:
     type: string
     default: ""
   # One entry per dispatched instance that a human signed off, in source-item
@@ -125,6 +141,28 @@ triggers:
     type: http
     flow: flow.expiring
     path: /expiring-answers
+    method: POST
+    input:
+      question: "payload.body.question"
+    respond: async
+
+  # The same budget against the other route `on_timeout:` admits: `end`, which
+  # retires the branch rather than sending it to a node.
+  on_lapsing_request:
+    type: http
+    flow: flow.lapsing
+    path: /lapsing-answers
+    method: POST
+    input:
+      question: "payload.body.question"
+    respond: async
+
+  # Two pauses one after the other, at one node: a bounded cycle whose back-edge
+  # is taken on the first answer.
+  on_revisiting_request:
+    type: http
+    flow: flow.revisiting
+    path: /revisited-answers
     method: POST
     input:
       question: "payload.body.question"
@@ -317,6 +355,98 @@ flow.expiring:
     - { from: sign_off, to: end }
     - { from: give_up, to: note }
     - { from: note, to: end }
+
+# The same expiry against the other target `on_timeout:` accepts. `end` is not a
+# node: it **retires the branch** that reaches it (grammar 7.6.3), and the same
+# sentence names it in a control-transfer position — so a wait that runs out here
+# schedules nothing, the flow reaches quiescence with one branch retired, and the
+# execution ends `completed` rather than `failed`. That is the reading a `goto`
+# of `__end__` has to produce; the alternatives — a run left waiting on a branch
+# nothing scheduled, or one reported as a failure because a node's outcome was
+# `failed` — are both a compiled graph away.
+#
+# `sign_off`'s own edge goes to `record`, which is the only writer of `signed`,
+# so an empty `signed:` in the outputs is what says the branch retired instead of
+# carrying on.
+flow.lapsing:
+  description: Give a reviewer a budget they will not meet, and retire the branch.
+  inputs:
+    question:
+      type: string
+      min_length: 1
+  outputs:
+    signed:
+      type: string
+  nodes:
+    sign_off:
+      human:
+        input:
+          question: { type: string }
+        output:
+          decision: { enum: [approve, reject] }
+        timeout: 3s
+        on_timeout: end
+      input:
+        question: "input.question"
+
+    record:
+      exec:
+        command: "${OPS_BIN}/echo"
+        args: ['{"signed":"a human answered"}']
+        output:
+          signed: { type: string }
+  edges:
+    - { from: start, to: sign_off }
+    - { from: sign_off, to: record }
+    - { from: record, to: end }
+
+# One `human` node, asked twice. A bounded cycle (grammar 7.4 clause 1) whose
+# back-edge is guarded on the node's own answer, so a `reject` sends the flow
+# round to the same node and a second pause opens there.
+#
+# What that reaches which `flow.batch`'s fan-out does not is the **traversal**
+# component of an instance path (grammar 9.4): the two pauses are one node at one
+# path, and the ordinal is the whole of what tells them apart — `sign/0` and then
+# `sign/1`. A wait id built from the node id alone would make the second question
+# indistinguishable from the first, and an answer to it would be refused as one
+# already given.
+#
+# `decisions` is an `append` channel, so the outputs hold both answers in the
+# order the passes made them, which is the proof both traversals really ran.
+flow.revisiting:
+  description: Sign an item off, and ask again for as long as the answer says to.
+  inputs:
+    question:
+      type: string
+      min_length: 1
+  outputs:
+    decisions:
+      type: array
+      max_items: 8
+      items:
+        enum: [approve, reject]
+  nodes:
+    sign:
+      human:
+        input:
+          question: { type: string }
+        output:
+          decision: { enum: [approve, reject] }
+      input:
+        question: "input.question"
+      writes:
+        decision: decisions
+  edges:
+    - { from: start, to: sign }
+    # The back-edge and its budget. Two more passes are allowed and the test
+    # spends one, so what ends the loop is the answer rather than the ceiling.
+    - from: sign
+      to: sign
+      when: "sign.output.decision == 'reject'"
+      max_iterations: 2
+    # The escape a bounded cycle requires: taken on `approve`, and equally on the
+    # pass where `reject` comes back with the budget spent.
+    - { from: sign, to: end, else: true }
 
 # One item's sign-off, as a module. Dispatched by `flow.batch` below, which is
 # what puts several pauses in one execution at once.

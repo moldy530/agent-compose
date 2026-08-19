@@ -6928,6 +6928,246 @@ fn an_enclosing_nodes_budget_does_not_run_while_a_pause_below_it_is_open() {
     assert_eq!(finished["outputs"]["decision"], "reject", "{finished}");
 }
 
+/// A wait whose `on_timeout:` names **`end`** retires the branch that was
+/// holding it, and the execution completes (grammar 8.7, 7.6.3).
+///
+/// `on_timeout:` takes §9.2's two target shapes and
+/// [`an_expired_wait_takes_its_route_and_refuses_the_answer_that_arrives_after_it`]
+/// reaches only the first: a flow-local node id, which schedules that node. This
+/// is the other, and it is the one whose runtime spelling is a pseudo-node —
+/// `goto: ["__end__"]` — so the two readings a compiled graph could produce are
+/// both a plausible bug. A branch that retired but was still counted as live
+/// leaves the run waiting on nothing until the superstep ceiling ends it, and a
+/// `failed` node outcome carried up as the *run's* outcome reports a composition
+/// that did exactly what it declared as a failure.
+///
+/// Three claims, in the one run that can hold them: nothing on the far side of
+/// the pause ran (`signed` has only one writer and it is the node the wait's own
+/// edge goes to), the execution ended `completed`, and the trace says which of
+/// the two ways the wait ended and where control went — `"__end__"`, which
+/// `docs/trace.md` §3 names as `fallback`'s spelling for the terminal
+/// pseudo-node.
+#[test]
+fn a_wait_that_expires_into_end_retires_its_branch_and_completes_the_execution() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let Some(served) = harness::serve("http-trigger", &provider) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+
+    let started = app
+        .post_json("/lapsing-answers", &json!({ "question": "ship it?" }))
+        .expect("the trigger's route answers");
+    assert_eq!(started.status, 202, "{:?}", started.body);
+    let execution = started.json()["execution_id"]
+        .as_str()
+        .expect("an execution id")
+        .to_string();
+
+    let waiting = wait_for_pauses(&app, &execution, 1);
+    assert_eq!(
+        waiting["interrupts"][0]["wait_id"], "sign_off/0",
+        "{waiting}"
+    );
+    assert!(
+        waiting["interrupts"][0]["expires_at"].is_string(),
+        "this node declares `timeout: 3s`, so the wait has a deadline to publish: {waiting}"
+    );
+
+    // Nobody answers, so the only thing that ends this run is the budget.
+    // `poll_until` rather than `harness::settled`, which counts `interrupted` as
+    // a state a run has stopped in: the pause this test is about is exactly that
+    // state, so waiting for "settled" would answer with the report above.
+    let finished = poll_until(&app, &execution, "completed");
+    assert_eq!(
+        finished["status"], "completed",
+        "a branch that retired at `end` is a run that finished, not one that \
+         failed: {finished}"
+    );
+    assert!(
+        finished["interrupts"].is_null(),
+        "the wait is over, so there is nothing left to publish: {finished}"
+    );
+    assert_eq!(
+        finished["outputs"]["signed"], "",
+        "`record` is the only writer of this channel and it is what the wait's \
+         own edge goes to, so a value here would mean the branch carried on: \
+         {finished}"
+    );
+
+    let trace = finished["trace"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a finished report carries its trace: {finished}"))
+        .clone();
+    assert!(
+        !trace.iter().any(|entry| entry["node"] == "record"),
+        "nothing on the far side of the pause ran: {finished}"
+    );
+    let entry = trace
+        .iter()
+        .find(|entry| entry["node"] == "sign_off")
+        .unwrap_or_else(|| panic!("the `human` node has an entry: {finished}"))
+        .clone();
+    assert_eq!(
+        entry["outcome"], "failed",
+        "the node left no result for the run to carry on from: {entry}"
+    );
+    assert_eq!(
+        entry["fallback"], "__end__",
+        "…and control transferred to the terminal pseudo-node rather than to \
+         the node its own edge names: {entry}"
+    );
+    assert!(
+        entry["routing"].is_null(),
+        "a node whose edges were not evaluated records no routing decision: {entry}"
+    );
+    assert_eq!(entry["human"]["settled"], "expired", "{entry}");
+    assert!(entry["human"]["settledAt"].is_string(), "{entry}");
+    assert!(entry["human"]["expiresAt"].is_string(), "{entry}");
+}
+
+/// Two pauses at **one node**, told apart by the traversal ordinal in their ids
+/// (grammar 9.4, 7.4).
+///
+/// The other axis a wait id is built on, and the one a fan-out cannot reach:
+/// [`two_pauses_in_one_execution_are_addressed_by_their_instance_paths`] holds
+/// several pauses at once, at *different* sites, while this holds them one after
+/// the other at the same site. `flow.revisiting` is a bounded cycle whose
+/// back-edge is guarded on the `human` node's own answer, so a `reject` sends
+/// the flow round to that node and a second pause opens there — and what tells
+/// the second question from the first is the ordinal alone: `sign/0`, then
+/// `sign/1`.
+///
+/// A wait id built from the node id would make the two indistinguishable, which
+/// is decidable here and nowhere else: the second resume would be refused as an
+/// answer already given, and the run would sit on a pause nothing could address.
+/// So the first id is sent again *after* the second pause opened — it must be
+/// refused as the settled wait it is, rather than answer the live one — and the
+/// `append` channel the node writes carries both answers in pass order, which is
+/// what says both traversals really ran.
+#[test]
+fn a_second_traversals_pause_is_addressed_apart_from_the_first() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let Some(served) = harness::serve("http-trigger", &provider) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+
+    let started = app
+        .post_json("/revisited-answers", &json!({ "question": "ship it?" }))
+        .expect("the trigger's route answers");
+    assert_eq!(started.status, 202, "{:?}", started.body);
+    let execution = started.json()["execution_id"]
+        .as_str()
+        .expect("an execution id")
+        .to_string();
+
+    let first = wait_for_pauses(&app, &execution, 1);
+    assert_eq!(
+        first["interrupts"][0]["wait_id"], "sign/0",
+        "the first traversal's pause is the node at ordinal `0`: {first}"
+    );
+    assert_eq!(
+        first["interrupts"][0]["resume_url"],
+        "/executions/{execution}/resume?wait=sign%2F0".replace("{execution}", &execution),
+        "{first}"
+    );
+
+    // `reject` is what the back-edge's guard is written over, so this answer is
+    // also the routing decision that sends the flow round again.
+    let resumed = app
+        .post_json(
+            &format!("/executions/{execution}/resume?wait=sign%2F0"),
+            &json!({ "decision": "reject" }),
+        )
+        .expect("the resume route answers");
+    assert_eq!(resumed.status, 202, "{:?}", resumed.body);
+    assert_eq!(resumed.json()["wait"], "sign/0", "{:?}", resumed.body);
+
+    let second = wait_for_pause_at(&app, &execution, "sign/1");
+    assert_eq!(
+        second["interrupts"].as_array().map(Vec::len),
+        Some(1),
+        "one question at a time: the first is answered and off the board: {second}"
+    );
+    assert_eq!(
+        second["interrupts"][0]["input"]["question"], "ship it?",
+        "the second traversal asks the node's own `input:` again: {second}"
+    );
+
+    // The first id, sent again now that a *live* pause exists at the same node.
+    // A board keyed on the node rather than on the instance path answers this
+    // `202` and settles the second question with it.
+    let stale = app
+        .post_json(
+            &format!("/executions/{execution}/resume?wait=sign%2F0"),
+            &json!({ "decision": "approve" }),
+        )
+        .expect("the resume route answers");
+    assert_eq!(stale.status, 409, "{:?}", stale.body);
+    assert!(
+        stale.json()["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("`sign/0` has already been answered"),
+        "the refusal names the wait that is settled rather than the one that is \
+         open: {:?}",
+        stale.body
+    );
+
+    // …and the live one is still live, which is the other half of the same
+    // claim: the stale answer consumed nothing.
+    let resumed = app
+        .post_json(
+            &format!("/executions/{execution}/resume?wait=sign%2F1"),
+            &json!({ "decision": "approve" }),
+        )
+        .expect("the resume route answers");
+    assert_eq!(resumed.status, 202, "{:?}", resumed.body);
+    assert_eq!(resumed.json()["wait"], "sign/1", "{:?}", resumed.body);
+
+    let finished = harness::settled(&app, &execution);
+    assert_eq!(finished["status"], "completed", "{finished}");
+    assert_eq!(
+        finished["outputs"]["decisions"],
+        json!(["reject", "approve"]),
+        "the `append` channel holds one answer per pass, in pass order: \
+         {finished}"
+    );
+
+    // Two entries for one node, and the trace numbers them the way the wait ids
+    // do (`docs/trace.md` §3's `traversal` is grammar 9.4's ordinal).
+    let entries: Vec<Value> = finished["trace"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a finished report carries its trace: {finished}"))
+        .iter()
+        .filter(|entry| entry["node"] == "sign")
+        .cloned()
+        .collect();
+    assert_eq!(entries.len(), 2, "one entry per traversal: {finished}");
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry["traversal"].clone())
+            .collect::<Vec<Value>>(),
+        vec![json!(0), json!(1)],
+        "{finished}"
+    );
+    for entry in &entries {
+        assert_eq!(entry["outcome"], "completed", "{entry}");
+        assert_eq!(entry["human"]["settled"], "resumed", "{entry}");
+        assert!(
+            entry["human"]["expiresAt"].is_null(),
+            "this node declares no `timeout:`, so its wait has no deadline: {entry}"
+        );
+        assert_eq!(
+            entry["writes"],
+            json!(["decisions"]),
+            "each answer reaches the run through the node's `writes:`: {entry}"
+        );
+    }
+}
+
 /// `agent-compose run` reports the pause it cannot answer, and exits on a code
 /// of its own (grammar 8.7, PRD 5.11).
 ///
@@ -7040,6 +7280,33 @@ fn wait_for_pauses(app: &Client, execution: &str, count: usize) -> Value {
         assert!(
             std::time::Instant::now() < deadline,
             "execution `{execution}` never held {count} pauses: {last}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Poll until the execution is holding a pause with this **id**.
+///
+/// The counterpart of [`wait_for_pauses`] for a run whose pauses arrive one
+/// after the other rather than together: answering one and waiting for the next
+/// passes through a moment where the board holds none at all, so a count is not
+/// what says the next question is open.
+fn wait_for_pause_at(app: &Client, execution: &str, wait: &str) -> Value {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let last: Value = app
+            .get(&format!("/executions/{execution}"))
+            .expect("the status route answers")
+            .json();
+        if last["interrupts"]
+            .as_array()
+            .is_some_and(|held| held.iter().any(|one| one["wait_id"] == wait))
+        {
+            return last;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "execution `{execution}` never held a pause at `{wait}`: {last}"
         );
         std::thread::sleep(Duration::from_millis(20));
     }
