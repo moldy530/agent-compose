@@ -26,6 +26,12 @@ project a given compiler release builds. This document and those declarations ar
 held together mechanically: `crates/compose-core/tests/trace_format_inventory.rs`
 fails when a field exists in `src/runtime.ts` and is not named here.
 
+**How this document is laid out**, because the check above reads it: each record
+type is named once, as a bare backticked type name, in the section that
+specifies it — and every field of that type has a **row in that section's
+table**. A field explained only in the surrounding prose is an undocumented
+field, and the fix is a row.
+
 ---
 
 ## Table of contents
@@ -156,13 +162,13 @@ retries are attempts at one execution, and `attempts` is where they are recorded
 | `traversal` | integer | always | How many times this node had **already** begun executing in this flow instance — `0` on the first, `1` on the second traversal of a bounded cycle. It is grammar §9.4's traversal ordinal, the same number the instance path is built from. |
 | `outcome` | `"completed"` \| `"skipped"` \| `"failed"` | always | See §3.2. |
 | `attempts` | integer | always | How many attempts the node's `retry:` policy **made**, not how many it allowed (grammar §9.1) — a budget that ran out during the second of three made two. `0` when the node never ran: an input binding that could not be evaluated fails the execution before any attempt (grammar §4.1, §10.1). |
-| `writes` | array of strings | `"completed"`, `"skipped"` | The state channels this node wrote, by name (grammar §10.1). Empty on a skipped node, which writes nothing. Absent on a failed entry, because the superstep a run dies in lands no writes at all. |
+| `writes` | array of strings | `"completed"`, `"skipped"` | The state channels this node wrote, by name (grammar §10.1). Empty on a skipped node, which writes nothing. Absent on a failed entry: a node that failed produced no output to write from, and where the failure ended the run the superstep it died in lands nothing at all (§9). |
 | `routing` | [routing decision](#4-routing-decisions) | `"completed"`, `"skipped"`; conditionally on `"failed"` | What this node's outgoing edges answered. See §4 and §9. |
-| `dispatches` | array of [dispatch records](#5-dispatch-records) | `map` nodes | What a fan-out dispatched, one record per source item in **index** order (grammar §8.6, PRD 5.6). See §5. |
+| `dispatches` | array of [dispatch records](#5-dispatch-records) | `map` nodes that dispatched | What a fan-out dispatched, one record per source item in **index** order (grammar §8.6, PRD 5.6). Absent rather than empty on a map that resolved nothing to report: one whose input binding failed before the plan was built, and one whose own `timeout:` caught every joined instance mid-flight (§5.2). See §5. |
 | `inner` | array of entries | `flow:` nodes | The trace of the subflow instance this node ran (grammar §8.5). See §8. |
 | `stores` | array of [store records](#6-store-records) | when the node performed any | Every store op this node performed, in the order it performed them (PRD 5.8). See §6. |
 | `models` | array of [model calls](#7-model-calls) | when the node made any | Every model call this node execution made (PRD 5.9). See §7. |
-| `error` | string | see §3.2 | What went wrong, as `<error name>: <message>`. |
+| `error` | string | see §3.2 | What went wrong, as `<error name>: <message>`. Written for a person, and it can quote what the other side of an activity answered — §11.1 is what it may and may not hold. |
 | `fallback` | string | when `on_error: { fallback: … }` fired | The node id the failure routed to instead of this node's own edges (grammar §9.2). `"__end__"` for the terminal pseudo-node. |
 
 ### 3.1 Order
@@ -186,9 +192,10 @@ caller's.
   `routing`; it carries no `error`.
 * **`"skipped"`** — the node's activity failed and its `on_error: skip` absorbed
   it (grammar §9.2). It carries `error` naming the failure, an empty `writes`,
-  and a `routing` decided under grammar §7.3 rule 6: a guard that reads the
-  node's own output is `false` **without being evaluated**, while a guard over
-  `input`, `state` or `execution` is evaluated normally.
+  and a `routing` decided under grammar §7.3 unchanged, with the one
+  substitution grammar §9.2 and Decision D97 make: a guard that reads the node's
+  own output is `false` **without being evaluated**, while a guard over `input`,
+  `state` or `execution` is evaluated normally.
 * **`"failed"`** — the node's activity failed and its policy did not absorb it.
   Two shapes, told apart by `fallback`:
   * with `fallback`, the failure routed to the named node (grammar §9.2,
@@ -219,7 +226,7 @@ which edge fired, and the guard values that decided it.
 | field | type | meaning |
 |---|---|---|
 | `edges` | array of [edge decisions](#41-edge-decisions) | What every outgoing edge answered, in **declaration order** (grammar §7.3). |
-| `targets` | array of strings | The nodes scheduled next, in the declaration order of the edges that reached them, deduplicated. `"__end__"` is the terminal pseudo-node. A multicast (grammar §7.3 rule 4) names more than one. |
+| `targets` | array of strings | The nodes scheduled next, in the declaration order of the edges that reached them, deduplicated — the same order `edges` is in, filtered to the taken ones. `"__end__"` is the terminal pseudo-node. A multicast (grammar §7.3 rule 6) names more than one. |
 | `counters` | object, string → integer | The `max_iterations` counters this step **spent**, by key, holding their new value (grammar §7.4). A key appears only when this step spent it; the value is the count after the spend. |
 
 ### 4.1 Edge decisions
@@ -231,7 +238,7 @@ that were **not** taken, which is the half a reader most often needs.
 |---|---|---|---|
 | `to` | string | always | The target node id, or `"__end__"`. |
 | `when` | string | guarded edges | The `when:` guard, as CEL source, verbatim from the composition (grammar §4.1). |
-| `else` | `true` | `else:` edges | Marks the edge as the `else:` catch-all (grammar §7.3 rule 5). Never `false`: an edge that is not the catch-all omits the field. |
+| `else` | `true` | `else:` edges | Marks the edge as the `else:` catch-all (grammar §7.3 rule 4). Never `false`: an edge that is not the catch-all omits the field. |
 | `value` | boolean | guarded edges | What the guard answered. |
 | `budget` | object | see below | The `max_iterations` budget on this edge, and its state at this decision: `key` (the counter this edge spends), `used` (the count **after** this decision), `max` (the declared budget). Present on a budgeted edge whose guard answered `true` — which is when a budget is either spent or found spent. |
 | `taken` | boolean | always | Whether this edge scheduled its target. |
@@ -244,7 +251,7 @@ than describing one:
 |---|---|
 | `"unconditional"` | an edge with no `when:` and no `else:`, which is always taken (grammar §7.3 rule 2) |
 | `"the \`max_iterations\` budget is spent"` | a guarded edge whose guard answered `true` and whose budget was already at `max`, so it was not taken (grammar §7.4) |
-| `"a guarded sibling was taken"` | an `else:` edge suppressed because a guarded sibling of this node was taken (grammar §7.3 rule 5) |
+| `"a guarded sibling was taken"` | an `else:` edge suppressed because a guarded sibling of this node was taken (grammar §7.3 rule 4) |
 
 A guarded edge that was simply not taken carries `value: false` and **no**
 `reason`: the guard value is the whole explanation.
@@ -279,7 +286,7 @@ in ascending `index` — never completion order.
 | field | type | presence | meaning |
 |---|---|---|---|
 | `index` | integer | always | The source-item index, which is what identifies the item and orders every write it made (PRD 5.6, grammar §7.6.4 clause 2). |
-| `route` | string | routed maps | The **route** the item was dispatched through: its variant tag, or `"$default"` for the `default:` catch-all (grammar §8.6 rule 8, Decision D30). Absent on the homogeneous form, which has one target and no tags. The catch-all's sigil is not a name an author could have written, because a union may declare a variant *called* `default` beside a `default:` catch-all. |
+| `route` | string | routed maps | The **route** the item was dispatched through: its variant tag, or `"$default"` for the `default:` catch-all (grammar §8.6 rule 4, Decision D30). Absent on the homogeneous form, which has one target and no tags. The catch-all's sigil is not a name an author could have written, because a union may declare a variant *called* `default` beside a `default:` catch-all. |
 | `variant` | string | routed maps | The **discriminator value the item carried** — the value at the map's `route_by:` field. On a named route it repeats `route`; on the catch-all it is the only record of which variant fell through, since `route` names the catch-all rather than the variant. It is always one of the union's declared variant tags: the item was parsed against its producer's declared schema before any of this ran (PRD 5.2). |
 | `target` | string | always | The component the item was dispatched to, as a typed address. |
 | `outcome` | `"completed"` \| `"skipped"` \| `"failed"` \| `"detached"` | always | See §5.1. |
@@ -314,7 +321,10 @@ in what survives:
   deadline is raced, so the records are those that had **resolved** — every
   detached delivery, and every joined instance that had settled. An instance
   still in flight when the budget ran out has no outcome and so no record; the
-  entry's `error` names the budget that ended it.
+  entry's `error` names the budget that ended it. A deadline that caught *every*
+  instance leaves no records at all, and the entry then carries no `dispatches`
+  key rather than an empty array — an absent key says "nothing resolved", where
+  an empty array would say "nothing was dispatched".
 
 ---
 
@@ -477,8 +487,13 @@ At a given `trace_version`, a reader MAY rely on:
   here;
 * the presence rules stated in each table's *presence* column;
 * the vocabularies of the closed enumerations: `TraceDocument.status`,
-  `TraceEntry.outcome`, `DispatchRecord.outcome`, `StoreRecord.effect`,
-  `StoreRecord.via`, `StoreRecord.scope`, and a refusal's `condition`;
+  `TraceEntry.outcome`, `DispatchRecord.outcome`, `StoreRecord.op`,
+  `StoreRecord.effect`, `StoreRecord.via`, `StoreRecord.scope`, and a refusal's
+  `condition`. `op` is the one whose type in `src/runtime.ts` is `string` rather
+  than the union — the union is the emitted `src/stores.ts`'s `StoreOp`, and a
+  record type declared under the runtime cannot name it without inverting that
+  dependency — so §6's seven are its vocabulary, and the inventory checks them
+  against `StoreOp` itself;
 * the orders §3.1, §4.1 and §5 fix — entries by `(step, node)`, edge decisions in
   declaration order, dispatch records in source-item index order;
 * the nesting structure of §8, and the shape of the keys it describes.
@@ -559,13 +574,43 @@ The version number alone is a promise; two tests make it a checkable one:
 
 ### 11.1 Secrets
 
-**No record type in this document holds a credential.** Grammar §4.3 admits
-`${ENV}` references in exactly the places a secret belongs — a provider's
-`api_key:`, a backend's URL — and nothing in this format is derived from one: no
-field carries a resolved environment value, a request header, or a signed URL.
+**No resolved `${ENV}` value appears in this format.** Grammar §4.3 classifies
+every string surface of a composition, and the two classes that can hold one are
+kept out for different reasons.
 
-`Refusal.detail` is the field to be clear about, because it is the one that
-quotes something from outside the process. What it quotes is what the
-**provider answered** — a status and a response body, truncated — or the socket
-failure that came back instead. It is never the request, so the key the request
-was signed with is not in it.
+**Class 1 — env-ref only.** A provider's `api_key:`, a backend's `url:`, `dsn:`
+or `token:`: the whole value is one `${NAME}` reference, and nothing here is
+derived from one. A trace names a `model.*` and a `store.*` by its typed address
+(grammar §2.2), never by what the provider or backend behind it is configured
+with. No field carries a request header, a connection string or a signed URL.
+
+**Class 2 — interpolable.** An `http:` binding's `url` and `headers` values, and
+the whole `exec:` block — `command`, every `args` entry, `cwd`, and `env` values.
+This class is wider than a reader might guess: `url: "${SIGNED_ENDPOINT}/reports"`
+and `command: "${TOOLBIN}/rg"` are compositions the grammar admits, and a failing
+activity quotes what it was pointed at. It quotes it **as the author wrote it** —
+`` `${SIGNED_ENDPOINT}/reports` answered 404 … `` — rather than as it resolved.
+The emitted runtime's `asWritten` is where that happens, and it buys a second
+property besides: one composition produces one message whatever environment it
+runs in, so an error is reproducible and a trace snapshot is comparable across
+machines. Both message sites are held to it —
+`crates/compose-core/tests/trace_format_inventory.rs` fails when either quotes
+the resolved string, and `crates/agent-compose/tests/trace_format_stability.rs`
+reads the promise off a real run's trace.
+
+What a message *does* quote from outside this process is **what the other side
+answered**, and a reader should treat that text as untrusted:
+
+| field | what it can carry from outside |
+|---|---|
+| `TraceEntry.error` | the failure the node's own activity raised — for an `http:` binding, the rejected response body truncated to 200 characters; for an `exec:` binding, the child's stderr |
+| `TraceDocument.error` | the same text, when that failure is what stopped the run |
+| `Refusal.detail` | what a provider answered: a status and a response body, truncated, or the socket failure that came back instead. Never the request, so the key it was signed with is not in it |
+
+A target that echoes back what it was sent puts that echo in the trace — a 404
+body naming the path it did not route, a command that prints its own arguments
+on stderr. This format records what it was answered; it does not audit it.
+
+One field is the composition's own to fill: `StoreRecord.answer` is what a read
+answered, verbatim (§6). A run that reads a secret out of a store has put it
+there itself, and the trace records the read like any other.

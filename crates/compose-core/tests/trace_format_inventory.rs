@@ -13,8 +13,22 @@
 //!
 //! From the **code toward the document**: every record type reachable from the
 //! trace envelope, every field of one, and every member of the closed
-//! enumerations those fields declare, must be named in `docs/trace.md`. A field
-//! added to `src/runtime.ts` without a row fails here.
+//! enumerations those fields declare, must be named in `docs/trace.md` — and
+//! named *where it belongs*, which is the load-bearing half.
+//!
+//! A field is looked for in a **table row of the section that introduces its
+//! record type**, never anywhere in the file. Searching the whole document is
+//! the obvious implementation and it does not work: `docs/trace.md` backticks
+//! `status`, `map`, `default`, `key` and a dozen other ordinary words for their
+//! own reasons, so a `TraceEntry.status` added to the runtime would find §2's
+//! envelope row and pass — an undocumented field shipping on a versioned public
+//! surface with CI green. Scoping is what closes that, and the section a type is
+//! introduced in is found from the document itself: each record type is named
+//! once, as a bare backticked type name, in the section that specifies it.
+//!
+//! The rule this places on the document is the one it already follows: **every
+//! field gets a row in the table of its own section.** A field explained only in
+//! surrounding prose fails here, and the fix is a row.
 //!
 //! The other direction is deliberately not checked. A specification says more
 //! than the type declarations do — presence rules, orders, what a reader may rely
@@ -310,53 +324,194 @@ fn reachable(source: &str) -> BTreeMap<String, Declaration> {
 /// enumeration member as code, so a match is a mention of the thing rather than
 /// of an English word that happens to be spelled the same (`error`, `key`,
 /// `value`, `step`).
+///
+/// Used unscoped only where the whole document is the right scope — the version
+/// constant, which belongs to no record type. Everything a record type owns goes
+/// through [`row_names`] instead.
 fn names(document: &str, token: &str) -> bool {
     document.contains(&format!("`{token}`"))
 }
 
-/// Whether the document names `member` as a value of a closed enumeration.
+/// One section of the document: a heading, and the lines up to the next heading.
+struct Section {
+    /// The heading line, verbatim, for a failure message a reader can act on.
+    heading: String,
+    /// Every line under it, up to the next heading of any level.
+    body: Vec<String>,
+}
+
+/// The document, split at its headings.
 ///
-/// Stricter than [`names`], and deliberately: a member is a JSON **string**, so
-/// the document writes it with its quotes — `` `"detached"` `` — and requiring
-/// them is what keeps `"node"` from being read as satisfied by the twenty places
-/// the word `node` is backticked as itself.
-fn names_member(document: &str, member: &str) -> bool {
-    document.contains(&format!("`\"{member}\"`"))
+/// Subsections are sections of their own rather than part of their parent: §4
+/// specifies `RoutingDecision` and §4.1 specifies `EdgeDecision`, and a field of
+/// one is not documented by a row in the other's table.
+///
+/// A fenced block is never read for headings: `#` opens a comment in half the
+/// languages a specification quotes, and a heading found inside one would split
+/// a section in the middle.
+fn sections(document: &str) -> Vec<Section> {
+    let mut found: Vec<Section> = Vec::new();
+    let mut fenced = false;
+    for line in document.lines() {
+        if line.trim_start().starts_with("```") {
+            fenced = !fenced;
+        }
+        if !fenced && line.starts_with('#') {
+            found.push(Section {
+                heading: line.to_string(),
+                body: Vec::new(),
+            });
+        } else if let Some(section) = found.last_mut() {
+            section.body.push(line.to_string());
+        }
+    }
+    found
 }
 
-/// Every record type the trace format reaches is specified.
-#[test]
-fn every_trace_record_type_is_documented() {
-    let document = specification();
-    let missing: Vec<String> = reachable(&runtime())
-        .into_keys()
-        .filter(|name| !names(&document, name))
-        .collect();
-    assert!(
-        missing.is_empty(),
-        "these trace record types are declared by `src/runtime.ts` and named nowhere \
-         in `docs/trace.md`: {missing:?}"
-    );
+/// Where a record type is specified: the section whose body names it as a bare
+/// backticked type name.
+fn introduces<'a>(sections: &'a [Section], name: &str) -> Vec<&'a Section> {
+    sections
+        .iter()
+        .filter(|section| {
+            section
+                .body
+                .iter()
+                .any(|line| line.contains(&format!("`{name}`")))
+        })
+        .collect()
 }
 
-/// Every field of every one of them is specified.
-#[test]
-fn every_trace_record_field_is_documented() {
-    let document = specification();
+/// Whether a **table row** of this section names `token`.
+///
+/// A row rather than the section's prose, because the prose of a section is
+/// where a field is *discussed* and the table is where it is *specified* — and a
+/// discussion is exactly what leaves a reader unable to tell presence from
+/// meaning. The pipe is the test: `docs/trace.md` writes every record type's
+/// fields as one table.
+fn row_names(section: &Section, token: &str) -> bool {
+    section
+        .body
+        .iter()
+        .any(|line| line.trim_start().starts_with('|') && line.contains(&format!("`{token}`")))
+}
+
+/// The same, for a member of a closed enumeration.
+///
+/// Stricter than [`row_names`], and deliberately: a member is a JSON **string**,
+/// so the document writes it with its quotes — `` `"detached"` `` — and
+/// requiring them is what keeps `"node"` from being read as satisfied by the
+/// places the word `node` is backticked as itself.
+fn row_names_member(section: &Section, member: &str) -> bool {
+    row_names(section, &format!("\"{member}\""))
+}
+
+/// Every record type of `declarations` the document does not introduce exactly
+/// once, as `<name>: <what is wrong>`.
+///
+/// Exactly once rather than at least once: the section a type is introduced in
+/// is what scopes every other assertion here, so a type named as a bare
+/// backticked name in two places leaves the scope ambiguous, and a document that
+/// has drifted into specifying one record in two places is worth failing over.
+fn unintroduced(document: &str, declarations: &BTreeMap<String, Declaration>) -> Vec<String> {
+    let sections = sections(document);
     let mut missing: Vec<String> = Vec::new();
-    for (name, declaration) in reachable(&runtime()) {
+    for name in declarations.keys() {
+        match introduces(&sections, name).as_slice() {
+            [_] => {}
+            [] => missing.push(format!("`{name}`: no section names it")),
+            found => missing.push(format!(
+                "`{name}`: {} sections name it ({}), so which one specifies it is \
+                 ambiguous",
+                found.len(),
+                found
+                    .iter()
+                    .map(|section| section.heading.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        }
+    }
+    missing
+}
+
+/// Every `<type>.<field>` the document does not give a row of that type's own
+/// section.
+fn undocumented_fields(
+    document: &str,
+    declarations: &BTreeMap<String, Declaration>,
+) -> Vec<String> {
+    let sections = sections(document);
+    let mut missing: Vec<String> = Vec::new();
+    for (name, declaration) in declarations {
+        let held = introduces(&sections, name);
+        let [home] = held.as_slice() else {
+            // Reported by `every_trace_record_type_is_documented`; with no
+            // section to scope to, none of its fields can be documented either.
+            missing.extend(declaration.fields.iter().map(|field| {
+                format!("{name}.{field} (no single section of the document introduces `{name}`)")
+            }));
+            continue;
+        };
         for field in &declaration.fields {
-            if !names(&document, field) {
-                missing.push(format!("{name}.{field}"));
+            if !row_names(home, field) {
+                missing.push(format!("{name}.{field} (looked for in {})", home.heading));
             }
         }
     }
     missing.sort();
+    missing
+}
+
+/// The same for the members of the closed enumerations those fields declare.
+fn undocumented_members(
+    document: &str,
+    declarations: &BTreeMap<String, Declaration>,
+) -> Vec<String> {
+    let sections = sections(document);
+    let mut missing: Vec<String> = Vec::new();
+    for (name, declaration) in declarations {
+        let held = introduces(&sections, name);
+        let [home] = held.as_slice() else {
+            missing.extend(declaration.literals.iter().map(|literal| {
+                format!("{name}: \"{literal}\" (no single section introduces `{name}`)")
+            }));
+            continue;
+        };
+        for literal in &declaration.literals {
+            if !row_names_member(home, literal) {
+                missing.push(format!(
+                    "{name}: \"{literal}\" (looked for in {})",
+                    home.heading
+                ));
+            }
+        }
+    }
+    missing.sort();
+    missing
+}
+
+/// Every record type the trace format reaches is specified, in one place.
+#[test]
+fn every_trace_record_type_is_documented() {
+    let missing = unintroduced(&specification(), &reachable(&runtime()));
     assert!(
         missing.is_empty(),
-        "these trace fields are recorded by `src/runtime.ts` and named nowhere in \
-         `docs/trace.md`, so a reader pinning `trace_version` has not been told about \
-         them: {missing:?}"
+        "`docs/trace.md` introduces a record type by naming it as a bare backticked \
+         type name in the section that specifies it, and these declarations of \
+         `src/runtime.ts` have no such section: {missing:?}"
+    );
+}
+
+/// Every field of every one of them is specified, in that type's own section.
+#[test]
+fn every_trace_record_field_is_documented() {
+    let missing = undocumented_fields(&specification(), &reachable(&runtime()));
+    assert!(
+        missing.is_empty(),
+        "these trace fields are recorded by `src/runtime.ts` and have no row in the \
+         `docs/trace.md` section that specifies their record type, so a reader \
+         pinning `trace_version` has not been told about them: {missing:?}"
     );
 }
 
@@ -368,20 +523,104 @@ fn every_trace_record_field_is_documented() {
 /// down would be a bump nobody knew to make.
 #[test]
 fn every_enumeration_member_is_documented() {
-    let document = specification();
-    let mut missing: Vec<String> = Vec::new();
-    for (name, declaration) in reachable(&runtime()) {
-        for literal in &declaration.literals {
-            if !names_member(&document, literal) {
-                missing.push(format!("{name}: \"{literal}\""));
-            }
-        }
-    }
-    missing.sort();
+    let missing = undocumented_members(&specification(), &reachable(&runtime()));
     assert!(
         missing.is_empty(),
-        "these enumeration members are emitted by `src/runtime.ts` and named nowhere \
-         in `docs/trace.md`: {missing:?}"
+        "these enumeration members are emitted by `src/runtime.ts` and have no row in \
+         the `docs/trace.md` section that specifies their record type: {missing:?}"
+    );
+}
+
+/// A field is looked for where its record type is specified, not anywhere in the
+/// file.
+///
+/// This is the assertion the three above are only as strong as. A whole-document
+/// search passes on a field whose name happens to be backticked somewhere else —
+/// and `docs/trace.md` backticks `status`, `map` and `key` for reasons of its
+/// own — so the scoping is pinned here rather than trusted.
+#[test]
+fn a_field_named_only_outside_its_types_section_is_undocumented() {
+    let declared = declarations(
+        r#"
+export interface TraceDocument {
+  readonly status: "completed";
+  readonly entries: readonly TraceEntry[];
+}
+
+export interface TraceEntry {
+  readonly outcome: "completed";
+}
+"#,
+    );
+    let document = "\
+## 2. The envelope
+
+`TraceDocument`, in the emitted `src/runtime.ts`.
+
+| field | meaning |
+|---|---|
+| `status` | whether the run produced an answer, `\"completed\"` or not |
+| `entries` | every entry the run recorded |
+
+## 3. Entries
+
+`TraceEntry`.
+
+| field | meaning |
+|---|---|
+| `outcome` | `\"completed\"`, and the rest |
+";
+
+    assert!(
+        undocumented_fields(document, &declared).is_empty(),
+        "each field has a row in its own type's section"
+    );
+
+    // The same document, with `TraceEntry`'s row removed. `status` and
+    // `entries` are still backticked in §2 — a whole-file search would find
+    // them — and `outcome` is not backticked at all.
+    let thinned = document.replace("| `outcome` | `\"completed\"`, and the rest |\n", "");
+    let missing = undocumented_fields(&thinned, &declared);
+    assert_eq!(
+        missing,
+        ["TraceEntry.outcome (looked for in ## 3. Entries)"],
+        "a field with no row in its own section is missing, whatever the rest of the \
+         file backticks"
+    );
+    assert_eq!(
+        undocumented_members(&thinned, &declared),
+        ["TraceEntry: \"completed\" (looked for in ## 3. Entries)"],
+        "…and so is its vocabulary, though `\"completed\"` is a row in §2"
+    );
+}
+
+/// A record type named in two sections is ambiguous rather than doubly
+/// documented.
+#[test]
+fn a_record_type_two_sections_introduce_has_no_home() {
+    let declared = declarations(
+        r#"
+export interface TraceEntry {
+  readonly outcome: "completed";
+}
+"#,
+    );
+    let missing = unintroduced(
+        "\
+## 3. Entries
+
+`TraceEntry`.
+
+## 9. Failed runs
+
+`TraceEntry`, once a run has stopped.
+",
+        &declared,
+    );
+    assert_eq!(missing.len(), 1, "{missing:?}");
+    assert!(
+        missing[0].contains("2 sections name it"),
+        "the failure says what is ambiguous: {missing:?}"
     );
 }
 
@@ -473,6 +712,92 @@ fn every_delivery_surface_emits_the_version() {
             emitted, sites,
             "`src/{module}` writes `trace_version` at {emitted} site(s); `docs/trace.md` \
              §1 promises {sites} — {what}"
+        );
+    }
+}
+
+/// `StoreRecord.op`'s vocabulary is documented too, though its union lives in
+/// another module.
+///
+/// The field is typed `string` in `src/runtime.ts` because the union it draws on
+/// — `src/stores.ts`'s `StoreOp` — is declared *above* the runtime in the module
+/// graph (`stores.ts` imports `StoreRecord`, not the other way round), so naming
+/// it there would invert that dependency. The consequence is that
+/// [`every_enumeration_member_is_documented`] cannot see the vocabulary at all,
+/// and `docs/trace.md` §10.1 counts `op` among the closed enumerations a reader
+/// may rely on: an op added to the catalog is a version bump, and a bump nobody
+/// knew to make is exactly what this file exists to prevent. So the union is
+/// read from where it is.
+#[test]
+fn every_store_op_is_documented() {
+    let stores =
+        fs::read_to_string(repository().join("crates/compose-core/src/codegen/js/stores.ts"))
+            .expect("the emitted store module is readable");
+    let union = stores
+        .lines()
+        .find_map(|line| line.strip_prefix("export type StoreOp = "))
+        .expect("`src/stores.ts` declares `StoreOp`");
+    let ops = strings(union);
+    assert!(
+        ops.len() >= 7,
+        "grammar 11.4's catalog is seven ops; `StoreOp` read as {ops:?}"
+    );
+
+    let document = specification();
+    let sections = sections(&document);
+    let held = introduces(&sections, "StoreRecord");
+    let [home] = held.as_slice() else {
+        panic!("`docs/trace.md` introduces `StoreRecord` in exactly one section");
+    };
+    let missing: Vec<&String> = ops.iter().filter(|op| !row_names(home, op)).collect();
+    assert!(
+        missing.is_empty(),
+        "these store ops are in `src/stores.ts`'s `StoreOp` and in no row of {} — \
+         `docs/trace.md` §10.1 makes the vocabulary something a reader may rely on, \
+         so an op it does not name is an undocumented member of a closed \
+         enumeration: {missing:?}",
+        home.heading
+    );
+}
+
+/// An activity that failed names the `${ENV}` reference its author wrote, never
+/// the value it resolved to.
+///
+/// `docs/trace.md` §11.1 is a promise about a **public** surface: no resolved
+/// environment value appears in the format. Two messages are where one could —
+/// grammar 4.3 class 2 makes an `http:` binding's `url` and an `exec:` binding's
+/// `command` interpolable, and both are quoted when the activity is refused — so
+/// both quote [`asWritten`] rather than the resolved string beside them.
+/// `crates/agent-compose/tests/trace_format_stability.rs` runs the `exec:` half
+/// against a real graph; this is the half that holds at both sites whether a
+/// fixture reaches them or not.
+#[test]
+fn an_activity_failure_quotes_the_reference_rather_than_the_resolved_value() {
+    let source = runtime();
+    // The needles are template-literal source, where the message's own backticks
+    // are escaped — which is also what keeps them from matching anything else.
+    for (site, written, resolved) in [
+        (
+            "runHttp",
+            r"\`${asWritten(binding.url)}\` answered ",
+            r"\`${url}\` answered ",
+        ),
+        (
+            "runExec",
+            r"\`${asWritten(binding.command)}\` exited ",
+            r"\`${command}\` exited ",
+        ),
+    ] {
+        assert!(
+            source.contains(written),
+            "`{site}` reports a refused activity as `{written}…`, which is what keeps \
+             a resolved `${{ENV}}` value out of `TraceEntry.error` (`docs/trace.md` §11.1)"
+        );
+        assert!(
+            !source.contains(resolved),
+            "`{site}` quotes the **resolved** value in `{resolved}…`; that value reaches \
+             `TraceEntry.error` and the trace file, which `docs/trace.md` §11.1 says it \
+             does not"
         );
     }
 }
