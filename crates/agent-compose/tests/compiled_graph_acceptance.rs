@@ -2286,112 +2286,57 @@ fn a_flow_attached_as_a_tool_runs_one_instance_per_call_under_its_own_frame() {
     assert_eq!(piped.outputs()["line"], "it says one line");
 }
 
-/// Arguments a flow-as-tool call's `inputs:` refuses fail the **agent node**,
-/// exactly as a `tool.*`'s and a store tool's do.
+/// Arguments a flow-as-tool call's `inputs:` refuses come back to the **model**
+/// as an error tool result, and the loop turns again (Decision D119, PRD §9.22).
 ///
 /// The three tool surfaces an agent can reach are one surface as far as an
 /// argument contract goes (grammar 5.4, 6, 11.5): the schema the model was
 /// constrained by is the schema its arguments are parsed with (PRD §9.16), and a
-/// mismatch leaves the tool, so grammar 9's chain decides the run. Answering it
-/// back to the model as a tool result instead would make "attached as a tool"
-/// mean one thing for a `flow.*` and another for everything else, and would put
-/// the decision about a refused contract in the hands of the component PRD 5.3
-/// takes decisions away from.
+/// call the schema refuses is a call the model can make differently — so it is
+/// handed the refusal rather than the node being ended over it. Answering it any
+/// other way on one of the three would make "attached as a tool" mean one thing
+/// for a `flow.*` and another for everything else.
 ///
-/// Nothing is instantiated, and that is the half worth a test of its own: the
-/// entry carries no dispatch record, because there was no instance to record.
+/// Three halves are worth pinning here, and none of them is the happy path:
+///
+///  * **nothing was instantiated** — the entry's one dispatch record is the
+///    *corrected* call's, because the refused one never reached a `runSubflow`;
+///  * **the refused call spent its ordinal** — the instance that did run is
+///    `condense/1`, not `condense/0`. The model made two calls to this tool and
+///    grammar 9.4's frame counts calls, so a runtime that only counted the ones
+///    that instantiated would move every key behind a refusal;
+///  * **the wire carries it as a refusal** — an `is_error` `tool_result` block,
+///    which is the Messages API's own shape for one and which
+///    `crates/mock-provider` is strict about.
 #[test]
-fn arguments_a_flow_tools_inputs_refuses_fail_the_agent_node() {
+fn arguments_a_flow_tools_inputs_refuses_come_back_to_the_model_as_a_tool_error() {
     let provider = MockProvider::start().expect("a loopback port");
-    provider.enqueue(Script::new(
-        SONNET,
+    provider.enqueue_all([
         // `passage` declares `min_length: 1`, which reaches the model as
         // `minLength` and is what this answer does not satisfy.
-        Outcome::tool_calls(vec![ToolCall::new("condense", json!({ "passage": "" }))]),
-    ));
-
-    let Some(run) = harness::invoke(
-        "flow-as-tool",
-        "flow.ask",
-        &[("question", "what does it say?")],
-        &provider,
-    ) else {
-        return;
-    };
-    let failure = run.failed();
-    assert!(
-        failure.contains("the arguments `condense` was called with"),
-        "the failure names the tool whose contract the arguments failed: {failure}"
-    );
-
-    let entries = run.entries("ask");
-    let [entry] = entries.as_slice() else {
-        panic!("`ask` ran once: {entries:?}");
-    };
-    assert_eq!(entry["outcome"], "failed", "{entry}");
-    assert!(
-        entry["toolDispatches"].is_null(),
-        "nothing was instantiated, so there is no dispatch to report: {entry}"
-    );
-    let asked = entry["models"][0]["toolCalls"]
-        .as_array()
-        .unwrap_or_else(|| panic!("the call that asked for the tool records it: {entry}"));
-    assert_eq!(asked.len(), 1, "{entry}");
-    assert_eq!(asked[0]["outcome"], "failed", "{entry}");
-    assert!(
-        asked[0]["instance"].is_null(),
-        "…and links to no instance, because the call started none: {entry}"
-    );
-    assert!(
-        asked[0]["error"]
-            .as_str()
-            .is_some_and(|text| text.contains("the arguments `condense` was called with")),
-        "{entry}"
-    );
-}
-
-/// A model that names a tool the agent does not offer ends the node, and the
-/// call is **recorded** before it does — with no `target`.
-///
-/// `docs/trace.md` §7.3 makes that absence a presence rule rather than a
-/// convenience: `target` is on a tool-call record "when the agent offers a tool
-/// of that name", and "absent on the one call that has none: a name the agent
-/// does not offer". So this is the only call in the format whose record carries
-/// no `target`, and a runtime that filed one anyway — an empty string, the name
-/// echoed back, the record skipped entirely — would break the rule in a
-/// direction §10.1 says a reader may rely on. Recording it at all is the other
-/// half: the loop stops here, so without a record the trace of the failed run
-/// would say what the node was asked and never say what the model asked *for*.
-///
-/// `Outcome::raw` is what scripts it, because `crates/mock-provider` refuses to
-/// render a scripted call to a tool the request did not offer (it is a codegen
-/// bug in every other test) — and this is exactly the "a response generated code
-/// must reject" case its refusal points at.
-#[test]
-fn a_call_to_a_tool_the_agent_does_not_offer_is_recorded_with_no_target_and_ends_the_node() {
-    let provider = MockProvider::start().expect("a loopback port");
-    provider.enqueue(Script::new(
-        SONNET,
-        Outcome::raw(
-            200,
-            json!({
-                "id": "msg_unoffered",
-                "type": "message",
-                "role": "assistant",
-                "model": SONNET,
-                "content": [{
-                    "type": "tool_use",
-                    "id": "toolu_summarise",
-                    // `agent.answerer` offers `condense` and nothing else.
-                    "name": "summarise",
-                    "input": { "passage": "a long passage" },
-                }],
-                "stop_reason": "tool_use",
-                "stop_sequence": null,
-                "usage": { "input_tokens": 12, "output_tokens": 34 },
-            }),
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new("condense", json!({ "passage": "" }))]),
         ),
-    ));
+        // …and this is the model doing the thing a refusal exists for.
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "condense",
+                json!({ "passage": "a long passage" }),
+            )]),
+        ),
+        // The instance the corrected call started.
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "line": "the only line" })),
+        ),
+        Script::new(SONNET, Outcome::text("I have the line.")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "answer": "it says one line" })),
+        ),
+    ]);
 
     let Some(run) = harness::invoke(
         "flow-as-tool",
@@ -2401,39 +2346,219 @@ fn a_call_to_a_tool_the_agent_does_not_offer_is_recorded_with_no_target_and_ends
     ) else {
         return;
     };
-    let failure = run.failed();
-    assert!(
-        failure.contains("was answered with a call to `summarise`")
-            && failure.contains("not one of its tools"),
-        "the failure names the tool the model invented: {failure}"
-    );
+    run.succeeded();
     assert_eq!(
-        provider.requests().len(),
-        1,
-        "…and the loop stopped there: no tool ran, and no second request was sent"
+        run.outputs()["answer"],
+        "it says one line",
+        "the node completed: a refusal is a turn of the loop, not the end of it"
+    );
+
+    let recorded = provider.requests();
+    assert_eq!(
+        recorded.len(),
+        5,
+        "the refused call, the corrected one, the instance's own call, the turn \
+         that ended the loop, and the pinned one"
+    );
+    for call in &recorded {
+        assert!(call.is_valid(), "{:?}", call.failures());
+    }
+
+    // The wire shape, on the surface this fixture speaks: the block answers the
+    // `tool_use` id it was asked under — an unanswered one is a request the API
+    // refuses — and says it is an error rather than a result.
+    let answering = recorded[1].body()["messages"][2].clone();
+    assert_eq!(answering["role"], "user", "{answering}");
+    let block = &answering["content"][0];
+    assert_eq!(block["type"], "tool_result", "{answering}");
+    assert_eq!(
+        block["is_error"],
+        json!(true),
+        "the Messages API's own flag for a tool result that is a refusal: {answering}"
+    );
+    assert!(
+        block["content"].as_str().is_some_and(|text| text
+            .contains("the arguments `condense` was called with")
+            && text.contains("passage")),
+        "…and the model is told which field of which tool refused it: {answering}"
     );
 
     let entries = run.entries("ask");
     let [entry] = entries.as_slice() else {
         panic!("`ask` ran once: {entries:?}");
     };
-    assert_eq!(entry["outcome"], "failed", "{entry}");
-    assert!(
-        entry["toolDispatches"].is_null(),
-        "nothing was instantiated, so there is no dispatch to report: {entry}"
-    );
+    assert_eq!(entry["outcome"], "completed", "{entry}");
 
     let models = entry["models"]
         .as_array()
-        .unwrap_or_else(|| panic!("the call that asked for it is on the entry: {entry}"));
-    let [call] = models.as_slice() else {
-        panic!("one model call, and it ended the node: {entry}");
-    };
-    let asked = call["toolCalls"]
+        .unwrap_or_else(|| panic!("the agent node reports its own calls: {entry}"));
+    assert_eq!(
+        models.len(),
+        4,
+        "the loop's three calls and the pinned one; the instance's call is on \
+         the instance's own entry: {entry}"
+    );
+
+    let asked = models[0]["toolCalls"]
         .as_array()
-        .unwrap_or_else(|| panic!("…and it records what it asked for: {call}"));
+        .unwrap_or_else(|| panic!("the call that asked for the tool records it: {entry}"));
+    let [refused] = asked.as_slice() else {
+        panic!("one tool call: {entry}");
+    };
+    assert_eq!(refused["name"], "condense", "{refused}");
+    assert_eq!(
+        refused["target"], "flow.condense",
+        "the tool exists — it is the arguments that did not fit: {refused}"
+    );
+    assert_eq!(
+        refused["outcome"], "refused",
+        "`docs/trace.md` §7.3's third outcome: the model was handed the refusal \
+         and the node carried on: {refused}"
+    );
+    assert!(
+        refused["instance"].is_null(),
+        "…and links to no instance, because the call started none: {refused}"
+    );
+    assert!(
+        refused["result"].is_null(),
+        "…and carries no result, because there was nothing to answer with: {refused}"
+    );
+    assert!(
+        refused["error"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("ToolCallRefused: ")
+                && text.contains("the arguments `condense` was called with")),
+        "…and its `error` is the very text the model saw, in §3's shape: {refused}"
+    );
+
+    let corrected = &models[1]["toolCalls"][0];
+    assert_eq!(corrected["outcome"], "completed", "{entry}");
+    assert_eq!(
+        corrected["result"],
+        json!({ "line": "the only line" }),
+        "the corrected call is an ordinary one: {entry}"
+    );
+
+    let dispatched = entry["toolDispatches"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the corrected call instantiated: {entry}"));
+    let [record] = dispatched.as_slice() else {
+        panic!("one instance, because only one call reached the flow: {entry}");
+    };
+    assert_eq!(
+        record["idempotencyKey"], corrected["instance"],
+        "the link is the dispatch record's own key: {entry}"
+    );
+    assert!(
+        record["idempotencyKey"]
+            .as_str()
+            .is_some_and(|key| key.ends_with("/ask/0/condense/1")),
+        "a refused call **spends** its ordinal: grammar 9.4 counts the calls the \
+         model made, and this is the second one: {record}"
+    );
+}
+
+/// A model that names a tool the agent does not offer is told which tools it
+/// has, and calls one (Decision D119).
+///
+/// The other refusal, and the one with no component behind it: `docs/trace.md`
+/// §7.3 makes `target`'s absence a presence rule rather than a convenience — it
+/// is on a tool-call record "when the agent offers a tool of that name", so this
+/// is the only call in the format whose record carries none, and a runtime that
+/// filed one anyway (an empty string, the name echoed back, the record skipped)
+/// would break a rule §10.1 says a reader may rely on.
+///
+/// What changed under D119 is what happens next: the loop used to end the node
+/// here, and a name is exactly the thing a model can get right on a second try —
+/// so the refusal names the tools that *are* on the wire and the loop turns
+/// again. `Outcome::raw` is what scripts it, because `crates/mock-provider`
+/// refuses to render a scripted call to a tool the request did not offer (it is
+/// a codegen bug in every other test) — and this is the "a response generated
+/// code must reject" case its refusal points at.
+#[test]
+fn a_call_to_a_tool_the_agent_does_not_offer_comes_back_with_the_names_it_has() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::raw(
+                200,
+                json!({
+                    "id": "msg_unoffered",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": SONNET,
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_summarise",
+                        // `agent.answerer` offers `condense` and nothing else.
+                        "name": "summarise",
+                        "input": { "passage": "a long passage" },
+                    }],
+                    "stop_reason": "tool_use",
+                    "stop_sequence": null,
+                    "usage": { "input_tokens": 12, "output_tokens": 34 },
+                }),
+            ),
+        ),
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "condense",
+                json!({ "passage": "a long passage" }),
+            )]),
+        ),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "line": "the only line" })),
+        ),
+        Script::new(SONNET, Outcome::text("I have the line.")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "answer": "it says one line" })),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke(
+        "flow-as-tool",
+        "flow.ask",
+        &[("question", "what does it say?")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(run.outputs()["answer"], "it says one line");
+
+    let recorded = provider.requests();
+    assert_eq!(recorded.len(), 5, "the loop went on rather than stopping");
+    for call in &recorded {
+        assert!(call.is_valid(), "{:?}", call.failures());
+    }
+    // The turn that answers a `tool_use` the request's own `tools` never
+    // declared: legal history on both surfaces, because it is the model's own
+    // content replayed (`WIRE-NOTES` (18)).
+    let block = recorded[1].body()["messages"][2]["content"][0].clone();
+    assert_eq!(block["tool_use_id"], "toolu_summarise", "{block}");
+    assert_eq!(block["is_error"], json!(true), "{block}");
+    assert!(
+        block["content"].as_str().is_some_and(
+            |text| text.contains("not one of its tools") && text.contains("`condense`")
+        ),
+        "the model is told what it may call instead (PRD G3): {block}"
+    );
+
+    let entries = run.entries("ask");
+    let [entry] = entries.as_slice() else {
+        panic!("`ask` ran once: {entries:?}");
+    };
+    assert_eq!(entry["outcome"], "completed", "{entry}");
+
+    let asked = entry["models"][0]["toolCalls"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the call that asked for it records it: {entry}"));
     let [record] = asked.as_slice() else {
-        panic!("one tool call: {call}");
+        panic!("one tool call: {entry}");
     };
     assert_eq!(
         record["name"], "summarise",
@@ -2444,11 +2569,11 @@ fn a_call_to_a_tool_the_agent_does_not_offer_is_recorded_with_no_target_and_ends
         "…and carries no `target`, because there is no component behind it \
          (`docs/trace.md` §7.3): {record}"
     );
-    assert_eq!(record["outcome"], "failed", "{record}");
+    assert_eq!(record["outcome"], "refused", "{record}");
     assert!(
         record["error"]
             .as_str()
-            .is_some_and(|text| text.starts_with("Error: ")
+            .is_some_and(|text| text.starts_with("ToolCallRefused: ")
                 && text.contains("was answered with a call to `summarise`")),
         "…and its `error` is in §3's `<error name>: <message>` shape: {record}"
     );
@@ -8688,7 +8813,7 @@ fn a_terminal_asks_one_question_per_pause_and_a_refused_answer_asks_again() {
         "{record}"
     );
     assert_eq!(
-        record["trace_version"], 3,
+        record["trace_version"], 4,
         "the JSON document a run prints is unchanged in shape by having asked: {record}"
     );
     assert!(

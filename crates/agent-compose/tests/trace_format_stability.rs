@@ -1200,7 +1200,7 @@ fn the_status_route_carries_the_version_beside_its_trace() {
     );
     assert_eq!(
         finished["trace_version"],
-        json!(3),
+        json!(4),
         "…and the version that describes them, beside them (`docs/trace.md` §1): \
          {finished}"
     );

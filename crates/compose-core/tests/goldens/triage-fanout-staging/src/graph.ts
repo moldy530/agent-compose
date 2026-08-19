@@ -274,10 +274,10 @@ const storeTriageMemory: stores.StoreBinding = {
 };
 
 /**
- * `tool.dead_letter` — an HTTP request (grammar 6.1). Its arguments are parsed with its own declared `input:` before the implementation sees them, which is the checked signature grammar 8.4 asks for and the model's arguments are held to.
+ * `tool.dead_letter` — an HTTP request (grammar 6.1). Its arguments are parsed with its own declared `input:` before the implementation sees them, which is the checked signature grammar 8.4 asks for and the model's arguments are held to. The parse is `runtime.parseToolArguments`, so arguments the schema refuses are a `ToolCallRefused`: at a `tools:` attachment the agent's loop hands that back to the model (Decision D119), and at a `function:` node — where grammar 8.4 has already checked the binding field-by-field and no model chose anything — nothing catches it and the node fails, as it always has. The tool's **result** is parsed with `runtime.parseResult` on both surfaces: a tool answering off-contract is not a call anybody can rephrase.
  */
 async function toolDeadLetter(args: unknown, context: runtime.RunContext): Promise<unknown> {
-  const input = runtime.parseResult(toolDeadLetterInput, args, "the arguments `tool.dead_letter` was called with");
+  const input = runtime.parseToolArguments(toolDeadLetterInput, args, "the arguments `tool.dead_letter` was called with");
   const roots = { input: runtime.bind(input, {
     "properties": {
       "kind": "string",
@@ -305,10 +305,10 @@ async function toolDeadLetter(args: unknown, context: runtime.RunContext): Promi
 }
 
 /**
- * `tool.repo_grep` — a subprocess (grammar 6.1). Its arguments are parsed with its own declared `input:` before the implementation sees them, which is the checked signature grammar 8.4 asks for and the model's arguments are held to.
+ * `tool.repo_grep` — a subprocess (grammar 6.1). Its arguments are parsed with its own declared `input:` before the implementation sees them, which is the checked signature grammar 8.4 asks for and the model's arguments are held to. The parse is `runtime.parseToolArguments`, so arguments the schema refuses are a `ToolCallRefused`: at a `tools:` attachment the agent's loop hands that back to the model (Decision D119), and at a `function:` node — where grammar 8.4 has already checked the binding field-by-field and no model chose anything — nothing catches it and the node fails, as it always has. The tool's **result** is parsed with `runtime.parseResult` on both surfaces: a tool answering off-contract is not a call anybody can rephrase.
  */
 async function toolRepoGrep(args: unknown, context: runtime.RunContext): Promise<unknown> {
-  const input = runtime.parseResult(toolRepoGrepInput, args, "the arguments `tool.repo_grep` was called with");
+  const input = runtime.parseToolArguments(toolRepoGrepInput, args, "the arguments `tool.repo_grep` was called with");
   return runtime.parseResult(
     toolRepoGrepOutput,
     await runtime.runExec({
@@ -329,10 +329,10 @@ async function toolRepoGrep(args: unknown, context: runtime.RunContext): Promise
 }
 
 /**
- * `tool.review_queue` — an HTTP request (grammar 6.1). Its arguments are parsed with its own declared `input:` before the implementation sees them, which is the checked signature grammar 8.4 asks for and the model's arguments are held to.
+ * `tool.review_queue` — an HTTP request (grammar 6.1). Its arguments are parsed with its own declared `input:` before the implementation sees them, which is the checked signature grammar 8.4 asks for and the model's arguments are held to. The parse is `runtime.parseToolArguments`, so arguments the schema refuses are a `ToolCallRefused`: at a `tools:` attachment the agent's loop hands that back to the model (Decision D119), and at a `function:` node — where grammar 8.4 has already checked the binding field-by-field and no model chose anything — nothing catches it and the node fails, as it always has. The tool's **result** is parsed with `runtime.parseResult` on both surfaces: a tool answering off-contract is not a call anybody can rephrase.
  */
 async function toolReviewQueue(args: unknown, context: runtime.RunContext): Promise<unknown> {
-  const input = runtime.parseResult(toolReviewQueueInput, args, "the arguments `tool.review_queue` was called with");
+  const input = runtime.parseToolArguments(toolReviewQueueInput, args, "the arguments `tool.review_queue` was called with");
   const roots = { input: runtime.bind(input, {
     "properties": {
       "severity": "string",
@@ -553,7 +553,7 @@ const agentTriage: runtime.AgentBinding = {
         stores.runStoreTool(
           storeDocs,
           "search",
-          runtime.parseResult(storeDocsToolSearchInput, args, "the arguments `docs_search` was called with") as Record<string, unknown>,
+          runtime.parseToolArguments(storeDocsToolSearchInput, args, "the arguments `docs_search` was called with") as Record<string, unknown>,
           context,
         ),
     },

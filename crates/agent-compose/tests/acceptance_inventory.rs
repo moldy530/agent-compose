@@ -421,12 +421,15 @@ const CODEGEN: &[Criterion] = &[
             // instance ran, its arguments never fit, it failed inside, and the
             // name the model used was never on the wire — the last being the
             // one call whose record carries no `target` (`docs/trace.md` §7.3).
+            // Two of the four are **refusals** and go back to the model
+            // (Decision D119); the one between them is the tool's execution
+            // failing, which still ends the node — that split is the point.
             (
                 "a_flow_attached_as_a_tool_runs_one_instance_per_call_under_its_own_frame",
                 Status::Live,
             ),
             (
-                "arguments_a_flow_tools_inputs_refuses_fail_the_agent_node",
+                "arguments_a_flow_tools_inputs_refuses_come_back_to_the_model_as_a_tool_error",
                 Status::Live,
             ),
             (
@@ -434,7 +437,7 @@ const CODEGEN: &[Criterion] = &[
                 Status::Live,
             ),
             (
-                "a_call_to_a_tool_the_agent_does_not_offer_is_recorded_with_no_target_and_ends_the_node",
+                "a_call_to_a_tool_the_agent_does_not_offer_comes_back_with_the_names_it_has",
                 Status::Live,
             ),
             // …and four more over the *frame* a call derives (grammar 9.4, PRD

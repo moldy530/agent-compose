@@ -108,10 +108,10 @@ const modelDefault: runtime.ModelRoute = {
 };
 
 /**
- * `tool.web_search` — an HTTP request (grammar 6.1). Its arguments are parsed with its own declared `input:` before the implementation sees them, which is the checked signature grammar 8.4 asks for and the model's arguments are held to.
+ * `tool.web_search` — an HTTP request (grammar 6.1). Its arguments are parsed with its own declared `input:` before the implementation sees them, which is the checked signature grammar 8.4 asks for and the model's arguments are held to. The parse is `runtime.parseToolArguments`, so arguments the schema refuses are a `ToolCallRefused`: at a `tools:` attachment the agent's loop hands that back to the model (Decision D119), and at a `function:` node — where grammar 8.4 has already checked the binding field-by-field and no model chose anything — nothing catches it and the node fails, as it always has. The tool's **result** is parsed with `runtime.parseResult` on both surfaces: a tool answering off-contract is not a call anybody can rephrase.
  */
 async function toolWebSearch(args: unknown, context: runtime.RunContext): Promise<unknown> {
-  const input = runtime.parseResult(toolWebSearchInput, args, "the arguments `tool.web_search` was called with");
+  const input = runtime.parseToolArguments(toolWebSearchInput, args, "the arguments `tool.web_search` was called with");
   const roots = { input: runtime.bind(input, {
     "properties": {
       "max_results": "int",
