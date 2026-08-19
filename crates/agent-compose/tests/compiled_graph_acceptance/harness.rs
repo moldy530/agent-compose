@@ -89,9 +89,12 @@
 
 #![allow(
     dead_code,
+    unused_imports,
     reason = "each helper is used by the tests of one M1 bullet, \
     and a bullet whose tests are all still `#[ignore]`d leaves its helper unused \
-    from the compiler's point of view until that bullet lands"
+    from the compiler's point of view until that bullet lands — and this module is \
+    included by more than one test target (`tests/trace_format_stability.rs` beside \
+    the acceptance suite), each of which reaches for a different part of it"
 )]
 
 #[path = "../../../compose-core/tests/support/toolchain.rs"]

@@ -45,3 +45,9 @@ assert_cmd = "2"
 # rather than a dependency — the shipped binary never talks to it, and the
 # single static binary of PRD 5.12 must not carry an HTTP stack it does not use.
 mock-provider = { workspace = true }
+# `tests/trace_format_stability.rs`: the trace format is a documented public
+# surface (`docs/trace.md`), and what pins it is a committed snapshot of the
+# shape real runs produce — so a renamed or removed field is a reviewable diff
+# rather than a downstream reader's discovery. Already `compose-core`'s choice
+# for the IR snapshots, and the same reason applies here.
+insta = "1"

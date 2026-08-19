@@ -10,3 +10,8 @@
 /crates/compose-core/tests/toolchain/node_modules/
 /crates/compose-core/tests/toolchain/projects/
 /crates/compose-core/tests/toolchain/node-fallback/
+
+# `insta`'s pending snapshots: a failed comparison writes the value it saw
+# beside the committed one, for `cargo insta review` to accept or reject. The
+# accepted file is what is committed; the pending one is a working note.
+*.snap.new

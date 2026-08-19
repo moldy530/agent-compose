@@ -125,7 +125,7 @@ in full, and what `run --format json` spreads into the record it prints.
 
 | field | type | presence | meaning |
 |---|---|---|---|
-| `trace_version` | integer | always | The format the `entries` are written in. `1` is this document. See [Stability](#10-stability). |
+| `trace_version` | integer | always | The format the `entries` are written in. `1` is this document, and a compiled project spells it `TRACE_VERSION` (exported from its `src/runtime.ts`). See [Stability](#10-stability). |
 | `flow` | string | always | The flow that was run, as its typed address (grammar §2.2). |
 | `execution_id` | string | always | The execution the entries belong to — grammar §4.1's `execution.id`, and the prefix of every idempotency key in the document (grammar §9.4). |
 | `status` | `"completed"` \| `"failed"` | always | Whether the run produced an answer. |

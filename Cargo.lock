@@ -10,6 +10,7 @@ dependencies = [
  "assert_cmd",
  "clap",
  "compose-core",
+ "insta",
  "libc",
  "mock-provider",
  "serde_json",

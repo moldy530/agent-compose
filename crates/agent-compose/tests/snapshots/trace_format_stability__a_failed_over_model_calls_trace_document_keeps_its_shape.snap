@@ -1,0 +1,50 @@
+---
+source: crates/agent-compose/tests/trace_format_stability.rs
+expression: document(&run)
+---
+{
+  "entries": [
+    {
+      "attempts": 1,
+      "flow": "flow.ask",
+      "models": [
+        {
+          "failovers": [
+            {
+              "condition": "rate_limit",
+              "detail": "ProviderFailure: `model.smart` answered 429: {\"error\":{\"message\":\"Number of requests has exceeded your per-minute rate limit.\",\"type\":\"rate_limit_error\"},\"request_id\":\"req_mock_00000001\",\"type\":\"error\"}",
+              "model": "model.smart"
+            }
+          ],
+          "fallback": 1,
+          "model": "model.default",
+          "servedBy": "model.fast"
+        }
+      ],
+      "node": "ask",
+      "outcome": "completed",
+      "routing": {
+        "counters": {},
+        "edges": [
+          {
+            "reason": "unconditional",
+            "taken": true,
+            "to": "__end__"
+          }
+        ],
+        "targets": [
+          "__end__"
+        ]
+      },
+      "step": 1,
+      "traversal": 0,
+      "writes": [
+        "answer"
+      ]
+    }
+  ],
+  "execution_id": "<execution-id>",
+  "flow": "flow.ask",
+  "status": "completed",
+  "trace_version": 1
+}
