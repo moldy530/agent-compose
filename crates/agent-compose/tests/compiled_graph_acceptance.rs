@@ -2661,6 +2661,16 @@ fn a_homogeneous_map_dispatches_one_instance_per_item() {
         4,
         "the planner plus three workers"
     );
+    // The homogeneous form declares no `route_by:`, so its items are not a
+    // union and no dispatch has a variant to name — neither a `route` (there is
+    // one target) nor a `variant` (there is no discriminator).
+    let dispatched = run.entries("work")[0]["dispatches"].clone();
+    for record in dispatched.as_array().expect("the map records its dispatch") {
+        assert!(
+            record["route"].is_null() && record["variant"].is_null(),
+            "a homogeneous dispatch names neither a route nor a variant: {record}"
+        );
+    }
     assert!(provider.snapshot().is_drained());
 }
 
@@ -2847,6 +2857,24 @@ fn a_sink_route_is_joined_and_a_detached_one_is_resolved_at_dispatch() {
         json!(0),
         "a detached dispatch has no observed outcome, so `on_item_error` never \
          applied to it (grammar 8.6 rule 7)"
+    );
+    // …and which variant each item *was*, which the route alone does not say.
+    // A named route's tag is the variant tag, so the two agree there; the
+    // catch-all's is `$default`, and without this the one item that fell
+    // through to it would be the one item whose variant the trace never named
+    // (PRD §7 M2: "which map variant a discriminator chose" as trace data).
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record["variant"].clone())
+            .collect::<Vec<_>>(),
+        [
+            json!("auto_fixable"),
+            json!("needs_human"),
+            json!("duplicate"),
+            json!("auto_fixable"),
+        ],
+        "every dispatch names the discriminator its item carried: {dispatched}"
     );
     assert!(
         records[3]["error"]

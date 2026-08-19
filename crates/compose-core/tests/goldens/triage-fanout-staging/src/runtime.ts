@@ -2441,6 +2441,27 @@ export interface DispatchRecord {
    * a target.
    */
   readonly route?: string;
+  /**
+   * The discriminator value the item itself carried, on the routed form
+   * (grammar 8.6 rule 8).
+   *
+   * Present exactly when the `map` declares `route_by:`, and recorded because
+   * [`route`] is not always the same fact. PRD §7 M2 asks for "which map variant
+   * a discriminator chose" as trace data, and a route's tag answers that only
+   * while a *named* route was selected: an item the `default:` catch-all took is
+   * recorded as `"$default"`, which names the route and says nothing about the
+   * variant that fell through to it — and the item is not in the trace, so
+   * nothing else could be read to recover it. The producing node's own result
+   * is not either: only the nodes a `map.over` reads are kept
+   * ([`RunChannel.outputs`]), and they are kept in graph state rather than in
+   * the trace.
+   *
+   * It is a declared variant tag rather than anything a model chose freely: the
+   * item was parsed against the union its producer declares (PRD 5.2) before any
+   * of this ran, so the set of values that can appear here is the composition's
+   * own (grammar 3.2's `variants:`).
+   */
+  readonly variant?: string;
   /** The component the item was dispatched to. */
   readonly target: string;
   /**
@@ -3381,6 +3402,8 @@ export interface MapDescriptor {
 interface PlannedInstance {
   readonly index: number;
   readonly route: MapRoute;
+  /** The discriminator the item carried, on the routed form (rule 8). */
+  readonly variant?: string;
   readonly input: unknown;
   readonly site: DispatchSite;
 }
@@ -3446,7 +3469,14 @@ export function mapPlan(map: MapDescriptor, view: NodeView): MapPlan {
       execution: bindRoot(execution, EXECUTION_SHAPE),
       [map.as]: bindRoot(item, route.itemShape),
     };
-    return { index, route, input: route.input(roots), site };
+    const variant = variantOf(map, item);
+    return {
+      index,
+      route,
+      ...(variant === undefined ? {} : { variant }),
+      input: route.input(roots),
+      site,
+    };
   });
   return {
     instances,
@@ -3496,6 +3526,23 @@ function mapSource(map: MapDescriptor, view: NodeView): unknown[] {
 function routeKey(map: MapDescriptor, route: MapRoute): string {
   const at = map.routes.indexOf(route);
   return at < 0 ? "*" : String(at);
+}
+
+/**
+ * The discriminator one item carries, for its dispatch record (rule 8, and see
+ * [`DispatchRecord.variant`]).
+ *
+ * `undefined` on the homogeneous form, which declares no `route_by:` and whose
+ * items are not a union — there is no variant to name. On the routed form it is
+ * the value at the literal discriminator field, read as a string because that is
+ * what a variant tag is (grammar 3.2); anything else is left unrecorded rather
+ * than rendered, since [`selectRoute`] has already refused an item the
+ * composition does not route.
+ */
+function variantOf(map: MapDescriptor, item: unknown): string | undefined {
+  if (map.routeBy === undefined) return undefined;
+  const tag = (item as Record<string, unknown> | null)?.[map.routeBy];
+  return typeof tag === "string" ? tag : undefined;
 }
 
 /** Which route one item takes (grammar 8.6 rules 2, 4). */
@@ -3640,7 +3687,13 @@ export async function runMap(
 
   for (const instance of plan.instances) {
     const { index, route, site } = instance;
-    const named = route.tag === undefined ? {} : { route: route.tag };
+    // What this dispatch is *about*, on every record it produces: the route the
+    // item took, and — on the routed form — the discriminator it carried, which
+    // the catch-all's own tag does not name (see [`DispatchRecord.variant`]).
+    const named = {
+      ...(route.tag === undefined ? {} : { route: route.tag }),
+      ...(instance.variant === undefined ? {} : { variant: instance.variant }),
+    };
     const scoped: RunContext = { ...context, execution: site.execution };
 
     if (route.detach) {
