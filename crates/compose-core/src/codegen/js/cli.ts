@@ -490,7 +490,27 @@ export async function answerPauses(
         return open.length === 0 ? undefined : open[0];
       });
       if (wait === undefined) return;
-      reading ??= lines(terminal.input);
+      if (reading === undefined) {
+        reading = lines(terminal.input);
+        // One turn of the event loop between attaching to the stream and asking
+        // anything of it, and only ever this once. A stream that is **already**
+        // at its end — a run launched with nothing on standard input, which is
+        // every `agent-compose run` in a script that forgot to pipe an answer —
+        // announces that end on the `end` event, and that event cannot have
+        // fired before the listener `lines` just attached existed. So the very
+        // first `spent()` would be read a turn too early and answer `false` for
+        // a surface that was gone before the run started: the whole block
+        // printed and withdrawn on the line under it, which is the one thing
+        // the guard in [`ask`] exists to prevent. Every later question is asked
+        // with the listener attached for the whole of the run behind it, so
+        // there is nothing left to wait for.
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        // Asked again rather than asked now: the board can have moved in that
+        // turn — the pause read above may have expired, and the run itself may
+        // have ended — and a question is owed to what is open when it is
+        // printed, not to what was open a turn before.
+        continue;
+      }
       const ended = await ask(execution, wait, reading, terminal.output, upon);
       if (ended === "input-ended") {
         terminal.output.write(
@@ -527,7 +547,11 @@ async function ask(
   // the loop is parked with no pause open — there is no read outstanding then,
   // so nothing notices until the next question goes looking for an answer. A
   // question printed in full and withdrawn on the line under it is a prompt
-  // that never existed; the surface was already gone.
+  // that never existed; the surface was already gone. The same is true of a
+  // stream that had already ended when the reader attached, which is why
+  // [`answerPauses`] gives the `end` event a turn to arrive before it asks the
+  // first question — this check reads a stream's state, and a state nothing has
+  // reported yet is not one it can read.
   if (reading.spent()) return "input-ended";
   output.write(question(wait));
   // One withdrawal watch for the whole prompt, resolving with the sentence the

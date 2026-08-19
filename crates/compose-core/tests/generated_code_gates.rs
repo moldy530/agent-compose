@@ -2030,12 +2030,18 @@ fn the_real_standard_input_was_read_and_released(run: &dyn Fn(&str, Option<&str>
         json!("HumanInterrupt"),
         "an EOF that preceded the reader still ends the surface: {ended}"
     );
-    assert!(
-        ended["said"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("standard input ended, so nothing can answer this run's pauses any more."),
-        "{ended}"
+    // …and the whole of what it said is that sentence. The surface was gone
+    // before the run started, so a question was never askable, and a block
+    // printed in full — the wait id, the `shown:` payload, the schema, the
+    // deadline — with the withdrawal on the line under it is the shape
+    // `Lines.spent()` exists to prevent. Asserted as an equality rather than as
+    // an absence of "pause `": the `end` event cannot fire before the listener
+    // that hears it is attached, so *anything* written before this sentence
+    // means the loop asked its first question a turn too early.
+    assert_eq!(
+        ended["said"],
+        json!("\nstandard input ended, so nothing can answer this run's pauses any more.\n"),
+        "an EOF that preceded the reader withdraws the surface without rendering a prompt: {ended}"
     );
 }
 

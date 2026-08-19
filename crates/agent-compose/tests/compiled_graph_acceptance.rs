@@ -8776,6 +8776,13 @@ fn a_wait_that_expires_while_the_terminal_is_asking_withdraws_the_question() {
 /// document's `status`, the entry of the node it stopped at, and the absence of
 /// a settlement on the pause. A reader cannot tell this run from a headless one,
 /// and that is the point.
+///
+/// It also asserts what the terminal **did not** print. The pipe held one line
+/// and its EOF from the moment the run started, so by the time the second pause
+/// comes up the surface is already gone — and a question that cannot be answered
+/// is not asked. What a reader sees is the first block, `taken.`, and the
+/// sentence saying the surface went away; a second block printed in full and
+/// withdrawn on the line under it would be a prompt that never existed.
 #[test]
 fn a_terminal_that_runs_out_of_answers_leaves_the_run_interrupted() {
     let provider = MockProvider::start().expect("a loopback port");
@@ -8808,6 +8815,28 @@ fn a_terminal_that_runs_out_of_answers_leaves_the_run_interrupted() {
         "{said}"
     );
 
+    // What ended the run is the second question rather than anything about the
+    // first: the first was asked in full and its answer taken. The second was
+    // never put on the screen at all — the pipe carried its EOF from the start,
+    // so the surface was gone before that pause came up, and the loop says so
+    // instead of printing a block it would have to withdraw.
+    let asked: Vec<&str> = said
+        .match_indices("pause `")
+        .map(|(at, _)| {
+            let rest = &said[at + "pause `".len()..];
+            &rest[..rest.find('`').expect("a rendered pause names its wait id")]
+        })
+        .collect();
+    assert_eq!(
+        asked,
+        ["fan/0/0/sign/0"],
+        "one question was asked, and it is the one the script had an answer for:\n{said}"
+    );
+    assert!(
+        said.contains("answer `fan/0/0/sign/0` with one line of JSON: taken.\n"),
+        "…and the line the script piped in answered it:\n{said}"
+    );
+
     let document = run.trace_document();
     assert_eq!(document["status"], "interrupted", "{document}");
     let entries = run.entries("fan");
@@ -8816,21 +8845,18 @@ fn a_terminal_that_runs_out_of_answers_leaves_the_run_interrupted() {
     };
     assert_eq!(entry["outcome"], "failed", "{entry}");
 
-    // The instance that *was* answered resolved as a dispatch record like any
-    // other, and its pause reads `resumed` — so what ended the run is the second
-    // question rather than anything about the first.
-    let answered = entry["dispatches"]
-        .as_array()
-        .unwrap_or_else(|| panic!("the answered instance resolved as a record: {entry}"))
-        .iter()
-        .flat_map(|record| record["inner"].as_array().cloned().unwrap_or_default())
-        .find(|inner| inner["node"] == "sign")
-        .unwrap_or_else(|| panic!("the answered instance's `human` node has an entry: {entry}"));
-    assert_eq!(answered["human"]["settled"], "resumed", "{answered}");
-
-    // The one that stopped the run rides out on the failure instead, in the
-    // aborting entry's `inner` (docs/trace.md §9): the pause is recorded, and it
-    // has no settlement to record.
+    // The pause that stopped the run rides out on the failure, in the aborting
+    // entry's `inner` (docs/trace.md §9): it is recorded, and it has no
+    // settlement to record.
+    //
+    // Nothing is asserted about the *answered* instance's dispatch record,
+    // because how far it got is not this run's guarantee: a `map` fails as soon
+    // as an item does, an answer delivered and an instance run to quiescence are
+    // not the same moment, and the surface here goes away in the moment after
+    // the answer — so the fan-out is abandoned with that instance somewhere in
+    // it. What the answer did is asserted where it is decided, on the screen
+    // above. A test that read a record out of that race would be pinning the
+    // scheduler rather than the behaviour.
     let unanswered = entry["inner"]
         .as_array()
         .unwrap_or_else(|| panic!("the failing instance's trace is on the entry: {entry}"))
