@@ -437,6 +437,9 @@ pub enum DiagnosticCode {
     /// `detach: true` under a durably checkpointed target (grammar 8.6 rule 7,
     /// Decision D59).
     UnsupportedDetach,
+    /// A **detached** `map` dispatch reaches a `human` node (grammar 8.6 rule 7,
+    /// 8.7, Decision D118).
+    DetachedInterrupt,
 
     // --- triggers (grammar 13.3) ------------------------------------------
     /// Two `http` triggers declare one route: the same effective `path:` at the
@@ -511,6 +514,7 @@ impl DiagnosticCode {
         Self::SyncTriggerInterrupt,
         Self::NonDominatingSource,
         Self::UnsupportedDetach,
+        Self::DetachedInterrupt,
         Self::DuplicateRoute,
         Self::ConflictingSessionKey,
     ];
@@ -573,6 +577,7 @@ impl DiagnosticCode {
             Self::SyncTriggerInterrupt => "sync-trigger-interrupt",
             Self::NonDominatingSource => "non-dominating-source",
             Self::UnsupportedDetach => "unsupported-detach",
+            Self::DetachedInterrupt => "detached-interrupt",
             Self::DuplicateRoute => "duplicate-route",
             Self::ConflictingSessionKey => "conflicting-session-key",
         }

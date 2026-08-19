@@ -1739,10 +1739,11 @@ live run rather than a plausible alternative to it.
 
 ### 7.7 Component reachability
 
-Three static checks ask whether a flow can *reach* something: session coherence
-(§11.3), sync-trigger interrupt-freedom (§13.3, §8.7), and recursion (§7.5). They
-share **one** relation, defined here once so that they cannot drift apart
-(Decision [D86](#d86-component-reachability-is-one-relation-and-it-crosses-every-invocation-edge)).
+Four static checks ask whether a flow — or one `map` dispatch target — can
+*reach* something: session coherence (§11.3), sync-trigger interrupt-freedom
+(§13.3, §8.7), detached-dispatch interrupt-freedom (§8.6 rule 7, §8.7), and
+recursion (§7.5). They share **one** relation, defined here once so that they
+cannot drift apart (Decision [D86](#d86-component-reachability-is-one-relation-and-it-crosses-every-invocation-edge)).
 
 A flow `F` **reaches** the components and `human` nodes named by the following,
 transitively:
@@ -1768,15 +1769,20 @@ output is not an invocation.
 |---|---|---|
 | session coherence (§11.3) | **declared** triggers (§13) | the trigger's flow reaches a `session`-scoped store and the trigger declares no `session_key:` |
 | interrupt-freedom (§13.3, §8.7) | **declared** `http` triggers with `respond: sync` | the trigger's flow reaches a `human` node |
+| detached-dispatch interrupt-freedom (§8.6 rule 7, §8.7) | dispatches declaring `detach: true` | the dispatch **target** reaches a `human` node |
 | recursion (§7.5) | flow definitions | a flow reaches itself |
 
-The relation is uniform across the three on purpose. An interrupt inside a
+The relation is uniform across the four on purpose. An interrupt inside a
 flow-as-tool is still an interrupt in the middle of a synchronous request, and
 PRD 5.11's settled position is that a `respond: sync` flow is *statically*
-interrupt-free; a session-scoped store reached through a map-dispatched flow
-still needs a session identity; and recursion through a tool attachment is still
-recursion. Clause 4 — traversal into `tools:` — is the one every earlier
-per-check wording left unstated.
+interrupt-free; a pause inside a flow-as-tool of an agent a detached dispatch
+targets is as unanswerable as one written in the target itself; a session-scoped
+store reached through a map-dispatched flow still needs a session identity; and
+recursion through a tool attachment is still recursion. Clause 4 — traversal into
+`tools:` — is the one every earlier per-check wording left unstated. The fourth
+row is the one whose domain is a **target** rather than a flow: it asks the same
+question of the address a dispatch names, which for an `agent.*` target is
+clauses 3 and 4 alone (an agent holds no `human` node of its own).
 
 This relation answers "can this flow *cause* that component to run". It is not
 §7.8's relation, which asks whether a node of one flow is reachable from that
@@ -2294,6 +2300,17 @@ A **route** object takes `node` (required) plus optional `max_concurrency`,
      the default is `false` and PRD 5.6 makes a failed enqueue a surfaced
      failure otherwise.
 
+   A detached dispatch's target MUST NOT **reach** a `human` node, in the sense
+   §7.7 fixes — which includes a `human` node inside a flow the target
+   instantiates and inside a flow attached to an agent it reaches. The three
+   clauses above are why: the join counts the dispatch resolved the moment it is
+   issued, so the execution can finish while the instance is still in flight, and
+   a pause inside it is a question whose answer nothing is left to receive — the
+   wait belongs to an execution that is not waiting for it and is dropped when
+   that execution ends. This one is **target-independent**, unlike the
+   checkpointing rule below (Decision
+   [D118](#d118-a-detached-dispatch-reaches-no-human-node)).
+
    In v0, `detach: true` is a
    validation error under any target whose execution state is durably
    checkpointed — every target except `local` (§14) — pointing at the roadmap
@@ -2386,8 +2403,16 @@ A **route** object takes `node` (required) plus optional `max_concurrency`,
 
 ### 8.7 `human`
 
-Human-in-the-loop pause (PRD 5.5). Grammar is active in v0; runtime support may
-land in M2 — the same reserved-grammar move as `placements`.
+Human-in-the-loop pause (PRD 5.5). Grammar **and** runtime are active: a
+compiled project stops the execution at the node, reports it as `interrupted`,
+publishes what the human is shown and the schema their answer is held to, and
+takes that answer at `POST /executions/:id/resume` — the third verb of §13.3's
+invocation surface (PRD 5.11). `agent-compose run` has no resume surface, so a
+one-shot run that reaches a pause reports it and exits on a code of its own
+rather than waiting or carrying on. A wait lives in the serving **process**:
+durable execution is a later milestone, so a `serve` restarted while a human was
+thinking has lost it, and the emitted `README.md` says so where a reader meets
+the resume route.
 
 ```yaml
 approve:
@@ -2426,10 +2451,19 @@ flow node's `policy:` (§9.3 level 1) or from `defaults:` (level 3), so a
 composition-wide budget can never cut a wait short (§9.3, Decision
 [D102](#d102-a-human-node-resolves-no-timeout-and-no-retry-at-any-level)).
 `on_error:` remains legal and resolves through all four levels (it covers
-delivery failures). A flow a `respond: sync` http trigger targets MUST NOT
-**reach** a `human` node, in the sense §7.7 fixes — which includes a `human` node
-inside a `map`-dispatched flow and inside a flow attached to an agent's `tools:`
-(PRD 5.11).
+delivery failures).
+
+Two constructs may not **reach** a `human` node, in the sense §7.7 fixes — which
+includes one inside a `map`-dispatched flow and inside a flow attached to an
+agent's `tools:`:
+
+- the flow a `respond: sync` http trigger targets, because a pause in the middle
+  of a synchronous request has no answer the request can wait for (§13.3,
+  PRD 5.11);
+- a **detached** `map` dispatch's target, because the join never observes the
+  instance and the execution can end while it is still in flight, leaving the
+  pause with nothing to deliver an answer to (§8.6 rule 7, Decision
+  [D118](#d118-a-detached-dispatch-reaches-no-human-node)).
 
 ### 8.8 `store`
 
@@ -3624,8 +3658,13 @@ its runtime effect is a documented no-op (PRD 5.10, 5.11).
 | `event_sources` | parsed + validated, no-op | M3 |
 | `triggers.<t>.type: schedule` | parsed + validated, no-op | M3 |
 | `triggers.<t>.type: event` | parsed + validated, no-op | M3 |
-| `human` nodes | grammar active; runtime may land later | M2 |
 | `network:` on a placement | parsed, no-op | M3 |
+
+`human` nodes were on this list and have left it: the runtime landed in M2, so a
+compiled project really pauses, publishes the question, and resumes (§8.7). What
+is still deferred is not the construct but its **durability** — a wait is a
+parked promise in the serving process rather than a checkpoint, and survives no
+restart until durable execution arrives in M3.
 
 ---
 
@@ -5761,6 +5800,40 @@ Appendix B's one-directional invariant, the failure
 already declines CEL surfaces on exactly that reasoning, so this joins the
 validator-owned list rather than being sniffed for. *PRD 5.11, G3.*
 
+### D118. A detached dispatch reaches no `human` node
+
+A `map` dispatch declaring `detach: true` MUST NOT reach a `human` node, in the
+sense §7.7 fixes — its target's own nodes, the flows that target instantiates,
+its maps' targets, and the `flow.*` tools of any agent it reaches. The check is
+target-independent, and it is the fourth reader of §7.7's relation (§8.6 rule 7,
+§8.7). **Rationale**: [D94](#d94-a-detached-dispatch-is-resolved-at-dispatch)
+makes a detached dispatch resolved at dispatch — "the last thing the graph knows
+about that item" — and §8.7's runtime makes a pause a wait held **by an
+execution**, published on that execution's status report and answered through its
+resume route. The two do not compose. The join never observes the instance, so
+the execution can finish while it is still in flight and the wait is dropped with
+every other one that run was holding; and while the run is alive, whether the
+pause is reachable at all depends on which of the two finishes first — a
+composition with one joined route beside the detached one would settle the pause
+at the joined route's pace, and the same composition without it would leave the
+question published on an execution whose graph has already moved on. That is one
+construct with two behaviours chosen by scheduling, which is the shape this
+document refuses elsewhere by refusing the construct
+([D71](#d71-no-silent-dead-ends-every-node-exits-and-every-run-starts),
+[D107](#d107-an-else-edge-requires-a-when-guarded-sibling)).
+
+Refusing it statically is also what keeps
+[D102](#d102-a-human-node-resolves-no-timeout-and-no-retry-at-any-level)'s
+promise honest one construct out. The enclosing node's budget is held still while
+a pause below it is open (§9.3), which is a statement about a node that is
+*waiting*; a detached dispatch is defined not to wait, so there is no budget to
+hold and nothing for the promise to be about. The narrower alternatives were both
+worse: letting the run end the wait makes an answer's reachability a race, and
+keeping the execution alive until every detached instance quiesces would make a
+fire-and-forget dispatch delay the enclosing run — precisely what rule 7's third
+clause forbids. The construct an author reaching for it wants is a *joined*
+dispatch, which is one key away. *PRD 5.5, 5.6, 5.11, G3.*
+
 ---
 
 ## Appendix B — Editor integration
@@ -5800,7 +5873,7 @@ authority. The schema cannot see across files, so it does not check:
 - the graph analyses of §7.6, §7.7, and §7.8, which need the whole flow graph
   rather than a key-and-value pair: balanced convergence (§7.6.2, D112), the
   no-dead-end rules of §7.6.3 apart from the `start` edge below, component
-  reachability (§7.7) and the three checks over it, node reachability from
+  reachability (§7.7) and the four checks over it, node reachability from
   `start` (§7.8, D95), `map.over` dominance (§8.6 rule 11), the totality of
   `flow:`-node bindings (§8.0, D68), and the injectivity of a node's *effective*
   write map (§8.0, D93) — JSON Schema constrains property *names*, never the set

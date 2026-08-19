@@ -220,6 +220,12 @@ const GRAMMAR: &[Check] = &[
         evidence: Evidence::Fixture,
     },
     Check {
+        rule: "a detached dispatch reaches no `human` node (8.6 rule 7, 8.7, D118)",
+        pass: "check/fanout.rs, over check/reach.rs",
+        codes: &["detached-interrupt"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
         rule: "a detached dispatch's key is not part of its sink's declared input (9.4, D66)",
         pass: "check/maps.rs",
         codes: &["conflicting-keys"],

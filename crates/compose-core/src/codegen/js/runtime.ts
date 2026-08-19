@@ -470,6 +470,13 @@ export interface RunContext {
    * route gives each member that has a successor a share of what is left, which
    * is what makes PRD 5.9's `timeout` condition reachable for a provider that
    * answers nothing at all. See [`callModel`].
+   *
+   * **Read it, never keep it.** It answers the reading *at the moment of the
+   * read*, because the budget it reports does not always run: a node holding a
+   * `human` pause below it stops its own clock (Decision D102, and see
+   * [`runActivity`]), and a value taken before the pause would hand the first
+   * call after it a budget the wait had spent. Every consumer here reads it and
+   * subtracts `Date.now()` in the same expression ([`requestBudget`]).
    */
   readonly deadline?: number;
   /** How this attempt is addressed, for a message. */
@@ -648,12 +655,18 @@ export function backoffFor(policy: RetryPolicy, attempt: number): number {
  * the milliseconds it had left, so a `timeout: 60s` still means sixty seconds of
  * running.
  *
- * [`RunContext.deadline`] is the reading taken when the attempt started and does
- * **not** move with a hold. Its only consumer is a model route dividing the
- * budget across its ladder ([`callModel`]), which belongs to an `agent` or
- * `model` node — and those cannot have a pause below them, because a `human`
- * node is only ever reached through a `flow:` node or a `map`, whose own
- * activities read no deadline.
+ * [`RunContext.deadline`] **moves with the hold**, because it is the same budget
+ * seen from the other side: it answers where the armed timer is due to fire
+ * while the budget runs, and `remaining` milliseconds from *now* while it is
+ * held. Its consumer is a model route dividing the budget across its ladder
+ * ([`callModel`], [`requestBudget`]), and today no `agent` or `model` node can
+ * have a pause below it — a `human` node is reached through a `flow:` node or a
+ * `map`, whose own activities read no deadline. That is a fact about this
+ * release rather than an invariant: grammar 8.7 already contemplates a `human`
+ * node inside a flow attached to an agent's `tools:`, and when that runtime
+ * lands the node holding the timer *is* the node dividing the budget. Making the
+ * two halves of one budget agree here is what keeps the first model call after
+ * an hour-long pause from being refused for a budget the wait spent.
  */
 export async function runActivity<T>(
   flow: string,
@@ -669,11 +682,6 @@ export async function runActivity<T>(
   const attempts = 1 + (policy.retry?.max ?? 0);
   const controller = new AbortController();
   const budget = policy.timeoutMs;
-  // Read once, beside the timer that enforces it, and shared by every attempt:
-  // grammar 9.2's budget bounds the node execution rather than an attempt, so
-  // an activity that divides it (see [`callModel`]) must divide the same one the
-  // timer below is counting down.
-  const deadline = budget === undefined ? undefined : Date.now() + budget;
   let expired = false;
   // What the node *did*, not what its policy allowed: a budget that ran out
   // during the second of three attempts made two, and a trace that reported
@@ -708,6 +716,16 @@ export async function runActivity<T>(
     timer = undefined;
     remaining = Math.max(0, remaining - (Date.now() - armedAt));
   };
+  // The same budget the timer above is counting down, as the reading an activity
+  // that *divides* it needs ([`RunContext.deadline`], [`callModel`]). Computed
+  // per read rather than once: grammar 9.2's budget bounds the node execution
+  // rather than an attempt, and a hold stops it — so while a pause below this
+  // node is open the expiry is `remaining` from now and moves with the clock,
+  // and while the timer is armed it is the instant that timer will fire.
+  const deadline = (): number | undefined => {
+    if (budget === undefined) return undefined;
+    return timer === undefined ? Date.now() + remaining : armedAt + remaining;
+  };
   const watching =
     budget === undefined
       ? undefined
@@ -734,7 +752,12 @@ export async function runActivity<T>(
         const running = activity({
           execution,
           signal: controller.signal,
-          ...(deadline === undefined ? {} : { deadline }),
+          // A getter rather than a field: the budget it reports is held still
+          // while a pause below this node is open, so what a reader needs is the
+          // reading at the moment it reads (see [`RunContext.deadline`]).
+          get deadline(): number | undefined {
+            return deadline();
+          },
           node,
           ...(storeRecords === undefined ? {} : { storeRecords }),
           ...(modelCalls === undefined ? {} : { modelCalls }),
@@ -777,6 +800,14 @@ export async function runActivity<T>(
         if (interruptOf(error) !== undefined) {
           throw new NodeFailure(flow, node, made, describe(error), error);
         }
+        // A pause the run stopped waiting for is not the ladder's either, and
+        // for a stronger reason: whatever abandoned it did so because nothing is
+        // reading this task's result any more (see [`abandonPausesUnder`]), so a
+        // second attempt would re-open a pause under a node that has already
+        // ended — parked for ever on a board no watcher is left to hold. Thrown
+        // on bare rather than wrapped in a [`NodeFailure`]: by construction
+        // there is nothing to report it to, which is what the class means.
+        if (abandonedOf(error) !== undefined) throw error;
         if (expired) break;
         if (attempt === attempts) break;
         const delay = backoffFor(policy.retry!, attempt);
@@ -804,8 +835,8 @@ export async function runActivity<T>(
     // below it is one nothing will ever read the answer of, and leaving it on
     // the board would publish a question to a human whose answer is thrown away
     // (see [`abandonPausesUnder`]). Reached by a deadline that ran out in the
-    // tick a pause was opening, and by a detached dispatch, whose instance the
-    // join never observes.
+    // tick a pause was opening: every other way one node execution ends is one
+    // where the instance below it had already finished.
     abandonPausesUnder(execution.id, site);
   }
 }
@@ -3346,7 +3377,11 @@ export interface Instantiation {
    *
    * A **detached** dispatch supplies it too, and it is the delivery's own signal
    * — the one nothing aborts (Decision D94, and see [`runMap`]) — so an instance
-   * reached that way runs to quiescence exactly as its sink does.
+   * reached that way runs to quiescence exactly as its sink does. Quiescence is
+   * something it can always *reach*, because the one construct that could stop
+   * an instance short of it while nothing is waiting is refused at build time: a
+   * detached dispatch reaching a `human` node is a validation error
+   * (Decision D118).
    */
   readonly signal?: AbortSignal;
   /** Level 1 of grammar 9.3 for every node inside it. */
@@ -3999,7 +4034,19 @@ export async function runMap(
       ...(route.tag === undefined ? {} : { route: route.tag }),
       ...(instance.variant === undefined ? {} : { variant: instance.variant }),
     };
-    const scoped: RunContext = { ...context, execution: site.execution };
+    // The node's context with the instance's own identity. `deadline` is
+    // re-exposed as a getter rather than left to the spread, which would have
+    // copied one reading of a budget that moves: the map node's clock stops
+    // while a pause below it is open (Decision D102), and an instance holding a
+    // copy would divide a budget the wait had already spent
+    // (see [`RunContext.deadline`]).
+    const scoped: RunContext = {
+      ...context,
+      execution: site.execution,
+      get deadline(): number | undefined {
+        return context.deadline;
+      },
+    };
 
     if (route.detach) {
       // Resolved at dispatch (Decision D94): the record is written now, the
@@ -4120,6 +4167,12 @@ export async function runMap(
           // and the node above reports it the same way a top-level pause is
           // reported.
           if (interruptOf(cause) !== undefined) throw error;
+          // Nor is an abandoned pause: nothing is reading this instance's result
+          // any more, so `skip` recording it as an item the fan-out absorbed
+          // would put a dispatch record on a trace entry for an outcome that
+          // never happened — and would carry the fan-out past a human for the
+          // reason above (see [`abandonedOf`]).
+          if (abandonedOf(cause) !== undefined) throw error;
           failed.push({ index, target: route.target, attempts, error: cause });
           // A dispatched `flow.*` that failed still made a trace, exactly as one
           // that completed did, and under `on_item_error: skip` the run carries
@@ -4237,6 +4290,10 @@ async function attemptItem(
       // instance did wrong, and re-executing it would repeat every effect it
       // issued on the way to asking a question that still cannot be delivered.
       if (interruptOf(error) !== undefined) throw new ItemAttempts(made, error);
+      // And the same rule for a pause this instance is no longer being waited
+      // on for: re-executing it would re-open the pause under a node that has
+      // stopped waiting, on top of repeating every effect the instance issued.
+      if (abandonedOf(error) !== undefined) throw new ItemAttempts(made, error);
       if (attempt === allowed) break;
       try {
         await sleep(backoffFor(retry!, attempt), context.signal);
@@ -4449,11 +4506,12 @@ export class HumanInterrupt extends Error {
  * A pause nobody is waiting for any more (see [`abandonPausesUnder`]).
  *
  * Not a failure the composition declared and not one it can route on: the task
- * it unwinds is inside an instance whose result was already discarded — a
- * detached dispatch's, or one a node stopped waiting for — so this error reaches
- * no trace entry and no `on_error:`. It exists so the parked task *ends*,
- * releasing the `map` permits and store handles the instance still holds, rather
- * than staying parked on a promise nothing will ever settle.
+ * it unwinds is inside an instance whose result was already discarded — one a
+ * node stopped waiting for, or one the run ended without — so this error reaches
+ * no trace entry and no `on_error:`. Every ladder and policy on its way out lets
+ * it through rather than acting on it ([`abandonedOf`]). It exists so the parked
+ * task *ends*, releasing the `map` permits and store handles the instance still
+ * holds, rather than staying parked on a promise nothing will ever settle.
  */
 export class HumanAbandoned extends Error {
   readonly wait: string;
@@ -4559,10 +4617,11 @@ export function openHumanWaits(execution: string, resumable: boolean): void {
  * dropped out from under it. A pause holds an expiry timer and, through it, its
  * whole closure — a `human: { timeout: 24h }` whose run ended some other way
  * would otherwise keep a `setTimeout` and everything it closes over alive for a
- * day, one per wait, in a `serve` process that answers many runs. Only a
- * *detached* dispatch's pause can still be pending here (grammar 8.6 rule 7):
- * every other one belongs to a task the run was waiting on, and a run that was
- * waiting on it has not ended.
+ * day, one per wait, in a `serve` process that answers many runs. What can still
+ * be pending here is a pause on a branch the run stopped scheduling: a fork
+ * whose other branch failed ends the run while this one is still parked, and the
+ * node holding the pause never reaches the `finally` that would have abandoned
+ * it ([`abandonPausesUnder`]).
  */
 export function releaseHumanWaits(execution: string): void {
   const board = humanBoards.get(execution);
@@ -4628,12 +4687,14 @@ export function watchHumanPauses(execution: string, listener: () => void): () =>
  * happened in is **orphaned**: nothing will read its answer, because the task
  * that would have read it was abandoned — and left on the board it would be
  * published by the status route as a question a human could still answer and
- * accepted by the resume route as an answer that goes nowhere. Two things reach
+ * accepted by the resume route as an answer that goes nowhere. One thing reaches
  * here: a `map` or `flow:` node whose own deadline ran out while an instance
- * below it was parked in the tick before the pause could hold it still, and a
- * **detached** dispatch, whose instance the join never observes at all
- * (grammar 8.6 rule 7, Decision D94) and whose answer therefore has nowhere to
- * be delivered even in principle.
+ * below it was parked in the tick before the pause could hold it still. The
+ * other shape it would have had is refused by the compiler instead — a
+ * **detached** dispatch's instance is never observed by the join at all
+ * (grammar 8.6 rule 7, Decision D94), so a `human` node under one has nowhere
+ * for an answer to be delivered even in principle, and a dispatch that reaches
+ * one is a validation error (Decision D118).
  *
  * The parked task is **rejected** rather than left parked: it is inside an
  * instance nobody is driving, and unwinding it lets that instance fail and give
@@ -4791,7 +4852,8 @@ function settledDetail(id: string, settled: Settlement): string {
  * M2 posture PRD §7 fixes (durable execution is M3), and it is what the emitted
  * `README.md` tells a reader to expect from a restarted `serve`.
  *
- * It is deliberately **not** LangGraph's own `interrupt()`. That primitive
+ * It is deliberately **not** LangGraph's own `interrupt()` — the shaping PRD §9's
+ * resolved question 4 settles, on the two grounds below. That primitive
  * resumes a run from a checkpointer, which this release does not configure, and
  * it announces itself out of the *top-level* stream — while a `map`'s instances
  * and a `flow:` node's subflow run inside their node's own task, as separate runs
@@ -4898,6 +4960,27 @@ const END_NODE = "__end__";
 function expiryOf(error: unknown): HumanExpiry | undefined {
   for (let held: unknown = error; held !== undefined && held !== null; ) {
     if (held instanceof HumanExpiry) return held;
+    held = (held as { cause?: unknown }).cause;
+  }
+  return undefined;
+}
+
+/**
+ * The [`HumanAbandoned`] on this error's `cause` chain, if it came out of one.
+ *
+ * An abandonment is an **unwinding**, never an outcome: the task it ends is
+ * inside an instance whose result was already discarded, so every ladder and
+ * every policy it passes on the way out has to let it through rather than act on
+ * it. Three do — [`runActivity`]'s `retry:`, [`attemptItem`]'s `on_item_error`,
+ * and [`runNode`]'s `on_error:` — and each reads this for the same reason
+ * [`interruptOf`] is read beside it: what reaches them is a [`NodeFailure`] or an
+ * [`ItemAttempts`] wrapping it. Absorbing one under `skip` would route a graph
+ * past a `human` node whose answer the composition declared it needed, and
+ * retrying one would re-open a pause under a node that has stopped waiting.
+ */
+function abandonedOf(error: unknown): HumanAbandoned | undefined {
+  for (let held: unknown = error; held !== undefined && held !== null; ) {
+    if (held instanceof HumanAbandoned) return held;
     held = (held as { cause?: unknown }).cause;
   }
   return undefined;
@@ -5117,12 +5200,13 @@ function joined(
  * that cannot be evaluated propagates, and only what the activity did reaches
  * the `catch`.
  *
- * Two more are outside it, and they are a `human` node's (grammar 8.7). A wait
+ * Three more are outside it, and they are a `human` node's (grammar 8.7). A wait
  * whose budget ran out routes to the node's own `on_timeout:` — §9.2's fallback
- * shape, reached from a different key — and a pause this run has no way to
- * answer ends the run whatever the policy says, because `skip` absorbing it
- * would route past a human the composition declared it needed. See
- * [`HumanExpiry`] and [`HumanInterrupt`].
+ * shape, reached from a different key — while a pause this run has no way to
+ * answer and a pause nobody is waiting for any more both end the node whatever
+ * the policy says, because `skip` absorbing either would route past a human the
+ * composition declared it needed. See [`HumanExpiry`], [`HumanInterrupt`] and
+ * [`HumanAbandoned`].
  *
  * **What a failure leaves behind.** Every way out of here that throws carries
  * this node's own trace entry on the error ([`carryEntry`]), because a thrown
@@ -5305,6 +5389,15 @@ export async function runNode(
       // `attempts` is "how many attempts the node made".
       throw carryEntry(error, aborted(error, failure?.attempts ?? 1));
     }
+    // A third leaves here without meeting the policy, and it is not an outcome
+    // at all: a pause nobody is waiting for any more. `skip` absorbing it would
+    // route this graph past a `human` node whose answer the composition declared
+    // it needed — the reading [`HumanInterrupt`] refuses for the interrupt — and
+    // it would do so inside an instance whose result was already discarded. It
+    // carries **no trace entry**, for the reason it carries no strategy: the
+    // entry would belong to a task nothing is left to read (see
+    // [`abandonPausesUnder`], [`HumanAbandoned`]).
+    if (abandonedOf(error) !== undefined) throw error;
     const expiry = expiryOf(error);
     const strategy: ErrorStrategy =
       expiry === undefined ? policy.onError : { fallback: expiry.route };

@@ -1287,11 +1287,12 @@ fn the_fan_out_runtime_bounds_orders_and_resolves_every_dispatch() {
     );
 }
 
-/// Gate 19: the `human` wait board — addressing, abandonment, and the timer a
-/// released wait leaves behind (grammar 8.7, 9.2, PRD 5.11).
+/// Gate 19: the `human` wait board — addressing, abandonment, the timer a
+/// released wait leaves behind, and the budget a wait does not spend
+/// (grammar 8.7, 9.2, PRD 5.11).
 ///
 /// The acceptance suite answers, expires and addresses pauses through a served
-/// app, which is where the composition's behaviour is decided. Three claims are
+/// app, which is where the composition's behaviour is decided. Five claims are
 /// not decidable there, because the case that breaks them is a task **nobody is
 /// awaiting**:
 ///
@@ -1304,11 +1305,22 @@ fn the_fan_out_runtime_bounds_orders_and_resolves_every_dispatch() {
 ///     person can still answer and taken by the resume route as an answer that
 ///     goes nowhere. Reaching it from a composition needs a dispatch abandoned
 ///     at a moment a test cannot schedule;
+///   * **an abandonment is not an activity outcome.** `on_error:` governs what
+///     the model, the process or the request did; a pause nobody is waiting for
+///     any more is the run's own unwinding, and a `skip` that absorbed one would
+///     route a graph past a `human` node whose answer the composition declared
+///     it needed;
 ///   * **a released wait's expiry timer is cleared.** An `unref`ed timer keeps
 ///     nothing alive, so it is invisible to `process.getActiveResourcesInfo()`
 ///     and to the process exiting: the runner counts the global
 ///     `setTimeout`/`clearTimeout` calls made with the pause's own budget, which
-///     is the only place that question has an answer at all.
+///     is the only place that question has an answer at all;
+///   * **the budget an activity divides is held still with the timer.**
+///     `context.deadline` is what a model route subtracts the clock from
+///     ([`requestBudget`]), so a reading that stayed put while the node's own
+///     timer was held would hand the first call after the wait a budget the wait
+///     had spent. What a served app can show is the node not failing; what the
+///     reading *said* is only visible from inside the activity.
 ///
 /// `src/runtime.ts` is a compiler constant, byte-identical in every project this
 /// release builds, so driving it directly is driving what every project runs.
@@ -1368,9 +1380,11 @@ fn the_human_wait_board_addresses_abandons_and_releases_every_pause() {
     );
 
     // …and it is `runActivity` that does it, on every way one node execution can
-    // end. A dispatch that failed while a sibling instance was still parked is
-    // the reachable shape: the node is over, so the pause under it is one
-    // nothing will read the answer of.
+    // end. The reachable shape is a node's own **deadline** racing an instance
+    // parked below it — the node is over, so the pause under it is one nothing
+    // will read the answer of — and the runner drives the same `finally` with a
+    // throwing activity, because what is under test is the wiring rather than
+    // which error reached it.
     assert_eq!(
         observed["orphans"],
         json!({
@@ -1382,6 +1396,44 @@ fn the_human_wait_board_addresses_abandons_and_releases_every_pause() {
             "refusal": "settled",
         })
     );
+
+    // An abandonment is an unwinding rather than an outcome, so it passes the
+    // node's `on_error:` untouched. The control above it is what makes this an
+    // assertion about the guard: the same node under the same `skip` really does
+    // absorb an ordinary delivery failure, entry, edges and all.
+    assert_eq!(
+        observed["absorbing"]["delivery_failure"],
+        json!({ "outcome": "skipped", "goto": ["__end__"] })
+    );
+    assert_eq!(observed["absorbing"]["pending"], json!(["sign/0"]));
+    assert_eq!(
+        observed["absorbing"]["abandoned"],
+        json!("HumanAbandoned"),
+        "`skip` absorbing this would route the graph past the human: {observed}"
+    );
+
+    // The budget reading moves with the hold: fixed while the timer is armed —
+    // it is the instant that timer will fire — and sliding with the clock while
+    // a pause below the node is open, which is the whole of "the budget does not
+    // run while a human is thinking" said to the activity that divides it.
+    assert_eq!(
+        observed["budget"]["armed_moved_by"],
+        json!(0),
+        "an armed budget expires at one instant: {observed}"
+    );
+    assert_eq!(
+        observed["budget"]["rearmed_moved_by"],
+        json!(0),
+        "…and so does the same budget re-armed after the answer: {observed}"
+    );
+    let held = observed["budget"]["held_moved_by"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("the runner reports how far the held budget moved: {observed}"));
+    assert!(
+        held >= 90,
+        "a budget held for 100ms of pause moved {held}ms, so the wait was spending it: {observed}"
+    );
+    assert_eq!(observed["budget"]["settled"], json!("resolved"));
 
     // A 24-hour budget arms one timer, and releasing the run clears it — rather
     // than leaving it, and the closure it holds, alive for the day.

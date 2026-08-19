@@ -9,8 +9,11 @@
 // a question a person can still answer and taken by the resume route as an
 // answer that goes nowhere — and neither end of that is reachable from a
 // composition on purpose, because it needs a dispatch to be abandoned at a
-// moment a test cannot schedule. The same goes for the expiry timer a released
-// wait leaves behind: nothing a served app answers says whether it was cleared.
+// moment a test cannot schedule. The same goes for what an abandonment must
+// *not* be — an activity outcome `on_error: skip` can absorb — for the expiry
+// timer a released wait leaves behind, and for the budget reading an activity
+// divides: nothing a served app answers says whether the timer was cleared or
+// what `context.deadline` said while the wait was open.
 //
 // `src/runtime.ts` is a compiler constant, byte-identical in every project, so
 // driving it directly is driving what every project runs.
@@ -139,9 +142,13 @@ const observed = {};
 }
 
 // The wiring, rather than the function: one node execution ending is what
-// abandons the pauses left under it. A `map` whose dispatch fails while a
-// sibling instance is still parked is the shape of it — the node is over, and
-// the parked instance's answer has nobody left to read it.
+// abandons the pauses left under it. The reachable shape is the node's own
+// **deadline** racing a parked instance — `runActivity` abandons on every way a
+// node execution ends, and a budget that ran out in the tick a pause was opening
+// is the one that leaves a pause behind. It is driven here through a throwing
+// activity rather than through a real deadline, because what is under test is
+// the `finally` rather than which error reached it: the node is over, and the
+// parked instance's answer has nobody left to read it.
 {
   const execution = "exec_orphan";
   runtime.openHumanWaits(execution, true);
@@ -252,6 +259,113 @@ const observed = {};
     mismatched: { ok: mismatched.ok, reason: mismatched.reason },
     still_published: runtime.humanWaits(execution).map((wait) => wait.id),
   };
+  runtime.releaseHumanWaits(execution);
+}
+
+// `on_error:` is a policy over what an activity *did*, and an abandonment is not
+// that: it is the run saying nobody is listening for this answer any more. A
+// `skip` that absorbed one would route the graph past a `human` node whose
+// answer the composition declared it needed — inside an instance whose result
+// was already discarded — so it leaves through `runNode` as a throw instead.
+{
+  const execution = "exec_absorbing";
+  runtime.openHumanWaits(execution, true);
+
+  /** A `human` node under `on_error: skip`, with the activity swapped in. */
+  const node = (run) => ({
+    flow: "flow.sign_off",
+    node: "sign",
+    policy: { onError: "skip" },
+    // A `human` node takes no `timeout:` and no `retry:` at any level (D102).
+    exempt: true,
+    shapes: {
+      input: { properties: {} },
+      state: { properties: {} },
+      output: { properties: {} },
+    },
+    input: () => ({}),
+    run,
+    writes: [],
+    edges: [{ to: "__end__" }],
+  });
+  const stateOf = () => ({
+    $run: {
+      ...runtime.emptyRun(),
+      execution: { id: execution, session_key: "" },
+    },
+  });
+
+  // The control, and it is what makes the assertion below about the guard
+  // rather than about a policy that was never applied: the same node and the
+  // same `skip`, over an ordinary failure, really does absorb it.
+  const absorbed = await runtime.runNode(
+    node(async () => {
+      throw new Error("the delivery failed");
+    }),
+    stateOf(),
+  );
+  const entry = absorbed.update?.$run?.trace?.[0];
+
+  const parked = outcomeOf(
+    runtime.runNode(
+      node((input, context, view) =>
+        runtime.runHuman(descriptor(), { question: "ship it?" }, context, view),
+      ),
+      stateOf(),
+    ),
+  );
+  await settle();
+  const pending = runtime.humanWaits(execution).map((wait) => wait.id);
+  runtime.abandonPausesUnder(execution, "sign/0");
+  await settle();
+
+  observed.absorbing = {
+    delivery_failure: { outcome: entry?.outcome, goto: absorbed.goto },
+    pending,
+    abandoned: parked.state,
+  };
+  runtime.releaseHumanWaits(execution);
+}
+
+// The budget of the node *above* a pause is held still while the pause is open
+// — and `context.deadline` is that same budget seen from the side an activity
+// divides it from, so it moves with the hold. Read as an instant: while the
+// budget runs it is the moment the armed timer will fire and does not move,
+// and while it is held it is `remaining` from *now* and slides with the clock.
+{
+  const execution = "exec_budget";
+  runtime.openHumanWaits(execution, true);
+  const seen = {};
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 100));
+
+  await runtime.runActivity(
+    "flow.patient",
+    "wrap",
+    "wrap/0",
+    { timeoutMs: 60_000, onError: "fail" },
+    { id: execution, session_key: "" },
+    async (context) => {
+      const armed = context.deadline;
+      await tick();
+      seen.armed_moved_by = context.deadline - armed;
+
+      const parked = park(execution, ["wrap", "0"]);
+      await settle();
+      const held = context.deadline;
+      await tick();
+      seen.held_moved_by = context.deadline - held;
+
+      runtime.deliverHumanAnswer(execution, "wrap/0/sign/0", { decision: "approve" });
+      await settle();
+      const rearmed = context.deadline;
+      await tick();
+      seen.rearmed_moved_by = context.deadline - rearmed;
+      seen.settled = parked.state;
+      return { output: {} };
+    },
+  );
+
+  observed.budget = seen;
   runtime.releaseHumanWaits(execution);
 }
 

@@ -6722,6 +6722,101 @@ fn two_pauses_in_one_execution_are_addressed_by_their_instance_paths() {
     );
 }
 
+/// Two interrupted executions hold their pauses — and their answers — apart
+/// (PRD 5.11).
+///
+/// The wait id is an instance path *inside one run*, so two executions of one
+/// composition pause at the same `approve/0`. What tells them apart is the
+/// execution the wait belongs to and nothing else, which makes this the case a
+/// board flattened into one id-keyed table would pass every other test and still
+/// break: the answer meant for one execution would settle the other's pause.
+/// Each report must carry only its own pause, answering one must leave the other
+/// waiting, and each run must end holding the decision that was sent to *it*.
+#[test]
+fn two_interrupted_executions_hold_their_pauses_and_answers_apart() {
+    let provider = MockProvider::start().expect("a loopback port");
+    // One per execution, and deliberately identical: what distinguishes the two
+    // runs here is the answer a human gives, not the one the model gave.
+    for _ in 0..2 {
+        provider.enqueue(Script::new(
+            SONNET,
+            Outcome::structured(json!({ "answer": "an answer" })),
+        ));
+    }
+
+    let Some(served) = harness::serve("http-trigger", &provider) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+
+    let start = |question: &str| -> String {
+        let started = app
+            .post_json("/answers", &json!({ "question": question }))
+            .expect("the trigger's route answers");
+        assert_eq!(started.status, 202, "{:?}", started.body);
+        started.json()["execution_id"]
+            .as_str()
+            .expect("an execution id")
+            .to_string()
+    };
+    let first = start("what is it?");
+    let second = start("and this one?");
+    assert_ne!(first, second, "two starts are two executions");
+
+    for execution in [&first, &second] {
+        let waiting = wait_for_pauses(&app, execution, 1);
+        assert_eq!(waiting["status"], "interrupted", "{waiting}");
+        assert_eq!(
+            waiting["execution_id"].as_str(),
+            Some(execution.as_str()),
+            "a report is about the execution it was asked for: {waiting}"
+        );
+        assert_eq!(
+            waiting["interrupts"][0]["wait_id"], "approve/0",
+            "both executions pause at the same instance path: {waiting}"
+        );
+    }
+
+    // Answering one settles that one's pause…
+    let resumed = app
+        .post_json(
+            &format!("/executions/{first}/resume"),
+            &json!({ "decision": "approve", "note": "the first" }),
+        )
+        .expect("the resume route answers");
+    assert_eq!(resumed.status, 202, "{:?}", resumed.body);
+    let finished = harness::settled(&app, &first);
+    assert_eq!(finished["status"], "completed", "{finished}");
+    assert_eq!(finished["outputs"]["decision"], "approve", "{finished}");
+
+    // …and leaves the other holding the pause it started with, un-addressed
+    // resume and all: "this execution is holding exactly one" is a question
+    // asked per execution.
+    let still = app
+        .get(&format!("/executions/{second}"))
+        .expect("the status route answers")
+        .json();
+    assert_eq!(
+        still["status"], "interrupted",
+        "the first execution's answer is not this one's: {still}"
+    );
+    assert_eq!(still["interrupts"][0]["wait_id"], "approve/0", "{still}");
+
+    let resumed = app
+        .post_json(
+            &format!("/executions/{second}/resume"),
+            &json!({ "decision": "reject", "note": "the second" }),
+        )
+        .expect("the resume route answers");
+    assert_eq!(resumed.status, 202, "{:?}", resumed.body);
+    let finished = harness::settled(&app, &second);
+    assert_eq!(finished["status"], "completed", "{finished}");
+    assert_eq!(
+        finished["outputs"]["decision"], "reject",
+        "each run ends holding the decision that was sent to it: {finished}"
+    );
+}
+
 /// A `timeout:` on the node **above** a pause does not cut the wait short
 /// (Decision D102, grammar 9.2).
 ///

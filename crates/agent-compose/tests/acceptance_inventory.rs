@@ -684,6 +684,14 @@ const COMMANDS: &[Criterion] = &[
                 "two_pauses_in_one_execution_are_addressed_by_their_instance_paths",
                 Status::Live,
             ),
+            // …and the other half of "several waits at once": two executions,
+            // each holding a pause of its own at the same instance path, which
+            // is what makes a wait belong to an execution rather than to the
+            // process.
+            (
+                "two_interrupted_executions_hold_their_pauses_and_answers_apart",
+                Status::Live,
+            ),
             // …and the promise Decision D102 makes about a wait, held one
             // construct further out than the decision's own text reaches: the
             // node that *dispatched* the pause has a budget, and it does not run
