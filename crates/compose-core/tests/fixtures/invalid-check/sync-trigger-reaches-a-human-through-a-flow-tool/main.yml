@@ -1,0 +1,57 @@
+# rule: interrupt-freedom crosses a flow-as-tool attachment (grammar 7.7 clause 4, 13.3)
+# code: sync-trigger-interrupt
+# message: the trigger `on_request` responds synchronously, and `flow.outer` reaches the `human` node `approve` of `flow.sign`
+# at: main.yml:31:3
+# label: main.yml:41:5 the `human` node is declared here
+# help: a flow exposed with `respond: sync` must be statically interrupt-free: it must reach no `human` node through its own nodes, its `flow:` nodes, its maps' dispatch targets, or the `flow.*` tools of any agent it reaches — declare `respond: async` and take the result through `callback:` instead (grammar 13.3, 7.7, PRD 5.11)
+#
+# The clause-4 edge, on the check whose consequence is loudest. `flow.sign` is
+# reachable from `flow.outer` only through `agent.a`'s `tools:` — no node names
+# it and no map dispatches to it — so a walk that stopped at nodes and dispatch
+# targets would accept a `respond: sync` trigger that stops mid-request at a
+# question nobody can answer. The runtime half of this pair is
+# `a_pause_inside_a_flow_a_model_called_is_published_and_answered_like_any_other`
+# in the acceptance suite: the same composition under an `async` trigger runs,
+# publishes the pause and takes the answer, so what this fixture pins is the
+# boundary rather than a construct that does not work.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.a:
+  model: model.m
+  prompt: Do it.
+  tools: [flow.sign]
+  output:
+    verdict: { enum: [approve, revise, escalate] }
+triggers:
+  on_request:
+    type: http
+    flow: flow.outer
+    respond: sync
+flow.sign:
+  description: Have a person sign off before the answer is used.
+  inputs:
+    text: { type: string }
+  outputs: {}
+  nodes:
+    approve:
+      human:
+        input:
+          text: { type: string }
+        output:
+          decision: { enum: [approve, reject] }
+      input: { text: "input.text" }
+  edges:
+    - { from: start, to: approve }
+    - { from: approve, to: end }
+flow.outer:
+  outputs: {}
+  nodes:
+    ask: { agent: agent.a, input: "'the goal'" }
+  edges:
+    - { from: start, to: ask }
+    - { from: ask, to: end }
