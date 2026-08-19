@@ -328,12 +328,13 @@ fn nodes_holding_a_pause(document: &Value) -> Vec<(String, String)> {
 /// A rule rather than a shape, and one a snapshot is a poor keeper of, because
 /// the entries a `human` record can wrongly reach are the ones nested runs put
 /// *outside* the flow a snapshot was written for. It is checkable without
-/// knowing which nodes a composition declares as `human`, because §3 gives two
+/// knowing which nodes a composition declares as `human`, because §3 gives three
 /// other keys the same kind of presence rule over a **different** kind of node:
-/// `inner` is a `flow:` node's and `dispatches` is a `map` node's. A node is one
-/// kind, so an entry carrying `human` beside either is an entry claiming to be
-/// two — and that is exactly the shape the mistake takes, since a pause is
-/// reached below one of those two constructs or not nested at all.
+/// `inner` is a `flow:` node's, `dispatches` is a `map` node's, and
+/// `toolDispatches` is an `agent:` node's (§5). A node is one kind, so an entry
+/// carrying `human` beside any of them is an entry claiming to be two — and that
+/// is exactly the shape the mistake takes, since a pause is reached below one of
+/// those three constructs or not nested at all.
 ///
 /// The failure it guards is a real one and is invisible to every other check
 /// here: an error raised inside a subflow or a dispatched instance travels up
@@ -356,6 +357,12 @@ fn every_human_record_is_on_the_node_that_paused(document: &Value) {
             "a `map` node's entry carries a pause that belongs to a node inside \
              an instance it dispatched, which `docs/trace.md` §3 says it never \
              does: {entry}"
+        );
+        assert!(
+            entry.get("toolDispatches").is_none(),
+            "an `agent:` node's entry carries a pause that belongs to a node \
+             inside a flow its model called, which `docs/trace.md` §3 says it \
+             never does: {entry}"
         );
     }
 }
@@ -785,15 +792,17 @@ fn an_interrupted_runs_trace_document_keeps_its_shape() {
 /// (`docs/trace.md` §3).
 ///
 /// The presence rule §3's `human` row ends on — "a node that is not a `human`
-/// node never carries it" — read at the two places a pause is reached from
+/// node never carries it" — read at the three places a pause is reached from
 /// *under* another node, which is where it can be broken without any snapshot
 /// here changing. `flow.assisted`, which
 /// [`an_interrupted_runs_trace_document_keeps_its_shape`] pins, pauses at the
 /// top level of the flow it triggered, so its document has no enclosing entry
-/// for a wait to leak onto; these two have one each. `flow.patient` wraps the
-/// pause in a `flow:` node and `flow.batch` dispatches it from a `map`, and the
-/// error that carries the interrupt out of the run passes through both on its
-/// way — which is the reason a node that held no wait can end up reporting one.
+/// for a wait to leak onto; these three have one each. `flow.patient` wraps the
+/// pause in a `flow:` node, `flow.batch` dispatches it from a `map`, and
+/// `flow.decide` reaches it through a flow a **model** called (grammar §5.4),
+/// and the error that carries the interrupt out of the run passes through each
+/// on its way — which is the reason a node that held no wait can end up
+/// reporting one.
 ///
 /// What a leak would look like to a reader is why this is a `must` rather than
 /// tidiness: one wait would be reported by N+1 entries, and the extra copies
@@ -841,6 +850,36 @@ fn a_pause_is_recorded_on_the_node_that_held_it_and_on_no_node_above_it() {
         [("flow.sign_off".to_string(), "sign".to_string())],
         "`fan` dispatched the instance that paused and held no wait of its own: \
          {held}"
+    );
+
+    // …and the third: an `agent:` node whose model called a flow that pauses.
+    // The enclosing entry here is the one that also carries the loop's own
+    // account — the dispatch record for the instance holding the question, and
+    // the model call whose `toolCalls` names it (PRD §9.20) — so it is the entry
+    // with the most to leak and the one a reader would most readily believe.
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::tool_calls(vec![ToolCall::new(
+            "sign",
+            json!({ "draft": "a drafted answer" }),
+        )]),
+    ));
+    let Some(called) = harness::run(
+        "flow-as-tool",
+        "flow.decide",
+        &[("question", "ship it?")],
+        &provider,
+    ) else {
+        return;
+    };
+    called.failed();
+    let held = called.trace_document();
+    every_human_record_is_on_the_node_that_paused(&held);
+    assert_eq!(
+        nodes_holding_a_pause(&held),
+        [("flow.sign".to_string(), "approve".to_string())],
+        "`draft` ran the loop that started the instance that paused, and held no \
+         wait of its own: {held}"
     );
 
     // The rule is an absence, so it is worth one positive beside it: the entry

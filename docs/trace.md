@@ -494,6 +494,23 @@ model as a plausible result — the failure leaves the tool and the agent node's
 own `on_error:` decides the run (grammar §9.2), which is the same shape a
 `tool.*` whose request was refused has.
 
+One failure is **not** the agent node's `on_error:`'s, and it is the record a
+reader is likeliest to misread: a `human` node inside the flow the model called,
+on a run with no way to answer it. A pause leaves ahead of every strategy
+(grammar §8.7), so nothing decides it — but the record the call had already
+filed stays on the entry, reading `outcome: "failed"` with a `HumanInterrupt`
+`error` while the document's `status` is `"interrupted"`. Read that pair the way
+§9 reads the aborting entry it sits on: the instance did not go wrong, it is
+parked at a question nobody could answer, and the document's `status` — never
+the record's outcome — is what says which. The `toolCalls` entry naming this
+record is on the entry's `models` beside it and reads the same way (§7.3, §9).
+
+The sibling carrier does not file one at that moment, and the asymmetry is an
+invariant's rather than an accident: PRD §9.20 makes every instance a **model**
+started findable as a dispatch record, so a flow-as-tool call files its record
+whichever way it ended, while a `map`'s records are the outcomes that
+**resolved** (§5.2) and a pause resolves none.
+
 ### 5.2 A map node that failed
 
 A map node that failed still dispatched, and its entry still carries what it
@@ -671,7 +688,7 @@ cost of one indirection for the part that is a run of its own.
 |---|---|---|---|
 | `name` | string | always | The tool the model called, spelled as the request offered it — a `tool.*`'s local name, a `flow.*`'s (grammar §5.4), or a synthesized store tool's (grammar §11.5). |
 | `target` | string | when the agent offers a tool of that name | The component behind the name, as a typed address (grammar §2.2). Absent on the one call that has none: a name the agent does not offer, which is a model answering with a tool that was never on the wire. That call is recorded and then ends the node. |
-| `outcome` | `"completed"` \| `"failed"` | always | Whether the loop handed the model a result. `"failed"` is a call that ended the node — its failure left the tool, and the node's own `on_error:` is what decided the run (grammar §9.2) — so it is also the record that says the model saw nothing back. |
+| `outcome` | `"completed"` \| `"failed"` | always | Whether the loop handed the model a result. `"failed"` is a call that ended the node — its failure left the tool, and the node's own `on_error:` is what decided the run (grammar §9.2) — so it is also the record that says the model saw nothing back. §5.1 names the one failure no `on_error:` decided: a `human` node inside the flow the call ran, on a run that could not answer it. |
 | `instance` | string | flow-as-tool calls that started an instance | The **link**: the subflow instance this call ran, named exactly as the dispatch record carrying that instance's trace names itself in `idempotencyKey`, so the join between the two is string equality (§5, §8). Absent on every call that instantiated nothing — a `tool.*`, a store tool — and on a flow-as-tool call refused before an instance existed, which is arguments that failed the flow's own `inputs:`. |
 | `result` | any | `"completed"` flow-as-tool calls, with `instance` | **The result the model saw**: the value the loop handed back, which for this tool is the instance's declared `outputs:` (grammar §5.4). PRD §9.20 asks the tool-call entry to record it, and it is the one tool result this format carries — §11 is where the rule it is carved out of is stated, and where the other two tool surfaces are left under it. On exactly the calls `instance` is on: the two are decided by the same test and are two halves of one account, so a reader that has one has the other. Absent on a `"failed"` call, where the absence is the record — the failure left the tool and the model saw nothing. |
 | `error` | string | `"failed"` | What went wrong, in §3's `<error name>: <message>` shape. |

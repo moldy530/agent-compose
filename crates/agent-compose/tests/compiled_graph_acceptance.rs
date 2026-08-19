@@ -8070,6 +8070,126 @@ fn run_reports_the_pause_it_cannot_answer_and_exits_on_its_own_code() {
     );
 }
 
+/// A pause a `run` cannot answer leaves the tool loop's whole story on the
+/// agent node's entry.
+///
+/// The pause the previous test reports arrives at a `human` node the flow's own
+/// graph reaches. This one arrives inside a flow a **model** called, which is
+/// the composition `serve` answers in
+/// `a_pause_inside_a_flow_a_model_called_is_published_and_answered_like_any_other`
+/// and which a one-shot run has no way to answer — so the agent node's entry is
+/// written by the interrupt path rather than by any of the outcomes
+/// `on_error:` decides (grammar 8.7).
+///
+/// What that entry owes is PRD §9.20's invariant, and it is the reason this is a
+/// test rather than a variation: the loop's story is complete inside the
+/// `ModelCall`, at the cost of one indirection. A `toolDispatches` record whose
+/// `ModelCall` was dropped on the way out would leave the instance findable and
+/// the call that started it nowhere — a dispatch record no tool call names, on
+/// an entry that also says the agent never called a provider. `docs/trace.md` §9
+/// states the same thing as a presence rule: `stores`, `models`, `dispatches`,
+/// `toolDispatches` and `inner` reach an aborting entry like any other.
+#[test]
+fn a_pause_a_run_cannot_answer_leaves_the_loops_calls_on_the_agent_nodes_entry() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::tool_calls(vec![ToolCall::new(
+            "sign",
+            json!({ "draft": "a drafted answer" }),
+        )]),
+    ));
+
+    let Some(run) = harness::run(
+        "flow-as-tool",
+        "flow.decide",
+        &[("question", "ship it?")],
+        &provider,
+    ) else {
+        return;
+    };
+    let said = run.failed();
+    assert_eq!(
+        run.output.status.code(),
+        Some(3),
+        "a pause below an agent node is still a pause: {said}"
+    );
+
+    let document = run.trace_document();
+    assert_eq!(document["status"], "interrupted", "{document}");
+    let entries = run.entries("draft");
+    let [entry] = entries.as_slice() else {
+        panic!("`draft` ran once: {document}");
+    };
+    assert_eq!(entry["outcome"], "failed", "{entry}");
+    assert!(
+        entry["human"].is_null(),
+        "the wait is the child instance's, not this node's: {entry}"
+    );
+
+    // Half one: the instance is findable, with the whole of what it did before
+    // it asked.
+    let dispatched = entry["toolDispatches"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the instance the model started is reported: {entry}"));
+    let [record] = dispatched.as_slice() else {
+        panic!("one call, one record: {entry}");
+    };
+    assert_eq!(record["target"], "flow.sign", "{record}");
+    assert_eq!(
+        record["outcome"], "failed",
+        "the call handed the model nothing back, which is what `failed` says \
+         here; the document's `status` is what says the instance is parked \
+         rather than broken (`docs/trace.md` §5.1): {record}"
+    );
+    let key = record["idempotencyKey"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a dispatch record names its instance: {record}"));
+    assert!(
+        key.ends_with("/draft/0/sign/0"),
+        "…under the frame grammar 9.4 gives the call: {record}"
+    );
+    let paused = record["inner"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the instance's trace is on its record: {record}"))
+        .iter()
+        .find(|one| one["node"] == "approve")
+        .cloned()
+        .unwrap_or_else(|| panic!("the `human` node has an entry: {record}"));
+    assert!(paused["human"]["pausedAt"].is_string(), "{paused}");
+    assert!(
+        paused["human"]["settled"].is_null(),
+        "nothing answered it: {paused}"
+    );
+
+    // Half two — the half an interrupt used to drop: the call that started it.
+    let models = entry["models"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the loop's model call is on the entry: {entry}"));
+    let [call] = models.as_slice() else {
+        panic!("the loop made one call and the pause ended it: {entry}");
+    };
+    let asked = call["toolCalls"]
+        .as_array()
+        .unwrap_or_else(|| panic!("…and it records what it asked for: {call}"));
+    let [tool_call] = asked.as_slice() else {
+        panic!("one tool call: {call}");
+    };
+    assert_eq!(tool_call["name"], "sign", "{tool_call}");
+    assert_eq!(tool_call["target"], "flow.sign", "{tool_call}");
+    assert_eq!(tool_call["outcome"], "failed", "{tool_call}");
+    assert_eq!(
+        tool_call["instance"], record["idempotencyKey"],
+        "the indirection PRD §9.20 promises: the call links to the record by \
+         string equality, on the entry of a run that ended holding a question: \
+         {entry}"
+    );
+    assert!(
+        tool_call["result"].is_null(),
+        "the model saw no result: {tool_call}"
+    );
+}
+
 /// Poll the status route until it reports `status`, and answer with that report.
 ///
 /// [`harness::settled`] stops at the three states a run can rest in; this is for

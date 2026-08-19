@@ -638,6 +638,15 @@ const COMMANDS: &[Criterion] = &[
                 "run_reports_the_pause_it_cannot_answer_and_exits_on_its_own_code",
                 Status::Live,
             ),
+            // …and the same exit taken from under an **agent** node, which is
+            // the one place the interrupt path has a trace entry to lose: a
+            // pause inside a flow the model called leaves the loop's dispatch
+            // records and the model calls that name them on one entry
+            // (PRD §9.20, `docs/trace.md` §9).
+            (
+                "a_pause_a_run_cannot_answer_leaves_the_loops_calls_on_the_agent_nodes_entry",
+                Status::Live,
+            ),
         ],
     },
     // The criterion's three verbs, plus what the app does with a request and

@@ -5945,6 +5945,20 @@ export async function runNode(
     // same error carries a pause raised below this node up past every enclosing
     // `flow:` and `map` node, none of which held one (see [`pauseOf`]).
     const paused = pause ?? pauseOf(error, site);
+    // Read off the collector the way `stores` and `toolDispatches` below are,
+    // and for their reason: whichever way this node ended, `modelCalls` holds
+    // every call it made (PRD 5.9). The local is preferred where there is one,
+    // because that is the ordering the node decided — the answer's, or the
+    // snapshot the `catch` below takes — and the one path that reaches here
+    // with calls made and no local set is a **pause**: an interrupt is
+    // re-thrown ahead of `on_error:` (grammar 8.7), before the `catch` gets to
+    // the line that snapshots them. Its entry would otherwise say the agent
+    // node called no model at all, and — since a `flow.*` in `tools:` may hold
+    // the `human` node that paused (grammar 5.4) — would carry a
+    // `toolDispatches` record with no tool call naming it, which is exactly the
+    // indirection PRD §9.20 promises is always there (`docs/trace.md` §7.3,
+    // §9).
+    const called = models ?? (modelCalls.length === 0 ? undefined : settled(modelCalls));
     return {
       step,
       flow: descriptor.flow,
@@ -5961,7 +5975,7 @@ export async function runNode(
       ...(toolDispatched.length === 0 ? {} : { toolDispatches: [...toolDispatched] }),
       ...(held === undefined ? {} : { inner: held }),
       ...(storeRecords.length === 0 ? {} : { stores: [...storeRecords] }),
-      ...(models === undefined ? {} : { models }),
+      ...(called === undefined ? {} : { models: called }),
       ...(paused === undefined ? {} : { human: paused }),
       error: describe(error),
     };
