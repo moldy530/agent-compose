@@ -2458,27 +2458,33 @@ record.
 A `run` with **neither** — standard input is not a terminal, or
 `AGENT_COMPOSE_INTERACTIVE=0` forces it — has no way to answer, so a run that
 reaches a pause reports it and exits on a code of its own rather than waiting or
-carrying on. So does one whose terminal goes away: standard input ending
-withdraws the surface, and every pause still waiting becomes that same outcome.
+carrying on. So does one whose terminal goes away.
 
-Three properties of the terminal surface are its own, because a stream of typed
-lines is not a request. The framing is **one JSON value per line** — a value
-spanning lines has no terminator a prompt could recognize without either guessing
-or hanging on a malformed one — and a line that is not JSON, or that the
-`output:` refuses, re-prompts. An execution holding more than one pause is asked
-**one at a time**, and each question is the **lowest-id pause open when it is
-asked** — §13.3's status-route order, so pauses waiting together are asked in the
-order the composition fixes rather than the one the scheduler happened to park
-them in. It is that rather than a total order over the run's pauses because a
-question already on the screen is not taken back: a pause that opens while one is
-being asked is asked after it, whatever its id sorts as. And a `timeout:` keeps
-running while the prompt is on the screen: an expiry routes through `on_timeout:`
-exactly as it would under `serve`, taking the question with it.
+Four details of the terminal surface are its own, because a stream of typed lines
+is not a request, and PRD §9.21 fixes the same four. The framing is **one JSON
+value per line** — a value spanning lines has no terminator a prompt could
+recognize without either guessing or hanging on a malformed one — and a line that
+is not JSON, or that the `output:` refuses, re-prompts. An execution holding more
+than one pause is asked **one at a time**, and each question is the **lowest-id
+pause open when it is asked** — §13.3's status-route order, so pauses waiting
+together are asked in the order the composition fixes rather than the one the
+scheduler happened to park them in. It is that rather than a total order over the
+run's pauses because a question already on the screen is not taken back: a pause
+that opens while one is being asked is asked after it, whatever its id sorts as.
 `AGENT_COMPOSE_INTERACTIVE` is what a *script* answers a pause with, and its only
 values are `1` and `0`; anything else is refused before the run starts, as a
 command that could not be run rather than a setting nobody read
 ([D50](#d50-unknown-keys-are-errors-everywhere-except-plugin-config-objects)).
-The emitted `README.md` documents the whole loop.
+And standard input **ending** withdraws the surface: every pause still waiting,
+and every one the run opens after it, becomes the same outcome a run with no
+surface has, so a script that answered too few questions ends where it stood
+instead of parking for ever.
+
+A `timeout:` is not one of the four. It keeps running while the prompt is on the
+screen exactly as it would under `serve`, and an expiry routes through
+`on_timeout:` there and then — taking the question with it, so the prompt is
+withdrawn and the next pause is asked. The emitted `README.md` documents the
+whole loop.
 
 ```yaml
 approve:
