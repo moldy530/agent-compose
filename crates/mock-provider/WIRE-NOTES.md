@@ -497,6 +497,41 @@ would name a member no answer here has.
 *If wrong*: a test scripting the missing reason is refused loudly, with the set
 in the message; nothing is served that a provider would not.
 
+### 18. How a tool result says it is an **error**, on each surface
+
+A compiled graph answers a tool call the tool's contract refused by handing the
+model the refusal rather than ending the node (grammar D119), so it sends a tool
+result that is not a result. The two surfaces spell that differently, and one of
+them does not spell it at all:
+
+| surface | how the refusal travels |
+|---|---|
+| Messages | the ordinary `tool_result` block with `is_error: true` beside its `content` — the key this server already accepts as an optional boolean |
+| Chat Completions | the ordinary `tool` role message, whose text *is* the refusal. There is nothing to set: the message is closed to `role`, `content` and `tool_call_id` |
+
+*What is certain*: that the block or message has to be **sent at all**. Both
+surfaces refuse a request that leaves a `tool_use` id or a `tool_call_id`
+unanswered, and this server checks both directions (`check_messages` in
+`src/anthropic.rs`, `an_orphaned_tool_message_is_refused` in `src/openai.rs`) —
+so a runtime that answered only the calls that worked would be caught here on its
+next request rather than in production.
+
+*What is assumed*, and it is one thing: that a **`tool_use` naming a tool the
+current request's `tools` does not declare stays legal in the history.** It is
+reachable exactly once — a model answered with a name the agent never offered,
+the loop refused it, and the assistant turn carrying that `tool_use` is replayed
+because the Messages API requires a turn back unaltered. Both APIs are documented
+to require `tools` to be *present* when the messages carry tool blocks, which is
+the rule this server enforces; neither is documented to re-validate the names in
+history against it. The alternative would be for a client to drop or rewrite the
+model's own turn, which the Messages API forbids for a different reason
+(`thinking` blocks must come back unaltered beside the `tool_use` they preceded).
+
+*If wrong*: the first live run in which a model invents a tool name answers 400
+on the request *after* the refusal, and the fix is this server growing the same
+check plus a codegen decision about which turn to send. Nothing about a correct
+composition changes: every other request carries only names the agent offered.
+
 ---
 
 ## Accepted-key lists are curated, not exhaustive

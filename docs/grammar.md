@@ -906,9 +906,10 @@ instance's `outputs:` are the result the model is handed. Six properties fix wha
 that instance is, and each is another section's rule reaching this call site:
 
 - **its arguments are the flow's `inputs:`**, checked against that schema before
-  anything is instantiated. Arguments the schema refuses fail the *agent node* —
-  the same event, reported the same way, as arguments a `tool.*` or a synthesized
-  store tool refuses (§6, §11.5) — and §9's chain decides what happens next;
+  anything is instantiated. Arguments the schema refuses **return to the model**
+  as an error tool result, so it can call again — the same event, answered the
+  same way, as arguments a `tool.*` or a synthesized store tool refuses (§6,
+  §11.5, Decision [D119](#d119-a-refused-tool-call-returns-to-the-model-and-a-failed-one-ends-the-node));
 - **its instance path** is the agent node's own frame plus `<tool name>/<call
   ordinal>` (§9.4), so a store write inside it derives a key no other call of
   this loop derives;
@@ -925,12 +926,26 @@ that instance is, and each is another section's rule reaching this call site:
   boundary, as it does at a `flow:` node (§9.2) — with §8.7's exemption intact,
   since a `human` node below still holds that budget still (D102).
 
-A call that fails — the instance failed, or it reached quiescence without an
+A call that **fails** — the instance failed, or it reached quiescence without an
 output — fails the agent node. It is never answered with a plausible result, and
 never quietly dropped: what the model asked for did not happen, and a run in
 which it silently appeared to would be the one outcome PRD 5.3's "the runtime
-decides every transition" is written against. `docs/trace.md` §5 and §7.3 are
-where the call, the instance and the link between them are recorded.
+decides every transition" is written against. That is the other half of D119's
+split, and the line between the two is what the model could do about it: a
+contract that refuses a *call* is answered by calling differently, and an
+instance that ran and failed is not.
+
+A call that is **refused** — its arguments, above, or a name this agent does not
+offer — is handed back as an error tool result and costs the loop one of its
+`max_tool_iterations` (D51, §5), because the correction is another model call.
+A model that never corrects therefore spends the bound and fails the node exactly
+as one that never answered does. A refused call still spends its **call ordinal**
+(§9.4): the model made the call, so the frame counts it, and an instance path is
+not moved by a refusal being inserted before it.
+
+`docs/trace.md` §5 and §7.3 are where the call, the instance and the link between
+them are recorded — a refused call under `outcome: "refused"`, carrying the very
+text the model was handed.
 
 ---
 
@@ -939,6 +954,21 @@ where the call, the instance and the link between them are recorded.
 One definition, two usage surfaces: attached to an agent (LLM-discovered,
 nondeterministic) and invoked as a `function` node (graph-invoked, deterministic).
 The definition is shared; validation is surface-specific (PRD 5.5).
+
+**Where the arguments come from decides what a refusal is.** `input:` is parsed
+before the implementation runs on both surfaces, and the two differ in who has to
+hear about a mismatch. At a `function:` node the arguments are the composition's,
+checked field-by-field at compile time (§8.4), so a runtime mismatch is the
+graph's own failure and §9's chain decides the run. Attached to an agent the
+arguments are a **model's**, so a schema that refuses them is answered back to
+the model as an error tool result and the tool loop turns again — the same rule a
+`flow.*` (§5.4) and a synthesized store tool (§11.5) follow, stated once in
+Decision
+[D119](#d119-a-refused-tool-call-returns-to-the-model-and-a-failed-one-ends-the-node).
+What the tool's **implementation** then does is nobody's contract: an `exec:`
+that exits outside its accepted list, an `http:` whose response a non-2xx rule
+refuses, or a result the tool's own `output:` refuses, fails the node on both
+surfaces alike. No rephrasing of a call fixes any of those.
 
 ```yaml
 tool.web_search:
@@ -2149,7 +2179,9 @@ lookup:
 - `function:` takes a `tool.*` reference.
 - `input:` values are CEL and are checked field-by-field against the tool's
   `input` schema (arity and types), unlike agent-attached tool use where the
-  model chooses arguments at runtime.
+  model chooses arguments at runtime — which is also why a mismatch here fails
+  the node rather than being answered back to anybody (§6, Decision
+  [D119](#d119-a-refused-tool-call-returns-to-the-model-and-a-failed-one-ends-the-node)).
 
 ### 8.5 `flow`
 
@@ -3312,6 +3344,16 @@ calls — PRD 5.8):
 `<name>` is the store's local name (`store.user_prefs` → `user_prefs_get`). A
 synthesized tool name that collides with an attached `tool.*`/`flow.*` tool name
 is a compile error.
+
+Each tool's arguments are its row of §11.4 with the expressions replaced by what
+the model supplies, and they are held to that schema before the store sees them.
+A call the schema refuses — a `top_k` outside `1..=100`, a `value` the store's
+`value_schema` does not admit — is **returned to the model** as an error tool
+result, the way it is at the other two tool surfaces (§5.4, §6, Decision
+[D119](#d119-a-refused-tool-call-returns-to-the-model-and-a-failed-one-ends-the-node)),
+and reaches no backend: a refused call leaves no store record. A **backend**
+that could not answer is the other half of that split and fails the agent node,
+with §9's chain deciding the run.
 
 ---
 
@@ -5956,6 +5998,84 @@ keeping the execution alive until every detached instance quiesces would make a
 fire-and-forget dispatch delay the enclosing run — precisely what rule 7's third
 clause forbids. The construct an author reaching for it wants is a *joined*
 dispatch, which is one key away. *PRD 5.5, 5.6, 5.11, G3.*
+
+### D119. A refused tool call returns to the model, and a failed one ends the node
+
+An agent's tool loop divides what can go wrong with a tool call in two, and the
+line is **what the model could do about it**.
+
+A call the tool's declared contract **refuses** is returned to the model as an
+error tool result, and the loop turns again. Two things are refusals, and they
+are refusals at every surface a tool can be attached from:
+
+- **arguments the tool's own schema does not admit** — a `tool.*`'s `input:`
+  (§6), a `flow.*`'s `inputs:` (§5.4), or a synthesized store tool's row of
+  §11.4 (§11.5). One rule over all three, because §5.4 makes "attached as a tool"
+  mean one thing and a surface answering this differently would make it mean two;
+- **a call naming a tool the agent was not offered**, which is the same event
+  with the contract missing entirely.
+
+Everything else is the tool's **execution** failing — an `exec:` that exits
+outside its accepted list, an `http:` whose response a non-2xx rule refuses, a
+child flow instance that failed or quiesced without an output, a store backend
+that could not answer, a result the tool's own `output:` refuses — and fails the
+agent node, with §9's chain deciding the run exactly as before.
+
+**Rationale**. A tool call is the one place a *model* proposes work, and the two
+kinds of failure are not alike from where it sits. A schema refusal is a
+statement about the call: the model chose the arguments, it can choose others,
+and the composition's contract is intact either way — so ending the run over it
+throws away a graph that was working because a model made a correctable mistake,
+which is not what §9's `retry:`/`on_error:` chain is for. An execution failure is
+a statement about the world: the command exited 2, the endpoint answered 500, the
+child flow failed. Handing that back would ask the model to route around a broken
+system, which is precisely the decision PRD 5.3 takes away from models — "the
+runtime decides every transition" — and the ladders in §9 are the declared way an
+author says what should happen instead.
+
+The narrower alternatives were both considered and are worse. Failing the node on
+every refusal — the rule this decision replaces — makes a composition's
+reliability depend on a model never mis-typing an argument, and pushes authors
+toward loosening schemas until nothing is checked, which costs the constrain ==
+parse property PRD §9.16 is built on. Bouncing *everything* would leave the model
+retrying an endpoint that is down, invisibly, until the loop's bound ran out,
+with the real failure buried in a tool result no trace field carries as a node
+error.
+
+**Termination is unchanged, and that is what makes the bounce affordable.** A
+correction is another model call, so a bounce costs one of the agent's
+`max_tool_iterations` ([D51](#d51-max_tool_iterations-bounds-the-intra-agent-tool-loop),
+§5) — the bound that already made the loop statically terminating, with no second
+counter to reason about. Several refusals in one answer are corrected together
+and cost one iteration between them, which is the honest reading of a bound that
+counts *model calls*: the model gets one turn to fix everything it got wrong.
+A model that never corrects spends the bound and fails the node, and that failure
+**names the last refusal it was holding** — without it, a loop that ran out
+because the model kept calling wrongly and a loop that ran out because the model
+kept calling correctly and never answered produce the same sentence.
+
+Three consequences are stated where a reader meets them rather than derived:
+
+- **every call of an answer is answered.** Both wire surfaces refuse a request
+  that leaves a `tool_use` id or a `tool_call_id` unanswered, so a refusal does
+  not stop the loop over the calls of one answer — the calls after it still run.
+  A failure still does stop it, because the node is ending;
+- **a refused call spends its call ordinal** (§9.4). The model made the call, and
+  a frame counted from the calls that *succeeded* would move every instance path
+  behind a refusal — turning a model's mistake into a change of idempotency key
+  for work that has nothing to do with it;
+- **the refusal names what a diagnostic would name** — the tool, the failing
+  field, the constraint, and an excerpt of the offending value (PRD G3). It is
+  one sentence written for two readers: the model, which has to act on it, and
+  the person reading `ToolCallRecord.error`, which carries it verbatim. Quoting
+  the arguments back costs nothing `docs/trace.md` §11 was protecting, because
+  the party being shown them is the party that composed them.
+
+The trace records a refused call under `outcome: "refused"` rather than reusing
+`"failed"`, which cost a `trace_version` bump: version `3` defines `"failed"` as
+a call that ended the node and whose answer the model never saw, and both halves
+are false of a refusal. `docs/trace.md` §10.3.3 is that reasoning in full.
+*PRD 5.1, 5.2, 5.3, 5.8, §9.14, §9.22, G3.*
 
 ---
 
