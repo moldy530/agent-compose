@@ -38,10 +38,19 @@
 //! # How the declarations are read
 //!
 //! By line, over the emitted `src/runtime.ts`, which is a formatted file this
-//! repository owns: an `export interface` header, a body of doc comments and
-//! one-line members, a closing brace. A body line that is neither a comment nor
-//! a member the reader understands is kept as **unreadable**, and a declaration
-//! the format actually reaches carrying one is a failure — see [`reachable`].
+//! repository owns: an `interface` header, a body of doc comments and one-line
+//! members, a closing brace. A body line that is neither a comment nor a member
+//! the reader understands is kept as **unreadable**, and a declaration the
+//! format actually reaches carrying one is a failure — see [`reachable`].
+//!
+//! `export` is **not** part of the test. What makes a type part of this format
+//! is being reachable from the envelope, and a record type the runtime happens
+//! to declare without exporting — `src/runtime.ts` already declares several
+//! unexported interfaces for its own use — would otherwise be absent from the
+//! map, skipped by [`reachable`]'s walk rather than followed, and have none of
+//! its fields held to `docs/trace.md`: an undocumented public surface with CI
+//! green, which is the precise drift this file exists to catch. Reading every
+//! declaration and letting reachability decide is what closes that.
 //! The runtime declares plenty this format does not carry (a method signature on
 //! `ResultSchema`, for one), so refusing every shape outright would fail on
 //! declarations that have nothing to do with a trace; refusing them where they
@@ -80,7 +89,7 @@ fn specification() -> String {
 /// without anybody remembering to add it here.
 const ROOTS: &[&str] = &["TraceDocument", "TraceEntry"];
 
-/// One exported declaration of the emitted runtime.
+/// One type declaration of the emitted runtime.
 #[derive(Clone)]
 struct Declaration {
     /// The member names it declares, nested inline object types included.
@@ -94,14 +103,18 @@ struct Declaration {
     unreadable: Vec<String>,
 }
 
-/// Every `export interface` and `export type` in `source`, by name.
+/// Every `interface` and `type` declaration in `source`, by name — whether or
+/// not the runtime exports it (see this file's header).
 fn declarations(source: &str) -> BTreeMap<String, Declaration> {
     let mut found: BTreeMap<String, Declaration> = BTreeMap::new();
     let lines: Vec<&str> = source.lines().collect();
     let mut at = 0usize;
     while at < lines.len() {
         let line = lines[at];
-        if let Some(header) = line.strip_prefix("export interface ") {
+        if let Some(header) = line
+            .strip_prefix("export interface ")
+            .or_else(|| line.strip_prefix("interface "))
+        {
             let (name, extends, body_at) = interface_header(header, at);
             let mut declaration = Declaration {
                 fields: Vec::new(),
@@ -126,11 +139,12 @@ fn declarations(source: &str) -> BTreeMap<String, Declaration> {
             }
             assert!(
                 at < lines.len(),
-                "`export interface {name}` has no closing brace in the first column"
+                "`interface {name}` has no closing brace in the first column"
             );
             found.insert(name, declaration);
         } else if let Some(header) = line
             .strip_prefix("export type ")
+            .or_else(|| line.strip_prefix("type "))
             // `export type { … };` re-exports names another module declared; it
             // introduces nothing, and the two are told apart by the brace.
             .filter(|header| !header.trim_start().starts_with('{'))
@@ -144,7 +158,7 @@ fn declarations(source: &str) -> BTreeMap<String, Declaration> {
             }
             let (name, body) = text
                 .split_once('=')
-                .unwrap_or_else(|| panic!("`export type {header}` has no `=`"));
+                .unwrap_or_else(|| panic!("`type {header}` has no `=`"));
             let name = name.trim().to_string();
             found.insert(
                 name,
@@ -167,7 +181,7 @@ fn interface_header(header: &str, at: usize) -> (String, String, usize) {
     let header = header.trim_end();
     let open = header
         .strip_suffix('{')
-        .unwrap_or_else(|| panic!("`export interface {header}` does not open its body on one line"))
+        .unwrap_or_else(|| panic!("`interface {header}` does not open its body on one line"))
         .trim();
     let (name, extends) = match open.split_once(" extends ") {
         Some((name, extends)) => (name, extends),
@@ -295,7 +309,7 @@ fn reachable(source: &str) -> BTreeMap<String, Declaration> {
             continue;
         }
         let Some(declaration) = all.get(&name) else {
-            panic!("`{name}` is named by the trace format but is not exported by the runtime");
+            panic!("`{name}` is named by the trace format but is not declared by the runtime");
         };
         assert!(
             declaration.unreadable.is_empty(),
@@ -935,6 +949,76 @@ export type Vocabulary = "left" | "right";
     let vocabulary = read.get("Vocabulary").expect("the alias was read");
     assert_eq!(vocabulary.literals, ["left", "right"]);
     assert!(vocabulary.fields.is_empty());
+}
+
+/// A record type the envelope reaches is inventoried whether or not the runtime
+/// exports it.
+///
+/// `export` says who outside the module may name a type; it says nothing about
+/// whether a trace carries it. A reader that keyed on the keyword would drop an
+/// unexported record out of the map, and [`reachable`] follows only what the map
+/// holds — so the walk would neither refuse it nor follow it, and every field it
+/// declares would ship on a versioned public surface with no row in
+/// `docs/trace.md` and CI green. `src/runtime.ts` declares unexported interfaces
+/// already (`ResultIssue` among them), so the shape below is one refactor away
+/// rather than hypothetical: retyping a member as a locally-declared record is
+/// an ordinary thing to do, and it must not take the record out of the
+/// inventory.
+#[test]
+fn a_record_the_envelope_reaches_is_inventoried_though_the_runtime_does_not_export_it() {
+    let source = r#"
+export interface TraceDocument {
+  readonly status: "completed";
+  readonly entries: readonly TraceEntry[];
+}
+
+export interface TraceEntry {
+  readonly outcome: "completed";
+  readonly budget?: Budget;
+}
+
+interface Budget {
+  readonly key: string;
+  readonly used: number;
+}
+"#;
+
+    let reached: BTreeSet<String> = reachable(source).into_keys().collect();
+    assert!(
+        reached.contains("Budget"),
+        "an unexported record the envelope reaches is part of the format: {reached:?}"
+    );
+
+    // …and is held to the document like any other, which is the half that would
+    // have been silently skipped: no section introduces `Budget`, so both of its
+    // fields are reported undocumented.
+    let document = "\
+## 2. The envelope
+
+`TraceDocument`.
+
+| field | meaning |
+|---|---|
+| `status` | whether the run produced an answer, `\"completed\"` or not |
+| `entries` | every entry the run recorded |
+
+## 3. Entries
+
+`TraceEntry`.
+
+| field | meaning |
+|---|---|
+| `outcome` | `\"completed\"`, and the rest |
+| `budget` | what the edge's budget had spent |
+";
+    assert_eq!(
+        undocumented_fields(document, &reachable(source)),
+        [
+            "Budget.key (no single section of the document introduces `Budget`)",
+            "Budget.used (no single section of the document introduces `Budget`)",
+        ],
+        "the fields of an unexported record are checked against `docs/trace.md` too"
+    );
 }
 
 /// …and an `extends` clause is followed, which is the one reference that is not

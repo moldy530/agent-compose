@@ -47,7 +47,10 @@
 //! or the `"$default"` route sigil. Those are held by
 //! `tests/compiled_graph_acceptance.rs`, which asserts about them by name rather
 //! than by shape — the two files divide the surface, and a run added here is
-//! worth adding when a shape has no home in either.
+//! worth adding when a shape has no home in either. The first two are reached
+//! here all the same, by the §3 rule below rather than by a snapshot: a rule
+//! about a field on every entry is not kept by pinning the entries that happen
+//! to be in a golden.
 //!
 //! Each goes through `agent-compose run`, so what is snapshotted is the file a
 //! reader is handed rather than an in-process value a test could shape for
@@ -55,15 +58,20 @@
 //!
 //! # …and the promises a snapshot cannot make
 //!
-//! Four claims of `docs/trace.md` are about a *rule* rather than about a shape,
+//! Five claims of `docs/trace.md` are about a *rule* rather than about a shape,
 //! and each is asserted directly, because a snapshot of a document that happens
 //! to satisfy a rule would go on passing after the rule was dropped: that the
 //! third delivery surface carries the version beside its trace **and only
 //! beside it** (§1), that both halves of a routing record are in declaration
 //! order even where a router cannot decide in that order (§4), that a write's
 //! `idempotencyKey` and `deduped` are a store-op **node**'s and not an agent
-//! tool's (§6), and that an activity's failure names the `${ENV}` reference its
-//! author wrote rather than the value it resolved to (§11.1).
+//! tool's (§6), that an activity's failure names the `${ENV}` reference its
+//! author wrote rather than the value it resolved to (§11.1), and that
+//! `TraceEntry.error` is `<error name>: <message>` on **every** entry that
+//! carries it (§3) — which is three sites of the emitted runtime rather than
+//! one, so [`document`] holds every snapshot run to it and
+//! [`a_failure_a_run_survived_carries_its_class_like_one_that_ended_a_run`]
+//! reaches the two no snapshot here does.
 //!
 //! The §6 pair rides on the store run rather than on a sixth run of its own: a
 //! presence rule is a claim about a record the snapshot already holds, and the
@@ -101,6 +109,7 @@ const HAIKU: &str = "claude-haiku-4-5";
 ///    instead of as a value that changes every run.
 fn document(run: &harness::Run) -> String {
     let held = run.trace_document();
+    every_entrys_error_is_in_one_shape(&held);
     let execution = held["execution_id"]
         .as_str()
         .unwrap_or_else(|| panic!("the trace document names its execution: {held}"))
@@ -140,6 +149,66 @@ fn redact(value: &mut Value, execution: &str, project: &str) {
             }
         }
         _ => {}
+    }
+}
+
+/// Every `TraceEntry.error` in `document`, node-qualified, nested entries
+/// included.
+///
+/// An entry is told from the other records by `traversal`, which only an entry
+/// carries: a dispatch record has an `outcome` and an `error` of its own, and it
+/// is not what §3 speaks about.
+fn entry_errors(document: &Value) -> Vec<(String, String)> {
+    let mut found: Vec<(String, String)> = Vec::new();
+    walk_entry_errors(document, &mut found);
+    found
+}
+
+fn walk_entry_errors(value: &Value, found: &mut Vec<(String, String)>) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                walk_entry_errors(item, found);
+            }
+        }
+        Value::Object(fields) => {
+            let node = fields.get("node").and_then(Value::as_str);
+            let error = fields.get("error").and_then(Value::as_str);
+            if let (true, Some(node), Some(error)) = (fields.contains_key("traversal"), node, error)
+            {
+                found.push((node.to_string(), error.to_string()));
+            }
+            for held in fields.values() {
+                walk_entry_errors(held, found);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `docs/trace.md` §3: `TraceEntry.error` is `<error name>: <message>` on
+/// **every** entry that carries it.
+///
+/// A rule rather than a shape, so a snapshot cannot hold it: a document whose
+/// entries happen to satisfy the rule goes on matching its snapshot after the
+/// rule is dropped. The field is written at three separate sites of the emitted
+/// runtime — the entry a failure aborted the run at, the entry a `fallback:`
+/// routed around, and the entry `on_error: skip` absorbed — and it is still one
+/// field, so a reader handed it should not have to know which of the three wrote
+/// it to know what it is holding.
+fn every_entrys_error_is_in_one_shape(document: &Value) {
+    for (node, error) in entry_errors(document) {
+        let named = error.split_once(": ").is_some_and(|(class, rest)| {
+            !class.is_empty()
+                && !rest.is_empty()
+                && class.chars().all(|c| c.is_alphanumeric() || c == '_')
+        });
+        assert!(
+            named,
+            "`{node}`'s entry carries an `error` that does not open with the class \
+             that raised it, which `docs/trace.md` §3 says every entry's does: \
+             {error:?}"
+        );
     }
 }
 
@@ -455,17 +524,79 @@ fn a_failed_activity_names_its_env_reference_rather_than_the_resolved_value() {
         .unwrap_or_else(|| panic!("a skipped node's entry says what failed: {}", tally[0]));
     assert_eq!(
         error,
-        "flow.pipeline node `tally` failed: Error: `${OPS_BIN}/false` exited 1, which \
-         is outside `expect_exit: [0]`",
-        "the message quotes the command as the composition spells it"
+        "NodeFailure: flow.pipeline node `tally` failed: Error: `${OPS_BIN}/false` \
+         exited 1, which is outside `expect_exit: [0]`",
+        "the message quotes the command as the composition spells it, in the one \
+         `<error name>: <message>` shape §3 gives the field on every entry that \
+         carries it — a failure the node absorbed reads exactly as one that ended \
+         the run does"
     );
 
     // The harness resolves `OPS_BIN` to `/bin`, so the command really ran; what
     // the document must not hold is that value.
+    every_entrys_error_is_in_one_shape(&run.trace_document());
     let document = run.trace_document().to_string();
     assert!(
         !document.contains("/bin/false"),
         "no resolved `${{ENV}}` value is in the trace document: {document}"
+    );
+}
+
+/// The two entries a failure the run **survived** lands on carry `error` in §3's
+/// one shape, like the entry a failure ended the run on.
+///
+/// The five snapshot runs above reach `error` by one path only — the aborting
+/// entry of a spent route — and [`document`] holds each of them to the rule. The
+/// other two paths are here, because they are separate sites in the emitted
+/// runtime and a rule kept at one of three is not a rule: `flow.pipeline`'s
+/// `tally` has its `exec:` failure absorbed by `on_error: skip`, and
+/// `flow.deadline`'s `slow` runs out of its `timeout:` and is routed around by
+/// `on_error: { fallback: rescue }`. Both runs **succeed** — which is the point:
+/// a reader reconstructing what happened inside a run that finished is reading
+/// exactly this field.
+#[test]
+fn a_failure_a_run_survived_carries_its_class_like_one_that_ended_a_run() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "verdict": "fast", "note": "a note" })),
+    ));
+
+    let Some(skipped) = harness::run(
+        "activities",
+        "flow.pipeline",
+        &[("goal", "ship it")],
+        &provider,
+    ) else {
+        return;
+    };
+    skipped.succeeded();
+    let held = skipped.trace_document();
+    every_entrys_error_is_in_one_shape(&held);
+    assert_eq!(
+        entry_errors(&held)
+            .iter()
+            .map(|(node, _)| node.as_str())
+            .collect::<Vec<_>>(),
+        ["tally"],
+        "the absorbed failure is the one entry of this run that carries the field: \
+         {held}"
+    );
+
+    let Some(rescued) = harness::run("activities", "flow.deadline", &[], &provider) else {
+        return;
+    };
+    rescued.succeeded();
+    let held = rescued.trace_document();
+    every_entrys_error_is_in_one_shape(&held);
+    let errors = entry_errors(&held);
+    let [(node, error)] = errors.as_slice() else {
+        panic!("the node the `fallback:` routed around is the one that carries it: {held}");
+    };
+    assert_eq!(node, "slow");
+    assert!(
+        error.starts_with("NodeFailure: ") && error.contains("timed out"),
+        "…and it names the class in front of the budget that ended it: {error:?}"
     );
 }
 

@@ -168,7 +168,7 @@ retries are attempts at one execution, and `attempts` is where they are recorded
 | `inner` | array of entries | `flow:` nodes | The trace of the subflow instance this node ran (grammar §8.5). See §8. |
 | `stores` | array of [store records](#6-store-records) | when the node performed any | Every store op this node performed, in the order it performed them (PRD 5.8). See §6. |
 | `models` | array of [model calls](#7-model-calls) | when the node made any | Every model call this node execution made (PRD 5.9). See §7. |
-| `error` | string | see §3.2 | What went wrong, as `<error name>: <message>`. Written for a person, and it can quote what the other side of an activity answered — §11.1 is what it may and may not hold. |
+| `error` | string | see §3.2 | What went wrong, as `<error name>: <message>` — the failure's class and its text, in that one shape on **every** entry that carries the field, whether the node aborted the run, took a `fallback:`, or had its failure absorbed by `on_error: skip`. Written for a person: §10.1 makes the text something a reader must not parse, and it can quote what the other side of an activity answered — §11.1 is what it may and may not hold. |
 | `fallback` | string | when `on_error: { fallback: … }` fired | The node id the failure routed to instead of this node's own edges (grammar §9.2). `"__end__"` for the terminal pseudo-node. |
 
 ### 3.1 Order
@@ -191,11 +191,14 @@ caller's.
 * **`"completed"`** — the node ran and produced a result. It carries `writes` and
   `routing`; it carries no `error`.
 * **`"skipped"`** — the node's activity failed and its `on_error: skip` absorbed
-  it (grammar §9.2). It carries `error` naming the failure, an empty `writes`,
-  and a `routing` decided under grammar §7.3 unchanged, with the one
-  substitution grammar §9.2 and Decision D97 make: a guard that reads the node's
-  own output is `false` **without being evaluated**, while a guard over `input`,
-  `state` or `execution` is evaluated normally.
+  it (grammar §9.2). It carries an empty `writes`, and a `routing` decided under
+  grammar §7.3 unchanged, with the one substitution grammar §9.2 and Decision D97
+  make: a guard that reads the node's own output is `false` **without being
+  evaluated**, while a guard over `input`, `state` or `execution` is evaluated
+  normally. It carries `error` naming the failure too — always, and in §3's one
+  shape: a failure a node absorbed is described exactly as one that ended the run
+  is, because a reader handed the same field should not have to know which of the
+  two it is reading to know what it is holding.
 * **`"failed"`** — the node left no result for the run to carry on from, and its
   policy did not absorb it. Usually that is its *activity* failing. It also
   covers the node whose activity completed and whose **routing** then failed —
@@ -537,11 +540,14 @@ A reader MUST NOT rely on:
 * **the absence of a field.** A later version may add one, and a reader that
   rejects unknown keys will break on a compatible change. Ignore what you do not
   recognize.
-* **the text of any message field** — `TraceEntry.error`, `Refusal.detail`, and
-  the envelope's `error`. These are diagnostics written for a person (PRD G3) and
-  are improved between releases. The `reason` field of an edge decision is the
-  exception, and only because §4.1 enumerates its values: it is a closed
-  vocabulary that happens to be spelled as a sentence.
+* **the text of any message field** — `TraceEntry.error`, `DispatchRecord.error`,
+  `Refusal.detail`, and the envelope's `error`. These are diagnostics written for
+  a person (PRD G3) and are improved between releases. §3's `<error name>:
+  <message>` is the shape they are written in, not a parse: the class in front of
+  the colon is whatever the failing activity raised, and neither the set of
+  classes nor the text after it is fixed by this format. The `reason` field of an
+  edge decision is the exception, and only because §4.1 enumerates its values: it
+  is a closed vocabulary that happens to be spelled as a sentence.
 * **anything printed by the human report.** See §11.
 * **the shape of `StoreRecord.answer`**, which is the store's, not this format's.
 
@@ -592,7 +598,11 @@ The version number alone is a promise; two tests make it a checkable one:
 * **The human report.** `run --format human` writes a summary to stderr — one
   line per node, plus what its models and stores did and which edges were taken.
   It is written for a terminal and is not versioned: nothing should be parsed out
-  of it. Use `--format json`, or the file it names.
+  of it. Use `--format json`, or the file it names. §11.1's promise is about the
+  format, and this report is outside it in one way worth naming: under a failure
+  it also prints the platform's own `cause` chain, which is where a resolved
+  `${ENV}` value can still reach a terminal — a DNS failure naming the host an
+  interpolated `url:` resolved to, say. No field of the format carries it.
 * **`FlowRun.trace` as a TypeScript type.** An in-process caller of the emitted
   `runFlow` receives the same entries as JavaScript objects. The *data* is this
   format; the declarations in `src/runtime.ts` are generated code, and an ejected
@@ -651,7 +661,7 @@ there itself, and the trace records the read like any other.
 
 ### 11.2 Where a resolved value would otherwise have escaped
 
-§11.1's promise is about **every** message this runtime writes, not only the ones
+§11.1's promise is about **every** message this format carries, not only the ones
 an author is likely to hit — and three of them are messages the *platform* would
 have written if the runtime had let it. A failure the runtime never composed
 itself is the shape a promise like this leaks through, so each of the three is

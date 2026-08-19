@@ -4251,6 +4251,20 @@ export async function runNode(
   let attempts = 0;
   let skipped = false;
   let failure: NodeFailure | undefined;
+  /**
+   * What a **skipped** entry's `error` says.
+   *
+   * Held here rather than read back off `failure` at the entry below, because
+   * `TraceEntry.error` is one field with one shape wherever it appears
+   * (`docs/trace.md` §3) and `failure.message` is not that shape. It is the
+   * message without the class [`describe`] puts in front of the text on the two
+   * entries that carry a failure the node did *not* absorb — the aborting one
+   * and the `fallback:` one — so a reader handed the same field on a skip would
+   * be handed a different form of it. And it is not there at all for a throw
+   * that reached the catch without having been wrapped in a [`NodeFailure`],
+   * which would leave a skipped entry with no account of what it absorbed.
+   */
+  let absorbed: string | undefined;
   // Every store op this node performs, across every attempt its policy makes:
   // an effect that happened is an effect that happened, and a record that kept
   // only the last attempt's would describe a run the store did not see
@@ -4393,6 +4407,7 @@ export async function runNode(
         goto: [strategy.fallback],
       });
     }
+    absorbed = describe(error);
     skipped = true;
   }
 
@@ -4476,7 +4491,7 @@ export async function runNode(
     ...(inner === undefined ? {} : { inner }),
     ...(storeRecords.length === 0 ? {} : { stores: [...storeRecords] }),
     ...(models === undefined ? {} : { models }),
-    ...(failure === undefined ? {} : { error: failure.message }),
+    ...(absorbed === undefined ? {} : { error: absorbed }),
   };
   update["$run"] = {
     ...base,
