@@ -15,6 +15,14 @@
 // divides: nothing a served app answers says whether the timer was cleared or
 // what `context.deadline` said while the wait was open.
 //
+// Three sections are about one id being used twice. A retry ladder re-executes
+// an instance at the site its predecessor ran at, so the pause a failed attempt
+// left parked and the pause the next attempt opens are two waits under one id —
+// and the shape that produces one needs a branch of an instance to fail while a
+// sibling of it is parked, which is a scheduling no composition can ask for.
+// Both halves of the rule are driven: each of the two ladders abandons what it
+// left behind, and a settlement reaches the pause it belongs to and no other.
+//
 // `src/runtime.ts` is a compiler constant, byte-identical in every project, so
 // driving it directly is driving what every project runs.
 //
@@ -40,6 +48,20 @@ if (project === undefined) {
 const runtime = await import(pathToFileURL(path.resolve(project, "src/runtime.ts")).href);
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+/**
+ * Wait until something has happened, rather than for a number of milliseconds.
+ *
+ * The one section that waits on a real expiry timer uses it: a fixed sleep long
+ * enough to be safe on a loaded runner is a slow test, and one short enough to
+ * be quick is a flaky one.
+ */
+async function until(ready, ms = 5_000) {
+  const deadline = Date.now() + ms;
+  while (!ready() && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
 
 /** The published schema of a sign-off's `output:`, and the parse that holds it. */
 const SCHEMA = {
@@ -102,6 +124,28 @@ function park(execution, instancePath, fields = {}) {
       viewAt(instancePath, execution),
     ),
   );
+}
+
+/** A `NodeView` over a `state.items` array, which is what a `map`'s `over:` reads. */
+function mapView(items, execution) {
+  const shape = { properties: { items: { items: "any" } } };
+  const run = {
+    ...runtime.emptyRun(),
+    execution: { id: execution, session_key: "" },
+    path: [],
+    traversals: {},
+  };
+  return {
+    state: { items },
+    run,
+    roots: {
+      input: runtime.bind({}, { properties: {} }),
+      state: runtime.bind({ items }, shape),
+      execution: runtime.bind(run.execution, {
+        properties: { id: "string", session_key: "string", item_index: "int" },
+      }),
+    },
+  };
 }
 
 const observed = {};
@@ -181,6 +225,139 @@ const observed = {};
     node_failed: failed,
     refusal: runtime.deliverHumanAnswer(execution, "fan/0/1/sign/0", { decision: "approve" })
       .reason,
+  };
+  runtime.releaseHumanWaits(execution);
+}
+
+// A retry ladder is the other way one task stops waiting for a pause, and the
+// sharper one: the next attempt re-executes the instance at the **same** site,
+// so a pause the failed attempt left parked would share its id with the one the
+// new attempt opens there. A `flow:` node's attempt is a whole instance and the
+// failure that ends it is yielded as soon as it settles, which is exactly the
+// shape that leaves a sibling branch parked — so every attempt abandons what it
+// left behind before the next one starts, and each attempt begins with nothing
+// held under its site.
+{
+  const execution = "exec_retrying";
+  runtime.openHumanWaits(execution, true);
+  const parked = [];
+  const openAtEntry = [];
+  let failed;
+  try {
+    await runtime.runActivity(
+      "flow.probe",
+      "wrap",
+      "wrap/0",
+      { retry: { max: 1, backoffMs: 1, multiplier: 1, jitter: false }, onError: "fail" },
+      { id: execution, session_key: "" },
+      async () => {
+        openAtEntry.push(runtime.pausesUnder(execution, "wrap/0"));
+        // A budget no attempt can outlive, so what settles these pauses is the
+        // ladder rather than a timer racing it.
+        parked.push(park(execution, ["wrap", "0"], { timeoutMs: 86_400_000, onTimeout: "escalate" }));
+        await settle();
+        throw new Error("one branch failed while another was still parked");
+      },
+    );
+  } catch (error) {
+    failed = error?.name ?? "Error";
+  }
+  await settle();
+
+  observed.retrying = {
+    open_at_each_attempt: openAtEntry,
+    settled: parked.map((one) => one.state),
+    published: runtime.humanWaits(execution).map((wait) => wait.id),
+    node_failed: failed,
+  };
+  runtime.releaseHumanWaits(execution);
+}
+
+// `on_item_error: { retry: … }` is the same seam one construct further in: an
+// item's attempts all re-execute the instance at one dispatch site. Driven
+// through `runActivity` because a compiled `map` node is always inside one, and
+// the pause the **last** attempt leaves is the node execution's to abandon.
+{
+  const execution = "exec_item_retrying";
+  runtime.openHumanWaits(execution, true);
+  const parked = [];
+  const openAtEntry = [];
+  const map = {
+    node: "fan",
+    as: "item",
+    source: { path: "state.items", shape: "any" },
+    maxConcurrency: 1,
+    onItemError: { retry: { max: 1, backoffMs: 1, multiplier: 1, jitter: false } },
+    routes: [
+      {
+        target: "flow.sign_off",
+        maxConcurrency: 1,
+        detach: false,
+        itemShape: "any",
+        input: () => ({}),
+        writes: [],
+        run: async (input, itemContext, site) => {
+          const at = site.path.join("/");
+          openAtEntry.push(runtime.pausesUnder(execution, at));
+          parked.push(park(execution, site.path));
+          await settle();
+          throw new Error("one branch failed while another was still parked");
+        },
+      },
+    ],
+  };
+  const view = mapView([{ at: 0 }], execution);
+  let failed;
+  try {
+    await runtime.runActivity(
+      "flow.probe",
+      "fan",
+      "fan/0",
+      { onError: "fail" },
+      { id: execution, session_key: "" },
+      async (context) => await runtime.runMap(map, runtime.mapPlan(map, view), context),
+    );
+  } catch (error) {
+    failed = error?.name ?? "Error";
+  }
+  await settle();
+
+  observed.item_retrying = {
+    open_at_each_attempt: openAtEntry,
+    settled: parked.map((one) => one.state),
+    published: runtime.humanWaits(execution).map((wait) => wait.id),
+    node_failed: failed,
+  };
+  runtime.releaseHumanWaits(execution);
+}
+
+// …and the half of that which is not an ordering: a settlement reaches the pause
+// it belongs to and no other. A wait id is an instance path and a path is re-run,
+// so the board can hold a *successor* pause under an id a stale closure still
+// remembers — and the stale closure with the longest reach is an expiry timer.
+// Driven by displacing a pause without abandoning it, which is the state a ladder
+// that forgot to would leave: the earlier wait's budget runs out, and what it
+// must settle is itself.
+{
+  const execution = "exec_successor";
+  runtime.openHumanWaits(execution, true);
+  const stale = park(execution, ["wrap", "0"], { timeoutMs: 20, onTimeout: "escalate" });
+  await settle();
+  const live = park(execution, ["wrap", "0"]);
+  await settle();
+  await until(() => stale.state !== "pending");
+
+  const open = runtime.pausesUnder(execution, "wrap/0");
+  const published = runtime.humanWaits(execution).map((wait) => wait.id);
+  const taken = runtime.deliverHumanAnswer(execution, "wrap/0/sign/0", { decision: "approve" });
+  await settle();
+
+  observed.successor = {
+    stale: stale.state,
+    open_after_the_stale_budget_ran_out: open,
+    published,
+    taken: { ok: taken.ok, wait: taken.wait?.id },
+    live: live.state,
   };
   runtime.releaseHumanWaits(execution);
 }

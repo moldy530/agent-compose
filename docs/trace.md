@@ -174,10 +174,18 @@ and nothing else.
 
 An `interrupted` report carries one more key, and it is what makes a status poll
 enough to *ask* the question rather than only to notice there is one:
-`interrupts`, an array with one entry per pause the execution is holding, in the
-order they began. Each entry names the pause (`wait_id`, `flow`, `node`), when it
-began and when its budget runs out (`paused_at`, and `expires_at` where the node
-declares a `timeout:`), what the human is shown (`input`, the node's own `input:`
+`interrupts`, an array with one entry per pause the execution is holding,
+ordered by `wait_id` — the same order a `409` lists them in. It is ordered by the
+id rather than by the order the pauses began because the order they began is not
+a fact about the composition: a `map`'s instances are admitted under
+`max_concurrency` and park in whatever order the scheduler interleaved them, so
+two runs of one composition would publish the same questions in different orders.
+The comparison is over the string, so item `10` sorts before item `2`; what the
+order buys is that it is the *same* every run, not that it counts.
+
+Each entry names the pause (`wait_id`, `flow`, `node`), when it began and when
+its budget runs out (`paused_at`, and `expires_at` where the node declares a
+`timeout:`), what the human is shown (`input`, the node's own `input:`
 evaluated), what their answer is held to (`output_schema`, the published JSON
 Schema of the node's `output:`), and where to send it (`resume_url`). It is a key
 of the `serve` **report** rather than of this format — no entry carries it, and

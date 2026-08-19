@@ -202,12 +202,13 @@ status route for the rest. A payload that does not fit the node's `output:` is a
 `400` and **does not consume the wait** — the execution is still interrupted and
 the corrected answer can be sent to the same URL. A `409` is about *which* pause
 rather than about the body: nothing is waiting, the wait already expired and
-`on_timeout:` has routed the execution on, or the execution is holding more than
-one pause and the request named none (the refusal lists their ids, and `?wait=`
-is how one is named). `wait_id` is that id: the pause's instance path, which is
-stable across runs of one composition — `approve/0` at the top level of a flow,
-`review/0/2/approve/0` for the pause inside the third instance a `map`
-dispatched. `interrupts` is ordered by `wait_id`, and so is the list a `409`
+`on_timeout:` has routed the execution on, the execution is holding more than one
+pause and the request named none, or `?wait=` named a pause this execution is not
+holding — a stale id from an earlier poll. The last two carry a `pending` array
+of the ids that *are* waiting, and `?wait=` is how one of them is named. That id
+is a pause's `wait_id`: its instance path, which is stable across runs of one
+composition — `approve/0` at the top level of a flow, `review/0/2/approve/0` for
+the pause inside the third instance a `map` dispatched. `interrupts` is ordered by `wait_id`, and so is the list a `409`
 gives, so two runs of one composition publish the same questions in the same
 order however their instances happened to be scheduled.
 
@@ -218,6 +219,14 @@ work it is doing: its clock is held still while a pause below it is open and
 resumes with the time it had left. This is what makes the rule "a `human` node
 resolves no `timeout` at any level" mean what it says for a pause that is not at
 the top level of the triggered flow.
+
+**A retry asks again.** A `retry:` on the node that dispatched the flow a pause
+is in re-executes the whole instance from its entry as a fresh attempt (grammar
+8.5), so an attempt that fails while somebody is still thinking takes its
+question with it: an answer arriving after that is a `409` saying the wait is no
+longer held, and the next attempt asks again at the same `wait_id`. Poll the
+status route for the question rather than holding on to an `interrupts` entry
+from an earlier poll.
 
 **A wait lives in this process.** It is a parked promise, not a checkpoint, so a
 `serve` restarted while a human was thinking has lost it and the execution is

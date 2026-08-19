@@ -810,6 +810,18 @@ export async function runActivity<T>(
         if (abandonedOf(error) !== undefined) throw error;
         if (expired) break;
         if (attempt === attempts) break;
+        // This attempt is over, so every pause it left open below it is one
+        // nothing will read the answer of — the same statement the `finally`
+        // below makes about the node, made one attempt at a time because the
+        // next attempt **re-runs the same instance path**. A `flow:` node's
+        // attempt is a whole instance and a failing branch of it is yielded as
+        // soon as it settles, so a sibling branch can still be parked here; left
+        // on the board its wait would share an id with the one the next attempt
+        // opens at that path, and a live question would be marked expired by a
+        // dead attempt's timer with the task holding it parked for ever. It is
+        // also what gives back the `map` permits and store handles the parked
+        // instance is holding, before the next attempt queues for them.
+        abandonPausesUnder(execution.id, site);
         const delay = backoffFor(policy.retry!, attempt);
         try {
           await sleep(delay, controller.signal);
@@ -4295,6 +4307,15 @@ async function attemptItem(
       // stopped waiting, on top of repeating every effect the instance issued.
       if (abandonedOf(error) !== undefined) throw new ItemAttempts(made, error);
       if (attempt === allowed) break;
+      // And the rule [`runActivity`]'s ladder follows between its attempts, for
+      // the same reason and at the same seam: this attempt is over, the next one
+      // re-executes the instance at **this very site**, and a pause a settled
+      // branch of the failed attempt left open would share its id with the pause
+      // the next attempt opens there. Two waits at one id settle each other (see
+      // [`abandonPausesUnder`]). The pause the *last* attempt leaves is the node
+      // execution's to abandon, which `runActivity`'s `finally` does for every
+      // instance this fan-out dispatched.
+      abandonPausesUnder(context.execution.id, instance.site.path.join("/"));
       try {
         await sleep(backoffFor(retry!, attempt), context.signal);
       } catch {
@@ -4532,7 +4553,18 @@ export type ResumeOutcome =
       readonly ok: false;
       readonly reason: "not-waiting" | "ambiguous" | "no-such-wait" | "settled" | "mismatch";
       readonly detail: string;
-      /** Every pause still waiting, by id — on `"ambiguous"` and nowhere else. */
+      /**
+       * Every pause still waiting, by id — on the two refusals a caller can
+       * answer by re-addressing the request, and only where there is something
+       * to list.
+       *
+       * `"ambiguous"` is one: a resume that named no pause against an execution
+       * holding several. `"no-such-wait"` is the other, and it is the one where
+       * the list is worth most — a `?wait=` that matched nothing is usually a
+       * stale id from an earlier poll, and the ids that *are* waiting are the
+       * answer to it. It is absent where the list would be empty, which on
+       * `"no-such-wait"` means the execution is holding no pause at all.
+       */
       readonly pending?: readonly string[];
     };
 
@@ -4682,15 +4714,29 @@ export function watchHumanPauses(execution: string, listener: () => void): () =>
 /**
  * Stop holding every pause at or inside the node instance at `site`.
  *
- * Called from [`runActivity`]'s `finally`, which is every way one node execution
- * can end. A pause below a node that has stopped waiting for the instance it
- * happened in is **orphaned**: nothing will read its answer, because the task
- * that would have read it was abandoned — and left on the board it would be
- * published by the status route as a question a human could still answer and
- * accepted by the resume route as an answer that goes nowhere. One thing reaches
- * here: a `map` or `flow:` node whose own deadline ran out while an instance
- * below it was parked in the tick before the pause could hold it still. The
- * other shape it would have had is refused by the compiler instead — a
+ * A pause below a node that has stopped waiting for the instance it happened in
+ * is **orphaned**: nothing will read its answer, because the task that would
+ * have read it was abandoned — and left on the board it would be published by
+ * the status route as a question a human could still answer and accepted by the
+ * resume route as an answer that goes nowhere.
+ *
+ * Three things reach here, and they are the three moments a task holding a pause
+ * stops being one anybody is waiting for:
+ *
+ *   * [`runActivity`]'s `finally`, which is every way one node execution can
+ *     end. The shape that leaves a pause behind is a `map` or `flow:` node whose
+ *     own deadline ran out while an instance below it was parked, in the tick
+ *     before the pause could hold that deadline still;
+ *   * [`runActivity`]'s **retry ladder**, between attempts. A `flow:` node's
+ *     attempt is a whole instance, and the failure that ends it is yielded as
+ *     soon as it settles — a sibling branch of that instance can still be
+ *     parked. The next attempt re-runs the instance at the *same* site, so a
+ *     pause left over would share its id with the one the new attempt opens
+ *     there;
+ *   * [`attemptItem`]'s ladder, which is the same seam for `on_item_error:
+ *     { retry: … }`: an item's attempts all run at one dispatch site.
+ *
+ * A fourth shape is refused by the compiler instead — a
  * **detached** dispatch's instance is never observed by the join at all
  * (grammar 8.6 rule 7, Decision D94), so a `human` node under one has nowhere
  * for an answer to be delivered even in principle, and a dispatch that reaches
@@ -4897,9 +4943,16 @@ export async function runHuman(
   return await new Promise<NodeAnswer>((resolve, reject) => {
     let timer: unknown;
     const settle = (outcome: Settlement, value: unknown): boolean => {
-      const entry = board.held.get(id);
-      if (entry === undefined || entry.settled !== undefined) return false;
-      entry.settled = outcome;
+      // **This** pause, held by identity rather than looked up by id. A wait id
+      // is an instance path, and a path is re-run: both retry ladders
+      // ([`runActivity`], [`attemptItem`]) re-execute an instance at the site
+      // its predecessor ran at, so the board can hold a *successor* pause under
+      // this very id. They abandon the predecessor first, and this is the half
+      // that makes that a guarantee rather than an ordering: a stale closure —
+      // this promise's expiry timer, above all — settles the wait it belongs to
+      // or nothing at all, never whichever wait happens to answer to its id.
+      if (mine.settled !== undefined) return false;
+      mine.settled = outcome;
       // Whichever side settled it, the budget is over: the timer and everything
       // it closes over go now rather than at the end of a wait nobody is holding
       // any more (see [`releaseHumanWaits`]).
@@ -4929,11 +4982,12 @@ export async function runHuman(
       return true;
     };
 
-    board.held.set(id, {
+    const mine: Held = {
       wait,
       parse: (payload) => descriptor.parse(payload),
       settle: (outcome, value) => settle(outcome, value),
-    });
+    };
+    board.held.set(id, mine);
     announce(board);
 
     if (descriptor.timeoutMs !== undefined) {
