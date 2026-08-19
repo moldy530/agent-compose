@@ -293,10 +293,10 @@ const storeNotes: stores.StoreBinding = {
 };
 
 /**
- * `tool.dispatch` — an HTTP request (grammar 6.1). Its arguments are parsed with its own declared `input:` before the implementation sees them, which is the checked signature grammar 8.4 asks for and the model's arguments are held to. The parse is `runtime.parseToolArguments`, so arguments the schema refuses are a `ToolCallRefused`: at a `tools:` attachment the agent's loop hands that back to the model (Decision D119), and at a `function:` node — where grammar 8.4 has already checked the binding field-by-field and no model chose anything — nothing catches it and the node fails, as it always has. The tool's **result** is parsed with `runtime.parseResult` on both surfaces: a tool answering off-contract is not a call anybody can rephrase.
+ * `tool.dispatch` — an HTTP request (grammar 6.1). Its arguments are parsed with its own declared `input:` before the implementation sees them, which is the checked signature grammar 8.4 asks for. This is the parse a `function:` node's binding faces, and it is a `ResultMismatch` that fails the node: the arguments are the composition's, checked field-by-field at compile time, so a value constraint they miss at runtime is the graph's own failure and there is nobody to hand it to. A **model's** arguments are refused one level out, at the entry in the agent's `tools:`, where `runtime.parseToolArguments` raises the `ToolCallRefused` the loop hands back (Decision D119). The tool's **result** is parsed with `runtime.parseResult` on both surfaces: a tool answering off-contract is not a call anybody can rephrase.
  */
 async function toolDispatch(args: unknown, context: runtime.RunContext): Promise<unknown> {
-  const input = runtime.parseToolArguments(toolDispatchInput, args, "the arguments `tool.dispatch` was called with");
+  const input = runtime.parseResult(toolDispatchInput, args, "the arguments `tool.dispatch` was called with");
   const roots = { input: runtime.bind(input, {
     "properties": {
       "payload": {
@@ -326,10 +326,10 @@ async function toolDispatch(args: unknown, context: runtime.RunContext): Promise
 }
 
 /**
- * `tool.file_ticket` — an HTTP request (grammar 6.1). Its arguments are parsed with its own declared `input:` before the implementation sees them, which is the checked signature grammar 8.4 asks for and the model's arguments are held to. The parse is `runtime.parseToolArguments`, so arguments the schema refuses are a `ToolCallRefused`: at a `tools:` attachment the agent's loop hands that back to the model (Decision D119), and at a `function:` node — where grammar 8.4 has already checked the binding field-by-field and no model chose anything — nothing catches it and the node fails, as it always has. The tool's **result** is parsed with `runtime.parseResult` on both surfaces: a tool answering off-contract is not a call anybody can rephrase.
+ * `tool.file_ticket` — an HTTP request (grammar 6.1). Its arguments are parsed with its own declared `input:` before the implementation sees them, which is the checked signature grammar 8.4 asks for. This is the parse a `function:` node's binding faces, and it is a `ResultMismatch` that fails the node: the arguments are the composition's, checked field-by-field at compile time, so a value constraint they miss at runtime is the graph's own failure and there is nobody to hand it to. A **model's** arguments are refused one level out, at the entry in the agent's `tools:`, where `runtime.parseToolArguments` raises the `ToolCallRefused` the loop hands back (Decision D119). The tool's **result** is parsed with `runtime.parseResult` on both surfaces: a tool answering off-contract is not a call anybody can rephrase.
  */
 async function toolFileTicket(args: unknown, context: runtime.RunContext): Promise<unknown> {
-  const input = runtime.parseToolArguments(toolFileTicketInput, args, "the arguments `tool.file_ticket` was called with");
+  const input = runtime.parseResult(toolFileTicketInput, args, "the arguments `tool.file_ticket` was called with");
   return runtime.parseResult(
     toolFileTicketOutput,
     await runtime.runHttp({
@@ -346,10 +346,10 @@ async function toolFileTicket(args: unknown, context: runtime.RunContext): Promi
 }
 
 /**
- * `tool.lookup` — an HTTP request (grammar 6.1). Its arguments are parsed with its own declared `input:` before the implementation sees them, which is the checked signature grammar 8.4 asks for and the model's arguments are held to. The parse is `runtime.parseToolArguments`, so arguments the schema refuses are a `ToolCallRefused`: at a `tools:` attachment the agent's loop hands that back to the model (Decision D119), and at a `function:` node — where grammar 8.4 has already checked the binding field-by-field and no model chose anything — nothing catches it and the node fails, as it always has. The tool's **result** is parsed with `runtime.parseResult` on both surfaces: a tool answering off-contract is not a call anybody can rephrase.
+ * `tool.lookup` — an HTTP request (grammar 6.1). Its arguments are parsed with its own declared `input:` before the implementation sees them, which is the checked signature grammar 8.4 asks for. This is the parse a `function:` node's binding faces, and it is a `ResultMismatch` that fails the node: the arguments are the composition's, checked field-by-field at compile time, so a value constraint they miss at runtime is the graph's own failure and there is nobody to hand it to. A **model's** arguments are refused one level out, at the entry in the agent's `tools:`, where `runtime.parseToolArguments` raises the `ToolCallRefused` the loop hands back (Decision D119). The tool's **result** is parsed with `runtime.parseResult` on both surfaces: a tool answering off-contract is not a call anybody can rephrase.
  */
 async function toolLookup(args: unknown, context: runtime.RunContext): Promise<unknown> {
-  const input = runtime.parseToolArguments(toolLookupInput, args, "the arguments `tool.lookup` was called with");
+  const input = runtime.parseResult(toolLookupInput, args, "the arguments `tool.lookup` was called with");
   return runtime.parseResult(
     toolLookupOutput,
     await runtime.runHttp({
@@ -366,10 +366,10 @@ async function toolLookup(args: unknown, context: runtime.RunContext): Promise<u
 }
 
 /**
- * `tool.ping` — a subprocess (grammar 6.1). Its arguments are parsed with its own declared `input:` before the implementation sees them, which is the checked signature grammar 8.4 asks for and the model's arguments are held to. The parse is `runtime.parseToolArguments`, so arguments the schema refuses are a `ToolCallRefused`: at a `tools:` attachment the agent's loop hands that back to the model (Decision D119), and at a `function:` node — where grammar 8.4 has already checked the binding field-by-field and no model chose anything — nothing catches it and the node fails, as it always has. The tool's **result** is parsed with `runtime.parseResult` on both surfaces: a tool answering off-contract is not a call anybody can rephrase.
+ * `tool.ping` — a subprocess (grammar 6.1). Its arguments are parsed with its own declared `input:` before the implementation sees them, which is the checked signature grammar 8.4 asks for. This is the parse a `function:` node's binding faces, and it is a `ResultMismatch` that fails the node: the arguments are the composition's, checked field-by-field at compile time, so a value constraint they miss at runtime is the graph's own failure and there is nobody to hand it to. A **model's** arguments are refused one level out, at the entry in the agent's `tools:`, where `runtime.parseToolArguments` raises the `ToolCallRefused` the loop hands back (Decision D119). The tool's **result** is parsed with `runtime.parseResult` on both surfaces: a tool answering off-contract is not a call anybody can rephrase.
  */
 async function toolPing(args: unknown, context: runtime.RunContext): Promise<unknown> {
-  const input = runtime.parseToolArguments(toolPingInput, args, "the arguments `tool.ping` was called with");
+  const input = runtime.parseResult(toolPingInput, args, "the arguments `tool.ping` was called with");
   return runtime.parseResult(
     toolPingOutput,
     await runtime.runExec({

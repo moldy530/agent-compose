@@ -825,6 +825,14 @@ fn check_tool_calls(
         };
         let pointer = at(&pointer, "function");
         checker.closed(&pointer, function, &["name", "arguments"]);
+        // History is re-validated against `tools` on this surface, and this is
+        // the check that does it — the one rule the two wires disagree about
+        // (WIRE-NOTES (18)): `src/anthropic.rs` has no counterpart, so a
+        // `tool_use` naming an undeclared tool is legal there and refused here.
+        // It is reachable from an ordinary composition — a model answering with
+        // a name its agent never offered, which grammar D119 refuses and the
+        // loop then replays — so the emitted runtime renders that turn
+        // differently per surface, and this is what holds it to it.
         if let Some(name) = checker.required_string(&pointer, function, "name")
             && !tools.is_empty()
             && !tools.iter().any(|tool| tool == name)

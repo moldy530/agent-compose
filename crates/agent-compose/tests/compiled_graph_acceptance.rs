@@ -1486,6 +1486,55 @@ registerFunction("rank_candidates", (args) => ({ ranked: `ranked: ${args.text}` 
     );
 }
 
+/// A `function:` node bound to a value its tool's `input:` refuses **fails the
+/// node**, and says so as a mismatch rather than as a refusal (grammar 6, 8.4,
+/// Decision D119).
+///
+/// One `tool.*` definition, two usage surfaces, and this is the surface with no
+/// model on it. Grammar 8.4 checks the binding for arity and types, so a
+/// `min_length:` a CEL expression misses arrives at the runtime parse — where
+/// the arguments are the composition's own and there is nobody to hand them back
+/// to. The class in `TraceEntry.error` is the observable, because D119 gives
+/// `ToolCallRefused` a meaning a reader is entitled to rely on — the model was
+/// handed this and the loop carried on — and a node that just ended must not
+/// wear it.
+#[test]
+fn a_function_nodes_unfit_argument_fails_the_node_as_a_mismatch() {
+    let provider = MockProvider::start().expect("a loopback port");
+
+    let Some(run) = harness::invoke("activities", "flow.unfit", &[], &provider) else {
+        return;
+    };
+    let failure = run.failed();
+    assert!(
+        failure.contains("ResultMismatch: the arguments `tool.echo` was called with"),
+        "the node failed on the tool's own contract, named as a mismatch and by \
+         the address a person reading this has to look up: {failure}"
+    );
+    assert!(
+        !failure.contains("ToolCallRefused"),
+        "…and not as a refusal: nothing here proposed a call, and nothing bounced: {failure}"
+    );
+
+    let entries = run.entries("check");
+    let [entry] = entries.as_slice() else {
+        panic!("`check` ran once: {entries:?}");
+    };
+    assert_eq!(entry["outcome"], "failed", "{entry}");
+    assert!(
+        entry["error"].as_str().is_some_and(|text| text
+            .contains("ResultMismatch: the arguments `tool.echo` was called with")
+            && !text.contains("ToolCallRefused")),
+        "`docs/trace.md` §3's `<error name>: <message>`, with the name the \
+         surface earns: {entry}"
+    );
+    assert_eq!(
+        provider.requests().len(),
+        0,
+        "no model was called: this failure is the graph's own"
+    );
+}
+
 /// Two edges of one fork both fire, and the node they meet at runs **once**
 /// (grammar 7.3 rule 6, 7.6 P1/P2).
 #[test]
@@ -2757,9 +2806,11 @@ fn a_tool_definitions_input_refuses_on_the_chat_completions_wire_and_an_exit_cod
     );
     assert!(
         answering["content"].as_str().is_some_and(|text| text
-            .contains("the arguments `tool.lookup` was called with")
+            .contains("the arguments `lookup` was called with")
             && text.contains("query")),
-        "the refusal is the whole of the message on this wire: {answering}"
+        "the refusal is the whole of the message on this wire, and it names the \
+         tool the way the **wire** offered it — `lookup`, the only spelling a \
+         correction could use: {answering}"
     );
     assert!(
         answering.get("is_error").is_none(),
@@ -2857,7 +2908,7 @@ fn a_tool_loop_that_never_corrects_spends_its_budget_and_fails_holding_the_last_
     );
     assert!(
         failure.contains("its last tool call was refused")
-            && failure.contains("the arguments `tool.lookup` was called with"),
+            && failure.contains("the arguments `lookup` was called with"),
         "…and the failure carries what the model kept getting wrong: {failure}"
     );
     assert_eq!(
@@ -2890,6 +2941,293 @@ fn a_tool_loop_that_never_corrects_spends_its_budget_and_fails_holding_the_last_
         );
         assert!(record["result"].is_null(), "{record}");
     }
+}
+
+/// The same bound spent by a loop whose **last call worked**: the failure says
+/// the bound stopped it and claims no refusal (Decision D119, D51).
+///
+/// The sentence the test above pins is about the call the loop was holding when
+/// the budget ran out, and it has to stay about that call. A run whose model
+/// mis-typed an argument, was told, corrected, and then simply kept calling is a
+/// different thing to diagnose from one that never corrected — and a holder that
+/// was only ever written to would describe the first as the second, which is
+/// exactly the confusion carrying the refusal was meant to remove.
+///
+/// `agent.researcher` bounds its loop at 2, so iteration 1 refuses, iteration 2
+/// runs the tool for real, and the bound trips on the way into the third.
+#[test]
+fn a_tool_loop_whose_last_call_worked_spends_its_budget_claiming_no_refusal() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        // `tool.lookup` declares `query: { min_length: 1 }`.
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new("lookup", json!({ "query": "" }))]),
+        ),
+        // …corrected, and answered by `printf` — the tool really ran.
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new("lookup", json!({ "query": "a fact" }))]),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke(
+        "agent-anthropic",
+        "flow.research",
+        &[("goal", "ship it")],
+        &provider,
+    ) else {
+        return;
+    };
+    let failure = run.failed();
+    assert!(
+        failure.contains("max_tool_iterations") && failure.contains("bound of 2"),
+        "the bound is still what stopped it: {failure}"
+    );
+    assert!(
+        !failure.contains("refused"),
+        "…and it says nothing about a refusal, because the last call was not one: {failure}"
+    );
+
+    let entries = run.entries("research");
+    let [entry] = entries.as_slice() else {
+        panic!("`research` ran once: {entries:?}");
+    };
+    assert_eq!(entry["outcome"], "failed", "{entry}");
+    assert_eq!(
+        entry["models"][0]["toolCalls"][0]["outcome"], "refused",
+        "the refusal happened — it is only the *holding* that ended: {entry}"
+    );
+    assert_eq!(
+        entry["models"][1]["toolCalls"][0]["outcome"], "completed",
+        "{entry}"
+    );
+}
+
+/// A refusal does not stop the **other calls of the same answer**: the sibling
+/// runs, and both are answered (Decision D119).
+///
+/// Two provider rules meet here. Both surfaces refuse a request that leaves a
+/// `tool_use` id or a `tool_call_id` unanswered, so a loop that stopped at the
+/// first refusal would send a turn answering one call of two and be refused on
+/// the very next request — which is why the loop *continues* over an answer's
+/// calls rather than breaking out of it. With one call per answer the two are
+/// indistinguishable, so this is the shape that tells them apart.
+///
+/// The ordinal is the other half: `condense/1` is the instance the second call
+/// started, because the refused call ahead of it spent `condense/0` (grammar
+/// §9.4) — a frame counted from the calls that *worked* would move the key of
+/// work that has nothing to do with the mistake.
+#[test]
+fn a_refused_call_does_not_stop_the_calls_beside_it_in_one_answer() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        // One answer, two calls: the first is refused, the second is not.
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![
+                ToolCall::new("condense", json!({ "passage": "" })),
+                ToolCall::new("condense", json!({ "passage": "a long passage" })),
+            ]),
+        ),
+        // The instance the second call started.
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "line": "the only line" })),
+        ),
+        Script::new(SONNET, Outcome::text("I have the line.")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "answer": "it says one line" })),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke(
+        "flow-as-tool",
+        "flow.ask",
+        &[("question", "what does it say?")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(run.outputs()["answer"], "it says one line");
+
+    let recorded = provider.requests();
+    for call in &recorded {
+        assert!(call.is_valid(), "{:?}", call.failures());
+    }
+    // Both calls of the answer are answered, in the order the answer asked, and
+    // in one turn: the request that carries them is the loop's next one.
+    let answering = recorded[2].body()["messages"][2].clone();
+    assert_eq!(answering["role"], "user", "{answering}");
+    let blocks = answering["content"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the turn carries a block per call: {answering}"));
+    assert_eq!(blocks.len(), 2, "{answering}");
+    assert_eq!(blocks[0]["is_error"], json!(true), "{answering}");
+    assert!(
+        blocks[1].get("is_error").is_none(),
+        "the sibling's result is a result, with no flag on it: {answering}"
+    );
+
+    let entries = run.entries("ask");
+    let [entry] = entries.as_slice() else {
+        panic!("`ask` ran once: {entries:?}");
+    };
+    let asked = entry["models"][0]["toolCalls"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the answer's calls are recorded: {entry}"));
+    let [refused, completed] = asked.as_slice() else {
+        panic!("both calls of the answer are recorded: {entry}");
+    };
+    assert_eq!(refused["outcome"], "refused", "{refused}");
+    assert_eq!(completed["outcome"], "completed", "{completed}");
+    assert!(
+        completed["instance"]
+            .as_str()
+            .is_some_and(|key| key.ends_with("/ask/0/condense/1")),
+        "the refused call ahead of it spent `condense/0`: {completed}"
+    );
+}
+
+/// A call to a tool the agent does not offer is corrected on the **Chat
+/// Completions** wire too — where the invented name may not be replayed.
+///
+/// This is the one place the two wire shapes do not agree, and the disagreement
+/// is a refusal rather than a preference: Chat Completions re-validates an
+/// assistant turn's `tool_calls` against the request's own `tools` and answers
+/// `400 Invalid value: '<name>'. This message calls a function the request does
+/// not define.`, while the Messages API has no such check (`WIRE-NOTES` (18)).
+/// So the turn is rewritten for this surface — the undeclared call is dropped
+/// and its refusal travels as a `user` turn — and a runtime that replayed it
+/// would turn Decision D119's correction into a provider failure one request
+/// later, on a request the model never saw.
+#[test]
+fn a_call_to_a_tool_the_agent_does_not_offer_is_corrected_on_the_chat_completions_wire() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(
+            LOCAL,
+            // `Outcome::raw` for the same reason the Messages twin needs it: the
+            // mock refuses to *render* a call to a function the request does not
+            // offer, which is a codegen bug everywhere else.
+            Outcome::raw(
+                200,
+                json!({
+                    "id": "chatcmpl-mock-unoffered",
+                    "object": "chat.completion",
+                    "created": 1_700_000_000,
+                    "model": LOCAL,
+                    "system_fingerprint": "fp_mock",
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": Value::Null,
+                            "tool_calls": [{
+                                "id": "call_mock_summarise",
+                                "type": "function",
+                                // `agent.researcher` offers `lookup` and `audit`.
+                                "function": {
+                                    "name": "summarise",
+                                    "arguments": "{\"query\":\"a fact\"}",
+                                },
+                            }],
+                            "refusal": Value::Null,
+                        },
+                        "logprobs": Value::Null,
+                        "finish_reason": "tool_calls",
+                    }],
+                    "usage": {
+                        "prompt_tokens": 12,
+                        "completion_tokens": 34,
+                        "total_tokens": 46,
+                    },
+                }),
+            ),
+        ),
+        Script::new(
+            LOCAL,
+            Outcome::tool_calls(vec![ToolCall::new("lookup", json!({ "query": "a fact" }))]),
+        ),
+        Script::new(LOCAL, Outcome::text("I have the fact.")),
+        Script::new(
+            LOCAL,
+            Outcome::structured(json!({ "feedback": "a looked-up snippet" })),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke(
+        "agent-openai",
+        "flow.research",
+        &[("goal", "ship it")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(run.outputs()["feedback"], "a looked-up snippet");
+
+    let recorded = provider.requests();
+    assert_eq!(recorded.len(), 4, "the loop went on rather than stopping");
+    for call in &recorded {
+        assert!(
+            call.is_valid(),
+            "every request this run sent is one the surface accepts: {:?}",
+            call.failures()
+        );
+    }
+
+    // The request *after* the refusal is the one that would have carried the
+    // invented name. It carries the refusal instead, as a turn this surface can
+    // hold — and nothing anywhere in it names `summarise` as a function.
+    let messages = recorded[1].body()["messages"].clone();
+    let listed = messages
+        .as_array()
+        .unwrap_or_else(|| panic!("the request carries its history: {messages}"));
+    assert!(
+        listed.iter().all(
+            |message| message["tool_calls"].as_array().is_none_or(|calls| calls
+                .iter()
+                .all(|call| call["function"]["name"] != "summarise"))
+        ),
+        "no message may name a function the request does not declare: {messages}"
+    );
+    let refusal = listed
+        .iter()
+        .find(|message| {
+            message["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("not one of its tools"))
+        })
+        .unwrap_or_else(|| panic!("the model is told what it called: {messages}"));
+    assert_eq!(
+        refusal["role"], "user",
+        "a `tool` message answering a dropped `tool_call_id` is refused just as \
+         loudly, so the refusal travels as the turn that needs no id: {refusal}"
+    );
+    assert!(
+        refusal["content"]
+            .as_str()
+            .is_some_and(|text| text.contains("`lookup`") && text.contains("`audit`")),
+        "…and it names the tools the agent does have (PRD G3): {refusal}"
+    );
+
+    // The trace is the wire's rendering apart: a refused call, recorded with no
+    // `target`, and the corrected one after it.
+    let entries = run.entries("research");
+    let [entry] = entries.as_slice() else {
+        panic!("`research` ran once: {entries:?}");
+    };
+    let record = &entry["models"][0]["toolCalls"][0];
+    assert_eq!(record["name"], "summarise", "{record}");
+    assert!(record["target"].is_null(), "{record}");
+    assert_eq!(record["outcome"], "refused", "{record}");
+    assert_eq!(
+        entry["models"][1]["toolCalls"][0]["outcome"], "completed",
+        "{entry}"
+    );
 }
 
 /// A flow-as-tool call whose **instance** failed fails the agent node, and the

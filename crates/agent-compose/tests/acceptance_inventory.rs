@@ -181,6 +181,19 @@ const CODEGEN: &[Criterion] = &[
                 "a_tool_loop_that_never_corrects_spends_its_budget_and_fails_holding_the_last_refusal",
                 Status::Live,
             ),
+            // …and its twin, which is what keeps that message honest: the same
+            // bound spent by a loop whose last call *worked* claims no refusal.
+            (
+                "a_tool_loop_whose_last_call_worked_spends_its_budget_claiming_no_refusal",
+                Status::Live,
+            ),
+            // One answer, two calls, the first refused: the loop answers both,
+            // because a request leaving either unanswered is one both surfaces
+            // refuse (D119, `WIRE-NOTES` (18)).
+            (
+                "a_refused_call_does_not_stop_the_calls_beside_it_in_one_answer",
+                Status::Live,
+            ),
             // What an agent node leaves behind for the next one: the implicit
             // `messages` channel of grammar 10.4 (PRD 5.7 tier 3), which is
             // state no composition declares and only the wire makes visible.
@@ -205,6 +218,14 @@ const CODEGEN: &[Criterion] = &[
             // The escape hatch of grammar 6.1, and the registration it costs.
             (
                 "a_host_registered_function_runs_and_an_unregistered_one_says_so",
+                Status::Live,
+            ),
+            // …and what a `tool.*`'s own `input:` does at that surface: a value
+            // constraint grammar 8.4's arity-and-types check does not cover
+            // fails the node, as a mismatch rather than as a refusal — the half
+            // of Decision D119's split with no model on it.
+            (
+                "a_function_nodes_unfit_argument_fails_the_node_as_a_mismatch",
                 Status::Live,
             ),
             // How those two inline kinds are *parameterised*: `input:` bindings
@@ -452,6 +473,14 @@ const CODEGEN: &[Criterion] = &[
             ),
             (
                 "a_call_to_a_tool_the_agent_does_not_offer_comes_back_with_the_names_it_has",
+                Status::Live,
+            ),
+            // …and the same correction on the other wire, where the invented
+            // name may not be replayed at all: Chat Completions re-validates an
+            // assistant turn's `tool_calls` against the request's `tools`
+            // (`WIRE-NOTES` (18)), so the turn is rewritten rather than sent.
+            (
+                "a_call_to_a_tool_the_agent_does_not_offer_is_corrected_on_the_chat_completions_wire",
                 Status::Live,
             ),
             // …and four more over the *frame* a call derives (grammar 9.4, PRD

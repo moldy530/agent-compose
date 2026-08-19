@@ -323,8 +323,15 @@ function excerpt(value: unknown): string {
  * Written once and read twice, because a refusal a *model* has to act on and a
  * mismatch a *person* has to fix want exactly the same sentence — see
  * [`ToolCallRefused`], whose message is this text under a different class.
+ *
+ * A schema that refused without saying why still gets a sentence, because both
+ * readers are worse off with an empty one: a model handed `<subject>: ` has
+ * nothing to correct and will spend the loop's bound repeating itself, and a
+ * person reading it cannot tell a refusal from a truncation. The callers pass
+ * `issues` defensively (`?? []`) for the same reason this clause exists.
  */
 function describeIssues(value: unknown, issues: readonly ResultIssue[]): string {
+  if (issues.length === 0) return "the schema refused it and reported no issue";
   return issues
     .map((issue) => {
       const path = issue.path.map(String).join(".");
@@ -359,9 +366,21 @@ export function parseResult<T>(schema: ResultSchema<T>, value: unknown, subject:
  * All three tool surfaces parse here, and that uniformity is the rule rather
  * than an implementation detail: grammar §5.4 makes "attached as a tool" mean one
  * thing, so a `tool.*`'s declared `input:`, a synthesized store tool's argument
- * surface and a `flow.*`'s `inputs:` refuse a call the same way. What is *not*
- * parsed here is any tool's **result** — that is [`parseResult`] still, because a
- * tool that answered off-contract is not a call the model can rephrase.
+ * surface and a `flow.*`'s `inputs:` refuse a call the same way. Each parses at
+ * its **attachment** — the entry in an agent's `tools:` — rather than inside the
+ * thing attached, which is what keeps the two `tool.*` call sites apart: the same
+ * `tool.*` reached from a `function:` node parses with [`parseResult`], because
+ * there the arguments are the composition's and grammar §8.4 has already checked
+ * them field-by-field, so a mismatch is the graph's own failure and there is
+ * nobody to hand it to.
+ *
+ * `subject` is therefore the name the **model** called, not the component's
+ * address: the sentence is going to a reader whose only way to call again is the
+ * name the wire offered it (`lookup`, not `tool.lookup`).
+ *
+ * What is *not* parsed here is any tool's **result** — that is [`parseResult`]
+ * still, because a tool that answered off-contract is not a call the model can
+ * rephrase.
  */
 export function parseToolArguments<T>(
   schema: ResultSchema<T>,
@@ -1275,6 +1294,12 @@ export type Turn =
        * `tool_result` block, Chat Completions with nothing, because a `tool`
        * role message carries no such flag and the text is the whole of what it
        * has (`WIRE-NOTES` (18)).
+       *
+       * `name` is carried for the one refusal that is not about arguments: a
+       * call to a tool the agent never offered. Chat Completions refuses a
+       * request whose history names an undeclared function, so
+       * [`callChatCompletions`] reads this to tell the results it may answer as
+       * `tool` messages from the one it has to carry another way.
        */
       readonly results: readonly {
         id: string;
@@ -1797,6 +1822,15 @@ async function callChatCompletions(
   },
   signal: AbortSignal,
 ): Promise<ModelAnswer> {
+  // What this request declares is also what its **history** may name on this
+  // surface, and that is the one rule the two wires do not share: Chat
+  // Completions re-validates an assistant turn's `tool_calls` against `tools`
+  // and refuses a name it does not find there, while the Messages API does not
+  // (`WIRE-NOTES` (18)). The only turn that can carry such a name is an answer
+  // that called a tool the agent never offered, which Decision D119 refuses and
+  // the loop then replays — so that turn is rendered here rather than sent as it
+  // stands.
+  const declared = new Set(request.tools.map((tool) => tool.name));
   const messages: Record<string, unknown>[] = [{ role: "system", content: request.system }];
   for (const turn of request.turns) {
     if (turn.role === "user") {
@@ -1804,20 +1838,43 @@ async function callChatCompletions(
       continue;
     }
     if (turn.role === "tool") {
+      // A refused call is answered here too, and with no flag beside it: the
+      // `tool` role message is closed to `role`, `content` and `tool_call_id`,
+      // so this surface has no `is_error` to set and the refusal text *is* the
+      // message (Decision D119, `WIRE-NOTES` (18)). Answering it at all is the
+      // load-bearing half — an unanswered `tool_call_id` is a request this
+      // surface refuses.
+      //
+      // Except for the calls whose `tool_call` this surface would not let the
+      // assistant turn carry: a `tool` message answering an id no assistant
+      // message asked for is refused just as loudly, so their refusals travel as
+      // a `user` turn — after the `tool` messages, so that nothing comes between
+      // an assistant turn and the answers to it.
+      const unoffered: string[] = [];
       for (const result of turn.results) {
-        // A refused call is answered here too, and with no flag beside it: the
-        // `tool` role message is closed to `role`, `content` and
-        // `tool_call_id`, so this surface has no `is_error` to set and the
-        // refusal text *is* the message (Decision D119, `WIRE-NOTES` (18)).
-        // Answering it at all is the load-bearing half — an unanswered
-        // `tool_call_id` is a request both surfaces refuse.
+        if (!declared.has(result.name)) {
+          unoffered.push(result.content);
+          continue;
+        }
         messages.push({ role: "tool", tool_call_id: result.id, content: result.content });
       }
+      if (unoffered.length > 0) messages.push({ role: "user", content: unoffered.join("\n\n") });
       continue;
     }
-    const message: Record<string, unknown> = { role: "assistant", content: turn.text ?? null };
-    if (turn.toolCalls !== undefined && turn.toolCalls.length > 0) {
-      message["tool_calls"] = turn.toolCalls.map((call) => ({
+    const offered = (turn.toolCalls ?? []).filter((call) => declared.has(call.name));
+    const text = turn.text ?? null;
+    if (offered.length === 0 && (text === null || text === "")) {
+      // The whole of this turn was calls this request may not name, so there is
+      // nothing left of it to send: an assistant message carrying neither
+      // `content` nor `tool_calls` is one this surface refuses, and an empty
+      // `content` invented to carry it would be a turn the model did not send.
+      // Nothing is lost that the model needs — the refusal that follows names
+      // the call it made, in full.
+      continue;
+    }
+    const message: Record<string, unknown> = { role: "assistant", content: text };
+    if (offered.length > 0) {
+      message["tool_calls"] = offered.map((call) => ({
         id: call.id,
         type: "function",
         function: { name: call.name, arguments: JSON.stringify(call.args) },
@@ -2271,12 +2328,17 @@ export async function callAgent(
 
   if (agent.tools.length > 0) {
     let iterations = 0;
-    // The last refusal this loop handed back, for the message a spent budget
+    // The refusal this loop is **holding**, for the message a spent budget
     // raises (Decision D119). A model that never corrects is the way a bounce
     // reaches the bound, and a node failure that named only the bound would
     // leave a reader with the symptom and none of the cause — the same run
     // whose model called correctly and simply kept going produces the very same
     // sentence.
+    //
+    // Held only for as long as the *last* call was one, which is why a call that
+    // completes clears it: a loop whose model corrected and then went on asking
+    // has no refusal outstanding, and a message that produced the last one it
+    // ever saw would say the opposite of what happened.
     let refusal: string | undefined;
     for (;;) {
       if (iterations >= agent.maxToolIterations) {
@@ -2413,6 +2475,10 @@ export async function callAgent(
           ...started(),
           ...(dispatches[before] === undefined ? {} : { result }),
         });
+        // The call worked, so the loop is holding no refusal: a budget spent
+        // after this says the bound stopped a model that was calling correctly
+        // and never answered, which is a different run to diagnose.
+        refusal = undefined;
         results.push({ id: call.id, name: call.name, content: JSON.stringify(result) });
       }
       turns.push({ role: "tool", results });

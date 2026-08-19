@@ -108,10 +108,10 @@ const modelDefault: runtime.ModelRoute = {
 };
 
 /**
- * `tool.web_search` — an HTTP request (grammar 6.1). Its arguments are parsed with its own declared `input:` before the implementation sees them, which is the checked signature grammar 8.4 asks for and the model's arguments are held to. The parse is `runtime.parseToolArguments`, so arguments the schema refuses are a `ToolCallRefused`: at a `tools:` attachment the agent's loop hands that back to the model (Decision D119), and at a `function:` node — where grammar 8.4 has already checked the binding field-by-field and no model chose anything — nothing catches it and the node fails, as it always has. The tool's **result** is parsed with `runtime.parseResult` on both surfaces: a tool answering off-contract is not a call anybody can rephrase.
+ * `tool.web_search` — an HTTP request (grammar 6.1). Its arguments are parsed with its own declared `input:` before the implementation sees them, which is the checked signature grammar 8.4 asks for. This is the parse a `function:` node's binding faces, and it is a `ResultMismatch` that fails the node: the arguments are the composition's, checked field-by-field at compile time, so a value constraint they miss at runtime is the graph's own failure and there is nobody to hand it to. A **model's** arguments are refused one level out, at the entry in the agent's `tools:`, where `runtime.parseToolArguments` raises the `ToolCallRefused` the loop hands back (Decision D119). The tool's **result** is parsed with `runtime.parseResult` on both surfaces: a tool answering off-contract is not a call anybody can rephrase.
  */
 async function toolWebSearch(args: unknown, context: runtime.RunContext): Promise<unknown> {
-  const input = runtime.parseToolArguments(toolWebSearchInput, args, "the arguments `tool.web_search` was called with");
+  const input = runtime.parseResult(toolWebSearchInput, args, "the arguments `tool.web_search` was called with");
   const roots = { input: runtime.bind(input, {
     "properties": {
       "max_results": "int",
@@ -189,7 +189,11 @@ const agentResearcher: runtime.AgentBinding = {
         ],
         "type": "object"
       },
-      invoke: toolWebSearch,
+      invoke: (args, context) =>
+        toolWebSearch(
+          runtime.parseToolArguments(toolWebSearchInput, args, "the arguments `web_search` was called with"),
+          context,
+        ),
     },
   ],
   maxToolIterations: 8,
@@ -254,7 +258,11 @@ const agentReviewer: runtime.AgentBinding = {
         ],
         "type": "object"
       },
-      invoke: toolWebSearch,
+      invoke: (args, context) =>
+        toolWebSearch(
+          runtime.parseToolArguments(toolWebSearchInput, args, "the arguments `web_search` was called with"),
+          context,
+        ),
     },
   ],
   maxToolIterations: 4,

@@ -965,6 +965,11 @@ the model as an error tool result and the tool loop turns again — the same rul
 `flow.*` (§5.4) and a synthesized store tool (§11.5) follow, stated once in
 Decision
 [D119](#d119-a-refused-tool-call-returns-to-the-model-and-a-failed-one-ends-the-node).
+The two even name the tool differently, for the same reason: the refusal a model
+reads names it `web_search`, the local name the request offered, because that is
+the only spelling a corrected call could use, while the mismatch a `function:`
+node fails with names `tool.web_search`, the address whoever fixes the
+composition has to find.
 What the tool's **implementation** then does is nobody's contract: an `exec:`
 that exits outside its accepted list, an `http:` whose response a non-2xx rule
 refuses, or a result the tool's own `output:` refuses, fails the node on both
@@ -6044,7 +6049,7 @@ error.
 
 **Termination is unchanged, and that is what makes the bounce affordable.** A
 correction is another model call, so a bounce costs one of the agent's
-`max_tool_iterations` ([D51](#d51-max_tool_iterations-bounds-the-intra-agent-tool-loop),
+`max_tool_iterations` ([D51](#d51-agents-carry-max_tool_iterations-default-8),
 §5) — the bound that already made the loop statically terminating, with no second
 counter to reason about. Several refusals in one answer are corrected together
 and cost one iteration between them, which is the honest reading of a bound that
@@ -6052,7 +6057,10 @@ counts *model calls*: the model gets one turn to fix everything it got wrong.
 A model that never corrects spends the bound and fails the node, and that failure
 **names the last refusal it was holding** — without it, a loop that ran out
 because the model kept calling wrongly and a loop that ran out because the model
-kept calling correctly and never answered produce the same sentence.
+kept calling correctly and never answered produce the same sentence. *Holding* is
+the operative word and is read strictly: a loop whose last call **worked** holds
+none, so the failure names none, and the sentence never reports a mistake the
+model already corrected.
 
 Three consequences are stated where a reader meets them rather than derived:
 
@@ -6069,7 +6077,12 @@ Three consequences are stated where a reader meets them rather than derived:
   one sentence written for two readers: the model, which has to act on it, and
   the person reading `ToolCallRecord.error`, which carries it verbatim. Quoting
   the arguments back costs nothing `docs/trace.md` §11 was protecting, because
-  the party being shown them is the party that composed them.
+  the party being shown them is the party that composed them. The tool is named
+  the way the **model** was offered it — a `tool.*`'s local name, not its address
+  (§5.4, §6) — because a refusal is an instruction to call again and an
+  identifier the model cannot call is not one. A mismatch on the *other* usage
+  surface, where a `function:` node's binding is what missed the contract, names
+  the address instead: there the reader is a person with a composition to fix.
 
 The trace records a refused call under `outcome: "refused"` rather than reusing
 `"failed"`, which cost a `trace_version` bump: version `3` defines `"failed"` as
