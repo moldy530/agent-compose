@@ -766,7 +766,10 @@ fn a_failure_a_run_survived_carries_its_class_like_one_that_ended_a_run() {
 /// Snapshotting this one would pin the *app's* report rather than the format —
 /// the same entries, wrapped in an execution's status — so what is asserted here
 /// is the rule the other four cannot reach: that a surface with an optional
-/// `trace` carries the version exactly when it carries entries.
+/// `trace` carries the version exactly when it carries a trace. The gate is the
+/// trace's presence, not its length (§1.3): a run that failed inside the graph
+/// having recorded nothing reports `trace: []` with the version beside it, and a
+/// report carries neither key only where there is no trace at all.
 ///
 /// **Both** halves, against reports the app really built. The negative half is
 /// the one that is easy to fake: a `404` body is `unknownExecution`'s, which
@@ -814,11 +817,12 @@ fn the_status_route_carries_the_version_beside_its_trace() {
     );
     assert!(
         running["trace"].is_null(),
-        "a running execution reports no entries (`docs/trace.md` §1.3): {running}"
+        "a running execution reports no trace at all — not an empty one \
+         (`docs/trace.md` §1.3): {running}"
     );
     assert!(
         running["trace_version"].is_null(),
-        "…and so no version, because the version travels with the entries: {running}"
+        "…and so no version, because the version travels with the trace: {running}"
     );
 
     let finished = harness::settled(&app, &execution);

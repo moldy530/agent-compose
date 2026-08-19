@@ -81,13 +81,14 @@ entries; they differ in what surrounds them.
 
 The rule that spans them: **on all three surfaces above, wherever a `trace`
 appears, the `trace_version` that describes it appears beside it — and wherever
-one is absent, so is the other.** Both halves are load-bearing, because two of
-the three surfaces have a report with no trace on it: a `serve` report for a run
-that is still going carries neither, and so does a `serve` report for a run that
-failed with nothing recorded at all. `run --format json` always carries both,
-`trace` empty where the run recorded nothing. In process there is no document to
-put a version in, so the constant `TRACE_VERSION` is where an in-process caller
-of `runFlow` reads the same number (§11).
+one is absent, so is the other.** Both halves are load-bearing, because one of
+the three carries reports with no trace on them: a `serve` report for a run that
+is still going carries neither, and so does one for a run whose failure carried
+no trace at all — a request the graph refused before it ran (§1.3). `run
+--format json` always carries both, `trace` empty where the run recorded
+nothing. In process there is no document to put a version in, so the constant
+`TRACE_VERSION` is where an in-process caller of `runFlow` reads the same number
+(§11).
 
 ### 1.1 `run --format json`
 
@@ -148,12 +149,21 @@ execution tracked by a live process can be in states a finished run cannot. It
 is `serve`'s own vocabulary rather than one of §10.1's closed enumerations: this
 format's `status` is the envelope's two.
 
-`trace` and `trace_version` appear together, on a run that has **stopped with
-entries to report**. Two reports carry neither: a `running` execution, which has
-nothing to report yet, and an execution that failed carrying no trace at all —
-a request refused before the graph ran a node. `outputs` and `error` are the
-same shape: each appears when the execution has one, so a `running` report is
-`execution_id`, `flow`, `trigger` and `status`, and nothing else.
+`trace` and `trace_version` appear together, on a run that has **stopped
+carrying a trace** — an empty one included. The gate is whether there is a trace
+at all, not whether it has entries in it: a run that failed inside the graph
+having recorded nothing reports `trace: []`, which §2 makes a statement about
+the run rather than a way of being absent.
+
+Two reports carry neither key: a `running` execution, which has nothing to
+report yet, and an execution whose failure carried **no trace at all** — one
+raised before the graph ran, so there was never a run to record one. A payload
+that does not fit the trigger or the flow's `inputs:` is not among them: that is
+answered `400`, before an execution exists to report on.
+
+`outputs` and `error` are the same shape: each appears when the execution has
+one, so a `running` report is `execution_id`, `flow`, `trigger` and `status`,
+and nothing else.
 
 ---
 
@@ -195,9 +205,9 @@ retries are attempts at one execution, and `attempts` is where they are recorded
 | `traversal` | integer | always | How many times this node had **already** begun executing in this flow instance — `0` on the first, `1` on the second traversal of a bounded cycle. It is grammar §9.4's traversal ordinal, the same number the instance path is built from. |
 | `outcome` | `"completed"` \| `"skipped"` \| `"failed"` | always | See §3.2. |
 | `attempts` | integer | always | How many attempts the node's `retry:` policy **made**, not how many it allowed (grammar §9.1) — a budget that ran out during the second of three made two. `0` when the node never ran: an input binding that could not be evaluated fails the execution before any attempt (grammar §4.1, §10.1). |
-| `writes` | array of strings | `"completed"`, `"skipped"`; possibly empty | The state channels this node wrote, by name (grammar §10.1). Empty on a skipped node, which writes nothing — and on a **completed** node that landed no channel: one whose `writes:` maps nothing, and one whose result omitted every field that is mapped (grammar §8.0, Decision D110). An empty array is therefore not a statement about `outcome`; read `outcome` for that. Absent on a failed entry: a node that failed produced no output to write from, and where the failure ended the run the superstep it died in lands nothing at all (§9). |
+| `writes` | array of strings | `"completed"`, `"skipped"`, possibly empty | The state channels this node wrote, by name (grammar §10.1). Empty on a skipped node, which writes nothing — and on a **completed** node that landed no channel: one whose `writes:` maps nothing, and one whose result omitted every field that is mapped (grammar §8.0, Decision D110). An empty array is therefore not a statement about `outcome`; read `outcome` for that. Absent on a failed entry: a node that failed produced no output to write from, and where the failure ended the run the superstep it died in lands nothing at all (§9). |
 | `routing` | [routing decision](#4-routing-decisions) | `"completed"`, `"skipped"`; on `"failed"` in the one case §9 names | What this node's outgoing edges answered. The one failed case is *no viable route*, where the edge decisions are the whole explanation; every other failure abandoned or never reached the decision. See §4 and §9. |
-| `dispatches` | array of [dispatch records](#5-dispatch-records) | `map` nodes with a fan-out to report; possibly empty | What a fan-out dispatched, one record per source item in **index** order (grammar §8.6, PRD 5.6). A map over an **empty** array records `[]` — present and empty. The key is absent, rather than empty, exactly where the fan-out has nothing resolved to report: a map whose input binding failed, so no plan was ever built, and a map whose failure abandoned its plan with no dispatch resolved in it — which §5.2's `timeout:` is the reachable case of. A node that is not a `map` never carries the key. See §5. |
+| `dispatches` | array of [dispatch records](#5-dispatch-records) | `map` nodes with a fan-out to report, possibly empty | What a fan-out dispatched, one record per source item in **index** order (grammar §8.6, PRD 5.6). A map over an **empty** array records `[]` — present and empty. The key is absent, rather than empty, exactly where the fan-out has nothing resolved to report: a map whose input binding failed, so no plan was ever built, and a map whose failure abandoned its plan with no dispatch resolved in it — which §5.2's `timeout:` is the reachable case of. A node that is not a `map` never carries the key. See §5. |
 | `inner` | array of entries | `flow:` nodes that ran an instance | The trace of the subflow instance this node ran (grammar §8.5). Absent on a `flow:` node that ran none — one whose *input* could not be built — and on one whose own `timeout:` abandoned its instance mid-flight, which leaves no trace to carry. A **dispatched** instance is never here: a `map`'s items report under their own dispatch records (§5), including the item whose failure ended the map node. See §8. |
 | `stores` | array of [store records](#6-store-records) | when the node performed any | Every store op this node performed, in the order it performed them (PRD 5.8). Never empty: a node that performed none carries no key. See §6. |
 | `models` | array of [model calls](#7-model-calls) | when the node made any | Every model call this node execution made (PRD 5.9). Never empty: a node that made none carries no key. See §7. |
@@ -405,12 +415,20 @@ in what survives:
   fan-out): the records are complete, one per source item.
 * the map node's own **`timeout:`** fired (grammar §9.2, §8.6 rule 9): the
   deadline is raced, so the records are those that had **resolved** — every
-  detached delivery, and every joined instance that had settled. An instance
-  still in flight when the budget ran out has no outcome and so no record; the
-  entry's `error` names the budget that ended it. A deadline that caught *every*
-  instance leaves no records at all, and the entry then carries no `dispatches`
-  key rather than an empty array — an absent key says "nothing resolved", where
-  an empty array would say "nothing was dispatched".
+  detached delivery, which resolves at dispatch, and every joined instance that
+  had settled. The entry's `error` names the budget that ended it.
+
+  What the deadline caught **mid-flight** is where this format stops promising.
+  Such an instance has no outcome at the moment the budget runs out, so there is
+  nothing to record for it — but it is not stopped dead either: it unwinds
+  against the aborted signal, and whether that unwinding lands a record before
+  the entry is written is a matter of scheduling. So read a missing record as
+  "no outcome resolved for this item", never as "this item never ran", and read
+  a record for an item the deadline caught as an outcome that did resolve rather
+  than as a contradiction. A deadline that caught every instance can therefore
+  leave no records at all, and the entry then carries no `dispatches` key rather
+  than an empty array — an absent key says "nothing resolved", where an empty
+  array would say "nothing was dispatched".
 
 ---
 
@@ -503,9 +521,21 @@ never absent, because a failover is by definition a refusal the route declared.
 The entry's `models` is **every model call that node execution made** — across
 every attempt its `retry:` policy made and every instance a `map` **joined** —
 not only the calls of the attempt that answered. A node that succeeded on its
-second attempt reports the first attempt's spent ladder too. "Joined" is the
-whole of the exception: a detached delivery's calls are not here, for the reason
-§5.1 gives.
+second attempt reports the first attempt's spent ladder too. A **detached**
+delivery's calls are not here, for the reason §5.1 gives: the node never waited
+for it, so what it had managed by the time the entry was written is a matter of
+scheduling.
+
+"That node execution made" divides a fan-out exactly as §6 divides its store
+ops, and for the same reason — where the call was made. A joined instance
+dispatched to an `agent.*` has no entry of its own, so its calls are the map
+node's; a `tool.*` makes none. An instance dispatched to a `flow.*` is a run of
+its own graph, whose nodes have entries: its calls are on those, reached through
+`DispatchRecord.inner` (§5), and none of them is on the map node's entry. A
+`flow:` node divides the same way, through `TraceEntry.inner`. So "joined" is
+not the whole of the bound: a per-node roll-up summing `models` over a `map`
+that fans out to `flow.*` targets finds nothing on the map node and every call
+one level down.
 
 Where the two sets differ, calls the node could **order** come in that order (a
 `map`'s, which is source-item order) and the rest come ahead of them in the order

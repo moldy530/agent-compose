@@ -978,19 +978,28 @@ fn a_failure_the_platform_worded_is_restated_rather_than_quoted() {
 ///     not be run", naming the command for a fault in the working directory.
 ///
 /// Where each resolution sits is therefore part of the format, not a detail of
-/// the function: it decides what `TraceEntry.error` says. Asserted on the
-/// source because the messages themselves are gated by
+/// the function: it decides what `TraceEntry.error` says.
+///
+/// So what is asserted is **position**, not presence. The regression this locks
+/// is the resolution moving *into* the guarded region, and a body that resolves
+/// inside it still spells the same line — `try { const resolved =
+/// interpolate(binding.url); … }` contains everything a presence check looks
+/// for. The line is therefore located, required to be the only one of its
+/// spelling, and required to sit ahead of the line that opens the region.
+/// Asserted on the source because the messages themselves are gated by
 /// `tests/generated_code_gates.rs`'s
 /// `no_failure_the_platform_worded_carries_a_resolved_env_value`, which needs an
 /// install, and this rule is cheap enough to hold on every run.
 #[test]
 fn an_unset_reference_is_resolved_outside_the_region_that_restates_a_failure() {
     let source = runtime();
-    for (site, header, hoisted, guarded, what) in [
+    for (site, header, hoisted, opens, region, guarded, what) in [
         (
             "runHttp",
             "export async function runHttp(",
             "const resolved = interpolate(binding.url);",
+            "try {",
+            "the `try` that restates a URL which does not parse",
             "new URL(interpolate(",
             "an unset `url:` reference is restated as a URL that does not parse",
         ),
@@ -998,20 +1007,45 @@ fn an_unset_reference_is_resolved_outside_the_region_that_restates_a_failure() {
             "runExec",
             "export async function runExec(",
             "const cwd = binding.cwd === undefined ? undefined : interpolate(binding.cwd);",
+            "const spawned = new Promise<",
+            "the `new Promise` executor whose rejection is restated as a command that \
+             could not be run",
             "cwd: binding.cwd === undefined ? undefined : interpolate(binding.cwd),",
             "an unset `cwd:` reference is restated as a command that could not be run",
         ),
     ] {
         let body = function_body(&source, header);
+        // Trimmed, so a line's indentation — which is what moving it into the
+        // region changes — is not what identifies it. Its *index* is.
+        let lines: Vec<&str> = body.lines().map(str::trim).collect();
+        let resolves: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| **line == hoisted)
+            .map(|(at, _)| at)
+            .collect();
+        let [resolved_at] = resolves.as_slice() else {
+            panic!(
+                "`{site}` spells `{hoisted}` on {} line(s) of its body; this rule is about \
+                 *where* that line is, so exactly one is expected — with a second copy \
+                 inside the guarded region, {what}",
+                resolves.len()
+            );
+        };
+        let opened_at = lines
+            .iter()
+            .position(|line| line.starts_with(opens))
+            .unwrap_or_else(|| panic!("`{site}` no longer opens {region} with `{opens}…`"));
         assert!(
-            body.contains(hoisted),
-            "`{site}` no longer resolves its `${{ENV}}` references as `{hoisted}`, \
-             ahead of the region that restates a failure; {what}"
+            *resolved_at < opened_at,
+            "`{site}` resolves its `${{ENV}}` references on line {resolved_at} of its body, \
+             at or inside {region}, which opens on line {opened_at}; the resolution belongs \
+             ahead of it, because {what}"
         );
         assert!(
             !body.contains(guarded),
-            "`{site}` resolves its `${{ENV}}` references at `{guarded}`, inside the \
-             region that restates a failure, so {what}"
+            "`{site}` resolves its `${{ENV}}` references at `{guarded}`, inside {region}, \
+             so {what}"
         );
     }
 }

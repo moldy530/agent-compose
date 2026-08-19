@@ -358,12 +358,15 @@ async function notify(callback: string, execution: Execution): Promise<void> {
  * a version key describing nothing would be a number a reader could pin against
  * no format at all. Two reports have nothing for it to describe — a run still
  * going, which has recorded nothing yet, and a run that **failed** carrying no
- * trace, which is a request the graph refused before a node produced an entry —
- * and both carry neither key. The rule a reader is given is the one this
- * expresses — wherever a `trace` appears, the version that describes it appears
- * beside it, and wherever one is absent so is the other — and it holds on the
- * two surfaces this function feeds, the status route and the completion webhook,
- * exactly as it does for `run`'s JSON record and the trace file.
+ * trace at all, which is a failure raised before the graph ran — and both carry
+ * neither key. The gate is whether a trace exists, not whether it has entries in
+ * it: a run that failed *inside* the graph having recorded nothing carries
+ * `trace: []` and the version beside it, because an empty trace is a statement
+ * about the run and an absent one is not. The rule a reader is given is the one
+ * this expresses — wherever a `trace` appears, the version that describes it
+ * appears beside it, and wherever one is absent so is the other — and it holds on
+ * the two surfaces this function feeds, the status route and the completion
+ * webhook, exactly as it does for `run`'s JSON record and the trace file.
  */
 function report(execution: Execution): Record<string, unknown> {
   return {
