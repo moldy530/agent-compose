@@ -8,11 +8,23 @@
 # responses, so a start returns an execution id and the status route is how a
 # caller learns the rest.
 #
-# Two triggers, over two flows, because the verbs do not all become testable at
-# once: `flow.assisted` interrupts and is what `resume` is for, while
-# `flow.direct` has no `human` node in it, so start and status can be decided
-# without the `human` node runtime (which PRD §9's resolved question 4 schedules
-# for M2). They share the agent, the model and the state channels.
+# Four flows, because the verbs and the ways a pause can end do not all become
+# testable at once:
+#
+#   * `flow.direct` has no `human` node in it, so start and status are decidable
+#     without one ever pausing;
+#   * `flow.assisted` interrupts and is what `resume` is for — an unbounded-ish
+#     wait (24h) that a test answers;
+#   * `flow.expiring` is the other way a wait ends: a budget short enough to
+#     spend, whose `on_timeout:` route is taken **instead of** the node's own
+#     edges (grammar 8.7, 9.2), and which then keeps the execution alive long
+#     enough for a late resume to be refused as the expiry it is;
+#   * `flow.batch` is the case that makes a pause need an address: a `map`
+#     dispatching a flow that contains a `human` node, so one execution holds
+#     several pauses at once and each resume has to name which it answers
+#     (grammar 9.4's instance path).
+#
+# They share the agent, the model and the state channels.
 #
 # The `escalate` node is reached only through the `human` node's `on_timeout:`
 # control transfer — one of the two positions node reachability counts besides
@@ -31,6 +43,19 @@ state:
   decision:
     enum: [approve, reject]
     default: approve
+  # Written only by the node `flow.expiring`'s `on_timeout:` transfers to, so a
+  # value here is proof the expiry route ran rather than the node's own edges.
+  escalated:
+    type: string
+    default: ""
+  # One entry per dispatched instance that a human signed off, in source-item
+  # order (grammar 8.6 rule 5).
+  decisions:
+    type: array
+    max_items: 8
+    items:
+      enum: [approve, reject]
+    reduce: append
 
 triggers:
   # `respond: async` returns an execution id immediately; the optional callback
@@ -88,6 +113,28 @@ triggers:
       question: "payload.body.question"
     respond: async
     callback: "payload.body.callback_url"
+
+  # A wait with a budget short enough to spend. `respond: async` again, because
+  # `flow.expiring` reaches a `human` node like `flow.assisted` does.
+  on_expiring_request:
+    type: http
+    flow: flow.expiring
+    path: /expiring-answers
+    method: POST
+    input:
+      question: "payload.body.question"
+    respond: async
+
+  # Several pauses in one execution: the payload is a list, the flow fans out
+  # over it, and each dispatched instance holds a pause of its own.
+  on_batch_request:
+    type: http
+    flow: flow.batch
+    path: /batch-answers
+    method: POST
+    input:
+      questions: "payload.body.questions"
+    respond: async
 
   # The third response shape (grammar 13.3, PRD §9.8): `sync` blocks for the
   # flow's outputs, and on `timeout:` expiry the response **upgrades** to the
@@ -193,3 +240,117 @@ flow.assisted:
     - { from: ask, to: approve }
     - { from: approve, to: end }
     - { from: escalate, to: end }
+
+# The other way a wait ends (grammar 8.7): the budget runs out and `on_timeout:`
+# takes control **instead of** the node's own edges, which is §9.2's fallback
+# shape reached from a different key. The route is two nodes rather than one so
+# that the execution is demonstrably still running after the expiry — which is
+# the window a resume arriving late has to be refused *as an expiry* in, rather
+# than as an execution that has already finished.
+flow.expiring:
+  description: Answer a question and give the reviewer a budget they will not meet.
+  inputs:
+    question:
+      type: string
+      min_length: 1
+  outputs:
+    answer:
+      type: string
+    escalated:
+      type: string
+  nodes:
+    ask:
+      agent: agent.answerer
+      input:
+        question: "input.question"
+
+    # `defaults: { timeout: 60s }` above reaches every other node in this project
+    # and not this one: a `human` node resolves no `timeout` at any level
+    # (Decision D102), so the only budget on this wait is the one written here.
+    sign_off:
+      human:
+        input:
+          answer: { type: string }
+        output:
+          decision: { enum: [approve, reject] }
+        timeout: 3s
+        on_timeout: give_up
+      input:
+        answer: "state.answer"
+
+    # Long enough that the execution is observably still going after the wait
+    # expired, so the late resume the test sends is refused by the *wait's* state
+    # rather than by the execution's.
+    give_up:
+      exec:
+        command: "${OPS_BIN}/sleep"
+        args: ["3"]
+
+    note:
+      exec:
+        command: "${OPS_BIN}/echo"
+        args: ['{"escalated":"the wait ran out"}']
+        output:
+          escalated: { type: string }
+  edges:
+    - { from: start, to: ask }
+    - { from: ask, to: sign_off }
+    - { from: sign_off, to: end }
+    - { from: give_up, to: note }
+    - { from: note, to: end }
+
+# One item's sign-off, as a module. Dispatched by `flow.batch` below, which is
+# what puts several pauses in one execution at once.
+flow.sign_off:
+  description: Have a human sign one item off.
+  inputs:
+    question:
+      type: string
+      min_length: 1
+  outputs:
+    decision:
+      enum: [approve, reject]
+  nodes:
+    sign:
+      human:
+        input:
+          question: { type: string }
+        output:
+          decision: { enum: [approve, reject] }
+      input:
+        question: "input.question"
+  edges:
+    - { from: start, to: sign }
+    - { from: sign, to: end }
+
+# A `map` over a flow that pauses: every dispatched instance parks, so the
+# execution holds one pause per item and the resume route has to address them.
+# Their ids are grammar 9.4's instance paths — `fan/0/<index>/sign/0` — which is
+# what makes them derivable rather than handed out by a counter.
+flow.batch:
+  description: Fan out over a list of questions, each signed off by a human.
+  inputs:
+    questions:
+      type: array
+      max_items: 4
+      items: { type: string }
+  outputs:
+    decisions:
+      type: array
+      max_items: 8
+      items:
+        enum: [approve, reject]
+  nodes:
+    fan:
+      map:
+        over: input.questions
+        as: question
+        node: flow.sign_off
+        max_concurrency: 4
+        input:
+          question: "question"
+        writes:
+          decision: decisions
+  edges:
+    - { from: start, to: fan }
+    - { from: fan, to: end }

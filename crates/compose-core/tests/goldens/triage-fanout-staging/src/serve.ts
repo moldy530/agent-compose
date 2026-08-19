@@ -15,7 +15,7 @@
 // | verb | route | what it does |
 // |---|---|---|
 // | start | the trigger's own `path:`, at its own `method:` | validates the payload, starts an execution, and answers per `respond:` |
-// | status | `GET /executions/:id` | the execution's state, and its outputs once it has them |
+// | status | `GET /executions/:id` | the execution's state, its outputs once it has them, and any pause it is holding |
 // | resume | `POST /executions/:id/resume` | delivers a human's answer to an interrupted execution |
 //
 // It is byte-identical in every project this compiler release builds, like
@@ -58,14 +58,33 @@
 // checkpointer, so it is M3's to write; until then the boundary is stated here
 // and in the emitted `README.md` rather than approximated with a bound.
 //
-// # Resume, and the runtime it waits for
+// # Resume (grammar 8.7, PRD 5.11)
 //
-// `resume` exists, validates that the execution exists, and then says what it
-// cannot do: an interrupt is the only thing there is to resume from, and `human`
-// nodes are grammar in v0 whose runtime PRD §9's resolved question 4 schedules
-// for M2. So an unknown id is a `404` and a known one is a `501` naming that,
-// rather than a route that pretends to have delivered a payload nothing was
-// waiting for.
+// A `human` node parks its execution: the graph stops advancing, the status
+// route reports `interrupted`, and the report carries what the human is shown
+// and what their answer has to fit, so a UI polling the status can present the
+// question without reading the composition.
+//
+// The answer comes back as the **body** of `POST /executions/:id/resume`,
+// validated against that node's `output:` — the schema the status route
+// published. A payload that does not fit is a `400` that does **not** consume
+// the wait: the execution stays interrupted and the same answer can be sent
+// again once it is corrected. Every other refusal here is about *which* pause,
+// not about what was in the body, and each is a `4xx` naming what happened:
+// there is nothing waiting, the wait already expired, or the execution is
+// holding more than one pause and the request named none of them.
+//
+// **Addressing a pause.** One execution can hold more than one at a time — a
+// `human` node inside a `map`-dispatched flow is the reachable case — so a
+// resume may carry `?wait=<id>`, where the id is grammar 9.4's instance path
+// flattened (`approve/0`, `review/0/2/approve/0`). It may be omitted where the
+// execution is holding exactly one, which is what the status route's
+// `resume_url` does for a caller that never has to think about it.
+//
+// **What durability there is.** The wait is a promise parked in this process,
+// like the execution table below: a `serve` restarted while a human was thinking
+// has lost it, and the emitted `README.md` says so. Checkpointed waits arrive
+// with durable execution (PRD §7, M3).
 
 import process from "node:process";
 
@@ -73,7 +92,7 @@ import Fastify from "fastify";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import { type CompiledFlow, flows, runFlow } from "./graph.ts";
-import { TRACE_VERSION } from "./runtime.ts";
+import { TRACE_VERSION, deliverHumanAnswer, humanWaits } from "./runtime.ts";
 import type * as runtime from "./runtime.ts";
 import { type HttpTrigger, httpTriggers } from "./triggers.ts";
 
@@ -85,12 +104,34 @@ interface Execution {
   readonly id: string;
   readonly flow: string;
   readonly trigger: string;
-  status: ExecutionStatus;
+  /**
+   * What the run itself has done: `running` until it stops, then `completed` or
+   * `failed`.
+   *
+   * `interrupted` is never written here — it is derived at report time from the
+   * pauses the runtime is holding ([`statusOf`]), because a pause is not a state
+   * the run transitions into and out of: the graph is still mid-superstep, and a
+   * resume puts it straight back to work. Deriving it means the two can never
+   * disagree, which a stored flag updated from two sides eventually would.
+   */
+  status: Exclude<ExecutionStatus, "interrupted">;
   outputs?: Record<string, unknown>;
   trace?: readonly runtime.TraceEntry[];
   error?: string;
   /** Resolves when the run has stopped, however it stopped. */
   settled: Promise<void>;
+}
+
+/**
+ * What an execution is doing, pauses included (PRD 5.11).
+ *
+ * A run that has stopped reports how it stopped. One that has not is
+ * `interrupted` exactly while the runtime is holding a pause for it, and
+ * `running` otherwise.
+ */
+function statusOf(execution: Execution): ExecutionStatus {
+  if (execution.status !== "running") return execution.status;
+  return humanWaits(execution.id).length > 0 ? "interrupted" : "running";
 }
 
 /** The payload shape grammar 13.3 fixes, as one request presents it. */
@@ -138,18 +179,62 @@ export function createApp(): FastifyInstance {
     const id = (request.params as { id: string }).id;
     const execution = executions.get(id);
     // The existence check first: a resume against an id this process never
-    // started is a different mistake from a resume this release cannot perform,
-    // and answering both the same way would hide the first.
+    // started is a different mistake from a resume that arrived at the wrong
+    // moment, and answering both the same way would hide the first.
     if (execution === undefined) return unknownExecution(reply, id);
-    return reply.code(501).send({
+    if (execution.status !== "running") {
+      return reply.code(409).send({
+        execution_id: id,
+        status: execution.status,
+        error: `this execution has already ${execution.status}, so nothing is waiting for an answer`,
+      });
+    }
+    const named = (request.query as { wait?: string }).wait;
+    const outcome = deliverHumanAnswer(id, named, request.body);
+    if (outcome.ok) {
+      // `202` rather than `200`: the answer has been delivered and the graph has
+      // gone back to work, which the status route is where to watch. The run is
+      // not finished, and a `200` carrying no outputs would read as if it were.
+      return reply.code(202).send({
+        execution_id: id,
+        wait: outcome.wait.id,
+        status: "running",
+        status_url: `/executions/${id}`,
+      });
+    }
+    return reply.code(outcome.reason === "mismatch" ? 400 : 409).send({
       execution_id: id,
-      status: execution.status,
+      status: statusOf(execution),
+      ...(named === undefined ? {} : { wait: named }),
+      ...(outcome.pending === undefined ? {} : { pending: outcome.pending }),
       error:
-        "resuming an execution needs the `human` node runtime, which this compiler release does not execute: `human` nodes are grammar in v0 and PRD §9's resolved question 4 schedules the runtime for M2. An interrupt is the only thing there is to resume from, so nothing is waiting for this payload",
+        outcome.reason === "mismatch"
+          ? `the resume payload does not fit the \`human\` node's \`output:\`, so the execution is still waiting for one that does: ${outcome.detail}`
+          : outcome.detail,
     });
   });
 
   return app;
+}
+
+/**
+ * One pause, as the status route publishes it (PRD 5.11, grammar 8.7).
+ *
+ * `snake_case` because these are document keys, alongside `execution_id` and
+ * `status` on the same report — the seam `docs/trace.md` §2 names, where an
+ * entry's keys are the runtime record's `camelCase` and a document's are these.
+ */
+function question(execution: Execution, wait: runtime.HumanWait): Record<string, unknown> {
+  return {
+    wait_id: wait.id,
+    flow: wait.flow,
+    node: wait.node,
+    paused_at: wait.pausedAt,
+    ...(wait.expiresAt === undefined ? {} : { expires_at: wait.expiresAt }),
+    input: wait.shown,
+    output_schema: wait.schema,
+    resume_url: `/executions/${execution.id}/resume?wait=${encodeURIComponent(wait.id)}`,
+  };
 }
 
 /**
@@ -310,7 +395,14 @@ function register(
     // because the run's own handlers write into it.
     settled: Promise.resolve(),
   };
-  execution.settled = runFlow(flow.address, inputs, { executionId: id, sessionKey })
+  // `resumable: true` is what makes a `human` node a *pause* rather than the end
+  // of the run: this app mounts the route that answers one (grammar 8.7,
+  // PRD 5.11), which `agent-compose run` does not.
+  execution.settled = runFlow(flow.address, inputs, {
+    executionId: id,
+    sessionKey,
+    resumable: true,
+  })
     .then((run) => {
       execution.status = "completed";
       execution.outputs = run.outputs;
@@ -373,13 +465,23 @@ async function notify(callback: string, execution: Execution): Promise<void> {
  * appears beside it, and wherever one is absent so is the other — and it holds on
  * the two surfaces this function feeds, the status route and the completion
  * webhook, exactly as it does for `run`'s JSON record and the trace file.
+ *
+ * `interrupts` is the third key that comes and goes, and it is on exactly the
+ * report whose `status` is `interrupted`: every pause the execution is holding,
+ * with what the human is shown, the schema their answer has to fit, and the URL
+ * that delivers it (grammar 8.7). It is what makes a status poll enough to
+ * *present* the question rather than only to notice that there is one.
  */
 function report(execution: Execution): Record<string, unknown> {
+  const waits = execution.status === "running" ? humanWaits(execution.id) : [];
   return {
     execution_id: execution.id,
     flow: execution.flow,
     trigger: execution.trigger,
-    status: execution.status,
+    status: statusOf(execution),
+    ...(waits.length === 0
+      ? {}
+      : { interrupts: waits.map((wait) => question(execution, wait)) }),
     ...(execution.outputs === undefined ? {} : { outputs: execution.outputs }),
     ...(execution.error === undefined ? {} : { error: execution.error }),
     ...(execution.trace === undefined
@@ -391,7 +493,7 @@ function report(execution: Execution): Record<string, unknown> {
 function accepted(reply: FastifyReply, execution: Execution): unknown {
   return reply.code(202).send({
     execution_id: execution.id,
-    status: execution.status,
+    status: statusOf(execution),
     status_url: `/executions/${execution.id}`,
   });
 }

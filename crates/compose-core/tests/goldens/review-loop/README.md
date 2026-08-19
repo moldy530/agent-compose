@@ -130,6 +130,7 @@ the life of the process, so a long-running `serve` grows with the number of
 requests it has answered. Restarting it is the only way to reclaim that until
 the checkpointer arrives and an execution stops living in memory.
 
+
 Stopping it stops the graph: `agent-compose serve` passes `SIGINT` and `SIGTERM`
 on to this project, which closes the app and exits, so a supervisor that signals
 the command is not left with a listener behind it.

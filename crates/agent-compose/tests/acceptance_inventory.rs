@@ -589,17 +589,21 @@ const COMMANDS: &[Criterion] = &[
                 "a_declared_manual_trigger_remaps_the_session_the_cli_was_given",
                 Status::Live,
             ),
+            // And the one outcome a one-shot CLI run cannot carry to the end: a
+            // `human` pause, whose answer arrives through `serve`'s resume route
+            // (grammar 8.7, PRD 5.11). What `run` owes there is an exit path of
+            // its own rather than one of the two it already has.
+            (
+                "run_reports_the_pause_it_cannot_answer_and_exits_on_its_own_code",
+                Status::Live,
+            ),
         ],
     },
-    // Four tests, because the criterion's three verbs do not unlock together.
-    // PRD §7 M1 puts `serve` — start, resume and status — in this milestone,
-    // while PRD §9's resolved question 4 says the `human` node runtime "may land
-    // M2". Only `resume` needs that runtime: an interrupt is what there is to
-    // resume from. So start/status is decided over the `http-trigger` fixture's
-    // interrupt-free flow and is `serve`'s to unlock — as is `respond: sync` and
-    // its timeout upgrade, and the half of `resume` that is about the route
-    // existing and validating what it was given. What is left pending is the one
-    // claim that needs an interrupt to resume *from*, and it names it.
+    // The criterion's three verbs, plus what the app does with a request and
+    // what the command does when there is no app to serve. `resume` is the verb
+    // that takes the most tests, because it is the one whose refusals carry
+    // information: which pause a request means, and whether the wait it names is
+    // still there to answer (grammar 8.7, PRD 5.11).
     Criterion {
         bullet: Bullet::Commands,
         phrase: "`agent-compose serve` (generated Fastify app for http triggers: start/resume/status)",
@@ -613,7 +617,7 @@ const COMMANDS: &[Criterion] = &[
                 Status::Live,
             ),
             (
-                "resume_validates_the_execution_and_names_the_runtime_it_waits_for",
+                "resume_tells_an_unknown_execution_from_one_that_is_not_waiting",
                 Status::Live,
             ),
             // What the app does with a request is as much a part of "generated
@@ -650,11 +654,24 @@ const COMMANDS: &[Criterion] = &[
             // waits on it — so "the app is served by this command" is only true
             // if ending the command ends the app.
             ("stopping_serve_stops_the_app_it_started", Status::Live),
+            // The third verb, end to end: the execution really stops at the
+            // pause, the status route publishes what the human is shown and
+            // what their answer has to fit, and the payload is held to that
+            // schema before anything is delivered.
             (
                 "serve_resumes_an_interrupted_execution_against_the_human_nodes_schema",
-                Status::Pending(
-                    "pending: the `human` node runtime, which PRD §9's resolved question 4 schedules for M2",
-                ),
+                Status::Live,
+            ),
+            // …and the two other ways a pause ends or is addressed: a budget
+            // that runs out and routes elsewhere, and an execution holding more
+            // than one pause at a time.
+            (
+                "an_expired_wait_takes_its_route_and_refuses_the_answer_that_arrives_after_it",
+                Status::Live,
+            ),
+            (
+                "two_pauses_in_one_execution_are_addressed_by_their_instance_paths",
+                Status::Live,
             ),
         ],
     },

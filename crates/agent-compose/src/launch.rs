@@ -34,7 +34,10 @@
 //! `2` for a command that could not run at all, which is what a missing
 //! entrypoint, an unresolvable JavaScript runtime, an unresolved dependency set
 //! and a missing environment variable all are. The child's own code is passed
-//! through unchanged, and `src/cli.ts` gives the three the same meanings.
+//! through unchanged, and `src/cli.ts` gives the three the same meanings — plus
+//! the fourth only it can reach: `3`, a run that stopped at a `human` pause
+//! (grammar 8.7). Nothing here decides that one; it arrives as the child's code
+//! like the rest.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};

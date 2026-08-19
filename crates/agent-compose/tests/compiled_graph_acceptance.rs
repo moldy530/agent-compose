@@ -3800,11 +3800,11 @@ fn a_subflow_inherits_the_callers_history_and_takes_its_instantiation_policy() {
 /// concurrent `http:` branch converging at equal depth, and an inline `exec:`
 /// node after it.
 ///
-/// It **stops** at `approve`, which is a `human:` node — the one construct on its
-/// path this compiler release does not execute (PRD §7 M1 leaves the `human`
-/// runtime to `serve`). That is asserted rather than worked around: the run gets
-/// all the way there, the trace holds every step it took, and the node it stopped
-/// at names the construct and the bullet that lands it.
+/// It **stops** at `approve`, which is a `human:` node: an in-process invocation
+/// has no resume surface, so the pause is where the run ends (grammar 8.7,
+/// PRD 5.11). That is asserted rather than worked around — the run gets all the
+/// way there, the trace holds every step it took, and the node it stopped at
+/// says what it is waiting for and where an answer would come from.
 ///
 /// The fixer answering **item 0** is delayed past the one answering item 3, so
 /// the two patches complete in the reverse of source order. What `summarize` is
@@ -3899,10 +3899,10 @@ fn the_triage_fanout_example_routes_every_finding_and_joins_them_in_source_order
         return;
     };
 
-    // Everything up to the one construct this release does not execute.
+    // Everything up to the pause an in-process invocation cannot answer.
     let failure = run.failed();
     assert!(
-        failure.contains("a `human` pause is not executed by this compiler release"),
+        failure.contains("is waiting for a human and this run has no way to answer"),
         "the run reaches `approve` and stops there, saying what it is: {failure}"
     );
     assert_eq!(
@@ -5921,9 +5921,9 @@ fn run_says_what_is_missing_when_the_dependency_set_is_not_installed() {
 /// Two of the criterion's three verbs, over the fixture's interrupt-free flow
 /// (`flow.direct`): a start that answers with an execution id and a status route
 /// that reports the run's terminal state and outputs. Split from the resume half
-/// below because this half is decidable with `serve` alone — the criterion is
-/// PRD §7 M1's, while the `human` node runtime the other half needs is scheduled
-/// for M2 (PRD §9, resolved question 4).
+/// below because this half is decidable without anything ever pausing, and a
+/// test that mixed the two would be asserting about the `human` runtime while
+/// claiming to be about the route.
 #[test]
 fn serve_exposes_start_and_status_for_an_http_trigger() {
     let provider = MockProvider::start().expect("a loopback port");
@@ -6034,16 +6034,17 @@ fn serve_answers_a_sync_trigger_and_upgrades_when_its_timeout_expires() {
     assert_eq!(finished["outputs"]["answer"], "eventually");
 }
 
-/// `resume` validates that the execution exists, and then names the runtime it
-/// waits for (PRD §9, resolved question 4).
+/// `resume` tells "no such execution" from "nothing is waiting", and disturbs
+/// neither (PRD 5.11).
 ///
-/// The half of the third verb this milestone can decide. `resume` is routed and
-/// reachable, an id this process never started is a `404`, and an id it did is a
-/// `501` naming the `human` node runtime — because an interrupt is the only
-/// thing there is to resume from and M2 owns that runtime. The companion test
-/// below is the other half, which needs the interrupt itself.
+/// Every refusal on this route is about *which* pause the request means, and a
+/// route that answered them all the same way would hide the one a caller can
+/// act on. An id this process never started is a `404` — the caller is polling
+/// the wrong app, or the process restarted. An id it did start, on a flow with
+/// no `human` node anywhere in it, is a `409`: there is a run, and it was never
+/// going to ask anyone anything.
 #[test]
-fn resume_validates_the_execution_and_names_the_runtime_it_waits_for() {
+fn resume_tells_an_unknown_execution_from_one_that_is_not_waiting() {
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue(Script::new(
         SONNET,
@@ -6055,12 +6056,20 @@ fn resume_validates_the_execution_and_names_the_runtime_it_waits_for() {
     };
     let app = Client::new(&served.base_url).expect("a client for the generated app");
 
-    // An id this process never started is not a resume this release cannot
-    // perform — it is a resume of nothing, and the two are told apart.
+    // An id this process never started is a resume of nothing, and is told apart
+    // from a resume that arrived at the wrong moment.
     let unknown = app
         .post_json("/executions/exec_nothing/resume", &json!({}))
         .expect("the resume route answers");
     assert_eq!(unknown.status, 404, "{:?}", unknown.body);
+    assert!(
+        unknown.json()["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no execution `exec_nothing` was started by this process"),
+        "{:?}",
+        unknown.body
+    );
 
     let started = app
         .post_json("/direct-answers", &json!({ "question": "what is it?" }))
@@ -6069,7 +6078,12 @@ fn resume_validates_the_execution_and_names_the_runtime_it_waits_for() {
         .as_str()
         .expect("an execution id")
         .to_string();
-    harness::settled(&app, &execution);
+    let finished = harness::settled(&app, &execution);
+    assert_eq!(finished["status"], "completed", "{finished}");
+    assert!(
+        finished["interrupts"].is_null(),
+        "`flow.direct` has no `human` node, so nothing was ever published: {finished}"
+    );
 
     let refused = app
         .post_json(
@@ -6077,14 +6091,12 @@ fn resume_validates_the_execution_and_names_the_runtime_it_waits_for() {
             &json!({ "decision": "approve" }),
         )
         .expect("the resume route answers");
-    assert_eq!(refused.status, 501, "{:?}", refused.body);
-    let error = refused.json()["error"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
-    assert!(
-        error.contains("`human` node runtime") && error.contains("M2"),
-        "the refusal names the runtime and the milestone: {error}"
+    assert_eq!(refused.status, 409, "{:?}", refused.body);
+    assert_eq!(
+        refused.json()["error"].as_str(),
+        Some("this execution has already completed, so nothing is waiting for an answer"),
+        "{:?}",
+        refused.body
     );
 }
 
@@ -6353,11 +6365,11 @@ fn a_completion_webhook_fires_with_the_runs_report_and_only_when_a_url_was_given
 
 /// The third verb: `resume` against the interrupting `human` node's schema.
 ///
-/// Kept apart from start/status because it cannot be decided without the `human`
-/// node runtime, which PRD §9's resolved question 4 puts in M2 — so this is the
-/// one row of the M1 inventory whose blocker is not `serve` itself.
+/// Kept apart from start/status because it is the one verb that needs the
+/// `human` node runtime: the execution has to really stop at the pause, the
+/// status route has to say so, and the payload has to be held to the node's own
+/// `output:` before anything is delivered (grammar 8.7, PRD 5.11).
 #[test]
-#[ignore = "pending: the `human` node runtime, which PRD §9's resolved question 4 schedules for M2"]
 fn serve_resumes_an_interrupted_execution_against_the_human_nodes_schema() {
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue(Script::new(
@@ -6384,6 +6396,41 @@ fn serve_resumes_an_interrupted_execution_against_the_human_nodes_schema() {
     let status = harness::settled(&app, &execution);
     assert_eq!(status["status"], "interrupted");
 
+    // …and the report is enough to *ask* the question rather than only to
+    // notice there is one: what the human is shown, the schema their answer has
+    // to fit, and where to send it (PRD 5.11).
+    let interrupts = status["interrupts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("an interrupted report names the pauses it is holding: {status}"));
+    assert_eq!(interrupts.len(), 1, "{status}");
+    let waiting = &interrupts[0];
+    assert_eq!(waiting["wait_id"], "approve/0", "{waiting}");
+    assert_eq!(waiting["flow"], "flow.assisted", "{waiting}");
+    assert_eq!(waiting["node"], "approve", "{waiting}");
+    assert_eq!(
+        waiting["input"],
+        json!({ "answer": "an answer" }),
+        "the node's own `input:`, evaluated — what the human is shown: {waiting}"
+    );
+    assert_eq!(
+        waiting["output_schema"]["properties"]["decision"]["enum"],
+        json!(["approve", "reject"]),
+        "…and the published schema an answer is held to: {waiting}"
+    );
+    assert_eq!(
+        waiting["resume_url"], "/executions/{execution}/resume?wait=approve%2F0"
+            .replace("{execution}", &execution),
+        "{waiting}"
+    );
+    assert!(
+        waiting["expires_at"].is_string(),
+        "this node declares `timeout: 24h`, so the wait has a deadline to publish: {waiting}"
+    );
+    assert!(
+        status["trace"].is_null() && status["trace_version"].is_null(),
+        "a run that has not stopped carries no trace (`docs/trace.md` §1.3): {status}"
+    );
+
     // Resume: the payload is validated against the `human` node's output schema.
     let refused = app
         .post_json(
@@ -6394,6 +6441,14 @@ fn serve_resumes_an_interrupted_execution_against_the_human_nodes_schema() {
     assert_eq!(
         refused.status, 400,
         "`maybe` is not one of the declared variants"
+    );
+
+    // …and it did not consume the wait: an answer that does not fit is a
+    // request to send a better one, not a turn spent (PRD 5.11).
+    let still = harness::settled(&app, &execution);
+    assert_eq!(
+        still["status"], "interrupted",
+        "the refused payload left the execution waiting: {still}"
     );
 
     let resumed = app
@@ -6408,6 +6463,364 @@ fn serve_resumes_an_interrupted_execution_against_the_human_nodes_schema() {
     assert_eq!(finished["status"], "completed");
     assert_eq!(finished["outputs"]["answer"], "an answer");
     assert_eq!(finished["outputs"]["decision"], "approve");
+    assert!(
+        finished["interrupts"].is_null(),
+        "a finished execution is holding nothing: {finished}"
+    );
+
+    // The pause is trace data (PRD 5.3, `docs/trace.md` §3): when it began, that
+    // it resumed, and when the answer arrived. What the human *said* is not
+    // there and is not meant to be — the same posture the format takes to a
+    // model's completion (§11) — so the entry names no `decision` anywhere.
+    let entry = finished["trace"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a finished report carries its trace: {finished}"))
+        .iter()
+        .find(|entry| entry["node"] == "approve")
+        .unwrap_or_else(|| panic!("the `human` node has an entry: {finished}"))
+        .clone();
+    assert_eq!(entry["outcome"], "completed", "{entry}");
+    assert_eq!(entry["human"]["settled"], "resumed", "{entry}");
+    assert!(entry["human"]["pausedAt"].is_string(), "{entry}");
+    assert!(entry["human"]["settledAt"].is_string(), "{entry}");
+    assert!(entry["human"]["expiresAt"].is_string(), "{entry}");
+    assert_eq!(
+        entry["writes"],
+        json!(["decision"]),
+        "the answer reaches the run through the node's writes, by channel name: {entry}"
+    );
+    assert!(
+        !entry.to_string().contains("looks right"),
+        "no field of the format carries what the human answered: {entry}"
+    );
+
+    // A resume for a run that has stopped is refused rather than delivered.
+    let late = app
+        .post_json(
+            &format!("/executions/{execution}/resume"),
+            &json!({ "decision": "reject", "note": "too late" }),
+        )
+        .expect("the resume route answers");
+    assert_eq!(late.status, 409, "{:?}", late.body);
+    assert_eq!(
+        late.json()["error"].as_str(),
+        Some("this execution has already completed, so nothing is waiting for an answer"),
+        "{:?}",
+        late.body
+    );
+
+    // …and an id this process never started is the other mistake, told apart.
+    let unknown = app
+        .post_json("/executions/exec_nobody/resume", &json!({ "decision": "approve" }))
+        .expect("the resume route answers");
+    assert_eq!(unknown.status, 404, "{:?}", unknown.body);
+}
+
+/// A wait that runs out its budget takes its `on_timeout:` route **instead of**
+/// the node's own edges, and the answer that arrives after it is refused as the
+/// expiry it is (grammar 8.7, 9.2).
+///
+/// Three claims in one run, because the second and third are only decidable
+/// against the first: the route was taken (a channel only that route writes has
+/// a value, and the node's own edges did not fire), the trace says which of the
+/// two ways the wait ended, and a resume sent into the window *after* the expiry
+/// and *before* the run finished is answered by the wait's own state rather than
+/// by "this execution is over" — which is why the fixture's route sleeps.
+#[test]
+fn an_expired_wait_takes_its_route_and_refuses_the_answer_that_arrives_after_it() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "answer": "an answer" })),
+    ));
+
+    let Some(served) = harness::serve("http-trigger", &provider) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+
+    let started = app
+        .post_json("/expiring-answers", &json!({ "question": "what is it?" }))
+        .expect("the trigger's route answers");
+    assert_eq!(started.status, 202, "{:?}", started.body);
+    let execution = started.json()["execution_id"]
+        .as_str()
+        .expect("an execution id")
+        .to_string();
+
+    let waiting = harness::settled(&app, &execution);
+    assert_eq!(waiting["status"], "interrupted", "{waiting}");
+    assert_eq!(waiting["interrupts"][0]["wait_id"], "sign_off/0", "{waiting}");
+
+    // The budget runs out and the `on_timeout:` route starts; the execution is
+    // still going, which is the window the late answer lands in.
+    let running = poll_until(&app, &execution, "running");
+    assert!(
+        running["interrupts"].is_null(),
+        "the wait is over, so there is nothing to publish: {running}"
+    );
+    let late = app
+        .post_json(
+            &format!("/executions/{execution}/resume?wait=sign_off/0"),
+            &json!({ "decision": "approve" }),
+        )
+        .expect("the resume route answers");
+    assert_eq!(late.status, 409, "{:?}", late.body);
+    let said = late.json()["error"].as_str().unwrap_or_default().to_string();
+    assert!(
+        said.contains("expired before this answer arrived")
+            && said.contains("on_timeout")
+            && said.contains("sign_off/0"),
+        "the refusal names what happened to the wait rather than only refusing: {said}"
+    );
+
+    let finished = harness::settled(&app, &execution);
+    assert_eq!(finished["status"], "completed", "{finished}");
+    assert_eq!(
+        finished["outputs"]["escalated"], "the wait ran out",
+        "only the `on_timeout:` route writes this channel: {finished}"
+    );
+
+    let entry = finished["trace"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a finished report carries its trace: {finished}"))
+        .iter()
+        .find(|entry| entry["node"] == "sign_off")
+        .unwrap_or_else(|| panic!("the `human` node has an entry: {finished}"))
+        .clone();
+    assert_eq!(
+        entry["outcome"], "failed",
+        "the node left no result for the run to carry on from: {entry}"
+    );
+    assert_eq!(
+        entry["fallback"], "give_up",
+        "…and control transferred to the declared route instead of its edges: {entry}"
+    );
+    assert!(
+        entry["routing"].is_null(),
+        "a node whose edges were not evaluated records no routing decision: {entry}"
+    );
+    assert_eq!(entry["human"]["settled"], "expired", "{entry}");
+    assert!(entry["human"]["settledAt"].is_string(), "{entry}");
+}
+
+/// Several pauses in one execution are told apart by the instance path that
+/// addresses them (grammar 9.4, 8.6).
+///
+/// A `map` dispatching a flow with a `human` node in it is the reachable way one
+/// execution holds more than one wait at a time, and it is the case a resume
+/// route with only an execution id could not serve. `?wait=` is what names one,
+/// the ids are derived rather than handed out — `fan/0/<index>/sign/0` — and a
+/// resume that names none while two are pending is refused rather than guessed.
+#[test]
+fn two_pauses_in_one_execution_are_addressed_by_their_instance_paths() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let Some(served) = harness::serve("http-trigger", &provider) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+
+    let started = app
+        .post_json(
+            "/batch-answers",
+            &json!({ "questions": ["ship it?", "revert it?"] }),
+        )
+        .expect("the trigger's route answers");
+    assert_eq!(started.status, 202, "{:?}", started.body);
+    let execution = started.json()["execution_id"]
+        .as_str()
+        .expect("an execution id")
+        .to_string();
+
+    let waiting = wait_for_pauses(&app, &execution, 2);
+    let ids: Vec<String> = waiting["interrupts"]
+        .as_array()
+        .expect("the pauses")
+        .iter()
+        .map(|one| one["wait_id"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["fan/0/0/sign/0".to_string(), "fan/0/1/sign/0".to_string()],
+        "each pause is addressed by its own instance path: {waiting}"
+    );
+    // Each carries the question *its* instance was dispatched with, which is
+    // what makes two pauses two questions rather than one asked twice.
+    assert_eq!(waiting["interrupts"][0]["input"]["question"], "ship it?");
+    assert_eq!(waiting["interrupts"][1]["input"]["question"], "revert it?");
+
+    // An unaddressed resume is refused rather than applied to whichever pause
+    // happened to be first, and it lists what it could have meant.
+    let ambiguous = app
+        .post_json(
+            &format!("/executions/{execution}/resume"),
+            &json!({ "decision": "approve" }),
+        )
+        .expect("the resume route answers");
+    assert_eq!(ambiguous.status, 409, "{:?}", ambiguous.body);
+    assert_eq!(
+        ambiguous.json()["pending"],
+        json!(["fan/0/0/sign/0", "fan/0/1/sign/0"]),
+        "{:?}",
+        ambiguous.body
+    );
+
+    // An id that is not one of them is the other refusal, told apart.
+    let nowhere = app
+        .post_json(
+            &format!("/executions/{execution}/resume?wait=sign/0"),
+            &json!({ "decision": "approve" }),
+        )
+        .expect("the resume route answers");
+    assert_eq!(nowhere.status, 409, "{:?}", nowhere.body);
+    assert!(
+        nowhere
+            .json()["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("holding no pause `sign/0`"),
+        "{:?}",
+        nowhere.body
+    );
+
+    // Answered in the reverse of source-item order, because what the fan-out
+    // writes is ordered by **index** rather than by who answered first
+    // (grammar 8.6 rule 5).
+    for (id, decision) in [("fan/0/1/sign/0", "reject"), ("fan/0/0/sign/0", "approve")] {
+        let resumed = app
+            .post_json(
+                &format!(
+                    "/executions/{execution}/resume?wait={}",
+                    id.replace('/', "%2F")
+                ),
+                &json!({ "decision": decision }),
+            )
+            .expect("the resume route answers");
+        assert_eq!(resumed.status, 202, "{:?}", resumed.body);
+        assert_eq!(resumed.json()["wait"], id, "{:?}", resumed.body);
+    }
+
+    let finished = harness::settled(&app, &execution);
+    assert_eq!(finished["status"], "completed", "{finished}");
+    assert_eq!(
+        finished["outputs"]["decisions"],
+        json!(["approve", "reject"]),
+        "the join is ordered by source-item index, not by who answered first: {finished}"
+    );
+}
+
+/// `agent-compose run` reports the pause it cannot answer, and exits on a code
+/// of its own (grammar 8.7, PRD 5.11).
+///
+/// Resume is an invocation the generated **app** exposes, so a one-shot CLI run
+/// that reaches a `human` node cannot finish. What it must not do is either of
+/// the two things that would be easier: wait forever, or carry on with a
+/// decision nobody made. It stops, says where the answer goes, writes the trace
+/// document with a status of its own, and exits `3` — beside `1` for a run that
+/// produced no answer and `2` for a command that could not be run.
+#[test]
+fn run_reports_the_pause_it_cannot_answer_and_exits_on_its_own_code() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "answer": "an answer" })),
+    ));
+
+    let Some(run) = harness::run(
+        "http-trigger",
+        "flow.assisted",
+        &[("question", "what is it?")],
+        &provider,
+    ) else {
+        return;
+    };
+    let said = run.failed();
+    assert_eq!(
+        run.output.status.code(),
+        Some(3),
+        "a pause is neither a failed run nor a command that could not be run: {said}"
+    );
+    assert!(
+        said.contains("is waiting for a human and this run has no way to answer")
+            && said.contains("POST /executions/:id/resume"),
+        "…and the message says where the answer goes: {said}"
+    );
+
+    let document = run.trace_document();
+    assert_eq!(
+        document["status"], "interrupted",
+        "the document says which of the three ways the run ended: {document}"
+    );
+    assert!(
+        document["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("HumanInterrupt"),
+        "{document}"
+    );
+    let entry = run
+        .entries("approve")
+        .pop()
+        .unwrap_or_else(|| panic!("the `human` node has an entry: {document}"));
+    assert_eq!(entry["outcome"], "failed", "{entry}");
+    assert!(
+        entry["human"]["pausedAt"].is_string(),
+        "the pause is recorded even though nothing settled it: {entry}"
+    );
+    assert!(
+        entry["human"]["settled"].is_null() && entry["human"]["settledAt"].is_null(),
+        "…and a wait the run ended holding has no settlement to record: {entry}"
+    );
+    assert!(
+        entry["fallback"].is_null(),
+        "an interrupt transfers control nowhere: {entry}"
+    );
+}
+
+/// Poll the status route until it reports `status`, and answer with that report.
+///
+/// [`harness::settled`] stops at the three states a run can rest in; this is for
+/// the transitions between them — a wait that expires while the execution
+/// carries on is a `running` report that only exists for as long as the route it
+/// took takes.
+fn poll_until(app: &Client, execution: &str, status: &str) -> Value {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let last: Value = app
+            .get(&format!("/executions/{execution}"))
+            .expect("the status route answers")
+            .json();
+        if last["status"] == status {
+            return last;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "execution `{execution}` never reached `{status}`: {last}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Poll until the execution is holding exactly `count` pauses.
+///
+/// A fan-out's instances start together and park one at a time, so a report read
+/// the instant after `start` answered can hold fewer than the dispatch will.
+fn wait_for_pauses(app: &Client, execution: &str, count: usize) -> Value {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let last: Value = app
+            .get(&format!("/executions/{execution}"))
+            .expect("the status route answers")
+            .json();
+        if last["interrupts"].as_array().is_some_and(|held| held.len() == count) {
+            return last;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "execution `{execution}` never held {count} pauses: {last}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// A route collision the **compiler cannot decide** is reported by the app as

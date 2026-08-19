@@ -130,6 +130,7 @@ the life of the process, so a long-running `serve` grows with the number of
 requests it has answered. Restarting it is the only way to reclaim that until
 the checkpointer arrives and an execution stops living in memory.
 
+
 Stopping it stops the graph: `agent-compose serve` passes `SIGINT` and `SIGTERM`
 on to this project, which closes the app and exits, so a supervisor that signals
 the command is not left with a listener behind it.
@@ -153,6 +154,72 @@ installer-specific — no `packageManager` field, no lockfile, no install-time
 script — so bun, npm and pnpm all resolve it to the same versions. The lockfile
 your installer writes is yours: `agent-compose build` never writes or removes
 one.
+
+## Answering a `human` node
+
+A flow that reaches a `human` node stops there and its execution reports
+`status: "interrupted"`. The status route is where the question is: an
+interrupted report carries an `interrupts` array, one entry per pause the
+execution is holding, and each entry has everything needed to ask a person and
+take their answer.
+
+```json
+{
+  "execution_id": "exec_0f1e…",
+  "flow": "flow.review",
+  "trigger": "on_request",
+  "status": "interrupted",
+  "interrupts": [
+    {
+      "wait_id": "approve/0",
+      "flow": "flow.review",
+      "node": "approve",
+      "paused_at": "2025-01-01T12:00:00.000Z",
+      "expires_at": "2025-01-02T12:00:00.000Z",
+      "input": { "draft": "…" },
+      "output_schema": { "type": "object", "properties": { "decision": { "enum": ["approve", "reject"] } }, "required": ["decision"], "additionalProperties": false },
+      "resume_url": "/executions/exec_0f1e…/resume?wait=approve%2F0"
+    }
+  ]
+}
+```
+
+`input` is the node's own `input:`, evaluated — what the human is shown.
+`output_schema` is the published JSON Schema of its `output:`, which is exactly
+what a resume payload is validated against, so a form can be built from the
+report rather than from the composition. `expires_at` is present only where the
+node declares a `timeout:`.
+
+POST the answer to `resume_url` as the JSON body:
+
+```sh
+curl -X POST "http://127.0.0.1:8787/executions/exec_0f1e…/resume?wait=approve%2F0" \
+  -H 'content-type: application/json' \
+  -d '{"decision":"approve"}'
+```
+
+A `202` means the answer was taken and the graph has gone back to work; poll the
+status route for the rest. A payload that does not fit the node's `output:` is a
+`400` and **does not consume the wait** — the execution is still interrupted and
+the corrected answer can be sent to the same URL. A `409` is about *which* pause
+rather than about the body: nothing is waiting, the wait already expired and
+`on_timeout:` has routed the execution on, or the execution is holding more than
+one pause and the request named none (the refusal lists their ids, and `?wait=`
+is how one is named). `wait_id` is that id: the pause's instance path, which is
+stable across runs of one composition — `approve/0` at the top level of a flow,
+`review/0/2/approve/0` for the pause inside the third instance a `map`
+dispatched.
+
+**A wait lives in this process.** It is a parked promise, not a checkpoint, so a
+`serve` restarted while a human was thinking has lost it and the execution is
+gone with every other one that process was tracking. Durable waits arrive with
+durable execution.
+
+`agent-compose run` cannot answer a pause — resume is the app's route — so a run
+that reaches a `human` node reports the pause and exits **`3`**, its own code
+beside `1` for a run that produced no answer and `2` for a command that could not
+be run. The trace document is still written, with `status: "interrupted"` and the
+pause on the entry of the node it stopped at.
 
 ## Where a store keeps its data
 

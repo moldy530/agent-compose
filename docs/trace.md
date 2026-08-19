@@ -1,6 +1,6 @@
 # agent-compose — Trace Format
 
-**Trace version:** `1`
+**Trace version:** `2`
 **Status:** Normative for the trace a compiled project emits
 **Companion artifacts:** [`docs/grammar.md`](grammar.md) (the DSL this describes runs of), [`prd.md`](../prd.md) §5.3, §5.6, §5.8, §5.9
 
@@ -102,17 +102,17 @@ documents and no grammar section defines — prints one document:
   "execution_id": "exec_0f1e…",
   "status": "completed",
   "outputs": { "draft": "…" },
-  "trace_version": 1,
+  "trace_version": 2,
   "trace": [ /* entries */ ],
   "trace_path": "/…/.agent-compose/traces/flow.review_loop-exec_0f1e….json"
 }
 ```
 
-`status` is `"completed"` or `"failed"`. A failed run answers with the same
-document, `error` in place of `outputs`, and the trace it did make. `trace_path`
-is absent when the file could not be written (an unwritable data directory is not
-a reason to lose a run that otherwise succeeded) and when the run made no entries
-at all.
+`status` is the envelope's three (§2). A run that produced no answer — `"failed"`
+or `"interrupted"` — answers with the same document, `error` in place of
+`outputs`, and the trace it did make. `trace_path` is absent when the file could
+not be written (an unwritable data directory is not a reason to lose a run that
+otherwise succeeded) and when the run made no entries at all.
 
 ### 1.2 The trace file
 
@@ -138,7 +138,7 @@ POSTs on completion, report an execution as (grammar §13.3):
   "trigger": "on_request",
   "status": "completed",
   "outputs": { "draft": "…" },
-  "trace_version": 1,
+  "trace_version": 2,
   "trace": [ /* entries */ ]
 }
 ```
@@ -147,23 +147,42 @@ POSTs on completion, report an execution as (grammar §13.3):
 `interrupted` — which is a larger vocabulary than the envelope's, because an
 execution tracked by a live process can be in states a finished run cannot. It
 is `serve`'s own vocabulary rather than one of §10.1's closed enumerations: this
-format's `status` is the envelope's two.
+format's `status` is the envelope's three, and the word `interrupted` names a
+different thing in each. Here it is a run that is **still going** and is holding
+a `human` pause somebody can still answer (grammar §8.7); in the envelope it is a
+run that **ended** holding one, which is what `agent-compose run` does with every
+pause it reaches.
 
-`trace` and `trace_version` appear together, on a run that has **stopped
-carrying a trace** — an empty one included. The gate is whether there is a trace
-at all, not whether it has entries in it: a run that failed inside the graph
-having recorded nothing reports `trace: []`, which §2 makes a statement about
-the run rather than a way of being absent.
+`trace` and `trace_version` appear together, on a run that has **stopped**
+carrying a trace — an empty one included. The gate is whether the run has stopped
+and there is a trace at all, not whether it has entries in it: a run that failed
+inside the graph having recorded nothing reports `trace: []`, which §2 makes a
+statement about the run rather than a way of being absent.
 
-Two reports carry neither key: a `running` execution, which has nothing to
-report yet, and an execution whose failure carried **no trace at all** — one
-raised before the graph ran, so there was never a run to record one. A payload
-that does not fit the trigger or the flow's `inputs:` is not among them: that is
-answered `400`, before an execution exists to report on.
+Two kinds of report carry neither key. The first is a run that has **not
+stopped**, which has nothing to report yet: a `running` execution, and an
+`interrupted` one — the pause is mid-superstep, and a resume puts the graph
+straight back to work, so there is no finished record to publish. The second is
+an execution whose failure carried **no trace at all** — one raised before the
+graph ran, so there was never a run to record one. A payload that does not fit
+the trigger or the flow's `inputs:` is not among them: that is answered `400`,
+before an execution exists to report on.
 
 `outputs` and `error` are the same shape: each appears when the execution has
 one, so a `running` report is `execution_id`, `flow`, `trigger` and `status`,
 and nothing else.
+
+An `interrupted` report carries one more key, and it is what makes a status poll
+enough to *ask* the question rather than only to notice there is one:
+`interrupts`, an array with one entry per pause the execution is holding, in the
+order they began. Each entry names the pause (`wait_id`, `flow`, `node`), when it
+began and when its budget runs out (`paused_at`, and `expires_at` where the node
+declares a `timeout:`), what the human is shown (`input`, the node's own `input:`
+evaluated), what their answer is held to (`output_schema`, the published JSON
+Schema of the node's `output:`), and where to send it (`resume_url`). It is a key
+of the `serve` **report** rather than of this format — no entry carries it, and
+the emitted project's own `README.md` is where it is documented for the reader
+who has to answer one.
 
 ---
 
@@ -174,11 +193,11 @@ in full, and what `run --format json` spreads into the record it prints.
 
 | field | type | presence | meaning |
 |---|---|---|---|
-| `trace_version` | integer | always | The format the `entries` are written in. `1` is this document, and a compiled project spells it `TRACE_VERSION` (exported from its `src/runtime.ts`). See [Stability](#10-stability). |
+| `trace_version` | integer | always | The format the `entries` are written in. `2` is this document, and a compiled project spells it `TRACE_VERSION` (exported from its `src/runtime.ts`). See [Stability](#10-stability). |
 | `flow` | string | always | The flow that was run, as its typed address (grammar §2.2). |
 | `execution_id` | string | always | The execution the entries belong to — grammar §4.1's `execution.id`, and the prefix of every idempotency key in the document (grammar §9.4). |
-| `status` | `"completed"` \| `"failed"` | always | Whether the run produced an answer. |
-| `error` | string | on `"failed"` | What stopped the run. Present on every failed document, because a failed run's last entry does not always say: a run stopped by the superstep ceiling has no aborting node to carry one. |
+| `status` | `"completed"` \| `"failed"` \| `"interrupted"` | always | How the run ended: with an answer, without one, or holding a `human` pause it had no way to answer (grammar §8.7, §9). The third is told apart from the second because the two ask different things of whoever is reading — one is a run to look into, the other a question to answer — and because a reader may not decide it from the message text (§10.1). |
+| `error` | string | on `"failed"` and `"interrupted"` | What stopped the run. Present on every document that carries neither answer, because such a run's last entry does not always say: a run stopped by the superstep ceiling has no aborting node to carry one. On `"interrupted"` it names the node that is waiting and where an answer would come from. |
 | `entries` | array of [entries](#3-entries) | always, possibly empty | Every entry the run recorded, in the order §3.1 fixes. Empty only on a run that recorded none at all — one that failed before any node produced an entry, which takes a failure the node a run aborts at cannot account for, since that node contributes one (§9). The trace **file** is not written for such a run (§1.2), so an empty array reaches a reader only as `run --format json`'s `trace` or a `serve` report's. |
 
 **Key spelling.** The envelope's keys are `snake_case`; an entry's are
@@ -211,8 +230,9 @@ retries are attempts at one execution, and `attempts` is where they are recorded
 | `inner` | array of entries | `flow:` nodes that ran an instance | The trace of the subflow instance this node ran (grammar §8.5). Absent on a `flow:` node that ran none — one whose *input* could not be built — and on one whose own `timeout:` abandoned its instance mid-flight, which leaves no trace to carry. A **dispatched** instance is never here: a `map`'s items report under their own dispatch records (§5), including the item whose failure ended the map node. See §8. |
 | `stores` | array of [store records](#6-store-records) | when the node performed any | Every store op this node performed, in the order it performed them (PRD 5.8). Never empty: a node that performed none carries no key. See §6. |
 | `models` | array of [model calls](#7-model-calls) | when the node made any | Every model call this node execution made (PRD 5.9). Never empty: a node that made none carries no key. See §7. |
+| `human` | [a pause](#34-a-human-nodes-pause) | `human` nodes that began a wait | What the wait did: when it began, how long it had, and how it ended (grammar §8.7). On every entry of a `human` node that got as far as pausing, which is all three ways one ends — an answer, an expiry, and a run that ended holding it — told apart *inside* the record rather than by its absence. The key is absent on the one `human` entry with no wait behind it: a node whose *input* could not be built, which fails the execution before the activity runs (`attempts: 0`), exactly as it leaves `inner` off a `flow:` node. A node that is not a `human` node never carries it. **What the human answered is not in it**, and that is a rule of this format rather than an omission — see §11. |
 | `error` | string | `"skipped"`, `"failed"` | What went wrong, as `<error name>: <message>` — the failure's class and its text, in that one shape on **every** entry that carries the field, whether the node aborted the run, took a `fallback:`, or had its failure absorbed by `on_error: skip`. On both of those outcomes without exception — including both shapes of `"failed"`, the one that ended the run and the one that took a `fallback:` — and never on `"completed"`: an outcome says what became of a failure, not whether there was one to describe (§3.2). Written for a person: §10.1 makes the text something a reader must not parse, and it can quote what the other side of an activity answered — §11.1 is what it may and may not hold. |
-| `fallback` | string | when `on_error: { fallback: … }` fired | The node id the failure routed to instead of this node's own edges (grammar §9.2). `"__end__"` for the terminal pseudo-node. |
+| `fallback` | string | when a declared control transfer replaced this node's own edges | The node id control went to instead, and there are two keys that declare one: `on_error: { fallback: … }` after a failure (grammar §9.2), and a `human` node's `on_timeout:` after its wait ran out (grammar §8.7, which gives it §9.2's targets). `"__end__"` for the terminal pseudo-node. Read `human` to tell the two apart on an entry that could be either. |
 
 ### 3.1 Order
 
@@ -268,6 +288,35 @@ A flow whose `start` edges carry guards gets a synthetic entry node, because
 §7.6.3). Its entries are ordinary entries with `node: "$start"`. The `$` sigil is
 outside grammar §2.1's identifier, so the id collides with nothing an author can
 declare.
+
+### 3.4 A `human` node's pause
+
+`HumanPause`, on `TraceEntry.human`. A `human` node stops its execution until
+somebody answers, its budget runs out, or the run ends holding it (grammar §8.7,
+PRD 5.5) — and without a record of that, a wait that ran for a day and one that
+took a millisecond leave the same entry.
+
+| field | type | presence | meaning |
+|---|---|---|---|
+| `pausedAt` | string | always | When the wait began, as an ISO 8601 instant. It is the runtime's own clock reading rather than anything derived from the trace's step numbers, because a wait is the one thing in a run whose duration is not the graph's to decide. |
+| `expiresAt` | string | when the node declares a `timeout:` | When the budget runs out, as an ISO 8601 instant — `pausedAt` plus the node's `human: { timeout: … }`, which is wall-clock from the moment the pause begins. Absent where the node declares none, which grammar §8.7 makes an **unbounded** wait rather than a defaulted one: a `human` node resolves no `timeout` from any policy level (Decision D102), so there is no other budget for this to have come from. |
+| `settledAt` | string | when the wait stopped waiting | When it stopped, as an ISO 8601 instant. Absent on the one entry whose wait nothing settled: a run that **ended** holding the pause, which is what `agent-compose run` does with every pause it reaches, since resume is a route the generated app mounts (PRD 5.11). That entry is the run's aborting entry (§9) and the document's `status` is `"interrupted"` (§2). |
+| `settled` | `"resumed"` \| `"expired"` | when `settledAt` is | How it stopped. `"resumed"` is an answer that fit the node's `output:` — one that did not is refused at the resume route and does not consume the wait, so it never becomes part of a run's record at all. `"expired"` is the budget running out, and that entry also carries `fallback` naming the `on_timeout:` route control transferred to (§3, grammar §9.2). The two are settled **exactly once**: a resume racing an expiry is decided rather than applied twice. |
+
+**How it reads beside `outcome`.** The three ways a wait ends are three shapes of
+entry, and each is the ordinary reading of the fields it carries rather than a
+special case:
+
+* **resumed** — `outcome: "completed"`, the answer written through the node's
+  `writes:` like any other result, and the node's own edges evaluated into
+  `routing`;
+* **expired** — `outcome: "failed"` with `fallback` and no `routing`, which is
+  §3.2's second shape: the node left no result for the run to carry on from, and
+  a declared control transfer replaced its edges. `error` names the budget that
+  ran out;
+* **held to the end of the run** — `outcome: "failed"` with neither `fallback`
+  nor `routing`, `error` naming what was waited for and where an answer would
+  have come from, and the document's `status` `"interrupted"`.
 
 ---
 
@@ -602,7 +651,11 @@ already been applied, rather than some other write colliding.
 
 ## 9. Failed runs
 
-A failed run has a trace, and it is the trace a reader most often wants. What is
+A run that produced no answer has a trace, and it is the trace a reader most
+often wants. Both `status` values that mean "no answer" — `"failed"` and
+`"interrupted"` — write the same document, and everything in this section holds
+for either: an interrupted run is one whose aborting node is a `human` node that
+was still waiting (§3.4), and there is nothing else different about it. What is
 in it:
 
 * every entry that **landed** — the supersteps that completed before the failure;
@@ -639,6 +692,14 @@ bounds, and it stops the run between supersteps. Such a document has every entry
 that landed and no final failed entry; the envelope's `error` is what names the
 ceiling.
 
+An **interrupted** run's aborting entry is the one place a `"failed"` entry is
+not about something going wrong: the node did everything it was asked to and is
+holding a question (grammar §8.7). It reads as every other aborting entry does —
+no `writes`, no `routing`, no `fallback`, an `error` saying what stopped the run
+— plus the `human` record whose missing `settledAt` is what says the wait was
+never settled. The document's `status` is what a reader branches on; the message
+text is not (§10.1).
+
 ---
 
 ## 10. Stability
@@ -668,7 +729,8 @@ At a given `trace_version`, a reader MAY rely on:
   the field is present only with something in it, and a reader may treat an empty
   value there as impossible rather than as a case to handle;
 * the vocabularies of the closed enumerations: `TraceDocument.status`,
-  `TraceEntry.outcome`, `DispatchRecord.outcome`, `StoreRecord.op`,
+  `TraceEntry.outcome`, `DispatchRecord.outcome`, `HumanPause.settled`,
+  `StoreRecord.op`,
   `StoreRecord.effect`, `StoreRecord.via`, `StoreRecord.scope`, a refusal's
   `condition`, and an edge decision's `reason` — the last being a closed
   vocabulary spelled as a sentence, which §4.1 enumerates and the MUST NOT below
@@ -740,6 +802,32 @@ A bump changes the number on every surface at once — the file, `run --format
 json`, and `serve` — because they carry one format. A release that bumps it says
 so in its notes, and this document's *Trace version* header moves with it.
 
+### 10.3.1 What version `2` changed
+
+The `human` node runtime (grammar §8.7, PRD 5.5) added one record and moved two
+promises a reader of version `1` had been given, which is what made it a bump
+rather than an addition:
+
+* **`TraceDocument.status` gained `"interrupted"`** — a member added to a closed
+  enumeration. A run that ends holding a pause is not a run that failed, and a
+  reader could not have been left to tell the two apart from `error`'s text,
+  which §10.1 forbids parsing;
+* **`TraceEntry.error` on the envelope widened with it** — the row now reads "on
+  `"failed"` and `"interrupted"`", which is a presence rule recorded in more
+  cases than version `1` promised;
+* **`TraceEntry.fallback` widened** — version `1` said the key appeared when
+  `on_error: { fallback: … }` fired, and a wait that runs out its budget now
+  writes it too, naming the `on_timeout:` route (§3, grammar §9.2). Its *meaning*
+  is unchanged — the node id control went to instead of this node's own edges —
+  but the cases it appears in are not, and a reader who read the key as "an
+  `on_error:` fallback fired" is wrong under `2`. `TraceEntry.human` is what
+  tells the two apart;
+* **`TraceEntry.human` was added**, and with it the pause record §3.4
+  specifies. That half is a §10.2 addition and would have needed no bump on its
+  own.
+
+Nothing was removed or renamed, and no order changed.
+
 ### 10.4 How the two are held together
 
 The version number alone is a promise; two tests make it a checkable one:
@@ -778,6 +866,22 @@ The version number alone is a promise; two tests make it a checkable one:
   project's, described in its own `README.md`.
 * **Anything a store answered.** `StoreRecord.answer` is carried verbatim; its
   shape is the store's declared schema (grammar §11.4).
+* **What a human answered.** A `human` node's pause is recorded — that it began,
+  how long it had, and how it ended (§3.4) — and the answer itself is not. It is
+  the same rule as the one below for a model's completion and is stated
+  separately because "never the completion" would not be read as covering it: a
+  person's answer is a *result*, and every other node's result is absent from
+  this format too. What the answer did to the run is on the entry, in the
+  `writes` that name the channels it landed in by name — never their values —
+  and the answer's *arrival* is `settledAt`.
+
+  The one exception the row below grants a model's answer has no counterpart
+  here, and the reason is worth stating: an answer that fails the contract its
+  component declares is reported with an excerpt of the offending value, but a
+  resume payload that fails the `human` node's `output:` is refused at the route
+  before anything is delivered, does not consume the wait, and so never becomes
+  part of a run's record at all (PRD 5.11). The refusal is an HTTP response to
+  whoever sent it; the excerpt is in that body and in no trace.
 * **Provider transcripts.** A trace records that a call was made and which member
   served it. It never carries a prompt, and it carries no completion as a field:
   §7's model-call record has no field for one. One fragment of a completion does

@@ -2411,7 +2411,7 @@ export function route(
  * `docs/trace.md`'s *Stability* section is the contract, and it is what a reader
  * is entitled to rely on.
  */
-export const TRACE_VERSION = 1;
+export const TRACE_VERSION = 2;
 
 /**
  * One run's whole trace, as a surface delivers it (`docs/trace.md`).
@@ -2435,15 +2435,24 @@ export interface TraceDocument {
   readonly flow: string;
   /** The execution the entries belong to (grammar 4.1's `execution.id`). */
   readonly execution_id: string;
-  /** Whether the run produced an answer. */
-  readonly status: "completed" | "failed";
   /**
-   * What stopped a run that produced none.
+   * How the run ended: with an answer, without one, or holding a pause.
    *
-   * Present exactly on `status: "failed"`, and there because a failed run's
-   * *last* entry does not always say why: a run stopped by the superstep ceiling
-   * ([`SuperstepCeiling`]) has no aborting node to carry one, and a file that
-   * held only `status: "failed"` would name no reason at all.
+   * `"interrupted"` is a run that reached a `human` node it had no way to answer
+   * (grammar 8.7, [`HumanInterrupt`]) — what `agent-compose run` does with every
+   * pause, since resume is `serve`'s route. It is told apart from `"failed"`
+   * because the two ask for different things from whoever is reading: one is a
+   * run to look into, the other is a question to answer.
+   */
+  readonly status: "completed" | "failed" | "interrupted";
+  /**
+   * What stopped a run that produced no answer.
+   *
+   * Present exactly on `status: "failed"` and `status: "interrupted"`, and there
+   * because such a run's *last* entry does not always say why: a run stopped by
+   * the superstep ceiling ([`SuperstepCeiling`]) has no aborting node to carry
+   * one, and a file that held only `status: "failed"` would name no reason at
+   * all.
    */
   readonly error?: string;
   /**
@@ -2532,6 +2541,18 @@ export interface TraceEntry {
    * infer from a provider's logs. See [`ModelCall`].
    */
   readonly models?: readonly ModelCall[];
+  /**
+   * The wait a `human` node held, and how it ended (grammar 8.7, PRD 5.5).
+   *
+   * A pause is a routing-relevant event with no other record: without it the
+   * only trace of a wait that ran for a day is an entry that looks exactly like
+   * one that took a millisecond. What is **not** here is what the human
+   * answered, for the reason no field carries a model's completion either —
+   * see [`HumanPause`] and `docs/trace.md` §11.
+   *
+   * A node that is not a `human` node never carries the key.
+   */
+  readonly human?: HumanPause;
   readonly error?: string;
   readonly fallback?: string;
 }
@@ -4180,6 +4201,473 @@ function orderedChannels(
 }
 
 // ---------------------------------------------------------------------------
+// Human pauses (grammar 8.7, PRD 5.5, 5.11)
+// ---------------------------------------------------------------------------
+
+/**
+ * A `human` node's wait, as `./graph.ts` describes it.
+ *
+ * The two schemas are both here because a pause has two audiences. `shown` — the
+ * node's `input:`, built by the node's input phase like any other — is what the
+ * *human* is handed, and [`schema`] is what a **resume payload** is held to
+ * (PRD 5.11): the published JSON Schema of the node's `output:`, carried so the
+ * status route can hand a UI the contract its answer has to fit without the UI
+ * reading the composition. [`parse`] is the emitted Zod for the same surface,
+ * which is what actually decides an answer — the pair the schema conformance
+ * corpus proves equal, asked at the two ends it is needed at.
+ */
+export interface HumanDescriptor {
+  readonly flow: string;
+  readonly node: string;
+  /**
+   * The wall-clock budget of grammar 8.7, in milliseconds — present exactly when
+   * the node declares `timeout:`.
+   *
+   * It is **not** [`NodePolicy.timeoutMs`] and never resolves from one: a
+   * `human` node takes no `timeout` at any of grammar 9.3's levels (D102), so a
+   * composition-wide budget can never cut a wait short. This is the node's own
+   * `human: { timeout: … }` and nothing else.
+   */
+  readonly timeoutMs?: number;
+  /**
+   * Where control goes when the budget runs out: a flow-local node id, or
+   * `"__end__"` (grammar 8.7, 9.2).
+   *
+   * Jointly optional and jointly required with [`timeoutMs`], which the compiler
+   * refuses a composition for breaking — so a pause either has both or neither.
+   */
+  readonly onTimeout?: string;
+  /** The published JSON Schema of the node's `output:` (grammar 3.8). */
+  readonly schema: JsonSchema;
+  /** Hold a resume payload to that surface, answering the parsed result. */
+  parse(payload: unknown): unknown;
+}
+
+/**
+ * One pause this process is holding, as a resume surface sees it.
+ *
+ * Everything here is what a caller needs to *ask the question and take the
+ * answer*: which pause this is, what the human is shown, what their answer has
+ * to fit, and how long it has. What the human eventually answers is not here and
+ * is not kept — see [`HumanPause`] and `docs/trace.md` §11.
+ */
+export interface HumanWait {
+  /**
+   * What addresses this pause inside its execution: the instance path of
+   * grammar 9.4, flattened.
+   *
+   * `"approve/0"` at the top level of a flow, `"review/0/2/approve/0"` for the
+   * pause inside the third instance a `map` dispatched. One execution can hold
+   * more than one pause at once — a `human` node inside a map-dispatched flow is
+   * the reachable case — and this is what tells them apart, deterministically
+   * and without a counter: two runs of one composition address the same pause by
+   * the same id.
+   */
+  readonly id: string;
+  readonly execution: string;
+  readonly flow: string;
+  readonly node: string;
+  /** The node's `input:`, evaluated — what the human is shown (grammar 8.7). */
+  readonly shown: Readonly<Record<string, unknown>>;
+  /** What a resume payload is validated against (PRD 5.11). */
+  readonly schema: JsonSchema;
+  /** When the pause began, as an ISO 8601 instant. */
+  readonly pausedAt: string;
+  /** When its budget runs out — present exactly when `timeout:` is declared. */
+  readonly expiresAt?: string;
+}
+
+/**
+ * What the trace records about a pause (`docs/trace.md` §3, PRD 5.3).
+ *
+ * The pause is a routing-relevant event and so is trace data: when the wait
+ * began, how long it had, and how it ended. **What the human answered is not
+ * here**, and that is a rule rather than an omission — the same posture
+ * `docs/trace.md` §11 takes to a model's completion, which no field of the
+ * format carries either. The answer's *arrival* is `settledAt`; its content
+ * reaches the run through the node's `writes:` like any other result.
+ */
+export interface HumanPause {
+  /** When the wait began, as an ISO 8601 instant. */
+  readonly pausedAt: string;
+  /** When it would expire — present exactly when `timeout:` is declared. */
+  readonly expiresAt?: string;
+  /**
+   * When it stopped waiting — present exactly when it did.
+   *
+   * Absent on the one entry that records a pause nothing settled: a run that
+   * ended holding it, which is what `agent-compose run` does with every pause it
+   * reaches (see [`HumanInterrupt`]).
+   */
+  readonly settledAt?: string;
+  /** How it stopped waiting — present exactly when `settledAt` is. */
+  readonly settled?: "resumed" | "expired";
+}
+
+/**
+ * A wait whose budget ran out before anyone answered (grammar 8.7).
+ *
+ * Not a `timeout:` in grammar 9.2's sense and not raised as one: it carries the
+ * route the composition declared for exactly this outcome, and [`runNode`]
+ * transfers control there **instead of** evaluating the node's own edges — which
+ * is §9.2's fallback shape, reached from `on_timeout:` rather than from
+ * `on_error:`.
+ */
+export class HumanExpiry extends Error {
+  /** The node id control transfers to, or `"__end__"` (grammar 8.7). */
+  readonly route: string;
+  /** What the trace records about the pause that expired. */
+  readonly pause: HumanPause;
+
+  constructor(flow: string, node: string, budgetMs: number, route: string, pause: HumanPause) {
+    super(
+      `${flow} node \`${node}\`: nobody answered inside its ${budgetMs}ms wait, so \`on_timeout\` routes to \`${route}\` (grammar 8.7)`,
+    );
+    this.name = "HumanExpiry";
+    this.route = route;
+    this.pause = pause;
+  }
+}
+
+/**
+ * A pause this run has no way to deliver an answer to.
+ *
+ * Resume is an invocation (PRD 5.11) and the generated app is what exposes it,
+ * so a run started **without** a resume surface — `agent-compose run`, and any
+ * in-process caller of [`runFlow`] that did not ask for one — reaches a `human`
+ * node and stops there. The alternative readings are both worse: waiting forever
+ * is a command that never returns, and carrying on with no answer is a graph
+ * that routed on a decision nobody made.
+ *
+ * **`on_error:` does not govern it.** Grammar 9's policy is over an *activity* —
+ * what the model, the process or the request did — and this is the run's own
+ * shape rather than something the pause did wrong; `skip` absorbing it would
+ * route past a human whose answer the composition declared it needed. So
+ * [`runNode`] answers this ahead of the policy, exactly as it does an input that
+ * could not be built.
+ */
+export class HumanInterrupt extends Error {
+  readonly flow: string;
+  readonly node: string;
+  /** Which pause it is (grammar 9.4's instance path, flattened). */
+  readonly wait: string;
+  /** What the trace records about it: a pause with no settlement. */
+  readonly pause: HumanPause;
+
+  constructor(flow: string, node: string, wait: string, pause: HumanPause) {
+    super(
+      `${flow} node \`${node}\` is waiting for a human and this run has no way to answer: \`agent-compose run\` cannot deliver a resume, which is \`agent-compose serve\`'s \`POST /executions/:id/resume\` (PRD 5.11)`,
+    );
+    this.name = "HumanInterrupt";
+    this.flow = flow;
+    this.node = node;
+    this.wait = wait;
+    this.pause = pause;
+  }
+}
+
+/** Why a resume was refused, or that it was taken. */
+export type ResumeOutcome =
+  | { readonly ok: true; readonly wait: HumanWait }
+  | {
+      readonly ok: false;
+      readonly reason: "not-waiting" | "ambiguous" | "no-such-wait" | "settled" | "mismatch";
+      readonly detail: string;
+      /** Every pause still waiting, by id — on `"ambiguous"` and nowhere else. */
+      readonly pending?: readonly string[];
+    };
+
+/** One pause, with the machinery that settles it exactly once. */
+interface Held {
+  readonly wait: HumanWait;
+  readonly settle: (outcome: "resumed", value: unknown) => boolean;
+  readonly parse: (payload: unknown) => unknown;
+  /** Set the moment this pause stops waiting, whichever side stopped it. */
+  settled?: "resumed" | "expired";
+}
+
+/** Every pause one execution is holding, in the order they began. */
+interface WaitBoard {
+  /** Whether a resume surface is attached to this run (PRD 5.11). */
+  readonly resumable: boolean;
+  readonly held: Map<string, Held>;
+}
+
+/**
+ * The pauses this **process** is holding, by execution id.
+ *
+ * A module-level table rather than something threaded through the graph, for the
+ * reason the store registry is one: a pause is reached from inside a node's
+ * activity, arbitrarily deep in a nesting of instances, and the surface that
+ * answers it is an HTTP route in another module that has only an execution id to
+ * go on. The execution id is what both ends already hold.
+ *
+ * **In this process, and only for as long as it lives.** That is the same
+ * boundary `src/serve.ts` states for the executions it tracks: durable execution
+ * and checkpointers are a later milestone, so a `serve` restarted while a human
+ * was thinking has lost the wait. The emitted `README.md` says so where a reader
+ * meets the resume route.
+ */
+const humanBoards = new Map<string, WaitBoard>();
+
+/**
+ * Open the pause registry for one execution, saying whether it can be resumed.
+ *
+ * Called by [`runFlow`] at the top of every run, before the graph is streamed,
+ * so a status route polling the moment after `start` answered already has
+ * something to read. `resumable` is the run's, not the composition's: the same
+ * compiled flow is resumable under `serve` and is not under `run`.
+ */
+export function openHumanWaits(execution: string, resumable: boolean): void {
+  humanBoards.set(execution, { resumable, held: new Map() });
+}
+
+/**
+ * Drop everything one execution's pauses held, however the run ended.
+ *
+ * The counterpart of [`openHumanWaits`], called from the same `finally` that
+ * releases the run's `scope: execution` stores: a pause that outlived its run
+ * would be a wait a resume could still be delivered to, with no graph left to
+ * receive it.
+ */
+export function releaseHumanWaits(execution: string): void {
+  humanBoards.delete(execution);
+}
+
+/**
+ * Every pause `execution` is still waiting on, in the order they began.
+ *
+ * What the status route reports (PRD 5.11) — and, where there is more than one,
+ * what a resume addresses itself with. An execution this process is not running,
+ * or one holding none, answers with an empty list.
+ */
+export function humanWaits(execution: string): readonly HumanWait[] {
+  const board = humanBoards.get(execution);
+  if (board === undefined) return [];
+  return [...board.held.values()].filter((one) => one.settled === undefined).map((one) => one.wait);
+}
+
+/**
+ * Deliver a human's answer to one pause (PRD 5.11's third verb).
+ *
+ * `wait` names which pause when the execution is holding more than one, and may
+ * be omitted when it is holding exactly one — an execution with two pauses
+ * pending and no name is `"ambiguous"` rather than a coin toss.
+ *
+ * **A payload that does not fit the node's `output:` does not consume the
+ * wait.** It answers `"mismatch"` and the pause goes on waiting, so a caller who
+ * mistyped an enum variant can send the answer again; every other refusal here
+ * is about *which* pause rather than about what was in the body.
+ *
+ * **A settled pause is settled.** Whichever of the two sides got there first —
+ * an answer, or the budget running out — wins exactly once, so a resume racing
+ * an expiry is decided rather than applied twice.
+ */
+export function deliverHumanAnswer(
+  execution: string,
+  wait: string | undefined,
+  payload: unknown,
+): ResumeOutcome {
+  const board = humanBoards.get(execution);
+  const held = board === undefined ? [] : [...board.held.values()];
+  const pending = held.filter((one) => one.settled === undefined);
+
+  let chosen: Held | undefined;
+  if (wait === undefined) {
+    if (pending.length === 0) {
+      return {
+        ok: false,
+        reason: "not-waiting",
+        detail: "this execution is not waiting for a human answer",
+      };
+    }
+    if (pending.length > 1) {
+      return {
+        ok: false,
+        reason: "ambiguous",
+        detail: `this execution is holding ${pending.length} pauses, so a resume has to name which one it answers`,
+        pending: pending.map((one) => one.wait.id),
+      };
+    }
+    chosen = pending[0];
+  } else {
+    chosen = held.find((one) => one.wait.id === wait);
+    if (chosen === undefined) {
+      return {
+        ok: false,
+        reason: "no-such-wait",
+        detail: `this execution is holding no pause \`${wait}\``,
+        ...(pending.length === 0 ? {} : { pending: pending.map((one) => one.wait.id) }),
+      };
+    }
+  }
+
+  if (chosen.settled !== undefined) {
+    return {
+      ok: false,
+      reason: "settled",
+      detail:
+        chosen.settled === "expired"
+          ? `the wait at \`${chosen.wait.id}\` expired before this answer arrived, and \`on_timeout\` has already routed the execution on (grammar 8.7)`
+          : `the wait at \`${chosen.wait.id}\` has already been answered`,
+    };
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = chosen.parse(payload);
+  } catch (error) {
+    // The wait is untouched: a payload that does not fit is a request to fix and
+    // send again, not a turn spent.
+    return { ok: false, reason: "mismatch", detail: describe(error) };
+  }
+
+  // Settling can still lose the race to an expiry that fired between the parse
+  // and here, which is why the answer is `settle`'s rather than this branch's.
+  if (!chosen.settle("resumed", parsed)) {
+    return {
+      ok: false,
+      reason: "settled",
+      detail: `the wait at \`${chosen.wait.id}\` expired before this answer arrived, and \`on_timeout\` has already routed the execution on (grammar 8.7)`,
+    };
+  }
+  return { ok: true, wait: chosen.wait };
+}
+
+/**
+ * Hold a `human` node's pause until somebody answers it, its budget runs out, or
+ * the run turns out to have no way to answer at all (grammar 8.7, PRD 5.11).
+ *
+ * **How the pause is held.** The node's task awaits a promise nothing else
+ * resolves, so the superstep the node is in never completes and the graph makes
+ * no further progress — which is the whole of what "interrupted" means here.
+ * Nothing is checkpointed: this is a promise parked in one process, which is the
+ * M2 posture PRD §7 fixes (durable execution is M3), and it is what the emitted
+ * `README.md` tells a reader to expect from a restarted `serve`.
+ *
+ * It is deliberately **not** LangGraph's own `interrupt()`. That primitive
+ * resumes a run from a checkpointer, which this release does not configure, and
+ * it announces itself out of the *top-level* stream — while a `map`'s instances
+ * and a `flow:` node's subflow run inside their node's own task, as separate runs
+ * of separate compiled graphs (PRD resolved q17). A pause three instances down
+ * would have to be lifted through two run boundaries that were built to keep
+ * their instances' business inside them. Parking the promise leaves the pause
+ * exactly where it happened and costs the same durability either shaping has.
+ */
+export async function runHuman(
+  descriptor: HumanDescriptor,
+  shown: unknown,
+  context: RunContext,
+  view: NodeView,
+): Promise<NodeAnswer> {
+  const id = instancePath(view, descriptor.node).join("/");
+  const began = Date.now();
+  const pausedAt = new Date(began).toISOString();
+  const expiresAt =
+    descriptor.timeoutMs === undefined
+      ? undefined
+      : new Date(began + descriptor.timeoutMs).toISOString();
+  const wait: HumanWait = {
+    id,
+    execution: context.execution.id,
+    flow: descriptor.flow,
+    node: descriptor.node,
+    shown: (shown ?? {}) as Record<string, unknown>,
+    schema: descriptor.schema,
+    pausedAt,
+    ...(expiresAt === undefined ? {} : { expiresAt }),
+  };
+  const opened: HumanPause = { pausedAt, ...(expiresAt === undefined ? {} : { expiresAt }) };
+
+  const board = humanBoards.get(context.execution.id);
+  if (board === undefined || !board.resumable) {
+    // The pause happened — it is on the trace entry either way — and there is
+    // nothing that could ever answer it.
+    throw new HumanInterrupt(descriptor.flow, descriptor.node, id, opened);
+  }
+
+  return await new Promise<NodeAnswer>((resolve, reject) => {
+    let timer: unknown;
+    const settle = (outcome: "resumed" | "expired", value: unknown): boolean => {
+      const entry = board.held.get(id);
+      if (entry === undefined || entry.settled !== undefined) return false;
+      entry.settled = outcome;
+      if (timer !== undefined) clearTimeout(timer as Parameters<typeof clearTimeout>[0]);
+      const pause: HumanPause = {
+        ...opened,
+        settledAt: new Date().toISOString(),
+        settled: outcome,
+      };
+      if (outcome === "resumed") {
+        resolve({ output: value, human: pause });
+      } else {
+        reject(
+          new HumanExpiry(
+            descriptor.flow,
+            descriptor.node,
+            descriptor.timeoutMs ?? 0,
+            descriptor.onTimeout ?? END_NODE,
+            pause,
+          ),
+        );
+      }
+      return true;
+    };
+
+    board.held.set(id, {
+      wait,
+      parse: (payload) => descriptor.parse(payload),
+      settle: (outcome, value) => settle(outcome, value),
+    });
+
+    if (descriptor.timeoutMs !== undefined) {
+      // Wall clock from the moment the pause begins (grammar 8.7), and `unref`ed
+      // where the runtime offers it: a 24-hour budget must not be the reason a
+      // process that has nothing else to do stays up.
+      timer = setTimeout(() => settle("expired", undefined), descriptor.timeoutMs);
+      if (typeof (timer as { unref?: () => void }).unref === "function") {
+        (timer as { unref: () => void }).unref();
+      }
+    }
+  });
+}
+
+/** LangGraph's terminal pseudo-node, as a `goto` target spells it. */
+const END_NODE = "__end__";
+
+/** The [`HumanExpiry`] on this error's `cause` chain, if it came out of one. */
+function expiryOf(error: unknown): HumanExpiry | undefined {
+  for (let held: unknown = error; held !== undefined && held !== null; ) {
+    if (held instanceof HumanExpiry) return held;
+    held = (held as { cause?: unknown }).cause;
+  }
+  return undefined;
+}
+
+/**
+ * The [`HumanInterrupt`] on this error's `cause` chain, if it came out of one.
+ *
+ * Exported because the two callers that have to tell an interrupted run from a
+ * failed one are outside this module: `src/cli.ts`, which reports the outcome
+ * and exits on a code of its own, and any ejected caller of [`runFlow`] that
+ * wants the same distinction. The chain is walked rather than the error tested,
+ * because what reaches them is a [`FlowFailure`] wrapping a [`NodeFailure`]
+ * wrapping this.
+ */
+export function interruptOf(error: unknown): HumanInterrupt | undefined {
+  for (let held: unknown = error; held !== undefined && held !== null; ) {
+    if (held instanceof HumanInterrupt) return held;
+    held = (held as { cause?: unknown }).cause;
+  }
+  return undefined;
+}
+
+/** The [`HumanPause`] either of the two carried out of a pause that did not resume. */
+function pauseOf(error: unknown): HumanPause | undefined {
+  return expiryOf(error)?.pause ?? interruptOf(error)?.pause;
+}
+
+// ---------------------------------------------------------------------------
 // One node execution, end to end
 // ---------------------------------------------------------------------------
 
@@ -4268,6 +4756,8 @@ export interface NodeAnswer {
   readonly inner?: readonly TraceEntry[];
   /** Which member of its route served each model call (PRD 5.9). */
   readonly models?: readonly ModelCall[];
+  /** The wait a `human` node held, and how it ended (grammar 8.7). */
+  readonly human?: HumanPause;
 }
 
 /** One channel a `map` node writes, with every contribution in index order. */
@@ -4368,6 +4858,13 @@ function joined(
  * that cannot be evaluated propagates, and only what the activity did reaches
  * the `catch`.
  *
+ * Two more are outside it, and they are a `human` node's (grammar 8.7). A wait
+ * whose budget ran out routes to the node's own `on_timeout:` — §9.2's fallback
+ * shape, reached from a different key — and a pause this run has no way to
+ * answer ends the run whatever the policy says, because `skip` absorbing it
+ * would route past a human the composition declared it needed. See
+ * [`HumanExpiry`] and [`HumanInterrupt`].
+ *
  * **What a failure leaves behind.** Every way out of here that throws carries
  * this node's own trace entry on the error ([`carryEntry`]), because a thrown
  * task returns no `Command` and LangGraph discards the superstep it was in —
@@ -4406,6 +4903,7 @@ export async function runNode(
   let dispatches: readonly DispatchRecord[] | undefined;
   let inner: readonly TraceEntry[] | undefined;
   let models: readonly ModelCall[] | undefined;
+  let pause: HumanPause | undefined;
   let attempts = 0;
   let skipped = false;
   let failure: NodeFailure | undefined;
@@ -4454,6 +4952,10 @@ export async function runNode(
     // is on its own record rather than on this entry.
     const held = inner ?? traceOf(error);
     const dispatched = dispatches ?? dispatchesOf(error) ?? plannedDispatches(input);
+    // A pause that never settled is on the error that ended the run, and it is
+    // the only account of the wait: the node's task never returned an answer to
+    // carry one (grammar 8.7).
+    const paused = pause ?? pauseOf(error);
     return {
       step,
       flow: descriptor.flow,
@@ -4466,6 +4968,7 @@ export async function runNode(
       ...(held === undefined ? {} : { inner: held }),
       ...(storeRecords.length === 0 ? {} : { stores: [...storeRecords] }),
       ...(models === undefined ? {} : { models }),
+      ...(paused === undefined ? {} : { human: paused }),
       error: describe(error),
     };
   };
@@ -4519,8 +5022,18 @@ export async function runNode(
     // has always been the whole of `storeRecords` for the same reason, and this
     // is the half that was missing it.
     models = merged(modelCalls, answer.value.models);
+    pause = answer.value.human;
   } catch (error) {
-    const strategy = policy.onError;
+    // Two outcomes of a `human` node reach here as throws and neither is an
+    // activity failure, so neither is `on_error`'s to decide (grammar 8.7,
+    // 9.2). They are answered ahead of the policy for the reason an input that
+    // could not be built is answered outside it: `skip` and `fallback:` are
+    // policies over what an activity did, and a wait that ran out its budget or
+    // a run with no way to answer one are the composition's own control flow.
+    if (interruptOf(error) !== undefined) throw carryEntry(error, aborted(error, 1));
+    const expiry = expiryOf(error);
+    const strategy: ErrorStrategy = expiry === undefined ? policy.onError : { fallback: expiry.route };
+    pause = pauseOf(error);
     failure = error instanceof NodeFailure ? error : undefined;
     // The same join as the success path, with nothing to join to: every attempt
     // that failed inside the boundary put its instance's trace in `innerTraces`,
@@ -4564,6 +5077,7 @@ export async function runNode(
         ...(inner === undefined ? {} : { inner }),
         ...(storeRecords.length === 0 ? {} : { stores: [...storeRecords] }),
         ...(models === undefined ? {} : { models }),
+        ...(pause === undefined ? {} : { human: pause }),
         fallback: strategy.fallback,
       };
       return new Command({
@@ -4657,6 +5171,7 @@ export async function runNode(
     ...(inner === undefined ? {} : { inner }),
     ...(storeRecords.length === 0 ? {} : { stores: [...storeRecords] }),
     ...(models === undefined ? {} : { models }),
+    ...(pause === undefined ? {} : { human: pause }),
     ...(absorbed === undefined ? {} : { error: absorbed }),
   };
   update["$run"] = {

@@ -80,19 +80,26 @@
 //! is the node's routing decision made — in the same task, as for every other
 //! node. P2 is LangGraph's, unchanged.
 //!
+//! # A `human` node
+//!
+//! One node like any other, plus a [`human_descriptor`] beside it: the wait's
+//! own budget and the route its expiry takes, and the two readings of its
+//! `output:` — the published JSON Schema a status route hands whoever is
+//! answering, and the emitted Zod that decides whether their answer fits
+//! (grammar 8.7, PRD 5.11). Its `input:` is built in the node's input phase
+//! through grammar 8.0's chain, exactly as an agent's is, because it *is* a
+//! declared input surface — and because what it evaluates to is the question a
+//! resume surface renders.
+//!
+//! Two things about it are the compiler's rather than the runtime's, and both
+//! are D102's: the descriptor's `timeoutMs` is the node's own `human: { timeout:
+//! … }` and never a resolved policy field, and the node's emitted `policy:`
+//! carries neither `timeout` nor `retry` at any level — `exempt: true` is the
+//! half of that which level 1 needs at runtime.
+//!
 //! # What is emitted for a construct this release does not execute
 //!
-//! A `human` node is parsed, validated, and **emitted as a real node with its
-//! real topology** — its edges, its budgets, its place in the graph, its
-//! `on_timeout:` control transfer — whose activity throws `Unimplemented` naming
-//! the construct and the milestone that lands it (PRD §9's resolved question 4
-//! puts the runtime in M2). The alternative was refusing to emit a graph for
-//! such a composition at all, which would leave `build` failing on a committed
-//! golden and nothing type-checking the topology around the construct. A node
-//! that says what it does not do is not the same as a node that pretends:
-//! nothing here answers a plausible value.
-//!
-//! The same posture covers a store bound to a **production** backend. Grammar
+//! A store bound to a **production** backend is the remaining one. Grammar
 //! 14.2's vocabulary reaches past this release — `redis`, `pgvector`, `s3` and
 //! the rest land in M3 — so [`backend_of`] resolves the alias at compile time
 //! and the emitted binding carries the provider it resolved to; `src/stores.ts`
@@ -174,6 +181,9 @@ pub fn declare(names: &mut Names, ir: &Ir) {
                     names.declare(&format!("{address}.node.{id}"));
                     if matches!(node.kind, NodeKind::Map { .. }) {
                         names.declare(&format!("{address}.node.{id}.map"));
+                    }
+                    if matches!(node.kind, NodeKind::Human { .. }) {
+                        names.declare(&format!("{address}.node.{id}.human"));
                     }
                 }
             }
@@ -1180,6 +1190,12 @@ fn flow(
             ));
         }
 
+        if let NodeKind::Human { human } = &node.kind {
+            text.push_str(&human_descriptor(
+                names, address, node, human, surfaces, imported,
+            ));
+        }
+
         text.push('\n');
         text.push_str(&names::doc(
             "",
@@ -1599,7 +1615,14 @@ fn input_builder(
         // evaluated fails the execution rather than the activity, and neither
         // `skip` nor a `fallback:` may absorb that (Decisions D78, D110).
         NodeKind::Store { params, .. } => store_params(params),
-        NodeKind::Human { .. } => "  input: () => null,\n".to_string(),
+        // What the human is **shown** (grammar 8.7): a declared input surface
+        // like an agent's or a tool's, bound through grammar 8.0's own chain, so
+        // `input: { answer: "state.answer" }` and a field that resolves by name
+        // from a channel read the same way here as anywhere else. It is built in
+        // the node's input phase for that reason and for one more: a resume
+        // surface has to be able to render the question, and this is the value
+        // it renders (`runtime.HumanWait.shown`).
+        NodeKind::Human { human } => field_map_input(ir, address, node, &human.input, &reader),
     }
     .to_string()
 }
@@ -1924,9 +1947,9 @@ fn activity(
             "  run: async (input, context) =>\n    runtime.runMap({}, input as runtime.MapPlan, context),\n",
             names.value(&format!("{address}.node.{id}.map"))
         ),
-        NodeKind::Human { .. } => unimplemented_run(
-            "a `human` pause",
-            "the `human` node runtime, which PRD §9's resolved question 4 schedules for M2",
+        NodeKind::Human { .. } => format!(
+            "  run: async (input, context, view) =>\n    runtime.runHuman({}, input, context, view),\n",
+            names.value(&format!("{address}.node.{id}.human"))
         ),
         // The result is **not** parsed against the emitted Zod for the derived
         // row. That schema describes a shape this compiler's own runtime builds
@@ -1947,12 +1970,69 @@ fn activity(
     }
 }
 
-fn unimplemented_run(what: &str, bullet: &str) -> String {
-    format!(
-        "  run: () => {{\n    throw new runtime.Unimplemented({}, {});\n  }},\n",
-        names::string(what),
-        names::string(bullet)
-    )
+/// One `human` node's wait, as a `runtime.HumanDescriptor` (grammar 8.7).
+///
+/// Everything a pause needs that is not the node's own input: its budget and the
+/// route its expiry takes, and the two readings of its `output:` — the published
+/// JSON Schema a status route hands whoever is answering, and the emitted Zod
+/// that decides whether their answer fits (PRD 5.11). Both are lowerings of one
+/// field map and `schema_conformance` is what holds them equal, so a UI told the
+/// contract by one is refused by the other only when it really did not fit.
+///
+/// The budget is **not** the node's `policy.timeoutMs` and cannot become one: a
+/// `human` node resolves no `timeout:` at any of grammar 9.3's levels (D102), so
+/// this is the one place a wait's duration is written.
+fn human_descriptor(
+    names: &Names,
+    address: &str,
+    node: &Node,
+    human: &crate::ir::flow::Human,
+    surfaces: &[schema::Surface<'_>],
+    imported: &mut Vec<String>,
+) -> String {
+    let id = node.id.value.as_str();
+    let output = surface_fields(surfaces, &format!("{address}.node.{id}.output"));
+    let parse = names.value(&format!("{address}.node.{id}.output")).to_string();
+    imported.push(parse.clone());
+
+    let mut text = String::from("\n");
+    text.push_str(&names::doc(
+        "",
+        &[format!(
+            "`{address}` node `{id}` — the pause it holds: what the human is shown, and \
+             what an answer has to fit (grammar 8.7, PRD 5.11)."
+        )],
+    ));
+    text.push_str(&format!(
+        "const {}: runtime.HumanDescriptor = {{\n",
+        names.value(&format!("{address}.node.{id}.human"))
+    ));
+    text.push_str(&format!("  flow: {},\n", names::string(address)));
+    text.push_str(&format!("  node: {},\n", names::string(id)));
+    if let Some(timeout) = &human.timeout {
+        text.push_str(&format!(
+            "  timeoutMs: {},\n",
+            policy::milliseconds(&timeout.value)
+        ));
+    }
+    if let Some(on_timeout) = &human.on_timeout {
+        text.push_str(&format!(
+            "  onTimeout: {},\n",
+            names::string(&control_name_raw(&on_timeout.value))
+        ));
+    }
+    text.push_str(&format!(
+        "  schema: {},\n",
+        json_literal(&schema::json_field_map(output.as_ref()), "  ")
+    ));
+    text.push_str(&format!(
+        "  parse: (payload) => runtime.parseResult({parse}, payload, {}),\n",
+        names::string(&format!(
+            "the resume payload for `{address}` node `{id}`"
+        ))
+    ));
+    text.push_str("};\n");
+    text
 }
 
 // ---------------------------------------------------------------------------
@@ -3194,6 +3274,13 @@ export function sessionRefusal(address: string, stores: readonly string[]): stri
  * (grammar 10.1, Decision D78). The second is the one whose trace is complete —
  * every step landed — so dropping it there would lose the whole routing record
  * of a run that made one.
+ *
+ * A third way is a `human` node (grammar 8.7): a run that reaches one and was
+ * started with **no resume surface** stops there, and the `FlowFailure` carries
+ * a `runtime.HumanInterrupt` on its `cause` chain — `runtime.interruptOf` is how
+ * a caller tells that outcome from a failure. `resumable: true` is what says a
+ * resume surface is attached, and `src/serve.ts` is the caller that passes it:
+ * its `POST /executions/:id/resume` is what delivers the answer (PRD 5.11).
  */
 export async function runFlow(
   address: string,
@@ -3202,6 +3289,14 @@ export async function runFlow(
     readonly executionId?: string;
     readonly sessionKey?: string;
     readonly recursionLimit?: number;
+    /**
+     * Whether something is standing by to answer a `human` pause this run
+     * reaches (grammar 8.7, PRD 5.11).
+     *
+     * `false` — the default, and what `agent-compose run` leaves it at — makes
+     * a pause the end of the run rather than a wait nothing can settle.
+     */
+    readonly resumable?: boolean;
   } = {},
 ): Promise<FlowRun> {
   const flow = flows[address];
@@ -3225,6 +3320,11 @@ export async function runFlow(
     throw new Error(sessionRefusal(address, flow.sessionStores));
   }
   const executionId = options.executionId ?? `exec_${globalThis.crypto.randomUUID()}`;
+  // Opened before the graph is streamed, so a status route asked the instant
+  // after `start` answered already has somewhere to read this run's pauses from
+  // (grammar 8.7, PRD 5.11). Every instance nested inside the run registers
+  // against the same execution id and is told apart by its instance path.
+  runtime.openHumanWaits(executionId, options.resumable === true);
   // `runtime.quiesce` keeps the last state each superstep produced, which is
   // what makes a failure's trace survive; the one failure it restates on the way
   // out is LangGraph stopping the run at the ceiling.
@@ -3243,8 +3343,14 @@ export async function runFlow(
     // `scope: execution` means what it says: whatever this run's own stores held
     // is released when the run ends, however it ended (PRD 5.8, grammar 11.1).
     // A `serve` process runs many executions, so a store that stayed open would
-    // be both a leak and a lifetime the composition did not declare.
-    .finally(() => stores.releaseExecution(executionId));
+    // be both a leak and a lifetime the composition did not declare. A pause the
+    // run was holding goes the same way and for the same reason: a wait that
+    // outlived its run would be one a resume could still be delivered to, with
+    // no graph left to receive it (grammar 8.7).
+    .finally(() => {
+      stores.releaseExecution(executionId);
+      runtime.releaseHumanWaits(executionId);
+    });
   if (error !== undefined) {
     throw new runtime.FlowFailure(
       address,
@@ -3718,13 +3824,21 @@ flow.f:
         );
     }
 
-    /// A construct this release does not execute is emitted as a real node with
-    /// its real topology, whose activity says what it is and which milestone
-    /// bullet lands it — rather than as a plausible answer.
+    /// A `human` node's whole wait is written down: its budget, the route its
+    /// expiry takes, and what an answer is held to (grammar 8.7, PRD 5.11).
+    ///
+    /// The budget is the one worth pinning by value. Grammar 9.3 keeps a `human`
+    /// node's `timeout` out of *every* level (D102), so `timeoutMs` on the
+    /// descriptor and no `timeoutMs` in the node's `policy:` is the whole of that
+    /// decision: a wait's duration is written in one place, and a
+    /// composition-wide budget can never reach it.
     #[test]
-    fn an_unimplemented_kind_throws_and_names_the_bullet_it_waits_on() {
+    fn a_human_nodes_descriptor_carries_its_wait_its_route_and_its_answer_schema() {
         let emitted = emit(&format!(
             r#"{PREAMBLE}
+defaults:
+  timeout: 30s
+
 flow.f:
   inputs: {{ goal: {{ type: string }} }}
   outputs: {{ draft: {{ type: string }} }}
@@ -3735,6 +3849,7 @@ flow.f:
         output: {{ decision: {{ enum: [approve, reject] }} }}
         timeout: 24h
         on_timeout: rescue
+      input: {{ question: "input.goal" }}
     rescue: {{ agent: agent.reviewer }}
   edges:
     - {{ from: start, to: ask }}
@@ -3743,7 +3858,36 @@ flow.f:
 "#
         ));
         assert!(
-            emitted.contains("throw new runtime.Unimplemented(\"a `human` pause\","),
+            emitted.contains("const flowFNodeAskHuman: runtime.HumanDescriptor = {"),
+            "{emitted}"
+        );
+        assert!(emitted.contains("  timeoutMs: 86400000,\n"), "{emitted}");
+        assert!(emitted.contains("  onTimeout: \"rescue\",\n"), "{emitted}");
+        assert!(
+            emitted.contains(
+                "  parse: (payload) => runtime.parseResult(flowFNodeAskOutput, payload, \
+                 \"the resume payload for `flow.f` node `ask`\"),"
+            ),
+            "{emitted}"
+        );
+        assert!(
+            emitted.contains("runtime.runHuman(flowFNodeAskHuman, input, context, view)"),
+            "{emitted}"
+        );
+        // What the human is shown is the node's own `input:`, bound through
+        // grammar 8.0's chain like any other declared input surface.
+        assert!(
+            emitted.contains("\"question\": runtime.toJson(runtime.evaluate(\"input.goal\", roots)),"),
+            "{emitted}"
+        );
+        // Decision D102: `defaults: { timeout: 30s }` above reaches every other
+        // node and not this one, so the node's resolved policy carries no
+        // budget at all — the wait's is the descriptor's.
+        assert!(
+            emitted.contains(
+                "// Grammar 9.3, resolved: `retry` from exempt (Decision D102), \
+                 `timeout` from exempt (Decision D102), `on_error` from the built-in."
+            ),
             "{emitted}"
         );
         // Grammar 7.8 clause 3: a node reached only by `on_timeout` is live
