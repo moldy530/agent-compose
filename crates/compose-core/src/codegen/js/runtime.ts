@@ -505,6 +505,13 @@ export interface RunContext {
    * idempotency key they carried, and whether the backend had already seen it,
    * are the whole of what at-least-once delivery means at this store.
    *
+   * **Absent on one context, and it is the same one [`deadline`] is absent
+   * on**: a detached `map` delivery's. This array and its sibling below are
+   * read the moment the join returns, and the join never waits for such a
+   * delivery (D94), so a record it pushed would be on the node's entry or not
+   * depending on when the sink answered. See [`runMap`], and `docs/trace.md`
+   * §5.1.
+   *
    * Mutable behind a `readonly` field on purpose: the field is the channel, and
    * what flows through it is appended by whoever runs an op.
    */
@@ -523,7 +530,8 @@ export interface RunContext {
    * [`callModel`] is what writes it, on both of its ways out, and [`runNode`]
    * reads it on both of *its* ways out — see [`merged`]. What arrives here
    * arrives in the order the calls were made, across every attempt the node's
-   * `retry:` policy made and every instance a `map` dispatched, while an answer
+   * `retry:` policy made and every instance a `map` **joined** — a detached
+   * delivery is handed neither this nor its sibling above — while an answer
    * that carries `models` carries the subset it put in an order the node decided
    * (a `map`'s, which is source-item order). So the answer decides the order and
    * this decides the set.
@@ -1889,6 +1897,24 @@ export const IDEMPOTENCY_ENV = "IDEMPOTENCY_KEY";
  */
 export const IDEMPOTENCY_HEADER = "Idempotency-Key";
 
+/**
+ * A write to a child's standard input that failed for a reason neither EPIPE nor
+ * a destroyed stream covers.
+ *
+ * Its own class because [`runExec`] has one promise and two rejections to tell
+ * apart: a spawn the platform refused, where the command never ran, and this,
+ * where it did. Restating this one as "could not be run" would assert something
+ * false — a reader chasing an `ENOENT` would go looking for a path that is
+ * there — so the message is composed at the reject site and carried through the
+ * catch untouched.
+ */
+class ExecInputFailure extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ExecInputFailure";
+  }
+}
+
 /** Run one `exec:` binding (grammar 6.1, 8.2). */
 export async function runExec(
   binding: ExecBinding,
@@ -1958,9 +1984,20 @@ export async function runExec(
       // design — so the exit code and the streams stay the result; a destroyed
       // stream is this run being aborted, which the abort path already reports;
       // anything else fails the node through the same promise a spawn error
-      // does.
+      // does — but as its own class and with its own message, because the
+      // command *ran* and the catch below is written for one that did not
+      // (see [`ExecInputFailure`]). Restated here for the reason the spawn
+      // failure is restated there: the platform words this one too, and one
+      // composition should produce one message whatever environment it runs in.
       child.stdin.on("error", (error: NodeJS.ErrnoException) => {
-        if (error.code !== "EPIPE" && error.code !== "ERR_STREAM_DESTROYED") reject(error);
+        if (error.code === "EPIPE" || error.code === "ERR_STREAM_DESTROYED") return;
+        reject(
+          new ExecInputFailure(
+            `\`${asWritten(binding.command)}\`'s standard input could not be written${
+              error.code === undefined ? "" : ` (${error.code})`
+            }`,
+          ),
+        );
       });
       if (stdin !== undefined) {
         child.stdin.end(stdin);
@@ -1978,6 +2015,10 @@ export async function runExec(
     // than as a failure to start, and it is not this binding's failure — so it
     // is raised as it came, the way [`send`] raises one.
     if (context.signal.aborted) throw error;
+    // The other rejection this promise has, already restated where it was
+    // raised: the command started and its input could not be written, which is
+    // not what the restatement below says (see [`ExecInputFailure`]).
+    if (error instanceof ExecInputFailure) throw error;
     // Everything else is the platform declining to run the command, and the
     // message it declines with quotes the **resolved** path: Node says
     // `spawn /opt/tokens/rg ENOENT`, Bun `ENOENT: no such file or directory,
@@ -3619,9 +3660,17 @@ function routeKey(map: MapDescriptor, route: MapRoute): string {
  * `undefined` on the homogeneous form, which declares no `route_by:` and whose
  * items are not a union — there is no variant to name. On the routed form it is
  * the value at the literal discriminator field, read as a string because that is
- * what a variant tag is (grammar 3.2); anything else is left unrecorded rather
- * than rendered, since [`selectRoute`] has already refused an item the
- * composition does not route.
+ * what a variant tag is (grammar 3.2), and a validated artifact has no other
+ * kind: `route_by:` names the discriminator of a discriminated union, and the
+ * items were parsed against their producer's declared schema before the fan-out
+ * planned anything (PRD 5.2). So the narrowing below is what makes the read
+ * total rather than a policy about values that reach it.
+ *
+ * A non-string that reached here anyway is left **unrecorded** rather than
+ * rendered, and not because [`selectRoute`] would have refused it — with a
+ * `default:` catch-all it routes it (rule 4, D30) — but because a number spelled
+ * as a string would be a `variant` that is not one of the union's declared tags,
+ * which is the one thing [`DispatchRecord.variant`] promises it is.
  */
 function variantOf(map: MapDescriptor, item: unknown): string | undefined {
   if (map.routeBy === undefined) return undefined;
@@ -3799,10 +3848,26 @@ export async function runMap(
       // aborts, and no `deadline` either — a delivery that inherited the node's
       // expiry would hand a model route a share of a budget this delivery is
       // defined not to be bounded by (see `RunContext.deadline`, `callModel`).
+      //
+      // And off the node's **trace entry**, which is the same statement about
+      // the other pair a context carries. `storeRecords` and `modelCalls` are
+      // the node execution's collectors, created by [`runNode`] and read the
+      // moment the join below returns — and by D94 the join does not wait for
+      // this delivery. A record pushed through the node's copy would therefore
+      // land on the entry or not depending on when the sink answered, so two
+      // runs of one composition would produce two trace documents. `docs/trace.md`
+      // §5.1 and §7.2 both say they do not: an entry reports what the *join*
+      // observed, and a detached delivery's outcome is the one thing it never
+      // observes — `outcome: "detached"` and `attempts: 0` are already that
+      // statement, and an entry that carried the delivery's model call beside
+      // them would contradict both. Dropped rather than collected somewhere
+      // else, because there is no entry for a second collector to reach.
       const delivery: RunContext = {
         ...scoped,
         signal: new AbortController().signal,
         deadline: undefined,
+        storeRecords: undefined,
+        modelCalls: undefined,
       };
       void (async () => {
         // `max_concurrency` is an **admission** bound over every in-flight
@@ -4138,7 +4203,7 @@ const EXECUTION_SHAPE = {
  *
  * `made` is the node's own channel ([`RunContext.modelCalls`]): every call, in
  * the order it was made, across every attempt the node's `retry:` policy made
- * and every instance a `map` dispatched. `ordered` is what the *answer* carried,
+ * and every instance a `map` joined. `ordered` is what the *answer* carried,
  * which is the subset the node put in an order of its own — a `map`'s, which is
  * source-item order — and which is therefore the shape a reader of a successful
  * run expects.

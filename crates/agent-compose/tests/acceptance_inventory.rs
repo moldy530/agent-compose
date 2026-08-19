@@ -291,6 +291,15 @@ const CODEGEN: &[Criterion] = &[
                 "a_sink_route_is_joined_and_a_detached_one_is_resolved_at_dispatch",
                 Status::Live,
             ),
+            // …and what "resolved at dispatch" leaves in the record: the join
+            // never observed the delivery, so nothing it went on to do is on
+            // the map node's entry either. The sibling above decides that the
+            // run does not wait; this decides that the trace does not report a
+            // wait it did not make (`docs/trace.md` §5.1, PRD 5.3).
+            (
+                "a_detached_deliverys_effects_stay_off_the_map_nodes_entry",
+                Status::Live,
+            ),
             // Rule 6's other end: a dispatch of zero instances is a completion,
             // not a stall — its outgoing edge fires as if every instance had
             // finished.

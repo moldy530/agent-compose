@@ -67,8 +67,9 @@ carries neither.
 
 ### 1.1 `run --format json`
 
-`agent-compose run <flow> --format json` — the invocation grammar §13.2 defines —
-prints one document:
+`agent-compose run <flow> --format json` — grammar §13.2's invocation, plus the
+emitted CLI's own `--format`, which the generated project's `README.md`
+documents and no grammar section defines — prints one document:
 
 ```json
 {
@@ -344,6 +345,17 @@ makes reliable.
   applied to it and `attempts` is `0`. A `"detached"` record says a delivery was
   issued; it says nothing about whether the sink accepted it.
 
+  That last sentence is a rule about the **whole entry**, not only about this
+  record: nothing a detached delivery goes on to do reaches the map node's
+  entry. Its model calls are not in the entry's `models` and its store ops are
+  not in the entry's `stores`, whether the sink answers before the join returns
+  or an hour later. The alternative is not a fuller trace but a
+  nondeterministic one — the entry is written when the join finishes, and what a
+  delivery it does not wait for had managed by then is a matter of scheduling.
+  So the account of a detached dispatch is exactly this record, and §7.2's "every
+  model call that node execution made" is bounded by the same join that bounds
+  the outcomes.
+
 ### 5.2 A map node that failed
 
 A map node that failed still dispatched, and its entry still carries what it
@@ -397,7 +409,10 @@ carry the rest some other way.
 Every op a node performs lands on that node's entry, across **every attempt** its
 `retry:` policy made: an effect that happened is an effect that happened, and a
 record that kept only the last attempt's would describe a run the store did not
-see.
+see. A **detached** `map` delivery is the one thing "a node performs" does not
+reach, for the reason §5.1 gives: the node never waited for it, so whether its
+ops had happened by the time the entry was written is a matter of scheduling
+rather than a fact about the run.
 
 ---
 
@@ -435,9 +450,11 @@ never absent, because a failover is by definition a refusal the route declared.
 ### 7.2 Which calls land on which entry
 
 The entry's `models` is **every model call that node execution made** — across
-every attempt its `retry:` policy made and every instance a `map` dispatched —
+every attempt its `retry:` policy made and every instance a `map` **joined** —
 not only the calls of the attempt that answered. A node that succeeded on its
-second attempt reports the first attempt's spent ladder too.
+second attempt reports the first attempt's spent ladder too. "Joined" is the
+whole of the exception: a detached delivery's calls are not here, for the reason
+§5.1 gives.
 
 Where the two sets differ, calls the node could **order** come in that order (a
 `map`'s, which is source-item order) and the rest come ahead of them in the order
@@ -464,10 +481,12 @@ subgraph's routing decisions or pretend they were the caller's. So they nest:
 Nesting moves nobody's step numbers: an inner instance numbers its own supersteps
 from `1`.
 
-**Instance paths surface in exactly two fields**, and only as the prefix of an
-idempotency key: `DispatchRecord.idempotencyKey`, which every dispatch record
-carries, and `StoreRecord.idempotencyKey`, which a store-op **node**'s write
-carries and a write through a synthesized store tool does not (§6). Both are
+**Instance paths surface in exactly two fields**, and in neither of them alone:
+each is an idempotency key, of which the path is the **remainder** after the
+execution id. The two are `DispatchRecord.idempotencyKey`, which every dispatch
+record carries, and `StoreRecord.idempotencyKey`, which a store-op **node**'s
+write carries and a write through a synthesized store tool does not (§6). Both
+are
 
 ```
 <execution.id> "/" <frame> { "/" <frame> }
@@ -539,7 +558,16 @@ At a given `trace_version`, a reader MAY rely on:
 
 * every field this document names, under the name and with the meaning given
   here;
-* the presence rules stated in each table's *presence* column;
+* the presence rules stated in each table's *presence* column — **both ways
+  round.** A column that names the cases a field appears in is also the statement
+  that it does not appear in the others, and in some of them the absence *is* the
+  record rather than a detail of it: §5.2's missing `dispatches`, where an absent
+  key says "nothing resolved" and `[]` says "nothing was dispatched"; the missing
+  `writes` and the mostly-missing `routing` of §9's aborting entry; `route` and
+  `variant` on a homogeneous map, which is how a reader tells the two forms
+  apart. Reading an absence this document states is using the format, not
+  guessing at it — see the MUST NOT below for the absences that are not stated,
+  which is a different thing;
 * the vocabularies of the closed enumerations: `TraceDocument.status`,
   `TraceEntry.outcome`, `DispatchRecord.outcome`, `StoreRecord.op`,
   `StoreRecord.effect`, `StoreRecord.via`, `StoreRecord.scope`, and a refusal's
@@ -554,15 +582,21 @@ At a given `trace_version`, a reader MAY rely on:
 
 A reader MUST NOT rely on:
 
-* **the absence of a field.** A later version may add one, and a reader that
-  rejects unknown keys will break on a compatible change. Ignore what you do not
-  recognize.
+* **the absence of a field this document does not name.** A later version may add
+  one, and a reader that rejects unknown keys — or that treats "no such key
+  today" as a fact about the format — will break on a compatible change. Ignore
+  what you do not recognize. This is the complement of the presence rule above
+  and not a retraction of it: an absence a *presence column* states is part of
+  the contract, and widening one is a version bump (§10.3).
 * **the text of any message field** — `TraceEntry.error`, `DispatchRecord.error`,
   `Refusal.detail`, and the envelope's `error`. These are diagnostics written for
   a person (PRD G3) and are improved between releases. §3's `<error name>:
   <message>` is the shape they are written in, not a parse: the class in front of
-  the colon is whatever the failing activity raised, and neither the set of
-  classes nor the text after it is fixed by this format. The `reason` field of an
+  the colon is the class of the error the runtime raised — which for an
+  activity's own failure is the wrapper the runtime puts around it, with the
+  activity's class appearing later in the text, and on the input-binding and
+  routing paths is something else again — and neither the set of classes nor the
+  text after it is fixed by this format. The `reason` field of an
   edge decision is the exception, and only because §4.1 enumerates its values: it
   is a closed vocabulary that happens to be spelled as a sentence.
 * **anything printed by the human report.** See §11.
@@ -574,8 +608,9 @@ Compatible, and made **without** a version bump:
 
 * adding a field to an existing record type;
 * adding a new record type reachable from an existing one;
-* recording a field in cases where it was previously absent, provided the
-  presence rule stated here is widened rather than contradicted;
+* recording a field in a case this document's presence column **already** names
+  and the runtime was not keeping — a bug in the implementation of this format
+  rather than a change to it, and the reason §10.4's two tests exist;
 * improving the text of a message field.
 
 ### 10.3 What requires a version bump
@@ -585,8 +620,12 @@ written against the previous version wrong:
 
 * removing a field, or renaming one;
 * changing a field's type, or the meaning of its value;
-* narrowing a presence rule — recording a field in fewer cases than this document
-  promises;
+* changing a presence rule in **either** direction — recording a field in fewer
+  cases than this document promises, and equally in more. §10.1 makes a presence
+  column readable both ways, so widening one moves an absence a reader was told
+  to rely on: a reader who tells a timed-out fan-out from an empty one by §5.2's
+  missing `dispatches` is broken by a release that starts writing `[]` there,
+  exactly as one who reads `dispatches` is broken by a release that stops;
 * adding a member to one of §10.1's closed enumerations, or removing one;
 * changing one of the fixed orders;
 * changing the derivation of an idempotency key, or where instance paths appear.

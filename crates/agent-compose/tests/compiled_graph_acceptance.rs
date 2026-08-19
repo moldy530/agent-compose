@@ -2895,6 +2895,26 @@ fn a_sink_route_is_joined_and_a_detached_one_is_resolved_at_dispatch() {
         "the skipped item says what was wrong with it: {}",
         records[3]
     );
+    // The detached delivery's own model call is the *unscripted* one this
+    // fixture is built around, so the mock refuses it — and that refusal is not
+    // on this entry. `models` is what the join observed (`docs/trace.md` §5.1,
+    // §7.2), and a delivery the join never waited for would put its record here
+    // or not depending on when the provider answered.
+    // `a_detached_deliverys_effects_stay_off_the_map_nodes_entry` decides the
+    // same rule with the ordering pinned; this is it on the path where the
+    // delivery fails.
+    let routed = run.entries("route")[0].clone();
+    for call in routed["models"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+    {
+        assert!(
+            call.get("refused").is_none(),
+            "the map node's entry carries the joined items' calls, and the only refused \
+             call this run makes is the detached delivery's: {call}"
+        );
+    }
 
     // Grammar 9.4's form, for the one dispatch that delivers without observing
     // an outcome: the execution id, then this dispatch's flattened instance
@@ -2924,6 +2944,107 @@ fn a_sink_route_is_joined_and_a_detached_one_is_resolved_at_dispatch() {
             "every dispatch derives its own key: {record}"
         );
     }
+}
+
+/// A detached delivery's own effects stay **off** the map node's trace entry
+/// (`docs/trace.md` §5.1, §6, §7.2).
+///
+/// The entry is written when the join finishes, and by Decision D94 the join
+/// does not wait for a detached delivery. A model call or a store op made
+/// through the node's own collectors would therefore be on that entry or not
+/// depending on when the sink answered — two runs of one composition producing
+/// two trace documents, which is the one thing a versioned format cannot do
+/// (`docs/trace.md` §10). The record the format gives such a dispatch is
+/// `outcome: "detached"` with `attempts: 0`, and it says what the join observed:
+/// nothing.
+///
+/// The fixture decides the race rather than leaving it to the scheduler. The one
+/// joined item's model call is answered after 400ms and the delivery's at once,
+/// so the delivery has certainly answered — the assertion below reads its
+/// request off the provider — well before the join returns. Without that
+/// ordering an absence would pass on a runtime that shares the collectors,
+/// whenever the sink happened to be the slower of the two.
+///
+/// Model calls are the half a composition can reach: a detached route's target
+/// is a `node:`, and only an agent with attached stores would record store ops
+/// through one. Both travel on the same two fields of the delivery's context, so
+/// the reachable half is what holds the rule.
+#[test]
+fn a_detached_deliverys_effects_stay_off_the_map_nodes_entry() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({
+                "findings": [
+                    { "kind": "auto_fixable", "file": "a.rs", "hint": "rename it" },
+                    { "kind": "duplicate", "of": "issue-7" },
+                ],
+            })),
+        ),
+        // The joined item, deliberately slow…
+        Script::new(
+            HAIKU,
+            Outcome::structured(json!({ "patch": "patch-a" })).after(Duration::from_millis(400)),
+        )
+        .matching("a.rs"),
+        // …and the detached delivery's own call, deliberately immediate.
+        Script::new(HAIKU, Outcome::structured(json!({ "text": "a duplicate" })))
+            .matching("issue-7"),
+    ]);
+
+    let Some(run) = harness::invoke(
+        "fanout",
+        "flow.sort",
+        &[("report", "the build is red")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+
+    // The delivery was made and was answered: without this the absence below
+    // would be evidence about a call that never happened.
+    let requests = provider.requests();
+    assert_eq!(
+        requests.len(),
+        3,
+        "the sorter, the joined item and the detached delivery all reached the provider: \
+         {requests:?}"
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.body_text.contains("issue-7")),
+        "the detached delivery's own model call is one of them: {requests:?}"
+    );
+
+    // …and exactly one of the three is on the map node's entry: the joined
+    // item's. `models` is what the join observed, and the delivery is what it
+    // did not.
+    let entry = run.entries("route")[0].clone();
+    let calls = entry["models"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the map node made a model call: {entry}"))
+        .clone();
+    assert_eq!(
+        calls.len(),
+        1,
+        "the map node's entry carries the joined item's model call and not the detached \
+         delivery's, which the join never waited for (`docs/trace.md` §5.1): {entry}"
+    );
+    assert!(
+        entry.get("stores").is_none(),
+        "and nothing else the delivery did either: {entry}"
+    );
+    // The dispatch record is the whole account of that delivery, which is the
+    // other half of the same rule.
+    let detached = entry["dispatches"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the map records what it dispatched: {entry}"))[1]
+        .clone();
+    assert_eq!(detached["outcome"], json!("detached"), "{detached}");
+    assert_eq!(detached["attempts"], json!(0), "{detached}");
 }
 
 /// A map whose target is a `flow.*` that itself fans out: two frames of instance
