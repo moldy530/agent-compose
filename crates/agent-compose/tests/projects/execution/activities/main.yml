@@ -34,6 +34,11 @@
 #     ids run opposite to their completion order, to the order their nodes are
 #     declared in (and so registered in), and to the order their edges are
 #     declared in, so only grammar 7.6.4 clause 1 explains the result.
+#   * `flow.branch_order` — an `else:` edge declared *before* an unconditional
+#     sibling, which is the one edge shape whose declaration order disagrees with
+#     the order a router can decide in (an `else:` is decided after every guarded
+#     sibling, grammar 7.3 rule 4). Both halves of the routing record —
+#     `edges` and `targets` — are in declaration order (`docs/trace.md` §4).
 #   * `flow.unset` and `flow.unset_expression` — reading a channel nothing has
 #     written fails the **execution**, naming the channel and the reader, and
 #     neither `on_error: skip` nor a `fallback:` absorbs it: those are strategies
@@ -592,6 +597,65 @@ flow.ordering:
     - { from: split, to: alpha }
     - { from: alpha, to: end }
     - { from: zulu, to: end }
+
+flow.branch_order:
+  description: An `else:` edge declared before an unconditional sibling.
+  outputs:
+    checks:
+      type: array
+      max_items: 8
+      items: { type: string }
+  nodes:
+    # The three edges out of `fork` are declared guarded, then `else:`, then
+    # unconditional — which is the one shape that tells declaration order apart
+    # from the order a router can *decide* in. An `else:` edge is not decidable
+    # until every guarded sibling has been decided (grammar 7.3 rule 4), so it is
+    # necessarily decided last while being declared second, and a record built in
+    # decision order would put `spare` after `always` in both `edges` and
+    # `targets`. `docs/trace.md` §4 promises declaration order for both.
+    fork:
+      exec:
+        command: printf
+        args: ["%s", "forked"]
+        output:
+          stdout: { type: string }
+
+    # Never taken: the guard reads an output that says something else.
+    guarded:
+      exec:
+        command: printf
+        args: ["%s", "guarded"]
+        output:
+          stdout: { type: string }
+      writes:
+        stdout: checks
+
+    spare:
+      exec:
+        command: printf
+        args: ["%s", "spare"]
+        output:
+          stdout: { type: string }
+      writes:
+        stdout: checks
+
+    always:
+      exec:
+        command: printf
+        args: ["%s", "always"]
+        output:
+          stdout: { type: string }
+      writes:
+        stdout: checks
+
+  edges:
+    - { from: start, to: fork }
+    - { from: fork, to: guarded, when: "fork.output.stdout == 'never'" }
+    - { from: fork, to: spare, else: true }
+    - { from: fork, to: always }
+    - { from: guarded, to: end }
+    - { from: spare, to: end }
+    - { from: always, to: end }
 
 flow.unset:
   description: A name-based read of a channel nothing has written.

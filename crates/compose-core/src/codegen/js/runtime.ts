@@ -350,6 +350,24 @@ export function interpolate(parts: readonly Interpolation[]): string {
     .join("");
 }
 
+/**
+ * The same string **as its author wrote it**: `${NAME}` where a reference is,
+ * rather than what the reference resolved to.
+ *
+ * This is what an error message quotes. A class-2 surface is interpolable
+ * end to end (grammar 4.3) — an `http:` binding's `url`, the whole `exec:`
+ * block — so a composition may perfectly well write
+ * `url: "${SIGNED_ENDPOINT}/reports"`, and a message that quoted the resolved
+ * value would put a credential into a node's `error`, which is a field the
+ * trace carries, the run prints and a reader files (`docs/trace.md` §11.1).
+ * Naming the reference keeps the message diagnostic — it says which binding
+ * failed, spelled the way the file spells it — and keeps it reproducible: two
+ * environments produce one message.
+ */
+export function asWritten(parts: readonly Interpolation[]): string {
+  return parts.map((part) => (typeof part === "string" ? part : `\${${part.env}}`)).join("");
+}
+
 // ---------------------------------------------------------------------------
 // Policy: grammar 9
 // ---------------------------------------------------------------------------
@@ -845,7 +863,7 @@ export interface ModelCall {
   readonly model: string;
   /** The member that answered. Absent when none did. */
   readonly servedBy?: string;
-  /** Its ordinal in the route, `0` for the first. Absent with `servedBy`. */
+  /** Its ordinal in the route, `0` for the first. Present with `servedBy`. */
   readonly fallback?: number;
   readonly failovers: readonly Failover[];
   /** What ended the call, when no member answered it. */
@@ -1936,8 +1954,10 @@ export async function runExec(
   );
 
   if (!binding.expectExit.includes(result.code)) {
+    // The command as the composition spells it ([`asWritten`]): a resolved
+    // `${ENV}` value has no business in a field the trace carries.
     throw new Error(
-      `\`${command}\` exited ${result.code}, which is outside \`expect_exit: [${binding.expectExit.join(", ")}]\`${result.stderr === "" ? "" : `: ${result.stderr.trim()}`}`,
+      `\`${asWritten(binding.command)}\` exited ${result.code}, which is outside \`expect_exit: [${binding.expectExit.join(", ")}]\`${result.stderr === "" ? "" : `: ${result.stderr.trim()}`}`,
     );
   }
 
@@ -2008,8 +2028,11 @@ export async function runHttp(
       ? response.status >= 200 && response.status < 300
       : binding.expectStatus.includes(response.status);
   if (!accepted) {
+    // The URL as the composition spells it ([`asWritten`]), which is the whole
+    // of what this runtime puts in the message: `text` below is what the server
+    // answered, and is the server's to say.
     throw new Error(
-      `\`${url}\` answered ${response.status}, which is outside ${
+      `\`${asWritten(binding.url)}\` answered ${response.status}, which is outside ${
         binding.expectStatus === "2xx" ? "the 2xx range" : `\`expect_status: [${binding.expectStatus.join(", ")}]\``
       }: ${text.slice(0, 200)}`,
     );
@@ -2156,17 +2179,21 @@ export function route(
   counters: Readonly<Record<string, number>>,
   skipped: boolean,
 ): RoutingDecision {
-  const decisions: EdgeDecision[] = [];
-  const targets: string[] = [];
+  // One slot per edge, filled at the edge's **declaration index** rather than
+  // in the order the two passes below reach it. Declaration order is what the
+  // trace records (`docs/trace.md` §4), and an `else:` edge is decided in a
+  // second pass — it needs to know whether a guarded sibling was taken — so a
+  // list appended to in evaluation order would put an `else:` declared before an
+  // unconditional edge after it, in both `edges` and `targets`.
+  const slots: (EdgeDecision | undefined)[] = edges.map(() => undefined);
   const spent: Record<string, number> = {};
   let guardedTaken = false;
 
-  for (const edge of edges) {
-    if (edge.otherwise === true) continue;
+  edges.forEach((edge, index) => {
+    if (edge.otherwise === true) return;
     if (edge.when === undefined) {
-      decisions.push({ to: edge.to, taken: true, reason: "unconditional" });
-      if (!targets.includes(edge.to)) targets.push(edge.to);
-      continue;
+      slots[index] = { to: edge.to, taken: true, reason: "unconditional" };
+      return;
     }
 
     let value: boolean;
@@ -2183,76 +2210,59 @@ export function route(
     }
 
     if (!value) {
-      decisions.push({ to: edge.to, when: edge.when, value, taken: false });
-      continue;
+      slots[index] = { to: edge.to, when: edge.when, value, taken: false };
+      return;
     }
     if (edge.budget !== undefined) {
       const used = counters[edge.budget.key] ?? 0;
       if (used >= edge.budget.max) {
-        decisions.push({
+        slots[index] = {
           to: edge.to,
           when: edge.when,
           value,
           budget: { key: edge.budget.key, used, max: edge.budget.max },
           taken: false,
           reason: "the `max_iterations` budget is spent",
-        });
-        continue;
+        };
+        return;
       }
       spent[edge.budget.key] = used + 1;
-      decisions.push({
+      slots[index] = {
         to: edge.to,
         when: edge.when,
         value,
         budget: { key: edge.budget.key, used: used + 1, max: edge.budget.max },
         taken: true,
-      });
+      };
     } else {
-      decisions.push({ to: edge.to, when: edge.when, value, taken: true });
+      slots[index] = { to: edge.to, when: edge.when, value, taken: true };
     }
     guardedTaken = true;
-    if (!targets.includes(edge.to)) targets.push(edge.to);
-  }
+  });
 
-  for (const edge of edges) {
-    if (edge.otherwise !== true) continue;
-    if (guardedTaken) {
-      decisions.push({
-        to: edge.to,
-        else: true,
-        taken: false,
-        reason: "a guarded sibling was taken",
-      });
-      continue;
-    }
-    decisions.push({ to: edge.to, else: true, taken: true });
-    if (!targets.includes(edge.to)) targets.push(edge.to);
+  edges.forEach((edge, index) => {
+    if (edge.otherwise !== true) return;
+    slots[index] = guardedTaken
+      ? { to: edge.to, else: true, taken: false, reason: "a guarded sibling was taken" }
+      : { to: edge.to, else: true, taken: true };
+  });
+
+  const decisions = slots.filter((decision): decision is EdgeDecision => decision !== undefined);
+  // The targets in the order their edges are declared in, deduplicated: a
+  // multicast reads the way the file does, and so does the `goto` it becomes.
+  const targets: string[] = [];
+  for (const decision of decisions) {
+    if (!decision.taken) continue;
+    if (!targets.includes(decision.to)) targets.push(decision.to);
   }
 
   if (targets.length === 0) {
-    // Ordered the way a returned decision is (below), because the trace entry
-    // this ends up on is read the same way whether the run survived it or not.
-    throw new NoViableRoute(flow, node, ordered(decisions, edges));
+    // The decisions travel in the same order a returned one does, because the
+    // trace entry this ends up on is read the same way whether the run survived
+    // it or not.
+    throw new NoViableRoute(flow, node, decisions);
   }
-  return { edges: ordered(decisions, edges), targets, counters: spent };
-}
-
-/**
- * The decisions in declaration order.
- *
- * Declaration order is what the trace records; the targets are ordered by it
- * too, so a multicast reads the way the file does.
- */
-function ordered(
-  decisions: EdgeDecision[],
-  edges: readonly EdgeDescriptor[],
-): EdgeDecision[] {
-  decisions.sort(
-    (left, right) =>
-      edges.findIndex((edge) => edge.to === left.to && edge.when === left.when) -
-      edges.findIndex((edge) => edge.to === right.to && edge.when === right.when),
-  );
-  return decisions;
+  return { edges: decisions, targets, counters: spent };
 }
 
 // ---------------------------------------------------------------------------

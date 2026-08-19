@@ -43,6 +43,17 @@
 //! Each goes through `agent-compose run`, so what is snapshotted is the file a
 //! reader is handed rather than an in-process value a test could shape for
 //! itself.
+//!
+//! # …and the promises a snapshot cannot make
+//!
+//! Three claims of `docs/trace.md` are about a *rule* rather than about a shape,
+//! and each is asserted here directly, because a snapshot of a document that
+//! happens to satisfy a rule would go on passing after the rule was dropped:
+//! that the third delivery surface carries the version beside its trace (§1),
+//! that both halves of a routing record are in declaration order even where a
+//! router cannot decide in that order (§4), and that an activity's failure names
+//! the `${ENV}` reference its author wrote rather than the value it resolved to
+//! (§11.1).
 
 // See the note on the same line in `tests/compiled_graph_acceptance.rs`: a test
 // target is a crate root, so the shared harness is reached by path.
@@ -275,6 +286,100 @@ fn a_failed_runs_trace_document_keeps_its_shape() {
     };
     run.failed();
     insta::assert_snapshot!(document(&run));
+}
+
+/// Both halves of a routing record are in **declaration** order, including the
+/// one edge shape whose declaration order a router cannot decide in
+/// (`docs/trace.md` §4).
+///
+/// `flow.branch_order` declares three edges out of one node: a guarded one that
+/// answers `false`, then an `else:`, then an unconditional one. An `else:` edge
+/// is not decidable until every guarded sibling has been (grammar §7.3 rule 4),
+/// so a record built as the router decides puts the `else:` edge last — after
+/// the unconditional edge it is declared before. §4 promises `edges` **and**
+/// `targets` in the order the file declares them, and this is the composition
+/// that can tell the difference.
+#[test]
+fn a_routing_records_edges_and_targets_are_both_in_declaration_order() {
+    let provider = MockProvider::start().expect("a loopback port");
+
+    let Some(run) = harness::run("activities", "flow.branch_order", &[], &provider) else {
+        return;
+    };
+    run.succeeded();
+
+    let fork = run.entries("fork");
+    let routing = &fork[0]["routing"];
+    let edges = routing["edges"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the entry carries its edge decisions: {}", fork[0]));
+    let decided: Vec<(&str, bool)> = edges
+        .iter()
+        .map(|edge| {
+            (
+                edge["to"].as_str().expect("a target"),
+                edge["taken"].as_bool().expect("a verdict"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        decided,
+        [("guarded", false), ("spare", true), ("always", true)],
+        "the decisions are in declaration order, not decision order: {routing}"
+    );
+    assert_eq!(
+        routing["targets"],
+        json!(["spare", "always"]),
+        "…and so are the targets, which is the half a reader reconstructs branch \
+         order from: {routing}"
+    );
+}
+
+/// A failed activity names the `${ENV}` reference its author wrote, never the
+/// value it resolved to (`docs/trace.md` §11.1).
+///
+/// `tally` runs `${OPS_BIN}/false`, which exits 1 — outside the default
+/// `expect_exit: [0]` — and its `on_error: skip` puts the message in a trace
+/// entry a reader is handed. Grammar §4.3 class 2 makes the whole `exec:` block
+/// interpolable, so a composition may perfectly well point a command or a URL at
+/// a secret; §11.1 is the promise that the resolved value stays out of the
+/// document, and this is that promise against a real run.
+#[test]
+fn a_failed_activity_names_its_env_reference_rather_than_the_resolved_value() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "verdict": "fast", "note": "a note" })),
+    ));
+
+    let Some(run) = harness::run(
+        "activities",
+        "flow.pipeline",
+        &[("goal", "ship it")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+
+    let tally = run.entries("tally");
+    let error = tally[0]["error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a skipped node's entry says what failed: {}", tally[0]));
+    assert_eq!(
+        error,
+        "flow.pipeline node `tally` failed: Error: `${OPS_BIN}/false` exited 1, which \
+         is outside `expect_exit: [0]`",
+        "the message quotes the command as the composition spells it"
+    );
+
+    // The harness resolves `OPS_BIN` to `/bin`, so the command really ran; what
+    // the document must not hold is that value.
+    let document = run.trace_document().to_string();
+    assert!(
+        !document.contains("/bin/false"),
+        "no resolved `${{ENV}}` value is in the trace document: {document}"
+    );
 }
 
 /// The third delivery surface keeps §1's rule: `serve` reports the version
