@@ -42,6 +42,14 @@ PRD 5.3 asks for: one entry per node execution, carrying the guards that were
 evaluated, what they answered, which edges were taken, and the state of any
 `max_iterations` budget they spent.
 
+The trace is a **versioned, documented format**, so a reader may be written
+against it rather than against whatever this release happened to record. Every
+machine surface that carries one carries its version beside it — the
+`trace_version` key of `run --format json`, of the trace file's envelope, and of
+the status route's report — and `runtime.TRACE_VERSION` is what a compiled
+project spells it with. What each field means, and what a bump to that number
+does and does not signal, is the compiler's `docs/trace.md`.
+
 A run that produces no answer throws a `FlowFailure`, and it carries that same
 record: `.trace` holds every step that completed plus one final entry for the
 node the run stopped at, and `.cause` is the error itself. Both ways a run can

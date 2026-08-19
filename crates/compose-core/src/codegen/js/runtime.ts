@@ -2260,6 +2260,59 @@ function ordered(
 // ---------------------------------------------------------------------------
 
 /**
+ * The version of the trace format this compiler release emits
+ * (`docs/trace.md`, PRD §7 M2's "a documented, stable trace format").
+ *
+ * It sits on the **envelope** ([`TraceDocument`], and the `trace_version` key
+ * every delivery surface carries beside its `trace`) rather than on an entry: a
+ * run's entries are all of one format, and a version per entry would be a
+ * per-step cost for a fact about the release that produced them.
+ *
+ * The number is bumped when a reader that pinned it would be wrong: a field
+ * removed, renamed, or given a different meaning. Adding a field is not a bump —
+ * `docs/trace.md`'s *Stability* section is the contract, and it is what a reader
+ * is entitled to rely on.
+ */
+export const TRACE_VERSION = 1;
+
+/**
+ * One run's whole trace, as a surface delivers it (`docs/trace.md`).
+ *
+ * The **envelope**: the version a reader pins, the run it describes, and the
+ * entries themselves. `agent-compose run --format json` spreads these keys into
+ * the record it prints (its `trace` is this document's `entries`), the trace
+ * **file** is exactly one of these, and the generated app's status route carries
+ * `trace_version` beside the `trace` it already reported.
+ *
+ * Its keys are `snake_case` while an entry's are `camelCase`, and the seam is
+ * deliberate: these are document keys, alongside `execution_id`, `trace_path`
+ * and `status_url` on the same surfaces, while an entry is a runtime record —
+ * the very object `runFlow` answers with in `FlowRun.trace`, read by in-process
+ * callers as JavaScript rather than as a document.
+ */
+export interface TraceDocument {
+  /** [`TRACE_VERSION`]: the format the `entries` below are written in. */
+  readonly trace_version: number;
+  /** The flow that was run, as its typed address (grammar 2.2). */
+  readonly flow: string;
+  /** The execution the entries belong to (grammar 4.1's `execution.id`). */
+  readonly execution_id: string;
+  /** Whether the run produced an answer. */
+  readonly status: "completed" | "failed";
+  /**
+   * What stopped a run that produced none.
+   *
+   * Present exactly on `status: "failed"`, and there because a failed run's
+   * *last* entry does not always say why: a run stopped by the superstep ceiling
+   * ([`SuperstepCeiling`]) has no aborting node to carry one, and a file that
+   * held only `status: "failed"` would name no reason at all.
+   */
+  readonly error?: string;
+  /** Every entry the run recorded, in the order [`mergeRun`] folds them. */
+  readonly entries: readonly TraceEntry[];
+}
+
+/**
  * One entry of the routing trace (PRD 5.3: routing decisions are data).
  *
  * A run that **fails** carries one final entry too: the node it aborted at,

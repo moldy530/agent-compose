@@ -42,6 +42,14 @@ PRD 5.3 asks for: one entry per node execution, carrying the guards that were
 evaluated, what they answered, which edges were taken, and the state of any
 `max_iterations` budget they spent.
 
+The trace is a **versioned, documented format**, so a reader may be written
+against it rather than against whatever this release happened to record. Every
+machine surface that carries one carries its version beside it — the
+`trace_version` key of `run --format json`, of the trace file's envelope, and of
+the status route's report — and `runtime.TRACE_VERSION` is what a compiled
+project spells it with. What each field means, and what a bump to that number
+does and does not signal, is the compiler's `docs/trace.md`.
+
 A run that produces no answer throws a `FlowFailure`, and it carries that same
 record: `.trace` holds every step that completed plus one final entry for the
 node the run stopped at, and `.cause` is the error itself. Both ways a run can
@@ -165,8 +173,11 @@ same. It is derived from this project's own location rather than from the
 working directory, so a graph reads the same store wherever it was launched from.
 
 One thing under the directory is not a store's: the traces above, which
-`agent-compose run` writes and names on stderr. The whole directory is listed in
-`.gitignore` — what a run produced is not what a build emitted.
+`agent-compose run` writes and names on stderr. Each is one JSON object — the
+trace envelope, carrying `trace_version`, the flow, the execution id, how the run
+ended, and the run's `entries` — rather than a bare list, so a file found on its
+own says which format it is in. The whole directory is listed in `.gitignore` —
+what a run produced is not what a build emitted.
 
 ### One process at a time
 

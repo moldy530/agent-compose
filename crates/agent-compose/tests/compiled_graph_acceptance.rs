@@ -5570,10 +5570,20 @@ fn run_reports_its_whole_record_under_the_json_format() {
         &std::fs::read_to_string(written).expect("the path names a file that exists"),
     )
     .expect("the trace file holds the trace");
+    // The file is the envelope of `docs/trace.md` — a document that says which
+    // format it is in — and its `entries` are the record's `trace`, so the two
+    // surfaces carry one trace rather than two readings of it.
     assert_eq!(
-        held, record["trace"],
+        held["entries"], record["trace"],
         "and the file holds what the record does"
     );
+    assert_eq!(
+        held["trace_version"], record["trace_version"],
+        "…under the same declared format version: {record}"
+    );
+    assert_eq!(held["flow"], record["flow"], "{held}");
+    assert_eq!(held["execution_id"], record["execution_id"], "{held}");
+    assert_eq!(held["status"], json!("failed"), "{held}");
 }
 
 /// `run` refuses **before** it launches when a variable the composition

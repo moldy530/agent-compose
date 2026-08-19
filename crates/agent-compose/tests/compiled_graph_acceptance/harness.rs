@@ -381,22 +381,40 @@ impl Run {
         self.stderr()
     }
 
-    /// Every routing decision the run recorded, in step order (PRD 5.3).
+    /// The whole trace **document** the run wrote (`docs/trace.md`).
     ///
     /// Read from the file the command **names on stderr**, which is the whole
     /// point of it naming one: a trace grows with the run, so the terminal gets
     /// a summary and a reader — a person or this harness — gets the file.
-    pub fn trace(&self) -> Vec<Value> {
+    ///
+    /// The file is the versioned envelope rather than a bare array: `entries`
+    /// holds what [`Run::trace`] answers, and the keys around it are the version
+    /// a reader pins and the run the entries belong to.
+    pub fn trace_document(&self) -> Value {
+        let path = self.trace_path();
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("cannot read the trace at `{path}`: {error}"));
+        serde_json::from_str(&text).expect("the trace file holds one JSON document")
+    }
+
+    /// Where the run said it wrote its trace.
+    pub fn trace_path(&self) -> String {
         let stderr = self.stderr();
-        let path = stderr
+        stderr
             .lines()
             .find_map(|line| line.strip_prefix("trace: "))
             .unwrap_or_else(|| panic!("the run names where it wrote its trace\nstderr: {stderr}"))
             .trim()
-            .to_string();
-        let text = std::fs::read_to_string(&path)
-            .unwrap_or_else(|error| panic!("cannot read the trace at `{path}`: {error}"));
-        serde_json::from_str(&text).expect("the trace is a JSON array")
+            .to_string()
+    }
+
+    /// Every routing decision the run recorded, in step order (PRD 5.3).
+    pub fn trace(&self) -> Vec<Value> {
+        let document = self.trace_document();
+        document["entries"]
+            .as_array()
+            .unwrap_or_else(|| panic!("the trace document carries its entries: {document}"))
+            .clone()
     }
 
     /// One node's trace entries, in step order.

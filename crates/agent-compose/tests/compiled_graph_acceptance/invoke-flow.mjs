@@ -25,6 +25,14 @@
 // Usage: node invoke-flow.mjs <project> <flow> <inputs.json> <trace.json> [session]
 // Output: the flow's outputs as one JSON object on stdout; the trace is written
 // to <trace.json>, so stdout stays exactly what `agent-compose run` prints.
+//
+// What lands in <trace.json> is the bare array of entries — `FlowRun.trace`, as
+// an in-process caller of `runFlow` receives it — and deliberately not the
+// versioned envelope `agent-compose run` writes to the project's data directory
+// (`docs/trace.md`). This file is the harness's own scratch output rather than a
+// delivery surface of the compiler, and a driver that wrapped it would be a
+// second, unversioned imitation of the one the product defines. `Run::trace`
+// reads the real file; `Invocation::trace` reads this one.
 
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
