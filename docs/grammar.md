@@ -2655,6 +2655,12 @@ as the `IDEMPOTENCY_KEY` environment variable; a `function:`-bound target
 receives it as the `idempotency_key` field of its invocation context. The key is
 delivery metadata, never part of the target's declared input schema.
 
+**Where a key is observable.** Both carriers record theirs in the run's trace —
+a dispatch record's `idempotencyKey` and a store record's — which is the one
+place the flattened instance path of a nested fan-out can be read back at all
+(§4.1's `execution.item_index` exposes only the innermost index). See
+[`docs/trace.md`](trace.md) §8.
+
 ```
 exec_01/a/0/save/0          # store node `save`, in flow.ingest instantiated by node `a`
 exec_01/b/0/save/0          # …and by node `b`: a different write, a different key

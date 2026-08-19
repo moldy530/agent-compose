@@ -4093,11 +4093,11 @@ function merged(
  *
  * The entries of two attempts sit in one list, as a retried node's model calls
  * and store records do, and a reader tells them apart the way the node's own
- * `attempts` count says to: an instance starts at `step: 0`, so a second `step:
- * 0` entry for the same node is the next attempt beginning. Nesting them per
- * attempt instead would put the attempt boundary in the trace's *shape*, and
- * every reader of `inner` — including a run that did not retry — would have to
- * learn it.
+ * `attempts` count says to: an instance numbers its own supersteps from `1`, so
+ * a second `step: 1` entry for the same node is the next attempt beginning.
+ * Nesting them per attempt instead would put the attempt boundary in the trace's
+ * *shape*, and every reader of `inner` — including a run that did not retry —
+ * would have to learn it.
  */
 function joined(
   collected: readonly TraceEntry[],
