@@ -820,9 +820,11 @@ rather than an addition:
   enumeration. A run that ends holding a pause is not a run that failed, and a
   reader could not have been left to tell the two apart from `error`'s text,
   which §10.1 forbids parsing;
-* **`TraceEntry.error` on the envelope widened with it** — the row now reads "on
+* **`TraceDocument.error` widened with it** — §2's envelope row now reads "on
   `"failed"` and `"interrupted"`", which is a presence rule recorded in more
-  cases than version `1` promised;
+  cases than version `1` promised. `TraceEntry.error` is a different field and
+  version `2` did not touch it: §3's row still reads "on `"skipped"`,
+  `"failed"`";
 * **`TraceEntry.fallback` widened** — version `1` said the key appeared when
   `on_error: { fallback: … }` fired, and a wait that runs out its budget now
   writes it too, naming the `on_timeout:` route (§3, grammar §9.2). Its *meaning*

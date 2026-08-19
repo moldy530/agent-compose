@@ -4471,16 +4471,32 @@ export interface HumanPause {
  * `on_error:`.
  */
 export class HumanExpiry extends Error {
+  /**
+   * Which pause it was (grammar 9.4's instance path, flattened).
+   *
+   * Carried for the reason [`HumanInterrupt`] carries it: [`pauseOf`] reads it
+   * to decide whether the pause on this error belongs to the node execution
+   * asking, and an error travels further than the node that raised it.
+   */
+  readonly wait: string;
   /** The node id control transfers to, or `"__end__"` (grammar 8.7). */
   readonly route: string;
   /** What the trace records about the pause that expired. */
   readonly pause: HumanPause;
 
-  constructor(flow: string, node: string, budgetMs: number, route: string, pause: HumanPause) {
+  constructor(
+    flow: string,
+    node: string,
+    wait: string,
+    budgetMs: number,
+    route: string,
+    pause: HumanPause,
+  ) {
     super(
       `${flow} node \`${node}\`: nobody answered inside its ${budgetMs}ms wait, so \`on_timeout\` routes to \`${route}\` (grammar 8.7)`,
     );
     this.name = "HumanExpiry";
+    this.wait = wait;
     this.route = route;
     this.pause = pause;
   }
@@ -4968,6 +4984,7 @@ export async function runHuman(
           new HumanExpiry(
             descriptor.flow,
             descriptor.node,
+            id,
             descriptor.timeoutMs ?? 0,
             descriptor.onTimeout ?? END_NODE,
             { ...opened, ...stopped(outcome) },
@@ -5058,9 +5075,33 @@ export function interruptOf(error: unknown): HumanInterrupt | undefined {
   return undefined;
 }
 
-/** The [`HumanPause`] either of the two carried out of a pause that did not resume. */
-function pauseOf(error: unknown): HumanPause | undefined {
-  return expiryOf(error)?.pause ?? interruptOf(error)?.pause;
+/**
+ * The [`HumanPause`] either of the two carried, when the pause was **`site`'s
+ * own** — and `undefined` when it belonged to a node further down.
+ *
+ * The identity check is the whole of this function, and it is what keeps
+ * `TraceEntry.human` a `human` node's field: `docs/trace.md` §3 says a node that
+ * is not one never carries the key, and an error travels much further than the
+ * node that raised it. A [`HumanInterrupt`] raised inside a subflow or a
+ * dispatched instance is re-wrapped by [`SubflowFailure`] or [`ItemAttempts`]
+ * and arrives on the `cause` chain at the enclosing `flow:` or `map` node's
+ * [`runNode`] catch, which walks that chain for everything else it recovers
+ * ([`traceOf`], [`dispatchesOf`]). Recovering the pause there too would stamp
+ * one wait onto N+1 entries — and onto entries whose node holds no wait at all,
+ * each without a `settledAt`, so each reading as a pause the run ended holding.
+ *
+ * `site` is the caller's own instance path (grammar 9.4, flattened), which is
+ * exactly the id [`runHuman`] named the pause under, so equality decides it.
+ * Both carriers are read in the order they were: an expiry is the node's own
+ * outcome and an interrupt is the run's, and a chain holding both is answered by
+ * the nearer one.
+ */
+function pauseOf(error: unknown, site: string): HumanPause | undefined {
+  const expiry = expiryOf(error);
+  if (expiry !== undefined && expiry.wait === site) return expiry.pause;
+  const interrupt = interruptOf(error);
+  if (interrupt !== undefined && interrupt.wait === site) return interrupt.pause;
+  return undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -5358,8 +5399,10 @@ export async function runNode(
     const dispatched = dispatches ?? dispatchesOf(error) ?? plannedDispatches(input);
     // A pause that never settled is on the error that ended the run, and it is
     // the only account of the wait: the node's task never returned an answer to
-    // carry one (grammar 8.7).
-    const paused = pause ?? pauseOf(error);
+    // carry one (grammar 8.7). `site` is what keeps it *this* node's pause: the
+    // same error carries a pause raised below this node up past every enclosing
+    // `flow:` and `map` node, none of which held one (see [`pauseOf`]).
+    const paused = pause ?? pauseOf(error, site);
     return {
       step,
       flow: descriptor.flow,
@@ -5452,10 +5495,18 @@ export async function runNode(
     // entry would belong to a task nothing is left to read (see
     // [`abandonPausesUnder`], [`HumanAbandoned`]).
     if (abandonedOf(error) !== undefined) throw error;
+    // An expiry never travels, which is what makes `expiry.route` safe to route
+    // on here: this is where one is answered, by the very node that raised it,
+    // and the answer is a `Command` rather than a throw, so — unlike an
+    // interrupt, which the line above has already re-thrown past every enclosing
+    // node — it is never on another node's `cause` chain. The pause below goes
+    // through [`pauseOf`]'s identity check all the same: the two sites read one
+    // rule, and a reader should not have to prove this one unreachable to know
+    // whose wait the entry is about.
     const expiry = expiryOf(error);
     const strategy: ErrorStrategy =
       expiry === undefined ? policy.onError : { fallback: expiry.route };
-    pause = pauseOf(error);
+    pause = pauseOf(error, site);
     // The same join as the success path, with nothing to join to: every attempt
     // that failed inside the boundary put its instance's trace in `innerTraces`,
     // the one that ended the node included. A `SubflowFailure` reached only

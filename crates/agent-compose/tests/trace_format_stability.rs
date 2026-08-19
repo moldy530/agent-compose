@@ -71,7 +71,7 @@
 //!
 //! # …and the promises a snapshot cannot make
 //!
-//! Six claims of `docs/trace.md` are about a *rule* rather than about a shape,
+//! Seven claims of `docs/trace.md` are about a *rule* rather than about a shape,
 //! and each is asserted directly, because a snapshot of a document that happens
 //! to satisfy a rule would go on passing after the rule was dropped: that the
 //! third delivery surface carries the version beside its trace **and only
@@ -84,15 +84,19 @@
 //! carries it (§3) — which is three sites of the emitted runtime rather than
 //! one, so [`document`] holds every snapshot run to it and
 //! [`a_failure_a_run_survived_carries_its_class_like_one_that_ended_a_run`]
-//! reaches the two no snapshot here does — and that an edge decision carries a
+//! reaches the two no snapshot here does — that an edge decision carries a
 //! `reason` for the three decisions §4.1 tabulates and for no others, which
 //! [`document`] also holds every snapshot run to, because §10.1 makes a
 //! presence column a promise and a field appearing where the document says it
-//! does not is that promise broken.
+//! does not is that promise broken — and that a `human` record is on the node
+//! that held the wait and on no node above it (§3), which
+//! [`document`] holds every snapshot run to as well and
+//! [`a_pause_is_recorded_on_the_node_that_held_it_and_on_no_node_above_it`]
+//! reaches at the two constructs a pause can be nested under.
 //!
-//! Two of the six ride on a run this file already makes rather than on a run of
-//! their own: the §6 pair on the store run — a presence rule is a claim about a
-//! record the snapshot already holds, and the two are asserted before
+//! Two of the seven ride on a run this file already makes rather than on a run
+//! of their own: the §6 pair on the store run — a presence rule is a claim about
+//! a record the snapshot already holds, and the two are asserted before
 //! `assert_snapshot!` so a change to the rule fails as itself rather than as a
 //! diff in a document — and §4.1's presence rule on
 //! [`a_routing_records_edges_and_targets_are_both_in_declaration_order`]'s
@@ -139,6 +143,7 @@ fn document(run: &harness::Run) -> String {
     let held = run.trace_document();
     every_entrys_error_is_in_one_shape(&held);
     every_edge_decisions_reason_follows_its_rule(&held);
+    every_human_record_is_on_the_node_that_paused(&held);
     let execution = held["execution_id"]
         .as_str()
         .unwrap_or_else(|| panic!("the trace document names its execution: {held}"))
@@ -210,37 +215,101 @@ fn is_instant(text: &str) -> bool {
         && dashes.iter().all(|(at, held)| bytes[*at] == *held)
 }
 
-/// Every `TraceEntry.error` in `document`, node-qualified, nested entries
-/// included.
+/// Every `TraceEntry` in `document`, in document order — the entries a subflow
+/// nested under `inner` and a dispatched instance's under its record included.
 ///
 /// An entry is told from the other records by `traversal`, which only an entry
 /// carries: a dispatch record has an `outcome` and an `error` of its own, and it
 /// is not what §3 speaks about.
-fn entry_errors(document: &Value) -> Vec<(String, String)> {
-    let mut found: Vec<(String, String)> = Vec::new();
-    walk_entry_errors(document, &mut found);
+fn entries(document: &Value) -> Vec<&Value> {
+    let mut found: Vec<&Value> = Vec::new();
+    walk_entries(document, &mut found);
     found
 }
 
-fn walk_entry_errors(value: &Value, found: &mut Vec<(String, String)>) {
+fn walk_entries<'a>(value: &'a Value, found: &mut Vec<&'a Value>) {
     match value {
         Value::Array(items) => {
             for item in items {
-                walk_entry_errors(item, found);
+                walk_entries(item, found);
             }
         }
         Value::Object(fields) => {
-            let node = fields.get("node").and_then(Value::as_str);
-            let error = fields.get("error").and_then(Value::as_str);
-            if let (true, Some(node), Some(error)) = (fields.contains_key("traversal"), node, error)
-            {
-                found.push((node.to_string(), error.to_string()));
+            if fields.contains_key("traversal") {
+                found.push(value);
             }
             for held in fields.values() {
-                walk_entry_errors(held, found);
+                walk_entries(held, found);
             }
         }
         _ => {}
+    }
+}
+
+/// Every `TraceEntry.error` in `document`, node-qualified, nested entries
+/// included.
+fn entry_errors(document: &Value) -> Vec<(String, String)> {
+    entries(document)
+        .into_iter()
+        .filter_map(|entry| {
+            let node = entry["node"].as_str()?;
+            let error = entry["error"].as_str()?;
+            Some((node.to_string(), error.to_string()))
+        })
+        .collect()
+}
+
+/// Every entry of `document` that carries a `human` record, as `(flow, node)`.
+fn nodes_holding_a_pause(document: &Value) -> Vec<(String, String)> {
+    entries(document)
+        .into_iter()
+        .filter(|entry| entry.get("human").is_some())
+        .map(|entry| {
+            let flow = entry["flow"]
+                .as_str()
+                .unwrap_or_else(|| panic!("an entry names the flow its node belongs to: {entry}"));
+            let node = entry["node"]
+                .as_str()
+                .unwrap_or_else(|| panic!("an entry names its node: {entry}"));
+            (flow.to_string(), node.to_string())
+        })
+        .collect()
+}
+
+/// `docs/trace.md` §3: a node that is not a `human` node never carries `human`.
+///
+/// A rule rather than a shape, and one a snapshot is a poor keeper of, because
+/// the entries a `human` record can wrongly reach are the ones nested runs put
+/// *outside* the flow a snapshot was written for. It is checkable without
+/// knowing which nodes a composition declares as `human`, because §3 gives two
+/// other keys the same kind of presence rule over a **different** kind of node:
+/// `inner` is a `flow:` node's and `dispatches` is a `map` node's. A node is one
+/// kind, so an entry carrying `human` beside either is an entry claiming to be
+/// two — and that is exactly the shape the mistake takes, since a pause is
+/// reached below one of those two constructs or not nested at all.
+///
+/// The failure it guards is a real one and is invisible to every other check
+/// here: an error raised inside a subflow or a dispatched instance travels up
+/// the `cause` chain, so an enclosing node that recovers the pause from it
+/// reports N+1 waits for one — each of the extra ones with no settlement, and so
+/// each reading as a wait the run ended holding.
+fn every_human_record_is_on_the_node_that_paused(document: &Value) {
+    for entry in entries(document) {
+        if entry.get("human").is_none() {
+            continue;
+        }
+        assert!(
+            entry.get("inner").is_none(),
+            "a `flow:` node's entry carries a pause that belongs to a node inside \
+             the instance it ran, which `docs/trace.md` §3 says it never does: \
+             {entry}"
+        );
+        assert!(
+            entry.get("dispatches").is_none(),
+            "a `map` node's entry carries a pause that belongs to a node inside \
+             an instance it dispatched, which `docs/trace.md` §3 says it never \
+             does: {entry}"
+        );
     }
 }
 
@@ -609,6 +678,83 @@ fn an_interrupted_runs_trace_document_keeps_its_shape() {
     };
     run.failed();
     insta::assert_snapshot!(document(&run));
+}
+
+/// A pause is recorded on the node that held it and on no node above it
+/// (`docs/trace.md` §3).
+///
+/// The presence rule §3's `human` row ends on — "a node that is not a `human`
+/// node never carries it" — read at the two places a pause is reached from
+/// *under* another node, which is where it can be broken without any snapshot
+/// here changing. `flow.assisted`, which
+/// [`an_interrupted_runs_trace_document_keeps_its_shape`] pins, pauses at the
+/// top level of the flow it triggered, so its document has no enclosing entry
+/// for a wait to leak onto; these two have one each. `flow.patient` wraps the
+/// pause in a `flow:` node and `flow.batch` dispatches it from a `map`, and the
+/// error that carries the interrupt out of the run passes through both on its
+/// way — which is the reason a node that held no wait can end up reporting one.
+///
+/// What a leak would look like to a reader is why this is a `must` rather than
+/// tidiness: one wait would be reported by N+1 entries, and the extra copies
+/// carry no `settledAt`, so each reads as §3.4's one settlement-free case — a
+/// wait the run ended holding — on a node that never waited for anything.
+#[test]
+fn a_pause_is_recorded_on_the_node_that_held_it_and_on_no_node_above_it() {
+    let provider = MockProvider::start().expect("a loopback port");
+
+    // One construct out: a `flow:` node whose subflow pauses.
+    let Some(wrapped) = harness::run(
+        "http-trigger",
+        "flow.patient",
+        &[("question", "what is it?")],
+        &provider,
+    ) else {
+        return;
+    };
+    wrapped.failed();
+    let held = wrapped.trace_document();
+    every_human_record_is_on_the_node_that_paused(&held);
+    assert_eq!(
+        nodes_holding_a_pause(&held),
+        [("flow.sign_off".to_string(), "sign".to_string())],
+        "`wrap` ran the instance that paused and held no wait of its own: {held}"
+    );
+
+    // …and the other: a `map` dispatching a flow that pauses. One item, because
+    // what is asserted is which entries carry the record rather than how many
+    // instances a fan-out gets as far as parking before the first interrupt ends
+    // the node.
+    let Some(dispatched) = harness::run(
+        "http-trigger",
+        "flow.batch",
+        &[("questions", r#"["what is it?"]"#)],
+        &provider,
+    ) else {
+        return;
+    };
+    dispatched.failed();
+    let held = dispatched.trace_document();
+    every_human_record_is_on_the_node_that_paused(&held);
+    assert_eq!(
+        nodes_holding_a_pause(&held),
+        [("flow.sign_off".to_string(), "sign".to_string())],
+        "`fan` dispatched the instance that paused and held no wait of its own: \
+         {held}"
+    );
+
+    // The rule is an absence, so it is worth one positive beside it: the entry
+    // that *does* carry the record is the one the run stopped at, and it carries
+    // the settlement-free shape §3.4 describes.
+    let paused = entries(&held)
+        .into_iter()
+        .find(|entry| entry.get("human").is_some())
+        .unwrap_or_else(|| panic!("the run ended holding a pause: {held}"));
+    assert!(
+        paused["human"]["pausedAt"].is_string()
+            && paused["human"]["settled"].is_null()
+            && paused["human"]["settledAt"].is_null(),
+        "{paused}"
+    );
 }
 
 /// Both halves of a routing record are in **declaration** order, including the
