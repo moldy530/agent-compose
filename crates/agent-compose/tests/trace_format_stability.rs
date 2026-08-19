@@ -59,8 +59,11 @@
 //! `tests/compiled_graph_acceptance.rs`, which asserts about them by name rather
 //! than by shape — the expiry form by
 //! [`an_expired_wait_takes_its_route_and_refuses_the_answer_that_arrives_after_it`]
-//! — the two files divide the surface, and a run added here is
-//! worth adding when a shape has no home in either. The first two are reached
+//! for a route naming a node and by
+//! [`a_wait_that_expires_into_end_retires_its_branch_and_completes_the_execution`]
+//! for the `"__end__"` spelling — the two files divide the surface, and a run
+//! added here is worth adding when a shape has no home in either. The first two
+//! are reached
 //! here all the same, by the §3 rule below rather than by a snapshot: a rule
 //! about a field on every entry is not kept by pinning the entries that happen
 //! to be in a golden.
@@ -131,14 +134,19 @@ const HAIKU: &str = "claude-haiku-4-5";
 ///    path. Nothing in the document holds one today; it is redacted anyway, so a
 ///    field that starts carrying a path lands in the snapshot as `<project>`
 ///    instead of as a value that changes every run;
-///  * an **instant**, which is a wall clock reading. §3.4's `pausedAt` and
-///    `settledAt` are the only two fields of the format that carry one, and a
-///    snapshot holding either would fail on the second run — so the *shape* is
-///    what is pinned: the key is there, with a value that was an RFC 3339
-///    instant, which is exactly the promise §3.4's table makes about it.
-///    Recognized by shape rather than by key name, so a field that starts
-///    carrying a clock reading is redacted the day it appears instead of the day
-///    somebody notices.
+///  * an **instant**, which is a wall clock reading. §3.4's `pausedAt`,
+///    `expiresAt` and `settledAt` are the fields of the format that carry one,
+///    and a snapshot holding any of them would fail on the second run — so the
+///    *shape* is what is pinned: the key is there, with a value that was an
+///    RFC 3339 instant, which is exactly the promise §3.4's table makes about
+///    it. Recognized **by key** ([`INSTANTS`]) rather than by what a value looks
+///    like: a redaction that fired on any 24-character date-shaped string would
+///    hide a *datum* that happens to be spelled like a timestamp — a store's
+///    answer, a model's completion, an error's text — and hiding data is the one
+///    thing a golden must not do. What a key-based rule costs is that a field
+///    which starts carrying a clock reading has to be added here; what it buys
+///    is that the redaction never reaches beyond the fields the document says
+///    hold one.
 fn document(run: &harness::Run) -> String {
     let held = run.trace_document();
     every_entrys_error_is_in_one_shape(&held);
@@ -162,14 +170,41 @@ fn document(run: &harness::Run) -> String {
     serde_json::to_string_pretty(&redacted).expect("the trace document serializes")
 }
 
+/// Every key of the format that carries a wall clock reading, enumerated from
+/// `docs/trace.md`.
+///
+/// §3.4's pause record is the whole list, and it is the only record in the
+/// document with a clock in it: `pausedAt`, `expiresAt` and `settledAt`.
+///
+/// Both spellings are here because §2's key seam runs through this list. An
+/// entry is a runtime record and spells its keys `camelCase`; a *document*
+/// spells its own `snake_case`, and the status route a `serve` report comes off
+/// publishes a pending pause as `paused_at`/`expires_at` (PRD 5.11). Only the
+/// `camelCase` three reach a snapshot here today — every run in this file goes
+/// through `agent-compose run`, which writes the trace document — so the other
+/// two are stated against the format rather than against the surface, and cost
+/// nothing while no key of that spelling appears. `settled_at` is deliberately
+/// absent: a settled wait is not a pending one, so no published pause has ever
+/// carried it.
+const INSTANTS: &[&str] = &[
+    "pausedAt",
+    "paused_at",
+    "expiresAt",
+    "expires_at",
+    "settledAt",
+];
+
 /// Replace the three volatile values everywhere in `value`.
+///
+/// An instant is replaced **by its key** rather than by what the value looks
+/// like, and the shape is asserted instead of being the trigger: a value under
+/// one of [`INSTANTS`] that is not an RFC 3339 instant is a broken promise of
+/// §3.4's table, and failing on it is the point. Everything else — including a
+/// datum that happens to be spelled like a timestamp, which a store's `answer`
+/// or a model's completion can hold — keeps its value and reaches the snapshot.
 fn redact(value: &mut Value, execution: &str, project: &str) {
     match value {
         Value::String(text) => {
-            if is_instant(text) {
-                *text = "<instant>".to_string();
-                return;
-            }
             let mut held = text.replace(execution, "<execution-id>");
             if !project.is_empty() {
                 held = held.replace(project, "<project>");
@@ -182,7 +217,15 @@ fn redact(value: &mut Value, execution: &str, project: &str) {
             }
         }
         Value::Object(fields) => {
-            for (_, held) in fields.iter_mut() {
+            for (key, held) in fields.iter_mut() {
+                if INSTANTS.contains(&key.as_str()) {
+                    assert!(
+                        held.as_str().is_some_and(is_instant),
+                        "`{key}` carries an RFC 3339 instant (`docs/trace.md` §3.4): {held}"
+                    );
+                    *held = Value::String("<instant>".to_string());
+                    continue;
+                }
                 redact(held, execution, project);
             }
         }
@@ -194,8 +237,10 @@ fn redact(value: &mut Value, execution: &str, project: &str) {
 ///
 /// `YYYY-MM-DDTHH:MM:SS.sssZ`, which is the one spelling the emitted runtime
 /// produces (`toISOString`) and the one `docs/trace.md` §3.4 names. Matched
-/// tightly rather than by "looks date-ish", so a string field whose *content*
-/// happens to start with digits is left alone.
+/// tightly, because it is what an [`INSTANTS`] key is *held to* rather than what
+/// selects a value for redaction: a field of that table that started answering
+/// with a second-resolution stamp, or with a local-time one, would be a change
+/// to a published surface.
 fn is_instant(text: &str) -> bool {
     let bytes = text.as_bytes();
     if bytes.len() != 24 {
