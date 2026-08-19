@@ -1101,17 +1101,18 @@ export interface ToolCallRecord {
    * **The result the model saw** — PRD §9.20's third clause, and the one field
    * of this record whose value came from outside the loop.
    *
-   * On the calls [`instance`] is on and no others: a flow-as-tool call that
-   * ran an instance and completed, whose result is that instance's declared
+   * On a **subset** of the calls [`instance`] is on: a flow-as-tool call that
+   * ran an instance *and completed*, whose result is that instance's declared
    * `outputs:` — the composition's own data, under a schema the composition
-   * wrote (grammar 5.4). The two keys are decided by the same test, because
-   * they are two halves of one account: `docs/trace.md` §11 keeps a tool's
-   * *answer* out of this format at every other surface, and PRD §9.20 is what
-   * carves this one out — "a bare dispatch record alone would leave a tool call
-   * whose result came from nowhere".
+   * wrote (grammar 5.4). A call carrying this carries [`instance`]; the reverse
+   * does not hold. What the two share is one account: `docs/trace.md` §11 keeps
+   * a tool's *answer* out of this format at every other surface, and PRD §9.20
+   * is what carves this one out — "a bare dispatch record alone would leave a
+   * tool call whose result came from nowhere".
    *
    * Absent on a call that **failed**, and that absence is the record: the
-   * failure left the tool, so the model saw nothing to record.
+   * failure left the tool, so the model saw nothing to record. A call whose
+   * instance failed is exactly that — an [`instance`] with no result beside it.
    */
   readonly result?: unknown;
   /** What went wrong, in `docs/trace.md` §3's `<error name>: <message>` shape. */

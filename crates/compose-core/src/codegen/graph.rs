@@ -99,7 +99,7 @@
 //!
 //! # What is emitted for a construct this release does not execute
 //!
-//! A store bound to a **production** backend is the remaining one. Grammar
+//! A store bound to a **production** backend is the only one. Grammar
 //! 14.2's vocabulary reaches past this release — `redis`, `pgvector`, `s3` and
 //! the rest land in M3 — so [`backend_of`] resolves the alias at compile time
 //! and the emitted binding carries the provider it resolved to; `src/stores.ts`
@@ -109,14 +109,11 @@
 //! what makes a project with production infrastructure in `deploy/staging.yml`
 //! still runnable with none.
 //!
-//! And it covers a `flow.*` in an agent's `tools:` — flow-as-tool, grammar 5.4.
-//! The tool is on the wire with the whole contract that section gives it, and
-//! its `invoke` is what refuses (see [`flow_tool`]). This one is worth naming
-//! because it is where the posture was once broken the other way: the entry was
-//! emitted as a source *comment* and no tool, so a composition the validator had
-//! analysed the attachment of — grammar 7.7 clause 4 carries session coherence,
-//! sync interrupt-freedom and recursion through it — reached the provider with
-//! the tool missing and nothing anywhere saying so.
+//! A `flow.*` in an agent's `tools:` was the other entry under this heading and
+//! is not one any more. Flow-as-tool **runs**: the emitted `invoke` calls
+//! `runtime.callSubflowTool`, which instantiates the module the model named and
+//! joins its trace to the caller's (grammar 5.4, PRD resolved q19 and q20) — see
+//! [`flow_tool`]. Nothing here refuses it.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
@@ -948,6 +945,17 @@ const DEFAULT_TOOL_ITERATIONS: i64 = 8;
 /// parse equality PRD §9.16 makes structured output load-bearing for. A flow
 /// with no `inputs:` is a no-argument tool: no field map is written anywhere, so
 /// there is no schema to name and the instance starts on an empty object.
+///
+/// What an attachment becomes is a **tool**, unconditionally — never a source
+/// comment, and never an entry the emitter skips. This is the attachment where
+/// that posture was once broken: the entry was emitted as a comment and no tool,
+/// so a composition the validator had analysed the attachment of — grammar 7.7
+/// clause 4 carries session coherence, sync interrupt-freedom and recursion
+/// through it — reached the provider with the tool missing and nothing anywhere
+/// saying so. The tool-name-collision rule in [`crate::check::bindings`] leans
+/// on the same posture from the other side: two attachments of one local name
+/// are both emitted and the provider refuses the request, because dropping
+/// either would be that bug again.
 fn flow_tool(
     ir: &Ir,
     names: &Names,
