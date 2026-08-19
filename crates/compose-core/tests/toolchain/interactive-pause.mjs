@@ -10,7 +10,7 @@
 // reader over exactly those. So the same runner answers under both, and gate 13
 // asserts the same observations with the same function this gate does.
 //
-// Six sections, and each is a claim a served app cannot make:
+// Eight sections, and each is a claim a served app cannot make:
 //
 //   * a pause is **rendered** — the wait id, the flow and node, what the human is
 //     shown, the shape their answer has to fit, and the deadline where the node
@@ -19,15 +19,23 @@
 //     that **re-prompt**: the wait is not consumed, which is the resume route's
 //     `400` rule at the other surface;
 //   * a blank line is not an answer and re-prompts with no refusal at all;
-//   * two pauses are asked **one at a time, in wait-id order** — the order the
-//     status route publishes them in, and the one that does not depend on how the
-//     scheduler interleaved the instances;
+//   * two pauses that are waiting **together** are asked one at a time and in
+//     wait-id order — the order the status route publishes them in, and the one
+//     that does not depend on how the scheduler interleaved the instances;
+//   * a pause that opens **while a question is on the screen** is asked after it,
+//     whatever its id sorts as: the guarantee is over the pauses open when a
+//     question is asked, not over every pause a run makes, because the only way
+//     to put a latecomer first would be to take back a question somebody is
+//     already answering;
 //   * an **expiry** takes the question away while it is on the screen: the prompt
 //     is withdrawn saying so, and the loop moves on rather than reading an answer
 //     into a wait nothing is holding;
 //   * standard input **ending** withdraws the whole surface: every pause still
 //     waiting becomes the interrupt a run with no surface raises, and so does the
-//     next one the run opens.
+//     next one the run opens;
+//   * …and an end that arrives while **no** question is outstanding is noticed
+//     before the next one is rendered, rather than after a whole prompt block has
+//     been printed under a surface that is already gone.
 //
 // `src/cli.ts` and `src/runtime.ts` are compiler constants, byte-identical in
 // every project this release builds, so driving them directly is driving what
@@ -210,8 +218,9 @@ const observed = {};
   runtime.releaseHumanWaits(execution);
 }
 
-// Two pauses at once, asked one at a time and in wait-id order — which is the
-// order the status route publishes them in, and not the order they opened.
+// Two pauses waiting at once, asked one at a time and in wait-id order — which
+// is the order the status route publishes them in, and not the order they
+// opened.
 {
   const execution = "exec_two";
   runtime.openHumanWaits(execution, true);
@@ -238,6 +247,45 @@ const observed = {};
     asked: [...said.matchAll(/pause `([^`]+)`/g)].map((match) => match[1]),
     after_the_first: afterTheFirst,
     outputs: [first.value?.output, second.value?.output],
+  };
+  runtime.releaseHumanWaits(execution);
+}
+
+// …and the other half of that guarantee, which is the half it does *not* make: a
+// pause that opens while a question is on the screen is asked after it, even
+// where its id sorts first. What is ordered is the set of pauses open when a
+// question is asked; putting a latecomer first would mean withdrawing a question
+// somebody may already be typing an answer to. The section above cannot see this
+// — its two pauses park together — and no composition can ask for the timing, so
+// it is staged: the second id is parked, waited for on the screen, and only then
+// is the first id's pause opened under it.
+{
+  const execution = "exec_later";
+  runtime.openHumanWaits(execution, true);
+  const asked_first = park(execution, ["fan", "0", "1"], { question: "b" });
+  await settle();
+  const driver = driving(execution);
+  await until(() => driver.output.text().includes("pause `fan/0/1/sign/0`"));
+
+  // Open while that question is on the screen, and with the id that sorts
+  // before it.
+  const opened_later = park(execution, ["fan", "0", "0"], { question: "a" });
+  await settle();
+  driver.input.write('{"decision":"approve"}\n');
+  await until(() => asked_first.state !== "pending");
+  await until(() => driver.output.text().includes("pause `fan/0/0/sign/0`"));
+  driver.input.write('{"decision":"reject"}\n');
+  await until(() => opened_later.state !== "pending");
+  driver.stop();
+  await driver.prompting;
+
+  const said = driver.output.text();
+  observed.later = {
+    asked: [...said.matchAll(/pause `([^`]+)`/g)].map((match) => match[1]),
+    // The first line answered the question that was on the screen, which is the
+    // same claim from the answers' side: a loop that had re-ordered on the
+    // latecomer would have given `approve` to `fan/0/0/sign/0`.
+    outputs: [asked_first.value?.output, opened_later.value?.output],
   };
   runtime.releaseHumanWaits(execution);
 }
@@ -301,6 +349,42 @@ const observed = {};
     message: held.value,
     later: later.state,
     published: runtime.humanWaits(execution).map((wait) => wait.id),
+  };
+  driver.stop();
+  runtime.releaseHumanWaits(execution);
+}
+
+// An end that arrives **between** questions is noticed before the next one is
+// rendered. The loop learns about the end from the stream's own event, and
+// parked with no pause open it has no read outstanding for that event to answer
+// — so without a check before the block is written, the next pause to open would
+// be printed in full (the id, what the human is shown, the schema, the deadline)
+// and withdrawn on the line under it: a question that was never askable.
+//
+// Staged rather than raced: the `end` listener the loop installed runs before
+// this one, because it was added first, so awaiting this one is awaiting the
+// loop having seen the end.
+{
+  const execution = "exec_ended_between";
+  runtime.openHumanWaits(execution, true);
+  const answered = park(execution, ["review", "0"]);
+  await settle();
+  const driver = driving(execution);
+  driver.input.write('{"decision":"approve"}\n');
+  await until(() => answered.state !== "pending");
+
+  const closed = new Promise((resolve) => driver.input.once("end", resolve));
+  driver.input.end();
+  await closed;
+
+  const later = park(execution, ["review", "1"]);
+  await until(() => later.state !== "pending");
+  await driver.prompting;
+
+  observed.ended_between = {
+    said: driver.output.text(),
+    answered: answered.state,
+    later: later.state,
   };
   driver.stop();
   runtime.releaseHumanWaits(execution);

@@ -2466,12 +2466,17 @@ lines is not a request. The framing is **one JSON value per line** — a value
 spanning lines has no terminator a prompt could recognize without either guessing
 or hanging on a malformed one — and a line that is not JSON, or that the
 `output:` refuses, re-prompts. An execution holding more than one pause is asked
-**one at a time, in wait-id order**, which is the order §13.3's status route
-publishes them in and the only one two runs of a composition agree on. And a
-`timeout:` keeps running while the prompt is on the screen: an expiry routes
-through `on_timeout:` exactly as it would under `serve`, taking the question with
-it. `AGENT_COMPOSE_INTERACTIVE` is what a *script* answers a pause with, and its
-only values are `1` and `0`; anything else fails the run naming the variable
+**one at a time**, and each question is the **lowest-id pause open when it is
+asked** — §13.3's status-route order, so pauses waiting together are asked in the
+order the composition fixes rather than the one the scheduler happened to park
+them in. It is that rather than a total order over the run's pauses because a
+question already on the screen is not taken back: a pause that opens while one is
+being asked is asked after it, whatever its id sorts as. And a `timeout:` keeps
+running while the prompt is on the screen: an expiry routes through `on_timeout:`
+exactly as it would under `serve`, taking the question with it.
+`AGENT_COMPOSE_INTERACTIVE` is what a *script* answers a pause with, and its only
+values are `1` and `0`; anything else is refused before the run starts, as a
+command that could not be run rather than a setting nobody read
 ([D50](#d50-unknown-keys-are-errors-everywhere-except-plugin-config-objects)).
 The emitted `README.md` documents the whole loop.
 

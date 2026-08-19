@@ -8612,10 +8612,16 @@ fn a_run_at_a_terminal_asks_the_pause_it_reaches_and_finishes_the_flow() {
 ///
 /// A `map` over a flow that pauses is the reachable way one execution holds more
 /// than one question at once (grammar 9.4), and it is where a terminal has to
-/// decide something a resume route does not: what order to ask in. It asks in
-/// **wait-id** order, which is what the status route publishes in and what two
-/// runs of one composition agree on, rather than the order the scheduler
-/// happened to park the instances in.
+/// decide something a resume route does not: what order to ask in. Each question
+/// is the **lowest wait id open when it is asked**, which is what the status
+/// route publishes in — so the two instances here, which park together and are
+/// both waiting when the first question goes out, are asked in the
+/// composition's order rather than the one the scheduler parked them in.
+///
+/// The guarantee is that and not a total order over the run's pauses; a pause
+/// that opens while a question is on the screen is asked after it, which gate 20
+/// pins directly (`interactive-pause.mjs`, the `later` section) because it needs
+/// a pause opened at an instant a composition cannot ask for.
 ///
 /// The refusals are here rather than in a test of their own because they are the
 /// same claim from the other side: two lines that do not answer the first

@@ -508,11 +508,13 @@ export function sessionRefusal(address: string, stores: readonly string[]): stri
  * of a run that made one.
  *
  * A third way is a `human` node (grammar 8.7): a run that reaches one and was
- * started with **no resume surface** stops there, and the `FlowFailure` carries
+ * started with **no answer surface** stops there, and the `FlowFailure` carries
  * a `runtime.HumanInterrupt` on its `cause` chain — `runtime.interruptOf` is how
- * a caller tells that outcome from a failure. `resumable: true` is what says a
- * resume surface is attached, and `src/serve.ts` is the caller that passes it:
- * its `POST /executions/:id/resume` is what delivers the answer (PRD 5.11).
+ * a caller tells that outcome from a failure. `resumable: true` is what says an
+ * answer surface is attached, and there are two callers that pass it, one per
+ * surface (PRD §9.21): `src/serve.ts`, whose `POST /executions/:id/resume`
+ * delivers the answer, and `src/cli.ts`, when the `run` it is serving may ask
+ * at the terminal it was launched from.
  */
 export async function runFlow(
   address: string,
@@ -525,8 +527,11 @@ export async function runFlow(
      * Whether something is standing by to answer a `human` pause this run
      * reaches (grammar 8.7, PRD 5.11).
      *
-     * `false` — the default, and what `agent-compose run` leaves it at — makes
-     * a pause the end of the run rather than a wait nothing can settle.
+     * `false` — the default, and what an `agent-compose run` with nobody to ask
+     * leaves it at — makes a pause the end of the run rather than a wait
+     * nothing can settle. `src/cli.ts` passes `true` where the run may ask at
+     * its own standard input, and `src/serve.ts` passes it for the resume
+     * route.
      */
     readonly resumable?: boolean;
   } = {},

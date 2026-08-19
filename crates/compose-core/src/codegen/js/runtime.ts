@@ -4818,12 +4818,13 @@ function orderedChannels(
  *
  * The two schemas are both here because a pause has two audiences. `shown` — the
  * node's `input:`, built by the node's input phase like any other — is what the
- * *human* is handed, and [`schema`] is what a **resume payload** is held to
- * (PRD 5.11): the published JSON Schema of the node's `output:`, carried so the
- * status route can hand a UI the contract its answer has to fit without the UI
- * reading the composition. [`parse`] is the emitted Zod for the same surface,
- * which is what actually decides an answer — the pair the schema conformance
- * corpus proves equal, asked at the two ends it is needed at.
+ * *human* is handed, and [`schema`] is what an **answer** is held to, whichever
+ * surface it arrived on (PRD 5.11, §9.21): the published JSON Schema of the
+ * node's `output:`, carried so the status route can hand a UI the contract its
+ * answer has to fit without the UI reading the composition. [`parse`] is the
+ * emitted Zod for the same surface, which is what actually decides an answer —
+ * the pair the schema conformance corpus proves equal, asked at the two ends it
+ * is needed at.
  */
 export interface HumanDescriptor {
   readonly flow: string;
@@ -4848,12 +4849,18 @@ export interface HumanDescriptor {
   readonly onTimeout?: string;
   /** The published JSON Schema of the node's `output:` (grammar 3.8). */
   readonly schema: JsonSchema;
-  /** Hold a resume payload to that surface, answering the parsed result. */
+  /**
+   * Hold an answer to that surface, answering the parsed result.
+   *
+   * Both delivery surfaces call it and both end their refusal in its message,
+   * so what it names is the *node* rather than the route or the terminal the
+   * answer came from (grammar 8.7, PRD §9.21).
+   */
   parse(payload: unknown): unknown;
 }
 
 /**
- * One pause this process is holding, as a resume surface sees it.
+ * One pause this process is holding, as a surface that can answer it sees it.
  *
  * Everything here is what a caller needs to *ask the question and take the
  * answer*: which pause this is, what the human is shown, what their answer has
@@ -4878,7 +4885,7 @@ export interface HumanWait {
   readonly node: string;
   /** The node's `input:`, evaluated — what the human is shown (grammar 8.7). */
   readonly shown: Readonly<Record<string, unknown>>;
-  /** What a resume payload is validated against (PRD 5.11). */
+  /** What an answer is validated against (PRD 5.11). */
   readonly schema: JsonSchema;
   /** When the pause began, as an ISO 8601 instant. */
   readonly pausedAt: string;

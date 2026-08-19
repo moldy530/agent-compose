@@ -57,7 +57,7 @@
 //! |---|---|
 //! | `0` | clean: nothing was reported |
 //! | `1` | diagnostics were reported, `build --check` found drift, or a `run` produced no answer |
-//! | `2` | the command could not run: bad usage, an unreadable entrypoint, an output directory that could not be written, a missing environment variable, an uninstalled dependency set, or no JavaScript runtime to launch |
+//! | `2` | the command could not run: bad usage, an unreadable entrypoint, an output directory that could not be written, a missing environment variable or one carrying a value the command does not take (`AGENT_COMPOSE_INTERACTIVE`, grammar 8.7), an uninstalled dependency set, or no JavaScript runtime to launch |
 //! | `3` | a `run` with nobody to ask stopped at a `human` pause (grammar 8.7, PRD 5.11) |
 //!
 //! `3` is the emitted project's own — [`launch`] passes a child's exit code

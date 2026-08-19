@@ -185,8 +185,8 @@ take their answer.
 
 `input` is the node's own `input:`, evaluated — what the human is shown.
 `output_schema` is the published JSON Schema of its `output:`, which is exactly
-what a resume payload is validated against, so a form can be built from the
-report rather than from the composition. `expires_at` is present only where the
+what an answer is validated against — at this route and at the terminal below —
+so a form can be built from the report rather than from the composition. `expires_at` is present only where the
 node declares a `timeout:`.
 
 POST the answer to `resume_url` as the JSON body:
@@ -274,8 +274,13 @@ same rule the resume route's `400` follows. A blank line is not an answer at all
 and just re-prompts.
 
 **One question at a time.** An execution holding several pauses — a `map` over a
-flow that pauses — is asked them one after another, in `wait_id` order, which is
-the order the status route publishes them in. Each prompt names its own wait id.
+flow that pauses — is asked them one after another, and each question is the
+lowest `wait_id` **open when it is asked**: the order the status route publishes
+them in, so pauses waiting together are asked in the composition's order rather
+than the one the scheduler parked them in. A pause that opens while a question
+is on the screen is asked after it, whatever its id sorts as — the question in
+front of you is never taken back to make room for it. Each prompt names its own
+wait id.
 
 **A budget keeps running while you think.** Nothing about being asked at a
 terminal holds a `timeout:` still: a wait that runs out while its question is on
@@ -300,8 +305,8 @@ no terminal does.
 | `0` | never asks, even at a terminal — which is how a supervisor keeps a run on the exit-`3` path below |
 | unset | asks when standard input is a terminal |
 
-Any other value fails the run naming the variable, rather than being a setting
-nothing read.
+Any other value is refused before the run starts, naming the variable: a command
+that could not be run (exit `2`), rather than a setting nothing read.
 
 A run that is not asking reports the pause and exits **`3`**, its own code beside
 `1` for a run that produced no answer and `2` for a command that could not be

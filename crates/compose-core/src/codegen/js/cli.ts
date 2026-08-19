@@ -70,9 +70,11 @@
 //
 // `AGENT_COMPOSE_INTERACTIVE` decides it where a terminal cannot. `1` prompts
 // whatever stdin is, which is how a pause is answered from a script or a test
-// harness — one line of JSON per prompt, in the order the ids sort; `0` never
-// prompts, which is how a run under a terminal is kept to the exit-`3` behaviour
-// a supervisor may be reading. Unset, stdin's own `isTTY` decides.
+// harness — one line of JSON per prompt, and each prompt names the pause it
+// belongs to; `0` never prompts, which is how a run under a terminal is kept to
+// the exit-`3` behaviour a supervisor may be reading. Unset, stdin's own `isTTY`
+// decides. A value that is neither is a command that could not be run (exit
+// `2`), rather than a setting nobody read.
 //
 // **Standard input ending withdraws the surface.** A script that answered fewer
 // pauses than the run reached leaves the run with nothing that can answer the
@@ -162,17 +164,23 @@ async function flush(): Promise<void> {
  * Run the project's own command line, and answer with the exit code.
  *
  * `0` is a clean run, `1` is a run that produced no answer, `2` is a command
- * that could not run at all, and `3` is a run that stopped at a `human` pause —
- * the same four meanings `agent-compose` itself gives them, so a caller reads
- * one table rather than two.
+ * that could not run at all, and `3` is a run that stopped at a `human` pause
+ * with **nobody to ask** — the same four meanings `agent-compose` itself gives
+ * them, so a caller reads one table rather than two.
  *
  * `3` is a code of its own rather than a shade of `1` because the three ask for
  * different things. `2` is an invocation to fix and `1` is a run to look into;
  * this is neither — the run did everything it was asked to and is holding a
- * question, and what closes it is a person answering through `serve`'s resume
- * route (grammar 8.7, PRD 5.11). A supervisor that retried `1` would re-run a
- * graph whose effects have already happened, and one that reported `2` would
- * send someone to look at the command line.
+ * question. What closes a pause is a person answering it, and there are two
+ * surfaces they can (grammar 8.7, PRD §9.21): the terminal this command prompts
+ * at when standard input is one, where the run carries on and ends `0` like any
+ * other, and the app's `POST /executions/:id/resume`. `3` is what is left when
+ * neither was available — standard input was not a terminal,
+ * `AGENT_COMPOSE_INTERACTIVE=0` said not to ask, or the terminal went away
+ * mid-run — and it points at `serve`, which is where the same question can be
+ * asked of a process that has a surface for the answer. A supervisor that
+ * retried `1` would re-run a graph whose effects have already happened, and one
+ * that reported `2` would send someone to look at the command line.
  */
 export async function main(argv: readonly string[]): Promise<number> {
   const [verb, ...rest] = argv;
@@ -391,11 +399,22 @@ function settling(running: Promise<unknown>): Promise<void> {
  *
  * # What it does, in order
  *
- * The pauses are asked in **wait-id order**, which is the order the status route
- * publishes them in and for that function's reason (`runtime.humanWaits`): the
- * order pauses *open* is the scheduler's, so a `map` over two items would ask its
- * two questions in a different order on a different machine. Ids are instance
- * paths, derived from the composition, so this order is the same every run.
+ * Each question is the **lowest-id pause open when it is asked**, which is the
+ * order the status route publishes them in and for that function's reason
+ * (`runtime.humanWaits`): the order pauses *open* is the scheduler's, so a `map`
+ * over two items that parked in one instant would otherwise ask its two
+ * questions in a different order on a different machine. Ids are instance paths,
+ * derived from the composition, so pauses that are open together are asked in an
+ * order the composition fixes rather than the scheduler.
+ *
+ * It is "when it is asked" rather than a total order over the run's pauses, and
+ * the difference is a question already on the screen: a pause that opens while
+ * one is being asked is asked **after** it, even where its id sorts first,
+ * because the only way to put it first would be to take back a question a person
+ * is already answering. So a run whose pauses open at moments its own `agent:`
+ * and `http:` latencies decide can ask them in an order that latency decided;
+ * what is fixed is that no *set* of pauses waiting together is asked in the
+ * scheduler's order, and that every prompt names the id it belongs to.
  *
  * One line of JSON per answer, and that is the framing: a value spanning lines
  * has no terminator a prompt could recognize without either guessing or hanging
@@ -462,6 +481,10 @@ export async function answerPauses(
 
   try {
     for (;;) {
+      // The lowest id **open at this moment**: `runtime.humanWaits` orders the
+      // board, so a set of pauses waiting together is asked in the
+      // composition's order rather than the scheduler's. A pause that opens
+      // later is asked later, whatever its id sorts as — see the note above.
       const wait = await upon((): runtime.HumanWait | undefined => {
         const open = humanWaits(execution);
         return open.length === 0 ? undefined : open[0];
@@ -500,6 +523,12 @@ async function ask(
   output: Terminal["output"],
   upon: <T>(ready: () => T | undefined) => Promise<T | undefined>,
 ): Promise<Asked> {
+  // Asked before the block is rendered, because standard input can end while
+  // the loop is parked with no pause open — there is no read outstanding then,
+  // so nothing notices until the next question goes looking for an answer. A
+  // question printed in full and withdrawn on the line under it is a prompt
+  // that never existed; the surface was already gone.
+  if (reading.spent()) return "input-ended";
   output.write(question(wait));
   // One withdrawal watch for the whole prompt, resolving with the sentence the
   // resume route refuses a late answer with. The `??` branch is the run ending:
@@ -648,6 +677,17 @@ interface Lines {
    * it. Each prompt names its own wait id for exactly that reason.
    */
   abandon(): void;
+  /**
+   * Whether the stream has ended and holds nothing a read could still answer.
+   *
+   * What [`ask`] consults before it renders a question: the end arrives on the
+   * stream's own event, so a loop parked with no pause open learns about it
+   * with no read outstanding to be answered `end`. Without this a run whose
+   * standard input closed while it was busy would print a whole prompt — the
+   * wait id, the `shown:` block, the schema, the deadline — and withdraw the
+   * surface on the line under it.
+   */
+  spent(): boolean;
   /** Stop reading the stream, and stop holding it open. */
   stop(): void;
 }
@@ -715,6 +755,12 @@ function lines(input: Terminal["input"]): Lines {
       // Only ever the read at the head, and only ever one still waiting: a read
       // that had a line was resolved and shifted off inside `serve`.
       waiting.shift();
+    },
+    spent(): boolean {
+      // What is held matters as much as the end: a stream that ended on
+      // `printf '{"decision":"approve"}'` has no newline on it and still has an
+      // answer in hand, which is the line `serve` gives the next read.
+      return ended && held.trim() === "";
     },
     stop(): void {
       input.removeListener("data", onData);
