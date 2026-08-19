@@ -150,8 +150,9 @@ is `serve`'s own vocabulary rather than one of §10.1's closed enumerations: thi
 format's `status` is the envelope's three, and the word `interrupted` names a
 different thing in each. Here it is a run that is **still going** and is holding
 a `human` pause somebody can still answer (grammar §8.7); in the envelope it is a
-run that **ended** holding one, which is what `agent-compose run` does with every
-pause it reaches.
+run that **ended** holding one, which is what an `agent-compose run` with nobody
+to ask does with every pause it reaches — a run *at a terminal* answers its
+pauses and ends `completed` like any other (PRD §9.21).
 
 `trace` and `trace_version` appear together, on a run that has **stopped**
 carrying a trace — an empty one included. The gate is whether the run has stopped
@@ -309,8 +310,8 @@ took a millisecond leave the same entry.
 |---|---|---|---|
 | `pausedAt` | string | always | When the wait began, as an ISO 8601 instant. It is the runtime's own clock reading rather than anything derived from the trace's step numbers, because a wait is the one thing in a run whose duration is not the graph's to decide. |
 | `expiresAt` | string | when the node declares a `timeout:` | When the budget runs out, as an ISO 8601 instant — `pausedAt` plus the node's `human: { timeout: … }`, which is wall-clock from the moment the pause begins. Absent where the node declares none, which grammar §8.7 makes an **unbounded** wait rather than a defaulted one: a `human` node resolves no `timeout` from any policy level (Decision D102), so there is no other budget for this to have come from. |
-| `settledAt` | string | when the wait stopped waiting | When it stopped, as an ISO 8601 instant. Absent on the one entry whose wait nothing settled: a run that **ended** holding the pause, which is what `agent-compose run` does with every pause it reaches, since resume is a route the generated app mounts (PRD 5.11). That entry is the run's aborting entry (§9) and the document's `status` is `"interrupted"` (§2). |
-| `settled` | `"resumed"` \| `"expired"` | when `settledAt` is | How it stopped. `"resumed"` is an answer that fit the node's `output:` — one that did not is refused at the resume route and does not consume the wait, so it never becomes part of a run's record at all. `"expired"` is the budget running out, and that entry also carries `fallback` naming the `on_timeout:` route control transferred to (§3, grammar §9.2). The two are settled **exactly once**: a resume racing an expiry is decided rather than applied twice. |
+| `settledAt` | string | when the wait stopped waiting | When it stopped, as an ISO 8601 instant. Absent on the one entry whose wait nothing settled: a run that **ended** holding the pause, which is what an `agent-compose run` with no way to answer does with every pause it reaches — standard input is not a terminal, or the terminal it was asking at went away (grammar §8.7, PRD §9.21). That entry is the run's aborting entry (§9) and the document's `status` is `"interrupted"` (§2). |
+| `settled` | `"resumed"` \| `"expired"` | when `settledAt` is | How it stopped. `"resumed"` is an answer that fit the node's `output:` — one that did not is refused where it arrived and does not consume the wait, so it never becomes part of a run's record at all. Which of the two delivery surfaces it arrived on is **not** recorded: an answer typed at a terminal `run` and one posted to the app's resume route leave the same entry, because they are the same delivery to the same wait (grammar §8.7). `"expired"` is the budget running out, and that entry also carries `fallback` naming the `on_timeout:` route control transferred to (§3, grammar §9.2). The two are settled **exactly once**: an answer racing an expiry is decided rather than applied twice. |
 
 **How it reads beside `outcome`.** The three ways a wait ends are three shapes of
 entry, and each is the ordinary reading of the fields it carries rather than a

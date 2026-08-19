@@ -58,15 +58,23 @@
 //! | `0` | clean: nothing was reported |
 //! | `1` | diagnostics were reported, `build --check` found drift, or a `run` produced no answer |
 //! | `2` | the command could not run: bad usage, an unreadable entrypoint, an output directory that could not be written, a missing environment variable, an uninstalled dependency set, or no JavaScript runtime to launch |
-//! | `3` | a `run` stopped at a `human` pause, which only `serve` can answer (grammar 8.7, PRD 5.11) |
+//! | `3` | a `run` with nobody to ask stopped at a `human` pause (grammar 8.7, PRD 5.11) |
 //!
 //! `3` is the emitted project's own — [`launch`] passes a child's exit code
 //! through — and it is a code rather than a shade of `1` because it asks for
 //! something neither of the others does. `2` is an invocation to fix and `1` is a
 //! run to look into; a run holding a pause did everything it was asked to and is
-//! waiting on a person, whose answer arrives through the app's `POST
-//! /executions/:id/resume`. A supervisor that read it as `1` would re-run a graph
+//! waiting on a person. A supervisor that read it as `1` would re-run a graph
 //! whose effects have already happened.
+//!
+//! It is the **non-interactive** path and only that. A pause has two delivery
+//! surfaces (grammar 8.7, PRD §9.21): the app's `POST /executions/:id/resume`,
+//! and the terminal of a `run` whose standard input is one — where the emitted
+//! CLI asks the question, reads the answer and carries on, so the run ends `0`
+//! like any other. `3` is what is left when neither is available: standard input
+//! is not a terminal, `AGENT_COMPOSE_INTERACTIVE=0` said not to ask, or the
+//! terminal went away mid-run. Nothing here decides which of those happened; the
+//! child does, and this passes its code through.
 //!
 //! The split between `1` and `2` is the difference between *the answer is no*
 //! and *the command could not be run at all*. A missing `imports:`
