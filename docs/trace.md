@@ -32,6 +32,24 @@ specifies it — and every field of that type has a **row in that section's
 table**. A field explained only in the surrounding prose is an undocumented
 field, and the fix is a row.
 
+**Presence vocabulary.** Every field table below has a *presence* column, and
+every cell in one is written in the same small vocabulary — because §10.1 makes a
+reader entitled to both halves of what such a cell says: the cases a field
+appears in, and the cases it therefore does not.
+
+| in a presence column | what it says |
+|---|---|
+| **always** | the key is on every record of this type, without exception |
+| a **condition** | the key is on exactly the records the condition describes, and on no others |
+| **, possibly empty** | a qualifier on either of the above: where the key is present, the array or object it holds may have no elements — and where this document gives an empty value a meaning, an empty value is a statement rather than a way of being absent |
+
+The qualifier is written **wherever an empty value is reachable**, so a presence
+cell without it promises a value with something in it. That is the distinction
+this format leans on hardest: `dispatches: []` and no `dispatches` key are two
+different facts about a fan-out (§5.2), as are an empty `failovers` and a call
+that named what refused it (§7). Absence is never spelled as an empty value, and
+an empty value is never spelled as absence.
+
 ---
 
 ## Table of contents
@@ -62,10 +80,14 @@ entries; they differ in what surrounds them.
 | `serve` status | `GET /executions/:id` and the `callback:` webhook body, whose `trace` is the array of entries | `trace_version`, beside `trace` |
 
 The rule that spans them: **on all three surfaces above, wherever a `trace`
-appears, the `trace_version` that describes it appears beside it.** A `serve`
-report for a run that is still going carries neither. In process there is no
-document to put a version in, so the constant `TRACE_VERSION` is where an
-in-process caller of `runFlow` reads the same number (§11).
+appears, the `trace_version` that describes it appears beside it — and wherever
+one is absent, so is the other.** Both halves are load-bearing, because two of
+the three surfaces have a report with no trace on it: a `serve` report for a run
+that is still going carries neither, and so does a `serve` report for a run that
+failed with nothing recorded at all. `run --format json` always carries both,
+`trace` empty where the run recorded nothing. In process there is no document to
+put a version in, so the constant `TRACE_VERSION` is where an in-process caller
+of `runFlow` reads the same number (§11).
 
 ### 1.1 `run --format json`
 
@@ -122,9 +144,16 @@ POSTs on completion, report an execution as (grammar §13.3):
 
 `status` here is the *execution's* — `running`, `completed`, `failed` or
 `interrupted` — which is a larger vocabulary than the envelope's, because an
-execution tracked by a live process can be in states a finished run cannot.
-`trace` and `trace_version` appear together once the run has stopped; a `running`
-execution reports neither.
+execution tracked by a live process can be in states a finished run cannot. It
+is `serve`'s own vocabulary rather than one of §10.1's closed enumerations: this
+format's `status` is the envelope's two.
+
+`trace` and `trace_version` appear together, on a run that has **stopped with
+entries to report**. Two reports carry neither: a `running` execution, which has
+nothing to report yet, and an execution that failed carrying no trace at all —
+a request refused before the graph ran a node. `outputs` and `error` are the
+same shape: each appears when the execution has one, so a `running` report is
+`execution_id`, `flow`, `trigger` and `status`, and nothing else.
 
 ---
 
@@ -139,8 +168,8 @@ in full, and what `run --format json` spreads into the record it prints.
 | `flow` | string | always | The flow that was run, as its typed address (grammar §2.2). |
 | `execution_id` | string | always | The execution the entries belong to — grammar §4.1's `execution.id`, and the prefix of every idempotency key in the document (grammar §9.4). |
 | `status` | `"completed"` \| `"failed"` | always | Whether the run produced an answer. |
-| `error` | string | on `"failed"` | What stopped the run. Present because a failed run's last entry does not always say: a run stopped by the superstep ceiling has no aborting node to carry one. |
-| `entries` | array of [entries](#3-entries) | always | Every entry the run recorded, in the order §3.1 fixes. |
+| `error` | string | on `"failed"` | What stopped the run. Present on every failed document, because a failed run's last entry does not always say: a run stopped by the superstep ceiling has no aborting node to carry one. |
+| `entries` | array of [entries](#3-entries) | always, possibly empty | Every entry the run recorded, in the order §3.1 fixes. Empty only on a run that recorded none at all — one that failed before any node produced an entry, which takes a failure the node a run aborts at cannot account for, since that node contributes one (§9). The trace **file** is not written for such a run (§1.2), so an empty array reaches a reader only as `run --format json`'s `trace` or a `serve` report's. |
 
 **Key spelling.** The envelope's keys are `snake_case`; an entry's are
 `camelCase`. The seam is deliberate rather than an oversight: the envelope's keys
@@ -166,13 +195,13 @@ retries are attempts at one execution, and `attempts` is where they are recorded
 | `traversal` | integer | always | How many times this node had **already** begun executing in this flow instance — `0` on the first, `1` on the second traversal of a bounded cycle. It is grammar §9.4's traversal ordinal, the same number the instance path is built from. |
 | `outcome` | `"completed"` \| `"skipped"` \| `"failed"` | always | See §3.2. |
 | `attempts` | integer | always | How many attempts the node's `retry:` policy **made**, not how many it allowed (grammar §9.1) — a budget that ran out during the second of three made two. `0` when the node never ran: an input binding that could not be evaluated fails the execution before any attempt (grammar §4.1, §10.1). |
-| `writes` | array of strings | `"completed"`, `"skipped"` | The state channels this node wrote, by name (grammar §10.1). Empty on a skipped node, which writes nothing — and on a **completed** node that landed no channel: one whose `writes:` maps nothing, and one whose result omitted every field that is mapped (grammar §8.0, Decision D110). An empty array is therefore not a statement about `outcome`; read `outcome` for that. Absent on a failed entry: a node that failed produced no output to write from, and where the failure ended the run the superstep it died in lands nothing at all (§9). |
-| `routing` | [routing decision](#4-routing-decisions) | `"completed"`, `"skipped"`; conditionally on `"failed"` | What this node's outgoing edges answered. See §4 and §9. |
-| `dispatches` | array of [dispatch records](#5-dispatch-records) | `map` nodes | What a fan-out dispatched, one record per source item in **index** order (grammar §8.6, PRD 5.6). A map over an **empty** array records `[]` — present and empty. Absent rather than empty on a map that resolved nothing to *report*: one whose input binding failed before the plan was built, and one whose own `timeout:` caught every joined instance mid-flight (§5.2). See §5. |
-| `inner` | array of entries | `flow:` nodes | The trace of the subflow instance this node ran (grammar §8.5). See §8. |
-| `stores` | array of [store records](#6-store-records) | when the node performed any | Every store op this node performed, in the order it performed them (PRD 5.8). See §6. |
-| `models` | array of [model calls](#7-model-calls) | when the node made any | Every model call this node execution made (PRD 5.9). See §7. |
-| `error` | string | see §3.2 | What went wrong, as `<error name>: <message>` — the failure's class and its text, in that one shape on **every** entry that carries the field, whether the node aborted the run, took a `fallback:`, or had its failure absorbed by `on_error: skip`. Written for a person: §10.1 makes the text something a reader must not parse, and it can quote what the other side of an activity answered — §11.1 is what it may and may not hold. |
+| `writes` | array of strings | `"completed"`, `"skipped"`; possibly empty | The state channels this node wrote, by name (grammar §10.1). Empty on a skipped node, which writes nothing — and on a **completed** node that landed no channel: one whose `writes:` maps nothing, and one whose result omitted every field that is mapped (grammar §8.0, Decision D110). An empty array is therefore not a statement about `outcome`; read `outcome` for that. Absent on a failed entry: a node that failed produced no output to write from, and where the failure ended the run the superstep it died in lands nothing at all (§9). |
+| `routing` | [routing decision](#4-routing-decisions) | `"completed"`, `"skipped"`; on `"failed"` in the one case §9 names | What this node's outgoing edges answered. The one failed case is *no viable route*, where the edge decisions are the whole explanation; every other failure abandoned or never reached the decision. See §4 and §9. |
+| `dispatches` | array of [dispatch records](#5-dispatch-records) | `map` nodes with a fan-out to report; possibly empty | What a fan-out dispatched, one record per source item in **index** order (grammar §8.6, PRD 5.6). A map over an **empty** array records `[]` — present and empty. The key is absent, rather than empty, exactly where the fan-out has nothing resolved to report: a map whose input binding failed, so no plan was ever built, and a map whose failure abandoned its plan with no dispatch resolved in it — which §5.2's `timeout:` is the reachable case of. A node that is not a `map` never carries the key. See §5. |
+| `inner` | array of entries | `flow:` nodes that ran an instance | The trace of the subflow instance this node ran (grammar §8.5). Absent on a `flow:` node that ran none — one whose *input* could not be built — and on one whose own `timeout:` abandoned its instance mid-flight, which leaves no trace to carry. A **dispatched** instance is never here: a `map`'s items report under their own dispatch records (§5), including the item whose failure ended the map node. See §8. |
+| `stores` | array of [store records](#6-store-records) | when the node performed any | Every store op this node performed, in the order it performed them (PRD 5.8). Never empty: a node that performed none carries no key. See §6. |
+| `models` | array of [model calls](#7-model-calls) | when the node made any | Every model call this node execution made (PRD 5.9). Never empty: a node that made none carries no key. See §7. |
+| `error` | string | `"skipped"`, `"failed"` | What went wrong, as `<error name>: <message>` — the failure's class and its text, in that one shape on **every** entry that carries the field, whether the node aborted the run, took a `fallback:`, or had its failure absorbed by `on_error: skip`. On both of those outcomes without exception — including both shapes of `"failed"`, the one that ended the run and the one that took a `fallback:` — and never on `"completed"`: an outcome says what became of a failure, not whether there was one to describe (§3.2). Written for a person: §10.1 makes the text something a reader must not parse, and it can quote what the other side of an activity answered — §11.1 is what it may and may not hold. |
 | `fallback` | string | when `on_error: { fallback: … }` fired | The node id the failure routed to instead of this node's own edges (grammar §9.2). `"__end__"` for the terminal pseudo-node. |
 
 ### 3.1 Order
@@ -188,7 +217,9 @@ a **failed** run aborted at (§9).
 
 Nested entries (`inner`, and a dispatch record's `inner`) have step numbers of
 their **own instance**, starting again at `1`. They are not interleaved with the
-caller's.
+caller's. Both rules above are the instance's own: a nested array is sorted by
+`(step, node)` within itself, and a nested instance that **failed** ends with the
+entry it aborted at, exactly as the root's does.
 
 ### 3.2 Outcomes
 
@@ -235,11 +266,11 @@ declare.
 `RoutingDecision`, on `TraceEntry.routing`. This is the record PRD 5.3 asks for:
 which edge fired, and the guard values that decided it.
 
-| field | type | meaning |
-|---|---|---|
-| `edges` | array of [edge decisions](#41-edge-decisions) | What every outgoing edge answered, in **declaration order** (grammar §7.3). |
-| `targets` | array of strings | The nodes scheduled next, in the declaration order of the edges that reached them, deduplicated — the same order `edges` is in, filtered to the taken ones. `"__end__"` is the terminal pseudo-node. A multicast (grammar §7.3 rule 6) names more than one. |
-| `counters` | object, string → integer | The `max_iterations` counters this step **spent**, by key, holding their new value (grammar §7.4). A key appears only when this step spent it; the value is the count after the spend. |
+| field | type | presence | meaning |
+|---|---|---|---|
+| `edges` | array of [edge decisions](#41-edge-decisions) | always | What every outgoing edge answered, in **declaration order** (grammar §7.3). Never empty: a node with no outgoing edge is a static error (grammar §7.6.3 rule 1). |
+| `targets` | array of strings | always, possibly empty | The nodes scheduled next, in the declaration order of the edges that reached them, deduplicated — the same order `edges` is in, filtered to the taken ones. `"__end__"` is the terminal pseudo-node. A multicast (grammar §7.3 rule 6) names more than one. Empty in exactly one place, and it is what went wrong there: the *no viable route* entry of §9. |
+| `counters` | object, string → integer | always, possibly empty | The `max_iterations` counters this step **spent**, by key, holding their new value (grammar §7.4). A key appears only when this step spent it; the value is the count after the spend. `{}` on every step that spent none, which is most of them. |
 
 ### 4.1 Edge decisions
 
@@ -252,7 +283,7 @@ that were **not** taken, which is the half a reader most often needs.
 | `when` | string | guarded edges | The `when:` guard, as CEL source, verbatim from the composition (grammar §4.1). |
 | `else` | `true` | `else:` edges | Marks the edge as the `else:` catch-all (grammar §7.3 rule 4). Never `false`: an edge that is not the catch-all omits the field. |
 | `value` | boolean | guarded edges | What the guard answered. |
-| `budget` | object | see below | The `max_iterations` budget on this edge, and its state at this decision: `key` (the counter this edge spends), `used` (the count **after** this decision), `max` (the declared budget). Present on a budgeted edge whose guard answered `true` — which is when a budget is either spent or found spent. |
+| `budget` | object | budgeted edges whose guard answered `true` | The `max_iterations` budget on this edge, and its state at this decision: `key` (the counter this edge spends), `used` (the count **after** this decision), `max` (the declared budget). A guard that answered `true` is when a budget is either spent or found spent; a budgeted edge whose guard answered `false` spent nothing and reports no budget. Only a guarded edge can carry one at all — `max_iterations:` requires a `when:` (Decision D90) — so an unconditional or `else:` decision never has this key. |
 | `taken` | boolean | always | Whether this edge scheduled its target. |
 | `reason` | string | the three decisions below, and no others | Why, where neither the guard's value nor the edge's own shape says. See below. |
 
@@ -285,11 +316,15 @@ A cycle (grammar §7.4) leaves through one of two decisions, and both are in the
 
 * **a counting bound ran out** — the back-edge's decision has `value: true`,
   `taken: false`, the `"the \`max_iterations\` budget is spent"` reason, and a
-  `budget` naming the counter, the count and the declared `max`. The `else:` edge
-  beside it is `taken: true`.
+  `budget` naming the counter, the count and the declared `max`.
 * **a CEL exit condition went false** — the back-edge's decision has
-  `value: false`, `taken: false`, and no reason. The `else:` edge beside it is
-  `taken: true`.
+  `value: false`, `taken: false`, and no reason.
+
+In both, the `else:` edge beside the back-edge is `taken: true` — on the shape a
+bounded cycle has, which is a node whose only guarded edge is the back-edge. The
+rule underneath is §4.1's and it is what a reader should apply where a node
+guards more than one way out: an `else:` edge is taken unless some guarded
+sibling was, and a sibling suppressed it says so in its `reason`.
 
 The passes before the last are the same edges seen `taken: true`, one entry per
 traversal, with `budget.used` climbing on a counted loop. A cycle that never left
@@ -302,8 +337,10 @@ the ceiling, and every traversal it did make in `entries`.
 ## 5. Dispatch records
 
 `DispatchRecord`, on `TraceEntry.dispatches`. PRD 5.6 makes a fan-out's
-cardinality and destination *data*; this is that data. One record per source item,
-in ascending `index` — never completion order.
+cardinality and destination *data*; this is that data. One record per source
+item, in ascending `index` — never completion order. "One record per source
+item" is the whole array on every fan-out that reached its join, however it left
+it; §5.2 is the one path that reports fewer, and it says which.
 
 A fan-out over an **empty** array has no source items, and its entry carries
 `dispatches: []` — the key present, the array empty. Grammar §8.6 rule 11 makes a
@@ -320,8 +357,8 @@ different statement, and §5.2 is where it is made.
 | `outcome` | `"completed"` \| `"skipped"` \| `"failed"` \| `"detached"` | always | See §5.1. |
 | `attempts` | integer | always | How many attempts the item's `on_item_error: { retry: … }` policy **made** (grammar §8.6 rule 10). `0` for a detached dispatch, which has no observed outcome for a policy to have acted on. |
 | `idempotencyKey` | string | always | The key this dispatch's effect site derives (grammar §9.4). See §8. |
-| `inner` | array of [entries](#3-entries) | **joined** `flow.*` targets | The dispatched instance's own trace, whether it completed or failed. Absent on a `"detached"` record whatever its target: see below. |
-| `error` | string | `"skipped"`, `"failed"` | Why the item did not complete. |
+| `inner` | array of [entries](#3-entries) | **joined** `flow.*` targets | The dispatched instance's own trace, whether it completed or failed — a joined `flow.*` dispatch always has one, because the instance either answered with its trace or failed carrying it. Absent on every other target, which ran no instance, and on a `"detached"` record whatever its target: see below. This is the **only** place a dispatched instance's trace appears; the map node's own `inner` is for a `flow:` node's instance and a `map` is not one (§3, §8). |
+| `error` | string | `"skipped"`, `"failed"` | Why the item did not complete. On both, and in §3's `<error name>: <message>` shape: `on_item_error` decides which of the two outcomes a failed item takes (§5.1), not whether there was a failure to describe. |
 
 A **detached** dispatch is the one target shape that carries no `inner` even
 where it points at a `flow.*`. Grammar §8.6 rule 7 admits `detach: true` on a
@@ -391,8 +428,8 @@ Writes are at-least-once with idempotency keys."
 | `effect` | `"read"` \| `"write"` | always | Which half of the replay discipline this record belongs to. `set`, `delete`, `upsert` and `put` are writes; the rest are reads. |
 | `via` | `"node"` \| `"tool"` | always | Which of PRD 5.8's two consumption surfaces ran it: a store-op node, or a synthesized store tool an agent called inside its loop. |
 | `scope` | `"execution"` \| `"session"` \| `"global"` | always | The store's declared lifetime, and with it which partition was addressed (grammar §11.3). |
-| `key` | string | ops that address one | The key the op addressed. |
-| `answer` | any | `"read"` | What the read answered — the history a replay consumes. Its shape is the store's own (grammar §11.4), not this format's. |
+| `key` | string | `get`, `set`, `delete`, `upsert`, `put` | The key the op addressed. Absent on the two ops of grammar §11.4's catalog that address no single key: `list`, which takes a `prefix`, and `search`, which takes a `query`. |
+| `answer` | any | `"read"` | What the read answered — the history a replay consumes. On **every** read record: a read that found nothing still answered, and grammar §11.4's own output row is what it answered with — a `get` that missed carries `{ found: false }` and no `value` (Decision D110), which is an answer and not an absence. Its shape is the store's (grammar §11.4), not this format's. |
 | `idempotencyKey` | string | `"write"` **via `"node"`** | The key the write carried (grammar §9.4). See §8, and the paragraph below for the surface that carries none. |
 | `deduped` | boolean | `"write"` **via `"node"`** | Whether the backend had already applied that key — the difference between "this run wrote it" and "an earlier attempt of this same effect did". |
 
@@ -409,12 +446,20 @@ for it. A reader indexing writes by key indexes the `via: "node"` ones and must
 carry the rest some other way.
 
 Every op a node performs lands on that node's entry, across **every attempt** its
-`retry:` policy made: an effect that happened is an effect that happened, and a
-record that kept only the last attempt's would describe a run the store did not
-see. A **detached** `map` delivery is the one thing "a node performs" does not
-reach, for the reason §5.1 gives: the node never waited for it, so whether its
-ops had happened by the time the entry was written is a matter of scheduling
-rather than a fact about the run.
+`retry:` policy made and **every instance a `map` joined**: an effect that
+happened is an effect that happened, and a record that kept only the last
+attempt's would describe a run the store did not see. That is the same bound
+§7.2 puts on `models`, and it has the same one exception. A **detached** `map`
+delivery is what "a node performs" does not reach, for the reason §5.1 gives:
+the node never waited for it, so whether its ops had happened by the time the
+entry was written is a matter of scheduling rather than a fact about the run.
+
+"On *that* node's entry" is decided by where the op ran, and a fan-out has both
+shapes. A joined instance dispatched to an `agent.*` or a `tool.*` has no entry
+of its own, so its ops are the map node's. An instance dispatched to a `flow.*`
+is a run of its own graph, whose nodes have entries: its ops are on those,
+reached through `DispatchRecord.inner` (§5), and none of them is on the map
+node's entry. A `flow:` node divides the same way, through `TraceEntry.inner`.
 
 ---
 
@@ -430,13 +475,17 @@ reader infers from a provider's own logs.
 | `model` | string | always | The `model.*` the composition named — a direct binding or a route (grammar §12.2). |
 | `servedBy` | string | when a member answered | The route member that answered. |
 | `fallback` | integer | with `servedBy` | Its ordinal in the route, `0` for the first — so `1` reads as "fallback #1". |
-| `failovers` | array of [refusals](#71-refusals) | always | Every member that refused **and moved the ladder on**, in the order they were tried. Empty when none did. |
+| `failovers` | array of [refusals](#71-refusals) | always, possibly empty | Every member that refused **and moved the ladder on**, in the order they were tried. Empty on every call that did not fail over — a direct binding's, and a route whose first member answered — which is most of them. |
 | `refused` | [refusal](#71-refusals) | when no member answered | What ended the call. Such a record carries no `servedBy` and no `fallback`. |
 
+Every record therefore carries exactly one of the two accounts of how it ended:
+`servedBy` with `fallback`, or `refused`. `failovers` is beside whichever it is,
+and describes the way there rather than the end of it.
+
 A **direct** binding produces a record too, with `servedBy === model`,
-`fallback: 0` and no failovers: a trace that recorded only the interesting calls
-would leave a reader unable to tell a call that did not fail over from a call
-nothing recorded.
+`fallback: 0` and an **empty** `failovers` — the key present, holding nothing: a
+trace that recorded only the interesting calls would leave a reader unable to
+tell a call that did not fail over from a call nothing recorded.
 
 ### 7.1 Refusals
 
@@ -480,8 +529,17 @@ subgraph's routing decisions or pretend they were the caller's. So they nest:
 * `DispatchRecord.inner` — the instance a `map` dispatched to a `flow.*`
   (grammar §8.6), whether it completed or failed.
 
+**One instance appears in one of those two places, never in both.** A `map` is
+not a `flow:` node, and its own entry carries no `inner` however its dispatches
+went — including the item whose failure ended the map node, whose instance is
+under its own record like every other. So a reader walking a trace for every
+subgraph run visits `TraceEntry.inner` and `DispatchRecord.inner` and counts each
+instance once.
+
 Nesting moves nobody's step numbers: an inner instance numbers its own supersteps
-from `1`.
+from `1`. An instance that **failed** carries the entry it aborted at last, the
+way §3.1 says a failed run does — the ordering rule is the instance's, not only
+the root's.
 
 **Instance paths surface in exactly two fields**, and in neither of them alone:
 each is an idempotency key, of which the path is the **remainder** after the
@@ -539,8 +597,11 @@ ways, both consequences of how a superstep dies rather than choices:
   guard.
 
 Everything else the node did is still there: `stores`, `models`, `dispatches` and
-`inner` are all recorded on the aborting entry, because those effects really
-happened and the failure alone says nothing about them.
+`inner` reach the aborting entry like any other, because those effects really
+happened and the failure alone says nothing about them. Failing is not a fifth
+presence rule — each of the four is on this entry exactly when §3's row for it
+says, so a node that made no model call still has no `models`, and a `map` whose
+deadline resolved nothing still has no `dispatches` (§5.2).
 
 A run stopped by the **superstep ceiling** has no aborting node at all: the
 ceiling is the compiler's safety net rather than one of the composition's own
@@ -560,24 +621,32 @@ At a given `trace_version`, a reader MAY rely on:
 
 * every field this document names, under the name and with the meaning given
   here;
-* the presence rules stated in each table's *presence* column — **both ways
-  round.** A column that names the cases a field appears in is also the statement
-  that it does not appear in the others, and in some of them the absence *is* the
-  record rather than a detail of it: §5.2's missing `dispatches`, where an absent
-  key says "nothing resolved" and `[]` says "nothing was dispatched"; the missing
-  `writes` and the mostly-missing `routing` of §9's aborting entry; `route` and
-  `variant` on a homogeneous map, which is how a reader tells the two forms
-  apart. Reading an absence this document states is using the format, not
-  guessing at it — see the MUST NOT below for the absences that are not stated,
-  which is a different thing;
+* the presence rules stated in each table's *presence* column, read in the
+  vocabulary the preamble fixes — **both ways round.** A column that names the
+  cases a field appears in is also the statement that it does not appear in the
+  others, and in some of them the absence *is* the record rather than a detail of
+  it: §5.2's missing `dispatches`, where an absent key says "nothing resolved"
+  and `[]` says "nothing was dispatched"; the missing `writes` and the
+  mostly-missing `routing` of §9's aborting entry; `route` and `variant` on a
+  homogeneous map, which is how a reader tells the two forms apart. Reading an
+  absence this document states is using the format, not guessing at it — see the
+  MUST NOT below for the absences that are not stated, which is a different
+  thing;
+* the **, possibly empty** qualifier, and its absence, as the same kind of
+  statement. Where a cell carries it, an empty array or object is a value this
+  format produces and means what the row says it means; where a cell does not,
+  the field is present only with something in it, and a reader may treat an empty
+  value there as impossible rather than as a case to handle;
 * the vocabularies of the closed enumerations: `TraceDocument.status`,
   `TraceEntry.outcome`, `DispatchRecord.outcome`, `StoreRecord.op`,
-  `StoreRecord.effect`, `StoreRecord.via`, `StoreRecord.scope`, and a refusal's
-  `condition`. `op` is the one whose type in `src/runtime.ts` is `string` rather
-  than the union — the union is the emitted `src/stores.ts`'s `StoreOp`, and a
-  record type declared under the runtime cannot name it without inverting that
-  dependency — so §6's seven are its vocabulary, and the inventory checks them
-  against `StoreOp` itself;
+  `StoreRecord.effect`, `StoreRecord.via`, `StoreRecord.scope`, a refusal's
+  `condition`, and an edge decision's `reason` — the last being a closed
+  vocabulary spelled as a sentence, which §4.1 enumerates and the MUST NOT below
+  names as the one message-shaped field a reader may match on. `op` is the one
+  whose type in `src/runtime.ts` is `string` rather than the union — the union is
+  the emitted `src/stores.ts`'s `StoreOp`, and a record type declared under the
+  runtime cannot name it without inverting that dependency — so §6's seven are
+  its vocabulary, and the inventory checks them against `StoreOp` itself;
 * the orders §3.1, §4.1 and §5 fix — entries by `(step, node)`, edge decisions in
   declaration order, dispatch records in source-item index order;
 * the nesting structure of §8, and the shape of the keys it describes.
@@ -628,6 +697,11 @@ written against the previous version wrong:
   to rely on: a reader who tells a timed-out fan-out from an empty one by §5.2's
   missing `dispatches` is broken by a release that starts writing `[]` there,
   exactly as one who reads `dispatches` is broken by a release that stops;
+* adding or removing the **, possibly empty** qualifier on a presence cell. It is
+  a presence rule in its own right — the preamble makes a cell without it a
+  promise that the value has something in it — so a field that starts producing
+  an empty array where this document said it produced none breaks the reader who
+  was told not to handle one;
 * adding a member to one of §10.1's closed enumerations, or removing one;
 * changing one of the fixed orders;
 * changing the derivation of an idempotency key, or where instance paths appear.
@@ -675,7 +749,14 @@ The version number alone is a promise; two tests make it a checkable one:
 * **Anything a store answered.** `StoreRecord.answer` is carried verbatim; its
   shape is the store's declared schema (grammar §11.4).
 * **Provider transcripts.** A trace records that a call was made and which member
-  served it, never the prompt or the completion.
+  served it. It never carries a prompt, and it carries no completion as a field:
+  §7's model-call record has no field for one. One fragment of a completion does
+  reach a **message** field, and it is worth stating because "never the
+  completion" would be read as covering it: an answer that failed the contract
+  its component declares (PRD 5.2) is reported with an excerpt of the offending
+  value at the failing path — at most 120 characters — and so are the arguments a
+  model sent to a tool. An answer that parsed is not recorded at all. §11.1's
+  table is where the excerpt is classified, as text this process did not compose.
 
 ### 11.1 Secrets
 
@@ -716,7 +797,7 @@ answered**, and a reader should treat that text as untrusted:
 
 | field | what it can carry from outside |
 |---|---|
-| `TraceEntry.error` | the failure the node's own activity raised — for an `http:` binding, the rejected response body truncated to 200 characters; for an `exec:` binding, the child's stderr |
+| `TraceEntry.error` | the failure the node's own activity raised — for an `http:` binding, the rejected response body truncated to 200 characters; for an `exec:` binding, the child's stderr; and on any surface parsed against a declared schema (PRD 5.2), an excerpt of the offending value at the failing path, truncated to 120 characters — a model's own answer, the arguments it sent to a tool, or a decoded `http:`/`exec:` payload that a non-2xx rule accepted and a schema did not |
 | `DispatchRecord.error` | the same text, raised by one dispatched item (§5). Under `on_item_error: skip` this is the **only** field it reaches: the run survives, so no entry carries an `error` for it |
 | `TraceDocument.error` | the same text, when that failure is what stopped the run |
 | `Refusal.detail` | what a provider answered: a status and a response body, truncated, or the socket failure that came back instead. Never the request, so the key it was signed with is not in it |
@@ -746,6 +827,16 @@ caught and restated:
 An **abort** is not in this table and is not restated: a node deadline (grammar
 §9.2) and a cancelled run reach the same place, and such a failure is raised as
 it came, because it is the run's own and carries nothing of the binding in it.
+
+One more failure is restated and is **not** in this table, and the difference is
+worth naming so the table reads as what it is. A child's standard input that
+could not be written — the one non-`EPIPE` failure of an `exec:` binding's stdin
+pipe — comes out as `` `${TOOLBIN}/rg`'s standard input could not be written
+(<code>) ``, in place of the platform's own wording. The platform's message
+there carries no resolved value, so §11.1's promise was never at stake; it is
+restated for the *second* property below — one composition, one message, whatever
+engine ran it — and because "could not be run" would be false of a command that
+ran. This table is the leak sites; that one is a wording site.
 
 Restating costs the platform's own wording, and the exchange is deliberate: what
 is lost is a path the reader can print for themselves from the reference the
