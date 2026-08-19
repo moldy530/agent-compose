@@ -416,9 +416,11 @@ const CODEGEN: &[Criterion] = &[
             // equivalence makes an agent's `tools:` entry a second way to reach
             // the same module, and grammar 7.7 clause 4 analyses it as one — so
             // what the provider is offered, and what a call to it instantiates,
-            // belong to this criterion rather than to the agent's. Three tests,
-            // because a call has three outcomes worth pinning apart: the
-            // instance ran, its arguments never fit, and it failed inside.
+            // belong to this criterion rather than to the agent's. Four tests,
+            // because a call has four outcomes worth pinning apart: the
+            // instance ran, its arguments never fit, it failed inside, and the
+            // name the model used was never on the wire — the last being the
+            // one call whose record carries no `target` (`docs/trace.md` §7.3).
             (
                 "a_flow_attached_as_a_tool_runs_one_instance_per_call_under_its_own_frame",
                 Status::Live,
@@ -429,6 +431,10 @@ const CODEGEN: &[Criterion] = &[
             ),
             (
                 "a_flow_tool_call_whose_instance_failed_fails_the_agent_node_carrying_its_trace",
+                Status::Live,
+            ),
+            (
+                "a_call_to_a_tool_the_agent_does_not_offer_is_recorded_with_no_target_and_ends_the_node",
                 Status::Live,
             ),
             // …and four more over the *frame* a call derives (grammar 9.4, PRD
@@ -770,6 +776,14 @@ const COMMANDS: &[Criterion] = &[
             // status and resume routes address it with nothing new.
             (
                 "a_pause_inside_a_flow_a_model_called_is_published_and_answered_like_any_other",
+                Status::Live,
+            ),
+            // …and D102's hold at that third construct, which is the one where
+            // the node holding the timer is also the node dividing the budget
+            // across a model route (grammar 9.2, 9.3): an `agent:` node's own
+            // `timeout:` outlived by the wait under its tool call.
+            (
+                "an_agent_nodes_budget_does_not_run_while_a_pause_below_its_tool_call_is_open",
                 Status::Live,
             ),
         ],

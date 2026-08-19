@@ -28,10 +28,15 @@
 #   * `flow.fan` dispatches the attachment through a `map`, so each child nests
 #     beneath its own item's frame.
 #
-# The last flow is the one that composes two runtimes: `flow.decide` attaches
-# `flow.sign`, which holds a `human:` node. Nothing about that is a special case
-# — the pause is the child instance's, its wait id is its own instance path, and
-# the resume route addresses it like any other (grammar 8.7, 9.4).
+# The last two flows compose two runtimes: `flow.decide` attaches `flow.sign`,
+# which holds a `human:` node. Nothing about that is a special case — the pause
+# is the child instance's, its wait id is its own instance path, and the resume
+# route addresses it like any other (grammar 8.7, 9.4). `flow.hold` is the same
+# composition with the agent node's own `timeout:` cut short, which is where the
+# two runtimes actually have to agree: Decision D102's hold has to reach the
+# third and last construct that can dispatch a pause, and it is the one where
+# the node holding the timer is also the node dividing the budget across a model
+# route (grammar 9.2, 9.3).
 version: "0.1"
 
 defaults:
@@ -349,6 +354,38 @@ flow.decide:
     - { from: start, to: draft }
     - { from: draft, to: end }
 
+# The same composition under a budget the wait outlives. `flow.decide`'s agent
+# node resolves `defaults: { timeout: 60s }` and no test spends a minute, so the
+# hold Decision D102 asks for is unobserved there; here the node declares
+# `timeout: 2s` and the wait below it runs for twice that before anybody answers.
+#
+# Grammar 9.2 bounds the work **one node execution** does, and time spent waiting
+# on a human is not work it is doing — so the deadline is held still while a
+# pause at or under this node's instance is open, and resumes with exactly the
+# milliseconds it had left. What makes this the interesting one of the three
+# constructs that can reach a pause is that an `agent` node also *divides* the
+# same budget across a model route (grammar 9.3), so the node holding the timer
+# and the node reading it are one node: a budget that ran while the human was
+# thinking would fail this node before the answer arrived.
+flow.hold:
+  description: Answer a question under a budget the sign-off must not spend.
+  inputs:
+    question:
+      type: string
+      min_length: 1
+  outputs:
+    answer:
+      type: string
+  nodes:
+    draft:
+      agent: agent.drafter
+      input:
+        question: "input.question"
+      timeout: 2s
+  edges:
+    - { from: start, to: draft }
+    - { from: draft, to: end }
+
 triggers:
   # `respond: async` because `flow.decide` reaches a `human` node through a
   # `tools:` entry, and grammar 7.7 clause 4 walks that edge: a `sync` response
@@ -358,6 +395,17 @@ triggers:
     type: http
     flow: flow.decide
     path: /decisions
+    method: POST
+    input:
+      question: "payload.body.question"
+    respond: async
+
+  # The same route one budget shorter, for the flow whose agent node declares a
+  # `timeout:` the wait outlives.
+  on_hold_request:
+    type: http
+    flow: flow.hold
+    path: /held-decisions
     method: POST
     input:
       question: "payload.body.question"

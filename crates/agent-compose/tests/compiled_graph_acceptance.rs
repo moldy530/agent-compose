@@ -2350,6 +2350,114 @@ fn arguments_a_flow_tools_inputs_refuses_fail_the_agent_node() {
     );
 }
 
+/// A model that names a tool the agent does not offer ends the node, and the
+/// call is **recorded** before it does — with no `target`.
+///
+/// `docs/trace.md` §7.3 makes that absence a presence rule rather than a
+/// convenience: `target` is on a tool-call record "when the agent offers a tool
+/// of that name", and "absent on the one call that has none: a name the agent
+/// does not offer". So this is the only call in the format whose record carries
+/// no `target`, and a runtime that filed one anyway — an empty string, the name
+/// echoed back, the record skipped entirely — would break the rule in a
+/// direction §10.1 says a reader may rely on. Recording it at all is the other
+/// half: the loop stops here, so without a record the trace of the failed run
+/// would say what the node was asked and never say what the model asked *for*.
+///
+/// `Outcome::raw` is what scripts it, because `crates/mock-provider` refuses to
+/// render a scripted call to a tool the request did not offer (it is a codegen
+/// bug in every other test) — and this is exactly the "a response generated code
+/// must reject" case its refusal points at.
+#[test]
+fn a_call_to_a_tool_the_agent_does_not_offer_is_recorded_with_no_target_and_ends_the_node() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::raw(
+            200,
+            json!({
+                "id": "msg_unoffered",
+                "type": "message",
+                "role": "assistant",
+                "model": SONNET,
+                "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_summarise",
+                    // `agent.answerer` offers `condense` and nothing else.
+                    "name": "summarise",
+                    "input": { "passage": "a long passage" },
+                }],
+                "stop_reason": "tool_use",
+                "stop_sequence": null,
+                "usage": { "input_tokens": 12, "output_tokens": 34 },
+            }),
+        ),
+    ));
+
+    let Some(run) = harness::invoke(
+        "flow-as-tool",
+        "flow.ask",
+        &[("question", "what does it say?")],
+        &provider,
+    ) else {
+        return;
+    };
+    let failure = run.failed();
+    assert!(
+        failure.contains("was answered with a call to `summarise`")
+            && failure.contains("not one of its tools"),
+        "the failure names the tool the model invented: {failure}"
+    );
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "…and the loop stopped there: no tool ran, and no second request was sent"
+    );
+
+    let entries = run.entries("ask");
+    let [entry] = entries.as_slice() else {
+        panic!("`ask` ran once: {entries:?}");
+    };
+    assert_eq!(entry["outcome"], "failed", "{entry}");
+    assert!(
+        entry["toolDispatches"].is_null(),
+        "nothing was instantiated, so there is no dispatch to report: {entry}"
+    );
+
+    let models = entry["models"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the call that asked for it is on the entry: {entry}"));
+    let [call] = models.as_slice() else {
+        panic!("one model call, and it ended the node: {entry}");
+    };
+    let asked = call["toolCalls"]
+        .as_array()
+        .unwrap_or_else(|| panic!("…and it records what it asked for: {call}"));
+    let [record] = asked.as_slice() else {
+        panic!("one tool call: {call}");
+    };
+    assert_eq!(
+        record["name"], "summarise",
+        "the record spells the name the model used, not a name the agent has: {record}"
+    );
+    assert!(
+        record.get("target").is_none(),
+        "…and carries no `target`, because there is no component behind it \
+         (`docs/trace.md` §7.3): {record}"
+    );
+    assert_eq!(record["outcome"], "failed", "{record}");
+    assert!(
+        record["error"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("Error: ")
+                && text.contains("was answered with a call to `summarise`")),
+        "…and its `error` is in §3's `<error name>: <message>` shape: {record}"
+    );
+    assert!(
+        record["instance"].is_null() && record["result"].is_null(),
+        "nothing ran, so there is neither a link nor a result: {record}"
+    );
+}
+
 /// A flow-as-tool call whose **instance** failed fails the agent node, and the
 /// instance's trace is the account of why.
 ///
@@ -8088,6 +8196,138 @@ fn a_pause_inside_a_flow_a_model_called_is_published_and_answered_like_any_other
         .unwrap_or_else(|| panic!("the `human` node has an entry: {agent}"));
     assert_eq!(paused["human"]["settled"], "resumed", "{paused}");
     assert!(paused["human"]["settledAt"].is_string(), "{paused}");
+}
+
+/// An **agent** node's own `timeout:` does not run while a pause below its tool
+/// call is open (Decision D102, grammar 8.7, 9.2).
+///
+/// [`an_enclosing_nodes_budget_does_not_run_while_a_pause_below_it_is_open`]
+/// decides this for a `flow:` node, which is one of the three constructs that
+/// can have a pause beneath them; a `map` is the second and an `agent:` node
+/// whose `tools:` names a `flow.*` holding a `human` node is the third
+/// (grammar 5.4, 7.7 clause 4). The third is not a variation on the first two,
+/// because it is the only one where the node holding the timer is also the node
+/// **dividing** the budget: a model route bounds each request from
+/// `RunContext.deadline`, and that reading is the same budget the hold is
+/// freezing. The two halves have to agree, or the first model call after an
+/// hour-long wait is refused for a budget the wait spent.
+///
+/// `flow.hold`'s `draft` node declares `timeout: 2s`; this waits four seconds —
+/// twice the budget — before answering. A budget that ran while the human was
+/// thinking would have failed the node before the resume was sent, and the
+/// execution would be `failed` rather than still holding the pause it started
+/// with; a budget that was *cancelled* rather than held would leave the two
+/// calls after the wait unbounded, which the node's single execution and its
+/// three model calls are what pin.
+#[test]
+fn an_agent_nodes_budget_does_not_run_while_a_pause_below_its_tool_call_is_open() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "sign",
+                json!({ "draft": "a drafted answer" }),
+            )]),
+        ),
+        Script::new(SONNET, Outcome::text("It is signed off.")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "answer": "a drafted answer" })),
+        ),
+    ]);
+
+    let Some(served) = harness::serve("flow-as-tool", &provider) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+
+    let started = app
+        .post_json("/held-decisions", &json!({ "question": "ship it?" }))
+        .expect("the trigger's route answers");
+    assert_eq!(started.status, 202, "{:?}", started.body);
+    let execution = started.json()["execution_id"]
+        .as_str()
+        .expect("an execution id")
+        .to_string();
+
+    let waiting = wait_for_pauses(&app, &execution, 1);
+    assert_eq!(
+        waiting["interrupts"][0]["wait_id"], "draft/0/sign/0/approve/0",
+        "the pause is the child instance's, addressed through the call that \
+         reached it: {waiting}"
+    );
+
+    // Twice the agent node's budget, spent doing nothing — which is exactly what
+    // a human takes.
+    std::thread::sleep(Duration::from_secs(4));
+
+    let still = app
+        .get(&format!("/executions/{execution}"))
+        .expect("the status route answers")
+        .json();
+    assert_eq!(
+        still["status"], "interrupted",
+        "`draft`'s 2s budget is not the wait's: {still}"
+    );
+    assert_eq!(
+        still["interrupts"][0]["wait_id"], "draft/0/sign/0/approve/0",
+        "…and it is the same pause, not a new one a retried node opened: {still}"
+    );
+
+    let resumed = app
+        .post_json(
+            &format!("/executions/{execution}/resume?wait=draft%2F0%2Fsign%2F0%2Fapprove%2F0"),
+            &json!({ "decision": "approve" }),
+        )
+        .expect("the resume route answers");
+    assert!(
+        resumed.status == 200 || resumed.status == 202,
+        "{resumed:?}"
+    );
+
+    let finished = harness::settled(&app, &execution);
+    assert_eq!(
+        finished["status"], "completed",
+        "the budget was held still, not cancelled — the loop finished inside \
+         what was left of it: {finished}"
+    );
+    assert_eq!(
+        finished["outputs"]["answer"], "a drafted answer",
+        "{finished}"
+    );
+
+    // One node execution, not a retried one, and the whole loop on its entry:
+    // the call that asked for sign-off, the one that ended the loop, and the
+    // pinned call — the last two made after the wait, inside the same budget.
+    let trace = finished["trace"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a finished report carries its trace: {finished}"));
+    let entry = trace
+        .iter()
+        .find(|held| held["node"] == "draft")
+        .unwrap_or_else(|| panic!("the agent node has an entry: {finished}"));
+    assert_eq!(entry["outcome"], "completed", "{entry}");
+    assert_eq!(
+        entry["attempts"], 1,
+        "the node made one attempt: the deadline never fired, so nothing \
+         restarted it: {entry}"
+    );
+    assert_eq!(
+        entry["models"].as_array().map(Vec::len),
+        Some(3),
+        "two loop calls and the pinned one, all on one node execution: {entry}"
+    );
+    assert!(
+        entry["human"].is_null(),
+        "the wait was not this node's: {entry}"
+    );
+    let record = &entry["toolDispatches"][0];
+    assert_eq!(record["target"], "flow.sign", "{entry}");
+    assert_eq!(
+        record["outcome"], "completed",
+        "the instance answered the tool call after the pause settled: {entry}"
+    );
 }
 
 /// `agent-compose run` reports the pause it cannot answer, and exits on a code
