@@ -2691,7 +2691,7 @@ fn a_generated_project_installs_type_checks_and_runs_under_the_node_fallback() {
     the_declared_media_type_arrived_alone(&request);
     the_bound_object_arrived_as_parameters(&request);
 
-    // Gate 2h, and the one whose subject is most the engine's: which of the two
+    // Gate 2j, and the one whose subject is most the engine's: which of the two
     // runtimes quotes a resolved string in a URL it could not parse is the
     // engine's own choice, so `docs/trace.md` §11.1's promise is only as good as
     // the runtime that held it last.

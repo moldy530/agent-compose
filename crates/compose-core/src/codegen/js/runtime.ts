@@ -2374,7 +2374,15 @@ export interface TraceDocument {
    * held only `status: "failed"` would name no reason at all.
    */
   readonly error?: string;
-  /** Every entry the run recorded, in the order [`mergeRun`] folds them. */
+  /**
+   * Every entry the run recorded, ordered by `(step, node)` — the order
+   * [`mergeRun`] folds them in.
+   *
+   * A **failed** run appends one entry outside that fold: [`failedTrace`] puts
+   * the entry of the node the run aborted at last, wherever its `(step, node)`
+   * would have sorted to. Re-sorting this array moves that entry into the middle
+   * of the run.
+   */
   readonly entries: readonly TraceEntry[];
 }
 

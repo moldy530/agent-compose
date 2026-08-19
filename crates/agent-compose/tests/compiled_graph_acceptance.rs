@@ -3052,7 +3052,13 @@ fn an_empty_fan_out_completes_and_its_downstream_edge_still_fires() {
 
     let work = run.entries("work");
     assert_eq!(work.len(), 1, "the map node ran");
-    assert_eq!(work[0]["dispatches"], json!([]));
+    assert_eq!(
+        work[0]["dispatches"],
+        json!([]),
+        "and the key is present and empty rather than absent: `docs/trace.md` §5 \
+         makes an empty array \"nothing was dispatched\" and an absent key \
+         \"nothing resolved\", and this map dispatched nothing"
+    );
     assert_eq!(
         work[0]["routing"]["targets"],
         json!(["__end__"]),

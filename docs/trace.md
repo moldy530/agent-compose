@@ -67,7 +67,8 @@ carries neither.
 
 ### 1.1 `run --format json`
 
-`agent-compose run <flow> --format json` prints one document (grammar §13.2):
+`agent-compose run <flow> --format json` — the invocation grammar §13.2 defines —
+prints one document:
 
 ```json
 {
@@ -164,7 +165,7 @@ retries are attempts at one execution, and `attempts` is where they are recorded
 | `attempts` | integer | always | How many attempts the node's `retry:` policy **made**, not how many it allowed (grammar §9.1) — a budget that ran out during the second of three made two. `0` when the node never ran: an input binding that could not be evaluated fails the execution before any attempt (grammar §4.1, §10.1). |
 | `writes` | array of strings | `"completed"`, `"skipped"` | The state channels this node wrote, by name (grammar §10.1). Empty on a skipped node, which writes nothing. Absent on a failed entry: a node that failed produced no output to write from, and where the failure ended the run the superstep it died in lands nothing at all (§9). |
 | `routing` | [routing decision](#4-routing-decisions) | `"completed"`, `"skipped"`; conditionally on `"failed"` | What this node's outgoing edges answered. See §4 and §9. |
-| `dispatches` | array of [dispatch records](#5-dispatch-records) | `map` nodes that dispatched | What a fan-out dispatched, one record per source item in **index** order (grammar §8.6, PRD 5.6). Absent rather than empty on a map that resolved nothing to report: one whose input binding failed before the plan was built, and one whose own `timeout:` caught every joined instance mid-flight (§5.2). See §5. |
+| `dispatches` | array of [dispatch records](#5-dispatch-records) | `map` nodes | What a fan-out dispatched, one record per source item in **index** order (grammar §8.6, PRD 5.6). A map over an **empty** array records `[]` — present and empty. Absent rather than empty on a map that resolved nothing to *report*: one whose input binding failed before the plan was built, and one whose own `timeout:` caught every joined instance mid-flight (§5.2). See §5. |
 | `inner` | array of entries | `flow:` nodes | The trace of the subflow instance this node ran (grammar §8.5). See §8. |
 | `stores` | array of [store records](#6-store-records) | when the node performed any | Every store op this node performed, in the order it performed them (PRD 5.8). See §6. |
 | `models` | array of [model calls](#7-model-calls) | when the node made any | Every model call this node execution made (PRD 5.9). See §7. |
@@ -300,6 +301,12 @@ the ceiling, and every traversal it did make in `entries`.
 `DispatchRecord`, on `TraceEntry.dispatches`. PRD 5.6 makes a fan-out's
 cardinality and destination *data*; this is that data. One record per source item,
 in ascending `index` — never completion order.
+
+A fan-out over an **empty** array has no source items, and its entry carries
+`dispatches: []` — the key present, the array empty. Grammar §8.6 rule 11 makes a
+zero-instance dispatch a completion, and the entry reads as one: the map node
+ran, dispatched nothing, and its outgoing edge fired. The *absent* key is a
+different statement, and §5.2 is where it is made.
 
 | field | type | presence | meaning |
 |---|---|---|---|
