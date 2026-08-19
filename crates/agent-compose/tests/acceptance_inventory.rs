@@ -407,11 +407,20 @@ const CODEGEN: &[Criterion] = &[
             // The subgraph's *other* call site. PRD 5.1's flow-as-tool
             // equivalence makes an agent's `tools:` entry a second way to reach
             // the same module, and grammar 7.7 clause 4 analyses it as one — so
-            // what the provider is offered, and what a call to it does in a
-            // release that does not instantiate from there, belong to this
-            // criterion rather than to the agent's.
+            // what the provider is offered, and what a call to it instantiates,
+            // belong to this criterion rather than to the agent's. Three tests,
+            // because a call has three outcomes worth pinning apart: the
+            // instance ran, its arguments never fit, and it failed inside.
             (
-                "a_flow_attached_as_a_tool_reaches_the_model_and_refuses_the_call",
+                "a_flow_attached_as_a_tool_runs_one_instance_per_call_under_its_own_frame",
+                Status::Live,
+            ),
+            (
+                "arguments_a_flow_tools_inputs_refuses_fail_the_agent_node",
+                Status::Live,
+            ),
+            (
+                "a_flow_tool_call_whose_instance_failed_fails_the_agent_node_carrying_its_trace",
                 Status::Live,
             ),
         ],
@@ -714,6 +723,15 @@ const COMMANDS: &[Criterion] = &[
             // while the pause is open.
             (
                 "an_enclosing_nodes_budget_does_not_run_while_a_pause_below_it_is_open",
+                Status::Live,
+            ),
+            // …and the third construct a pause can sit under, which grammar 8.7
+            // names and which arrived with the flow-as-tool runtime: a flow a
+            // **model** called (grammar 5.4, 7.7 clause 4). The wait id is the
+            // child instance's path with the node's frame on the end, so the
+            // status and resume routes address it with nothing new.
+            (
+                "a_pause_inside_a_flow_a_model_called_is_published_and_answered_like_any_other",
                 Status::Live,
             ),
         ],

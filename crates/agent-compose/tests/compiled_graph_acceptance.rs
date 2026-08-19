@@ -2042,7 +2042,7 @@ fn a_subgraph_runs_with_explicit_bindings_and_isolated_history() {
 }
 
 /// A flow attached to an agent as a tool **reaches the model** with the contract
-/// grammar 5.4 gives it, and a call to it is refused by name.
+/// grammar 5.4 gives it, and a call to it runs the module.
 ///
 /// Both halves are the same claim, and only the first is easy to lose. PRD 5.1
 /// makes the two call sites of a `flow.*` interchangeable and grammar 7.7
@@ -2051,27 +2051,53 @@ fn a_subgraph_runs_with_explicit_bindings_and_isolated_history() {
 /// everywhere, and an emitter that then dropped the tool would put an agent the
 /// validator accepted on the wire *without* it: no diagnostic at `validate`,
 /// none at `build`, and a model that cannot call what the composition attached.
-/// So what the provider was offered is the observable, read off the recorded
-/// request rather than off the emitted TypeScript.
+/// So what the provider was offered is read off the recorded request rather than
+/// off the emitted TypeScript.
 ///
-/// The second half is what this release does when the model takes the offer: it
-/// says so, naming the construct, exactly as a `human` node does — a node that
-/// says what it does not do is not a node that pretends. The third run is the
-/// sentence that refusal points at: the same subflow at a `flow:` node
-/// (grammar 8.5) runs, so the advice is checked rather than asserted.
+/// The second half is PRD resolved q19 and q20, over the case that decides both:
+/// the model calls the flow **twice**, with different arguments. Each call is
+/// its own instance — its own frame beneath the agent node's, its own store
+/// write under its own idempotency key, its own trace — and each is findable as
+/// a dispatch record the model call links to. A runtime that reused one site for
+/// both would leave the second write deduped away by the backend, which is the
+/// failure grammar 9.4's frame exists to prevent.
 #[test]
-fn a_flow_attached_as_a_tool_reaches_the_model_and_refuses_the_call() {
+fn a_flow_attached_as_a_tool_runs_one_instance_per_call_under_its_own_frame() {
     let provider = MockProvider::start().expect("a loopback port");
-    // One loop call, answered with a call to the attached flow. The loop offers
-    // the agent's tools and pins nothing, which is what makes `tool_calls` the
-    // legal answer here (see this file's header).
-    provider.enqueue(Script::new(
-        SONNET,
-        Outcome::tool_calls(vec![ToolCall::new(
-            "condense",
-            json!({ "passage": "a long passage" }),
-        )]),
-    ));
+    // Sequential by construction, so the queue order *is* the call order: the
+    // loop runs one tool call at a time, and the instance it starts makes its
+    // own call before the loop asks again. The loop's own calls pin nothing —
+    // which is what makes `tool_calls` and `text` legal answers to them — and
+    // the pinned call is the one that ends the node.
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "condense",
+                json!({ "passage": "the first passage" }),
+            )]),
+        ),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "line": "the first line" })),
+        ),
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "condense",
+                json!({ "passage": "the second passage" }),
+            )]),
+        ),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "line": "the second line" })),
+        ),
+        Script::new(SONNET, Outcome::text("I have both lines.")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "answer": "it says two lines" })),
+        ),
+    ]);
 
     let Some(run) = harness::invoke(
         "flow-as-tool",
@@ -2081,10 +2107,10 @@ fn a_flow_attached_as_a_tool_reaches_the_model_and_refuses_the_call() {
     ) else {
         return;
     };
-    let failure = run.failed();
+    run.succeeded();
+    assert_eq!(run.outputs()["answer"], "it says two lines");
 
     let recorded = provider.requests();
-    assert_eq!(recorded.len(), 1);
     let offered = &recorded[0];
     assert!(offered.is_valid(), "{:?}", offered.failures());
     assert_eq!(
@@ -2112,21 +2138,126 @@ fn a_flow_attached_as_a_tool_reaches_the_model_and_refuses_the_call() {
         "Condense one passage into a single line.",
         "…and the flow's own `description:` is what the model selects on"
     );
-
+    // The result the model was handed is the instance's `outputs:` — the other
+    // half of grammar 5.4's schema pair, read off the turn that carried it.
+    let returned = serde_json::to_string(&recorded[2].body()).expect("the request serializes");
     assert!(
-        failure.contains(
-            "`flow.condense` attached as a tool is not executed by this compiler release"
-        ),
-        "the call is refused naming the construct rather than answered with a \
-         plausible value: {failure}"
-    );
-    assert!(
-        failure.contains("the same flow reached from a `flow:` node runs"),
-        "…and names the call site that does run: {failure}"
+        returned.contains("the first line"),
+        "the first instance's `outputs:` went back as the tool result: {returned}"
     );
 
-    // The sentence above, checked: the same subflow, instantiated at a `flow:`
-    // node, runs to its outputs.
+    let entries = run.entries("ask");
+    let [entry] = entries.as_slice() else {
+        panic!("`ask` ran once: {entries:?}");
+    };
+    let dispatched = entry["toolDispatches"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the agent node reports what its loop instantiated: {entry}"));
+    assert_eq!(dispatched.len(), 2, "{entry}");
+    assert!(
+        entry["inner"].is_null(),
+        "an agent node carries no `inner`: a model-invoked instance is under its \
+         own dispatch record (`docs/trace.md` §3, §8): {entry}"
+    );
+
+    // q19: the frame is `<tool name>/<call ordinal>` beneath the agent node's
+    // own, so the two calls are two effect sites rather than one.
+    let keys: Vec<&str> = dispatched
+        .iter()
+        .map(|record| {
+            record["idempotencyKey"]
+                .as_str()
+                .expect("every dispatch record carries its key")
+        })
+        .collect();
+    assert!(
+        keys[0].ends_with("/ask/0/condense/0") && keys[1].ends_with("/ask/0/condense/1"),
+        "the call ordinal is what tells the two instances apart: {keys:?}"
+    );
+    for (ordinal, record) in dispatched.iter().enumerate() {
+        assert_eq!(record["index"], json!(ordinal), "{record}");
+        assert_eq!(record["target"], "flow.condense", "{record}");
+        assert_eq!(record["outcome"], "completed", "{record}");
+        assert_eq!(record["attempts"], json!(1), "{record}");
+        assert!(
+            record["route"].is_null() && record["variant"].is_null(),
+            "no `map` routed this dispatch: {record}"
+        );
+        let inner: Vec<&str> = record["inner"]
+            .as_array()
+            .unwrap_or_else(|| panic!("the instance's own trace is on its record: {record}"))
+            .iter()
+            .map(|one| one["node"].as_str().expect("a node id"))
+            .collect();
+        assert_eq!(inner, ["note", "reduce"], "{record}");
+    }
+
+    // q20: the tool-call entry inside the model call records the call and links
+    // to the instance by the key its dispatch record carries.
+    let models = entry["models"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the agent node reports its own calls: {entry}"));
+    assert_eq!(
+        models.len(),
+        4,
+        "the loop's three calls and the pinned one; the instances' calls are on \
+         the instances' own entries (`docs/trace.md` §7.2): {models:?}"
+    );
+    for (ordinal, call) in models.iter().take(2).enumerate() {
+        let asked = call["toolCalls"]
+            .as_array()
+            .unwrap_or_else(|| panic!("the call that asked for a tool records it: {call}"));
+        assert_eq!(asked.len(), 1, "{call}");
+        assert_eq!(asked[0]["name"], "condense", "{call}");
+        assert_eq!(asked[0]["target"], "flow.condense", "{call}");
+        assert_eq!(asked[0]["outcome"], "completed", "{call}");
+        assert_eq!(
+            asked[0]["instance"], keys[ordinal],
+            "the link is the dispatch record's own key, so the join is string \
+             equality (`docs/trace.md` §7.3): {call}"
+        );
+    }
+    for call in models.iter().skip(2) {
+        assert!(
+            call["toolCalls"].is_null(),
+            "a call whose answer asked for no tool carries no record of one: {call}"
+        );
+    }
+
+    // The consequence q19 is *for*: a store write inside the instance derives
+    // its key from that instance's path (grammar 9.4, D104), so two calls write
+    // under two keys and the backend dedupes neither.
+    let writes: Vec<&Value> = dispatched
+        .iter()
+        .flat_map(|record| {
+            record["inner"][0]["stores"]
+                .as_array()
+                .unwrap_or_else(|| panic!("the instance's store op is on its own entry: {record}"))
+        })
+        .collect();
+    assert_eq!(writes.len(), 2, "{writes:?}");
+    assert_eq!(
+        writes[0]["idempotencyKey"],
+        json!(format!("{}/note/0", keys[0])),
+        "{:?}",
+        writes[0]
+    );
+    assert_eq!(
+        writes[1]["idempotencyKey"],
+        json!(format!("{}/note/0", keys[1])),
+        "{:?}",
+        writes[1]
+    );
+    for write in &writes {
+        assert_eq!(
+            write["deduped"],
+            json!(false),
+            "a second real write is not a duplicate of the first: {write}"
+        );
+    }
+
+    // The same subflow at a `flow:` node runs the same way, which is what makes
+    // PRD 5.1's equivalence a comparison rather than an assertion.
     provider.reset();
     provider.enqueue(Script::new(
         SONNET,
@@ -2142,6 +2273,156 @@ fn a_flow_attached_as_a_tool_reaches_the_model_and_refuses_the_call() {
     };
     piped.succeeded();
     assert_eq!(piped.outputs()["line"], "it says one line");
+}
+
+/// Arguments a flow-as-tool call's `inputs:` refuses fail the **agent node**,
+/// exactly as a `tool.*`'s and a store tool's do.
+///
+/// The three tool surfaces an agent can reach are one surface as far as an
+/// argument contract goes (grammar 5.4, 6, 11.5): the schema the model was
+/// constrained by is the schema its arguments are parsed with (PRD §9.16), and a
+/// mismatch leaves the tool, so grammar 9's chain decides the run. Answering it
+/// back to the model as a tool result instead would make "attached as a tool"
+/// mean one thing for a `flow.*` and another for everything else, and would put
+/// the decision about a refused contract in the hands of the component PRD 5.3
+/// takes decisions away from.
+///
+/// Nothing is instantiated, and that is the half worth a test of its own: the
+/// entry carries no dispatch record, because there was no instance to record.
+#[test]
+fn arguments_a_flow_tools_inputs_refuses_fail_the_agent_node() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        // `passage` declares `min_length: 1`, which reaches the model as
+        // `minLength` and is what this answer does not satisfy.
+        Outcome::tool_calls(vec![ToolCall::new("condense", json!({ "passage": "" }))]),
+    ));
+
+    let Some(run) = harness::invoke(
+        "flow-as-tool",
+        "flow.ask",
+        &[("question", "what does it say?")],
+        &provider,
+    ) else {
+        return;
+    };
+    let failure = run.failed();
+    assert!(
+        failure.contains("the arguments `condense` was called with"),
+        "the failure names the tool whose contract the arguments failed: {failure}"
+    );
+
+    let entries = run.entries("ask");
+    let [entry] = entries.as_slice() else {
+        panic!("`ask` ran once: {entries:?}");
+    };
+    assert_eq!(entry["outcome"], "failed", "{entry}");
+    assert!(
+        entry["toolDispatches"].is_null(),
+        "nothing was instantiated, so there is no dispatch to report: {entry}"
+    );
+    let asked = entry["models"][0]["toolCalls"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the call that asked for the tool records it: {entry}"));
+    assert_eq!(asked.len(), 1, "{entry}");
+    assert_eq!(asked[0]["outcome"], "failed", "{entry}");
+    assert!(
+        asked[0]["instance"].is_null(),
+        "…and links to no instance, because the call started none: {entry}"
+    );
+    assert!(
+        asked[0]["error"]
+            .as_str()
+            .is_some_and(|text| text.contains("the arguments `condense` was called with")),
+        "{entry}"
+    );
+}
+
+/// A flow-as-tool call whose **instance** failed fails the agent node, and the
+/// instance's trace is the account of why.
+///
+/// The failure never reaches the model as a plausible result — PRD 5.3 makes the
+/// runtime decide every transition, and a subflow that did not run is not a
+/// thing the model gets to answer around. What a reader is left with is the
+/// whole of what happened inside the boundary, on the dispatch record rather
+/// than on the agent node's own entry: `TraceEntry.inner` is a `flow:` node's
+/// field (`docs/trace.md` §3, §8), and an agent node that claimed one would
+/// report an instance it never ran.
+#[test]
+fn a_flow_tool_call_whose_instance_failed_fails_the_agent_node_carrying_its_trace() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "condense",
+                json!({ "passage": "a long passage" }),
+            )]),
+        ),
+        // `agent.summariser` declares `line: { min_length: 1 }`, so the instance
+        // fails at its own contract (PRD 5.2) after its store node has written.
+        Script::new(SONNET, Outcome::structured(json!({ "line": "" }))),
+    ]);
+
+    let Some(run) = harness::invoke(
+        "flow-as-tool",
+        "flow.ask",
+        &[("question", "what does it say?")],
+        &provider,
+    ) else {
+        return;
+    };
+    let failure = run.failed();
+    assert!(
+        failure.contains("flow.condense"),
+        "the failure names the flow the model called: {failure}"
+    );
+
+    let entries = run.entries("ask");
+    let [entry] = entries.as_slice() else {
+        panic!("`ask` ran once: {entries:?}");
+    };
+    assert_eq!(entry["outcome"], "failed", "{entry}");
+    assert!(
+        entry["inner"].is_null(),
+        "the instance is on its dispatch record, never on the agent's entry: {entry}"
+    );
+    let dispatched = entry["toolDispatches"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the instance that failed is still reported: {entry}"));
+    let [record] = dispatched.as_slice() else {
+        panic!("one call, one record: {entry}");
+    };
+    assert_eq!(record["outcome"], "failed", "{record}");
+    assert!(
+        record["error"]
+            .as_str()
+            .is_some_and(|text| text.contains("agent.summariser")),
+        "{record}"
+    );
+    let inner = record["inner"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a failed instance carries its trace too: {record}"));
+    assert_eq!(
+        inner
+            .iter()
+            .map(|one| (
+                one["node"].as_str().expect("a node id"),
+                one["outcome"].as_str().expect("an outcome")
+            ))
+            .collect::<Vec<_>>(),
+        [("note", "completed"), ("reduce", "failed")],
+        "the store node's write happened and the model call is what failed: {record}"
+    );
+    assert_eq!(
+        entry["models"][0]["toolCalls"][0]["outcome"], "failed",
+        "…and the call the model made says so too: {entry}"
+    );
+    assert_eq!(
+        entry["models"][0]["toolCalls"][0]["instance"], record["idempotencyKey"],
+        "…and still links to the instance it ran: {entry}"
+    );
 }
 
 /// An edge guard routes on the source node's structured output, deterministically
@@ -7166,6 +7447,134 @@ fn a_second_traversals_pause_is_addressed_apart_from_the_first() {
             "each answer reaches the run through the node's `writes:`: {entry}"
         );
     }
+}
+
+/// A `human` node inside a flow a **model** called is answerable like any other.
+///
+/// The two runtimes compose rather than special-case each other, and this is
+/// where that is decided. Grammar 8.7 names the two constructs that may not
+/// reach a pause — a `respond: sync` trigger and a detached dispatch — and
+/// grammar 7.7 clause 4 walks an agent's `tools:` for both, so a flow-as-tool
+/// call reached from an `async` trigger is neither and has to *work*.
+///
+/// Three things make it work, and each is somebody else's mechanism reaching
+/// this composition unchanged: the pause belongs to the **child instance**, so
+/// its wait id is that instance's own path with the `human` node's frame on the
+/// end (grammar 9.4, PRD resolved q19) — `draft/0/sign/0/approve/0` reads as
+/// "the `approve` node, inside the first `sign` call agent node `draft` made";
+/// the wait board is keyed by the execution, which the instance shares, so the
+/// status route publishes the question and the resume route addresses it; and
+/// the agent node's own budget is held still while the pause is open
+/// (Decision D102), which is the property `defaults: { timeout: 60s }` here
+/// would otherwise break — the node holding the timer is now also the node
+/// dividing it across a model route.
+#[test]
+fn a_pause_inside_a_flow_a_model_called_is_published_and_answered_like_any_other() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        // The loop asks for sign-off, and the flow it calls stops at its `human`
+        // node. The two calls after it are the loop ending and the pinned call,
+        // and neither is served until somebody answers.
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "sign",
+                json!({ "draft": "a drafted answer" }),
+            )]),
+        ),
+        Script::new(SONNET, Outcome::text("It is signed off.")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "answer": "a drafted answer" })),
+        ),
+    ]);
+
+    let Some(served) = harness::serve("flow-as-tool", &provider) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+
+    let started = app
+        .post_json("/decisions", &json!({ "question": "ship it?" }))
+        .expect("the trigger's route answers");
+    assert_eq!(started.status, 202, "{:?}", started.body);
+    let execution = started.json()["execution_id"]
+        .as_str()
+        .expect("an execution id")
+        .to_string();
+
+    let status = harness::settled(&app, &execution);
+    assert_eq!(
+        status["status"], "interrupted",
+        "the run stopped inside the flow the model called: {status}"
+    );
+    let interrupts = status["interrupts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("an interrupted report names its pauses: {status}"));
+    assert_eq!(interrupts.len(), 1, "{status}");
+    let waiting = &interrupts[0];
+    assert_eq!(
+        waiting["wait_id"], "draft/0/sign/0/approve/0",
+        "the pause is addressed through the tool call that reached it, which is \
+         grammar 9.4's frame with the `human` node's on the end: {waiting}"
+    );
+    assert_eq!(waiting["flow"], "flow.sign", "{waiting}");
+    assert_eq!(waiting["node"], "approve", "{waiting}");
+    assert_eq!(
+        waiting["input"],
+        json!({ "draft": "a drafted answer" }),
+        "what the human is shown is the child node's own `input:`, built from \
+         the arguments the model sent: {waiting}"
+    );
+
+    let resumed = app
+        .post_json(
+            &format!("/executions/{execution}/resume?wait=draft%2F0%2Fsign%2F0%2Fapprove%2F0"),
+            &json!({ "decision": "approve" }),
+        )
+        .expect("the resume route answers");
+    assert!(
+        resumed.status == 200 || resumed.status == 202,
+        "{resumed:?}"
+    );
+
+    let finished = harness::settled(&app, &execution);
+    assert_eq!(
+        finished["status"], "completed",
+        "the answer went back into the instance, the instance answered the tool \
+         call, and the loop carried on: {finished}"
+    );
+    assert_eq!(
+        finished["outputs"]["answer"], "a drafted answer",
+        "{finished}"
+    );
+
+    // The pause is on the entry of the node that held it — inside the instance,
+    // reached through the dispatch record the call filed (`docs/trace.md` §3,
+    // §5) — and on no node above it.
+    let trace = finished["trace"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a finished report carries its trace: {finished}"));
+    let agent = trace
+        .iter()
+        .find(|entry| entry["node"] == "draft")
+        .unwrap_or_else(|| panic!("the agent node has an entry: {finished}"));
+    assert!(
+        agent["human"].is_null(),
+        "the wait was not this node's: {agent}"
+    );
+    let record = &agent["toolDispatches"][0];
+    assert_eq!(record["target"], "flow.sign", "{agent}");
+    assert_eq!(record["outcome"], "completed", "{agent}");
+    let inner = record["inner"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the instance's trace is on its record: {agent}"));
+    let paused = inner
+        .iter()
+        .find(|entry| entry["node"] == "approve")
+        .unwrap_or_else(|| panic!("the `human` node has an entry: {agent}"));
+    assert_eq!(paused["human"]["settled"], "resumed", "{paused}");
+    assert!(paused["human"]["settledAt"].is_string(), "{paused}");
 }
 
 /// `agent-compose run` reports the pause it cannot answer, and exits on a code

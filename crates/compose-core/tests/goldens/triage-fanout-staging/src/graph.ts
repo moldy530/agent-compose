@@ -738,11 +738,13 @@ const flowTriageNodeClassify: runtime.NodeDescriptor = {
       input,
       runtime.historyTurns(view.state["messages"] as unknown[]),
       context,
+      { path: runtime.instancePath(view, "classify"), policy: view.run.policy },
     );
     return {
       output: runtime.parseResult(agentTriageOutput, answer.output, "the answer of `agent.triage`"),
       history: answer.history,
       models: answer.models,
+      toolDispatches: answer.toolDispatches,
     };
   },
   writes: [],
@@ -799,11 +801,12 @@ const flowTriageNodeDispatchMap: runtime.MapDescriptor = {
         "file": runtime.toJson(runtime.evaluate("finding.file", roots)),
         "patch_hint": runtime.toJson(runtime.evaluate("finding.patch_hint", roots)),
       }),
-      run: async (input, context) => {
-        const answer = await runtime.callAgent(agentFixer, input, [], context);
+      run: async (input, context, site) => {
+        const answer = await runtime.callAgent(agentFixer, input, [], context, { path: site.path });
         return {
           output: runtime.parseResult(agentFixerOutput, answer.output, "the answer of `agent.fixer`"),
           models: answer.models,
+          toolDispatches: answer.toolDispatches,
         };
       },
       writes: [
@@ -1029,11 +1032,13 @@ const flowTriageNodeSummarize: runtime.NodeDescriptor = {
       input,
       runtime.historyTurns(view.state["messages"] as unknown[]),
       context,
+      { path: runtime.instancePath(view, "summarize"), policy: view.run.policy },
     );
     return {
       output: runtime.parseResult(agentSummarizerOutput, answer.output, "the answer of `agent.summarizer`"),
       history: answer.history,
       models: answer.models,
+      toolDispatches: answer.toolDispatches,
     };
   },
   writes: [

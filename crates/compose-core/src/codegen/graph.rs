@@ -877,9 +877,16 @@ fn agents(
                 };
                 let DefinitionBody::Tool(tool) = &attached.body else {
                     // A `flow.*` here is flow-as-tool (grammar 5.4): a real tool
-                    // on the wire, whose call this release does not serve.
+                    // on the wire, and a call to it instantiates the module.
                     if let DefinitionBody::Flow(attached) = &attached.body {
-                        text.push_str(&flow_tool(ir, surfaces, &tool_address, attached));
+                        text.push_str(&flow_tool(
+                            ir,
+                            names,
+                            surfaces,
+                            imported,
+                            &tool_address,
+                            attached,
+                        ));
                     }
                     continue;
                 };
@@ -921,30 +928,34 @@ const DEFAULT_TOOL_ITERATIONS: i64 = 8;
 
 /// One `flow.*` in an agent's `tools:` — flow-as-tool (grammar 5.4, PRD 5.1).
 ///
-/// The tool is **emitted**, with the name, description and parameter schema
-/// grammar 5.4 gives it: its local name is the name the model calls, its
-/// `description:` — which the validator requires exactly here — is the selection
-/// signal, and its `inputs:` is the parameter schema. Only the call is refused,
-/// by an `invoke` that throws `runtime.Unimplemented` naming the construct.
+/// The tool is emitted with the contract grammar 5.4 gives it — its local name
+/// is the name the model calls, its `description:`, which the validator requires
+/// exactly here, is the selection signal, and its `inputs:` is the parameter
+/// schema — and a call to it **instantiates the module**, which is PRD 5.1's
+/// flow-as-tool equivalence executed rather than asserted.
 ///
-/// That is this module's posture for a construct it does not run, and the
-/// alternative it replaces is the one the header calls out by name: an agent
-/// whose `tools:` names a flow used to reach the provider with that tool simply
-/// *absent* — no diagnostic at `validate`, none at `build`, and a model that
-/// could not call what the composition attached. The compiler analyses the
-/// attachment as a call everywhere else — grammar 7.7 clause 4 carries session
-/// coherence, sync interrupt-freedom and recursion through it, and grammar
-/// 11.5's collision rule reserves its name against a store's — so dropping it at
-/// the last step was the emitter answering a plausible value.
+/// Everything the instantiation needs that a module-level binding cannot know is
+/// handed to `runtime.callSubflowTool` at the call: the invoking agent
+/// execution's instance path and the ordinal of this call, which together are
+/// the frame grammar 9.4 gives it (PRD resolved q19), and the level-1 policy
+/// that reached the calling instance. What is emitted here is the half that *is*
+/// a compile-time constant — which module, under which name, held to which
+/// parameter schema.
 ///
-/// What is still not here is the instantiation. A `flow:` node hands
-/// `runtime.runSubflow` an instance path and a policy off its `NodeView`
-/// (grammar 9.3, 9.4), and neither exists at a tool call: how many times a model
-/// calls a tool is the model's, so the effect site a nested store write derives
-/// its idempotency key from is not derivable the way a node's is, and where an
-/// instance's own trace joins the caller's is undecided. Those are questions for
-/// the PRD, not for this function to answer quietly.
-fn flow_tool(ir: &Ir, surfaces: &[schema::Surface<'_>], address: &str, flow: &Flow) -> String {
+/// The parameter schema is emitted twice, and the two columns are the same
+/// document: the JSON below is what constrains the model, and the emitted Zod
+/// beside it is what the arguments are parsed with, which is the constrain ==
+/// parse equality PRD §9.16 makes structured output load-bearing for. A flow
+/// with no `inputs:` is a no-argument tool: no field map is written anywhere, so
+/// there is no schema to name and the instance starts on an empty object.
+fn flow_tool(
+    ir: &Ir,
+    names: &Names,
+    surfaces: &[schema::Surface<'_>],
+    imported: &mut Vec<String>,
+    address: &str,
+    flow: &Flow,
+) -> String {
     let local = address.split_once('.').map_or(address, |(_, rest)| rest);
     let description = flow.description.as_ref().map_or_else(
         // Unreachable over a composition `validate` accepted: grammar 5.4 makes
@@ -956,6 +967,13 @@ fn flow_tool(ir: &Ir, surfaces: &[schema::Surface<'_>], address: &str, flow: &Fl
         |description| description.value.clone(),
     );
     let parameters = flow_parameters(ir, surfaces, address);
+    let inputs = if flow.inputs.is_some() {
+        let schema = names.value(&format!("{address}.inputs")).to_string();
+        imported.push(schema.clone());
+        format!(", inputs: {schema}")
+    } else {
+        String::new()
+    };
     let mut text = String::from("    {\n");
     text.push_str(&format!("      name: {},\n", names::string(local)));
     text.push_str(&format!("      address: {},\n", names::string(address)));
@@ -968,12 +986,11 @@ fn flow_tool(ir: &Ir, surfaces: &[schema::Surface<'_>], address: &str, flow: &Fl
         json_literal(&schema::json_fields(parameters.as_ref()), "      ")
     ));
     text.push_str(&format!(
-        "      invoke: () => {{\n        throw new runtime.Unimplemented({}, {});\n      }},\n",
-        names::string(&format!("`{address}` attached as a tool")),
-        names::string(
-            "a subflow instantiated from a model's tool call — the same flow \
-             reached from a `flow:` node runs (grammar 8.5, 5.4)"
-        )
+        "      invoke: (args, context, call) =>\n        runtime.callSubflowTool(\n          \
+         {{ name: {}, binding: {}{inputs} }},\n          args,\n          context,\n          \
+         call,\n        ),\n",
+        names::string(local),
+        names.value(&format!("{address}.binding")),
     ));
     text.push_str("    },\n");
     text
@@ -1851,15 +1868,27 @@ fn activity(
         NodeKind::Agent { agent } => {
             let binding = names.value(&agent.value.to_string());
             let schema = output_schema.expect("an agent node has an output surface");
+            // Where this agent execution sits, for the one tool that needs it:
+            // a `flow.*` in its `tools:` instantiates a module beneath this
+            // node's own frame (grammar 5.4, 9.4, PRD resolved q19), and the
+            // level-1 policy that reached this instance crosses with it
+            // (grammar 9.3, Decision D79). Emitted on every agent node rather
+            // than only the ones with a `flow.*` attached: what a node knows
+            // about its own site is not a property of its tool list, and a
+            // conditional would make the emitter the thing to audit when a
+            // frame comes out wrong.
             format!(
                 "  run: async (input, context, view) => {{\n    \
                  const answer = await runtime.callAgent(\n      {binding},\n      input,\n      \
-                 runtime.historyTurns(view.state[\"messages\"] as unknown[]),\n      context,\n    );\n    \
+                 runtime.historyTurns(view.state[\"messages\"] as unknown[]),\n      context,\n      \
+                 {{ path: runtime.instancePath(view, {node}), policy: view.run.policy }},\n    );\n    \
                  return {{\n      \
                  output: runtime.parseResult({schema}, answer.output, {subject}),\n      \
                  history: answer.history,\n      \
-                 models: answer.models,\n    \
+                 models: answer.models,\n      \
+                 toolDispatches: answer.toolDispatches,\n    \
                  }};\n  }},\n",
+                node = names::string(id),
                 subject = names::string(&format!("the answer of `{}`", agent.value))
             )
         }
@@ -2399,12 +2428,19 @@ fn dispatch_run(
             // dispatched instance runs on a fresh conversation that is discarded
             // when it completes, and there is no key to say otherwise
             // (grammar 10.4, Decision D105).
+            // The dispatch's own instance path is this agent's site, so a
+            // `flow.*` in its `tools:` instantiates beneath the item rather
+            // than beneath the map node (grammar 9.4, PRD resolved q19). No
+            // policy travels with it: grammar 8.6 rule 10 resolves a dispatched
+            // instance's nodes with level 1 absent, and what the agent's own
+            // tool loop starts is inside that instance.
             format!(
-                "{indent}run: async (input, context) => {{\n{indent}  \
-                 const answer = await runtime.callAgent({binding}, input, [], context);\n{indent}  \
+                "{indent}run: async (input, context, site) => {{\n{indent}  \
+                 const answer = await runtime.callAgent({binding}, input, [], context, {{ path: site.path }});\n{indent}  \
                  return {{\n{indent}    \
                  output: runtime.parseResult({schema}, answer.output, {subject}),\n{indent}    \
-                 models: answer.models,\n{indent}  \
+                 models: answer.models,\n{indent}    \
+                 toolDispatches: answer.toolDispatches,\n{indent}  \
                  }};\n{indent}\
                  }},\n",
                 subject = names::string(&format!("the answer of `{target}`"))
@@ -3900,17 +3936,19 @@ flow.f:
     }
 
     /// A flow attached as a tool is **on the wire** with the contract grammar
-    /// 5.4 gives it, and only its call is refused.
+    /// 5.4 gives it, and a call to it instantiates the module.
     ///
     /// The two halves are one rule. A tool the compiler drops is a model that
     /// cannot call what the composition attached and a run that says nothing
     /// about it — no diagnostic at `validate`, none at `build`, and an agent the
     /// validator analysed the attachment of (grammar 7.7 clause 4) reaching the
     /// provider without it. So the name, the description grammar 5.4 requires
-    /// here, and the `inputs:` schema are all emitted; the `invoke` is where
-    /// this release says what it does not do.
+    /// here, and the `inputs:` schema are all emitted; the `invoke` is where the
+    /// call is served, by handing `runtime.callSubflowTool` the three things a
+    /// module-level binding can know — which flow, under which name, and the
+    /// emitted Zod its arguments are parsed with (PRD 5.1, resolved q19/q20).
     #[test]
-    fn a_flow_attached_as_a_tool_is_offered_to_the_model_and_refuses_its_call() {
+    fn a_flow_attached_as_a_tool_is_offered_to_the_model_and_instantiates_on_a_call() {
         let emitted = emit(&format!(
             r#"{PREAMBLE}
 agent.caller:
@@ -3962,23 +4000,104 @@ flow.f:
         );
         // …and its `inputs:` is the parameter schema, `min_length:` included.
         assert!(emitted.contains("\"minLength\": 1"), "{emitted}");
+        // The call is served: the module the tool instantiates, and the emitted
+        // Zod for the same `inputs:` the JSON column above constrained the model
+        // with — constrain == parse, at the one surface a model supplies the
+        // arguments (PRD §9.16).
         assert!(
-            emitted
-                .contains("throw new runtime.Unimplemented(\"`flow.helper` attached as a tool\","),
+            emitted.contains(
+                "{ name: \"helper\", binding: flowHelperBinding, inputs: flowHelperInputs }"
+            ),
             "{emitted}"
         );
         // A flow with no `inputs:` is a no-argument tool rather than a panic:
         // the empty parameter list is written nowhere, so there is no field map
-        // to look up (see `flow_parameters`).
+        // to look up and no schema to name (see `flow_parameters`).
         assert!(emitted.contains("      name: \"bare\","), "{emitted}");
         assert!(
-            emitted.contains("throw new runtime.Unimplemented(\"`flow.bare` attached as a tool\","),
+            emitted.contains("{ name: \"bare\", binding: flowBareBinding }"),
             "{emitted}"
         );
+        // The construct is emitted rather than refused or commented away.
+        assert!(!emitted.contains("Unimplemented"), "{emitted}");
         assert!(
             !emitted
                 .contains("is a flow attached as a tool, which this compiler release does not run"),
             "the construct is emitted rather than commented away:\n{emitted}"
+        );
+    }
+
+    /// An `agent:` node hands `callAgent` the site its tool loop instantiates
+    /// beneath (grammar 9.4, PRD resolved q19).
+    ///
+    /// Emitted on **every** agent node rather than only the ones with a `flow.*`
+    /// attached, which is the half worth pinning: a conditional would make the
+    /// emitter the thing to audit when an instance path comes out wrong, and the
+    /// site a node execution sits at is not a property of its tool list. The two
+    /// call sites differ in exactly one thing, and it is grammar 8.6 rule 10's:
+    /// a dispatched instance resolves its nodes with level 1 absent, so a
+    /// `map`-dispatched agent passes its dispatch path and no policy.
+    #[test]
+    fn every_agent_call_site_hands_the_loop_the_instance_it_would_start_under() {
+        let emitted = emit(&format!(
+            r#"{PREAMBLE}
+agent.caller:
+  model: model.m
+  prompt: Answer.
+  input: {{ goal: {{ type: string }} }}
+  output:
+    drafts:
+      type: array
+      max_items: 4
+      items: {{ type: string }}
+
+agent.each:
+  model: model.m
+  prompt: Answer.
+  input: {{ goal: {{ type: string }} }}
+  output: {{ draft: {{ type: string }} }}
+
+flow.f:
+  inputs: {{ goal: {{ type: string }} }}
+  outputs: {{ notes: {{ type: array, max_items: 4, items: {{ type: string }} }} }}
+  nodes:
+    say:
+      agent: agent.caller
+      input: {{ goal: "input.goal" }}
+    fan:
+      map:
+        over: "say.output.drafts"
+        as: one
+        node: agent.each
+        max_concurrency: 2
+        input: {{ goal: "one" }}
+        writes: {{ draft: notes }}
+  edges:
+    - {{ from: start, to: say }}
+    - {{ from: say, to: fan }}
+    - {{ from: fan, to: end }}
+"#
+        ));
+        assert!(
+            emitted.contains(
+                "{ path: runtime.instancePath(view, \"say\"), policy: view.run.policy },"
+            ),
+            "an `agent:` node's own frame and the level-1 policy that reached its \
+             instance (grammar 9.3, D79):\n{emitted}"
+        );
+        assert!(
+            emitted
+                .contains("runtime.callAgent(agentEach, input, [], context, { path: site.path })"),
+            "a dispatched agent's site is the dispatch's, and no policy crosses \
+             (grammar 8.6 rule 10):\n{emitted}"
+        );
+        // What the loop instantiated reaches the node's trace entry from both.
+        assert_eq!(
+            emitted
+                .matches("toolDispatches: answer.toolDispatches,")
+                .count(),
+            2,
+            "{emitted}"
         );
     }
 

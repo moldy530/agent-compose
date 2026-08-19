@@ -31,7 +31,7 @@
 //! INSTA_UPDATE=always cargo test -p agent-compose --test trace_format_stability
 //! ```
 //!
-//! # Why these six runs
+//! # Why these seven runs
 //!
 //! Between them they reach every record **type** the format has, every member of
 //! `TraceDocument.status`, and the entry shapes a reader meets first: a bounded
@@ -42,8 +42,10 @@
 //! model call that was served by its second member; a spent route for a
 //! **failed** run — the shape a reader most often opens a trace for, and the one
 //! whose rules (no writes, routing only where routing failed) exist nowhere
-//! else; and a run that ended holding a `human` pause, for the `human` record
-//! and the `"interrupted"` document status version `2` introduced (§10.3.1).
+//! else; a run that ended holding a `human` pause, for the `human` record
+//! and the `"interrupted"` document status version `2` introduced (§10.3.1);
+//! and a flow attached as a tool and called twice, for the tool-call record and
+//! the second dispatch-record carrier version `3` introduced (§10.3.2).
 //!
 //! A run added here is what keeps that first sentence true: the count is a claim
 //! about coverage, so a record type or a status member added to the format
@@ -528,6 +530,60 @@ fn a_routed_fan_outs_trace_document_keeps_its_shape() {
         "fanout",
         "flow.triage",
         &[("report", "a raw report")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    insta::assert_snapshot!(document(&run));
+}
+
+/// A flow attached to an agent as a tool, called twice: the two record surfaces
+/// version `3` added (`docs/trace.md` §5, §7.3, §10.3.2).
+///
+/// One run reaches all three halves of PRD §9.20's join at once — the dispatch
+/// records under `toolDispatches`, each carrying an instance path no other call
+/// derives (PRD §9.19) and the instance's whole trace, and the `toolCalls` entry
+/// inside each model call linking to one by its key. It is also the only
+/// snapshot here whose entries hold a nested trace reached from something other
+/// than a `map`, which is what §8's two-place rule is about.
+#[test]
+fn a_flow_tool_runs_trace_document_keeps_its_shape() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "condense",
+                json!({ "passage": "the first passage" }),
+            )]),
+        ),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "line": "the first line" })),
+        ),
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "condense",
+                json!({ "passage": "the second passage" }),
+            )]),
+        ),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "line": "the second line" })),
+        ),
+        Script::new(SONNET, Outcome::text("I have both lines.")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "answer": "it says two lines" })),
+        ),
+    ]);
+
+    let Some(run) = harness::run(
+        "flow-as-tool",
+        "flow.ask",
+        &[("question", "what does it say?")],
         &provider,
     ) else {
         return;
@@ -1105,7 +1161,7 @@ fn the_status_route_carries_the_version_beside_its_trace() {
     );
     assert_eq!(
         finished["trace_version"],
-        json!(2),
+        json!(3),
         "…and the version that describes them, beside them (`docs/trace.md` §1): \
          {finished}"
     );

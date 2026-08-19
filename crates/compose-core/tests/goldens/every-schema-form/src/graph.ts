@@ -492,9 +492,13 @@ const agentShaper: runtime.AgentBinding = {
         ],
         "type": "object"
       },
-      invoke: () => {
-        throw new runtime.Unimplemented("`flow.condense` attached as a tool", "a subflow instantiated from a model's tool call — the same flow reached from a `flow:` node runs (grammar 8.5, 5.4)");
-      },
+      invoke: (args, context, call) =>
+        runtime.callSubflowTool(
+          { name: "condense", binding: flowCondenseBinding, inputs: flowCondenseInputs },
+          args,
+          context,
+          call,
+        ),
     },
   ],
   maxToolIterations: 8,
@@ -583,11 +587,13 @@ const flowShapeNodeShape: runtime.NodeDescriptor = {
       input,
       runtime.historyTurns(view.state["messages"] as unknown[]),
       context,
+      { path: runtime.instancePath(view, "shape"), policy: view.run.policy },
     );
     return {
       output: runtime.parseResult(agentShaperOutput, answer.output, "the answer of `agent.shaper`"),
       history: answer.history,
       models: answer.models,
+      toolDispatches: answer.toolDispatches,
     };
   },
   writes: [

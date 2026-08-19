@@ -36,7 +36,11 @@
 //
 // A `map` dispatches its instances **inside the map node's own task**
 // ([`runMap`]), and a `flow:` node instantiates its subflow as a separate run of
-// a separate compiled graph ([`runSubflow`]). Grammar 7.6's codegen note leaves
+// a separate compiled graph ([`runSubflow`]). A `flow.*` in an agent's `tools:`
+// is the third way in and reaches the same function: [`callSubflowTool`] starts
+// one instance per model tool call, beneath the frame grammar 9.4 gives that
+// call (PRD 5.1's flow-as-tool, resolved q19 and q20).
+// Grammar 7.6's codegen note leaves
 // the shaping to M1 and fixes P1 and P2 instead; the reasons this is the shaping
 // that satisfies grammar 8.6 and 10.1 — and what a `Send` into the parent graph
 // cannot express — are the ledger in `codegen::graph`, which is where a reader
@@ -123,11 +127,38 @@ export class NoViableRoute extends Error {
   }
 }
 
-/** A construct this compiler release parses, validates, and does not yet run. */
-export class Unimplemented extends Error {
-  constructor(what: string, bullet: string) {
-    super(`${what} is not executed by this compiler release: ${bullet}`);
-    this.name = "Unimplemented";
+/**
+ * A subflow a model invoked that did not answer (grammar 5.4, PRD 5.1).
+ *
+ * The boundary class of flow-as-tool, and it is a boundary in the same sense
+ * [`ItemFailure`] is one: what happened below it is the *child instance's*
+ * business, already recorded on the [`DispatchRecord`] this call filed
+ * (`docs/trace.md` §5, PRD §9.20), so [`traceOf`] and [`dispatchesOf`] stop
+ * here rather than walking on and stamping the child's account onto the
+ * **agent** node's entry — where §3 says a `flow:` node's instance and a
+ * `map`'s fan-out are, and an agent node's tool loop is not.
+ *
+ * It wraps every way a call can fail, including a pause this run cannot answer:
+ * `interruptOf`, `abandonedOf` and `expiryOf` all walk the `cause` chain, so
+ * wrapping is transparent to them and the run still ends the way the pause says
+ * it does.
+ *
+ * What it does **not** wrap is the arguments failing the flow's own `inputs:`.
+ * That failure happens before anything is instantiated, and it is reported the
+ * way every other tool surface reports one — see [`callSubflowTool`].
+ */
+export class ToolFailure extends Error {
+  /** The name the model called it by (grammar 5.4). */
+  readonly tool: string;
+  /** The flow behind that name, as a typed address (grammar 2.2). */
+  readonly target: string;
+
+  constructor(tool: string, target: string, cause: unknown) {
+    super(`\`${tool}\` — the flow \`${target}\` a model called — failed: ${describe(cause)}`);
+    this.name = "ToolFailure";
+    this.tool = tool;
+    this.target = target;
+    this.cause = cause;
   }
 }
 
@@ -550,6 +581,25 @@ export interface RunContext {
    * this decides the set.
    */
   readonly modelCalls?: ModelCall[];
+  /**
+   * Where a subflow a **model** invoked records its dispatch, for this node's
+   * trace entry (grammar 5.4, PRD §9.20, `docs/trace.md` §5).
+   *
+   * The third of the same family, and it is here for the third instance of one
+   * reason: a flow-as-tool call happens inside an agent's tool loop, which is
+   * inside an activity, and an activity that **throws** returns no answer — so a
+   * record that travelled only on the answer would be missing from exactly the
+   * run a reader opens the trace for, the one whose fourth tool call failed
+   * after three succeeded. Every instance a model started really ran, and its
+   * trace is the only account of what it did.
+   *
+   * **Absent on a detached delivery's context**, with [`deadline`],
+   * [`storeRecords`][`RunContext.storeRecords`] and
+   * [`modelCalls`][`RunContext.modelCalls`], and for their reason: the join
+   * never waits for it (Decision D94), so a record it pushed would be on the
+   * node's entry or not depending on when the sink answered.
+   */
+  readonly toolDispatches?: DispatchRecord[];
 }
 
 /**
@@ -684,6 +734,7 @@ export async function runActivity<T>(
   storeRecords?: StoreRecord[],
   modelCalls?: ModelCall[],
   innerTraces?: TraceEntry[],
+  toolDispatches?: DispatchRecord[],
 ): Promise<{ value: T; attempts: number }> {
   const attempts = 1 + (policy.retry?.max ?? 0);
   const controller = new AbortController();
@@ -767,6 +818,7 @@ export async function runActivity<T>(
           node,
           ...(storeRecords === undefined ? {} : { storeRecords }),
           ...(modelCalls === undefined ? {} : { modelCalls }),
+          ...(toolDispatches === undefined ? {} : { toolDispatches }),
         });
         // The loser of the race rejects with nobody awaiting it — an activity
         // that observes the abort, after the deadline has already answered for
@@ -1003,6 +1055,50 @@ export interface ModelCall {
   readonly failovers: readonly Failover[];
   /** What ended the call, when no member answered it. */
   readonly refused?: Refusal;
+  /**
+   * What this call's answer asked the agent's tools to do, one record per tool
+   * call the loop ran (`docs/trace.md` §7.3, PRD §9.20).
+   *
+   * The one field of this record the *loop* writes rather than [`callModel`],
+   * and therefore the one that is not `readonly`: a tool call is run after its
+   * answer has come back, so there is nothing to put here at the moment the
+   * record is made. The array is the loop's channel into the record of the call
+   * that asked for them, and it holds the very objects the loop is filling in —
+   * so a call that ends the node still reports the tool call that ended it, by
+   * the same identity [`merged`] relies on.
+   */
+  toolCalls?: ToolCallRecord[];
+}
+
+/**
+ * One tool call an agent's loop ran, on [`ModelCall.toolCalls`].
+ *
+ * PRD §9.20 asks the tool loop's story to be complete inside the `ModelCall` at
+ * the cost of one indirection: what the model asked for, what came of it, and —
+ * for a `flow.*` attached as a tool (grammar 5.4) — a **link** to the instance
+ * that answered it. The instance's own trace is not here; it is on the
+ * [`DispatchRecord`] this call filed, which [`instance`] names.
+ */
+export interface ToolCallRecord {
+  /** The name the model called, as the request offered it. */
+  readonly name: string;
+  /**
+   * The component behind that name, as a typed address (grammar 2.2). Absent on
+   * the one call with no component behind it: a name the agent does not offer.
+   */
+  readonly target?: string;
+  /** Whether the loop handed the model a result, or the call ended the node. */
+  readonly outcome: "completed" | "failed";
+  /**
+   * The child instance this call ran, as the dispatch record carrying its trace
+   * spells itself in `idempotencyKey` — so the link is string equality.
+   *
+   * Read off the record the call filed rather than derived a second time, which
+   * is what makes the two unable to disagree.
+   */
+  readonly instance?: string;
+  /** What went wrong, in `docs/trace.md` §3's `<error name>: <message>` shape. */
+  readonly error?: string;
 }
 
 /**
@@ -1765,7 +1861,85 @@ export async function callEmbeddings(
 /** One tool an agent may call, and how the graph runs it. */
 export interface AgentTool extends ToolSpec {
   readonly address: string;
-  invoke(args: unknown, context: RunContext): Promise<unknown>;
+  invoke(args: unknown, context: RunContext, site: ToolCallSite): Promise<unknown>;
+}
+
+/**
+ * Where an agent execution sits, for the one tool that needs to know.
+ *
+ * A `tool.*` and a synthesized store tool are called with the node's context and
+ * nothing else — an `http:` request and a store op have no instance beneath
+ * them. A `flow.*` attached to `tools:` (grammar 5.4) does: it starts a subflow
+ * instance, which needs an instance path to derive its nested effects' keys from
+ * (grammar 9.4) and a level-1 policy to resolve its nodes' against (grammar 9.3).
+ * Both are the *calling node's*, so both are handed to [`callAgent`] rather than
+ * captured in the module-level binding, which knows nothing about the execution.
+ */
+export interface AgentSite {
+  /**
+   * The instance-path frames down to this agent execution, outermost first
+   * (grammar 9.4): [`instancePath`] at an `agent:` node, and the dispatch's own
+   * path where a `map` dispatched the agent.
+   */
+  readonly path: readonly string[];
+  /**
+   * Grammar 9.3 level 1 for an instance the loop starts — what already reached
+   * *this* instance, which crosses the boundary with it (Decision D79).
+   *
+   * A `map`-dispatched agent passes none, because grammar 8.6 rule 10 resolves a
+   * dispatched instance's nodes with level 1 absent.
+   */
+  readonly policy?: InstancePolicy;
+}
+
+/**
+ * Where one tool call sits, and where what it did is recorded.
+ *
+ * Handed to every tool for one uniform signature; read by the only one that
+ * instantiates anything ([`callSubflowTool`]).
+ */
+export interface ToolCallSite {
+  /** The calling agent execution's own frames ([`AgentSite.path`]). */
+  readonly path: readonly string[];
+  /**
+   * How many times **this tool** has already been called in this agent
+   * execution, `0` on the first — grammar 9.4's flow-tool ordinal (PRD §9.19).
+   *
+   * It counts within one agent-node *execution*, so a node-level `retry:`
+   * restarts it: the Nth call of a retried attempt reuses the Nth key of the
+   * failed one, which is the positional — not semantic — reuse the grammar
+   * states openly.
+   */
+  readonly ordinal: number;
+  /** [`AgentSite.policy`], for an instance this call starts. */
+  readonly policy?: InstancePolicy;
+  /**
+   * The agent execution's own list of the subflow dispatches its loop made, in
+   * call order.
+   *
+   * [`ModelCall.toolCalls`]' counterpart for the record that carries the
+   * instance's trace, and the list a `map` orders by source-item index before it
+   * answers. A record pushed here is pushed to
+   * [`RunContext.toolDispatches`][`RunContext.toolDispatches`] too, and is the
+   * same object in both.
+   */
+  readonly dispatches: DispatchRecord[];
+}
+
+/**
+ * The instance path of the subflow one model tool call starts (grammar 9.4,
+ * PRD §9.19).
+ *
+ * [`instancePath`]'s counterpart for the other call site a `flow.*` has: the
+ * calling agent execution's frames, then `<tool name>/<call ordinal>`. The tool
+ * name is the flow's local name (grammar 2.2) and the ordinal is decimal, so —
+ * exactly as for a node frame — no component can contain the separator.
+ *
+ * Derived here rather than at each of its two readers, so the key a dispatch
+ * record files and the link a [`ToolCallRecord`] carries cannot drift apart.
+ */
+export function toolInstancePath(site: ToolCallSite, tool: string): readonly string[] {
+  return [...site.path, `${tool}/${site.ordinal}`];
 }
 
 /** Everything a compiled `agent:` node needs (grammar 5, 8.1). */
@@ -1777,6 +1951,111 @@ export interface AgentBinding {
   readonly output: ToolSpec;
   readonly tools: readonly AgentTool[];
   readonly maxToolIterations: number;
+}
+
+/** A `flow.*` attached to an agent's `tools:` — flow-as-tool (grammar 5.4, PRD 5.1). */
+export interface SubflowTool {
+  /** The name the model calls it by: the flow's local name (grammar 2.2). */
+  readonly name: string;
+  /** The module one call instantiates. */
+  readonly binding: SubflowBinding;
+  /**
+   * Its `inputs:`, which is the parameter schema the model's arguments are held
+   * to — the same column the request constrained the model with (PRD §9.16).
+   *
+   * Absent where the flow declares no `inputs:`, which is a no-argument tool
+   * (grammar 3.1): there is no field map to parse against, and the instance is
+   * started with an empty object.
+   */
+  readonly inputs?: ResultSchema<unknown>;
+}
+
+/**
+ * One flow-as-tool call: the model's arguments, an instance, and its outputs
+ * back as the tool's result (grammar 5.4, PRD 5.1, §9.19, §9.20).
+ *
+ * PRD 5.1 makes a flow's I/O surface interchangeable with a tool's, and this is
+ * where that equivalence is executed rather than asserted. Four things happen,
+ * and each is somebody else's rule kept here:
+ *
+ *  * **the arguments are parsed** against the flow's own `inputs:` before an
+ *    instance exists. A mismatch is reported exactly as one is for a `tool.*`
+ *    and for a synthesized store tool — the failure leaves the tool, so the
+ *    agent node fails and grammar 9's chain decides what happens next. It is
+ *    deliberately *not* handed back to the model as a tool result: an argument
+ *    the contract refuses is the same event on all three tool surfaces, and one
+ *    surface answering it differently would make "attached as a tool" mean two
+ *    things;
+ *  * **the instance runs beneath this call's own frame** (grammar 9.4, PRD
+ *    §9.19), so a store write inside it derives a key no other call of this loop
+ *    derives, and the node's clock crosses the boundary the way a `flow:` node's
+ *    does;
+ *  * **its outputs are the result the model sees** — the object grammar 5.4
+ *    makes this tool's result schema;
+ *  * **it files a dispatch record** carrying the instance's whole trace, which
+ *    is PRD §9.20's canonical surface for it, whether the instance answered or
+ *    failed. A child that failed reaches the model as nothing at all: the
+ *    failure leaves the tool wrapped in a [`ToolFailure`], never silently as a
+ *    plausible result.
+ */
+export async function callSubflowTool(
+  tool: SubflowTool,
+  args: unknown,
+  context: RunContext,
+  site: ToolCallSite,
+): Promise<unknown> {
+  // Outside the `try`, and outside the record: nothing was instantiated, so
+  // there is no dispatch to report and no instance for a trace to come from.
+  const inputs =
+    tool.inputs === undefined
+      ? {}
+      : (parseResult(
+          tool.inputs,
+          args,
+          `the arguments \`${tool.name}\` was called with`,
+        ) as Record<string, unknown>);
+
+  const path = toolInstancePath(site, tool.name);
+  const filed = (record: DispatchRecord): void => {
+    site.dispatches.push(record);
+    context.toolDispatches?.push(record);
+  };
+  const common = {
+    index: site.ordinal,
+    target: tool.binding.address,
+    attempts: 1,
+    idempotencyKey: [context.execution.id, ...path].join("/"),
+  } as const;
+
+  try {
+    const answer = await runSubflow(tool.binding, {
+      inputs,
+      execution: context.execution,
+      path,
+      // The calling node's deadline, inside the boundary — a `flow:` node's
+      // reason exactly (grammar 9.2, and see [`Instantiation.signal`]).
+      signal: context.signal,
+      ...(site.policy === undefined ? {} : { policy: site.policy }),
+    });
+    filed({
+      ...common,
+      outcome: "completed",
+      ...(answer.inner === undefined ? {} : { inner: answer.inner }),
+    });
+    return answer.output;
+  } catch (error) {
+    // A subflow that failed still made a trace, and this record is its only
+    // account: the caller is an agent node, whose entry carries no `inner`
+    // (`docs/trace.md` §3, §8).
+    const held = traceOf(error);
+    filed({
+      ...common,
+      outcome: "failed",
+      ...(held === undefined ? {} : { inner: held }),
+      error: describe(error),
+    });
+    throw new ToolFailure(tool.name, tool.binding.address, error);
+  }
 }
 
 /**
@@ -1807,7 +2086,13 @@ export async function callAgent(
   input: unknown,
   history: readonly Turn[],
   context: RunContext,
-): Promise<{ output: unknown; history: MessageLike[]; models: readonly ModelCall[] }> {
+  where: AgentSite,
+): Promise<{
+  output: unknown;
+  history: MessageLike[];
+  models: readonly ModelCall[];
+  toolDispatches?: readonly DispatchRecord[];
+}> {
   const rendered = typeof input === "string" ? input : JSON.stringify(input);
   const turn: Turn = { role: "user", text: rendered };
   const turns: Turn[] = [...history, turn];
@@ -1818,6 +2103,17 @@ export async function callAgent(
   // [`callModel`] rather than here, because a call the ladder *lost* has no
   // answer to travel out on and this list only holds what came back.
   const models: ModelCall[] = [];
+  // Every subflow this loop instantiated, in the order it called them
+  // (PRD §9.20). The node's own channel ([`RunContext.toolDispatches`]) holds
+  // the same objects, and this list is what a `map` can put in source-item
+  // order before it answers — [`merged`] then reconciles the two by identity,
+  // exactly as it does for `models` above.
+  const dispatches: DispatchRecord[] = [];
+  // How many times each tool has been called, which is the ordinal grammar 9.4
+  // gives a flow-tool's frame (PRD §9.19). It starts empty **per call of this
+  // function**, and that is the whole of "an agent-node retry restarts the
+  // ordinals": a retry is a second call of the node's activity.
+  const ordinals = new Map<string, number>();
 
   if (agent.tools.length > 0) {
     let iterations = 0;
@@ -1837,15 +2133,66 @@ export async function callAgent(
       turns.push(replayed(agent, answer));
       if (answer.toolCalls.length === 0) break;
 
+      // The record of this call's tool calls, on the record of the call that
+      // asked for them (`docs/trace.md` §7.3). Attached before the first one
+      // runs, so a call that ends the node still reports what it was running:
+      // [`callModel`] has already pushed `by` into the node's own channel, and
+      // this is the same object.
+      const asked: ToolCallRecord[] = [];
+      by.toolCalls = asked;
+
       const results: { id: string; name: string; content: string }[] = [];
       for (const call of answer.toolCalls) {
         const tool = agent.tools.find((candidate) => candidate.name === call.name);
         if (tool === undefined) {
-          throw new Error(
+          // Recorded before it is raised, and with no `target`: there is no
+          // component behind a name the agent does not offer, and a reader of
+          // the failed run should still see what the model asked for. The text
+          // goes through [`describe`] like every other message field, so it
+          // carries the class the way `docs/trace.md` §3 says one does.
+          const unknown = new Error(
             `\`${agent.address}\` was answered with a call to \`${call.name}\`, which is not one of its tools`,
           );
+          asked.push({ name: call.name, outcome: "failed", error: describe(unknown) });
+          throw unknown;
         }
-        const result = await tool.invoke(call.args, context);
+        const ordinal = ordinals.get(call.name) ?? 0;
+        ordinals.set(call.name, ordinal + 1);
+        const site: ToolCallSite = {
+          path: where.path,
+          ordinal,
+          ...(where.policy === undefined ? {} : { policy: where.policy }),
+          dispatches,
+        };
+        // Which dispatches this call filed is decided by counting, so the link
+        // below is read off the record the call really made rather than derived
+        // a second time — [`ToolCallRecord.instance`] and
+        // [`DispatchRecord.idempotencyKey`] cannot disagree. A tool that
+        // instantiates nothing files none and carries no link.
+        const before = dispatches.length;
+        const started = (): { instance: string } | Record<string, never> => {
+          const filed = dispatches[before];
+          return filed === undefined ? {} : { instance: filed.idempotencyKey };
+        };
+        let result: unknown;
+        try {
+          result = await tool.invoke(call.args, context, site);
+        } catch (error) {
+          asked.push({
+            name: call.name,
+            target: tool.address,
+            outcome: "failed",
+            ...started(),
+            error: describe(error),
+          });
+          throw error;
+        }
+        asked.push({
+          name: call.name,
+          target: tool.address,
+          outcome: "completed",
+          ...started(),
+        });
         results.push({ id: call.id, name: call.name, content: JSON.stringify(result) });
       }
       turns.push({ role: "tool", results });
@@ -1880,6 +2227,10 @@ export async function callAgent(
       { role: "assistant", content: JSON.stringify(final.structured) },
     ],
     models,
+    // Absent rather than empty on the agents that instantiate nothing, which is
+    // most of them: `docs/trace.md` §3 gives the key to the entries that have
+    // one to report.
+    ...(dispatches.length === 0 ? {} : { toolDispatches: dispatches }),
   };
 }
 
@@ -2526,7 +2877,7 @@ export function route(
  * `docs/trace.md`'s *Stability* section is the contract, and it is what a reader
  * is entitled to rely on.
  */
-export const TRACE_VERSION = 2;
+export const TRACE_VERSION = 3;
 
 /**
  * One run's whole trace, as a surface delivers it (`docs/trace.md`).
@@ -2623,6 +2974,23 @@ export interface TraceEntry {
    * and the entry's `error` names the budget that ended it.
    */
   readonly dispatches?: readonly DispatchRecord[];
+  /**
+   * What a **model** dispatched: one record per flow-as-tool call an agent this
+   * node ran made (grammar 5.4, PRD 5.1, §9.20).
+   *
+   * The same record type as [`dispatches`][`TraceEntry.dispatches`] and a
+   * different key, because the two are different fan-outs of the same entry: a
+   * `map` dispatches over source items and a tool loop over the calls a model
+   * asked for, and a `map` whose target is an `agent.*` with a `flow.*` in its
+   * `tools:` has both at once. One array each is what keeps their `index`
+   * spaces — a source-item index and a call ordinal — from being read as one.
+   *
+   * Every instance a model started is findable here, whether it answered or
+   * failed, which is the invariant PRD §9.20 keeps: a subflow instance's trace
+   * lives on a dispatch record, and the tool-call entry inside the
+   * [`ModelCall`] links to it by [`DispatchRecord.idempotencyKey`].
+   */
+  readonly toolDispatches?: readonly DispatchRecord[];
   /**
    * The trace of the subflow instance a `flow:` node ran (grammar 8.5).
    *
@@ -2841,6 +3209,12 @@ export function carryEntry<E>(error: E, entry: TraceEntry): E {
 function dispatchesOf(error: unknown): readonly DispatchRecord[] | undefined {
   for (let held: unknown = error; typeof held === "object" && held !== null; ) {
     if (held instanceof ItemFailure) return held.dispatches;
+    // A flow-as-tool call is a module boundary, and what a `map` inside the
+    // instance dispatched is the *instance's* — already on its own entries,
+    // inside the trace this call's dispatch record carries. Walking past it
+    // would put a subflow's fan-out on the **agent** node's entry, where
+    // `docs/trace.md` §3 says only a `map` node has one (see [`ToolFailure`]).
+    if (held instanceof ToolFailure) return undefined;
     held = (held as { cause?: unknown }).cause;
   }
   return undefined;
@@ -2871,6 +3245,11 @@ function traceOf(error: unknown): readonly TraceEntry[] | undefined {
   for (let held: unknown = error; typeof held === "object" && held !== null; ) {
     if (held instanceof SubflowFailure) return held.trace;
     if (held instanceof ItemFailure) return undefined;
+    // The second boundary, for the second reason a caller must not claim an
+    // instance it did not run: below a [`ToolFailure`] is a subflow a *model*
+    // asked for, whose trace [`callSubflowTool`] has already put on its own
+    // dispatch record. An agent node carries no `inner` (`docs/trace.md` §3).
+    if (held instanceof ToolFailure) return undefined;
     held = (held as { cause?: unknown }).cause;
   }
   return undefined;
@@ -4014,6 +4393,7 @@ export async function runMap(
     route: MapRoute;
     output: unknown;
     models?: readonly ModelCall[];
+    toolDispatches?: readonly DispatchRecord[];
   }[] = [];
   const failed: { index: number; target: string; attempts: number; error: unknown }[] = [];
   const joined: Promise<void>[] = [];
@@ -4105,6 +4485,7 @@ export async function runMap(
         deadline: undefined,
         storeRecords: undefined,
         modelCalls: undefined,
+        toolDispatches: undefined,
       };
       void (async () => {
         // `max_concurrency` is an **admission** bound over every in-flight
@@ -4164,6 +4545,15 @@ export async function runMap(
             // is where it belongs, in source-item order like everything else a
             // fan-out reports.
             ...(answer.value.models === undefined ? {} : { models: answer.value.models }),
+            // And the subflows a model invoked inside this instance, for the
+            // reason above and one more: the loop that made them is one item's,
+            // and two items running concurrently would otherwise leave their
+            // records in whatever order they settled — while `docs/trace.md` §5
+            // is written about records a fan-out reports in an order the node
+            // decided (PRD §9.20).
+            ...(answer.value.toolDispatches === undefined
+              ? {}
+              : { toolDispatches: answer.value.toolDispatches }),
           });
           records.push({
             index,
@@ -4251,14 +4641,15 @@ export async function runMap(
     );
   }
 
-  const models = [...landed]
-    .sort((left, right) => left.index - right.index)
-    .flatMap((one) => one.models ?? []);
+  const byIndex = [...landed].sort((left, right) => left.index - right.index);
+  const models = byIndex.flatMap((one) => one.models ?? []);
+  const toolDispatches = byIndex.flatMap((one) => one.toolDispatches ?? []);
   return {
     output: {},
     channels: orderedChannels(landed),
     dispatches: dispatched,
     ...(models.length === 0 ? {} : { models }),
+    ...(toolDispatches.length === 0 ? {} : { toolDispatches }),
   };
 }
 
@@ -5249,6 +5640,16 @@ export interface NodeAnswer {
   readonly channels?: readonly ChannelWrite[];
   /** What a `map` dispatched, for the trace (PRD 5.3, 5.6). */
   readonly dispatches?: readonly DispatchRecord[];
+  /**
+   * What a model dispatched: the subflows an agent's tool loop instantiated, in
+   * the order the node can put them (PRD §9.20).
+   *
+   * `models`' counterpart, and it carries the same two facts: an `agent:` node
+   * answers with its loop's own call order, and a `map` answers with its items'
+   * concatenated in source-item order. What the node execution *made* is
+   * [`RunContext.toolDispatches`], and [`merged`] is where the two meet.
+   */
+  readonly toolDispatches?: readonly DispatchRecord[];
   /** The trace of the subflow instance a `flow:` node ran (grammar 8.5). */
   readonly inner?: readonly TraceEntry[];
   /** Which member of its route served each model call (PRD 5.9). */
@@ -5271,28 +5672,29 @@ const EXECUTION_SHAPE = {
 } as const;
 
 /**
- * Every model call one node execution made, reported once (PRD 5.9).
+ * Every record of one kind that a node execution made, reported once (PRD 5.9,
+ * §9.20).
  *
- * `made` is the node's own channel ([`RunContext.modelCalls`]): every call, in
- * the order it was made, across every attempt the node's `retry:` policy made
- * and every instance a `map` joined. `ordered` is what the *answer* carried,
- * which is the subset the node put in an order of its own — a `map`'s, which is
- * source-item order — and which is therefore the shape a reader of a successful
- * run expects.
+ * `made` is the node's own channel ([`RunContext.modelCalls`], and
+ * [`RunContext.toolDispatches`] for the other kind): every record, in the order
+ * it was made, across every attempt the node's `retry:` policy made and every
+ * instance a `map` joined. `ordered` is what the *answer* carried, which is the
+ * subset the node put in an order of its own — a `map`'s, which is source-item
+ * order — and which is therefore the shape a reader of a successful run expects.
  *
  * The two are not the same set. An answer can only hold what its own attempt
  * produced and only what the node had something to say about, so three kinds of
- * real call fall outside it: an earlier attempt's, an item whose own retries
+ * real record fall outside it: an earlier attempt's, an item whose own retries
  * were exhausted and which `on_item_error: skip` absorbed, and an item-level
  * retry's earlier attempts. This puts them back, ahead of `ordered` and in the
  * order they were made, and identifies them by **identity** rather than by
- * shape: [`callModel`] pushes the very object it returns, so a call is in
- * `ordered` exactly when it is the same object.
+ * shape: [`callModel`] and [`callSubflowTool`] each push the very object they
+ * hand on, so a record is in `ordered` exactly when it is the same object.
  */
-function merged(
-  made: readonly ModelCall[],
-  ordered: readonly ModelCall[] | undefined,
-): readonly ModelCall[] | undefined {
+function merged<T>(
+  made: readonly T[],
+  ordered: readonly T[] | undefined,
+): readonly T[] | undefined {
   if (made.length === 0) return ordered;
   if (ordered === undefined || ordered.length === 0) return [...made];
   const carried = new Set(ordered);
@@ -5406,6 +5808,7 @@ export async function runNode(
   let history: readonly unknown[] | undefined;
   let channels: readonly ChannelWrite[] | undefined;
   let dispatches: readonly DispatchRecord[] | undefined;
+  let toolDispatches: readonly DispatchRecord[] | undefined;
   let inner: readonly TraceEntry[] | undefined;
   let models: readonly ModelCall[] | undefined;
   let pause: HumanPause | undefined;
@@ -5444,6 +5847,13 @@ export async function runNode(
   // each failed attempt threw; the instance that *succeeded* is carried by the
   // answer instead, and the two are joined below.
   const innerTraces: TraceEntry[] = [];
+  // And every subflow a model invoked, for the fourth time the same reason: a
+  // tool loop that failed on its fourth call still ran three instances, and
+  // each one's trace is the only account of what it did (grammar 5.4,
+  // PRD §9.20, and see `RunContext.toolDispatches`). `callSubflowTool` pushes
+  // here as it files each record; the answer carries the same objects in the
+  // order the node could put them, and `merged` reconciles the two.
+  const toolDispatched: DispatchRecord[] = [];
 
   /** This node's entry, for a failure that leaves nothing else behind. */
   const aborted = (error: unknown, made: number, routing?: RoutingDecision): TraceEntry => {
@@ -5472,6 +5882,11 @@ export async function runNode(
       attempts: made,
       ...(routing === undefined ? {} : { routing }),
       ...(dispatched === undefined ? {} : { dispatches: dispatched }),
+      // Read straight off the collector rather than recovered from the error:
+      // every record a model's call filed is pushed there as it is filed, so
+      // whichever way this node ended, this is the whole of what its tool loop
+      // instantiated (PRD §9.20).
+      ...(toolDispatched.length === 0 ? {} : { toolDispatches: [...toolDispatched] }),
       ...(held === undefined ? {} : { inner: held }),
       ...(storeRecords.length === 0 ? {} : { stores: [...storeRecords] }),
       ...(models === undefined ? {} : { models }),
@@ -5503,12 +5918,18 @@ export async function runNode(
       storeRecords,
       modelCalls,
       innerTraces,
+      toolDispatched,
     );
     attempts = answer.attempts;
     output = answer.value.output;
     history = answer.value.history;
     channels = answer.value.channels;
     dispatches = answer.value.dispatches;
+    // Every subflow a model invoked, read the way `models` below is read: the
+    // answer puts the ones it could order in that order — an agent's own call
+    // order, a `map`'s source-item order — and the collector holds every record
+    // that really happened, including an earlier attempt's (PRD §9.20).
+    toolDispatches = merged(toolDispatched, answer.value.toolDispatches);
     // Every instance this node ran, in the order it ran them: the attempts that
     // failed inside the boundary first — `runActivity` collected each one's
     // trace — and the one that answered last, because it happened last. A node
@@ -5589,6 +6010,9 @@ export async function runNode(
     // the one that ended it (PRD 5.9, `RunContext.modelCalls`). `models` is
     // still undefined here: the activity threw, so no answer set it.
     if (modelCalls.length > 0) models = [...modelCalls];
+    // And every subflow a model invoked before the call that ended the node,
+    // for the same reason and off the same kind of collector (PRD §9.20).
+    if (toolDispatched.length > 0) toolDispatches = [...toolDispatched];
     // `runActivity` wraps everything the activity threw in a `NodeFailure`
     // carrying the attempts it *made*, so the fallback is for an error that
     // reached here without one being made at all — and `0` is what that is.
@@ -5606,6 +6030,7 @@ export async function runNode(
         attempts,
         error: describe(error),
         ...(dispatches === undefined ? {} : { dispatches }),
+        ...(toolDispatches === undefined ? {} : { toolDispatches }),
         ...(inner === undefined ? {} : { inner }),
         ...(storeRecords.length === 0 ? {} : { stores: [...storeRecords] }),
         ...(models === undefined ? {} : { models }),
@@ -5700,6 +6125,7 @@ export async function runNode(
     writes: written,
     routing,
     ...(dispatches === undefined ? {} : { dispatches }),
+    ...(toolDispatches === undefined ? {} : { toolDispatches }),
     ...(inner === undefined ? {} : { inner }),
     ...(storeRecords.length === 0 ? {} : { stores: [...storeRecords] }),
     ...(models === undefined ? {} : { models }),
