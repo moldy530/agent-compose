@@ -10,15 +10,16 @@
 // reader over exactly those. So the same runner answers under both, and gate 13
 // asserts the same observations with the same function this gate does.
 //
-// Eight sections, and each is a claim a served app cannot make:
+// Eight sections, one bullet each and in the order they run, and each is a claim
+// a served app cannot make:
 //
 //   * a pause is **rendered** — the wait id, the flow and node, what the human is
 //     shown, the shape their answer has to fit, and the deadline where the node
 //     declares one — and one line of JSON answers it;
 //   * a line that is not JSON, and one the node's `output:` refuses, are refusals
 //     that **re-prompt**: the wait is not consumed, which is the resume route's
-//     `400` rule at the other surface;
-//   * a blank line is not an answer and re-prompts with no refusal at all;
+//     `400` rule at the other surface — and a blank line is not an answer at all
+//     and re-prompts with no refusal;
 //   * two pauses that are waiting **together** are asked one at a time and in
 //     wait-id order — the order the status route publishes them in, and the one
 //     that does not depend on how the scheduler interleaved the instances;
@@ -33,9 +34,12 @@
 //   * standard input **ending** withdraws the whole surface: every pause still
 //     waiting becomes the interrupt a run with no surface raises, and so does the
 //     next one the run opens;
-//   * …and an end that arrives while **no** question is outstanding is noticed
-//     before the next one is rendered, rather than after a whole prompt block has
-//     been printed under a surface that is already gone.
+//   * an end that arrives while **no** question is outstanding is noticed before
+//     the next one is rendered, rather than after a whole prompt block has been
+//     printed under a surface that is already gone;
+//   * …and a last line carrying **no newline** is still an answer, because
+//     `printf '{"decision":"approve"}'` is a script that answered and a reader
+//     that waited for a terminator would hang on it until the stream closed.
 //
 // `src/cli.ts` and `src/runtime.ts` are compiler constants, byte-identical in
 // every project this release builds, so driving them directly is driving what
