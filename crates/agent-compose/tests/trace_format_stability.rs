@@ -31,14 +31,23 @@
 //!
 //! # Why these five runs
 //!
-//! Between them they reach every record type the format has, and every shape of
-//! entry: a bounded cycle for guarded edges, budgets and an `else:` escape; a
-//! routed fan-out for dispatch records, variants, idempotency keys and a nested
-//! subflow trace; a store round trip for read-replay and write-dedupe records; a
-//! failover for a model call that was served by its second member; and a spent
-//! route for a **failed** run — the shape a reader most often opens a trace for,
-//! and the one whose rules (no writes, routing only when routing failed) exist
-//! nowhere else.
+//! Between them they reach every record **type** the format has, and the entry
+//! shapes a reader meets first: a bounded cycle for guarded edges, budgets and
+//! an `else:` escape; a routed fan-out for dispatch records, variants,
+//! idempotency keys and a nested subflow trace; a store round trip for
+//! read-replay and write-dedupe records, and for the tool-invoked write that
+//! carries neither key nor dedupe flag; a failover for a model call that was
+//! served by its second member; and a spent route for a **failed** run — the
+//! shape a reader most often opens a trace for, and the one whose rules (no
+//! writes, routing only where routing failed) exist nowhere else.
+//!
+//! It is not every *shape* the format admits, and the header should not be read
+//! as claiming so: no snapshot here holds a `"skipped"` entry, a `fallback`
+//! entry, a no-viable-route entry, a dispatch that skipped, failed or detached,
+//! or the `"$default"` route sigil. Those are held by
+//! `tests/compiled_graph_acceptance.rs`, which asserts about them by name rather
+//! than by shape — the two files divide the surface, and a run added here is
+//! worth adding when a shape has no home in either.
 //!
 //! Each goes through `agent-compose run`, so what is snapshotted is the file a
 //! reader is handed rather than an in-process value a test could shape for
@@ -46,19 +55,27 @@
 //!
 //! # …and the promises a snapshot cannot make
 //!
-//! Three claims of `docs/trace.md` are about a *rule* rather than about a shape,
-//! and each is asserted here directly, because a snapshot of a document that
-//! happens to satisfy a rule would go on passing after the rule was dropped:
-//! that the third delivery surface carries the version beside its trace (§1),
-//! that both halves of a routing record are in declaration order even where a
-//! router cannot decide in that order (§4), and that an activity's failure names
-//! the `${ENV}` reference its author wrote rather than the value it resolved to
-//! (§11.1).
+//! Four claims of `docs/trace.md` are about a *rule* rather than about a shape,
+//! and each is asserted directly, because a snapshot of a document that happens
+//! to satisfy a rule would go on passing after the rule was dropped: that the
+//! third delivery surface carries the version beside its trace **and only
+//! beside it** (§1), that both halves of a routing record are in declaration
+//! order even where a router cannot decide in that order (§4), that a write's
+//! `idempotencyKey` and `deduped` are a store-op **node**'s and not an agent
+//! tool's (§6), and that an activity's failure names the `${ENV}` reference its
+//! author wrote rather than the value it resolved to (§11.1).
+//!
+//! The §6 pair rides on the store run rather than on a sixth run of its own: a
+//! presence rule is a claim about a record the snapshot already holds, and the
+//! two are asserted before `assert_snapshot!` so a change to the rule fails as
+//! itself rather than as a diff in a document.
 
 // See the note on the same line in `tests/compiled_graph_acceptance.rs`: a test
 // target is a crate root, so the shared harness is reached by path.
 #[path = "compiled_graph_acceptance/harness.rs"]
 mod harness;
+
+use std::time::Duration;
 
 use mock_provider::{Client, MockProvider, Outcome, Script, ToolCall};
 use serde_json::{Value, json};
@@ -202,9 +219,14 @@ fn a_routed_fan_outs_trace_document_keeps_its_shape() {
 /// and both of PRD 5.8's consumption surfaces (`docs/trace.md` §6).
 ///
 /// The flow's own `store:` nodes supply the `via: "node"` records; the agent in
-/// the middle of it calls a **synthesized store tool**, which is the other
+/// the middle of it calls **synthesized store tools**, which is the other
 /// surface — "recorded as tool calls" in PRD 5.8's own words, and a record the
 /// provider transcript alone could not stand in for.
+///
+/// The agent both reads and **writes** through that surface, because the two are
+/// not the same record: §6 gives `idempotencyKey` and `deduped` to a store-op
+/// *node*'s write and to nothing else, and a fixture whose only tool call was a
+/// read would leave the whole of that rule to prose.
 #[test]
 fn a_store_using_runs_trace_document_keeps_its_shape() {
     let provider = MockProvider::start().expect("a loopback port");
@@ -216,6 +238,16 @@ fn a_store_using_runs_trace_document_keeps_its_shape() {
             Outcome::tool_calls(vec![ToolCall::new(
                 "prefs_get",
                 json!({ "key": "preferences" }),
+            )]),
+        ),
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "prefs_set",
+                json!({
+                    "key": "preferences",
+                    "value": { "theme": "dark", "verbosity": "high" },
+                }),
             )]),
         ),
         Script::new(SONNET, Outcome::text("I have what I need.")),
@@ -234,6 +266,61 @@ fn a_store_using_runs_trace_document_keeps_its_shape() {
         return;
     };
     run.succeeded();
+
+    // §6's presence rule for the two fields a write carries, asserted before the
+    // snapshot so a change to it fails as itself rather than as a diff: a write
+    // the *agent* made through a synthesized tool (grammar §11.5) has neither,
+    // and grammar §9.4 is why — it names the store-op node catalog (§11.4) as
+    // the carrier, and a tool call's outcome goes straight back to the model
+    // that asked for it, so there is no unobserved effect for a key to stand in
+    // for.
+    let tooled: Vec<Value> = run
+        .entries("ask")
+        .iter()
+        .flat_map(|entry| {
+            entry["stores"]
+                .as_array()
+                .cloned()
+                .unwrap_or_else(|| panic!("the agent's entry carries its store ops: {entry}"))
+        })
+        .filter(|record| record["effect"] == "write")
+        .collect();
+    assert_eq!(
+        tooled.len(),
+        1,
+        "the agent wrote through exactly one synthesized tool: {tooled:?}"
+    );
+    for record in &tooled {
+        assert_eq!(record["via"], "tool", "{record}");
+        assert!(
+            record.get("idempotencyKey").is_none(),
+            "a tool-invoked write carries no idempotency key (`docs/trace.md` §6): {record}"
+        );
+        assert!(
+            record.get("deduped").is_none(),
+            "…and no dedupe flag, which travels with the key: {record}"
+        );
+    }
+
+    // …and the node writes beside it do carry both, so the rule is a
+    // distinction rather than a field the runtime stopped recording.
+    let noded: Vec<Value> = run
+        .trace()
+        .iter()
+        .flat_map(|entry| entry["stores"].as_array().cloned().unwrap_or_default())
+        .filter(|record| record["effect"] == "write" && record["via"] == "node")
+        .collect();
+    assert!(
+        !noded.is_empty(),
+        "the flow's `store:` nodes wrote: {noded:?}"
+    );
+    for record in &noded {
+        assert!(
+            record["idempotencyKey"].is_string() && record["deduped"].is_boolean(),
+            "a store-op node's write carries both: {record}"
+        );
+    }
+
     insta::assert_snapshot!(document(&run));
 }
 
@@ -389,12 +476,26 @@ fn a_failed_activity_names_its_env_reference_rather_than_the_resolved_value() {
 /// the same entries, wrapped in an execution's status — so what is asserted here
 /// is the rule the other four cannot reach: that a surface with an optional
 /// `trace` carries the version exactly when it carries entries.
+///
+/// **Both** halves, against reports the app really built. The negative half is
+/// the one that is easy to fake: a `404` body is `unknownExecution`'s, which
+/// never goes through the report builder at all, so its missing `trace_version`
+/// would go on being missing however the builder was changed. So the assertion
+/// is made against a `running` execution — the state §1 names — and the model's
+/// answer is held back to put the run in it. `Outcome::after` is what makes that
+/// a fact about the fixture rather than about scheduling luck: the status is
+/// read while the provider is still holding the only answer the run is waiting
+/// on.
 #[test]
 fn the_status_route_carries_the_version_beside_its_trace() {
     let provider = MockProvider::start().expect("a loopback port");
+    // Long enough that the status route below is answered while the run is still
+    // waiting on it, and short enough not to dominate the suite. The flow has
+    // one model call in it, so this is the whole of what it is waiting for.
+    const HELD: Duration = Duration::from_secs(3);
     provider.enqueue(Script::new(
         SONNET,
-        Outcome::structured(json!({ "answer": "an answer" })),
+        Outcome::structured(json!({ "answer": "an answer" })).after(HELD),
     ));
 
     let Some(served) = harness::serve("http-trigger", &provider) else {
@@ -409,6 +510,25 @@ fn the_status_route_carries_the_version_beside_its_trace() {
         .as_str()
         .expect("an execution id")
         .to_string();
+
+    // The negative half: a report the app built for an execution that has made
+    // no trace yet carries neither key.
+    let running = app
+        .get(&format!("/executions/{execution}"))
+        .expect("the status route answers")
+        .json();
+    assert_eq!(
+        running["status"], "running",
+        "the provider is still holding this run's only answer: {running}"
+    );
+    assert!(
+        running["trace"].is_null(),
+        "a running execution reports no entries (`docs/trace.md` §1.3): {running}"
+    );
+    assert!(
+        running["trace_version"].is_null(),
+        "…and so no version, because the version travels with the entries: {running}"
+    );
 
     let finished = harness::settled(&app, &execution);
     assert_eq!(finished["status"], "completed", "{finished}");
@@ -425,16 +545,18 @@ fn the_status_route_carries_the_version_beside_its_trace() {
          {finished}"
     );
 
-    // A `404` is the app's own report about an id it never started, and it
-    // carries no trace — so it carries no version either, which is the other
-    // half of the rule.
+    // An id the app never started is answered by a different builder entirely —
+    // a `404` with an `error` and nothing else — so this says nothing about the
+    // rule above. It is here because a reader polling a status URL can be handed
+    // it, and what it must not do is answer a version for a trace it has not
+    // got.
     let unknown = app
         .get("/executions/exec_not_started")
         .expect("the status route answers");
     assert_eq!(unknown.status, 404, "{:?}", unknown.body);
     assert!(
         unknown.json()["trace_version"].is_null(),
-        "a report with no trace names no trace version: {:?}",
+        "a `404` names no trace version either: {:?}",
         unknown.body
     );
 }

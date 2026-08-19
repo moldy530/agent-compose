@@ -2,7 +2,7 @@
 //! the **real** pinned JavaScript toolchain — under **Bun**, which PRD §9.18
 //! makes the default runtime and package manager of every emitted project.
 //!
-//! Seventeen gates. The first four are in increasing strength, each one existing
+//! Eighteen gates. The first four are in increasing strength, each one existing
 //! because the one above it passes on code the one below it catches; the fifth
 //! is about a construct whose guarantees are only observable from inside the
 //! runtime; the next two are about the schemas rather than the graph; the eighth
@@ -10,8 +10,10 @@
 //! are about what a binding does on the wire, which no amount of type-checking or
 //! graph construction reaches; the three after those are about the *other*
 //! runtime — the Node fallback the same decision keeps supported; the sixteenth
-//! is about the storage underneath a `store.*`; and the last is about the
-//! argument parser every launch of an emitted project goes through:
+//! is about the storage underneath a `store.*`; the seventeenth is about the
+//! argument parser every launch of an emitted project goes through; and the last
+//! is about what a failure *says*, which is the one subject here that is a
+//! published surface rather than a behaviour:
 //!
 //! 1. **`bun run typecheck`** — every golden project type-checks under its own
 //!    strict `tsconfig.json`, against installed `@langchain/langgraph`,
@@ -152,6 +154,18 @@
 //!     and never read would be a caller asking for the JSON record, getting
 //!     human output, and being told `0`. D50's rule, asserted where the compiler
 //!     is no longer standing in front of it.
+//! 18. **What a failure the platform worded says** — `docs/trace.md` §11.1
+//!     promises that no resolved `${ENV}` value appears in a trace, and §11.2
+//!     names the three failures where one would have: a command the OS refused
+//!     to spawn, an `http:` `url` that is not a URL once its references resolve,
+//!     and a provider whose resolved `base_url:` `fetch` cannot parse. Each of
+//!     those messages is the *engine's*, and each embeds the string it could not
+//!     use, so each is caught and restated. A gate rather than a source check —
+//!     `tests/trace_format_inventory.rs` holds that half — because the wording
+//!     differs between the two supported runtimes: Bun quotes what `new URL`
+//!     could not parse and Node says only `Invalid URL`, while Node quotes what
+//!     `fetch` could not parse and Bun does not. Gate 13 asks Node the same
+//!     question for exactly that reason.
 //!
 //! # The toolchain fixture
 //!
@@ -1377,6 +1391,79 @@ fn the_unread_input_was_survived(answer: &Value) {
     );
 }
 
+/// Gate 2j: a failure the **platform** worded carries no resolved `${ENV}`
+/// value.
+///
+/// `docs/trace.md` §11.1 promises that no resolved environment value appears in
+/// a trace, and §11.2 names the three failures where one would have: a command
+/// the OS refused to spawn, an `http:` `url` that is not a URL once its
+/// references resolve, and a provider whose resolved `base_url:` `fetch` cannot
+/// parse. Each embeds the resolved string in the message the *engine* composes,
+/// so each is caught and restated.
+///
+/// A gate rather than a source-level check — that half is
+/// `tests/trace_format_inventory.rs`'s
+/// `a_failure_the_platform_worded_is_restated_rather_than_quoted` — because the
+/// wording is the engine's and the two supported engines word them differently:
+/// Bun quotes the resolved string a `new URL` could not parse and Node says only
+/// `Invalid URL`, while Node quotes the endpoint `fetch` could not parse and Bun
+/// says only `fetch() URL is invalid`. A promise about a public surface that
+/// held on one runtime and not the other would be no promise at all, so gate 13
+/// asks the same question of Node.
+#[test]
+fn no_failure_the_platform_worded_carries_a_resolved_env_value() {
+    let Some(root) = installed() else {
+        return;
+    };
+    let project = staged(goldens::golden("review-loop"), root, "resolved-env");
+
+    let output = runner("resolved-env-in-failures.mjs")
+        .arg(&project)
+        .output()
+        .expect("bun runs");
+    assert!(
+        output.status.success(),
+        "the probe did not reach all three failures under Bun:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    the_resolved_values_stayed_out_of_the_messages(
+        &serde_json::from_slice(&output.stdout).expect("the runner prints one JSON object"),
+    );
+}
+
+/// The verdict `resolved-env-in-failures.mjs` has to come back with, whichever
+/// runtime ran it.
+///
+/// Two claims per message, and the second is what keeps the first from being
+/// satisfied by saying nothing: the resolved value is **absent**, and the
+/// reference — or, for the provider, its typed address — is **present**. A
+/// runtime that answered `an activity failed` would pass a check for the secret
+/// alone and leave a reader with nothing to fix (PRD G3).
+fn the_resolved_values_stayed_out_of_the_messages(answer: &Value) {
+    let secret = answer["secret"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the runner names the value it planted: {answer}"));
+    for (surface, names) in [
+        ("exec", "${OPS_BIN}"),
+        ("http", "${SIGNED_ENDPOINT}"),
+        ("provider", "provider.acme"),
+    ] {
+        let message = answer[surface]
+            .as_str()
+            .unwrap_or_else(|| panic!("the runner reports the `{surface}` failure: {answer}"));
+        assert!(
+            !message.contains(secret),
+            "the `{surface}` failure carries the resolved `${{ENV}}` value, which \
+             `docs/trace.md` §11.1 says no field of a trace does: {message}"
+        );
+        assert!(
+            message.contains(names),
+            "…and the `{surface}` failure has to name `{names}`, or a reader is told \
+             something failed and nothing about what to fix: {message}"
+        );
+    }
+}
+
 /// Gate 2g: a declared `Content-Type` replaces the runtime's rather than joining
 /// it.
 ///
@@ -2479,6 +2566,13 @@ fn the_toolchain_fixture_pins_what_the_emitter_pins() {
 /// assertions their own gates make — the *same functions*, so the two runs cannot
 /// come to different verdicts by drifting apart.
 ///
+/// Gate 18's runner is re-run for the sharpest form of the same reason: the
+/// messages it is about are *written* by the engine, and the two engines write
+/// them differently. Bun quotes the resolved string a `new URL` could not parse
+/// where Node says only `Invalid URL`, and Node quotes the endpoint `fetch`
+/// could not parse where Bun does not — so `docs/trace.md` §11.1's promise about
+/// a public surface would be exactly half-checked without this column.
+///
 /// They are pointed at this gate's own staged project rather than a second copy:
 /// `src/runtime.ts` is a compiler constant, byte-identical in every project this
 /// release builds (see `codegen::runtime`), and `runExec`/`runHttp` are all the
@@ -2596,6 +2690,15 @@ fn a_generated_project_installs_type_checks_and_runs_under_the_node_fallback() {
     let request = node_runner("http-request.mjs", &project);
     the_declared_media_type_arrived_alone(&request);
     the_bound_object_arrived_as_parameters(&request);
+
+    // Gate 2h, and the one whose subject is most the engine's: which of the two
+    // runtimes quotes a resolved string in a URL it could not parse is the
+    // engine's own choice, so `docs/trace.md` §11.1's promise is only as good as
+    // the runtime that held it last.
+    the_resolved_values_stayed_out_of_the_messages(&node_runner(
+        "resolved-env-in-failures.mjs",
+        &project,
+    ));
 
     // Gate 16, asked of the other runtime. The local store backends are a
     // WebAssembly SQLite over `node:fs` and a directory of files, which is

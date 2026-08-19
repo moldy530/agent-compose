@@ -196,8 +196,13 @@ caller's.
   substitution grammar §9.2 and Decision D97 make: a guard that reads the node's
   own output is `false` **without being evaluated**, while a guard over `input`,
   `state` or `execution` is evaluated normally.
-* **`"failed"`** — the node's activity failed and its policy did not absorb it.
-  Two shapes, told apart by `fallback`:
+* **`"failed"`** — the node left no result for the run to carry on from, and its
+  policy did not absorb it. Usually that is its *activity* failing. It also
+  covers the node whose activity completed and whose **routing** then failed —
+  no viable route (grammar §7.3 rule 7), or a guard that could not be evaluated
+  at all — which is one entry a reader should not read as "the work did not
+  happen": everything the node did is on it (§9). Two shapes, told apart by
+  `fallback`:
   * with `fallback`, the failure routed to the named node (grammar §9.2,
     Decision D21). The node's own edges were not evaluated, so there is no
     `routing`. The run continues, and the entry lands in the trace like any
@@ -292,8 +297,18 @@ in ascending `index` — never completion order.
 | `outcome` | `"completed"` \| `"skipped"` \| `"failed"` \| `"detached"` | always | See §5.1. |
 | `attempts` | integer | always | How many attempts the item's `on_item_error: { retry: … }` policy **made** (grammar §8.6 rule 10). `0` for a detached dispatch, which has no observed outcome for a policy to have acted on. |
 | `idempotencyKey` | string | always | The key this dispatch's effect site derives (grammar §9.4). See §8. |
-| `inner` | array of [entries](#3-entries) | `flow.*` targets | The dispatched instance's own trace, whether it completed or failed. |
+| `inner` | array of [entries](#3-entries) | **joined** `flow.*` targets | The dispatched instance's own trace, whether it completed or failed. Absent on a `"detached"` record whatever its target: see below. |
 | `error` | string | `"skipped"`, `"failed"` | Why the item did not complete. |
+
+A **detached** dispatch is the one target shape that carries no `inner` even
+where it points at a `flow.*`. Grammar §8.6 rule 7 admits `detach: true` on a
+route whose `node:` is a `flow.*` (under `--target local`, which is where the key
+is legal at all), and this record is written when the dispatch is *issued*:
+before the instance has run a node, and the join never comes back for it
+(Decision D94). So a reader reconstructing subgraph traces reads `inner` on the
+joined dispatches and gets nothing from the detached ones — which is the same
+thing `outcome: "detached"` says, stated where the presence column is what §10.1
+makes reliable.
 
 ### 5.1 Dispatch outcomes
 
@@ -344,8 +359,20 @@ Writes are at-least-once with idempotency keys."
 | `scope` | `"execution"` \| `"session"` \| `"global"` | always | The store's declared lifetime, and with it which partition was addressed (grammar §11.3). |
 | `key` | string | ops that address one | The key the op addressed. |
 | `answer` | any | `"read"` | What the read answered — the history a replay consumes. Its shape is the store's own (grammar §11.4), not this format's. |
-| `idempotencyKey` | string | `"write"` | The key the write carried (grammar §9.4). See §8. |
-| `deduped` | boolean | `"write"` | Whether the backend had already applied that key — the difference between "this run wrote it" and "an earlier attempt of this same effect did". |
+| `idempotencyKey` | string | `"write"` **via `"node"`** | The key the write carried (grammar §9.4). See §8, and the paragraph below for the surface that carries none. |
+| `deduped` | boolean | `"write"` **via `"node"`** | Whether the backend had already applied that key — the difference between "this run wrote it" and "an earlier attempt of this same effect did". |
+
+**A write through a synthesized store tool carries neither.** The two fields go
+together, and they are a property of the store-op **node** catalog rather than of
+writing: a record with `via: "tool"` and `effect: "write"` — an agent that called
+`notes_upsert` or `prefs_set` inside its loop (grammar §11.5) — has no
+`idempotencyKey` and no `deduped`, whichever of §6's four write ops it ran. That
+is grammar §9.4's own reading: it names exactly two carriers, "a detached `map`
+dispatch (§8.6 rule 7) and a store write (§11.4)", and §11.4 is the node catalog.
+It is also what the mechanism is for — a key stands in for an outcome nobody
+observed, and a tool call's outcome goes straight back to the model that asked
+for it. A reader indexing writes by key indexes the `via: "node"` ones and must
+carry the rest some other way.
 
 Every op a node performs lands on that node's entry, across **every attempt** its
 `retry:` policy made: an effect that happened is an effect that happened, and a
@@ -418,8 +445,9 @@ Nesting moves nobody's step numbers: an inner instance numbers its own superstep
 from `1`.
 
 **Instance paths surface in exactly two fields**, and only as the prefix of an
-idempotency key: `DispatchRecord.idempotencyKey` and `StoreRecord.idempotencyKey`
-(grammar §9.4). Both are
+idempotency key: `DispatchRecord.idempotencyKey`, which every dispatch record
+carries, and `StoreRecord.idempotencyKey`, which a store-op **node**'s write
+carries and a write through a synthesized store tool does not (§6). Both are
 
 ```
 <execution.id> "/" <frame> { "/" <frame> }
@@ -457,11 +485,17 @@ ways, both consequences of how a superstep dies rather than choices:
 * it records **no `writes`**. The superstep a run dies in lands none of them —
   every task's update in that step is discarded — so a `writes` array would name
   channels that were never written.
-* it records **`routing` only when the routing decision is what failed.** A node
-  whose activity failed never got to evaluate its edges. A node that completed
-  and then found **no viable route** (grammar §7.3 rule 7) did: that entry
-  carries a `routing` whose `edges` are the guard values that decided it,
-  `targets: []` — which is what went wrong — and `counters: {}`.
+* it records **`routing` in exactly one case: no viable route** (grammar §7.3
+  rule 7). A node whose activity failed never got to evaluate its edges, so
+  there is nothing to record. A node that completed and then matched no edge
+  did evaluate them all: that entry carries a `routing` whose `edges` are the
+  guard values that decided it, `targets: []` — which is what went wrong — and
+  `counters: {}`. The near case is worth stating too, because "routing failed"
+  would suggest otherwise: a guard that could not be **evaluated** — a CEL
+  expression that threw — also fails the node at routing time and records
+  **no** `routing`, since the decision was abandoned part way and there is no
+  complete set of edge decisions to hand over. The entry's `error` names the
+  guard.
 
 Everything else the node did is still there: `stores`, `models`, `dispatches` and
 `inner` are all recorded on the aborting entry, because those effects really
@@ -583,6 +617,9 @@ or `token:`: the whole value is one `${NAME}` reference, and nothing here is
 derived from one. A trace names a `model.*` and a `store.*` by its typed address
 (grammar §2.2), never by what the provider or backend behind it is configured
 with. No field carries a request header, a connection string or a signed URL.
+A provider whose resolved `base_url:` is not a URL at all is reported as
+`` `provider.acme`'s resolved `base_url:` is not a URL ``, which is the whole of
+what the runtime says about it.
 
 **Class 2 — interpolable.** An `http:` binding's `url` and `headers` values, and
 the whole `exec:` block — `command`, every `args` entry, `cwd`, and `env` values.
@@ -593,10 +630,7 @@ activity quotes what it was pointed at. It quotes it **as the author wrote it** 
 The emitted runtime's `asWritten` is where that happens, and it buys a second
 property besides: one composition produces one message whatever environment it
 runs in, so an error is reproducible and a trace snapshot is comparable across
-machines. Both message sites are held to it —
-`crates/compose-core/tests/trace_format_inventory.rs` fails when either quotes
-the resolved string, and `crates/agent-compose/tests/trace_format_stability.rs`
-reads the promise off a real run's trace.
+machines.
 
 What a message *does* quote from outside this process is **what the other side
 answered**, and a reader should treat that text as untrusted:
@@ -614,3 +648,43 @@ on stderr. This format records what it was answered; it does not audit it.
 One field is the composition's own to fill: `StoreRecord.answer` is what a read
 answered, verbatim (§6). A run that reads a secret out of a store has put it
 there itself, and the trace records the read like any other.
+
+### 11.2 Where a resolved value would otherwise have escaped
+
+§11.1's promise is about **every** message this runtime writes, not only the ones
+an author is likely to hit — and three of them are messages the *platform* would
+have written if the runtime had let it. A failure the runtime never composed
+itself is the shape a promise like this leaks through, so each of the three is
+caught and restated:
+
+| failure | what the platform says | what the runtime says instead |
+|---|---|---|
+| an `exec:` command that could not be started — a `command:` or `cwd:` that is missing or not executable | Node: `spawn /opt/tokens/rg ENOENT`; Bun: `ENOENT: no such file or directory, posix_spawn '/opt/tokens/rg'` | `` `${TOOLBIN}/rg` could not be run (ENOENT) `` — the reference as written, plus the platform's error **code**, which names what went wrong without naming what it went wrong on |
+| an `http:` binding whose interpolated `url` is not a URL | Bun: `"secret/reports" cannot be parsed as a URL.` | `` `${SIGNED_ENDPOINT}/reports` is not a URL once its `${ENV}` references are resolved `` |
+| a provider whose resolved `base_url:` is not a URL | Node: `Failed to parse URL from https://secret…` | `` `provider.acme`'s resolved `base_url:` is not a URL `` |
+
+An **abort** is not in this table and is not restated: a node deadline (grammar
+§9.2) and a cancelled run reach the same place, and such a failure is raised as
+it came, because it is the run's own and carries nothing of the binding in it.
+
+Restating costs the platform's own wording, and the exchange is deliberate: what
+is lost is a path the reader can print for themselves from the reference the
+message names, and what is bought is the property §11.1 opens with — plus the
+one it buys alongside, that one composition produces one message whatever
+environment it runs in, so an error is reproducible and a trace snapshot is
+comparable across machines.
+
+The whole set is held mechanically, in three places, because a promise about a
+public surface is worth no more than what checks it:
+
+* `crates/compose-core/tests/trace_format_inventory.rs` fails when any of the
+  five message sites — the two that quote a *refused* activity (a non-2xx
+  response, an unexpected exit code) and the three above — stops naming the
+  reference or starts quoting the resolved string;
+* `crates/compose-core/tests/generated_code_gates.rs` plants one value in all
+  three surfaces and drives a generated project's own runtime into each failure,
+  **under both** supported runtimes (PRD §9.18). That column is not optional
+  here: which engine quotes a resolved string differs by failure, so a check that
+  asked one of them would be evidence for whichever half it happened to run;
+* `crates/agent-compose/tests/trace_format_stability.rs` reads the promise off a
+  real run's trace.

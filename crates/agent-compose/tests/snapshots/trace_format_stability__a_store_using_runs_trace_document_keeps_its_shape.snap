@@ -62,6 +62,12 @@ expression: document(&run)
           "fallback": 0,
           "model": "model.smart",
           "servedBy": "model.smart"
+        },
+        {
+          "failovers": [],
+          "fallback": 0,
+          "model": "model.smart",
+          "servedBy": "model.smart"
         }
       ],
       "node": "ask",
@@ -88,6 +94,14 @@ expression: document(&run)
           "effect": "read",
           "key": "preferences",
           "op": "get",
+          "scope": "execution",
+          "store": "store.prefs",
+          "via": "tool"
+        },
+        {
+          "effect": "write",
+          "key": "preferences",
+          "op": "set",
           "scope": "execution",
           "store": "store.prefs",
           "via": "tool"

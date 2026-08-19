@@ -2858,6 +2858,18 @@ fn a_sink_route_is_joined_and_a_detached_one_is_resolved_at_dispatch() {
         "a detached dispatch has no observed outcome, so `on_item_error` never \
          applied to it (grammar 8.6 rule 7)"
     );
+    // The same fact read off the other field it decides, which `docs/trace.md`
+    // §5 states as a presence rule: this record is written when the dispatch is
+    // *issued*, before the instance it names has run anything, so it carries no
+    // `inner` — and it would carry none if the route pointed at a `flow.*`,
+    // which rule 7 admits and which is the case a reader would otherwise expect
+    // a subgraph trace from.
+    assert!(
+        records[2].get("inner").is_none(),
+        "a detached dispatch's record is written before its delivery runs, so there \
+         is no inner trace to carry: {}",
+        records[2]
+    );
     // …and which variant each item *was*, which the route alone does not say.
     // A named route's tag is the variant tag, so the two agree there; the
     // catch-all's is `$default`, and without this the one item that fell

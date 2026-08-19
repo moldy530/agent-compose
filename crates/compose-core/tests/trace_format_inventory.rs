@@ -802,6 +802,88 @@ fn an_activity_failure_quotes_the_reference_rather_than_the_resolved_value() {
     }
 }
 
+/// …and so does a failure the runtime never composed itself.
+///
+/// The three sites of `docs/trace.md` §11.2. Each is a place the **platform**
+/// writes the message — a spawn the OS refused, a string neither `URL` nor
+/// `fetch` could parse — and every one of those messages embeds the resolved
+/// value: `spawn /opt/tokens/rg ENOENT` on Node, `"secret/reports" cannot be
+/// parsed as a URL.` on Bun, `Failed to parse URL from https://secret…` on Node
+/// again. All three reach `TraceEntry.error` (the last through
+/// `Refusal.detail`), so §11.1's promise holds only while each is caught and
+/// restated.
+///
+/// Two needles per site, and the pair is the point: the **restatement** must be
+/// there, and the **unguarded** call it replaced must not. Asserting only the
+/// first would pass on a runtime that had both — a catch nothing reaches, beside
+/// the platform call that still throws past it.
+///
+/// Both needles are looked for in the **function's own body** rather than in the
+/// file, for the reason [`row_names`] is scoped: `await fetch(url, {` is the
+/// unguarded spelling in [`send`] and the guarded one in `runHttp`, where `url`
+/// is already a parsed `URL`, so a whole-file search would report a hole that is
+/// not there — or, worse, stop reporting one that is once the other site moves.
+#[test]
+fn a_failure_the_platform_worded_is_restated_rather_than_quoted() {
+    let source = runtime();
+    for (site, header, restated, unguarded, what) in [
+        (
+            "runExec",
+            "export async function runExec(",
+            r"\`${asWritten(binding.command)}\` could not be run",
+            "const result = await new Promise<",
+            "a command the platform refused to spawn quotes the resolved path",
+        ),
+        (
+            "runHttp",
+            "export async function runHttp(",
+            r"\`${asWritten(binding.url)}\` is not a URL once its ",
+            "const url = new URL(interpolate(binding.url));",
+            "`new URL` quotes the resolved string it could not parse",
+        ),
+        (
+            "send",
+            "async function send(",
+            r"\`${model.provider.address}\`'s resolved \`base_url:\` is not a URL",
+            "await fetch(url, {",
+            "`fetch` quotes the endpoint it could not parse, which is built from a \
+             `base_url:` grammar 4.3 class 1 makes a whole-value `${ENV}` reference",
+        ),
+    ] {
+        let body = function_body(&source, header);
+        assert!(
+            body.contains(restated),
+            "`{site}` no longer restates its platform failure as `{restated}…`; without \
+             it {what}, and that value reaches `TraceEntry.error` and the trace file \
+             (`docs/trace.md` §11.2)"
+        );
+        assert!(
+            !body.contains(unguarded),
+            "`{site}` calls `{unguarded}…` with nothing catching it, so {what} \
+             (`docs/trace.md` §11.2)"
+        );
+    }
+}
+
+/// One function of the emitted runtime, from its header to the closing brace in
+/// the first column — which is where a formatted declaration ends, the same
+/// boundary [`declarations`] reads an interface body to.
+fn function_body(source: &str, header: &str) -> String {
+    let mut lines = source.lines().skip_while(|line| !line.starts_with(header));
+    let opened = lines
+        .next()
+        .unwrap_or_else(|| panic!("`src/runtime.ts` declares `{header}…`"));
+    let mut held = String::from(opened);
+    for line in lines {
+        held.push('\n');
+        held.push_str(line);
+        if line == "}" {
+            return held;
+        }
+    }
+    panic!("`{header}…` has no closing brace in the first column")
+}
+
 /// The reader behind every assertion above reads what this repository's own
 /// declarations look like — and refuses what it cannot read.
 ///

@@ -1056,13 +1056,30 @@ async function send(
   body: unknown,
   signal: AbortSignal,
 ): Promise<Record<string, unknown>> {
+  // Parsed here rather than left to `fetch`, which quotes what it could not
+  // parse: Node answers a malformed endpoint with `Failed to parse URL from
+  // <the resolved string>`. That string is built from the provider's
+  // `base_url:`, which grammar 4.3 class 1 makes a whole-value `${ENV}`
+  // reference — a connection string, and one `docs/trace.md` §11.1 keeps out of
+  // `Refusal.detail` and `TraceEntry.error`. So the provider is named and the
+  // value is not. Raised as a [`ProviderUnreachable`] because that is what a
+  // `fetch` refusing this URL already produced: only the message changes.
+  let endpoint: URL;
+  try {
+    endpoint = new URL(url);
+  } catch {
+    throw new ProviderUnreachable(
+      model.address,
+      new Error(`\`${model.provider.address}\`'s resolved \`base_url:\` is not a URL`),
+    );
+  }
   // The type is spelled from `fetch` itself rather than as `Response`: the
   // global type comes from the runtime's own library types, and naming it here
   // would tie this module to one of them.
   let response: Awaited<ReturnType<typeof fetch>>;
   let text: string;
   try {
-    response = await fetch(url, {
+    response = await fetch(endpoint, {
       method: "POST",
       headers: headerSet({ "content-type": "application/json" }, headers, model.provider.headers),
       body: JSON.stringify(body),
@@ -1919,7 +1936,7 @@ export async function runExec(
 
   const command = interpolate(binding.command);
   const args = binding.args.map((argument) => interpolate(argument));
-  const result = await new Promise<{ code: number; stdout: string; stderr: string }>(
+  const spawned = new Promise<{ code: number; stdout: string; stderr: string }>(
     (resolve, reject) => {
       const child = spawn(command, args, {
         cwd: binding.cwd === undefined ? undefined : interpolate(binding.cwd),
@@ -1959,6 +1976,30 @@ export async function runExec(
     },
   );
 
+  let result: { code: number; stdout: string; stderr: string };
+  try {
+    result = await spawned;
+  } catch (error) {
+    // A deadline, or a run somebody cancelled, arrives here as an abort rather
+    // than as a failure to start, and it is not this binding's failure — so it
+    // is raised as it came, the way [`send`] raises one.
+    if (context.signal.aborted) throw error;
+    // Everything else is the platform declining to run the command, and the
+    // message it declines with quotes the **resolved** path: Node says
+    // `spawn /opt/tokens/rg ENOENT`, Bun `ENOENT: no such file or directory,
+    // posix_spawn '/opt/tokens/rg'`. That string would reach `TraceEntry.error`,
+    // the trace file and stderr, which `docs/trace.md` §11.1 says no resolved
+    // `${ENV}` value does — so the failure is restated: the command as the
+    // composition spells it ([`asWritten`]), and the platform's own error
+    // **code**, which names what went wrong without naming what it went wrong
+    // on. The same restatement is what keeps one composition producing one
+    // message whatever environment it runs in.
+    const code = (error as NodeJS.ErrnoException | null | undefined)?.code;
+    throw new Error(
+      `\`${asWritten(binding.command)}\` could not be run${code === undefined ? "" : ` (${code})`}`,
+    );
+  }
+
   if (!binding.expectExit.includes(result.code)) {
     // The command as the composition spells it ([`asWritten`]): a resolved
     // `${ENV}` value has no business in a field the trace carries.
@@ -1994,7 +2035,22 @@ export async function runHttp(
   request: { readonly query?: Record<string, unknown>; readonly body?: unknown },
   context: RunContext,
 ): Promise<unknown> {
-  const url = new URL(interpolate(binding.url));
+  let url: URL;
+  try {
+    url = new URL(interpolate(binding.url));
+  } catch {
+    // The platform's own parse failure quotes the **resolved** string — Bun says
+    // `"secret/reports" cannot be parsed as a URL` — and grammar 4.3 class 2
+    // makes this surface interpolable, so that string can be a credential. It
+    // would reach `TraceEntry.error` and the trace file, which `docs/trace.md`
+    // §11.1 says no resolved `${ENV}` value does, so the binding is named as the
+    // composition spells it ([`asWritten`]) and the resolved value is not
+    // repeated. There is nothing else to say about it: the whole failure is that
+    // what the references resolved to is not a URL.
+    throw new Error(
+      `\`${asWritten(binding.url)}\` is not a URL once its \`\${ENV}\` references are resolved`,
+    );
+  }
   for (const [name, value] of Object.entries(request.query ?? {})) {
     url.searchParams.set(name, typeof value === "string" ? value : JSON.stringify(value));
   }
@@ -2408,10 +2464,17 @@ export interface TraceEntry {
  * two are recorded for different reasons. A **read** is recorded because PRD 5.8
  * makes store ops effects whose reads replay from history rather than from the
  * live store: the answer is kept so a replay has something to consume. A
- * **write** is recorded because it is at-least-once — it carries the
- * idempotency key of grammar 9.4, and `deduped` says whether the backend had
- * already applied that key, which is the difference between "this run wrote it"
- * and "an earlier attempt of this same effect did".
+ * **write** is recorded because it is at-least-once — a store-op *node*'s write
+ * carries the idempotency key of grammar 9.4, and `deduped` says whether the
+ * backend had already applied that key, which is the difference between "this
+ * run wrote it" and "an earlier attempt of this same effect did".
+ *
+ * A write an agent made through a synthesized store tool (grammar 11.5) carries
+ * neither: grammar 9.4 names the store-op node catalog (§11.4) as the carrier,
+ * and a tool call's outcome goes straight back to the model that asked for it,
+ * so there is no unobserved effect for a key to substitute for. See
+ * `src/stores.ts`'s module header for the whole argument, and `docs/trace.md`
+ * §6 for the presence rule a reader is given.
  */
 export interface StoreRecord {
   /** The store's typed address (grammar 2.2). */
@@ -2428,7 +2491,7 @@ export interface StoreRecord {
   readonly key?: string;
   /** What a read answered — the history a replay consumes. */
   readonly answer?: unknown;
-  /** A write's idempotency key (grammar 9.4). */
+  /** A store-op node write's idempotency key (grammar 9.4). */
   readonly idempotencyKey?: string;
   /** Whether the backend had already applied that key (at-least-once). */
   readonly deduped?: boolean;
@@ -2506,7 +2569,16 @@ export interface DispatchRecord {
    * observable at all.
    */
   readonly idempotencyKey: string;
-  /** The instance's own trace, when the target was a `flow.*`. */
+  /**
+   * The instance's own trace, when a **joined** dispatch's target was a
+   * `flow.*`.
+   *
+   * A `detach: true` route is the exception, and for the reason its whole
+   * record is: this record is written when the dispatch is *issued* (Decision
+   * D94), before the instance it names has run a node, and the join never comes
+   * back for it. So a detached dispatch carries no `inner` whatever its target
+   * is — see `docs/trace.md` §5.
+   */
   readonly inner?: readonly TraceEntry[];
   /** Why the item did not complete, when `on_item_error` skipped it. */
   readonly error?: string;
