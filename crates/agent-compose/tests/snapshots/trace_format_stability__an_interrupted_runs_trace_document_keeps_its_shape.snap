@@ -38,7 +38,7 @@ expression: document(&run)
     },
     {
       "attempts": 1,
-      "error": "NodeFailure: flow.assisted node `approve` failed: HumanInterrupt: flow.assisted node `approve` is waiting for a human and this run has no way to answer: `agent-compose run` cannot deliver a resume, which is `agent-compose serve`'s `POST /executions/:id/resume` (PRD 5.11)",
+      "error": "NodeFailure: flow.assisted node `approve` failed: HumanInterrupt: flow.assisted node `approve` is waiting for a human and this run has no way to answer: an answer reaches a pause through `agent-compose serve`'s `POST /executions/:id/resume`, or at the terminal of an `agent-compose run` whose standard input is one (grammar 8.7, PRD 5.11)",
       "flow": "flow.assisted",
       "human": {
         "expiresAt": "<instant>",
@@ -50,7 +50,7 @@ expression: document(&run)
       "traversal": 0
     }
   ],
-  "error": "HumanInterrupt: flow.assisted node `approve` is waiting for a human and this run has no way to answer: `agent-compose run` cannot deliver a resume, which is `agent-compose serve`'s `POST /executions/:id/resume` (PRD 5.11)",
+  "error": "HumanInterrupt: flow.assisted node `approve` is waiting for a human and this run has no way to answer: an answer reaches a pause through `agent-compose serve`'s `POST /executions/:id/resume`, or at the terminal of an `agent-compose run` whose standard input is one (grammar 8.7, PRD 5.11)",
   "execution_id": "<execution-id>",
   "flow": "flow.assisted",
   "status": "interrupted",
