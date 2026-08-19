@@ -58,7 +58,7 @@
 //!
 //! # …and the promises a snapshot cannot make
 //!
-//! Five claims of `docs/trace.md` are about a *rule* rather than about a shape,
+//! Six claims of `docs/trace.md` are about a *rule* rather than about a shape,
 //! and each is asserted directly, because a snapshot of a document that happens
 //! to satisfy a rule would go on passing after the rule was dropped: that the
 //! third delivery surface carries the version beside its trace **and only
@@ -66,17 +66,24 @@
 //! order even where a router cannot decide in that order (§4), that a write's
 //! `idempotencyKey` and `deduped` are a store-op **node**'s and not an agent
 //! tool's (§6), that an activity's failure names the `${ENV}` reference its
-//! author wrote rather than the value it resolved to (§11.1), and that
+//! author wrote rather than the value it resolved to (§11.1), that
 //! `TraceEntry.error` is `<error name>: <message>` on **every** entry that
 //! carries it (§3) — which is three sites of the emitted runtime rather than
 //! one, so [`document`] holds every snapshot run to it and
 //! [`a_failure_a_run_survived_carries_its_class_like_one_that_ended_a_run`]
-//! reaches the two no snapshot here does.
+//! reaches the two no snapshot here does — and that an edge decision carries a
+//! `reason` for the three decisions §4.1 tabulates and for no others, which
+//! [`document`] also holds every snapshot run to, because §10.1 makes a
+//! presence column a promise and a field appearing where the document says it
+//! does not is that promise broken.
 //!
-//! The §6 pair rides on the store run rather than on a sixth run of its own: a
-//! presence rule is a claim about a record the snapshot already holds, and the
-//! two are asserted before `assert_snapshot!` so a change to the rule fails as
-//! itself rather than as a diff in a document.
+//! Two of the six ride on a run this file already makes rather than on a run of
+//! their own: the §6 pair on the store run — a presence rule is a claim about a
+//! record the snapshot already holds, and the two are asserted before
+//! `assert_snapshot!` so a change to the rule fails as itself rather than as a
+//! diff in a document — and §4.1's presence rule on
+//! [`a_routing_records_edges_and_targets_are_both_in_declaration_order`]'s
+//! composition, which is the only one here whose guard answers `false` at all.
 
 // See the note on the same line in `tests/compiled_graph_acceptance.rs`: a test
 // target is a crate root, so the shared harness is reached by path.
@@ -110,6 +117,7 @@ const HAIKU: &str = "claude-haiku-4-5";
 fn document(run: &harness::Run) -> String {
     let held = run.trace_document();
     every_entrys_error_is_in_one_shape(&held);
+    every_edge_decisions_reason_follows_its_rule(&held);
     let execution = held["execution_id"]
         .as_str()
         .unwrap_or_else(|| panic!("the trace document names its execution: {held}"))
@@ -208,6 +216,86 @@ fn every_entrys_error_is_in_one_shape(document: &Value) {
             "`{node}`'s entry carries an `error` that does not open with the class \
              that raised it, which `docs/trace.md` §3 says every entry's does: \
              {error:?}"
+        );
+    }
+}
+
+/// Every `EdgeDecision` in `document`, nested traces included.
+///
+/// A decision is told from the other records by carrying both `to` and `taken`:
+/// an entry names its `node`, a dispatch record its `target`, and neither
+/// carries a `taken`.
+fn edge_decisions(document: &Value) -> Vec<Value> {
+    let mut found: Vec<Value> = Vec::new();
+    walk_edge_decisions(document, &mut found);
+    found
+}
+
+fn walk_edge_decisions(value: &Value, found: &mut Vec<Value>) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                walk_edge_decisions(item, found);
+            }
+        }
+        Value::Object(fields) => {
+            if fields.get("to").is_some_and(Value::is_string)
+                && fields.get("taken").is_some_and(Value::is_boolean)
+            {
+                found.push(value.clone());
+            }
+            for held in fields.values() {
+                walk_edge_decisions(held, found);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The `reason` `docs/trace.md` §4.1 gives this decision, read off the rest of
+/// the record — `None` where its table describes none.
+///
+/// The three the table names are each recognizable from the other fields, which
+/// is what makes the presence rule checkable at all: the shape of a decision
+/// says which of the three rows it is, or that it is neither.
+fn documented_reason(edge: &Value) -> Option<&'static str> {
+    let taken = edge["taken"]
+        .as_bool()
+        .unwrap_or_else(|| panic!("an edge decision says whether it was taken: {edge}"));
+    if edge.get("else").is_some() {
+        // Row 3, or a catch-all that was taken — which nothing suppressed, and
+        // which §4.1 therefore leaves without a reason.
+        return (!taken).then_some("a guarded sibling was taken");
+    }
+    if edge.get("when").is_none() {
+        // Row 1: no guard and no `else:` is an edge that is always taken.
+        return Some("unconditional");
+    }
+    // A guarded edge. `value: false` is its own explanation; a guard that
+    // answered `true` over an edge that was not taken is row 2, and is the one
+    // decision the guard value does not account for.
+    (edge["value"].as_bool() == Some(true) && !taken)
+        .then_some("the `max_iterations` budget is spent")
+}
+
+/// `docs/trace.md` §4.1: an edge decision carries `reason` for the three
+/// decisions its table names, and for no others.
+///
+/// A rule rather than a shape, and one a snapshot is especially poor at holding:
+/// §10.1 makes each table's *presence* column something a reader may rely on, so
+/// a `reason` that appeared on decisions the table does not describe would be a
+/// promise broken rather than a field added — and a reader following §4.1 would
+/// read `undefined`. Every document this file snapshots goes through here, and
+/// [`an_edge_decision_carries_a_reason_only_where_the_document_names_one`]
+/// reaches the two absences none of them holds.
+fn every_edge_decisions_reason_follows_its_rule(document: &Value) {
+    for edge in edge_decisions(document) {
+        let held = edge.get("reason").and_then(Value::as_str);
+        let expected = documented_reason(&edge);
+        assert_eq!(
+            held, expected,
+            "this edge decision carries `reason: {held:?}` where `docs/trace.md` \
+             §4.1's table gives it {expected:?}: {edge}"
         );
     }
 }
@@ -488,6 +576,78 @@ fn a_routing_records_edges_and_targets_are_both_in_declaration_order() {
         json!(["spare", "always"]),
         "…and so are the targets, which is the half a reader reconstructs branch \
          order from: {routing}"
+    );
+}
+
+/// An edge decision carries `reason` for the three decisions `docs/trace.md`
+/// §4.1 names, and for none of the others.
+///
+/// The **absences** are what needs a fixture of its own. The five snapshot runs
+/// above reach all three presences — `"unconditional"`, the budget-spent reason
+/// and the else-suppressed one — and not one of them holds a guarded edge that
+/// answered `false` or an `else:` edge that was taken, so a runtime that started
+/// writing a `reason` on every untaken edge would leave every snapshot here
+/// matching. §10.1 makes the presence column something a reader may rely on, and
+/// a reader taking §4.1 at its word on an untaken edge reads `undefined` from a
+/// field the table promised: the same class of break as a rename, which is what
+/// this file exists to catch.
+///
+/// `flow.branch_order` declares all three shapes out of one node — a guarded
+/// edge that answers `false`, an `else:` edge nothing suppresses, and an
+/// unconditional one — so one run reaches both absences and the presence beside
+/// them.
+#[test]
+fn an_edge_decision_carries_a_reason_only_where_the_document_names_one() {
+    let provider = MockProvider::start().expect("a loopback port");
+
+    let Some(run) = harness::run("activities", "flow.branch_order", &[], &provider) else {
+        return;
+    };
+    run.succeeded();
+
+    let held = run.trace_document();
+    every_edge_decisions_reason_follows_its_rule(&held);
+
+    let fork = run.entries("fork");
+    let routing = &fork[0]["routing"];
+    let edges = routing["edges"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the entry carries its edge decisions: {}", fork[0]));
+    // The shapes first, because the reasons below say nothing without them:
+    // whichever way `reason` went, these are the decisions §4.1 speaks about.
+    assert_eq!(
+        edges[0]["value"],
+        json!(false),
+        "`guarded` is the guarded edge that answered `false`: {routing}"
+    );
+    assert_eq!(
+        edges[1]["else"],
+        json!(true),
+        "`spare` is the `else:` catch-all, and no guarded sibling was taken: {routing}"
+    );
+    assert!(
+        edges[2].get("when").is_none() && edges[2].get("else").is_none(),
+        "`always` is the unconditional edge: {routing}"
+    );
+
+    let reasons: Vec<(&str, Option<&str>)> = edges
+        .iter()
+        .map(|edge| {
+            (
+                edge["to"].as_str().expect("a target"),
+                edge.get("reason").and_then(Value::as_str),
+            )
+        })
+        .collect();
+    assert_eq!(
+        reasons,
+        [
+            ("guarded", None),
+            ("spare", None),
+            ("always", Some("unconditional")),
+        ],
+        "only the decisions `docs/trace.md` §4.1 tabulates carry a `reason`; an \
+         untaken edge is not by itself one of them: {routing}"
     );
 }
 

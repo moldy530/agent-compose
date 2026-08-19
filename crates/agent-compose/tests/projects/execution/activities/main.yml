@@ -615,7 +615,7 @@ flow.branch_order:
     # `targets`. `docs/trace.md` §4 promises declaration order for both.
     fork:
       exec:
-        command: printf
+        command: "${OPS_BIN}/printf"
         args: ["%s", "forked"]
         output:
           stdout: { type: string }
@@ -623,7 +623,7 @@ flow.branch_order:
     # Never taken: the guard reads an output that says something else.
     guarded:
       exec:
-        command: printf
+        command: "${OPS_BIN}/printf"
         args: ["%s", "guarded"]
         output:
           stdout: { type: string }
@@ -632,7 +632,7 @@ flow.branch_order:
 
     spare:
       exec:
-        command: printf
+        command: "${OPS_BIN}/printf"
         args: ["%s", "spare"]
         output:
           stdout: { type: string }
@@ -641,7 +641,7 @@ flow.branch_order:
 
     always:
       exec:
-        command: printf
+        command: "${OPS_BIN}/printf"
         args: ["%s", "always"]
         output:
           stdout: { type: string }

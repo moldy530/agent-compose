@@ -250,10 +250,11 @@ that were **not** taken, which is the half a reader most often needs.
 | `value` | boolean | guarded edges | What the guard answered. |
 | `budget` | object | see below | The `max_iterations` budget on this edge, and its state at this decision: `key` (the counter this edge spends), `used` (the count **after** this decision), `max` (the declared budget). Present on a budgeted edge whose guard answered `true` — which is when a budget is either spent or found spent. |
 | `taken` | boolean | always | Whether this edge scheduled its target. |
-| `reason` | string | untaken edges, and unconditional ones | Why, when the guard value alone does not say. See below. |
+| `reason` | string | the three decisions below, and no others | Why, where neither the guard's value nor the edge's own shape says. See below. |
 
 `reason` takes exactly three values in this version, and each names a rule rather
-than describing one:
+than describing one. The table is both the vocabulary and the presence rule: a
+decision this table does not describe carries no `reason` at all.
 
 | `reason` | when |
 |---|---|
@@ -261,8 +262,17 @@ than describing one:
 | `"the \`max_iterations\` budget is spent"` | a guarded edge whose guard answered `true` and whose budget was already at `max`, so it was not taken (grammar §7.4) |
 | `"a guarded sibling was taken"` | an `else:` edge suppressed because a guarded sibling of this node was taken (grammar §7.3 rule 4) |
 
-A guarded edge that was simply not taken carries `value: false` and **no**
-`reason`: the guard value is the whole explanation.
+So the two decisions a reader meets most often carry none, and an untaken edge is
+**not** in itself a decision that carries one:
+
+* a **guarded edge that answered `false`** has `value: false`, `taken: false` and
+  no `reason` — the guard value is the whole explanation;
+* an **`else:` edge that was taken** has `else: true`, `taken: true` and no
+  `reason` — nothing suppressed it, which is all its being taken means.
+
+A reader that wants a sentence for every edge composes those two itself. Reading
+`reason` off an arbitrary untaken edge does not work and is not something this
+version promises.
 
 ### 4.2 What terminated a cycle
 
@@ -631,10 +641,18 @@ A provider whose resolved `base_url:` is not a URL at all is reported as
 `` `provider.acme`'s resolved `base_url:` is not a URL ``, which is the whole of
 what the runtime says about it.
 
-**Class 2 — interpolable.** An `http:` binding's `url` and `headers` values, and
-the whole `exec:` block — `command`, every `args` entry, `cwd`, and `env` values.
-This class is wider than a reader might guess: `url: "${SIGNED_ENDPOINT}/reports"`
-and `command: "${TOOLBIN}/rg"` are compositions the grammar admits, and a failing
+**Class 2 — interpolable.** Grammar §4.3's class-2 row in full: an `http:` node's
+and `http:` tool binding's `url` and `headers` values; the whole `exec:` surface —
+`command`, every `args` entry, `cwd`, and `env` values, on the tool binding and
+the inline node alike; a provider's `headers` values and its non-secret keys
+(`region`, `location`, `project`, `organization`, `profile`, `api_version`); and
+non-secret `storage_backends` and `event_sources` config values. Any of them may
+hold a resolved value, and the promise above is over all of them rather than over
+the ones a message happens to quote.
+
+Two are what a message does quote, and they are the two an author is likeliest to
+point at a secret: `url: "${SIGNED_ENDPOINT}/reports"` and
+`command: "${TOOLBIN}/rg"` are compositions the grammar admits, and a failing
 activity quotes what it was pointed at. It quotes it **as the author wrote it** —
 `` `${SIGNED_ENDPOINT}/reports` answered 404 … `` — rather than as it resolved.
 The emitted runtime's `asWritten` is where that happens, and it buys a second
@@ -648,6 +666,7 @@ answered**, and a reader should treat that text as untrusted:
 | field | what it can carry from outside |
 |---|---|
 | `TraceEntry.error` | the failure the node's own activity raised — for an `http:` binding, the rejected response body truncated to 200 characters; for an `exec:` binding, the child's stderr |
+| `DispatchRecord.error` | the same text, raised by one dispatched item (§5). Under `on_item_error: skip` this is the **only** field it reaches: the run survives, so no entry carries an `error` for it |
 | `TraceDocument.error` | the same text, when that failure is what stopped the run |
 | `Refusal.detail` | what a provider answered: a status and a response body, truncated, or the socket failure that came back instead. Never the request, so the key it was signed with is not in it |
 

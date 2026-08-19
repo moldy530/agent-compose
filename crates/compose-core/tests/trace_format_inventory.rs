@@ -30,6 +30,11 @@
 //! field gets a row in the table of its own section.** A field explained only in
 //! surrounding prose fails here, and the fix is a row.
 //!
+//! One class of field is held to a **second** section besides its own: a field
+//! that carries free diagnostic text needs a row in §11.1 as well, because that
+//! is where an operator reads which fields can hold bytes this process did not
+//! compose. See [`every_message_field_is_classified_as_untrusted_text`].
+//!
 //! The other direction is deliberately not checked. A specification says more
 //! than the type declarations do — presence rules, orders, what a reader may rely
 //! on — so "every backticked word in the document is a field" is not a property
@@ -770,6 +775,67 @@ fn every_store_op_is_documented() {
          `docs/trace.md` §10.1 makes the vocabulary something a reader may rely on, \
          so an op it does not name is an undocumented member of a closed \
          enumeration: {missing:?}",
+        home.heading
+    );
+}
+
+/// The field names this format writes free diagnostic text under.
+///
+/// Two spellings and no more: `error` on the three records that carry a failure,
+/// and `detail` on the one that carries what a provider answered. Every other
+/// field of the format is a name, a number, a boolean or a member of a closed
+/// enumeration — so a field with one of these names is a message, and a message
+/// is the one thing in a trace that can hold bytes from outside this process.
+const MESSAGE_FIELDS: &[&str] = &["error", "detail"];
+
+/// Every message field is classified in the section that warns about untrusted
+/// text.
+///
+/// `docs/trace.md` §11.1 tells an operator which fields can hold bytes the run
+/// did not compose — a rejected response body, a child's stderr, what a provider
+/// answered — and a table that is *nearly* the set is worse than none: a reader
+/// takes the omitted field for runtime-composed text and renders it unescaped.
+/// `DispatchRecord.error` is the field that showed this is worth checking rather
+/// than reviewing: it carries a failed item's activity text verbatim, and under
+/// `on_item_error: skip` it is the **only** field that text reaches, because the
+/// run survives and no entry's `error` is written for it.
+///
+/// Name-based rather than type-based, for the reason [`MESSAGE_FIELDS`] gives: a
+/// message is recognizable by what it is called here, and a *third* spelling
+/// would slip past this — so the constant is the thing to extend when the format
+/// grows one, and its doc comment says so.
+#[test]
+fn every_message_field_is_classified_as_untrusted_text() {
+    let reached = reachable(&runtime());
+    let mut messages: Vec<String> = Vec::new();
+    for (name, declaration) in &reached {
+        for field in &declaration.fields {
+            if MESSAGE_FIELDS.contains(&field.as_str()) {
+                messages.push(format!("{name}.{field}"));
+            }
+        }
+    }
+    assert!(
+        messages.contains(&"TraceEntry.error".to_string()),
+        "the reader found the format's message fields at all — it read {messages:?}, \
+         and the entry's own `error` is the one every reader of this format meets"
+    );
+
+    let document = specification();
+    let sections = sections(&document);
+    let home = sections
+        .iter()
+        .find(|section| section.heading.starts_with("### 11.1 "))
+        .expect("`docs/trace.md` has a §11.1, which is where untrusted text is classified");
+    let missing: Vec<&String> = messages
+        .iter()
+        .filter(|message| !row_names(home, message))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "these fields carry free text and have no row in {} — an operator reading \
+         that table takes it for the whole set, so a message field missing from it \
+         is text from outside this process that nothing warned about: {missing:?}",
         home.heading
     );
 }
