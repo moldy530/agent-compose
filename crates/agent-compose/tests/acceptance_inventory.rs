@@ -315,6 +315,14 @@ const CODEGEN: &[Criterion] = &[
                 "a_nested_fan_out_keys_and_isolates_each_instance_by_its_whole_path",
                 Status::Live,
             ),
+            // …and where the trace puts a dispatched instance: under its own
+            // record, once. The sibling above decides that a nested instance is
+            // reported; this decides that the map node's entry is not a second
+            // place it is reported from (`docs/trace.md` §3, §8, PRD 5.3).
+            (
+                "a_dispatched_instances_trace_stays_under_its_own_record",
+                Status::Live,
+            ),
             // The same criterion over the *documented* project rather than a
             // fixture: `examples/triage-fanout` is what PRD 5.6 is written
             // about, and it reaches further than any fixture — a subgraph, a

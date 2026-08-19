@@ -3145,6 +3145,86 @@ fn a_nested_fan_out_keys_and_isolates_each_instance_by_its_whole_path() {
     );
 }
 
+/// A dispatched instance's trace is under **its own** dispatch record and
+/// nowhere else, including when its failure is what ended the map node
+/// (`docs/trace.md` §3, §8).
+///
+/// The format has two nesting fields and they say two different things:
+/// `TraceEntry.inner` is the instance a `flow:` node ran, and
+/// `DispatchRecord.inner` is the instance a `map` dispatched. A `map` is not a
+/// `flow:` node, so its own entry carries no `inner` however its dispatches
+/// went — otherwise a reader walking a trace for every subgraph run counts one
+/// instance twice, and counts *which* one by a rule the document does not state:
+/// the lowest-indexed failure, on the `on_error: fail` path alone.
+///
+/// The path is the one that reaches it. The failing item's error travels out of
+/// the fan-out inside an `ItemFailure`, which the node's failure wraps, so a
+/// walk of the `cause` chain that does not stop at that boundary finds the
+/// dispatched instance's `SubflowFailure` underneath and attaches its trace to
+/// the map node's own entry.
+#[test]
+fn a_dispatched_instances_trace_stays_under_its_own_record() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({
+                "tasks": [{ "steps": ["alpha"] }, { "steps": ["gamma"] }],
+            })),
+        ),
+        // Item 0 runs its instance through: one step, then the roll-up.
+        Script::new(HAIKU, Outcome::structured(json!({ "part": "made-alpha" }))).matching("alpha"),
+        Script::new(HAIKU, Outcome::structured(json!({ "line": "line-0" }))).matching("made-alpha"),
+        // Item 1's own step is refused, which fails the instance's inner map,
+        // the instance, the item, and — `on_item_error` and `on_error` both
+        // being `fail` here — the outer map node and the run.
+        Script::new(HAIKU, Outcome::server_error()).matching("gamma"),
+    ]);
+
+    let Some(run) = harness::invoke("fanout", "flow.nested", &[("goal", "ship it")], &provider)
+    else {
+        return;
+    };
+    run.failed();
+
+    let entries = run.entries("work");
+    assert_eq!(entries.len(), 1, "one map node, one entry: {entries:?}");
+    let entry = entries[0].clone();
+    assert_eq!(entry["outcome"], json!("failed"), "{entry}");
+
+    // The account of the fan-out survives the failure, one record per source
+    // item, and the failed one carries the instance it dispatched.
+    let records = entry["dispatches"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a failed map still says what it dispatched: {entry}"))
+        .clone();
+    assert_eq!(records.len(), 2, "one record per source item: {entry}");
+    assert_eq!(records[1]["outcome"], json!("failed"), "{}", records[1]);
+    let dispatched = records[1]["inner"]
+        .as_array()
+        .unwrap_or_else(|| {
+            panic!(
+                "the failed item's instance is under its record: {}",
+                records[1]
+            )
+        })
+        .clone();
+    assert!(
+        dispatched
+            .iter()
+            .any(|held| held["node"] == "steps" && held["outcome"] == "failed"),
+        "…and it is that instance's own trace, ending at the node it aborted at: {dispatched:?}"
+    );
+
+    // The one this test exists for: the same instance is not *also* on the map
+    // node's entry, where §3 says a `flow:` node's instance is.
+    assert!(
+        entry.get("inner").is_none(),
+        "a `map` node's entry carries no `inner`: a dispatched instance is under its \
+         own record (`docs/trace.md` §3, §8), and this one reports it twice: {entry}"
+    );
+}
+
 /// A fan-out over an empty array completes immediately, writes nothing, and its
 /// outgoing edge fires exactly as if every instance had finished (rule 6).
 #[test]

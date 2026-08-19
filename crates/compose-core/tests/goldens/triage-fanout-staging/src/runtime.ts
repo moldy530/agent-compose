@@ -862,9 +862,10 @@ export interface Failover extends Refusal {
  * with.
  *
  * A direct binding produces one too, with `model === servedBy`, `fallback: 0`
- * and no failovers: a trace that recorded only the interesting calls would leave
- * a reader unable to tell a call that did not fail over apart from a call
- * nothing recorded at all.
+ * and an **empty** `failovers` — the key is there holding nothing, which is a
+ * different record from one that omits it, and no record omits it. A trace that
+ * kept only the interesting calls would leave a reader unable to tell a call
+ * that did not fail over apart from a call nothing recorded at all.
  *
  * **A call nothing answered is recorded too**, and it is the one a reader most
  * often opens a trace for: a route that spent every member made a real call to
@@ -879,6 +880,11 @@ export interface ModelCall {
   readonly servedBy?: string;
   /** Its ordinal in the route, `0` for the first. Present with `servedBy`. */
   readonly fallback?: number;
+  /**
+   * Every member that refused and moved the ladder on, in the order they were
+   * tried. On every record, and **empty** where none did — a direct binding's,
+   * and a route whose first member answered.
+   */
   readonly failovers: readonly Failover[];
   /** What ended the call, when no member answered it. */
   readonly refused?: Refusal;
@@ -2500,6 +2506,11 @@ export interface TraceEntry {
    * would either lose them or pretend they were the caller's. Nesting them keeps
    * PRD 5.3's record complete across a module boundary without moving anyone's
    * step numbers.
+   *
+   * A **dispatched** instance is not here. A `map`'s items each have a record of
+   * their own and the instance goes under [`DispatchRecord.inner`], including
+   * the item whose failure ended the map node — see [`traceOf`], which is what
+   * keeps the two apart, and `docs/trace.md` §3 and §8.
    */
   readonly inner?: readonly TraceEntry[];
   /**
@@ -2652,7 +2663,14 @@ export interface DispatchRecord {
    * is — see `docs/trace.md` §5.
    */
   readonly inner?: readonly TraceEntry[];
-  /** Why the item did not complete, when `on_item_error` skipped it. */
+  /**
+   * Why the item did not complete.
+   *
+   * On **both** outcomes that did not: `skipped` and `failed` alike, because
+   * `on_item_error` decides which of the two an item's failure becomes and not
+   * whether there was one. Absent on `completed` and on `detached`, the second
+   * for the reason its whole record is thin — nothing was observed to fail.
+   */
   readonly error?: string;
 }
 
@@ -2703,10 +2721,20 @@ function dispatchesOf(error: unknown): readonly DispatchRecord[] | undefined {
  * followed for the reason [`dispatchesOf`] follows it: `runActivity` wraps
  * whatever the activity threw, so the [`SubflowFailure`] is rarely the outermost
  * error by the time anyone asks.
+ *
+ * An [`ItemFailure`] is where the walk **stops**, and that is the difference
+ * between the two recording sites above. Below one is a *dispatched* instance's
+ * failure, whose trace belongs to that item — [`runMap`] has already put it on
+ * the item's own [`DispatchRecord.inner`], reading from underneath this
+ * boundary. Walking past it would put one item's instance on the **map node's**
+ * `inner` as well: the lowest-indexed failure only, and only on the
+ * `on_error: fail` path, where `docs/trace.md` §3 says a `flow:` node's own
+ * instance is and §8 says a dispatched one is under its record instead.
  */
 function traceOf(error: unknown): readonly TraceEntry[] | undefined {
   for (let held: unknown = error; typeof held === "object" && held !== null; ) {
     if (held instanceof SubflowFailure) return held.trace;
+    if (held instanceof ItemFailure) return undefined;
     held = (held as { cause?: unknown }).cause;
   }
   return undefined;
@@ -4417,7 +4445,13 @@ export async function runNode(
   /** This node's entry, for a failure that leaves nothing else behind. */
   const aborted = (error: unknown, made: number, routing?: RoutingDecision): TraceEntry => {
     // A subflow that failed still made a trace, and it is the only account of
-    // what happened inside the boundary (grammar 8.5, PRD 5.3).
+    // what happened inside the boundary (grammar 8.5, PRD 5.3). `inner` already
+    // holds every instance *this node* ran — `runActivity` collects one per
+    // failed attempt — so [`traceOf`] is the recovery for a [`SubflowFailure`]
+    // that arrived restated on the `cause` chain instead, the way
+    // [`abortedEntry`] recovers an entry from one. It stops at an
+    // [`ItemFailure`]: what is under one is a *dispatched* instance, whose trace
+    // is on its own record rather than on this entry.
     const held = inner ?? traceOf(error);
     const dispatched = dispatches ?? dispatchesOf(error) ?? plannedDispatches(input);
     return {
@@ -4492,7 +4526,9 @@ export async function runNode(
     // that failed inside the boundary put its instance's trace in `innerTraces`,
     // the one that ended the node included. A `SubflowFailure` reached only
     // through a chain — a `map`'s item, wrapped in an `ItemFailure` — is not one
-    // of this node's own attempts and is left to `traceOf` in [`aborted`].
+    // of this node's own attempts and is not one of these: it is a *dispatched*
+    // instance, already recorded under its own [`DispatchRecord.inner`], and
+    // [`traceOf`] stops at that boundary so it does not arrive here twice.
     inner = joined(innerTraces, undefined);
     // A `map` that failed still dispatched: the items that completed had their
     // effects and the detached ones were delivered, and the records are the only
