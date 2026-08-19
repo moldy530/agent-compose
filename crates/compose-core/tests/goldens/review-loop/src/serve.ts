@@ -72,14 +72,17 @@
 // again once it is corrected. Every other refusal here is about *which* pause,
 // not about what was in the body, and each is a `4xx` naming what happened:
 // there is nothing waiting, the wait already expired, or the execution is
-// holding more than one pause and the request named none of them.
+// holding more than one pause and the request named none of them — or named
+// more than one.
 //
 // **Addressing a pause.** One execution can hold more than one at a time — a
 // `human` node inside a `map`-dispatched flow is the reachable case — so a
 // resume may carry `?wait=<id>`, where the id is grammar 9.4's instance path
 // flattened (`approve/0`, `review/0/2/approve/0`). It may be omitted where the
 // execution is holding exactly one, which is what the status route's
-// `resume_url` does for a caller that never has to think about it.
+// `resume_url` does for a caller that never has to think about it. Exactly one
+// `wait` is what it addresses: a repeated `?wait=` names two pauses and is
+// refused as such, rather than joined into an id nothing is holding.
 //
 // **What durability there is.** The wait is a promise parked in this process,
 // like the execution table below: a `serve` restarted while a human was thinking
@@ -189,7 +192,25 @@ export function createApp(): FastifyInstance {
         error: `this execution has already ${execution.status}, so nothing is waiting for an answer`,
       });
     }
-    const named = (request.query as { wait?: string }).wait;
+    // Fastify's default query parser answers a **repeated** key with an array,
+    // so `?wait=a&wait=b` arrives here as `["a", "b"]`. Refused rather than
+    // joined or first-wins: every refusal on this route says what actually
+    // happened, and a request that named two pauses cannot be told `no pause
+    // \`a,b\`` — an id no client ever sent — nor answered by picking one of the
+    // two, which would settle a pause the request did not unambiguously name.
+    // Like every other refusal about *which* pause, it consumes nothing.
+    const asked = (request.query as { wait?: string | string[] }).wait;
+    if (Array.isArray(asked)) {
+      const pending = humanWaits(id).map((wait) => wait.id);
+      return reply.code(400).send({
+        execution_id: id,
+        status: statusOf(execution),
+        wait: asked,
+        ...(pending.length === 0 ? {} : { pending }),
+        error: `a resume answers exactly one pause, and this request carried \`wait\` ${asked.length} times`,
+      });
+    }
+    const named = asked;
     const outcome = deliverHumanAnswer(id, named, request.body);
     if (outcome.ok) {
       // `202` rather than `200`: the answer has been delivered and the graph has

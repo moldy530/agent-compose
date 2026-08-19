@@ -200,7 +200,10 @@ curl -X POST "http://127.0.0.1:8787/executions/exec_0f1e…/resume?wait=approve%
 A `202` means the answer was taken and the graph has gone back to work; poll the
 status route for the rest. A payload that does not fit the node's `output:` is a
 `400` and **does not consume the wait** — the execution is still interrupted and
-the corrected answer can be sent to the same URL. A `409` is about *which* pause
+the corrected answer can be sent to the same URL. So is a request carrying
+`?wait=` more than once, and for the same reason: it names two pauses where a
+resume answers one, so it is refused as that — rather than joined into an id
+nothing is holding — and consumes neither. A `409` is about *which* pause
 rather than about the body: nothing is waiting, the wait already expired and
 `on_timeout:` has routed the execution on, the execution is holding more than one
 pause and the request named none, or `?wait=` named a pause this execution is not

@@ -6621,6 +6621,8 @@ fn an_expired_wait_takes_its_route_and_refuses_the_answer_that_arrives_after_it(
 /// route with only an execution id could not serve. `?wait=` is what names one,
 /// the ids are derived rather than handed out — `fan/0/<index>/sign/0` — and a
 /// resume that names none while two are pending is refused rather than guessed.
+/// So is one that names *two*: a repeated `?wait=` arrives as an array, and the
+/// refusal says that rather than reporting a comma-joined id no client sent.
 #[test]
 fn two_pauses_in_one_execution_are_addressed_by_their_instance_paths() {
     let provider = MockProvider::start().expect("a loopback port");
@@ -6694,6 +6696,41 @@ fn two_pauses_in_one_execution_are_addressed_by_their_instance_paths() {
             .contains("holding no pause `sign/0`"),
         "{:?}",
         nowhere.body
+    );
+
+    // And a request carrying `wait` **twice** names two pauses, which is not
+    // what one resume answers. Refused as that — rather than joined into a
+    // comma-spliced id no client ever sent, or applied to whichever of the two
+    // the parser happened to keep — and it consumes neither, which the resumes
+    // below prove by still being taken.
+    let doubled = app
+        .post_json(
+            &format!(
+                "/executions/{execution}/resume?wait=fan%2F0%2F0%2Fsign%2F0&wait=fan%2F0%2F1%2Fsign%2F0"
+            ),
+            &json!({ "decision": "approve" }),
+        )
+        .expect("the resume route answers");
+    assert_eq!(doubled.status, 400, "{:?}", doubled.body);
+    assert_eq!(
+        doubled.json()["wait"],
+        json!(["fan/0/0/sign/0", "fan/0/1/sign/0"]),
+        "the refusal echoes what the request actually named: {:?}",
+        doubled.body
+    );
+    assert_eq!(
+        doubled.json()["pending"],
+        json!(["fan/0/0/sign/0", "fan/0/1/sign/0"]),
+        "{:?}",
+        doubled.body
+    );
+    assert!(
+        doubled.json()["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("carried `wait` 2 times"),
+        "{:?}",
+        doubled.body
     );
 
     // Answered in the reverse of source-item order, because what the fan-out

@@ -15,6 +15,15 @@
 // divides: nothing a served app answers says whether the timer was cleared or
 // what `context.deadline` said while the wait was open.
 //
+// One precedence is here for a different reason. Deciding it takes a
+// composition that declares `on_timeout:` beside an *explicit* `on_error:`, and
+// no fixture a served app runs does: every composition that can reach an expiry
+// resolves `on_error: fail`, where routing the `on_timeout:` fallback and
+// absorbing the expiry look identical from outside. So a delivery failure, an
+// expiry and an interrupt are each driven through one `human` node under one
+// `on_error: skip` — the first absorbed, the other two not, because neither of
+// them is a thing the activity did.
+//
 // Three sections are about one id being used twice. A retry ladder re-executes
 // an instance at the site its predecessor ran at, so the pause a failed attempt
 // left parked and the pause the next attempt opens are two waits under one id —
@@ -124,6 +133,49 @@ function park(execution, instancePath, fields = {}) {
       viewAt(instancePath, execution),
     ),
   );
+}
+
+/**
+ * A `human` node under an explicit `on_error: skip`, with the activity swapped
+ * in — the shape the three precedence sections share.
+ *
+ * Its own outgoing edge goes to `__end__`, so a section whose `on_timeout:`
+ * names anything else can tell "the fallback was routed to" apart from "the
+ * node's own edges were evaluated" by reading `goto` alone.
+ */
+function skipping(run) {
+  return {
+    flow: "flow.sign_off",
+    node: "sign",
+    policy: { onError: "skip" },
+    // A `human` node takes no `timeout:` and no `retry:` at any level (D102).
+    exempt: true,
+    shapes: {
+      input: { properties: {} },
+      state: { properties: {} },
+      output: { properties: {} },
+    },
+    input: () => ({}),
+    run,
+    writes: [],
+    edges: [{ to: "__end__" }],
+  };
+}
+
+/** The state a `runNode` call reads its execution from. */
+function stateFor(execution) {
+  return {
+    $run: {
+      ...runtime.emptyRun(),
+      execution: { id: execution, session_key: "" },
+    },
+  };
+}
+
+/** The `human` activity of [`skipping`], as a node's `run`. */
+function pausing(fields = {}) {
+  return (input, context, view) =>
+    runtime.runHuman(descriptor(fields), { question: "ship it?" }, context, view);
 }
 
 /** A `NodeView` over a `state.items` array, which is what a `map`'s `over:` reads. */
@@ -448,49 +500,18 @@ const observed = {};
   const execution = "exec_absorbing";
   runtime.openHumanWaits(execution, true);
 
-  /** A `human` node under `on_error: skip`, with the activity swapped in. */
-  const node = (run) => ({
-    flow: "flow.sign_off",
-    node: "sign",
-    policy: { onError: "skip" },
-    // A `human` node takes no `timeout:` and no `retry:` at any level (D102).
-    exempt: true,
-    shapes: {
-      input: { properties: {} },
-      state: { properties: {} },
-      output: { properties: {} },
-    },
-    input: () => ({}),
-    run,
-    writes: [],
-    edges: [{ to: "__end__" }],
-  });
-  const stateOf = () => ({
-    $run: {
-      ...runtime.emptyRun(),
-      execution: { id: execution, session_key: "" },
-    },
-  });
-
-  // The control, and it is what makes the assertion below about the guard
+  // The control, and it is what makes every assertion below about a guard
   // rather than about a policy that was never applied: the same node and the
   // same `skip`, over an ordinary failure, really does absorb it.
   const absorbed = await runtime.runNode(
-    node(async () => {
+    skipping(async () => {
       throw new Error("the delivery failed");
     }),
-    stateOf(),
+    stateFor(execution),
   );
   const entry = absorbed.update?.$run?.trace?.[0];
 
-  const parked = outcomeOf(
-    runtime.runNode(
-      node((input, context, view) =>
-        runtime.runHuman(descriptor(), { question: "ship it?" }, context, view),
-      ),
-      stateOf(),
-    ),
-  );
+  const parked = outcomeOf(runtime.runNode(skipping(pausing()), stateFor(execution)));
   await settle();
   const pending = runtime.humanWaits(execution).map((wait) => wait.id);
   runtime.abandonPausesUnder(execution, "sign/0");
@@ -501,6 +522,70 @@ const observed = {};
     pending,
     abandoned: parked.state,
   };
+  runtime.releaseHumanWaits(execution);
+}
+
+// …and neither is an **expiry**. A budget that ran out is the composition's own
+// control flow — `on_timeout:` transfers control to the route it names *instead
+// of* evaluating the node's outgoing edges (grammar 8.7, 9.2) — so a node
+// declaring both keys must route to `on_timeout:`'s target rather than let
+// `on_error: skip` mark it skipped and take its own edge onward. The two keys
+// are legal together (`retry:`/`timeout:` are the pair a `human` node refuses,
+// D102), and no served composition can decide this: the acceptance fixture's
+// expiring flow resolves `on_error: fail`, so the ordering `runNode` reads them
+// in is only visible from here. The node's edge goes to `__end__` and the
+// `on_timeout:` route does not, so `goto` alone says which one fired.
+{
+  const execution = "exec_expiry_over_skip";
+  runtime.openHumanWaits(execution, true);
+  const ended = outcomeOf(
+    runtime.runNode(
+      skipping(pausing({ timeoutMs: 20, onTimeout: "note" })),
+      stateFor(execution),
+    ),
+  );
+  await until(() => ended.state !== "pending");
+  const entry = ended.value?.update?.$run?.trace?.[0];
+
+  observed.expiry_over_skip = {
+    settled: ended.state,
+    goto: ended.value?.goto,
+    outcome: entry?.outcome,
+    fallback: entry?.fallback,
+    pause_settled: entry?.human?.settled,
+    published: runtime.humanWaits(execution).map((wait) => wait.id),
+  };
+  runtime.releaseHumanWaits(execution);
+}
+
+// …and neither is an **interrupt**. A run with no resume surface is the run's
+// own shape rather than something the activity did, so it leaves `runNode` as a
+// throw ahead of the policy: `skip` absorbing it would carry the graph past a
+// `human` node whose answer the composition declared it needed — which is what
+// `agent-compose run` reports as its own exit path instead. Under the same
+// explicit `on_error: skip` as the control above.
+{
+  const execution = "exec_interrupt_over_skip";
+  runtime.openHumanWaits(execution, false);
+  let refused;
+  try {
+    const skipped = await runtime.runNode(skipping(pausing()), stateFor(execution));
+    refused = {
+      threw: false,
+      outcome: skipped.update?.$run?.trace?.[0]?.outcome,
+      goto: skipped.goto,
+    };
+  } catch (error) {
+    refused = {
+      threw: true,
+      name: error?.name ?? "Error",
+      interrupt: runtime.interruptOf(error)?.name ?? null,
+      node: runtime.interruptOf(error)?.node ?? null,
+    };
+  }
+  await settle();
+
+  observed.interrupt_over_skip = refused;
   runtime.releaseHumanWaits(execution);
 }
 

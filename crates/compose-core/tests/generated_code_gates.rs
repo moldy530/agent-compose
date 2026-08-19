@@ -167,15 +167,19 @@
 //!     `fetch` could not parse and Bun does not. Gate 13 asks Node the same
 //!     question for exactly that reason.
 //! 19. **The `human` wait board** — the pauses a run is holding, driven directly.
-//!     Three of grammar 8.7's guarantees are invisible from a served app,
-//!     because the case that breaks them is a task nobody is awaiting: that a
+//!     Four of grammar 8.7's guarantees are invisible from a served app: that a
 //!     pause belongs to the node whose instance path is a prefix of its own —
 //!     which is what holds an enclosing budget still (Decision D102) — that a
 //!     pause the run abandoned leaves the board rather than being published as a
-//!     question and answered into nothing, and that a released wait's expiry
-//!     timer is cleared. The last has no observable consequence at all: an
-//!     `unref`ed timer keeps nothing alive, so the runner counts the global
-//!     `setTimeout`/`clearTimeout` calls instead.
+//!     question and answered into nothing, that a released wait's expiry timer
+//!     is cleared, and that an expiry and an interrupt are answered ahead of an
+//!     *explicit* `on_error:` on the same node. The first three are invisible
+//!     because the case that breaks them is a task nobody is awaiting; the last
+//!     because every composition that can reach an expiry resolves
+//!     `on_error: fail`, where routing the `on_timeout:` fallback and absorbing
+//!     the expiry look alike. The timer claim has no observable consequence at
+//!     all: an `unref`ed timer keeps nothing alive, so the runner counts the
+//!     global `setTimeout`/`clearTimeout` calls instead.
 //!
 //! # The toolchain fixture
 //!
@@ -1292,9 +1296,10 @@ fn the_fan_out_runtime_bounds_orders_and_resolves_every_dispatch() {
 /// (grammar 8.7, 9.2, PRD 5.11).
 ///
 /// The acceptance suite answers, expires and addresses pauses through a served
-/// app, which is where the composition's behaviour is decided. Eight claims are
-/// not decidable there, because the case that breaks them is a task **nobody is
-/// awaiting**:
+/// app, which is where the composition's behaviour is decided. Ten claims are
+/// not decidable there — eight because the case that breaks them is a task
+/// **nobody is awaiting**, and two because every composition that can reach one
+/// declares an `on_error:` the orderings agree on:
 ///
 ///   * **a pause is addressed by, and belongs to, an instance path.** A node
 ///     holds the pauses its own path is a prefix of, which is the whole of what
@@ -1320,6 +1325,15 @@ fn the_fan_out_runtime_bounds_orders_and_resolves_every_dispatch() {
 ///     any more is the run's own unwinding, and a `skip` that absorbed one would
 ///     route a graph past a `human` node whose answer the composition declared
 ///     it needed;
+///   * **an expiry and an interrupt are not activity outcomes either**, and the
+///     node that decides it is one declaring `on_timeout:` beside an *explicit*
+///     `on_error:` — the pair grammar 8.7 permits, since it is `timeout:` and
+///     `retry:` a `human` node refuses (D102). The expiry routes to
+///     `on_timeout:`'s target **instead of** the node's own edges (grammar 9.2)
+///     and the interrupt leaves the node, both over the top of a `skip` that
+///     absorbs an ordinary delivery failure at that same node. A served app
+///     cannot tell the orderings apart: every fixture that reaches an expiry
+///     resolves `on_error: fail`, where they agree;
 ///   * **a released wait's expiry timer is cleared.** An `unref`ed timer keeps
 ///     nothing alive, so it is invisible to `process.getActiveResourcesInfo()`
 ///     and to the process exiting: the runner counts the global
@@ -1481,6 +1495,44 @@ fn the_wait_board_behaved(observed: &Value) {
         observed["absorbing"]["abandoned"],
         json!("HumanAbandoned"),
         "`skip` absorbing this would route the graph past the human: {observed}"
+    );
+
+    // …and an **expiry** is not one either, which is the precedence a node
+    // declaring both keys turns on: `on_timeout:` transfers control to its route
+    // *instead of* the node's own edges (grammar 8.7, 9.2), over the top of an
+    // explicit `on_error: skip` that would otherwise mark the node skipped and
+    // send it down them. The node's edge goes to `__end__` and the route does
+    // not, so `goto` is the whole assertion: a `runNode` that consulted
+    // `policy.onError` first reports `["__end__"]` and `"skipped"` here. No
+    // served composition can decide it — every fixture that reaches an expiry
+    // resolves `on_error: fail`, where the two orderings agree.
+    assert_eq!(
+        observed["expiry_over_skip"],
+        json!({
+            "settled": "resolved",
+            "goto": ["note"],
+            "outcome": "failed",
+            "fallback": "note",
+            "pause_settled": "expired",
+            "published": [],
+        }),
+        "`on_error: skip` absorbed the expiry instead of `on_timeout:` routing it: {observed}"
+    );
+
+    // …and neither is an **interrupt**: a run with no way to answer stops at the
+    // pause rather than being skipped past it, under the same explicit `skip`.
+    // `runActivity` wraps it in a `NodeFailure` — the interrupt is on the cause
+    // chain, which is what `runNode` answers ahead of the policy and what
+    // `cli.ts` reads for its own exit path.
+    assert_eq!(
+        observed["interrupt_over_skip"],
+        json!({
+            "threw": true,
+            "name": "NodeFailure",
+            "interrupt": "HumanInterrupt",
+            "node": "sign",
+        }),
+        "`on_error: skip` absorbed the interrupt instead of the run stopping: {observed}"
     );
 
     // The budget reading moves with the hold: fixed while the timer is armed —
