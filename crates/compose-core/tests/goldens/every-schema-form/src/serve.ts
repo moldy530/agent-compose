@@ -361,10 +361,13 @@ async function notify(callback: string, execution: Execution): Promise<void> {
  * What both the status route and the callback report about an execution.
  *
  * `trace_version` travels **with** the trace and only with it (`docs/trace.md`):
- * a report for a run still going carries no entries, and a version key
- * describing nothing would be a number a reader could pin against no format at
- * all. The rule a reader is given is the one this expresses — wherever a `trace`
- * appears, the version that describes it appears beside it — and it holds on the
+ * a version key describing nothing would be a number a reader could pin against
+ * no format at all. Two reports have nothing for it to describe — a run still
+ * going, which has recorded nothing yet, and a run that **failed** carrying no
+ * trace, which is a request the graph refused before a node produced an entry —
+ * and both carry neither key. The rule a reader is given is the one this
+ * expresses — wherever a `trace` appears, the version that describes it appears
+ * beside it, and wherever one is absent so is the other — and it holds on the
  * two surfaces this function feeds, the status route and the completion webhook,
  * exactly as it does for `run`'s JSON record and the trace file.
  */
