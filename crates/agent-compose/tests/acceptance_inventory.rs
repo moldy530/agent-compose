@@ -644,12 +644,42 @@ const COMMANDS: &[Criterion] = &[
                 "a_declared_manual_trigger_remaps_the_session_the_cli_was_given",
                 Status::Live,
             ),
-            // And the one outcome a one-shot CLI run cannot carry to the end: a
-            // `human` pause, whose answer arrives through `serve`'s resume route
-            // (grammar 8.7, PRD 5.11). What `run` owes there is an exit path of
-            // its own rather than one of the two it already has.
+            // And the outcome a one-shot CLI run cannot carry to the end
+            // *headless*: a `human` pause, whose answer then arrives through
+            // `serve`'s resume route (grammar 8.7, PRD 5.11). What `run` owes
+            // there is an exit path of its own rather than one of the two it
+            // already has.
             (
                 "run_reports_the_pause_it_cannot_answer_and_exits_on_its_own_code",
+                Status::Live,
+            ),
+            // …which is the *other* half of a rule whose first half is a run at a
+            // terminal. A pause is a question, and a `run` with somebody to ask
+            // asks it: the emitted CLI renders what the human is shown, reads one
+            // line of JSON, holds it to the node's `output:` exactly as the
+            // resume route does, and carries on in the same process (grammar 8.7,
+            // PRD §9.21). Five tests, because the surface has five separable
+            // claims — the loop itself, the order and refusals of several
+            // questions, a budget that runs out mid-question, the answers running
+            // out, and the switch that decides which path a run takes.
+            (
+                "a_run_at_a_terminal_asks_the_pause_it_reaches_and_finishes_the_flow",
+                Status::Live,
+            ),
+            (
+                "a_terminal_asks_one_question_per_pause_and_a_refused_answer_asks_again",
+                Status::Live,
+            ),
+            (
+                "a_wait_that_expires_while_the_terminal_is_asking_withdraws_the_question",
+                Status::Live,
+            ),
+            (
+                "a_terminal_that_runs_out_of_answers_leaves_the_run_interrupted",
+                Status::Live,
+            ),
+            (
+                "a_run_told_not_to_ask_reports_the_pause_instead_of_reading_the_answer",
                 Status::Live,
             ),
             // …and the same exit taken from under an **agent** node, which is

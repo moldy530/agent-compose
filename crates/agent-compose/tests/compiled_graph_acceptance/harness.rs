@@ -727,6 +727,21 @@ pub fn run_formatted(
     format: Option<&str>,
     environment: &[(String, String)],
 ) -> Run {
+    let mut command = run_command(out, name, flow, inputs, session, format);
+    seal(&mut command, environment);
+    let output = command.output().expect("the command runs");
+    Run { output }
+}
+
+/// `agent-compose run <fixture> <flow> …`, before its environment is sealed.
+fn run_command(
+    out: &Path,
+    name: &str,
+    flow: &str,
+    inputs: &[(&str, &str)],
+    session: Option<&str>,
+    format: Option<&str>,
+) -> Command {
     let mut command = agent_compose();
     command.arg("run").arg(fixture(name)).arg(flow);
     for (field, value) in inputs {
@@ -739,9 +754,129 @@ pub fn run_formatted(
         command.arg("--format").arg(format);
     }
     command.arg("--out").arg(out);
-    seal(&mut command, environment);
-    let output = command.output().expect("the command runs");
-    Run { output }
+    command
+}
+
+/// The variable that tells an emitted `run` to answer `human` pauses at standard
+/// input, whatever that input is (grammar 8.7).
+///
+/// A terminal is what decides it for a person, and a test has none: the child is
+/// a pipe, so `isTTY` is false and a run that waited on one would be a suite
+/// that hangs. The variable is not a test seam invented for that — it is the
+/// documented way a *script* answers a pause, which is what a test is — and it
+/// is why the acceptance suite can drive the surface at all.
+pub const INTERACTIVE: &str = "AGENT_COMPOSE_INTERACTIVE";
+
+/// What standard input does once a terminal-answered run has been given its
+/// answers.
+pub enum Answers {
+    /// Closed, which is a script that has said everything it has to say.
+    ///
+    /// The run then has no answer surface left, so a pause it has not been given
+    /// an answer for ends it exactly as a non-interactive run's does.
+    Closed,
+    /// Held open until the command exits — a terminal nobody is typing at.
+    ///
+    /// What a wait has to **expire** against: a closed input would end the run
+    /// before the budget could run out, and the two ways a prompt ends without
+    /// an answer would be one.
+    Held,
+}
+
+/// One terminal-answered `run`, as [`run_answering`] takes it.
+///
+/// A struct rather than a parameter list because a `run` this suite *answers*
+/// carries everything an ordinary one does plus the script for the questions,
+/// and eight positional arguments at a call site say nothing about which is
+/// which.
+pub struct Answering<'a> {
+    /// Where the project is built, so a store's data and the pinned install are
+    /// this call's (see [`scratch_project`]).
+    pub out: &'a Path,
+    /// The acceptance fixture to run, by directory name.
+    pub fixture: &'a str,
+    /// Its flow address.
+    pub flow: &'a str,
+    /// The `--input k=v` arguments.
+    pub inputs: &'a [(&'a str, &'a str)],
+    /// `--format`, where the test is about which stream carries what.
+    pub format: Option<&'a str>,
+    /// The environment the run resolves its `${ENV}` references from.
+    pub environment: &'a [(String, String)],
+    /// One line per pause the run is expected to ask, in the order it asks.
+    pub answers: &'a [&'a str],
+    /// What standard input does once those are written.
+    pub afterwards: Answers,
+}
+
+/// `agent-compose run …` with its `human` pauses answered at standard input.
+///
+/// One line per answer, which is the framing the prompt asks for. Both output
+/// streams are drained on threads of their own while the answers are written,
+/// because a run that pauses writes its prompts to stderr *before* it reads: a
+/// caller that wrote first and read afterwards would deadlock the moment a
+/// composition's prompts filled the pipe.
+pub fn run_answering(asked: Answering<'_>) -> Run {
+    let Answering {
+        out,
+        fixture: name,
+        flow,
+        inputs,
+        format,
+        environment,
+        answers,
+        afterwards,
+    } = asked;
+    let mut command = run_command(out, name, flow, inputs, None, format);
+    let mut sealed: Vec<(String, String)> = environment.to_vec();
+    // Not forced over a caller that named it: one test's whole subject is what
+    // `AGENT_COMPOSE_INTERACTIVE=0` does to a run whose input is otherwise a
+    // perfectly good script.
+    if !sealed.iter().any(|(name, _)| name == INTERACTIVE) {
+        sealed.push((INTERACTIVE.to_string(), "1".to_string()));
+    }
+    seal(&mut command, &sealed);
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("the command runs");
+    let mut stdin = child.stdin.take().expect("stdin is piped");
+    let mut stdout = child.stdout.take().expect("stdout is piped");
+    let mut stderr = child.stderr.take().expect("stderr is piped");
+    let reading_out = std::thread::spawn(move || {
+        let mut held = Vec::new();
+        let _ = stdout.read_to_end(&mut held);
+        held
+    });
+    let reading_err = std::thread::spawn(move || {
+        let mut held = Vec::new();
+        let _ = stderr.read_to_end(&mut held);
+        held
+    });
+    for answer in answers {
+        let _ = writeln!(stdin, "{answer}");
+        let _ = stdin.flush();
+    }
+    // `Child::wait` closes the handle it holds, and this one is no longer the
+    // child's — it was taken above — so keeping it here is what keeps standard
+    // input open for a run whose wait has to expire against it.
+    let open = match afterwards {
+        Answers::Closed => {
+            drop(stdin);
+            None
+        }
+        Answers::Held => Some(stdin),
+    };
+    let status = child.wait().expect("the command is waited on");
+    drop(open);
+    Run {
+        output: Output {
+            status,
+            stdout: reading_out.join().expect("stdout is read"),
+            stderr: reading_err.join().expect("stderr is read"),
+        },
+    }
 }
 
 /// The variables that survive [`seal`], because they are the machine and not
