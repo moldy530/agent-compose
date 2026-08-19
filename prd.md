@@ -395,7 +395,6 @@ Exit criterion: a user can download a released binary, hand their coding agent t
 
 - `agent-compose plan` (topology + validation diff between two specs).
 - Tracing conventions in generated code: a documented, stable trace format; routing decisions (which edge fired and the guard values that decided it, which map variant a discriminator chose, what terminated a cycle) as trace data.
-- `eject` command.
 - `human` node runtime (interrupt/resume through `serve`, and the same answer typed at an interactive `run`; grammar shipped in M0, runtime deferred here per resolved q4, second delivery surface per resolved q21).
 - Flow-as-tool runtime (unblocked by resolved q19/q20).
 - Progressive discovery: the binary teaches its own grammar. CLI surfaces sized for coding-agent consumption — topic-scoped grammar docs, expanded explanations for diagnostics, schema emission — so an agent can go from zero to authoring specs against only the installed binary.
@@ -408,6 +407,7 @@ Exit criterion: a user can download a released binary, hand their coding agent t
 - Execute `schedule` and `event` triggers; declarative auth for `http` triggers.
 - Production `storage_backends` (Redis, pgvector, S3) behind the store plugin interface.
 - Least-privilege env distribution: isolated deployments receive only statically-referenced secrets.
+- `eject` command (deferred from M2 — owner call: not needed until the deploy story firms up).
 
 ## 8. Risks
 
