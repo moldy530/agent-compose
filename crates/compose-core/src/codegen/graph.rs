@@ -4018,13 +4018,9 @@ flow.f:
             emitted.contains("{ name: \"bare\", binding: flowBareBinding }"),
             "{emitted}"
         );
-        // The construct is emitted rather than refused or commented away.
+        // The construct is emitted rather than refused: the wiring above is what
+        // the tool does, and no refusal path is left beside it.
         assert!(!emitted.contains("Unimplemented"), "{emitted}");
-        assert!(
-            !emitted
-                .contains("is a flow attached as a tool, which this compiler release does not run"),
-            "the construct is emitted rather than commented away:\n{emitted}"
-        );
     }
 
     /// An `agent:` node hands `callAgent` the site its tool loop instantiates

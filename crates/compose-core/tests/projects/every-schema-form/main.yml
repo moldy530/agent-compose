@@ -9,12 +9,14 @@
 # spelling this compiler could get wrong in a way only a type-checker or a parse
 # would notice.
 #
-# It is deliberately the smallest graph that carries all of it: one agent, one
-# store, and one flow plus the one-node subflow `flow.condense` that exists only
-# to be *attached* to that agent. What is being covered here is the schema
-# language, not the topology — plus the handful of *binding* shapes no example
-# reaches, which are marked where they are declared and are here for the same
-# reason: a spelling only `tsc` or a real request would notice.
+# It is deliberately the smallest graph that carries all of it: one flow, one
+# store, and the one-node subflow `flow.condense` that exists only to be
+# *attached* to an agent. What is being covered here is the schema language, not
+# the topology — plus the handful of *binding* shapes no example reaches, which
+# are marked where they are declared and are here for the same reason: a
+# spelling only `tsc` or a real request would notice. The second agent is one of
+# those: it exists so a `map` can dispatch to an agent that carries an attached
+# flow, which is the one node shape whose entry holds both dispatch carriers.
 version: "0.1"
 
 state:
@@ -302,10 +304,34 @@ agent.shaper:
         email: { type: string, format: email }
       optional: [email]
 
+# The `map` in `flow.shape` below needs a target of its own rather than
+# `agent.shaper`: a dispatched instance's outputs land by name as well as through
+# `writes:`, and `agent.shaper`'s `author` would be concurrent writers on an
+# unreduced channel (grammar 8.6 rule 5). What is being covered is the
+# *attachment* under a fan-out, so this agent carries the same `flow.condense`
+# and answers with one field that lands in a reduced channel.
+agent.spreader:
+  description: Shapes one goal of a batch.
+  model: model.m
+  prompt: Shape one goal.
+  tools: [flow.condense]
+  input:
+    goal: { type: string }
+  output:
+    note: { type: string, min_length: 1 }
+
 flow.shape:
   description: One pass over the shaper.
   inputs:
     goal: { type: string, min_length: 1 }
+    # The source array of the `map` below, bounded on its own axis (PRD 5.6).
+    goals:
+      type: array
+      max_items: 8
+      items:
+        type: object
+        properties:
+          goal: { type: string }
   outputs:
     draft: { type: string }
     notes:
@@ -347,10 +373,29 @@ flow.shape:
       op: search
       query: "state.latest"
       top_k: 3
+    # A `map` whose target is the agent carrying `flow.condense` in its `tools:`
+    # — the one node shape whose trace entry can hold both dispatch carriers at
+    # once (`docs/trace.md` §5): the fan-out's own `dispatches` and the tool
+    # loop's `toolDispatches`, whose instance paths nest the item frame inside
+    # the map node's (grammar 9.4). Nothing else in the corpus combines the two
+    # constructs, so without this node the emitted call site that threads the
+    # *item's* site — rather than the map node's — into the loop is written but
+    # never type-checked or constructed.
+    spread:
+      map:
+        over: input.goals
+        as: one
+        node: agent.spreader
+        max_concurrency: 2
+        input:
+          goal: "one.goal"
+        writes:
+          note: notes
   edges:
     - { from: start, to: shape }
     - { from: shape, to: ask }
     - { from: ask, to: probe }
     - { from: probe, to: notify }
     - { from: notify, to: recall }
-    - { from: recall, to: end }
+    - { from: recall, to: spread }
+    - { from: spread, to: end }

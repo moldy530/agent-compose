@@ -20,6 +20,7 @@ import * as runtime from "./runtime.ts";
 import * as stores from "./stores.ts";
 import {
   agentShaperOutput,
+  agentSpreaderOutput,
   flowCondenseInputs,
   flowCondenseNodeReduceOutput,
   flowShapeInputs,
@@ -139,7 +140,14 @@ const flowCondenseNodeReduceShape: runtime.Shape = {
 /** `flow.shape` — the `input` root inside it (grammar 7.5). */
 const flowShapeShape: runtime.Shape = {
   "properties": {
-    "goal": "string"
+    "goal": "string",
+    "goals": {
+      "items": {
+        "properties": {
+          "goal": "string"
+        }
+      }
+    }
   }
 };
 
@@ -504,6 +512,61 @@ const agentShaper: runtime.AgentBinding = {
   maxToolIterations: 8,
 };
 
+/**
+ * `agent.spreader` — one LLM call with structured output (PRD 5.2, grammar 5). The schema below is the **published** JSON Schema of grammar 3.8's table, which is the column the conformance corpus proves equal to the parse its answer then faces.
+ */
+const agentSpreader: runtime.AgentBinding = {
+  address: "agent.spreader",
+  prompt: "Shape one goal.",
+  model: modelM,
+  output: {
+    name: "spreader_output",
+    description: "The structured output `agent.spreader` must produce.",
+    schema: {
+      "additionalProperties": false,
+      "properties": {
+        "note": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "note"
+      ],
+      "type": "object"
+    },
+  },
+  tools: [
+    {
+      name: "condense",
+      address: "flow.condense",
+      description: "Condense a passage into the one line worth keeping.",
+      schema: {
+        "additionalProperties": false,
+        "properties": {
+          "passage": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "passage"
+        ],
+        "type": "object"
+      },
+      invoke: (args, context, call) =>
+        runtime.callSubflowTool(
+          { name: "condense", binding: flowCondenseBinding, inputs: flowCondenseInputs },
+          args,
+          context,
+          call,
+        ),
+    },
+  ],
+  maxToolIterations: 8,
+};
+
 // --- flow.condense ---
 
 /** `flow.condense` node `reduce` — an inline subprocess (grammar 8.2). */
@@ -741,6 +804,64 @@ const flowShapeNodeRecall: runtime.NodeDescriptor = {
   }),
   writes: [],
   edges: [
+    { to: "spread" },
+  ],
+};
+
+/**
+ * `flow.shape` node `spread` — the fan-out it dispatches (grammar 8.6). `over` resolves against `input.goals`, and `one` is what an instance's own bindings call the item.
+ */
+const flowShapeNodeSpreadMap: runtime.MapDescriptor = {
+  node: "spread",
+  as: "one",
+  source: {
+    path: "input.goals",
+    shape: "any",
+  },
+  maxConcurrency: 2,
+  onItemError: "fail",
+  routes: [
+    {
+      target: "agent.spreader",
+      maxConcurrency: 2,
+      detach: false,
+      itemShape: {
+        "properties": {
+          "goal": "string"
+        }
+      },
+      input: (roots) => ({
+        "goal": runtime.toJson(runtime.evaluate("one.goal", roots)),
+      }),
+      run: async (input, context, site) => {
+        const answer = await runtime.callAgent(agentSpreader, input, [], context, { path: site.path });
+        return {
+          output: runtime.parseResult(agentSpreaderOutput, answer.output, "the answer of `agent.spreader`"),
+          models: answer.models,
+          toolDispatches: answer.toolDispatches,
+        };
+      },
+      writes: [
+        { field: "note", channel: "notes", reduce: "append" },
+      ],
+    },
+  ],
+};
+
+/** `flow.shape` node `spread` — a fan-out (grammar 8.6). */
+const flowShapeNodeSpread: runtime.NodeDescriptor = {
+  flow: "flow.shape",
+  node: "spread",
+  // Grammar 9.3, resolved: `retry` from the built-in, `timeout` from the built-in, `on_error` from the built-in.
+  policy: {
+    onError: "fail",
+  },
+  shapes: { input: flowShapeShape, state: stateShape, output: "any" },
+  input: (_roots, view) => runtime.mapPlan(flowShapeNodeSpreadMap, view),
+  run: async (input, context) =>
+    runtime.runMap(flowShapeNodeSpreadMap, input as runtime.MapPlan, context),
+  writes: [],
+  edges: [
     { to: END },
   ],
 };
@@ -761,6 +882,9 @@ function flowShape() {
       ends: ["recall"],
     })
     .addNode("recall", (state: GraphState) => runtime.runNode(flowShapeNodeRecall, state), {
+      ends: ["spread"],
+    })
+    .addNode("spread", (state: GraphState) => runtime.runNode(flowShapeNodeSpread, state), {
       ends: [END],
     })
     .addEdge(START, "shape")
@@ -778,7 +902,7 @@ const flowShapeGraph = flowShape();
 const flowShapeBinding: runtime.SubflowBinding = {
   address: "flow.shape",
   outputs: ["draft", "notes"],
-  recursionLimit: 30,
+  recursionLimit: 31,
   stream: (initial, options) =>
     flowShapeGraph.stream(initial, {
       ...options,
@@ -866,11 +990,11 @@ export const flows: Readonly<Record<string, CompiledFlow>> = {
   },
   "flow.shape": {
     address: "flow.shape",
-    inputs: ["goal"],
-    inputKinds: { "goal": "string", },
+    inputs: ["goal", "goals"],
+    inputKinds: { "goal": "string", "goals": "json", },
     outputs: ["draft", "notes"],
     sessionStores: [],
-    recursionLimit: 30,
+    recursionLimit: 31,
     parse: (inputs: unknown) =>
       runtime.parseResult(flowShapeInputs, inputs, "the `inputs:` of `flow.shape`") as Record<string, unknown>,
     stream: (initial, options) =>

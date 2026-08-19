@@ -2750,14 +2750,22 @@ to be discovered:
 - **distinct calls in one tool loop get distinct instance paths.** Two calls to
   one flow-tool are two instances with two sets of effects, and a bare node frame
   would give them one key — the collision this section exists to prevent;
-- **an agent-node `retry:` restarts the ordinals**, so the Nth call of a retried
-  attempt reuses the Nth key of the failed one. That reuse is **positional, not
+- **a re-run of the tool loop restarts the ordinals**, so the Nth call of the
+  second run reuses the Nth key of the first. That reuse is **positional, not
   semantic**: the emitter is a nondeterministic model, and what it asks for the
-  Nth time on a second attempt need not be the work it asked for the Nth time on
+  Nth time on a second run need not be the work it asked for the Nth time on
   the first. It is accepted because the alternatives are worse — a provider's
   tool-use id is fresh on every retry, so key reuse dies and every agent retry
   re-fires every child flow's side effects, while an argument hash merges two
   intentional identical calls into one (PRD resolved q19).
+
+  **Two policies re-run a loop**, and the rule is one rule over both. An
+  agent-node `retry:` (§9.1) re-executes the node's activity, loop and all. A
+  `map`'s `on_item_error: { retry: … }` (§8.6 rule 10) re-executes a dispatched
+  `agent.*` from its entry at the **same** source index, so nothing the item's
+  frames are built from changes and the ordinals restart under an unchanged
+  prefix — the same at-least-once compromise, reached through a policy that is
+  not the node's own. An author who writes either is choosing it.
 
 Like every other frame, this one is **derived**: no spec construct sets or
 overrides a tool name or an ordinal, so there is nothing here for `validate` to

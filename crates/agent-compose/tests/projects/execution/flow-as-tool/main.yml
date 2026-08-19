@@ -17,6 +17,17 @@
 # neither is deduped — while a key built from the agent node alone would make the
 # second write a duplicate the backend drops.
 #
+# Three more flows put the same attachment under the three policies that change
+# what its frames come out as, each one a rule stated in grammar 9.4 that nothing
+# else here would exercise:
+#
+#   * `flow.retried` puts the agent node under a `retry:`, so the ordinals
+#     restart and the second attempt re-derives the first attempt's keys;
+#   * `flow.rush` puts it under a `timeout:` a call outlives, which is the raced
+#     deadline `docs/trace.md` §5.3 describes;
+#   * `flow.fan` dispatches the attachment through a `map`, so each child nests
+#     beneath its own item's frame.
+#
 # The last flow is the one that composes two runtimes: `flow.decide` attaches
 # `flow.sign`, which holds a `human:` node. Nothing about that is a special case
 # — the pause is the child instance's, its wait id is its own instance path, and
@@ -40,6 +51,13 @@ state:
     description: What the human said about the draft `flow.decide` produced.
     enum: [approve, reject]
     default: approve
+  replies:
+    description: One entry per item `flow.fan` dispatched, in source-item order.
+    type: array
+    max_items: 8
+    items:
+      type: string
+    reduce: append
 
 provider.mock:
   kind: anthropic
@@ -144,6 +162,109 @@ flow.ask:
   edges:
     - { from: start, to: ask }
     - { from: ask, to: end }
+
+# The same agent node under a `retry:`. Grammar 9.4 makes the call ordinals
+# restart with the attempt, so the second attempt's first `condense` call derives
+# the *first* attempt's first key — the positional, not semantic, reuse the
+# grammar states openly (PRD resolved q19). The observable is inside the child:
+# the store write under a repeated key is `deduped: true`, which is the
+# at-least-once compromise showing up where it actually costs something.
+flow.retried:
+  description: Answer a question, re-running the whole tool loop on a failure.
+  inputs:
+    question:
+      type: string
+      min_length: 1
+  outputs:
+    answer:
+      type: string
+  nodes:
+    ask:
+      agent: agent.answerer
+      input:
+        question: "input.question"
+      retry: { max: 1, backoff: 10ms }
+  edges:
+    - { from: start, to: ask }
+    - { from: ask, to: end }
+
+# The same agent node under a `timeout:` the tool call outlives. The deadline is
+# raced against the loop (grammar 9.2), so a call caught mid-flight resolves
+# neither a dispatch record nor a tool-call record — `docs/trace.md` §5.3 is
+# that shape, and the two keys are absent rather than empty.
+flow.rush:
+  description: Answer a question under a budget a tool call outlives.
+  inputs:
+    question:
+      type: string
+      min_length: 1
+  outputs:
+    answer:
+      type: string
+  nodes:
+    ask:
+      agent: agent.answerer
+      input:
+        question: "input.question"
+      timeout: 300ms
+  edges:
+    - { from: start, to: ask }
+    - { from: ask, to: end }
+
+# A **fan-out** over an agent that carries the attachment: the one node shape
+# whose entry holds both dispatch carriers at once (`docs/trace.md` §5). Each
+# item's tool call nests its instance beneath the item's own frame, so the two
+# items' children derive `<map node>/0/<item index>/condense/0` and are two
+# effect sites rather than one — the same property `flow.ask` shows across two
+# calls of one loop, shown here across two items of one fan-out.
+#
+# `max_concurrency: 1` because the scripted provider answers a queue in order: a
+# fan-out that interleaved its items' calls would be asserting about the
+# scheduler rather than about the frames.
+agent.batcher:
+  description: Answers one question of a batch, with the same flow attached.
+  model: model.smart
+  prompt: |
+    Answer the question. Condense anything long before you quote it.
+  input:
+    question:
+      type: string
+  output:
+    reply:
+      type: string
+      min_length: 1
+  tools: [flow.condense]
+
+flow.fan:
+  description: Answer a batch of questions, one agent instance per question.
+  inputs:
+    questions:
+      type: array
+      max_items: 8
+      items:
+        type: object
+        properties:
+          text: { type: string }
+  outputs:
+    replies:
+      type: array
+      max_items: 8
+      items:
+        type: string
+  nodes:
+    fan:
+      map:
+        over: input.questions
+        as: one
+        node: agent.batcher
+        max_concurrency: 1
+        input:
+          question: "one.text"
+        writes:
+          reply: replies
+  edges:
+    - { from: start, to: fan }
+    - { from: fan, to: end }
 
 # Call site two: the graph's. The same subflow, instantiated deterministically.
 flow.pipe:

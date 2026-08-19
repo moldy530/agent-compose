@@ -709,14 +709,15 @@ export function backoffFor(policy: RetryPolicy, attempt: number): number {
  * seen from the other side: it answers where the armed timer is due to fire
  * while the budget runs, and `remaining` milliseconds from *now* while it is
  * held. Its consumer is a model route dividing the budget across its ladder
- * ([`callModel`], [`requestBudget`]), and today no `agent` or `model` node can
- * have a pause below it — a `human` node is reached through a `flow:` node or a
- * `map`, whose own activities read no deadline. That is a fact about this
- * release rather than an invariant: grammar 8.7 already contemplates a `human`
- * node inside a flow attached to an agent's `tools:`, and when that runtime
- * lands the node holding the timer *is* the node dividing the budget. Making the
- * two halves of one budget agree here is what keeps the first model call after
- * an hour-long pause from being refused for a budget the wait spent.
+ * ([`callModel`], [`requestBudget`]), and an `agent` node **is** one of the
+ * nodes that can have a pause below it: a `flow.*` in its `tools:` may hold a
+ * `human` node (grammar 5.4, 8.7), and a model that calls it puts the wait
+ * under the very node holding the timer. So the node dividing the budget and
+ * the node holding it are one node, and making the two halves agree here is
+ * what keeps the first model call after an hour-long pause from being refused
+ * for a budget the wait spent. The other two routes to a pause — through a
+ * `flow:` node or a `map` — divide no budget, so for them this is bookkeeping
+ * the reader never sees.
  */
 export async function runActivity<T>(
   flow: string,
@@ -1060,6 +1061,10 @@ export interface ModelCall {
    * that asked for them, and it holds the very objects the loop is filling in —
    * so a call that ends the node still reports the tool call that ended it, by
    * the same identity [`merged`] relies on.
+   *
+   * Because it is written late it is also the one field an **entry** must not
+   * hold live, which [`settled`] is for: an entry copies it at the moment it is
+   * built, and drops it where the loop has recorded nothing yet.
    */
   toolCalls?: ToolCallRecord[];
 }
@@ -1068,10 +1073,11 @@ export interface ModelCall {
  * One tool call an agent's loop ran, on [`ModelCall.toolCalls`].
  *
  * PRD §9.20 asks the tool loop's story to be complete inside the `ModelCall` at
- * the cost of one indirection: what the model asked for, what came of it, and —
- * for a `flow.*` attached as a tool (grammar 5.4) — a **link** to the instance
- * that answered it. The instance's own trace is not here; it is on the
- * [`DispatchRecord`] this call filed, which [`instance`] names.
+ * the cost of one indirection: what the model asked for, what came of it, the
+ * result the model saw, and — for a `flow.*` attached as a tool (grammar 5.4) —
+ * a **link** to the instance that answered it. The instance's own trace is not
+ * here; it is on the [`DispatchRecord`] this call filed, which [`instance`]
+ * names.
  */
 export interface ToolCallRecord {
   /** The name the model called, as the request offered it. */
@@ -1091,6 +1097,23 @@ export interface ToolCallRecord {
    * is what makes the two unable to disagree.
    */
   readonly instance?: string;
+  /**
+   * **The result the model saw** — PRD §9.20's third clause, and the one field
+   * of this record whose value came from outside the loop.
+   *
+   * On the calls [`instance`] is on and no others: a flow-as-tool call that
+   * ran an instance and completed, whose result is that instance's declared
+   * `outputs:` — the composition's own data, under a schema the composition
+   * wrote (grammar 5.4). The two keys are decided by the same test, because
+   * they are two halves of one account: `docs/trace.md` §11 keeps a tool's
+   * *answer* out of this format at every other surface, and PRD §9.20 is what
+   * carves this one out — "a bare dispatch record alone would leave a tool call
+   * whose result came from nowhere".
+   *
+   * Absent on a call that **failed**, and that absence is the record: the
+   * failure left the tool, so the model saw nothing to record.
+   */
+  readonly result?: unknown;
   /** What went wrong, in `docs/trace.md` §3's `<error name>: <message>` shape. */
   readonly error?: string;
 }
@@ -2128,12 +2151,24 @@ export async function callAgent(
       if (answer.toolCalls.length === 0) break;
 
       // The record of this call's tool calls, on the record of the call that
-      // asked for them (`docs/trace.md` §7.3). Attached before the first one
-      // runs, so a call that ends the node still reports what it was running:
-      // [`callModel`] has already pushed `by` into the node's own channel, and
-      // this is the same object.
+      // asked for them (`docs/trace.md` §7.3). [`callModel`] has already pushed
+      // `by` into the node's own channel and this is the same object, so a
+      // record written here reaches the trace even on the call that **ends** the
+      // node — which is why the failure path below writes one before it throws.
+      //
+      // The key is attached on the **first** record rather than beside the empty
+      // array, and that is a presence rule rather than a tidiness: `docs/trace.md`
+      // §7 makes `toolCalls` a key that is never empty, so a reader is entitled
+      // to treat `[]` there as impossible (§10.1). The array is empty for as long
+      // as the first call is still running, and a node deadline that fires in
+      // that window abandons the loop mid-flight — an entry built from `by`
+      // would otherwise carry exactly the value the format promises never to
+      // produce.
       const asked: ToolCallRecord[] = [];
-      by.toolCalls = asked;
+      const record = (entry: ToolCallRecord): void => {
+        asked.push(entry);
+        by.toolCalls = asked;
+      };
 
       const results: { id: string; name: string; content: string }[] = [];
       for (const call of answer.toolCalls) {
@@ -2147,7 +2182,7 @@ export async function callAgent(
           const unknown = new Error(
             `\`${agent.address}\` was answered with a call to \`${call.name}\`, which is not one of its tools`,
           );
-          asked.push({ name: call.name, outcome: "failed", error: describe(unknown) });
+          record({ name: call.name, outcome: "failed", error: describe(unknown) });
           throw unknown;
         }
         const ordinal = ordinals.get(call.name) ?? 0;
@@ -2163,6 +2198,12 @@ export async function callAgent(
         // a second time — [`ToolCallRecord.instance`] and
         // [`DispatchRecord.idempotencyKey`] cannot disagree. A tool that
         // instantiates nothing files none and carries no link.
+        //
+        // It decides [`ToolCallRecord.result`] too, for the reason that field
+        // gives: PRD §9.20 carves the *subflow* call's result out of
+        // `docs/trace.md` §11's rule, and "the call filed a dispatch record" is
+        // what "this was a flow-as-tool call" is, read off what happened rather
+        // than off the tool's shape.
         const before = dispatches.length;
         const started = (): { instance: string } | Record<string, never> => {
           const filed = dispatches[before];
@@ -2172,7 +2213,7 @@ export async function callAgent(
         try {
           result = await tool.invoke(call.args, context, site);
         } catch (error) {
-          asked.push({
+          record({
             name: call.name,
             target: tool.address,
             outcome: "failed",
@@ -2181,11 +2222,12 @@ export async function callAgent(
           });
           throw error;
         }
-        asked.push({
+        record({
           name: call.name,
           target: tool.address,
           outcome: "completed",
           ...started(),
+          ...(dispatches[before] === undefined ? {} : { result }),
         });
         results.push({ id: call.id, name: call.name, content: JSON.stringify(result) });
       }
@@ -5697,6 +5739,36 @@ function merged<T>(
 }
 
 /**
+ * The model calls an entry carries, taken off the loop's live records
+ * (`docs/trace.md` §7, §5.3).
+ *
+ * [`ModelCall.toolCalls`] is the one field of a trace record written *after* the
+ * record was made, by a tool loop that is still running when the record reaches
+ * [`merged`] — so a call object is a moving thing and an entry must not hold
+ * one. It matters in exactly one place, and that place is why this exists: a
+ * node deadline is **raced** against the loop (see [`runActivity`]), so a tool
+ * call still in flight when the budget runs out unwinds against the aborted
+ * signal some turns after this entry was built, and a live object would grow a
+ * record for a call the rest of the entry says nothing about — a trace entry
+ * that changed after it was written.
+ *
+ * So the entry takes a copy of each call with the loop's array copied out of
+ * it, which is the discipline `dispatches`, `stores` and the outer `models`
+ * array already follow, applied one level in. An **empty** list is dropped
+ * rather than copied, and that is what makes `docs/trace.md` §7's "never empty"
+ * hold for the call a deadline caught between asking for a tool and hearing
+ * back: the key is absent there, which §5.3 reads as "no outcome resolved".
+ */
+function settled(calls: readonly ModelCall[] | undefined): readonly ModelCall[] | undefined {
+  return calls?.map((call) => {
+    const { toolCalls, ...rest } = call;
+    return toolCalls === undefined || toolCalls.length === 0
+      ? rest
+      : { ...rest, toolCalls: [...toolCalls] };
+  });
+}
+
+/**
  * Every instance a `flow:` node ran, in the order it ran them (grammar 8.5,
  * PRD 5.3).
  *
@@ -5944,7 +6016,7 @@ export async function runNode(
     // ordering that is not a clock — see [`merged`]. `stores` on the same entry
     // has always been the whole of `storeRecords` for the same reason, and this
     // is the half that was missing it.
-    models = merged(modelCalls, answer.value.models);
+    models = settled(merged(modelCalls, answer.value.models));
     pause = answer.value.human;
   } catch (error) {
     // Two outcomes of a `human` node reach here as throws and neither is an
@@ -6003,7 +6075,7 @@ export async function runNode(
     // an exhausted route's whole ladder, or the calls a tool loop made before
     // the one that ended it (PRD 5.9, `RunContext.modelCalls`). `models` is
     // still undefined here: the activity threw, so no answer set it.
-    if (modelCalls.length > 0) models = [...modelCalls];
+    if (modelCalls.length > 0) models = settled(modelCalls);
     // And every subflow a model invoked before the call that ended the node,
     // for the same reason and off the same kind of collector (PRD §9.20).
     if (toolDispatched.length > 0) toolDispatches = [...toolDispatched];

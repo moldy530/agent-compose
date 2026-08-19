@@ -2192,8 +2192,9 @@ fn a_flow_attached_as_a_tool_runs_one_instance_per_call_under_its_own_frame() {
         assert_eq!(inner, ["note", "reduce"], "{record}");
     }
 
-    // q20: the tool-call entry inside the model call records the call and links
-    // to the instance by the key its dispatch record carries.
+    // q20: the tool-call entry inside the model call records the call, the
+    // result the model saw, and a link to the instance by the key its dispatch
+    // record carries.
     let models = entry["models"]
         .as_array()
         .unwrap_or_else(|| panic!("the agent node reports its own calls: {entry}"));
@@ -2215,6 +2216,16 @@ fn a_flow_attached_as_a_tool_runs_one_instance_per_call_under_its_own_frame() {
             asked[0]["instance"], keys[ordinal],
             "the link is the dispatch record's own key, so the join is string \
              equality (`docs/trace.md` §7.3): {call}"
+        );
+        // …and the third clause of q20: the value the loop handed back, which
+        // for this tool is the instance's declared `outputs:`. A reader of the
+        // model call can see what the model was answered with without opening
+        // the instance the link names.
+        assert_eq!(
+            asked[0]["result"],
+            json!({ "line": if ordinal == 0 { "the first line" } else { "the second line" } }),
+            "the tool-call entry records the result the model saw \
+             (PRD §9.20, `docs/trace.md` §7.3): {call}"
         );
     }
     for call in models.iter().skip(2) {
@@ -2422,6 +2433,420 @@ fn a_flow_tool_call_whose_instance_failed_fails_the_agent_node_carrying_its_trac
     assert_eq!(
         entry["models"][0]["toolCalls"][0]["instance"], record["idempotencyKey"],
         "…and still links to the instance it ran: {entry}"
+    );
+    assert!(
+        entry["models"][0]["toolCalls"][0]["result"].is_null(),
+        "…and carries no result, because the model saw none: the failure left \
+         the tool (`docs/trace.md` §7.3): {entry}"
+    );
+}
+
+/// Two calls to one flow-tool in a **single** model answer get two ordinals.
+///
+/// The happy path above spends two loop turns to make its two calls, which
+/// exercises the counter but not the case grammar 9.4 names first: "distinct
+/// calls in one tool loop get distinct instance paths". A loop that assigned the
+/// ordinal per *turn* rather than per call would give both calls
+/// `condense/0`, and nothing else in the trace would say so — the link on each
+/// tool-call entry would still resolve, to the same record, and the two children
+/// would share one idempotency key so the second's store write would be deduped
+/// away as a repeat of work it never repeated.
+#[test]
+fn two_flow_tool_calls_in_one_model_answer_get_distinct_ordinals() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        // One answer, two calls. The loop runs them in the order the answer
+        // asked, one at a time, so the two instances' model calls follow.
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![
+                ToolCall::new("condense", json!({ "passage": "the first passage" })),
+                ToolCall::new("condense", json!({ "passage": "the second passage" })),
+            ]),
+        ),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "line": "the first line" })),
+        ),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "line": "the second line" })),
+        ),
+        Script::new(SONNET, Outcome::text("I have both lines.")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "answer": "it says two lines" })),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke(
+        "flow-as-tool",
+        "flow.ask",
+        &[("question", "what does it say?")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+
+    let entries = run.entries("ask");
+    let [entry] = entries.as_slice() else {
+        panic!("`ask` ran once: {entries:?}");
+    };
+    let dispatched = entry["toolDispatches"]
+        .as_array()
+        .unwrap_or_else(|| panic!("both calls instantiated: {entry}"));
+    let keys: Vec<&str> = dispatched
+        .iter()
+        .map(|record| record["idempotencyKey"].as_str().expect("a key"))
+        .collect();
+    assert!(
+        keys[0].ends_with("/ask/0/condense/0") && keys[1].ends_with("/ask/0/condense/1"),
+        "the ordinal counts calls, not answers (grammar 9.4): {keys:?}"
+    );
+    assert_ne!(keys[0], keys[1], "two calls, two effect sites: {keys:?}");
+    assert_eq!(dispatched[0]["index"], json!(0), "{entry}");
+    assert_eq!(dispatched[1]["index"], json!(1), "{entry}");
+
+    // One model call asked for both, so both records are on **one**
+    // `toolCalls` array, in the order the answer asked (`docs/trace.md` §7).
+    let asked = entry["models"][0]["toolCalls"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the one call that asked for both records both: {entry}"));
+    assert_eq!(asked.len(), 2, "{entry}");
+    assert_eq!(asked[0]["instance"], keys[0], "{entry}");
+    assert_eq!(asked[1]["instance"], keys[1], "{entry}");
+
+    // And the consequence: two keys means two writes the backend kept.
+    let writes: Vec<&Value> = dispatched
+        .iter()
+        .flat_map(|record| {
+            record["inner"][0]["stores"]
+                .as_array()
+                .unwrap_or_else(|| panic!("the instance's store op is on its own entry: {record}"))
+        })
+        .collect();
+    assert_eq!(writes.len(), 2, "{writes:?}");
+    assert_ne!(
+        writes[0]["idempotencyKey"], writes[1]["idempotencyKey"],
+        "{writes:?}"
+    );
+    for write in &writes {
+        assert_eq!(write["deduped"], json!(false), "{write}");
+    }
+}
+
+/// An agent-node `retry:` **restarts** the call ordinals, so the second
+/// attempt's Nth call reuses the first attempt's Nth key.
+///
+/// Grammar 9.4 and `docs/trace.md` §8 both state this openly as an at-least-once
+/// compromise rather than a property, which is exactly why it needs a test: a
+/// change that made the counter outlive the attempt — hoisting the `Map` out of
+/// the agent call, say — would silently re-key every retried composition's child
+/// flows, and nothing about the run would look different. What the reuse costs
+/// is inside the child, so that is where it is read: the second attempt's store
+/// write is `deduped`, against a key the first attempt already applied.
+#[test]
+fn an_agent_node_retry_restarts_the_flow_tool_call_ordinals() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        // Attempt one: a tool call, its instance, and a pinned answer that fails
+        // `agent.answerer`'s own `answer: { min_length: 1 }` contract.
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "condense",
+                json!({ "passage": "a long passage" }),
+            )]),
+        ),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "line": "the only line" })),
+        ),
+        Script::new(SONNET, Outcome::text("I have the line.")),
+        Script::new(SONNET, Outcome::structured(json!({ "answer": "" }))),
+        // Attempt two: the same shape, answered properly.
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "condense",
+                json!({ "passage": "a long passage" }),
+            )]),
+        ),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "line": "the only line" })),
+        ),
+        Script::new(SONNET, Outcome::text("I have the line.")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "answer": "it says one line" })),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke(
+        "flow-as-tool",
+        "flow.retried",
+        &[("question", "what does it say?")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(run.outputs()["answer"], "it says one line");
+
+    let entries = run.entries("ask");
+    let [entry] = entries.as_slice() else {
+        panic!("a retry is one node execution, so one entry: {entries:?}");
+    };
+    assert_eq!(entry["attempts"], json!(2), "{entry}");
+
+    let dispatched = entry["toolDispatches"]
+        .as_array()
+        .unwrap_or_else(|| panic!("both attempts' instances are reported: {entry}"));
+    assert_eq!(
+        dispatched.len(),
+        2,
+        "one call per attempt, and the failed attempt's is not dropped: {entry}"
+    );
+    assert_eq!(
+        dispatched[0]["idempotencyKey"], dispatched[1]["idempotencyKey"],
+        "the ordinals restart with the attempt, so the second attempt's first \
+         call derives the first attempt's first key (grammar 9.4): {entry}"
+    );
+    assert!(
+        dispatched[0]["idempotencyKey"]
+            .as_str()
+            .is_some_and(|key| key.ends_with("/ask/0/condense/0")),
+        "…and it is ordinal `0` that both derive: {entry}"
+    );
+
+    // What positional reuse actually costs, read where it costs it.
+    let writes: Vec<&Value> = dispatched
+        .iter()
+        .flat_map(|record| {
+            record["inner"][0]["stores"]
+                .as_array()
+                .unwrap_or_else(|| panic!("the instance's store op is on its own entry: {record}"))
+        })
+        .collect();
+    assert_eq!(writes.len(), 2, "{writes:?}");
+    assert_eq!(
+        writes[0]["deduped"],
+        json!(false),
+        "the first attempt's write is the one that happened: {}",
+        writes[0]
+    );
+    assert_eq!(
+        writes[1]["deduped"],
+        json!(true),
+        "…and the second derives the same key, so the backend refuses it — the \
+         at-least-once compromise grammar 9.4 states openly: {}",
+        writes[1]
+    );
+    assert!(
+        provider.snapshot().is_drained(),
+        "both attempts ran their whole loop"
+    );
+}
+
+/// A `map` dispatching to an agent that carries a flow-tool: the child instance
+/// nests beneath the **item's** frame, not the map node's.
+///
+/// This is the one entry shape that holds both dispatch carriers at once
+/// (`docs/trace.md` §5) — the fan-out's own `dispatches` and the tool loop's
+/// `toolDispatches` — and the shape the `index` row spends a paragraph on,
+/// because two items' first calls both carry `index: 0` and only the
+/// `idempotencyKey` tells them apart. A call site that threaded the map node's
+/// own path instead of the item's would give both children one key, and every
+/// effect the second dispatched would be deduped away as a repeat of the first's.
+#[test]
+fn a_map_dispatched_agents_flow_tool_calls_nest_under_the_items_frame() {
+    let provider = MockProvider::start().expect("a loopback port");
+    // `max_concurrency: 1`, so the queue order is the dispatch order: item 0's
+    // whole loop, then item 1's.
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "condense",
+                json!({ "passage": "the first passage" }),
+            )]),
+        ),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "line": "the first line" })),
+        ),
+        Script::new(SONNET, Outcome::text("I have it.")),
+        Script::new(SONNET, Outcome::structured(json!({ "reply": "first" }))),
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "condense",
+                json!({ "passage": "the second passage" }),
+            )]),
+        ),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "line": "the second line" })),
+        ),
+        Script::new(SONNET, Outcome::text("I have it.")),
+        Script::new(SONNET, Outcome::structured(json!({ "reply": "second" }))),
+    ]);
+
+    let Some(run) = harness::invoke_with(
+        "flow-as-tool",
+        "flow.fan",
+        &json!({ "questions": [{ "text": "the first?" }, { "text": "the second?" }] }),
+        &harness::environment(&provider),
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(run.outputs()["replies"], json!(["first", "second"]));
+
+    let entries = run.entries("fan");
+    let [entry] = entries.as_slice() else {
+        panic!("`fan` ran once: {entries:?}");
+    };
+
+    // Carrier one: the fan-out's own records, one per source item.
+    let items = entry["dispatches"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the map reports what it dispatched: {entry}"));
+    assert_eq!(items.len(), 2, "{entry}");
+    for (index, item) in items.iter().enumerate() {
+        assert_eq!(item["index"], json!(index), "{item}");
+        assert_eq!(item["target"], "agent.batcher", "{item}");
+        assert!(
+            item["inner"].is_null(),
+            "an `agent.*` target runs no instance of its own: {item}"
+        );
+    }
+
+    // Carrier two: what the *models* dispatched, one record per item's call,
+    // each beneath its own item's frame.
+    let tools = entry["toolDispatches"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the items' tool loops instantiated: {entry}"));
+    assert_eq!(tools.len(), 2, "{entry}");
+    let keys: Vec<&str> = tools
+        .iter()
+        .map(|record| record["idempotencyKey"].as_str().expect("a key"))
+        .collect();
+    assert!(
+        keys[0].ends_with("/fan/0/0/condense/0") && keys[1].ends_with("/fan/0/1/condense/0"),
+        "the item index is a frame of its own, between the map node's and the \
+         tool call's (grammar 9.4): {keys:?}"
+    );
+    assert_eq!(
+        (tools[0]["index"].clone(), tools[1]["index"].clone()),
+        (json!(0), json!(0)),
+        "both are the first call of their own loop, so the two records repeat an \
+         `index` and `idempotencyKey` is what tells them apart (`docs/trace.md` \
+         §5): {entry}"
+    );
+
+    // The items' model calls are the map node's (`docs/trace.md` §7.2), and each
+    // tool-call entry still links to the child its own item ran.
+    let models = entry["models"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the map node carries its items' calls: {entry}"));
+    let links: Vec<&Value> = models
+        .iter()
+        .filter_map(|call| call["toolCalls"].as_array())
+        .flatten()
+        .map(|asked| &asked["instance"])
+        .collect();
+    assert_eq!(links, [&json!(keys[0]), &json!(keys[1])], "{entry}");
+
+    // And the effect the frames exist for: two items, two keys, neither deduped.
+    let writes: Vec<&Value> = tools
+        .iter()
+        .flat_map(|record| {
+            record["inner"][0]["stores"]
+                .as_array()
+                .unwrap_or_else(|| panic!("the instance's store op is on its own entry: {record}"))
+        })
+        .collect();
+    assert_eq!(writes.len(), 2, "{writes:?}");
+    assert_ne!(
+        writes[0]["idempotencyKey"], writes[1]["idempotencyKey"],
+        "{writes:?}"
+    );
+    for write in &writes {
+        assert_eq!(write["deduped"], json!(false), "{write}");
+    }
+}
+
+/// A node deadline that catches a tool call **mid-flight** records neither half
+/// of it — and, crucially, records no *empty* half either.
+///
+/// `docs/trace.md` §5.3 is this shape, and both keys it names are presence rules
+/// a reader is entitled to rely on (§10.1): `toolCalls` is documented as never
+/// empty, so `"toolCalls": []` is a value the format promises cannot occur. The
+/// loop attaches the key with its first record rather than with the empty array
+/// it fills, and that is the whole of what keeps the promise: the window between
+/// "the model asked for a tool" and "the tool answered" is exactly where a
+/// raced deadline lands, and it is wide — a subflow is a whole graph.
+#[test]
+fn a_node_deadline_that_abandons_a_tool_call_records_neither_half_of_it() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "condense",
+                json!({ "passage": "a long passage" }),
+            )]),
+        ),
+        // The child's own model call, answered long after `ask`'s 300ms budget
+        // is spent — so the tool call is in flight when the deadline fires.
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "line": "too late" })).after(Duration::from_millis(2_000)),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke(
+        "flow-as-tool",
+        "flow.rush",
+        &[("question", "what does it say?")],
+        &provider,
+    ) else {
+        return;
+    };
+    let failure = run.failed();
+    assert!(
+        failure.contains("300ms budget was spent"),
+        "the node's own deadline is what ended it (grammar 9.2): {failure}"
+    );
+
+    let entries = run.entries("ask");
+    let [entry] = entries.as_slice() else {
+        panic!("`ask` ran once: {entries:?}");
+    };
+    assert_eq!(entry["outcome"], "failed", "{entry}");
+    assert!(
+        entry["toolDispatches"].is_null(),
+        "no outcome resolved for the one call, so the key is absent rather than \
+         empty (`docs/trace.md` §5.3): {entry}"
+    );
+    let models = entry["models"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the loop's first call came back and is reported: {entry}"));
+    assert_eq!(models.len(), 1, "{entry}");
+    assert!(
+        models[0]["toolCalls"].is_null(),
+        "…and the call it asked for resolved nothing, so `toolCalls` is absent \
+         rather than the empty array `docs/trace.md` §7 promises never to write: \
+         {entry}"
+    );
+    let serialized = serde_json::to_string(entry).expect("the entry serializes");
+    assert!(
+        !serialized.contains("\"toolCalls\":[]"),
+        "an empty `toolCalls` is a value a reader may treat as impossible \
+         (`docs/trace.md` §10.1): {serialized}"
     );
 }
 

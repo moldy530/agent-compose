@@ -18,6 +18,9 @@ expression: document(&run)
               "instance": "<execution-id>/ask/0/condense/0",
               "name": "condense",
               "outcome": "completed",
+              "result": {
+                "line": "the first line"
+              },
               "target": "flow.condense"
             }
           ]
@@ -32,6 +35,9 @@ expression: document(&run)
               "instance": "<execution-id>/ask/0/condense/1",
               "name": "condense",
               "outcome": "completed",
+              "result": {
+                "line": "the second line"
+              },
               "target": "flow.condense"
             }
           ]

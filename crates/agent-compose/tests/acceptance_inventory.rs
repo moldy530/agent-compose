@@ -423,6 +423,27 @@ const CODEGEN: &[Criterion] = &[
                 "a_flow_tool_call_whose_instance_failed_fails_the_agent_node_carrying_its_trace",
                 Status::Live,
             ),
+            // …and four more over the *frame* a call derives (grammar 9.4, PRD
+            // resolved q19), which is the half of this call site that no other
+            // construct has: the ordinal counts calls rather than answers, a
+            // node `retry:` restarts it, a `map` puts an item frame above it,
+            // and a raced deadline leaves a call with no record at all.
+            (
+                "two_flow_tool_calls_in_one_model_answer_get_distinct_ordinals",
+                Status::Live,
+            ),
+            (
+                "an_agent_node_retry_restarts_the_flow_tool_call_ordinals",
+                Status::Live,
+            ),
+            (
+                "a_map_dispatched_agents_flow_tool_calls_nest_under_the_items_frame",
+                Status::Live,
+            ),
+            (
+                "a_node_deadline_that_abandons_a_tool_call_records_neither_half_of_it",
+                Status::Live,
+            ),
         ],
     },
     Criterion {
