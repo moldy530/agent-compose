@@ -486,16 +486,19 @@ the corrected answer can be sent to the same URL. So is a request carrying
 `?wait=` more than once, and for the same reason: it names two pauses where a
 resume answers one, so it is refused as that — rather than joined into an id
 nothing is holding — and consumes neither. A `409` is about *which* pause
-rather than about the body: nothing is waiting, the wait already expired and
-`on_timeout:` has routed the execution on, the execution is holding more than one
-pause and the request named none, or `?wait=` named a pause this execution is not
-holding — a stale id from an earlier poll. The last two carry a `pending` array
-of the ids that *are* waiting, and `?wait=` is how one of them is named. That id
-is a pause's `wait_id`: its instance path, which is stable across runs of one
-composition — `approve/0` at the top level of a flow, `review/0/2/approve/0` for
-the pause inside the third instance a `map` dispatched. `interrupts` is ordered by `wait_id`, and so is the list a `409`
-gives, so two runs of one composition publish the same questions in the same
-order however their instances happened to be scheduled.
+rather than about the body: the execution has already completed or failed, so
+there is no run left to be waiting; the run is still going and nothing in it is
+waiting; the wait already expired and `on_timeout:` has routed the execution on;
+the execution is holding more than one pause and the request named none; or
+`?wait=` named a pause this execution is not holding — a stale id from an
+earlier poll. The last two carry a `pending` array of the ids that *are*
+waiting, and `?wait=` is how one of them is named. That id is a pause's
+`wait_id`: its instance path, which is stable across runs of one composition —
+`approve/0` at the top level of a flow, `review/0/2/approve/0` for the pause
+inside the third instance a `map` dispatched. `interrupts` is ordered by
+`wait_id`, and so is the list a `409` gives, so two runs of one composition
+publish the same questions in the same order however their instances happened
+to be scheduled.
 
 **A node above a pause does not spend its budget waiting.** A `timeout:` on the
 `flow:` node or `map` that dispatched the flow the pause is in — including one
