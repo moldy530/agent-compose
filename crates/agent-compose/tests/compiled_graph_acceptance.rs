@@ -6399,9 +6399,9 @@ fn serve_resumes_an_interrupted_execution_against_the_human_nodes_schema() {
     // …and the report is enough to *ask* the question rather than only to
     // notice there is one: what the human is shown, the schema their answer has
     // to fit, and where to send it (PRD 5.11).
-    let interrupts = status["interrupts"]
-        .as_array()
-        .unwrap_or_else(|| panic!("an interrupted report names the pauses it is holding: {status}"));
+    let interrupts = status["interrupts"].as_array().unwrap_or_else(|| {
+        panic!("an interrupted report names the pauses it is holding: {status}")
+    });
     assert_eq!(interrupts.len(), 1, "{status}");
     let waiting = &interrupts[0];
     assert_eq!(waiting["wait_id"], "approve/0", "{waiting}");
@@ -6418,8 +6418,8 @@ fn serve_resumes_an_interrupted_execution_against_the_human_nodes_schema() {
         "…and the published schema an answer is held to: {waiting}"
     );
     assert_eq!(
-        waiting["resume_url"], "/executions/{execution}/resume?wait=approve%2F0"
-            .replace("{execution}", &execution),
+        waiting["resume_url"],
+        "/executions/{execution}/resume?wait=approve%2F0".replace("{execution}", &execution),
         "{waiting}"
     );
     assert!(
@@ -6511,7 +6511,10 @@ fn serve_resumes_an_interrupted_execution_against_the_human_nodes_schema() {
 
     // …and an id this process never started is the other mistake, told apart.
     let unknown = app
-        .post_json("/executions/exec_nobody/resume", &json!({ "decision": "approve" }))
+        .post_json(
+            "/executions/exec_nobody/resume",
+            &json!({ "decision": "approve" }),
+        )
         .expect("the resume route answers");
     assert_eq!(unknown.status, 404, "{:?}", unknown.body);
 }
@@ -6550,7 +6553,10 @@ fn an_expired_wait_takes_its_route_and_refuses_the_answer_that_arrives_after_it(
 
     let waiting = harness::settled(&app, &execution);
     assert_eq!(waiting["status"], "interrupted", "{waiting}");
-    assert_eq!(waiting["interrupts"][0]["wait_id"], "sign_off/0", "{waiting}");
+    assert_eq!(
+        waiting["interrupts"][0]["wait_id"], "sign_off/0",
+        "{waiting}"
+    );
 
     // The budget runs out and the `on_timeout:` route starts; the execution is
     // still going, which is the window the late answer lands in.
@@ -6566,7 +6572,10 @@ fn an_expired_wait_takes_its_route_and_refuses_the_answer_that_arrives_after_it(
         )
         .expect("the resume route answers");
     assert_eq!(late.status, 409, "{:?}", late.body);
-    let said = late.json()["error"].as_str().unwrap_or_default().to_string();
+    let said = late.json()["error"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
     assert!(
         said.contains("expired before this answer arrived")
             && said.contains("on_timeout")
@@ -6639,6 +6648,11 @@ fn two_pauses_in_one_execution_are_addressed_by_their_instance_paths() {
         .iter()
         .map(|one| one["wait_id"].as_str().unwrap_or_default().to_string())
         .collect();
+    // Ordered by id rather than by which instance parked first: two instances
+    // doing identical work under `max_concurrency: 4` are interleaved by the
+    // scheduler, and a report ordered on that would differ between runs of one
+    // composition. `humanWaits` sorts, which is what makes this an assertion
+    // about addressing rather than about scheduling.
     assert_eq!(
         ids,
         vec!["fan/0/0/sign/0".to_string(), "fan/0/1/sign/0".to_string()],
@@ -6674,8 +6688,7 @@ fn two_pauses_in_one_execution_are_addressed_by_their_instance_paths() {
         .expect("the resume route answers");
     assert_eq!(nowhere.status, 409, "{:?}", nowhere.body);
     assert!(
-        nowhere
-            .json()["error"]
+        nowhere.json()["error"]
             .as_str()
             .unwrap_or_default()
             .contains("holding no pause `sign/0`"),
@@ -6707,6 +6720,80 @@ fn two_pauses_in_one_execution_are_addressed_by_their_instance_paths() {
         json!(["approve", "reject"]),
         "the join is ordered by source-item index, not by who answered first: {finished}"
     );
+}
+
+/// A `timeout:` on the node **above** a pause does not cut the wait short
+/// (Decision D102, grammar 9.2).
+///
+/// D102 withholds `timeout` and `retry` from a `human` node at every level of
+/// grammar 9.3's chain so that a composition-wide budget can never end a wait —
+/// and the node that *dispatches* a pause is where that promise is easiest to
+/// break, because it is not a `human` node and resolves `defaults:` like any
+/// other. `flow.patient`'s `wrap` node declares `timeout: 2s` over a subflow
+/// whose only node is a `human` one; this waits four seconds — twice the budget —
+/// and then answers. A budget that ran while the human was thinking would have
+/// failed the node before the resume was sent, and the execution would be
+/// `failed` rather than holding the same pause it started with.
+#[test]
+fn an_enclosing_nodes_budget_does_not_run_while_a_pause_below_it_is_open() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let Some(served) = harness::serve("http-trigger", &provider) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+
+    let started = app
+        .post_json("/patient-answers", &json!({ "question": "ship it?" }))
+        .expect("the trigger's route answers");
+    assert_eq!(started.status, 202, "{:?}", started.body);
+    let execution = started.json()["execution_id"]
+        .as_str()
+        .expect("an execution id")
+        .to_string();
+
+    let waiting = wait_for_pauses(&app, &execution, 1);
+    assert_eq!(
+        waiting["interrupts"][0]["wait_id"], "wrap/0/sign/0",
+        "the pause is addressed through the node that dispatched it: {waiting}"
+    );
+
+    // Twice the enclosing node's budget, spent doing nothing — which is exactly
+    // what a human takes.
+    std::thread::sleep(Duration::from_secs(4));
+
+    let still = app
+        .get(&format!("/executions/{execution}"))
+        .expect("the status route answers")
+        .json();
+    assert_eq!(
+        still["status"], "interrupted",
+        "`wrap`'s 2s budget is not the wait's: {still}"
+    );
+    assert_eq!(
+        still["interrupts"][0]["wait_id"], "wrap/0/sign/0",
+        "…and it is the same pause, not a new one: {still}"
+    );
+    assert_eq!(
+        still["interrupts"][0]["expires_at"],
+        Value::Null,
+        "the wait declares no `timeout:`, so it has no expiry to report: {still}"
+    );
+
+    let resumed = app
+        .post_json(
+            &format!("/executions/{execution}/resume?wait=wrap%2F0%2Fsign%2F0"),
+            &json!({ "decision": "reject" }),
+        )
+        .expect("the resume route answers");
+    assert_eq!(resumed.status, 202, "{:?}", resumed.body);
+
+    let finished = harness::settled(&app, &execution);
+    assert_eq!(
+        finished["status"], "completed",
+        "the budget was held still, not cancelled — the instance finished inside \
+         what was left of it: {finished}"
+    );
+    assert_eq!(finished["outputs"]["decision"], "reject", "{finished}");
 }
 
 /// `agent-compose run` reports the pause it cannot answer, and exits on a code
@@ -6812,7 +6899,10 @@ fn wait_for_pauses(app: &Client, execution: &str, count: usize) -> Value {
             .get(&format!("/executions/{execution}"))
             .expect("the status route answers")
             .json();
-        if last["interrupts"].as_array().is_some_and(|held| held.len() == count) {
+        if last["interrupts"]
+            .as_array()
+            .is_some_and(|held| held.len() == count)
+        {
             return last;
         }
         assert!(

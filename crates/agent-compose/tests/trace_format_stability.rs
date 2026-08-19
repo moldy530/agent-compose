@@ -14,11 +14,13 @@
 //! The trace **document** a run wrote to disk, with its volatile values
 //! redacted: the execution id becomes `<execution-id>` wherever it appears —
 //! including inside the idempotency keys, where the remainder is the instance
-//! path (grammar §9.4) and is exactly what should stay legible — and the built
-//! project's own directory becomes `<project>`. Everything else is kept, because
-//! everything else is deterministic: the fixtures script every model answer, and
-//! `docs/trace.md` fixes the order of entries, edge decisions and dispatch
-//! records so that two runs of one composition produce one document.
+//! path (grammar §9.4) and is exactly what should stay legible — the built
+//! project's own directory becomes `<project>`, and a wall clock reading becomes
+//! `<instant>`, which pins that the key is there and holds an RFC 3339 instant
+//! without pinning the second it was written in. Everything else is kept,
+//! because everything else is deterministic: the fixtures script every model
+//! answer, and `docs/trace.md` fixes the order of entries, edge decisions and
+//! dispatch records so that two runs of one composition produce one document.
 //!
 //! So an unannounced rename or removal is a diff in a pull request. A snapshot
 //! that changes is not by itself a failure — `docs/trace.md` §10.2 lists the
@@ -29,24 +31,35 @@
 //! INSTA_UPDATE=always cargo test -p agent-compose --test trace_format_stability
 //! ```
 //!
-//! # Why these five runs
+//! # Why these six runs
 //!
-//! Between them they reach every record **type** the format has, and the entry
-//! shapes a reader meets first: a bounded cycle for guarded edges, budgets and
-//! an `else:` escape; a routed fan-out for dispatch records, variants,
-//! idempotency keys and a nested subflow trace; a store round trip for
-//! read-replay and write-dedupe records, and for the tool-invoked write that
-//! carries neither key nor dedupe flag; a failover for a model call that was
-//! served by its second member; and a spent route for a **failed** run — the
-//! shape a reader most often opens a trace for, and the one whose rules (no
-//! writes, routing only where routing failed) exist nowhere else.
+//! Between them they reach every record **type** the format has, every member of
+//! `TraceDocument.status`, and the entry shapes a reader meets first: a bounded
+//! cycle for guarded edges, budgets and an `else:` escape; a routed fan-out for
+//! dispatch records, variants, idempotency keys and a nested subflow trace; a
+//! store round trip for read-replay and write-dedupe records, and for the
+//! tool-invoked write that carries neither key nor dedupe flag; a failover for a
+//! model call that was served by its second member; a spent route for a
+//! **failed** run — the shape a reader most often opens a trace for, and the one
+//! whose rules (no writes, routing only where routing failed) exist nowhere
+//! else; and a run that ended holding a `human` pause, for the `human` record
+//! and the `"interrupted"` document status version `2` introduced (§10.3.1).
+//!
+//! A run added here is what keeps that first sentence true: the count is a claim
+//! about coverage, so a record type or a status member added to the format
+//! without a run that reaches it is a claim this file stopped keeping.
 //!
 //! It is not every *shape* the format admits, and the header should not be read
 //! as claiming so: no snapshot here holds a `"skipped"` entry, a `fallback`
 //! entry, a no-viable-route entry, a dispatch that skipped, failed or detached,
-//! or the `"$default"` route sigil. Those are held by
+//! or the `"$default"` route sigil. `TraceEntry.fallback`'s **expiry** form is
+//! in that list too — the widening version `2` made, where the key names an
+//! `on_timeout:` route rather than an `on_error:` one — because reaching it
+//! needs a resume surface, which `agent-compose run` is not. Those are held by
 //! `tests/compiled_graph_acceptance.rs`, which asserts about them by name rather
-//! than by shape — the two files divide the surface, and a run added here is
+//! than by shape — the expiry form by
+//! [`an_expired_wait_takes_its_route_and_refuses_the_answer_that_arrives_after_it`]
+//! — the two files divide the surface, and a run added here is
 //! worth adding when a shape has no home in either. The first two are reached
 //! here all the same, by the §3 rule below rather than by a snapshot: a rule
 //! about a field on every entry is not kept by pinning the entries that happen
@@ -102,8 +115,8 @@ const HAIKU: &str = "claude-haiku-4-5";
 
 /// The trace document a run wrote, as a snapshot reads it.
 ///
-/// Two substitutions, and only two, because only two things about a trace differ
-/// between runs of one composition:
+/// Three substitutions, and only three, because only three things about a trace
+/// differ between runs of one composition:
 ///
 ///  * the **execution id**, which is minted per run. It is replaced wherever it
 ///    appears rather than only at `execution_id`, which is the point: an
@@ -113,7 +126,15 @@ const HAIKU: &str = "claude-haiku-4-5";
 ///  * the **project directory**, which a scratch build puts under a temporary
 ///    path. Nothing in the document holds one today; it is redacted anyway, so a
 ///    field that starts carrying a path lands in the snapshot as `<project>`
-///    instead of as a value that changes every run.
+///    instead of as a value that changes every run;
+///  * an **instant**, which is a wall clock reading. §3.4's `pausedAt` and
+///    `settledAt` are the only two fields of the format that carry one, and a
+///    snapshot holding either would fail on the second run — so the *shape* is
+///    what is pinned: the key is there, with a value that was an RFC 3339
+///    instant, which is exactly the promise §3.4's table makes about it.
+///    Recognized by shape rather than by key name, so a field that starts
+///    carrying a clock reading is redacted the day it appears instead of the day
+///    somebody notices.
 fn document(run: &harness::Run) -> String {
     let held = run.trace_document();
     every_entrys_error_is_in_one_shape(&held);
@@ -136,10 +157,14 @@ fn document(run: &harness::Run) -> String {
     serde_json::to_string_pretty(&redacted).expect("the trace document serializes")
 }
 
-/// Replace the two volatile values everywhere in `value`.
+/// Replace the three volatile values everywhere in `value`.
 fn redact(value: &mut Value, execution: &str, project: &str) {
     match value {
         Value::String(text) => {
+            if is_instant(text) {
+                *text = "<instant>".to_string();
+                return;
+            }
             let mut held = text.replace(execution, "<execution-id>");
             if !project.is_empty() {
                 held = held.replace(project, "<project>");
@@ -158,6 +183,31 @@ fn redact(value: &mut Value, execution: &str, project: &str) {
         }
         _ => {}
     }
+}
+
+/// Whether `text` is the instant `JSON.stringify(new Date(…))` writes.
+///
+/// `YYYY-MM-DDTHH:MM:SS.sssZ`, which is the one spelling the emitted runtime
+/// produces (`toISOString`) and the one `docs/trace.md` §3.4 names. Matched
+/// tightly rather than by "looks date-ish", so a string field whose *content*
+/// happens to start with digits is left alone.
+fn is_instant(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    if bytes.len() != 24 {
+        return false;
+    }
+    let digits = [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18, 20, 21, 22];
+    let dashes = [
+        (4, b'-'),
+        (7, b'-'),
+        (10, b'T'),
+        (13, b':'),
+        (16, b':'),
+        (19, b'.'),
+        (23, b'Z'),
+    ];
+    digits.iter().all(|at| bytes[*at].is_ascii_digit())
+        && dashes.iter().all(|(at, held)| bytes[*at] == *held)
 }
 
 /// Every `TraceEntry.error` in `document`, node-qualified, nested entries
@@ -532,6 +582,35 @@ fn a_failed_runs_trace_document_keeps_its_shape() {
     insta::assert_snapshot!(document(&run));
 }
 
+/// A run that ended holding a pause (`docs/trace.md` §3.4, §9).
+///
+/// The third thing a document's `status` can say, and the record version `2`
+/// added, in the one run that produces both without a resume surface: an
+/// `agent-compose run` that reaches a `human` node stops there (grammar §8.7),
+/// so the document is `status: "interrupted"` and the node's entry carries a
+/// `human` record with a `pausedAt` and no settlement — the one case §3.4's
+/// presence column says `settled`/`settledAt` are absent in, which is a promise
+/// nothing else here holds.
+#[test]
+fn an_interrupted_runs_trace_document_keeps_its_shape() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "answer": "an answer" })),
+    ));
+
+    let Some(run) = harness::run(
+        "http-trigger",
+        "flow.assisted",
+        &[("question", "what is it?")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.failed();
+    insta::assert_snapshot!(document(&run));
+}
+
 /// Both halves of a routing record are in **declaration** order, including the
 /// one edge shape whose declaration order a router cannot decide in
 /// (`docs/trace.md` §4).
@@ -835,7 +914,7 @@ fn the_status_route_carries_the_version_beside_its_trace() {
     );
     assert_eq!(
         finished["trace_version"],
-        json!(1),
+        json!(2),
         "…and the version that describes them, beside them (`docs/trace.md` §1): \
          {finished}"
     );

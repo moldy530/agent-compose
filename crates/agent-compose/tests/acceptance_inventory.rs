@@ -60,6 +60,17 @@ enum Status {
     Live,
     /// They are `#[ignore]`d, with this reason — verbatim, so the attribute and
     /// the inventory cannot drift apart.
+    ///
+    /// **No row is pending right now**, which is what the `expect` says: every
+    /// test this file inventories runs. The arm stays because it is half of what
+    /// `a_pending_criterion_names_what_must_land_first` decides — a row claimed
+    /// live whose test is ignored, and a row claimed pending whose test is not —
+    /// and deleting it would delete that half of the check along with the
+    /// vocabulary the next criterion written ahead of its feature needs.
+    /// `expect` rather than `allow` so that the day a pending row returns, the
+    /// unfulfilled expectation is what removes this attribute, instead of a
+    /// suppression outliving its reason.
+    #[expect(dead_code, reason = "no acceptance test is ignored today")]
     Pending(&'static str),
 }
 
@@ -671,6 +682,14 @@ const COMMANDS: &[Criterion] = &[
             ),
             (
                 "two_pauses_in_one_execution_are_addressed_by_their_instance_paths",
+                Status::Live,
+            ),
+            // …and the promise Decision D102 makes about a wait, held one
+            // construct further out than the decision's own text reaches: the
+            // node that *dispatched* the pause has a budget, and it does not run
+            // while the pause is open.
+            (
+                "an_enclosing_nodes_budget_does_not_run_while_a_pause_below_it_is_open",
                 Status::Live,
             ),
         ],

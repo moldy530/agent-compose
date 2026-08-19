@@ -2598,6 +2598,18 @@ on_timeout: escalate }` leaves that wait running for 24 hours; with no
 through all four levels as on any other node: it covers delivery failures, which
 are ordinary node errors (§8.7).
 
+**Nor does the budget of a node *above* a wait cut it short.** A `human` node
+reached inside a subflow sits under a `flow:` node or a `map`, and those are not
+`human` nodes: they resolve `timeout:` at every level like anything else, and
+§8.5 makes a node-level one bound the entire instance. A budget that ran while
+the instance was parked at a pause would cap every wait below it at the
+composition's default, which is the reading D102 refuses, reached one construct
+further out — so the enclosing node's deadline is **held still** for as long as a
+wait inside it is open and resumes with the time it had left. §9.2's budget
+bounds the work a node execution does; waiting on a human is not work it is
+doing. A `timeout: 60s` on a `flow:` node whose subflow pauses for an hour still
+means sixty seconds of running.
+
 **Levels 1 and 3 take no `fallback`.** `on_error:` in `defaults:` and in a
 `flow:` node's `policy:` is `fail` or `skip` only; the
 `{ fallback: <node id or end> }` form is legal at level 2 alone, because its
@@ -5163,6 +5175,16 @@ opposite reason: a delivery failure *is* an ordinary node error, so the strategy
 covering it is ordinary policy, and §8.7 already keeps the key legal at the node.
 The cost is that a composition cannot bound its human waits from one place —
 which is what `human.timeout:` is for, one line at the node that owns the wait.
+**A budget above a wait does not run while the wait is open** (§9.3). The four
+levels this decision speaks about are the ones that resolve *onto the `human`
+node*, and a pause reached inside a subflow has a fifth clock beside them: the
+`flow:` node or `map` that dispatched the instance, which is not a `human` node
+and whose `timeout:` §8.5 makes bound the entire instance. Left to run, it would
+cap every nested wait at whatever `defaults:` said — this decision's own reading,
+defeated one construct out — so the enclosing deadline is held still for as long
+as a wait inside it is open. What that costs is nothing a composition can
+observe except the thing it is for: the enclosing node's budget still bounds
+every millisecond of *work* the instance does, which is what §9.2 says it bounds.
 *PRD 5.5, 5.11, G3.*
 
 ### D103. `fallback` is a node-level `on_error` form only

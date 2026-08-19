@@ -189,10 +189,15 @@ export function createApp(): FastifyInstance {
       // `202` rather than `200`: the answer has been delivered and the graph has
       // gone back to work, which the status route is where to watch. The run is
       // not finished, and a `200` carrying no outputs would read as if it were.
+      //
+      // Derived rather than asserted, for [`statusOf`]'s own reason: answering
+      // one of two pauses leaves the execution `interrupted`, and a body that
+      // said `running` would tell a client that trusts it to stop polling for
+      // the second question.
       return reply.code(202).send({
         execution_id: id,
         wait: outcome.wait.id,
-        status: "running",
+        status: statusOf(execution),
         status_url: `/executions/${id}`,
       });
     }
@@ -464,7 +469,10 @@ async function notify(callback: string, execution: Execution): Promise<void> {
  * report whose `status` is `interrupted`: every pause the execution is holding,
  * with what the human is shown, the schema their answer has to fit, and the URL
  * that delivers it (grammar 8.7). It is what makes a status poll enough to
- * *present* the question rather than only to notice that there is one.
+ * *present* the question rather than only to notice that there is one. Ordered
+ * by `wait_id` — `runtime.humanWaits`'s order — so that two runs of one
+ * composition publish the same questions in the same order whatever order their
+ * instances were scheduled in.
  */
 function report(execution: Execution): Record<string, unknown> {
   const waits = execution.status === "running" ? humanWaits(execution.id) : [];

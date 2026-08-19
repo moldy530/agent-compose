@@ -166,6 +166,16 @@
 //!     could not parse and Node says only `Invalid URL`, while Node quotes what
 //!     `fetch` could not parse and Bun does not. Gate 13 asks Node the same
 //!     question for exactly that reason.
+//! 19. **The `human` wait board** — the pauses a run is holding, driven directly.
+//!     Three of grammar 8.7's guarantees are invisible from a served app,
+//!     because the case that breaks them is a task nobody is awaiting: that a
+//!     pause belongs to the node whose instance path is a prefix of its own —
+//!     which is what holds an enclosing budget still (Decision D102) — that a
+//!     pause the run abandoned leaves the board rather than being published as a
+//!     question and answered into nothing, and that a released wait's expiry
+//!     timer is cleared. The last has no observable consequence at all: an
+//!     `unref`ed timer keeps nothing alive, so the runner counts the global
+//!     `setTimeout`/`clearTimeout` calls instead.
 //!
 //! # The toolchain fixture
 //!
@@ -1274,6 +1284,167 @@ fn the_fan_out_runtime_bounds_orders_and_resolves_every_dispatch() {
             "exempt": { "onError": "skip" },
             "plain": { "timeoutMs": 10_000, "onError": "fail" },
         })
+    );
+}
+
+/// Gate 19: the `human` wait board — addressing, abandonment, and the timer a
+/// released wait leaves behind (grammar 8.7, 9.2, PRD 5.11).
+///
+/// The acceptance suite answers, expires and addresses pauses through a served
+/// app, which is where the composition's behaviour is decided. Three claims are
+/// not decidable there, because the case that breaks them is a task **nobody is
+/// awaiting**:
+///
+///   * **a pause is addressed by, and belongs to, an instance path.** A node
+///     holds the pauses its own path is a prefix of, which is the whole of what
+///     links a wait to the node that dispatched the instance it happened in —
+///     and is what [`runActivity`] reads to hold its deadline still (D102);
+///   * **an abandoned pause leaves the board.** A wait whose node stopped
+///     waiting would otherwise be published by the status route as a question a
+///     person can still answer and taken by the resume route as an answer that
+///     goes nowhere. Reaching it from a composition needs a dispatch abandoned
+///     at a moment a test cannot schedule;
+///   * **a released wait's expiry timer is cleared.** An `unref`ed timer keeps
+///     nothing alive, so it is invisible to `process.getActiveResourcesInfo()`
+///     and to the process exiting: the runner counts the global
+///     `setTimeout`/`clearTimeout` calls made with the pause's own budget, which
+///     is the only place that question has an answer at all.
+///
+/// `src/runtime.ts` is a compiler constant, byte-identical in every project this
+/// release builds, so driving it directly is driving what every project runs.
+#[test]
+fn the_human_wait_board_addresses_abandons_and_releases_every_pause() {
+    let Some(root) = installed() else {
+        return;
+    };
+    let project = staged(goldens::golden("review-loop"), root, "human-waits");
+    let output = runner("human-waits.mjs")
+        .arg(&project)
+        .output()
+        .expect("bun runs");
+    assert!(
+        output.status.success(),
+        "the wait board did not run:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let observed: Value =
+        serde_json::from_slice(&output.stdout).expect("the runner prints its observations as JSON");
+
+    // Grammar 9.4, flattened: two instances of one `map` hold two pauses, told
+    // apart by the path that addresses them and published in id order rather
+    // than in the order the scheduler happened to park them.
+    assert_eq!(
+        observed["addressing"],
+        json!({
+            "ids": ["fan/0/0/sign/0", "fan/0/1/sign/0"],
+            "under_the_map": 2,
+            "under_one_instance": 1,
+            "under_the_wait_itself": 1,
+            "under_another_node": 0,
+            "both_pending": ["pending", "pending"],
+        })
+    );
+
+    // …and abandoning the node that dispatched them settles both: nothing is
+    // published, nothing is open, and a resume is refused as the abandonment it
+    // is rather than taken with a `202` that discards the answer.
+    assert_eq!(
+        observed["abandoning"]["both_settled"],
+        json!(["HumanAbandoned", "HumanAbandoned"])
+    );
+    assert_eq!(observed["abandoning"]["still_published"], json!([]));
+    assert_eq!(observed["abandoning"]["still_open"], json!(0));
+    assert_eq!(observed["abandoning"]["refusal"]["ok"], json!(false));
+    assert_eq!(
+        observed["abandoning"]["refusal"]["reason"],
+        json!("settled")
+    );
+    assert!(
+        observed["abandoning"]["refusal"]["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no longer held"),
+        "the refusal says what became of the wait: {observed}"
+    );
+
+    // …and it is `runActivity` that does it, on every way one node execution can
+    // end. A dispatch that failed while a sibling instance was still parked is
+    // the reachable shape: the node is over, so the pause under it is one
+    // nothing will read the answer of.
+    assert_eq!(
+        observed["orphans"],
+        json!({
+            "before": 1,
+            "after": 0,
+            "published": [],
+            "settled": "HumanAbandoned",
+            "node_failed": "NodeFailure",
+            "refusal": "settled",
+        })
+    );
+
+    // A 24-hour budget arms one timer, and releasing the run clears it — rather
+    // than leaving it, and the closure it holds, alive for the day.
+    assert_eq!(
+        observed["timer"],
+        json!({
+            "armed": 1,
+            "cleared_while_pending": 0,
+            "cleared_after_release": 1,
+            "settled": "HumanAbandoned",
+            "after_release": "not-waiting",
+        })
+    );
+
+    // The ordinary path, unchanged by any of it: the pause is published with
+    // what the human is shown and the schema their answer is held to, the answer
+    // is parsed against that schema, and the wait settles exactly once.
+    assert_eq!(
+        observed["answering"]["published"]["id"],
+        json!("review/0/sign/0")
+    );
+    assert_eq!(
+        observed["answering"]["published"]["shown"],
+        json!({ "question": "ship it?" })
+    );
+    assert_eq!(
+        observed["answering"]["published"]["schema"]["properties"]["decision"]["enum"],
+        json!(["approve", "reject"])
+    );
+    assert_eq!(
+        observed["answering"]["taken"],
+        json!({ "ok": true, "wait": "review/0/sign/0" })
+    );
+    assert_eq!(observed["answering"]["settled"], json!("resolved"));
+    assert_eq!(
+        observed["answering"]["output"],
+        json!({ "decision": "reject" })
+    );
+    assert_eq!(
+        observed["answering"]["pause"],
+        json!({
+            "settled": "resumed",
+            "paused_at_is_an_instant": true,
+            "settled_at_is_an_instant": true,
+            "expires_at": null,
+        })
+    );
+    assert_eq!(
+        observed["answering"]["twice"],
+        json!({ "ok": false, "reason": "settled" })
+    );
+    assert_eq!(
+        observed["answering"]["mismatched"],
+        json!({ "ok": false, "reason": "settled" })
+    );
+    assert_eq!(observed["answering"]["still_published"], json!([]));
+
+    // A run with no resume surface never registers a pause: `agent-compose run`
+    // has no way to answer one, so the node raises instead of parking, and there
+    // is nothing for a status route to publish (grammar 8.7).
+    assert_eq!(
+        observed["unanswerable"],
+        json!({ "settled": "HumanInterrupt", "published": [] })
     );
 }
 

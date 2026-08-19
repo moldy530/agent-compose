@@ -1992,7 +1992,9 @@ fn human_descriptor(
 ) -> String {
     let id = node.id.value.as_str();
     let output = surface_fields(surfaces, &format!("{address}.node.{id}.output"));
-    let parse = names.value(&format!("{address}.node.{id}.output")).to_string();
+    let parse = names
+        .value(&format!("{address}.node.{id}.output"))
+        .to_string();
     imported.push(parse.clone());
 
     let mut text = String::from("\n");
@@ -2027,9 +2029,7 @@ fn human_descriptor(
     ));
     text.push_str(&format!(
         "  parse: (payload) => runtime.parseResult({parse}, payload, {}),\n",
-        names::string(&format!(
-            "the resume payload for `{address}` node `{id}`"
-        ))
+        names::string(&format!("the resume payload for `{address}` node `{id}`"))
     ));
     text.push_str("};\n");
     text
@@ -3877,7 +3877,8 @@ flow.f:
         // What the human is shown is the node's own `input:`, bound through
         // grammar 8.0's chain like any other declared input surface.
         assert!(
-            emitted.contains("\"question\": runtime.toJson(runtime.evaluate(\"input.goal\", roots)),"),
+            emitted
+                .contains("\"question\": runtime.toJson(runtime.evaluate(\"input.goal\", roots)),"),
             "{emitted}"
         );
         // Decision D102: `defaults: { timeout: 30s }` above reaches every other

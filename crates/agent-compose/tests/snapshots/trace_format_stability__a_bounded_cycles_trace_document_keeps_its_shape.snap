@@ -318,5 +318,5 @@ expression: document(&run)
   "execution_id": "<execution-id>",
   "flow": "flow.review_loop",
   "status": "completed",
-  "trace_version": 1
+  "trace_version": 2
 }

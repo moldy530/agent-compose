@@ -8,7 +8,7 @@
 # responses, so a start returns an execution id and the status route is how a
 # caller learns the rest.
 #
-# Four flows, because the verbs and the ways a pause can end do not all become
+# Five flows, because the verbs and the ways a pause can end do not all become
 # testable at once:
 #
 #   * `flow.direct` has no `human` node in it, so start and status are decidable
@@ -22,7 +22,12 @@
 #   * `flow.batch` is the case that makes a pause need an address: a `map`
 #     dispatching a flow that contains a `human` node, so one execution holds
 #     several pauses at once and each resume has to name which it answers
-#     (grammar 9.4's instance path).
+#     (grammar 9.4's instance path);
+#   * `flow.patient` is the case Decision D102 is about one construct further
+#     out: a `flow:` node with a short `timeout:` of its own wrapping a subflow
+#     that pauses. The enclosing budget must not cut the wait short (§9.2's
+#     budget bounds the work the node does, and waiting on a human is not work
+#     it is doing), and the test outlives it by seconds before answering.
 #
 # They share the agent, the model and the state channels.
 #
@@ -134,6 +139,17 @@ triggers:
     method: POST
     input:
       questions: "payload.body.questions"
+    respond: async
+
+  # A pause under a node that has a budget of its own, which the test outlives
+  # before answering.
+  on_patient_request:
+    type: http
+    flow: flow.patient
+    path: /patient-answers
+    method: POST
+    input:
+      question: "payload.body.question"
     respond: async
 
   # The third response shape (grammar 13.3, PRD §9.8): `sync` blocks for the
@@ -280,11 +296,14 @@ flow.expiring:
 
     # Long enough that the execution is observably still going after the wait
     # expired, so the late resume the test sends is refused by the *wait's* state
-    # rather than by the execution's.
+    # rather than by the execution's. Five seconds rather than the two the test
+    # needs, because the window is what a poll has to catch: a loaded machine
+    # that stalls between the expiry and the first poll would otherwise see a run
+    # that had already finished and read the wrong refusal.
     give_up:
       exec:
         command: "${OPS_BIN}/sleep"
-        args: ["3"]
+        args: ["5"]
 
     note:
       exec:
@@ -354,3 +373,32 @@ flow.batch:
   edges:
     - { from: start, to: fan }
     - { from: fan, to: end }
+
+# A pause under a node that has a budget of its own. `wrap` declares
+# `timeout: 2s` — and would resolve `defaults: { timeout: 60s }` even if it did
+# not — while the wait below it has none at all. Decision D102 withholds
+# `timeout` from a `human` node at every level so that a composition-wide budget
+# can never cut a wait short, and the node that *dispatches* a pause is where
+# that promise is easiest to break: grammar 9.2's budget bounds the work a node
+# execution does, and waiting on a human is not work it is doing, so the deadline
+# does not run while a wait below it is open.
+flow.patient:
+  description: Wrap a sign-off in a node whose own budget must not end the wait.
+  inputs:
+    question:
+      type: string
+      min_length: 1
+  outputs:
+    decision:
+      enum: [approve, reject]
+  nodes:
+    wrap:
+      flow: flow.sign_off
+      timeout: 2s
+      input:
+        question: "input.question"
+      writes:
+        decision: decision
+  edges:
+    - { from: start, to: wrap }
+    - { from: wrap, to: end }

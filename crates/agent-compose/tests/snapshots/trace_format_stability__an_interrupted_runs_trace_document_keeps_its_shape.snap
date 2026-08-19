@@ -1,0 +1,58 @@
+---
+source: crates/agent-compose/tests/trace_format_stability.rs
+expression: document(&run)
+---
+{
+  "entries": [
+    {
+      "attempts": 1,
+      "flow": "flow.assisted",
+      "models": [
+        {
+          "failovers": [],
+          "fallback": 0,
+          "model": "model.smart",
+          "servedBy": "model.smart"
+        }
+      ],
+      "node": "ask",
+      "outcome": "completed",
+      "routing": {
+        "counters": {},
+        "edges": [
+          {
+            "reason": "unconditional",
+            "taken": true,
+            "to": "approve"
+          }
+        ],
+        "targets": [
+          "approve"
+        ]
+      },
+      "step": 1,
+      "traversal": 0,
+      "writes": [
+        "answer"
+      ]
+    },
+    {
+      "attempts": 1,
+      "error": "NodeFailure: flow.assisted node `approve` failed: HumanInterrupt: flow.assisted node `approve` is waiting for a human and this run has no way to answer: `agent-compose run` cannot deliver a resume, which is `agent-compose serve`'s `POST /executions/:id/resume` (PRD 5.11)",
+      "flow": "flow.assisted",
+      "human": {
+        "expiresAt": "<instant>",
+        "pausedAt": "<instant>"
+      },
+      "node": "approve",
+      "outcome": "failed",
+      "step": 2,
+      "traversal": 0
+    }
+  ],
+  "error": "HumanInterrupt: flow.assisted node `approve` is waiting for a human and this run has no way to answer: `agent-compose run` cannot deliver a resume, which is `agent-compose serve`'s `POST /executions/:id/resume` (PRD 5.11)",
+  "execution_id": "<execution-id>",
+  "flow": "flow.assisted",
+  "status": "interrupted",
+  "trace_version": 2
+}

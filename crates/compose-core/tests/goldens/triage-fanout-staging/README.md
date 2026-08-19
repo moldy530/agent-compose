@@ -130,7 +130,6 @@ the life of the process, so a long-running `serve` grows with the number of
 requests it has answered. Restarting it is the only way to reclaim that until
 the checkpointer arrives and an execution stops living in memory.
 
-
 Stopping it stops the graph: `agent-compose serve` passes `SIGINT` and `SIGTERM`
 on to this project, which closes the app and exits, so a supervisor that signals
 the command is not left with a listener behind it.
@@ -208,7 +207,17 @@ one pause and the request named none (the refusal lists their ids, and `?wait=`
 is how one is named). `wait_id` is that id: the pause's instance path, which is
 stable across runs of one composition — `approve/0` at the top level of a flow,
 `review/0/2/approve/0` for the pause inside the third instance a `map`
-dispatched.
+dispatched. `interrupts` is ordered by `wait_id`, and so is the list a `409`
+gives, so two runs of one composition publish the same questions in the same
+order however their instances happened to be scheduled.
+
+**A node above a pause does not spend its budget waiting.** A `timeout:` on the
+`flow:` node or `map` that dispatched the flow the pause is in — including one
+resolved from `defaults:` — bounds the work that node does, and the wait is not
+work it is doing: its clock is held still while a pause below it is open and
+resumes with the time it had left. This is what makes the rule "a `human` node
+resolves no `timeout` at any level" mean what it says for a pause that is not at
+the top level of the triggered flow.
 
 **A wait lives in this process.** It is a parked promise, not a checkpoint, so a
 `serve` restarted while a human was thinking has lost it and the execution is
