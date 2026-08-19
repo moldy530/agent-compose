@@ -2583,6 +2583,315 @@ fn a_call_to_a_tool_the_agent_does_not_offer_comes_back_with_the_names_it_has() 
     );
 }
 
+/// A synthesized store tool refuses the arguments its own row does not admit,
+/// the model corrects — and a *backend* failure still ends the node.
+///
+/// Grammar 11.5's tools are the third surface Decision D119 quantifies over, and
+/// this is where the split it draws is visible in one place: `top_k` is
+/// `1..=100` (grammar 11.4), so `0` is a call the model can make again, while a
+/// blob key the local backend cannot hold is the store *failing* and no
+/// rephrasing helps. The observable that keeps the first honest is the store
+/// record: a refused call never reached a backend, so it left none.
+#[test]
+fn a_store_tool_refuses_arguments_to_the_model_and_still_fails_the_node_on_a_backend_error() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        // `top_k` is a bounded integer; `0` is below its minimum.
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "notes_search",
+                json!({ "query": "anything at all", "top_k": 0 }),
+            )]),
+        ),
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "notes_search",
+                json!({ "query": "anything at all", "top_k": 1 }),
+            )]),
+        ),
+        Script::new(SONNET, Outcome::text("I have what I need.")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "answer": "an answer" })),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke(
+        "stores",
+        "flow.answer",
+        &[("question", "what is it?")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(run.outputs()["answer"], "an answer");
+
+    let entries = run.entries("ask");
+    let [entry] = entries.as_slice() else {
+        panic!("`ask` ran once: {entries:?}");
+    };
+    let refused = &entry["models"][0]["toolCalls"][0];
+    assert_eq!(refused["name"], "notes_search", "{entry}");
+    assert_eq!(
+        refused["target"], "store.notes",
+        "the tool exists — its arguments did not fit: {refused}"
+    );
+    assert_eq!(refused["outcome"], "refused", "{refused}");
+    assert!(
+        refused["error"].as_str().is_some_and(|text| text
+            .contains("the arguments `notes_search` was called with")
+            && text.contains("top_k")),
+        "the field and the constraint, the way a compiler diagnostic names them: {refused}"
+    );
+    assert_eq!(
+        entry["models"][1]["toolCalls"][0]["outcome"], "completed",
+        "…and the corrected call ran: {entry}"
+    );
+    let records = entry["stores"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the call that ran left a store record: {entry}"));
+    assert_eq!(
+        records.len(),
+        1,
+        "a refused call reached no backend, so it left no store record: {records:?}"
+    );
+    assert_eq!(records[0]["op"], "search", "{records:?}");
+
+    // The other half. A blob key the local backend cannot address is the store
+    // failing, not the contract refusing: the argument schema admits the empty
+    // string, so the parse passes and the backend is what says no.
+    let backend = MockProvider::start().expect("a loopback port");
+    backend.enqueue(Script::new(
+        SONNET,
+        Outcome::tool_calls(vec![ToolCall::new("artifacts_get", json!({ "key": "" }))]),
+    ));
+    let broken = harness::invoke(
+        "stores",
+        "flow.answer",
+        &[("question", "what is it?")],
+        &backend,
+    )
+    .expect("the toolchain was there a moment ago");
+    let failure = broken.failed();
+    assert!(
+        failure.contains("addresses no blob"),
+        "the backend's own failure is what ended the node: {failure}"
+    );
+    assert_eq!(
+        backend.requests().len(),
+        1,
+        "…and the loop stopped there: an execution failure leaves the tool"
+    );
+    let entries = broken.entries("ask");
+    let [entry] = entries.as_slice() else {
+        panic!("`ask` ran once: {entries:?}");
+    };
+    assert_eq!(entry["outcome"], "failed", "{entry}");
+    let record = &entry["models"][0]["toolCalls"][0];
+    assert_eq!(record["name"], "artifacts_get", "{record}");
+    assert_eq!(record["target"], "store.artifacts", "{record}");
+    assert_eq!(
+        record["outcome"], "failed",
+        "not `refused`: the tool ran and the store could not answer: {record}"
+    );
+}
+
+/// The same split on the **other** wire: a `tool.*`'s declared `input:` refuses,
+/// the refusal travels as a `tool` role message, and a tool that exits nonzero
+/// still ends the node.
+///
+/// Chat Completions has no `is_error` — a `tool` role message carries `role`,
+/// `content` and `tool_call_id` and nothing else (`WIRE-NOTES` (18)) — so the
+/// refusal text *is* the message there, and answering the call at all is the
+/// load-bearing half: an unanswered `tool_call_id` is a request the surface
+/// refuses. Running this on `agent-openai` is what makes Decision D119 a claim
+/// about both wire shapes rather than about the Messages API alone.
+#[test]
+fn a_tool_definitions_input_refuses_on_the_chat_completions_wire_and_an_exit_code_does_not() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        // `query` declares `min_length: 1`.
+        Script::new(
+            LOCAL,
+            Outcome::tool_calls(vec![ToolCall::new("lookup", json!({ "query": "" }))]),
+        ),
+        Script::new(
+            LOCAL,
+            Outcome::tool_calls(vec![ToolCall::new("lookup", json!({ "query": "a fact" }))]),
+        ),
+        Script::new(LOCAL, Outcome::text("I have the fact.")),
+        Script::new(
+            LOCAL,
+            Outcome::structured(json!({ "feedback": "a looked-up snippet" })),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke(
+        "agent-openai",
+        "flow.research",
+        &[("goal", "ship it")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(run.outputs()["feedback"], "a looked-up snippet");
+
+    let recorded = provider.requests();
+    assert_eq!(recorded.len(), 4, "the loop turned after the refusal");
+    for call in &recorded {
+        assert!(call.is_valid(), "{:?}", call.failures());
+        assert_eq!(call.surface, Surface::OpenAi, "{:?}", call.surface);
+    }
+    // `[3]`, not `[2]`: this surface leads with a `system` message, so the user
+    // turn, the assistant's call and the answer to it sit one further along.
+    let answering = recorded[1].body()["messages"][3].clone();
+    assert_eq!(answering["role"], "tool", "{answering}");
+    assert!(
+        answering["tool_call_id"].is_string(),
+        "the refusal answers the call it was made under — an unanswered \
+         `tool_call_id` is a request this surface refuses: {answering}"
+    );
+    assert!(
+        answering["content"].as_str().is_some_and(|text| text
+            .contains("the arguments `tool.lookup` was called with")
+            && text.contains("query")),
+        "the refusal is the whole of the message on this wire: {answering}"
+    );
+    assert!(
+        answering.get("is_error").is_none(),
+        "…and it carries no flag, because this surface has none to carry: {answering}"
+    );
+
+    let entries = run.entries("research");
+    let [entry] = entries.as_slice() else {
+        panic!("`research` ran once: {entries:?}");
+    };
+    let refused = &entry["models"][0]["toolCalls"][0];
+    assert_eq!(refused["name"], "lookup", "{refused}");
+    assert_eq!(refused["target"], "tool.lookup", "{refused}");
+    assert_eq!(refused["outcome"], "refused", "{refused}");
+    assert!(
+        refused["result"].is_null() && refused["instance"].is_null(),
+        "{refused}"
+    );
+    assert_eq!(
+        entry["models"][1]["toolCalls"][0]["outcome"], "completed",
+        "{entry}"
+    );
+
+    // `tool.audit` runs `false`, so the child exits 1 with nothing on stdout.
+    // That is the tool's execution failing, and no argument would have helped.
+    let failing = MockProvider::start().expect("a loopback port");
+    failing.enqueue(Script::new(
+        LOCAL,
+        Outcome::tool_calls(vec![ToolCall::new("audit", json!({ "claim": "a claim" }))]),
+    ));
+    let ended = harness::invoke(
+        "agent-openai",
+        "flow.research",
+        &[("goal", "ship it")],
+        &failing,
+    )
+    .expect("the toolchain was there a moment ago");
+    let failure = ended.failed();
+    assert!(
+        failure.contains("false") || failure.contains("exit"),
+        "the child's exit code is what ended the node: {failure}"
+    );
+    assert_eq!(
+        failing.requests().len(),
+        1,
+        "…and no second request was sent: an execution failure leaves the tool"
+    );
+    let entries = ended.entries("research");
+    let [entry] = entries.as_slice() else {
+        panic!("`research` ran once: {entries:?}");
+    };
+    assert_eq!(entry["outcome"], "failed", "{entry}");
+    assert_eq!(
+        entry["models"][0]["toolCalls"][0]["outcome"], "failed",
+        "not `refused`: the tool ran and the process failed: {entry}"
+    );
+}
+
+/// A model that never corrects spends `max_tool_iterations` and fails the node
+/// **holding the last refusal** (Decision D119, D51).
+///
+/// This is what keeps a bounce statically terminating: a correction is another
+/// model call, so the bound that already governed the loop governs refusals too
+/// and no new counter is needed. It is also why the node error carries the
+/// refusal — the same sentence would otherwise describe a model that called its
+/// tools correctly and simply never answered, and a reader would have the
+/// symptom with none of the cause.
+///
+/// `agent.researcher` declares `max_tool_iterations: 2`, so the budget is spent
+/// after two refusals rather than after eight.
+#[test]
+fn a_tool_loop_that_never_corrects_spends_its_budget_and_fails_holding_the_last_refusal() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(
+        Script::new(
+            SONNET,
+            // `tool.lookup` declares `query: { min_length: 1 }`.
+            Outcome::tool_calls(vec![ToolCall::new("lookup", json!({ "query": "" }))]),
+        )
+        .times(8),
+    );
+
+    let Some(run) = harness::invoke(
+        "agent-anthropic",
+        "flow.research",
+        &[("goal", "ship it")],
+        &provider,
+    ) else {
+        return;
+    };
+    let failure = run.failed();
+    assert!(
+        failure.contains("max_tool_iterations") && failure.contains("bound of 2"),
+        "the bound is what stopped it: {failure}"
+    );
+    assert!(
+        failure.contains("its last tool call was refused")
+            && failure.contains("the arguments `tool.lookup` was called with"),
+        "…and the failure carries what the model kept getting wrong: {failure}"
+    );
+    assert_eq!(
+        provider.requests().len(),
+        2,
+        "two calls, not eight: a bounce costs the loop an iteration"
+    );
+
+    let entries = run.entries("research");
+    let [entry] = entries.as_slice() else {
+        panic!("`research` ran once: {entries:?}");
+    };
+    assert_eq!(entry["outcome"], "failed", "{entry}");
+    let models = entry["models"]
+        .as_array()
+        .unwrap_or_else(|| panic!("both calls are on the entry: {entry}"));
+    assert_eq!(models.len(), 2, "{entry}");
+    for call in models {
+        let asked = call["toolCalls"]
+            .as_array()
+            .unwrap_or_else(|| panic!("each call asked for the tool: {call}"));
+        let [record] = asked.as_slice() else {
+            panic!("one tool call per answer: {call}");
+        };
+        assert_eq!(record["name"], "lookup", "{record}");
+        assert_eq!(record["target"], "tool.lookup", "{record}");
+        assert_eq!(
+            record["outcome"], "refused",
+            "every one of them was refused, and none of them ended the node: {record}"
+        );
+        assert!(record["result"].is_null(), "{record}");
+    }
+}
+
 /// A flow-as-tool call whose **instance** failed fails the agent node, and the
 /// instance's trace is the account of why.
 ///

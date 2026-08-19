@@ -167,6 +167,20 @@ const CODEGEN: &[Criterion] = &[
                 "an_agent_node_bounds_its_tool_loop_at_max_tool_iterations",
                 Status::Live,
             ),
+            // What the loop does with a call the tool's own contract refuses
+            // (Decision D119, PRD §9.22): it goes back to the model as an error
+            // tool result, on both wire shapes, while a tool whose *execution*
+            // failed still ends the node. The second of the two is what stops
+            // the bound from becoming decorative — a model that never corrects
+            // spends it and fails holding the last refusal.
+            (
+                "a_tool_definitions_input_refuses_on_the_chat_completions_wire_and_an_exit_code_does_not",
+                Status::Live,
+            ),
+            (
+                "a_tool_loop_that_never_corrects_spends_its_budget_and_fails_holding_the_last_refusal",
+                Status::Live,
+            ),
             // What an agent node leaves behind for the next one: the implicit
             // `messages` channel of grammar 10.4 (PRD 5.7 tier 3), which is
             // state no composition declares and only the wire makes visible.
@@ -533,6 +547,14 @@ const CODEGEN: &[Criterion] = &[
             // store tools" a composition actually depends on.
             (
                 "an_agent_calling_a_synthesized_store_tool_reaches_the_backend_with_its_arguments",
+                Status::Live,
+            ),
+            // …and what happens when it calls one *wrong*. Decision D119 splits
+            // this surface the way it splits the other two: arguments grammar
+            // 11.4's row does not admit go back to the model, and a backend that
+            // could not answer still ends the node.
+            (
+                "a_store_tool_refuses_arguments_to_the_model_and_still_fails_the_node_on_a_backend_error",
                 Status::Live,
             ),
         ],

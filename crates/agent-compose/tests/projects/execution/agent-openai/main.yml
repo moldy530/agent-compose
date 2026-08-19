@@ -12,6 +12,13 @@
 # be asked to close. It is what makes the `strict-is-refused-by-an-optional-
 # property` row of `codegen::runtime`'s ledger reachable from ordinary grammar
 # rather than a claim about a schema nobody writes.
+#
+# `flow.research` is `agent-anthropic`'s twin one level further in: an agent with
+# `tools:`, so this surface's **tool loop** runs a compiled graph too. It is what
+# makes a refused tool call a claim about both wire shapes rather than about the
+# Messages API alone (grammar 5.4, Decision D119) — a refusal travels back as a
+# `tool` role message here and as an `is_error` `tool_result` block there, and a
+# runtime that got either wrong would be caught by a provider that refuses it.
 version: "0.1"
 
 state:
@@ -43,6 +50,44 @@ model.local:
   settings:
     temperature: 0.2
     max_tokens: 2000
+
+# An `exec` binding over `printf` for the reason `agent-anthropic`'s twin gives:
+# the tool loop has to be runnable in CI with no infrastructure, and a single
+# string-typed output property takes raw stdout (grammar 6.1). `query` declares
+# `min_length: 1`, which is what a model can answer with arguments this tool's
+# own schema refuses — the refusal Decision D119 sends back to it.
+tool.lookup:
+  description: Look up one fact the answer depends on.
+  input:
+    query:
+      description: What to look up.
+      type: string
+      min_length: 1
+  output:
+    snippet:
+      description: The one fact found, as text.
+      type: string
+  exec:
+    command: printf
+    args: ["a looked-up snippet"]
+
+# The other half of Decision D119's split, on the same surface: a tool whose
+# **execution** fails. `false` exits 1 and prints nothing, so no rephrasing of
+# the call could make it succeed — the failure leaves the tool and grammar 9's
+# chain decides the run, exactly as it did before a refusal started bouncing.
+tool.audit:
+  description: Audit a looked-up fact. This one can never answer.
+  input:
+    claim:
+      description: The claim to audit.
+      type: string
+      min_length: 1
+  output:
+    note:
+      description: What the audit said.
+      type: string
+  exec:
+    command: "false"
 
 agent.reviewer:
   description: Reviews a draft against a goal and returns a routable verdict.
@@ -86,6 +131,24 @@ agent.triager:
         severity: { type: string }
         owner: { type: string }
       optional: [owner]
+
+agent.researcher:
+  description: Looks a fact up before answering, which is what opens the tool loop.
+  model: model.local
+  prompt: |
+    You are a researcher.
+
+    Look up whatever the goal depends on before you answer, then report what you
+    found.
+  tools: [tool.lookup, tool.audit]
+  input:
+    goal:
+      description: What the answer must accomplish.
+      type: string
+  output:
+    feedback:
+      description: What was found, as text.
+      type: string
 
 flow.review:
   description: Review one draft and return the verdict.
@@ -134,3 +197,21 @@ flow.triage:
   edges:
     - { from: start, to: triage }
     - { from: triage, to: end }
+
+flow.research:
+  description: Look one fact up and return what the researcher reported.
+  inputs:
+    goal:
+      type: string
+      min_length: 1
+  outputs:
+    feedback:
+      type: string
+  nodes:
+    research:
+      agent: agent.researcher
+      input:
+        goal: "input.goal"
+  edges:
+    - { from: start, to: research }
+    - { from: research, to: end }

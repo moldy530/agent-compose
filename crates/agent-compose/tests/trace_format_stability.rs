@@ -599,6 +599,62 @@ fn a_flow_tool_runs_trace_document_keeps_its_shape() {
     insta::assert_snapshot!(document(&run));
 }
 
+/// The same call site with a **refused** call in front of the one that worked:
+/// the third `ToolCallRecord.outcome` version `4` added (`docs/trace.md` §7.3,
+/// §10.3.3).
+///
+/// Two shapes are pinned here that no other snapshot in this file can hold. The
+/// refused record is one of them — an `outcome: "refused"` carrying the very text
+/// the model was handed, with neither `instance` nor `result` beside it, which is
+/// the absence §7.3 makes a record in its own right. The other is what follows
+/// it: a record after a refusal *exists*, which is the whole of how version `4`'s
+/// third member differs from `"failed"`, and the instance the corrected call ran
+/// is keyed `condense/1` because a refused call spends its ordinal (grammar §9.4,
+/// D119).
+///
+/// A snapshot rather than an assertion because the claim is about the document's
+/// shape: a release that started writing `result: null` on a refusal, or that
+/// stopped writing `error`, would be a reviewable diff here rather than a
+/// discovery made downstream (§10.4).
+#[test]
+fn a_refused_tool_calls_trace_document_keeps_its_shape() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        // `flow.condense` declares `passage: { min_length: 1 }`.
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new("condense", json!({ "passage": "" }))]),
+        ),
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "condense",
+                json!({ "passage": "the first passage" }),
+            )]),
+        ),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "line": "the first line" })),
+        ),
+        Script::new(SONNET, Outcome::text("I have the line.")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "answer": "it says one line" })),
+        ),
+    ]);
+
+    let Some(run) = harness::run(
+        "flow-as-tool",
+        "flow.ask",
+        &[("question", "what does it say?")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    insta::assert_snapshot!(document(&run));
+}
+
 /// A store round trip: a read's recorded answer, a write's key and dedupe flag,
 /// and both of PRD 5.8's consumption surfaces (`docs/trace.md` §6).
 ///
