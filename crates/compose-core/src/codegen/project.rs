@@ -584,7 +584,7 @@ no terminal does.
 
 | value | what a `run` does |
 |---|---|
-| `1` | asks at standard input whatever it is — which is how a **script** answers a pause: `printf '%s\n' '{"decision":"approve"}' \| bun src/index.ts run flow.review --input goal=ship` |
+| `1` | asks at standard input whatever it is — which is how a **script** answers a pause: `printf '%s\n' '{"decision":"approve"}' \| AGENT_COMPOSE_INTERACTIVE=1 bun src/index.ts run flow.review --input goal=ship` |
 | `0` | never asks, even at a terminal — which is how a supervisor keeps a run on the exit-`3` path below |
 | unset | asks when standard input is a terminal |
 
