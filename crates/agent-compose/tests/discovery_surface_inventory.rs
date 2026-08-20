@@ -31,11 +31,21 @@
 //! unclaimed ones, so a new grammar subsection forces a decision about which
 //! topic teaches it rather than quietly falling out of the curriculum.
 //!
-//! **(c) The CLI's own vocabulary.** The `cli` topic names every verb the
-//! binary has, read out of `--help` so it is clap's list rather than a second
-//! one; and every environment variable `compose_core::docs::ENVIRONMENT`
-//! declares, which is itself held to naming every `AGENT_COMPOSE_*` variable
-//! the sources mention. The skill is held to the verb half of the same rule.
+//! **(c) The CLI's own vocabulary, both ways round.** The `cli` topic names
+//! every verb the binary has, read out of `--help` so it is clap's list rather
+//! than a second one; and every environment variable
+//! `compose_core::docs::ENVIRONMENT` declares, which is itself held to naming
+//! every `AGENT_COMPOSE_*` variable the sources mention. The skill is held to
+//! the verb half of the same rule, and to listing the curriculum.
+//!
+//! That direction — *the binary's vocabulary appears in the documents* — is
+//! only half a bind, and the half that catches an addition. The other half
+//! catches an **invention**: every `agent-compose <verb>` and
+//! `agent-compose docs <topic>` written in code voice anywhere in the embedded
+//! documents names something that exists. Without it a document can instruct a
+//! reader to run a verb this compiler does not have, which is worse than an
+//! undocumented verb — the reader spends a turn on a usage error, inside a
+//! binary they cannot correct.
 //!
 //! # What a claim looks like
 //!
@@ -126,6 +136,117 @@ fn verbs() -> BTreeSet<String> {
         "the help parser still finds the verbs, found {found:?}"
     );
     found
+}
+
+/// Every document the binary carries, by the name a failure should call it.
+///
+/// The **embedded** text rather than the files, because that is what ships: a
+/// file the registry does not carry is caught by the registry bind above, and
+/// this one is about what a reader is told. The scaffold is YAML rather than
+/// Markdown and is wrapped in a fence, which is the honest description of it —
+/// the whole document is code voice, comments included.
+fn embedded_documents() -> Vec<(String, String)> {
+    let mut found: Vec<(String, String)> = docs::TOPICS
+        .iter()
+        .map(|topic| {
+            (
+                format!("the `{}` topic", topic.name),
+                topic.body.to_string(),
+            )
+        })
+        .collect();
+    found.push(("the skill".to_string(), docs::SKILL.to_string()));
+    found.push((
+        "the `init` scaffold".to_string(),
+        format!("```yaml\n{}\n```", docs::SCAFFOLD),
+    ));
+    for code in DiagnosticCode::ALL {
+        found.push((
+            format!("`{}`'s explanation", code.as_str()),
+            docs::explanation(*code).to_string(),
+        ));
+    }
+    found
+}
+
+/// Every fragment of `document` written in **code voice**: fenced lines, and
+/// inline spans.
+///
+/// The distinction is the documents' own discipline and the reason a scan over
+/// them is worth anything: a command a reader is meant to type is in a span or
+/// a fence, and prose *about* the product — "an agent-compose project is YAML"
+/// — is not. Scanning the prose too would fail on English sentences.
+///
+/// A fenced block is kept line by line, so an invocation never runs on into the
+/// next command; the prose is flattened first, so an inline span that wrapped
+/// across a line — `` `agent-compose docs\n<topic>` `` — is still one fragment.
+fn code_voice(document: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut prose = String::new();
+    let mut fenced = false;
+    for line in document.lines() {
+        if line.trim_start().starts_with("```") {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced {
+            found.push(line.to_string());
+        } else {
+            prose.push_str(line);
+            prose.push(' ');
+        }
+    }
+    assert!(!fenced, "every fence in the document is closed");
+    assert!(
+        prose.matches('`').count().is_multiple_of(2),
+        "every inline span in the document is closed"
+    );
+    found.extend(
+        prose
+            .split('`')
+            .enumerate()
+            .filter(|(index, _)| index % 2 == 1)
+            .map(|(_, span)| span.to_string()),
+    );
+    found
+}
+
+/// Every `agent-compose …` invocation in `document`, as the words after the
+/// program name.
+fn invocations(document: &str) -> Vec<Vec<String>> {
+    let mut found = Vec::new();
+    for fragment in code_voice(document) {
+        let words: Vec<&str> = fragment.split_whitespace().collect();
+        for (at, word) in words.iter().enumerate() {
+            if *word == "agent-compose" {
+                found.push(
+                    words[at + 1..]
+                        .iter()
+                        .map(|held| held.to_string())
+                        .collect(),
+                );
+            }
+        }
+    }
+    found
+}
+
+/// Whether `word` is a name this compiler could answer to, rather than a
+/// placeholder or a flag.
+///
+/// `<topic>`, `[<dir>]` and `--version` are all things a document writes where
+/// a name would go, and none of them is a claim that a name exists. A claim
+/// looks like a name: a lowercase letter, then lowercase letters and hyphens,
+/// which is the spelling every verb and every topic has.
+///
+/// Flags are therefore outside this bind, and stay outside it: a document
+/// mostly names a flag in prose about it — "add `--format json` to any verb
+/// that reports" — rather than inside an invocation, so binding the invocations
+/// would check the few and miss the many. What is bound here is the two
+/// **registries**: the verbs and the topics.
+fn is_a_name(word: &str) -> bool {
+    word.starts_with(|c: char| c.is_ascii_lowercase())
+        && word.chars().all(|c| c.is_ascii_lowercase() || c == '-')
 }
 
 /// Every numbered heading of the grammar, as it is written after the `#`s.
@@ -342,6 +463,158 @@ fn the_cli_topic_names_every_verb() {
     }
 }
 
+/// (c) …and every verb the documents name is one the binary has.
+///
+/// The other direction of the same bind, and the one that catches an
+/// invention rather than an omission. `agent-compose migrate` shipped in two
+/// explanations under a suite that only checked docs ⊇ clap: every verb was
+/// documented, and one documented command was not a verb.
+#[test]
+fn the_documents_name_only_verbs_the_binary_has() {
+    let verbs = verbs();
+    for (document, text) in embedded_documents() {
+        for words in invocations(&text) {
+            let Some(verb) = words.first() else { continue };
+            if !is_a_name(verb) {
+                continue;
+            }
+            assert!(
+                verbs.contains(verb),
+                "{document} tells a reader to run `agent-compose {verb}`, which is not a verb \
+                 this binary has: {verbs:?}"
+            );
+        }
+    }
+}
+
+/// (c) …and every topic the documents point at is one the curriculum has.
+///
+/// The same hole over the other registry. Every explanation and every topic
+/// closes with an `agent-compose docs <topic>` pointer, and a renamed topic
+/// would leave those pointers exiting `2` in a released binary with the suite
+/// green.
+#[test]
+fn the_documents_name_only_topics_the_curriculum_has() {
+    let topics: BTreeSet<&str> = docs::topics::names().into_iter().collect();
+    let mut checked = 0;
+    for (document, text) in embedded_documents() {
+        for words in invocations(&text) {
+            if words.first().map(String::as_str) != Some("docs") {
+                continue;
+            }
+            let Some(topic) = words.get(1) else { continue };
+            if !is_a_name(topic) {
+                continue;
+            }
+            assert!(
+                topics.contains(topic.as_str()),
+                "{document} points at `agent-compose docs {topic}`, which the curriculum does not \
+                 have: {topics:?}"
+            );
+            checked += 1;
+        }
+    }
+    // Every explanation and most topics close with one, so a scan that found a
+    // handful would mean the reader stopped seeing them.
+    assert!(
+        checked >= 50,
+        "the scan still finds the documents' topic pointers, found {checked}"
+    );
+}
+
+/// (c) …and so does every command the **sources** name.
+///
+/// The documents are not the only place this compiler tells somebody to run
+/// something: a `help:` line does it too, and a diagnostic's help is read far
+/// more often than a topic is. `parse::spec_version` carried
+/// "run `agent-compose migrate` to update a spec written for another version",
+/// which is the same failure one layer earlier — the message a reader gets is
+/// itself a document nobody can correct.
+///
+/// Code voice in a source file is a backtick, in a Rust doc comment and in a
+/// diagnostic's own text alike, and this project writes every command that way.
+/// Prose about the product — "run agent-compose specs" — carries none, so the
+/// scan reads the marked half and leaves the sentences alone.
+#[test]
+fn the_sources_name_only_verbs_and_topics_that_exist() {
+    let verbs = verbs();
+    let topics: BTreeSet<&str> = docs::topics::names().into_iter().collect();
+    let mut found = Vec::new();
+    for crate_name in ["agent-compose", "compose-core"] {
+        quoted_commands(
+            &repository().join("crates").join(crate_name).join("src"),
+            &mut found,
+        );
+    }
+    assert!(
+        found.len() >= 40,
+        "the source scan still finds this project's own commands, found {}",
+        found.len()
+    );
+
+    for (file, words) in &found {
+        let Some(verb) = words.first() else { continue };
+        if !is_a_name(verb) {
+            continue;
+        }
+        assert!(
+            verbs.contains(verb),
+            "{file} names `agent-compose {verb}`, which is not a verb this binary has: {verbs:?}"
+        );
+        if verb != "docs" {
+            continue;
+        }
+        let Some(topic) = words.get(1) else { continue };
+        if !is_a_name(topic) {
+            continue;
+        }
+        assert!(
+            topics.contains(topic.as_str()),
+            "{file} points at `agent-compose docs {topic}`, which the curriculum does not have: \
+             {topics:?}"
+        );
+    }
+}
+
+/// Collect every backticked `agent-compose …` under `directory`, with the file
+/// that wrote it.
+fn quoted_commands(directory: &Path, found: &mut Vec<(String, Vec<String>)>) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.is_dir() {
+            quoted_commands(&path, found);
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let name = path
+            .strip_prefix(repository())
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        // Line by line: a span that wrapped is a span whose first line names no
+        // verb, and reading on into the next line of a source file would read a
+        // sentence rather than the rest of the command.
+        for line in text.lines() {
+            for at in line.match_indices("`agent-compose ").map(|(at, _)| at) {
+                let rest = &line[at + "`agent-compose ".len()..];
+                let command = rest.split('`').next().unwrap_or_default();
+                found.push((
+                    name.clone(),
+                    command
+                        .split_whitespace()
+                        .map(str::to_string)
+                        .collect::<Vec<_>>(),
+                ));
+            }
+        }
+    }
+}
+
 /// (c) The `cli` topic names every environment variable this project reads.
 #[test]
 fn the_cli_topic_names_every_environment_variable() {
@@ -420,9 +693,10 @@ fn walk(directory: &Path, found: &mut BTreeSet<String>) {
 ///
 /// The skill is installed into somebody else's agent and cannot be re-published
 /// from here, so a verb it does not mention is one that agent will not reach
-/// for. It is held to the verbs and to nothing else on purpose: the skill
-/// teaches the loop, and a check over grammar rules would be asking it to
-/// restate what it deliberately does not.
+/// for. It is held to the two **registries** the binary owns — the verbs and
+/// the topics — and to nothing else on purpose: the skill teaches the loop, and
+/// a check over grammar rules would be asking it to restate what it
+/// deliberately does not.
 #[test]
 fn the_skill_names_every_verb() {
     for verb in verbs() {
@@ -435,6 +709,38 @@ fn the_skill_names_every_verb() {
             "the skill's verb table does not name `{verb}`"
         );
     }
+}
+
+/// The skill lists the curriculum, in the curriculum's own order.
+///
+/// The list is written out in the document because the skill is one static
+/// document — but it is a **registry** the binary owns rather than a rule the
+/// grammar owns, so it costs one assertion to hold it exactly. Set equality and
+/// order both: a reader is told these are "in reading order", and the index the
+/// binary prints is what that order means.
+#[test]
+fn the_skill_lists_the_curriculum_in_reading_order() {
+    let section = docs::SKILL
+        .split_once("\n## The topics\n")
+        .expect("the skill has a `The topics` section")
+        .1
+        .split("\n## ")
+        .next()
+        .expect("the section ends");
+    let flattened = section.split_whitespace().collect::<Vec<_>>().join(" ");
+    let listed: Vec<&str> = flattened
+        .split('`')
+        .enumerate()
+        .filter(|(index, _)| index % 2 == 1)
+        .map(|(_, span)| span)
+        // The section names the verb that prints the list as well as the list.
+        .filter(|span| !span.starts_with("agent-compose"))
+        .collect();
+    assert_eq!(
+        listed,
+        docs::topics::names(),
+        "the skill's topic list and the curriculum have drifted apart"
+    );
 }
 
 /// A guard on the two coverage checks: they are only worth something if the two
@@ -479,6 +785,11 @@ fn the_two_sides_of_the_coverage_check_are_both_populated() {
 /// It is what decides when an agent reaches for the skill, and it is read as a
 /// single line of YAML: a newline would end the value early, and a paragraph
 /// would be a description nobody's picker shows.
+///
+/// The sentence **count** is asserted rather than left to the name of this
+/// test. A length bound alone lets the value grow into a paragraph under a test
+/// whose name says it cannot, which is a doc comment and a check disagreeing
+/// about the same constant.
 #[test]
 fn the_skill_description_is_one_short_sentence() {
     let description = docs::skill::DESCRIPTION;
@@ -495,5 +806,19 @@ fn the_skill_description_is_one_short_sentence() {
     assert!(
         description.contains("agent-compose"),
         "it names the product a user would mention"
+    );
+
+    // A terminator with anything after it starts a second sentence. `main.yml`
+    // is not one: the test is a terminator followed by a space, which is what
+    // separates sentences and never what separates a stem from a suffix.
+    let interior: Vec<usize> = description
+        .char_indices()
+        .filter(|(_, held)| matches!(held, '.' | '!' | '?'))
+        .filter(|(at, _)| description[at + 1..].starts_with(' '))
+        .map(|(at, _)| at)
+        .collect();
+    assert!(
+        interior.is_empty(),
+        "it is one sentence, and a terminator at {interior:?} ends another: `{description}`"
     );
 }

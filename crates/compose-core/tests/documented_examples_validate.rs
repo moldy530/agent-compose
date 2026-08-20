@@ -21,11 +21,17 @@
 //! * ```` ```yaml triggers ```` — a complete spec that must **report** the code
 //!   its explanation file is named for. Anything else it reports is fine; a
 //!   minimal example of one failure often carries a second.
+//! * ```` ```yaml deploy <target> ```` — a complete **deploy file**, which is
+//!   the one document kind that is not a spec and cannot be checked on its own:
+//!   it is written to `deploy/<target>.yml` beside the topic's `yaml spec`
+//!   block and the pair is resolved under `--target <target>`. The marker
+//!   carries the name because the target is what the file is *for*, and a
+//!   deploy file checked under the wrong name is not checked at all.
 //! * ```` ```yaml ```` — a fragment. Skipped, and deliberately so: a block
 //!   showing `retry: { max: 2 }` on its own is not a document and has no
 //!   verdict to have.
 //!
-//! The marker is one word after the language because it has to survive a
+//! The marker starts one word after the language because it has to survive a
 //! Markdown renderer: every renderer takes the first token of an info string as
 //! the language, so ```` ```yaml spec ```` still highlights as YAML wherever
 //! these documents are read outside the binary.
@@ -41,16 +47,20 @@
 //! shipped inside a binary rather than a mistake in a file somebody might
 //! reread.
 //!
-//! [`EXPLANATIONS_WITHOUT_A_RUNNABLE_EXAMPLE`] is what keeps that second check
-//! honest. Five codes cannot be demonstrated by one `main.yml`, and each is
-//! listed there with the reason; every other explanation MUST carry a
-//! `yaml triggers` block, so a new code cannot quietly opt out of being checked
-//! without editing this file.
+//! [`EXPLANATIONS_WITHOUT_A_RUNNABLE_EXAMPLE`] and
+//! [`TOPICS_WITHOUT_A_RUNNABLE_EXAMPLE`] are what keep these checks honest. A
+//! document with no marked block is checked by nothing, so "how many were
+//! checked" is the wrong question to ask of a corpus this size — a floor is
+//! satisfied by the documents that still have their examples while the ones
+//! that lost theirs go unnoticed. Both lists are therefore held to **set
+//! equality** against the documents that actually lack an example: every other
+//! document MUST carry one, and opting out is an edit to this file that a
+//! reviewer sees.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use compose_core::{Diagnostic, docs, resolve};
+use compose_core::{Diagnostic, docs};
 
 /// The codes whose explanation carries no runnable example, and why.
 ///
@@ -84,6 +94,31 @@ const EXPLANATIONS_WITHOUT_A_RUNNABLE_EXAMPLE: &[(&str, &str)] = &[
         "target-dependent: it cannot fire under `local`, which is the target when none is named",
     ),
 ];
+
+/// The topics whose document carries no complete spec, and why.
+///
+/// Both are reference rather than curriculum: their code blocks are command
+/// lines and a run's output document, neither of which is a composition. Every
+/// other topic is example-led — that is what the topics are *for* — so a topic
+/// arriving here is a decision about what kind of document it is.
+const TOPICS_WITHOUT_A_RUNNABLE_EXAMPLE: &[(&str, &str)] = &[
+    (
+        "cli",
+        "a reference for the verbs: its blocks are command lines, not compositions",
+    ),
+    (
+        "trace",
+        "orientation on what a run writes; its block is a trace document, not a spec",
+    ),
+];
+
+/// The topics that teach a deploy file, and must keep one that resolves.
+///
+/// A deploy file is the one document kind a reader cannot check on its own —
+/// `agent-compose validate` takes a spec — so it is the one most likely to rot
+/// unwatched, and the list exists so that dropping the marker is an edit here
+/// rather than a silent loss.
+const TOPICS_WITH_A_DEPLOY_EXAMPLE: &[&str] = &["targets"];
 
 /// The repository root.
 fn repository() -> PathBuf {
@@ -131,18 +166,54 @@ fn blocks(document: &str, marker: &str) -> Vec<String> {
     found
 }
 
-/// Resolve and check one complete spec written as `main.yml`.
-fn report(name: &str, source: &str) -> Vec<Diagnostic> {
-    let directory = scratch(name);
-    let entrypoint = directory.join("main.yml");
-    fs::write(&entrypoint, source).expect("can write the spec");
+/// Every fenced block whose info string is `yaml deploy <target>`, paired with
+/// the target it is written for.
+///
+/// A separate reader from [`blocks`] because this marker carries an argument:
+/// the target names the file the block becomes and the name it is resolved
+/// under, and both have to come from the document rather than from a convention
+/// a reader of the document cannot see.
+fn deploy_blocks(document: &str) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    let mut lines = document.lines();
+    while let Some(line) = lines.next() {
+        let Some(target) = line.trim_end().strip_prefix("```yaml deploy ") else {
+            continue;
+        };
+        let target = target.trim();
+        assert!(
+            !target.is_empty() && target.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+            "a `yaml deploy` block names the target it is for, found `{target}`"
+        );
+        let mut body = String::new();
+        for line in lines.by_ref() {
+            if line.trim_end() == "```" {
+                break;
+            }
+            body.push_str(line);
+            body.push('\n');
+        }
+        found.push((target.to_string(), body));
+    }
+    found
+}
 
-    let resolution = resolve(&entrypoint);
+/// Resolve and check the composition in `directory` under `target`.
+fn report_in(directory: &Path, target: &str) -> Vec<Diagnostic> {
+    let entrypoint = directory.join("main.yml");
+    let resolution = compose_core::resolve_with_target(&entrypoint, target);
     let mut diagnostics = resolution.diagnostics;
     if let Some(ir) = &resolution.ir {
         diagnostics.extend(compose_core::check(ir));
     }
     diagnostics
+}
+
+/// Resolve and check one complete spec written as `main.yml`.
+fn report(name: &str, source: &str) -> Vec<Diagnostic> {
+    let directory = scratch(name);
+    fs::write(directory.join("main.yml"), source).expect("can write the spec");
+    report_in(&directory, compose_core::DEFAULT_TARGET)
 }
 
 /// Resolve and check one complete spec, and require it to say nothing.
@@ -256,9 +327,95 @@ fn every_topic_example_validates_clean() {
             checked += 1;
         }
     }
+    // A floor derived from the exemptions rather than a number somebody chose:
+    // every topic that is not exempt carries at least one, which the set
+    // equality below is what actually establishes.
+    let floor = topics().len() - TOPICS_WITHOUT_A_RUNNABLE_EXAMPLE.len();
     assert!(
-        checked >= 10,
-        "the marker convention still finds the curriculum's examples, found {checked}"
+        checked >= floor,
+        "the marker convention still finds the curriculum's examples, found {checked} of at least \
+         {floor}"
+    );
+}
+
+/// A topic carries a runnable example unless it is one of the two that cannot.
+///
+/// The curriculum's shape *is* the example: a topic opens with a complete spec
+/// and teaches the rules that spec demonstrates. A topic whose example quietly
+/// became a fragment — a bare ```` ```yaml ```` fence — still reads as a topic
+/// and is checked by nothing, which is why this is a set equality rather than a
+/// count.
+#[test]
+fn only_the_named_topics_lack_a_runnable_example() {
+    let mut without: Vec<String> = topics()
+        .into_iter()
+        .filter(|(_, document)| blocks(document, "spec").is_empty())
+        .map(|(topic, _)| topic)
+        .collect();
+    without.sort();
+    let mut expected: Vec<String> = TOPICS_WITHOUT_A_RUNNABLE_EXAMPLE
+        .iter()
+        .map(|(topic, _)| (*topic).to_string())
+        .collect();
+    expected.sort();
+    assert_eq!(
+        without, expected,
+        "a topic gained or lost a runnable example; if a topic is genuinely reference rather than \
+         curriculum, add it to TOPICS_WITHOUT_A_RUNNABLE_EXAMPLE with the reason"
+    );
+}
+
+/// Every deploy example resolves against the composition it sits beside.
+///
+/// A deploy file is the half of a project `validate` cannot be pointed at, and
+/// `targets` is where a reader learns `storage_backends`, `placements` and
+/// `event_sources` at all. So the block is written to `deploy/<target>.yml`
+/// beside the topic's own spec and the pair is resolved under that target —
+/// which also checks the thing a deploy file alone could not: that the
+/// addresses `placements:` names resolve in the composition.
+#[test]
+fn every_deploy_example_resolves_against_its_topic() {
+    let mut carrying = Vec::new();
+    for (topic, document) in topics() {
+        let deploys = deploy_blocks(&document);
+        if deploys.is_empty() {
+            continue;
+        }
+        carrying.push(topic.clone());
+
+        let specs = blocks(&document, "spec");
+        assert_eq!(
+            specs.len(),
+            1,
+            "`{topic}` has exactly one composition for its deploy files to be targets of"
+        );
+        for (target, body) in deploys {
+            let directory = scratch(&format!("deploy-{topic}-{target}"));
+            fs::write(directory.join("main.yml"), &specs[0]).expect("can write the spec");
+            fs::create_dir_all(directory.join("deploy")).expect("can create `deploy/`");
+            fs::write(
+                directory.join("deploy").join(format!("{target}.yml")),
+                &body,
+            )
+            .expect("can write the deploy file");
+
+            let diagnostics = report_in(&directory, &target);
+            assert!(
+                diagnostics.is_empty(),
+                "`{topic}`'s `deploy/{target}.yml` does not validate against its own spec:\n{}",
+                render(&diagnostics)
+            );
+        }
+    }
+    carrying.sort();
+    let expected: Vec<String> = TOPICS_WITH_A_DEPLOY_EXAMPLE
+        .iter()
+        .map(|topic| (*topic).to_string())
+        .collect();
+    assert_eq!(
+        carrying, expected,
+        "a topic gained or lost its deploy example; `yaml deploy <target>` is the marker, and \
+         TOPICS_WITH_A_DEPLOY_EXAMPLE is the list"
     );
 }
 
@@ -331,5 +488,22 @@ fn every_exempt_explanation_names_a_real_code() {
     for (code, reason) in EXPLANATIONS_WITHOUT_A_RUNNABLE_EXAMPLE {
         assert!(known.contains(code), "`{code}` is not a diagnostic code");
         assert!(!reason.is_empty(), "`{code}`'s exemption states a reason");
+    }
+}
+
+/// The two topic lists name topics that exist.
+///
+/// Same residual as the codes': a stale entry would excuse nothing while
+/// looking like it excused something, and a renamed topic is exactly how one
+/// goes stale.
+#[test]
+fn every_listed_topic_is_a_registered_topic() {
+    let known = docs::topics::names();
+    for (topic, reason) in TOPICS_WITHOUT_A_RUNNABLE_EXAMPLE {
+        assert!(known.contains(topic), "`{topic}` is not a topic");
+        assert!(!reason.is_empty(), "`{topic}`'s exemption states a reason");
+    }
+    for topic in TOPICS_WITH_A_DEPLOY_EXAMPLE {
+        assert!(known.contains(topic), "`{topic}` is not a topic");
     }
 }
