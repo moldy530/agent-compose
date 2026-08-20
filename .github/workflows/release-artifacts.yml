@@ -16,7 +16,7 @@ name: Release artifacts
 #     downloaded is named for what they wanted;
 #   * a Linux binary is **statically linked** (PRD 5.12's single-binary posture:
 #     it must survive an alpine container and an old glibc alike), and a macOS
-#     one links nothing outside `/usr/lib`;
+#     one links nothing the system does not ship;
 #   * `--version` names the crate version the archive is named for and the
 #     target it was built for;
 #   * `init` then `validate` — the first two steps of the discovery loop
@@ -66,10 +66,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # `cargo metadata` rather than a hand-parse of `Cargo.toml`: the version
-      # lives in `[workspace.package]` and the package inherits it, so the
-      # manifest that names the binary does not carry the number. Reading it
-      # here also installs the pinned toolchain once before four jobs need it,
-      # which turns "the pin does not resolve" into a ten-second failure.
+      # lives in `[workspace.package]` and the package that names the binary
+      # inherits it, so the manifest a parse would reach for does not carry the
+      # number. It costs the pinned toolchain's install to read one string, and
+      # buys an answer that stays right when the manifests are rearranged.
       - name: Read the crate version, and hold the tag to it
         id: crate
         env:
