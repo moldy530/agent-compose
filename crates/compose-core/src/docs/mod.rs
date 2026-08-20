@@ -20,6 +20,8 @@
 //! * [`skill`] — the installable skill, which teaches the loop rather than the
 //!   grammar.
 
+pub mod scaffold;
 pub mod schema;
 
+pub use scaffold::{SCAFFOLD, SCAFFOLD_NAME};
 pub use schema::SCHEMA;

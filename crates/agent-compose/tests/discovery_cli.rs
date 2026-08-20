@@ -95,3 +95,76 @@ fn a_redirected_schema_is_a_usable_file() {
         "the redirect carries the dialect an editor reads"
     );
 }
+
+/// The loop's first two steps, back to back, through the real binary: `init`
+/// then `validate`.
+///
+/// This is the one property the scaffold has, and it is worth running through
+/// the command rather than over the constant — an agent's very first
+/// `validate` must not be a report about this compiler's own file.
+#[test]
+fn a_scaffolded_project_validates_clean() {
+    let directory = scratch("init-then-validate");
+    let initialized = run(&directory, &["init"]);
+    assert_eq!(code(&initialized), 0, "stderr: {}", stderr(&initialized));
+    assert_eq!(stdout(&initialized), "", "the file is the answer");
+    assert!(
+        stderr(&initialized).contains("agent-compose validate"),
+        "the next step is named: {}",
+        stderr(&initialized)
+    );
+
+    let validated = run(&directory, &["validate", "main.yml"]);
+    assert_eq!(
+        code(&validated),
+        0,
+        "the scaffold validates: {}",
+        stderr(&validated)
+    );
+    assert_eq!(stderr(&validated), "`main.yml` is valid (target `local`)\n");
+}
+
+/// A named directory that does not exist is created; an argument is not a
+/// second way to spell the current directory.
+#[test]
+fn init_creates_the_directory_it_is_named() {
+    let directory = scratch("init-names-a-child");
+    let output = run(&directory, &["init", "summarizer"]);
+    assert_eq!(code(&output), 0, "stderr: {}", stderr(&output));
+    let scaffold = directory.join("summarizer/main.yml");
+    assert!(scaffold.is_file(), "the scaffold landed under the name");
+    assert_eq!(
+        std::fs::read_to_string(&scaffold).expect("readable"),
+        compose_core::docs::SCAFFOLD
+    );
+}
+
+/// A directory holding anything at all is refused, with the exit code that
+/// means *the answer is no* rather than the one that means *the command could
+/// not run*, and with the remedy in the message (PRD G3).
+#[test]
+fn init_refuses_a_directory_that_holds_anything() {
+    let directory = scratch("init-refuses-occupied");
+    std::fs::write(directory.join("notes.md"), "mine\n").expect("can write");
+    let output = run(&directory, &["init"]);
+    assert_eq!(code(&output), 1);
+    assert_eq!(stdout(&output), "");
+    let reported = stderr(&output);
+    assert!(
+        reported.contains("`notes.md`"),
+        "names what it found: {reported}"
+    );
+    assert!(
+        reported.contains("agent-compose init <name>"),
+        "names the remedy: {reported}"
+    );
+    assert!(
+        !directory.join("main.yml").exists(),
+        "a refusal writes nothing"
+    );
+    assert_eq!(
+        std::fs::read_to_string(directory.join("notes.md")).expect("readable"),
+        "mine\n",
+        "and touches nothing"
+    );
+}

@@ -72,6 +72,7 @@
 //! The remaining verbs take no spec at all (PRD §7 M2, resolved q23):
 //!
 //! ```text
+//! agent-compose init [<dir>]
 //! agent-compose schema
 //! ```
 //!
@@ -84,6 +85,8 @@
 //! what keeps a surface measured in hundreds of kilobytes off the millisecond
 //! budget.
 //!
+//! `init` writes a project that validates, which is the loop's first step and
+//! the only one that needs a file rather than a document (see [`discover`]).
 //! `schema` writes the published JSON Schema — the document an editor's
 //! `$schema` points at (grammar Appendix B) — byte for byte.
 //!
@@ -92,7 +95,7 @@
 //! | code | meaning |
 //! |---|---|
 //! | `0` | clean: nothing was reported, or a `plan` was produced |
-//! | `1` | diagnostics were reported, `build --check` found drift, a `run` produced no answer, or a `plan`'s spec did not resolve |
+//! | `1` | diagnostics were reported, `build --check` found drift, a `run` produced no answer, a `plan`'s spec did not resolve, or a discovery verb found something already there and would not replace it |
 //! | `2` | the command could not run: bad usage, an unreadable entrypoint, an output directory that could not be written, a missing environment variable or one carrying a value the command does not take (`AGENT_COMPOSE_INTERACTIVE`, grammar 8.7), an uninstalled dependency set, or no JavaScript runtime to launch |
 //! | `3` | a `run` with nobody to ask stopped at a `human` pause (grammar 8.7, PRD 5.11) |
 //!
@@ -160,6 +163,7 @@
 //! resolves the built-in `local` target, which requires no deploy file at all.
 
 mod build;
+mod discover;
 mod launch;
 mod plan;
 mod report;
@@ -248,6 +252,12 @@ enum Command {
         /// How to report what was found, and how the run answers
         #[arg(long, value_enum, default_value_t = Format::Human)]
         format: Format,
+    },
+    /// Write a minimal project that validates: one agent, one flow, one trigger
+    Init {
+        /// Where to write it; must be empty or absent [default: the current directory]
+        #[arg(value_name = "DIR", default_value = ".")]
+        directory: PathBuf,
     },
     /// Print the published JSON Schema, for an editor's `$schema` or a linter
     Schema,
@@ -341,6 +351,7 @@ fn main() -> ExitCode {
             );
             launch(&path, "run", &target, &out, format, &arguments)
         }
+        Command::Init { directory } => init(&directory),
         Command::Schema => emit_text(compose_core::docs::SCHEMA),
         Command::Serve {
             path,
@@ -799,6 +810,35 @@ fn build_project(
         Ok(()) => ExitCode::from(verdict),
         Err(error) if departed(&error) => ExitCode::from(verdict),
         Err(error) => fail(&format!("cannot write the report: {error}")),
+    }
+}
+
+/// `agent-compose init [<dir>]`: write the scaffold, then say what to run.
+///
+/// The two lines after the write are the verb's actual product. A scaffold on
+/// disk with nothing said about it leaves a reader where they started — the
+/// point is the *loop*, and naming the command that starts it is what turns a
+/// file into a first step. They go to **stderr**: `init`'s answer is the file,
+/// and stdout stays free for the one thing a caller might redirect.
+fn init(directory: &Path) -> ExitCode {
+    match discover::init(directory) {
+        Ok(path) => {
+            let _ = write(
+                &mut io::stderr().lock(),
+                &format!(
+                    "wrote `{}`\n\nnext: `agent-compose validate {}`, then `agent-compose docs` \
+                     for the topics\n",
+                    path.display(),
+                    path.display()
+                ),
+            );
+            ExitCode::from(CLEAN)
+        }
+        Err(discover::Refusal::Occupied(reason)) => {
+            let _ = write(&mut io::stderr().lock(), &format!("error: {reason}\n"));
+            ExitCode::from(REPORTED)
+        }
+        Err(discover::Refusal::Unusable(reason)) => fail(&reason),
     }
 }
 
