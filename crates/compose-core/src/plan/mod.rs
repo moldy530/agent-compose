@@ -82,9 +82,11 @@ pub use document::{
 /// any other rather than something only `validate` can see.
 #[derive(Clone, Copy, Debug)]
 pub struct Composition<'a> {
-    /// The entrypoint as the command named it, which is what the plan reports
-    /// this side by. The IR's own `entrypoint` is relative to the project root
-    /// and is therefore `main.yml` on both sides of most comparisons.
+    /// The entrypoint the command resolved — the file it was given, or the
+    /// `main.yml` inside the directory it was given — which is what the plan
+    /// reports this side by. The IR's own `entrypoint` is relative to the
+    /// project root and is therefore `main.yml` on both sides of most
+    /// comparisons.
     pub entrypoint: &'a str,
     /// The resolved artifact.
     pub ir: &'a Ir,

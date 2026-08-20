@@ -2,8 +2,8 @@
 #
 # `triage` loses the first of its four outgoing edges, `fix` has two of its
 # guarded edges swapped, and `ask` gains one ahead of the two it has. Each is the
-# same shape of edit — an edge list rewritten — and grammar 7.3 reads only the
-# middle one as a change of precedence.
+# same shape of edit — an edge list rewritten — and only the middle one moves an
+# edge within its own source node's outgoing order (`docs/plan.md` §5).
 #
 # Every one of the three is written between edges that run to the **same node**,
 # so no edge here is identified by its endpoints alone: what tells them apart is

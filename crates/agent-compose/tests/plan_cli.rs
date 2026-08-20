@@ -488,7 +488,10 @@ topology
 ///   survived shares its address. The `-` names the edge that *left*, at the
 ///   line it was written on, and the survivor is not reported at all;
 /// * `fix` had its two guarded edges swapped, which is the one edit here that
-///   changes which edge fires — two `order` records, one per edge that moved;
+///   moves an edge within its own source node's outgoing order — two `order`
+///   records, one per edge that moved. Grammar 7.3 rule 6 is multicast, so this
+///   does not change which of the two fires; what it changes is the order the
+///   node's routing decision is recorded in (`docs/plan.md` §5);
 /// * `ask` gained an edge ahead of the two it had, to the node they both already
 ///   run to. One `+`, and nothing about the two it pushed down: positions are
 ///   counted over the edges both sides declare, which is §3's rule for a named

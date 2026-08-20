@@ -529,27 +529,39 @@ fn edges(found: &mut Vec<TopologyChange>, flow: &str, before: &Flow, after: &Flo
 /// Each edge's position among the outgoing edges of its own source node: the one
 /// thing the artifact records as a position rather than as a key.
 ///
-/// Grammar 7.3 evaluates **a node's outgoing edges in declaration order**, and
-/// takes the first whose guard passes — so swapping two guarded edges from one
-/// node changes which one fires, on a composition where every edge is otherwise
-/// untouched. The IR carries that as the position of the edge in `edges:`, which
-/// a diff matching edges by identity would never see.
+/// Grammar 7.3 rule 1 evaluates **a node's outgoing edges in declaration
+/// order**. The IR carries that as the position of the edge in `edges:`, which a
+/// diff matching edges by identity would never see.
+///
+/// **It is not which edge fires.** Rule 6 fires *all* taken edges — routing is
+/// multicast with an `else:`, not first-match-wins (Decision D17) — and rule 4
+/// decides an `else:` edge against whether any guarded sibling was taken rather
+/// than against one of them in particular, which is why `runtime.ts` settles the
+/// `else:` edges in a second pass over the whole list. Reordering a node's
+/// out-edges changes neither which of them are taken nor what they write
+/// (Decision D72 orders concurrent writers by node id). What it does change is
+/// the order the decision is **recorded** in — a trace entry's `edges` and
+/// `targets` are in declaration order (`docs/trace.md` §4, §4.1) — and which of
+/// two unevaluable guards throws first. `docs/plan.md` §5 is the normative
+/// statement of both.
 ///
 /// [`ORDER`](super::diff::ORDER) is the plan's own key for it — the same one a
 /// named array's entries carry when their order is the composition's (`diff`) —
 /// and two rules narrow what it counts, each keeping out of the report a
-/// position no composition reads differently:
+/// position nothing reads differently:
 ///
 /// * **per source node** rather than over the whole list, because that is what
-///   grammar 7.3 is stated over: an edge inserted between two edges of a
-///   *different* node changes nobody's precedence, and reporting it as though it
-///   had would make every insertion look like a routing change;
+///   grammar 7.3 is stated over and what one routing decision covers: an edge
+///   inserted between two edges of a *different* node leaves both nodes'
+///   decisions reading as they did, and reporting it would make every insertion
+///   look like a routing change. The whole list's own positions key the
+///   `max_iterations` counters codegen emits, which `docs/plan.md` §11 accounts
+///   for;
 /// * **over the edges both specs declare** — `paired` is what says which, one
 ///   flag per edge of this side — for `diff::places`'s reason, and it is the
 ///   same rule: an edge inserted ahead of others is one addition rather than a
-///   move of everything below it. A genuine precedence swap still reports,
-///   because a swap moves an edge past another edge that is *also* on both
-///   sides.
+///   move of everything below it. A genuine swap still reports, because a swap
+///   moves an edge past another edge that is *also* on both sides.
 fn ordered(edges: &[Value], paired: &[bool]) -> Vec<u64> {
     let mut counted: BTreeMap<&str, u64> = BTreeMap::new();
     let mut found = vec![0; edges.len()];

@@ -94,8 +94,9 @@ impl Plan {
 /// One side of a plan, identified the way the command was given it.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Spec {
-    /// The entrypoint, as the command named it. Every span in this side of the
-    /// plan is relative to **this file's own directory**, which is that
+    /// The entrypoint the command resolved: the file it was given, or the
+    /// `main.yml` inside the directory it was given. Every span in this side of
+    /// the plan is relative to **this file's own directory**, which is that
     /// composition's project root (grammar 1.4).
     pub entrypoint: String,
     /// The deploy target the composition was resolved for.
@@ -114,18 +115,6 @@ pub enum ChangeKind {
     Removed,
     /// Both declare it, and something about it differs.
     Changed,
-}
-
-impl ChangeKind {
-    /// The lowercase name of this kind.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Added => "added",
-            Self::Removed => "removed",
-            Self::Changed => "changed",
-        }
-    }
 }
 
 /// Which kind of component a [`ComponentChange`] is about.
@@ -152,24 +141,6 @@ pub enum ComponentKind {
     EventSource,
 }
 
-impl ComponentKind {
-    /// The lowercase name of this kind.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Agent => "agent",
-            Self::Tool => "tool",
-            Self::Flow => "flow",
-            Self::Store => "store",
-            Self::Provider => "provider",
-            Self::Model => "model",
-            Self::Trigger => "trigger",
-            Self::Placement => "placement",
-            Self::EventSource => "event_source",
-        }
-    }
-}
-
 /// Which kind of site a [`TopologyChange`] is about.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -184,19 +155,6 @@ pub enum TopologyKind {
     Defaults,
 }
 
-impl TopologyKind {
-    /// The lowercase name of this kind.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Node => "node",
-            Self::Edge => "edge",
-            Self::Channel => "channel",
-            Self::Defaults => "defaults",
-        }
-    }
-}
-
 /// Which surface an [`InterfaceChange`] is about.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -205,17 +163,6 @@ pub enum InterfaceKind {
     Flow,
     /// A trigger's delivery surface.
     Trigger,
-}
-
-impl InterfaceKind {
-    /// The lowercase name of this kind.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Flow => "flow",
-            Self::Trigger => "trigger",
-        }
-    }
 }
 
 /// Which of the two specs something belongs to.
@@ -229,7 +176,12 @@ pub enum SpecSide {
 }
 
 impl SpecSide {
-    /// The lowercase name of this side.
+    /// The lowercase name of this side — the one vocabulary of this format the
+    /// human report has to spell out, because a refusal names which spec failed
+    /// (`crates/agent-compose/src/main.rs`). The other four are never printed:
+    /// the mark and the address carry them, so none of them has one of these,
+    /// and a second spelling of a member is a second thing to keep in step with
+    /// `serde`.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -372,7 +324,7 @@ impl Refusal {
 pub struct Refused {
     /// Which side of the comparison it is.
     pub spec: SpecSide,
-    /// The entrypoint, as the command named it.
+    /// The entrypoint the command resolved, spelled the way [`Spec`]'s is.
     pub entrypoint: String,
     /// Everything the parser and the resolver reported, in source order and in
     /// the shape `agent-compose validate --format json` writes.

@@ -34,9 +34,14 @@
 //!
 //! [`compared`] restates §11 independently of `crates/compose-core/src/plan/`.
 //! It is the same rules — take the source regions out, sort the sets, sort the
-//! arrays the generated code looks up by name, drop the keys no section owns —
-//! written from the document rather than shared with the code under test, which
-//! is what keeps the property from agreeing with a bug by construction.
+//! arrays the generated code looks up by name, drop the keys no section owns,
+//! drop a section declared with no entries — written from the document rather
+//! than shared with the code under test, which is what keeps the property from
+//! agreeing with a bug by construction. Which is also how it can be wrong: a
+//! clause the document states and this file omits makes the property fail on
+//! documented behavior and name the compiler for it, and no golden anywhere
+//! would notice. [`CASES`] is where a clause is held to an actual edit rather
+//! than assumed.
 //!
 //! # Where the validation section is
 //!
@@ -116,6 +121,28 @@ const BY_NAME: &[(&str, &[&str])] = &[
     ("routes", &["tag"]),
 ];
 
+/// Where each section of the artifact sits, for [`compared`]'s last clause
+/// (`docs/plan.md` §11, final bullet).
+///
+/// A section written with no entries reaches the artifact as a `Section` whose
+/// `entries` map is empty; an absent one is no key at all (`crate::ir::Section`).
+/// §11 excuses the difference — a plan reports the channels, the triggers and
+/// the placements themselves rather than the sections that hold them — so this
+/// restatement has to excuse it too, or the property would blame the compiler
+/// for behaving exactly as documented.
+///
+/// Stated over the **place** rather than over the key, for the reason §3 gives
+/// about arrays: `settings: { state: {} }` is an author's own empty object under
+/// a key spelled like a section's, and canonicalizing that away would make a
+/// real edit read as no change. `storage_backends:` is a section too and is not
+/// here: [`UNOWNED_DEPLOY`] has already removed it.
+const SECTIONS: &[&[&str]] = &[
+    &["state"],
+    &["triggers"],
+    &["deploy", "placements"],
+    &["deploy", "event_sources"],
+];
+
 /// The artifact with everything `docs/plan.md` §11 excuses taken out of it.
 ///
 /// Two artifacts whose `compared` forms agree differ in nothing a plan reports;
@@ -133,7 +160,36 @@ fn compared(ir: &Ir) -> Value {
             }
         }
     }
-    canonical("", value)
+    let mut value = canonical("", value);
+    for place in SECTIONS {
+        emptied(&mut value, place);
+    }
+    value
+}
+
+/// Drop the key at `place` when what it holds is an object with nothing left in
+/// it — which, a section's span having been taken out already, is a section
+/// declared with no entries. See [`SECTIONS`].
+fn emptied(value: &mut Value, place: &[&str]) {
+    let Some((key, above)) = place.split_last() else {
+        return;
+    };
+    let mut at = value;
+    for step in above {
+        let Some(next) = at.get_mut(*step) else {
+            return;
+        };
+        at = next;
+    }
+    let Value::Object(map) = at else {
+        return;
+    };
+    if map
+        .get(*key)
+        .is_some_and(|held| held.as_object().is_some_and(Map::is_empty))
+    {
+        map.remove(*key);
+    }
 }
 
 /// The same value with its source regions removed and its excused orders made
@@ -209,11 +265,12 @@ fn named(item: &Value, names: &[&str]) -> String {
 /// A flow's edges with the **groups** put in one order and the order *within*
 /// each group left alone.
 ///
-/// Grammar 7.3 evaluates a node's outgoing edges in declaration order, so a swap
-/// between two edges of one node decides which fires and is reported
+/// Grammar 7.3 rule 1 evaluates a node's outgoing edges in declaration order,
+/// and that order is what a trace's routing decision for the node is written in
+/// (`docs/trace.md` §4). A swap between two edges of one node is reported
 /// (`docs/plan.md` §5) — this must not hide it. An edge moved past an edge of a
-/// *different* node changes nobody's precedence and is not reported, which is
-/// what putting the groups in `from` order excuses.
+/// *different* node leaves both nodes' decisions reading as they did and is not
+/// reported, which is what putting the groups in `from` order excuses.
 fn grouped(items: Vec<Value>) -> Vec<Value> {
     let mut groups: BTreeMap<String, Vec<Value>> = BTreeMap::new();
     for item in items {
@@ -548,15 +605,18 @@ const INPUTS_SWAPPED: &str = r#"    pattern:
       type: string
       min_length: 1"#;
 
-/// Two outgoing edges of one node, and the same two swapped. Grammar 7.3 takes
-/// the first whose guard passes, so this decides which fires.
+/// Two outgoing edges of one node, and the same two swapped. Grammar 7.3 rule 1
+/// evaluates them in this order and a trace records the node's decision in it
+/// (`docs/plan.md` §5), so the swap is reported — it does not decide which of
+/// the two fires, which is rule 6's multicast.
 const SIBLINGS: &str = r#"    - { from: approve, to: end, when: "approve.output.decision == 'approve'" }
     - { from: approve, to: escalate, when: "approve.output.decision == 'reject'" }"#;
 const SIBLINGS_SWAPPED: &str = r#"    - { from: approve, to: escalate, when: "approve.output.decision == 'reject'" }
     - { from: approve, to: end, when: "approve.output.decision == 'approve'" }"#;
 
 /// Two edges of **different** nodes, and the same two swapped. Neither node's
-/// precedence moves.
+/// own outgoing order moves, so neither node's routing decision reads
+/// differently.
 const STRANGERS: &str = r#"    - { from: dispatch, to: verify }
     - { from: announce, to: verify }"#;
 const STRANGERS_SWAPPED: &str = r#"    - { from: announce, to: verify }
@@ -661,7 +721,7 @@ const CASES: &[Case] = &[
         after: &[("flows/triage.yml", INPUTS, INPUTS_SWAPPED)],
         differs: true,
     },
-    // --- Edges, whose precedence is per source node. --------------------------
+    // --- Edges, whose reported order is per source node. ----------------------
     Case {
         what: "two edges of one node swapped",
         before: &[],
@@ -730,6 +790,17 @@ const CASES: &[Case] = &[
             "flows/triage.yml",
             "  edges:",
             "  # Every edge, in the order grammar 7.3 evaluates them.\n\n  edges:",
+        )],
+        differs: false,
+    },
+    // --- A section written with nothing in it, which §11's last bullet excuses.
+    Case {
+        what: "a section declared with no entries where the other side declares none",
+        before: &[],
+        after: &[(
+            "deploy/local.yml",
+            "  flow.triage:\n    runtime: colocated",
+            "  flow.triage:\n    runtime: colocated\n\nevent_sources: {}",
         )],
         differs: false,
     },

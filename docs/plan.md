@@ -109,14 +109,16 @@ one.
 
 | field | meaning |
 |---|---|
-| `entrypoint` | the entrypoint as the command named it, which is also the path §10's locations are read against |
+| `entrypoint` | the entrypoint the command resolved — the file it was given, or the `main.yml` inside the directory it was given — which is also the path §10's locations are read against |
 | `target` | the deploy target the composition was resolved for; `local` in this version (§1) |
 | `spec_version` | the DSL version that composition declares (`version:` in its entrypoint) |
 
-`entrypoint` is the command's own argument rather than the artifact's, and
-deliberately: the IR records its entrypoint relative to the project root, which
-makes it `main.yml` on both sides of nearly every comparison. What a reader needs
-is the path that tells the two apart.
+`entrypoint` is read off the command's own argument rather than off the
+artifact, and deliberately: the IR records its entrypoint relative to the project
+root, which makes it `main.yml` on both sides of nearly every comparison. What a
+reader needs is the path that tells the two apart. Each side may be named by
+either spelling and the plan is the same, so a side handed `renamed-model/before`
+is written `renamed-model/before/main.yml` here — the file, never the directory.
 
 ### 2.3 A spec that does not resolve
 
@@ -133,7 +135,7 @@ Each entry is a `Refused`:
 | field | meaning |
 |---|---|
 | `spec` | which side it is: `"before"` or `"after"` |
-| `entrypoint` | that spec's entrypoint, as the command named it |
+| `entrypoint` | that spec's entrypoint, resolved the way §2.2's is |
 | `diagnostics` | everything the parser and the resolver reported, in source order, in exactly the shape `agent-compose validate --format json` writes — the same `Diagnostic` records, with their codes, labels and help |
 
 Both entries are present when both specs failed. A person comparing two branches
@@ -322,13 +324,34 @@ added/removed lines would hide. What is left really arrived or really left.
 
 One key an edge record can report is not a key of the artifact: `order`, the
 edge's position among the outgoing edges of its own source node. Grammar 7.3
-evaluates a node's outgoing edges in declaration order and takes the first whose
-guard passes, so swapping two of them changes which one fires on a composition
-where every edge is otherwise untouched; the IR carries that as list position,
-and this is the plan's name for it. Two rules say what it counts:
+rule 1 evaluates a node's outgoing edges **in declaration order**; the IR carries
+that as list position, and this is the plan's name for it.
 
-* **per source node**, because that is what grammar 7.3 is stated over — an edge
-  inserted between two edges of a *different* node changes nobody's precedence;
+**It is not which edge fires, and must not be read that way.** Grammar 7.3 rule 6
+fires **all** taken edges — routing is multicast with an `else:`, not
+first-match-wins (grammar Decision D17) — and rule 4 decides an `else:` edge
+against whether *any* guarded sibling was taken rather than against one of them
+in particular. So no reordering of a node's out-edges changes which of them are
+taken, and none changes what a run writes either: concurrent writers are ordered
+by node id (Decision D72). What a node's declaration order does decide is two
+things, and each is worth the line a plan spends on it:
+
+* **the order the decision is recorded in.** A trace entry's `edges` array holds
+  "what every outgoing edge answered, in **declaration order**", and its
+  `targets` are the taken ones "in the declaration order of the edges that
+  reached them" (`docs/trace.md` §4, §4.1). That is a machine surface with a
+  version of its own, and a swap rewrites it;
+* **which of two unevaluable guards fails the run.** The guards are evaluated in
+  that order and evaluation stops at the first one that throws, so a swap can
+  change the expression the run dies naming.
+
+Two rules say what `order` counts:
+
+* **per source node**, because that is what grammar 7.3 is stated over, and what
+  a trace's routing decision is one of — an edge moved past an edge of a
+  *different* node leaves both nodes' decisions reading exactly as they did. The
+  position of an edge in the flow's `edges:` list *as a whole* is a different
+  number, and §11 is where the one thing it decides is accounted for;
 * **over the edges both specs declare**, which is §3's rule for a named sequence
   applied here — an edge inserted ahead of others is one addition rather than a
   move of everything below it, and a genuine swap still reports, because a swap
@@ -514,7 +537,19 @@ a reason:
   shape of its elements — §3's table is the closed list — so an author's own
   array of objects in a `default:` or a `settings:` is not one of these, whatever
   its elements are called. Reversing one is a different literal value, and it
-  reports;
+  reports.
+
+  A flow's `edges:` is the one array this bullet and §5 split between them. §5
+  reports an edge's position among the outgoing edges of **its own source node**,
+  which is the order grammar 7.3 rule 1 is stated over. Its position in the
+  flow's `edges:` list *as a whole* is not reported, and one generated identifier
+  reads off it: a budgeted edge's `max_iterations` counter is keyed
+  `<flow>#<index>` by that position
+  (`crates/compose-core/src/codegen/graph.rs`). Moving an edge past an edge of a
+  different node respells that key — in `src/graph.ts`, and in the `budget.key`
+  and `counters` a trace writes — while leaving one counter per budgeted edge and
+  every spend against the same edge. It is a generated name rather than something
+  the composition decides, so it lands in this bullet with the rest;
 
 * **`sources`** — the list of files the composition was read from. It is the one
   part of the IR that is *about* file layout, which §1 excludes by construction.
@@ -546,6 +581,8 @@ a reason:
   a plan reports the channels, the triggers and the placements themselves rather
   than the sections that hold them. The difference is invisible to a plan and
   visible to `validate`, which is the command that has a rule about it.
+  `crates/compose-core/tests/plan_completeness.rs` restates this clause as
+  `SECTIONS` and holds it to an actual edit, the way it does the rest.
 
 Three things a plan **does** report read as more than they are, and they belong
 here for the same reason the list above does: this section is what a plan will

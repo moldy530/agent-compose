@@ -2,9 +2,9 @@
 #
 # `triage` loses the first of its four outgoing edges, leaving behind the `else:`
 # one that runs to the same node and shares its address. `fix` has its two
-# guarded edges swapped, which is the one edit here that changes which edge
-# fires. `ask` gains an edge ahead of the two it had, to the node they both
-# already run to.
+# guarded edges swapped, which is the one edit here that moves an edge within
+# its own node's order — not which edge fires (7.3 rule 6 is multicast). `ask`
+# gains an edge ahead of the two it had, to the node they both already run to.
 version: "0.1"
 
 state:

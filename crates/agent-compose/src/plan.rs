@@ -315,7 +315,8 @@ fn cut(text: &str, skip: usize) -> String {
 pub(crate) struct Failed<'a> {
     /// Which side of the comparison it is.
     pub(crate) side: SpecSide,
-    /// The entrypoint, as the command named it.
+    /// The entrypoint the command resolved: the file it was given, or the
+    /// `main.yml` inside the directory it was given.
     pub(crate) entrypoint: String,
     /// That composition's project root, which is the directory its entrypoint
     /// sits in — what the paths in its report are printed against.
