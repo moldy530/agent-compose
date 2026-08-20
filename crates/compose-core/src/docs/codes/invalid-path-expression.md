@@ -15,6 +15,12 @@ fan-out the compiler cannot refuse.
 
 ```yaml triggers
 version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
 agent.worker:
   model: model.m
   prompt: Work.
