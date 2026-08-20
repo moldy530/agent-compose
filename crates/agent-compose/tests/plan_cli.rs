@@ -22,6 +22,7 @@
 //! | `redeployed` | §4's deploy-layer components, which the `local` target admits |
 //! | `reordered` | §3's order rule and §11's line under it, in both directions at once — including the two arrays of one model that fall on opposite sides of it, and an author's literal array, which is neither |
 //! | `respelled` | §11's residual: the three leaves the artifact keeps as source text |
+//! | `restated-defaults` | §11's other residual: a default written out is a key the artifact holds |
 //! | `reworded-prompt` | §13: a cut may not hide the change it was run to show |
 //! | `added-flow` | §3's rule that a component which arrived brings nothing with it |
 //! | `broken-routing` | §7 in both directions, and §1's second property: an error introduced is a plan, exit `0` |
@@ -33,6 +34,8 @@
 //! (`crates/agent-compose/src/plan.rs`) — but the **refusal** goes through the
 //! snippet renderer, which is where the variable would be.
 
+use std::collections::BTreeMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
@@ -95,6 +98,60 @@ fn stderr(output: &Output) -> &str {
 #[track_caller]
 fn code(output: &Output) -> i32 {
     output.status.code().expect("the command was not signalled")
+}
+
+/// The project `agent-compose build` emits for one entrypoint, as its files by
+/// relative path.
+///
+/// Here so that "these two specs decide the same thing" can be *checked* rather
+/// than asserted in a comment: a plan is a diff of compositions, and the claim
+/// that a reported change is one the composition does not feel is only worth
+/// what the emitted project says about it (`docs/plan.md` §11).
+#[track_caller]
+fn built(entrypoint: &str, purpose: &str) -> BTreeMap<String, Vec<u8>> {
+    let out = std::env::temp_dir().join(format!(
+        "agent-compose-plan-cli-{purpose}-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&out);
+    let output = Command::cargo_bin("agent-compose")
+        .expect("the binary under test is built")
+        .current_dir(projects())
+        .env("NO_COLOR", "1")
+        .args(["build", entrypoint, "--out"])
+        .arg(&out)
+        .output()
+        .expect("the command runs");
+    assert_eq!(
+        code(&output),
+        0,
+        "`{entrypoint}` builds: {}",
+        stderr(&output)
+    );
+
+    let mut found = BTreeMap::new();
+    let mut queue = vec![out.clone()];
+    while let Some(directory) = queue.pop() {
+        for entry in fs::read_dir(&directory)
+            .expect("the emitted directory is readable")
+            .flatten()
+        {
+            let path = entry.path();
+            if path.is_dir() {
+                queue.push(path);
+                continue;
+            }
+            let name = path
+                .strip_prefix(&out)
+                .expect("the walk started at the root")
+                .to_string_lossy()
+                .into_owned();
+            found.insert(name, fs::read(&path).expect("an emitted file is readable"));
+        }
+    }
+    let _ = fs::remove_dir_all(&out);
+    assert!(!found.is_empty(), "`{entrypoint}` emitted a project");
+    found
 }
 
 /// Two specs that resolve the same way are the same composition, however
@@ -570,6 +627,149 @@ topology
 "
     );
     assert_eq!(code, 0);
+}
+
+/// A default written out is a key the artifact holds, and reports as one.
+///
+/// The `after` of this pair writes four of the grammar's own defaults out and
+/// edits nothing else: `expect_exit: [0]` (grammar 6.1),
+/// `max_tool_iterations: 8` (Decision D51), `unique_items: false` (grammar 3.5),
+/// and an `http` trigger's `method: POST` (grammar 13.3, Decision D45). The IR
+/// materializes no default (`crates/compose-core/src/ir`), so each of the four
+/// is a key the after spec's artifact holds and the before spec's does not — one
+/// record in each of the three structural sections, and two in the first.
+///
+/// The second half of the test is why the pair is here rather than in a comment:
+/// the two sides emit the **same project, byte for byte**, so every one of those
+/// four lines is a change to the artifact and to nothing the composition does.
+/// `docs/plan.md` §11 states it for a reader branching on the command, beside
+/// the three respelled leaves, and normalizing it away would need the table of
+/// keys and their defaults §3's closing paragraph refuses.
+#[test]
+fn a_default_written_out_is_a_key_the_artifact_holds() {
+    let (report, code) = report("restated-defaults");
+    assert_eq!(
+        report,
+        "\
+components
+  ~ agent.writer  restated-defaults/after/main.yml:45:1
+      max_tool_iterations: (absent) -> 8
+  ~ tool.spell_check  restated-defaults/after/main.yml:34:1
+      exec.expect_exit: (absent) -> [0]
+
+topology
+  ~ state.notes  restated-defaults/after/main.yml:26:3
+      type.unique_items: (absent) -> false
+
+interfaces
+  ~ trigger.on_request  restated-defaults/after/main.yml:69:5
+      method: (absent) -> \"POST\"
+
+`restated-defaults/after/main.yml` differs from `restated-defaults/before/main.yml` \
+(target `local`): 2 component changes, 1 topology change, 1 interface change
+"
+    );
+    assert_eq!(code, 0);
+
+    // …and the machine document writes no `before` key at all on any of the
+    // four, which is §3's spelling for a field that is not declared — not the
+    // same thing as one declared `null`.
+    let (document, code) = document("restated-defaults");
+    assert_eq!(
+        document,
+        r#"{
+  "plan_version": 1,
+  "before": {
+    "entrypoint": "restated-defaults/before/main.yml",
+    "target": "local",
+    "spec_version": "0.1"
+  },
+  "after": {
+    "entrypoint": "restated-defaults/after/main.yml",
+    "target": "local",
+    "spec_version": "0.1"
+  },
+  "components": [
+    {
+      "change": "changed",
+      "component": "agent",
+      "address": "agent.writer",
+      "fields": [
+        {
+          "path": "max_tool_iterations",
+          "after": 8
+        }
+      ],
+      "span": "main.yml:45:1..50:28"
+    },
+    {
+      "change": "changed",
+      "component": "tool",
+      "address": "tool.spell_check",
+      "fields": [
+        {
+          "path": "exec.expect_exit",
+          "after": [
+            0
+          ]
+        }
+      ],
+      "span": "main.yml:34:1..43:21"
+    }
+  ],
+  "topology": [
+    {
+      "change": "changed",
+      "site": "channel",
+      "address": "state.notes",
+      "fields": [
+        {
+          "path": "type.unique_items",
+          "after": false
+        }
+      ],
+      "span": "main.yml:26:3..32:16"
+    }
+  ],
+  "interfaces": [
+    {
+      "change": "changed",
+      "surface": "trigger",
+      "address": "trigger.on_request",
+      "fields": [
+        {
+          "path": "method",
+          "after": "POST"
+        }
+      ],
+      "span": "main.yml:69:5..75:32"
+    }
+  ],
+  "validation": {
+    "introduced": [],
+    "resolved": []
+  }
+}
+"#
+    );
+    assert_eq!(code, 0);
+
+    // …and the four changes are changes to the artifact and to nothing the
+    // composition does: one project, emitted twice.
+    let before = built("restated-defaults/before/main.yml", "restated-before");
+    let after = built("restated-defaults/after/main.yml", "restated-after");
+    assert_eq!(
+        before.keys().collect::<Vec<_>>(),
+        after.keys().collect::<Vec<_>>(),
+        "the two sides emit the same files"
+    );
+    for (name, held) in &before {
+        assert_eq!(
+            String::from_utf8_lossy(held),
+            String::from_utf8_lossy(&after[name]),
+            "`{name}` is emitted identically for the two sides"
+        );
+    }
 }
 
 /// A cut may not hide the change the command was run to show.

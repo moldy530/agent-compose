@@ -117,6 +117,19 @@
 //! rather than report a non-edit. `docs/plan.md` §11 states the residual for
 //! readers of the format.
 //!
+//! # A default written out is a key the artifact holds
+//!
+//! The mirror of the section above, and it needs no code at all: the IR does not
+//! materialize defaults (`crate::ir`), so an `expect_exit: [0]` written where
+//! the grammar already supplies `[0]` is a key on one side only, and [`walk`]
+//! reports it like any other. The composition decides exactly what it decided
+//! before — `agent-compose build` emits a byte-identical project for the two —
+//! and suppressing the record would need a table of keys and their defaults,
+//! consulted **by key**, running over `settings:` and `default:` as well: the
+//! rule the sections above refuse, for the reason they give. `docs/plan.md` §11
+//! states this residual too, and
+//! `crates/agent-compose/tests/projects/plan/restated-defaults` pins four keys.
+//!
 //! # Depth
 //!
 //! [`normalize`] and [`walk`] recurse, and what they recurse over is the depth
@@ -773,6 +786,48 @@ mod tests {
     fn an_authors_array_of_objects_is_not_taken_for_a_set() {
         let value = json!({ "settings": { "optional": [{ "b": 1 }, { "a": 1 }] } });
         assert_eq!(normalize(value.clone()), value);
+    }
+
+    /// …and so is a **mixed** flat array, which is the other shape none of the
+    /// grammar's four memberships can take: `optional:` and `route_on:` hold
+    /// names, `expect_exit:` and `expect_status:` hold integers, so an array
+    /// holding both is author data and its order is its own.
+    ///
+    /// `tests/plan_completeness.rs` restates this rule from `docs/plan.md`, and
+    /// this is what it is restating.
+    #[test]
+    fn an_authors_mixed_array_is_not_taken_for_a_set() {
+        let value = json!({ "settings": { "optional": [1, "a"] } });
+        assert_eq!(normalize(value.clone()), value);
+
+        let found = changes(
+            &semantic(&json!({ "settings": { "optional": [1, "a"] } })),
+            &semantic(&json!({ "settings": { "optional": ["a", 1] } })),
+        );
+        let paths: Vec<&str> = found.iter().map(|held| held.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            ["settings.optional[0]", "settings.optional[1]"],
+            "{found:?}"
+        );
+    }
+
+    /// One edit to an interpolated string is **two** field records, because the
+    /// artifact holds both halves of one: the text as authored, and the list of
+    /// names it embeds (`crate::ir::leaf`). The list is the authoritative one —
+    /// an escaped `$${NAME}` stands in the text and names nothing — so neither
+    /// is redundant, and a rename edits both.
+    ///
+    /// `docs/plan.md` §11 tells a reader to read the pair as the one rename it
+    /// is; this pins the pair it will see.
+    #[test]
+    fn a_renamed_environment_reference_reports_both_halves_of_the_string() {
+        let found = changes(
+            &semantic(&json!({ "cwd": { "text": "${REPO_ROOT}", "env_refs": ["REPO_ROOT"] } })),
+            &semantic(&json!({ "cwd": { "text": "${REPO_ROOT2}", "env_refs": ["REPO_ROOT2"] } })),
+        );
+        let paths: Vec<&str> = found.iter().map(|held| held.path.as_str()).collect();
+        assert_eq!(paths, ["cwd.env_refs[0]", "cwd.text"], "{found:?}");
     }
 
     #[test]

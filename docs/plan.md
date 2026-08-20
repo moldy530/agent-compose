@@ -547,7 +547,7 @@ a reason:
   than the sections that hold them. The difference is invisible to a plan and
   visible to `validate`, which is the command that has a rule about it.
 
-One thing is compared **more literally** than a reader may expect, and it belongs
+Three things a plan **does** report read as more than they are, and they belong
 here for the same reason the list above does: this section is what a plan will
 and will not tell you.
 
@@ -575,9 +575,55 @@ a duration from a string would mean reading
 the key above it to know when to try, and a key-gated rule over `settings:` and
 `default:` is the mistake §3's closing paragraph refuses — a
 `settings: { timeout: "2m" }` is data, and normalizing it would hide an edit
-rather than suppress a non-edit. A reviewer branching on `plan` should read these
-three the way they read a reformatted comment: real in the artifact, and nothing
-the composition does differently.
+rather than suppress a non-edit.
+
+**A default written out is a change.** The artifact records what the composition
+declares, and a default is not materialized into it
+(`crates/compose-core/src/ir`): a key an author leaves out is a key the artifact
+does not hold, and the same key written with the value the grammar already
+supplies is a key it does. So each of these is a reported change as well, on a
+pair `agent-compose build` emits a byte-identical project for:
+
+| left out | written out | reported as |
+|---|---|---|
+| `expect_exit:` absent | `expect_exit: [0]` (grammar 6.1) | `exec.expect_exit: (absent) -> [0]` |
+| `max_tool_iterations:` absent | `max_tool_iterations: 8` (Decision D51) | `max_tool_iterations: (absent) -> 8` |
+| `method:` absent | `method: POST` (grammar 13.3) | `method: (absent) -> "POST"` |
+
+The class is not these three: it is every key `docs/grammar.md` gives a default —
+`context: isolated`, `as: item`, `on_item_error: fail`, `detach: false`,
+`respond: async`, `unique_items: false`, `agent_access: read_write`,
+`timezone: UTC` and the rest all read the same way.
+
+§3's rule that an absent `before` or `after` key means **not declared** is that
+representation seen from the format's side, and §3's example is worth reading
+against this table rather than as a case of it: an absent `timeout:` is not the
+same as one written with the value it would have inherited. Grammar 9.3 resolves
+a policy key through four levels, and declaring it at a node takes that node out
+of the chain — the emitted project records the value as resolved from the node
+rather than from `defaults:`, and a later edit to `defaults:` no longer reaches
+it. A key of the table above is not like that. Telling the two apart inside the
+comparison would need a table of keys and their defaults consulted **by key**,
+and it would have to run over `settings:` and `default:` as well — where an
+author's own `method: POST` is data — which is the rule §3's closing paragraph
+refuses.
+
+**One edit to an interpolated string is two field records.** A string that may
+embed an environment reference reaches the artifact as the text the author wrote
+**and** as the list of names it embeds (`crates/compose-core/src/ir/leaf.rs`),
+because the list is the authoritative one and the text is not: an escaped
+`$${NAME}` stands in the text and names nothing. Renaming a reference edits both,
+so a `cwd: "${REPO_ROOT}"` rewritten to `cwd: "${REPO_ROOT2}"` reports at
+`exec.cwd.env_refs[0]` and at `exec.cwd.text` — two records, two lines of the
+human report, one edit. Suppressing either would hide the one case where the two
+disagree, so a reader reads the pair as the rename it is.
+
+None of the three is a plan being wrong about the artifact, and that is the
+distinction to hold on to: a plan reports the artifact. A reviewer branching on
+`plan` should read the first two the way they read a reformatted comment — real
+in the artifact, and nothing the composition does differently, the one exception
+being the respelled guard above, whose text is what is shipped — and the third as
+one edit written twice.
 
 ## 12. Stability
 
@@ -640,8 +686,9 @@ answer that, from opposite ends.
 over a corpus of spec pairs — a pair that differs only in formatting, a rename, a
 topology edit, an edge-order edit, a policy edit, a surface edit, a deploy edit, a
 pair that only reorders declarations, a pair that only respells three leaves, a
-pair whose one edit falls past the end of a report line, and a pair where the
-after spec introduces errors.
+pair that only writes four of the grammar's own defaults out — and builds both
+sides to prove it decides nothing differently — a pair whose one edit falls past
+the end of a report line, and a pair where the after spec introduces errors.
 
 `crates/compose-core/tests/plan_completeness.rs` states §11 as a property, which
 is what holds the **silences** to it: the three structural sections are empty if

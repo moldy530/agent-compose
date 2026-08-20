@@ -1,0 +1,75 @@
+# The same composition with all four defaults written out and nothing else
+# edited: `expect_exit: [0]`, `max_tool_iterations: 8`, `unique_items: false`,
+# and `method: POST`. Every one of them is the value the grammar supplies when
+# the key is absent, so the composition decides exactly what it decided before
+# and `agent-compose build` emits a byte-identical project for the two.
+#
+# A plan reports all four all the same: defaults are not materialized into the
+# artifact (`crates/compose-core/src/ir`), so a key written is a key the artifact
+# holds and a key absent is a key it does not. `docs/plan.md` §11 states it for a
+# reader branching on the command.
+version: "0.1"
+
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+
+model.fast:
+  provider: provider.anthropic
+  id: some-fast-model
+
+state:
+  draft:
+    description: The draft as it stands.
+    type: string
+    default: ""
+  notes:
+    description: Every note the checker has raised so far.
+    type: array
+    items: { type: string }
+    max_items: 20
+    unique_items: false
+    default: []
+
+tool.spell_check:
+  description: Check the spelling of a draft.
+  input:
+    text: { type: string }
+  output:
+    notes: { type: array, items: { type: string }, max_items: 20 }
+  exec:
+    command: spell
+    args: ["--stdin"]
+    expect_exit: [0]
+
+agent.writer:
+  model: model.fast
+  prompt: Write a draft.
+  max_tool_iterations: 8
+  output:
+    draft: { type: string }
+
+flow.review_loop:
+  description: Draft, then check the spelling of what was drafted.
+  inputs:
+    goal: { type: string }
+  outputs:
+    draft: { type: string }
+    notes: { type: array, items: { type: string }, max_items: 20 }
+  nodes:
+    write: { agent: agent.writer, input: "input.goal" }
+    check: { function: tool.spell_check, input: { text: "state.draft" } }
+  edges:
+    - { from: start, to: write }
+    - { from: write, to: check }
+    - { from: check, to: end }
+
+triggers:
+  on_request:
+    type: http
+    flow: flow.review_loop
+    path: /review
+    method: POST
+    respond: sync
+    input:
+      goal: "payload.body.goal"

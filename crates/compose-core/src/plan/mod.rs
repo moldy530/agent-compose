@@ -28,14 +28,24 @@
 //! agree in everything but their source coordinates produce an empty plan,
 //! byte for byte, every time.
 //!
-//! **That cuts both ways, and the one place it is worth knowing about is a leaf
-//! the artifact keeps as source text.** A duration, a CEL expression and the
-//! integer-or-float spelling of a number reach the IR as the author wrote them,
-//! so `timeout: 120s` against `timeout: 2m` is a reported change on a pair that
-//! builds to a byte-identical project. It is the narrow reading of "the diff is
-//! over the artifact" rather than an oversight — `diff`'s module docs work out
-//! why the alternative is worse, `docs/plan.md` §11 states it for a reader of
-//! the format, and `tests/projects/plan/respelled` pins all three.
+//! **That cuts both ways, and the first place it is worth knowing about is a
+//! leaf the artifact keeps as source text.** A duration, a CEL expression and
+//! the integer-or-float spelling of a number reach the IR as the author wrote
+//! them, so `timeout: 120s` against `timeout: 2m` is a reported change on a pair
+//! that builds to a byte-identical project. It is the narrow reading of "the
+//! diff is over the artifact" rather than an oversight — `diff`'s module docs
+//! work out why the alternative is worse, `docs/plan.md` §11 states it for a
+//! reader of the format, and `tests/projects/plan/respelled` pins all three.
+//!
+//! **The second is a default written out.** The IR materializes none of them
+//! (`crate::ir`), so a key written with the value the grammar already supplies
+//! is a key the artifact holds where the absent one is not: writing
+//! `max_tool_iterations: 8` out reports, on a pair that again builds
+//! byte-identically. Normalizing it away would need a table of keys and their
+//! defaults consulted by key, over `settings:` and `default:` as well — the rule
+//! `diff`'s module docs refuse, for the reason they give. `docs/plan.md` §11
+//! states this residual too, and `tests/projects/plan/restated-defaults` pins
+//! four keys and both builds.
 //!
 //! # Check diagnostics are content, not a refusal
 //!

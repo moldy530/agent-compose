@@ -163,7 +163,7 @@ fn canonical(key: &str, value: Value) -> Value {
         Value::Array(items) => {
             let mut items: Vec<Value> =
                 items.into_iter().map(|item| canonical(key, item)).collect();
-            if SETS.contains(&key) && items.iter().all(|item| !item.is_object()) {
+            if SETS.contains(&key) && flat(&items) {
                 items.sort_by_key(Value::to_string);
             } else if let Some((_, names)) = BY_NAME.iter().find(|(held, _)| *held == key) {
                 items.sort_by_key(|item| (named(item, names), item.to_string()));
@@ -174,6 +174,27 @@ fn canonical(key: &str, value: Value) -> Value {
         }
         scalar => scalar,
     }
+}
+
+/// Whether every element is a scalar of one kind — all strings, or all numbers.
+///
+/// Every membership of [`SETS`] the grammar can produce is exactly that:
+/// `optional:` and `route_on:` hold names, `expect_exit:` and `expect_status:`
+/// hold integers. The document states the rule over the **key** an array sits
+/// under (§3, §11), and the one place the key alone is not enough is an author's
+/// own array written under one of the four names inside a `settings:` or a
+/// `default:`, which is data rather than one of the grammar's memberships.
+///
+/// The compiler draws that line at a uniform flat array
+/// (`crates/compose-core/src/plan/diff.rs`), and this restatement draws it in the
+/// same place on purpose. The two are meant to be independent, not to disagree:
+/// a mixed `optional: [1, "a"]` is unreachable through the grammar, so on every
+/// composition the two readings decide alike — and a weaker line here (anything
+/// that is not an object, say) would report that author's array as canonicalized
+/// while the code compares it by position, failing the property over code
+/// behaving exactly as documented.
+fn flat(items: &[Value]) -> bool {
+    items.iter().all(Value::is_string) || items.iter().all(Value::is_number)
 }
 
 /// The first of these keys this entry carries as a string, for sorting.
@@ -660,6 +681,17 @@ const CASES: &[Case] = &[
             "flows/triage.yml",
             "    - { from: verify, to: summarize }",
             "    - { from: verify, to: remember }",
+        )],
+        differs: true,
+    },
+    // --- A default written out, which the artifact holds and a plan reports. --
+    Case {
+        what: "a default written out as the value the grammar already supplies",
+        before: &[],
+        after: &[(
+            "agents/triage.yml",
+            "  stores: [store.docs]",
+            "  stores: [store.docs]\n  max_tool_iterations: 8",
         )],
         differs: true,
     },
