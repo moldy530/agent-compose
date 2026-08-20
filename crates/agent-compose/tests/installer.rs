@@ -167,6 +167,107 @@ fn install(artifacts: &Path, into: &Path, path_first: &Path, arguments: &[&str])
         .expect("the installer runs")
 }
 
+/// A GitHub that serves one release, as a `curl` to put on `PATH` ahead of the
+/// real one.
+///
+/// It answers **two exact URLs** and refuses everything else with `curl`'s own
+/// "the transfer failed" status — the release's `latest` document, and an asset
+/// under `releases/download/<tag>/<name>`. Both shapes are GitHub's, written
+/// here rather than read out of the script, so an installer that asked for the
+/// wrong URL gets a refusal naming what it asked for.
+///
+/// The served directory holds `latest.json` and a `v<version>/` of assets.
+fn github(purpose: &str) -> PathBuf {
+    let served = scratch(purpose);
+    let assets = release(&format!("{purpose}-assets"), &[RELEASED]);
+    fs::rename(&assets, served.join(format!("v{RELEASED}"))).expect("the assets are movable");
+
+    // The order is the API's own: `tag_name` before `body`. The body carries the
+    // same words on purpose — a release note may quote them, and the reader must
+    // still take the field.
+    fs::write(
+        served.join("latest.json"),
+        format!(
+            "{{\n  \"html_url\": \"https://github.com/moldy530/agent-compose/releases/tag/\
+             v{RELEASED}\",\n  \"tag_name\": \"v{RELEASED}\",\n  \"draft\": false,\n  \
+             \"body\": \"the installer reads \\\"tag_name\\\": \\\"v9.9.9\\\" out of this \
+             document\"\n}}\n"
+        ),
+    )
+    .expect("the release document is writable");
+
+    write_executable(
+        &served.join("curl"),
+        r#"#!/bin/sh
+# A GitHub that serves one release. Reads the argument shapes the installer
+# uses: `-fsSL <url>` to standard output, and `-fsSL --retry N -o <path> <url>`.
+destination=""
+url=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o) destination="$2"; shift 2 ;;
+    --retry) shift 2 ;;
+    -*) shift ;;
+    *) url="$1"; shift ;;
+  esac
+done
+
+serve() {
+  if [ -n "$destination" ]; then cp "$1" "$destination"; else cat "$1"; fi
+}
+
+case "$url" in
+  https://api.github.com/repos/moldy530/agent-compose/releases/latest)
+    serve "$FAKE_GITHUB/latest.json"
+    ;;
+  https://github.com/moldy530/agent-compose/releases/download/*/*)
+    name="${url##*/}"
+    tag="${url%/*}"
+    tag="${tag##*/}"
+    if [ ! -f "$FAKE_GITHUB/$tag/$name" ]; then
+      echo "no such asset: $url" >&2
+      exit 22
+    fi
+    serve "$FAKE_GITHUB/$tag/$name"
+    ;;
+  *)
+    echo "not a url this release serves: $url" >&2
+    exit 22
+    ;;
+esac
+"#,
+    );
+    served
+}
+
+/// Run `install.sh` against the GitHub `serving`, with no artifact directory —
+/// the path every user who runs the one-liner takes.
+fn install_from_github(
+    serving: &Path,
+    into: &Path,
+    path_first: &Path,
+    arguments: &[&str],
+) -> Output {
+    let inherited = std::env::var("PATH").unwrap_or_default();
+    Command::new("sh")
+        .arg(repo_root().join("install.sh"))
+        .args(arguments)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}:{inherited}",
+                serving.to_str().expect("a UTF-8 path"),
+                path_first.to_str().expect("a UTF-8 path")
+            ),
+        )
+        .env("FAKE_GITHUB", serving)
+        .env_remove("AGENT_COMPOSE_ARTIFACT_DIR")
+        .env_remove("AGENT_COMPOSE_VERSION")
+        .env("AGENT_COMPOSE_INSTALL", into)
+        .output()
+        .expect("the installer runs")
+}
+
 #[track_caller]
 fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
@@ -366,6 +467,67 @@ fn a_version_nobody_built_is_refused() {
         stderr(&output)
     );
     assert!(!into.join("agent-compose").exists());
+}
+
+/// The path the one-liner takes: ask GitHub for the latest release, download
+/// the archive and the checksums it published, verify, install.
+///
+/// This is the branch every user runs and the one nothing else here reaches —
+/// the dry-run gate installs from a local directory, because on a pull request
+/// there is no release to download. What it pins is the two URL shapes, which
+/// are GitHub's rather than ours: a wrong one is a `curl` failure at somebody
+/// else's terminal, months after the change that caused it.
+#[test]
+fn the_latest_release_is_resolved_downloaded_and_verified() {
+    let serving = github("github");
+    let into = scratch("from-github");
+    let output = install_from_github(
+        &serving,
+        &into,
+        &machine("uname-github", "Linux", "x86_64"),
+        &[],
+    );
+    assert!(
+        output.status.success(),
+        "{}{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    // The tag came out of the release document — including past a body that
+    // quotes the same field name — and the asset URL was built from it.
+    assert!(
+        stdout(&output).contains(&format!(
+            "downloading https://github.com/moldy530/agent-compose/releases/download/v{RELEASED}/\
+             agent-compose-{RELEASED}-x86_64-unknown-linux-musl.tar.gz"
+        )),
+        "the installer asked for a different URL: {}",
+        stdout(&output)
+    );
+    assert!(
+        stdout(&output).contains(&format!(
+            "agent-compose {RELEASED} (fixture, x86_64-unknown-linux-musl)"
+        )),
+        "the downloaded binary should be the one that ran: {}",
+        stdout(&output)
+    );
+    assert!(into.join("agent-compose").is_file());
+
+    // A release that is not there is a refusal naming the version, not a
+    // half-install.
+    let missing = scratch("from-github-missing");
+    let refused = install_from_github(
+        &serving,
+        &missing,
+        &machine("uname-github-missing", "Linux", "x86_64"),
+        &["7.7.7"],
+    );
+    assert!(!refused.status.success());
+    assert!(
+        stderr(&refused).contains("v7.7.7"),
+        "the refusal should name the release it could not get: {}",
+        stderr(&refused)
+    );
+    assert!(!missing.join("agent-compose").exists());
 }
 
 /// The workflows publish the artifacts the installer asks for.

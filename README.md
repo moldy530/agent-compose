@@ -27,8 +27,12 @@ Two things it takes:
 curl -fsSL https://raw.githubusercontent.com/moldy530/agent-compose/main/install.sh | sh -s -- 0.1.0
 
 # somewhere else to put it
-curl -fsSL https://raw.githubusercontent.com/moldy530/agent-compose/main/install.sh | AGENT_COMPOSE_INSTALL=/usr/local/bin sh
+curl -fsSL https://raw.githubusercontent.com/moldy530/agent-compose/main/install.sh | AGENT_COMPOSE_INSTALL="$HOME/bin" sh
 ```
+
+Name a directory you can write to. A system one like `/usr/local/bin` needs
+`sudo`, and `sudo` does not carry that variable — download the script, then run
+`sudo env AGENT_COMPOSE_INSTALL=/usr/local/bin sh install.sh`.
 
 Piping a script into a shell is worth reading first: the script is
 [`install.sh`](install.sh) in this repository, and it is the same file the
