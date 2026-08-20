@@ -16,8 +16,8 @@ read the topic.
 agent-compose --version
 ```
 
-If that fails, the binary is not on `PATH`. Releases publish prebuilt binaries
-for Linux and macOS; there is nothing else to install, and no Rust toolchain is
+If that fails, the binary is not on `PATH`. It is a single static executable and
+is the whole of the compiler: nothing else to install, and no Rust toolchain
 needed. Node or Bun is needed only to *run* a compiled project.
 
 ## The loop
@@ -82,10 +82,10 @@ messages are improved between releases.
 
 A flow with a `human` node pauses. A `run` whose standard input is a terminal
 prompts for the answer; a script sets `AGENT_COMPOSE_INTERACTIVE=1` and writes
-**one JSON value per line** on stdin, in the order the prompts arrive. An answer
-the node's output schema refuses re-prompts and does not consume the wait.
+**one JSON value per line** on stdin, in the order the prompts arrive.
 `AGENT_COMPOSE_INTERACTIVE=0` forces the exit-`3` path, which is what a
-supervisor that must not block should set.
+supervisor that must not block should set. What a pause asks for, and what
+becomes of an answer it will not take, is `agent-compose docs human`.
 
 ## The topics
 
@@ -113,5 +113,6 @@ normative text.
   `agent-compose docs maps`.
 - **Do not hand-edit generated code.** It is a build artifact; `build --check`
   in CI is what keeps the spec the source of truth.
-- **Never put a credential in a spec.** Secret-bearing fields take `${NAME}`
-  environment references only, and the compiler refuses a literal.
+- **Never put a credential in a spec.** Where a secret may come from is a rule
+  the compiler enforces rather than a convention you can keep by being careful;
+  `agent-compose docs models` is where it is written.
