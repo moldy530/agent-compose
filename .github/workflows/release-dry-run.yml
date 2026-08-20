@@ -4,14 +4,18 @@ name: Release dry run
 #
 # CLAUDE.md's validation strategy says CI green must mean actually done, and a
 # release workflow that only ever runs on a tag is the one part of this
-# repository nothing checks until it matters. So every pull request builds all
-# four artifacts through the same callable workflow the tag path uses, and then
-# runs `install.sh` end to end against what it just built: detection, checksum
-# verification, the install, and `--version`. A pull request that breaks the
-# installer cannot be green.
+# repository nothing checks until it matters. So every pull request builds
+# release artifacts through the same callable workflow the tag path uses, and
+# then runs `install.sh` end to end against what it just built: detection,
+# checksum verification, the install, and `--version`. A pull request that
+# breaks the installer cannot be green.
 #
 # It is a workflow of its own rather than a job in `ci.yml` so that the two run
 # in parallel and the compiler's own gates are no slower for it.
+#
+# `workflow_dispatch` is the rehearsal: the same steps over all four legs,
+# runnable by hand on any branch, so a release can be practised without a tag
+# being pushed for it.
 
 on:
   pull_request:
@@ -20,22 +24,42 @@ on:
 permissions:
   contents: read
 
+# One answer per ref. A pull request pushed to three times in a minute needs
+# the cross-builds for its head commit and not for the two commits already
+# replaced — on a private repository those superseded runs are billed minutes
+# spent on a question nobody will read the answer to.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   artifacts:
     uses: ./.github/workflows/release-artifacts.yml
     with:
       # No `expected-version`: a pull request claims no tag, so there is nothing
-      # to hold the crate version to. Everything else is what a release does,
-      # including both macOS legs — the tag path is then not the first time any
-      # of the four is built.
+      # to hold the crate version to.
       cache: true
+      # **A pull request builds the two Linux legs; a manual rehearsal builds
+      # all four.** This repository is private, where a macOS runner minute
+      # bills at ten times a Linux one, so two macOS legs on every push of every
+      # pull request is a standing cost against a rare failure: this crate is
+      # pure Rust with no platform-specific code, and what a Darwin leg catches
+      # that a Linux one does not is a linkage or a toolchain difference rather
+      # than a compile error. Both macOS legs still run before anything is
+      # published — the tag path builds four, and so does a `workflow_dispatch`
+      # of this workflow. The trade is stated in the PRD's q24 entry: a
+      # macOS-only break surfaces at the rehearsal or at the tag, not on the
+      # pull request that caused it.
       targets: >-
-        [
-          {"triple": "x86_64-unknown-linux-musl", "runner": "ubuntu-latest"},
-          {"triple": "aarch64-unknown-linux-musl", "runner": "ubuntu-latest"},
-          {"triple": "x86_64-apple-darwin", "runner": "macos-14"},
-          {"triple": "aarch64-apple-darwin", "runner": "macos-14"}
-        ]
+        ${{ github.event_name == 'workflow_dispatch' && '[
+        {"triple": "x86_64-unknown-linux-musl", "runner": "ubuntu-latest"},
+        {"triple": "aarch64-unknown-linux-musl", "runner": "ubuntu-latest"},
+        {"triple": "x86_64-apple-darwin", "runner": "macos-14"},
+        {"triple": "aarch64-apple-darwin", "runner": "macos-14"}
+        ]' || '[
+        {"triple": "x86_64-unknown-linux-musl", "runner": "ubuntu-latest"},
+        {"triple": "aarch64-unknown-linux-musl", "runner": "ubuntu-latest"}
+        ]' }}
 
   # Its own job, ahead of the builds rather than behind them: a quoting mistake
   # in the installer should be an answer in twenty seconds, not after four

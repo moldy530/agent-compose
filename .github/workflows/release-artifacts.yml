@@ -103,17 +103,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # `dtolnay/rust-toolchain` is the one non-`actions/*` action this pipeline
-      # needs and the one `ci.yml` already runs: installing a *pinned* toolchain
-      # with an added target is what `rustup` does, and the alternative is
-      # hand-written `rustup` lines that would drift from CI's.
-      - uses: dtolnay/rust-toolchain@stable
+      # `dtolnay/rust-toolchain` and `Swatinem/rust-cache` (below) are the two
+      # non-`actions/*` actions this pipeline uses, and both are the ones
+      # `ci.yml` already runs: installing a *pinned* toolchain with an added
+      # target is what `rustup` does, and the alternative is hand-written
+      # `rustup` lines that would drift from CI's.
+      #
+      # **Pinned by commit, not by `@stable`.** A branch or a tag is whatever it
+      # was moved to last night, and this job produces the bytes people
+      # download — a mutable ref here is somebody else's push landing inside our
+      # release. The sha is the `stable` branch's head on 2026-08-04; the
+      # toolchain it installs is named below rather than by the branch, so the
+      # pin holds the action's own code still and nothing else. Bumping it is a
+      # commit that says so, in `ci.yml` and here together.
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
           toolchain: 1.94.1
           targets: ${{ matrix.target.triple }}
 
+      # Swatinem/rust-cache v2.9.2, pinned by commit for the same reason.
       - if: inputs.cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           key: ${{ matrix.target.triple }}
 
