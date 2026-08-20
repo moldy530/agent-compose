@@ -184,14 +184,18 @@ jobs:
           ldd "$binary" || true
 
       # macOS has no static libSystem, so the equivalent promise is narrower and
-      # is the one Apple supports: nothing outside `/usr/lib`, which is on every
-      # machine. A Homebrew dylib finding its way in is the failure this catches.
+      # is the one Apple supports: nothing outside what the system itself ships
+      # — `/usr/lib` and the system frameworks, which are on every machine. A
+      # Homebrew dylib from `/opt/homebrew` or `/usr/local` finding its way in is
+      # the failure this catches, and it is the failure that would make an
+      # artifact run on the runner and nowhere else.
       - name: The macOS binary links only what macOS ships
         if: contains(matrix.target.triple, 'darwin')
         run: |
           binary="target/$TRIPLE/release/agent-compose"
           otool -L "$binary"
-          outside="$(otool -L "$binary" | tail -n +2 | awk '{ print $1 }' | grep -v '^/usr/lib/' || true)"
+          outside="$(otool -L "$binary" | tail -n +2 | awk '{ print $1 }' \
+            | grep -Ev '^(/usr/lib/|/System/Library/Frameworks/)' || true)"
           if [ -n "$outside" ]; then
             echo "::error::$TRIPLE links against something macOS does not ship: $outside"
             exit 1

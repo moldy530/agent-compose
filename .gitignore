@@ -1,6 +1,12 @@
 /target
 /.claude/worktrees/
 
+# Where the release pipeline stages what it is about to publish
+# (`.github/workflows/release-artifacts.yml`), and where anybody reproducing
+# those steps by hand will stage it too. An artifact belongs to a release, never
+# to the tree.
+/dist/
+
 # The pinned JavaScript toolchain the generated-code gates install, and the
 # scratch copies of the golden projects they type-check. `node-fallback/` is the
 # second install of the same pins, the npm one gates 13 and 15 run under Node —

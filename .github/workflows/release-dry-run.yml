@@ -81,6 +81,7 @@ jobs:
 
       - name: Install from the built artifacts, and verify what landed
         run: |
+          rm -rf "${RUNNER_TEMP:?}/bin" "${RUNNER_TEMP:?}/scaffold"
           AGENT_COMPOSE_ARTIFACT_DIR="$PWD/dist" AGENT_COMPOSE_INSTALL="$RUNNER_TEMP/bin" sh install.sh
           printed="$("$RUNNER_TEMP/bin/agent-compose" --version)"
           echo "$printed"
@@ -100,7 +101,7 @@ jobs:
       # both cases the install directory must still be empty afterwards.
       - name: A checksum that does not match installs nothing
         run: |
-          rm -rf corrupt "$RUNNER_TEMP/refused"
+          rm -rf corrupt "${RUNNER_TEMP:?}/refused"
           cp -r dist corrupt
           printf '%s  %s\n' \
             0000000000000000000000000000000000000000000000000000000000000000 \
@@ -116,7 +117,7 @@ jobs:
 
       - name: A checksum file that says nothing about the archive installs nothing
         run: |
-          rm -rf silent "$RUNNER_TEMP/unvouched"
+          rm -rf silent "${RUNNER_TEMP:?}/unvouched"
           cp -r dist silent
           printf '%s  %s\n' \
             0000000000000000000000000000000000000000000000000000000000000000 \
@@ -134,7 +135,7 @@ jobs:
       # version nobody built.
       - name: A pinned version installs, and a version nobody built does not
         run: |
-          rm -rf "$RUNNER_TEMP/pinned" "$RUNNER_TEMP/absent"
+          rm -rf "${RUNNER_TEMP:?}/pinned" "${RUNNER_TEMP:?}/absent"
           AGENT_COMPOSE_ARTIFACT_DIR="$PWD/dist" AGENT_COMPOSE_INSTALL="$RUNNER_TEMP/pinned" sh install.sh "v$VERSION"
           test -x "$RUNNER_TEMP/pinned/agent-compose"
           if AGENT_COMPOSE_ARTIFACT_DIR="$PWD/dist" AGENT_COMPOSE_INSTALL="$RUNNER_TEMP/absent" AGENT_COMPOSE_VERSION=99.99.99 sh install.sh; then
