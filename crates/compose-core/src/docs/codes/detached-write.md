@@ -65,7 +65,9 @@ map then joins on every instance, and the write is an ordinary reduced write.
 itself: a detached sink's whole job is the effect it performs, not what it
 returns.
 
-Renaming the channel is not a fix; the rule is about the write, not the name.
+Renaming the channel does silence the report, but it is not a repair: with the
+names no longer matching there is no write left to refuse, so the instance now
+contributes nothing at all. Pick one of the two above instead.
 
 Grammar: `docs/grammar.md` §8.6, Decisions D31, D94. Topic:
 `agent-compose docs maps`.

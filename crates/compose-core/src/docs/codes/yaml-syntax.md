@@ -24,10 +24,13 @@ Read from the reported line **upwards** for the construct that was left open.
 The usual causes are an unclosed `{` or `[`, inconsistent indentation under a
 mapping key, and a tab character where YAML requires spaces.
 
-Two spec-specific gotchas produce YAML errors rather than compiler ones:
-`version: 0.1` unquoted is a float and a `${NAME}` reference written unquoted
-inside `{ … }` or `[ … ]` is a syntax error, because YAML forbids those
-indicators in a plain scalar in flow context. Quote both.
+One spec-specific gotcha lands here rather than on a compiler check: a `${NAME}`
+reference written unquoted inside `{ … }` or `[ … ]` is a syntax error, because
+YAML forbids those indicators in a plain scalar in flow context. Quote it.
+
+The other thing worth quoting — an unquoted `version: 0.1`, which YAML reads as
+a float — is *not* one of these. It parses, and the compiler reports it as
+`wrong-type`.
 
 Grammar: `docs/grammar.md` §1.1, §1.3, §4.3. Topic:
 `agent-compose docs getting-started`.
