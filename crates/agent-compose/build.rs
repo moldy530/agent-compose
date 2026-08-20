@@ -87,6 +87,15 @@ fn shorten(raw: &str) -> Option<String> {
 /// `packed-refs` stands in for it. Every one of them is tracked only if it
 /// exists — a path cargo cannot stat is a path cargo treats as changed, which
 /// would re-run this script on every build.
+///
+/// **A linked worktree splits those two files across two directories.** `HEAD`
+/// is per-worktree and lives in the worktree's own git directory
+/// (`…/.git/worktrees/<name>/HEAD`); the branch it names is shared and lives in
+/// the repository's *common* directory. Looking for the ref beside `HEAD` finds
+/// nothing there, and then neither does the `packed-refs` fallback — so a
+/// commit made in a worktree would leave `--version` naming the commit before
+/// it. Asking for the common directory answers both cases at once, because in
+/// an ordinary checkout it is the git directory.
 fn track_head(manifest_dir: &Path) {
     let Some(git_dir) = git(manifest_dir, &["rev-parse", "--absolute-git-dir"]) else {
         return;
@@ -99,11 +108,19 @@ fn track_head(manifest_dir: &Path) {
         // the whole of it.
         return;
     };
-    let loose = git_dir.join(&reference);
+    // A `git` too old for `--path-format` (added in 2.31) answers nothing and
+    // the git directory stands in, which is where refs are in a checkout that
+    // is not a linked worktree anyway.
+    let common = git(
+        manifest_dir,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .map_or(git_dir, PathBuf::from);
+    let loose = common.join(&reference);
     if loose.is_file() {
         track(&loose);
     } else {
-        track(&git_dir.join("packed-refs"));
+        track(&common.join("packed-refs"));
     }
 }
 
