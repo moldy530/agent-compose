@@ -1,0 +1,141 @@
+# The same composition with six declarations swapped, and nothing else edited.
+#
+# Swapped here: `tool.spell_check`'s `expect_exit:`, `agent.reviewer`'s
+# `output:`, `agent.triage`'s union `variants:` and its `optional:`, the `review`
+# node's `input:` bindings, and the `dispatch` map's `routes:`. Two of the six
+# reach the schema a model is handed and are reported; the other four are
+# dispatched on by name and are not.
+version: "0.1"
+
+state:
+  patches:
+    description: One patch per mechanically fixable finding.
+    type: array
+    max_items: 8
+    items: { type: string }
+    reduce: append
+  tickets:
+    description: One ticket per finding a human must look at.
+    type: array
+    max_items: 8
+    items: { type: string }
+    reduce: append
+
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+
+model.fast:
+  provider: provider.anthropic
+  id: some-fast-model
+
+tool.spell_check:
+  description: Check the spelling of a draft.
+  input:
+    text: { type: string }
+  output:
+    ok: { type: boolean }
+  exec:
+    command: spell
+    args: ["--stdin"]
+    expect_exit: [2, 0]
+
+agent.reviewer:
+  model: model.fast
+  prompt: Review the draft against the goal.
+  input:
+    draft: { type: string }
+    goal: { type: string }
+  output:
+    reason: { type: string }
+    verdict: { enum: [approve, revise] }
+
+agent.triage:
+  model: model.fast
+  prompt: Classify each finding in the report.
+  input:
+    report: { type: string }
+  output:
+    findings:
+      type: array
+      max_items: 8
+      items:
+        discriminator: kind
+        variants:
+          needs_human:
+            summary: { type: string }
+            severity: { enum: [low, high] }
+          auto_fixable:
+            file: { type: string }
+            hint: { type: string }
+    counts:
+      type: object
+      properties:
+        fixed: { type: integer }
+        raised: { type: integer }
+      optional: [raised, fixed]
+
+agent.fixer:
+  model: model.fast
+  prompt: Patch exactly the defect described.
+  input:
+    file: { type: string }
+    hint: { type: string }
+  output:
+    patch: { type: string }
+
+agent.escalator:
+  model: model.fast
+  prompt: Write one ticket line for the finding.
+  input:
+    summary: { type: string }
+    severity: { enum: [low, high] }
+  output:
+    ticket: { type: string }
+
+flow.sweep:
+  description: Review a draft, classify what it turned up, and route each finding.
+  inputs:
+    goal: { type: string }
+    draft: { type: string }
+  outputs:
+    patches:
+      type: array
+      max_items: 8
+      items: { type: string }
+  nodes:
+    review:
+      agent: agent.reviewer
+      input:
+        goal: "input.goal"
+        draft: "input.draft"
+    classify:
+      agent: agent.triage
+      input:
+        report: "input.draft"
+    dispatch:
+      map:
+        over: classify.output.findings
+        as: finding
+        route_by: kind
+        max_concurrency: 2
+        routes:
+          needs_human:
+            node: agent.escalator
+            input:
+              summary: "finding.summary"
+              severity: "finding.severity"
+            writes:
+              ticket: tickets
+          auto_fixable:
+            node: agent.fixer
+            input:
+              file: "finding.file"
+              hint: "finding.hint"
+            writes:
+              patch: patches
+  edges:
+    - { from: start, to: review }
+    - { from: review, to: classify }
+    - { from: classify, to: dispatch }
+    - { from: dispatch, to: end }

@@ -177,7 +177,8 @@ enum Command {
         #[arg(long, value_enum, default_value_t = Format::Human)]
         format: Format,
     },
-    /// Diff two specs: what changed in the components, the topology, the interfaces, and the report
+    /// Diff two specs: what changed in the components, the topology, the interfaces, and the
+    /// validation
     Plan {
         /// The spec compared from: an entrypoint, or a project directory holding `main.yml`
         before: PathBuf,

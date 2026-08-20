@@ -40,7 +40,7 @@ use crate::ir::flow::Flow;
 use crate::ir::{Definition, Ir};
 
 use super::Composition;
-use super::diff::{changes, only, semantic, without};
+use super::diff::{ORDER, changes, only, semantic, without};
 use super::document::{
     ChangeKind, ComponentChange, ComponentKind, Finding, InterfaceChange, InterfaceKind,
     TopologyChange, TopologyKind, Validation,
@@ -515,11 +515,12 @@ fn edges(found: &mut Vec<TopologyChange>, flow: &str, before: &Flow, after: &Flo
 /// untouched. The IR carries that as the position of the edge in `edges:`, which
 /// a diff matching edges by identity would never see.
 ///
-/// `order` is the plan's own key for it, and it counts **per source node**
-/// rather than over the whole list, because that is what the rule is stated
-/// over: an edge inserted between two edges of a different node changes nobody's
-/// precedence, and reporting it as though it had would make every insertion look
-/// like a routing change.
+/// [`ORDER`] is the plan's own key for it — the same one a named array's entries
+/// carry when their order is the composition's (`diff`) — and it counts **per
+/// source node** rather than over the whole list, because that is what the rule
+/// is stated over: an edge inserted between two edges of a different node
+/// changes nobody's precedence, and reporting it as though it had would make
+/// every insertion look like a routing change.
 fn ordered(flow: &Flow) -> Vec<Value> {
     let mut counted: BTreeMap<String, u64> = BTreeMap::new();
     flow.edges
@@ -529,7 +530,7 @@ fn ordered(flow: &Flow) -> Vec<Value> {
             let from = text(&value, "from").to_string();
             let at = counted.entry(from).or_insert(0);
             if let Value::Object(map) = &mut value {
-                map.insert("order".to_string(), Value::from(*at));
+                map.insert(ORDER.to_string(), Value::from(*at));
             }
             *at += 1;
             value

@@ -8,8 +8,8 @@
 //! half of that — it holds the *shape* to the document; this file holds what the
 //! document *says* to what the command actually produces.
 //!
-//! The corpus is one composition and eight edits of it, each chosen for a
-//! sentence `docs/plan.md` makes:
+//! The corpus is one composition and a project per edit of it, each edit chosen
+//! for a sentence `docs/plan.md` makes:
 //!
 //! | project | what it pins |
 //! |---|---|
@@ -19,6 +19,8 @@
 //! | `retimed-policy` | §5's policy half, at all three sites that carry one |
 //! | `widened-surface` | §6: what a caller feels, and nothing else |
 //! | `redeployed` | §4's deploy-layer components, which the `local` target admits |
+//! | `reordered` | §3's order rule and §11's line under it, in both directions at once |
+//! | `reworded-prompt` | §13: a cut may not hide the change it was run to show |
 //! | `added-flow` | §3's rule that a component which arrived brings nothing with it |
 //! | `broken-routing` | §7 in both directions, and §1's second property: an error introduced is a plan, exit `0` |
 //! | `unresolvable-after` | §2.3: a spec with no artifact leaves nothing to compare, exit `1` |
@@ -265,6 +267,8 @@ topology
   ~ state.draft  rerouted-flow/after/main.yml:8:3
       type.description: \"The current draft, rewritten on every pass.\" -> \"The current draft, rewritten on every pass and …
 
+note: a value longer than one line is cut, with a `…` where the cut is; \
+`--format json` carries every value whole
 `rerouted-flow/after/main.yml` differs from `rerouted-flow/before/main.yml` (target `local`): \
 5 topology changes
 "
@@ -322,6 +326,8 @@ interfaces
       respond: \"sync\" -> \"async\"
       session_key: (absent) -> \"payload.body.session\"
 
+note: a value longer than one line is cut, with a `…` where the cut is; \
+`--format json` carries every value whole
 `widened-surface/after/main.yml` differs from `widened-surface/before/main.yml` (target `local`): \
 2 interface changes
 "
@@ -345,11 +351,86 @@ fn a_changed_deploy_layer_is_reported_as_a_component() {
 components
   + placement.agent.reviewer  redeployed/after/deploy/local.yml:5:3
   ~ placement.agent.writer  redeployed/after/deploy/local.yml:7:3
+      description: \"In-process, where there is one process.\" -> \"Its own process, even locally.\"
       runtime: \"colocated\" -> \"isolated\"
 
 `redeployed/after/main.yml` differs from `redeployed/before/main.yml` (target `local`): \
 2 component changes
 "
+    );
+    assert_eq!(code, 0);
+}
+
+/// A declaration order is reported when the composition behaves differently for
+/// it, and not otherwise.
+///
+/// The `after` of this pair swaps **six** declarations and edits nothing else.
+/// Two of them reach the schema the model is handed — a field map's order is a
+/// JSON Schema's `properties` and `required`, a union's is its `oneOf` — and are
+/// the four lines below. The other four are the assertion this test is really
+/// making, because what pins them is the lines that are *not* here: an
+/// `optional:` set, an `expect_exit:` set, a node's `input:` bindings and a
+/// routed map's `routes:` are all selected by name or tested for membership, so
+/// `docs/plan.md` §11 leaves them out and a regression would show up as extra
+/// lines in this golden.
+#[test]
+fn a_declaration_order_is_reported_where_the_composition_reads_it() {
+    let (report, code) = report("reordered");
+    assert_eq!(
+        report,
+        "\
+components
+  ~ agent.reviewer  reordered/after/main.yml:43:1
+      output.fields[reason].order: 1 -> 0
+      output.fields[verdict].order: 0 -> 1
+  ~ agent.triage  reordered/after/main.yml:53:1
+      output.fields[findings].type.items.variants[auto_fixable].order: 0 -> 1
+      output.fields[findings].type.items.variants[needs_human].order: 1 -> 0
+
+`reordered/after/main.yml` differs from `reordered/before/main.yml` (target `local`): \
+2 component changes
+"
+    );
+    assert_eq!(code, 0);
+}
+
+/// A cut may not hide the change the command was run to show.
+///
+/// The two prompts of this pair agree for sixty-odd characters and differ after
+/// them, which is past the end of a report line: cut from the head, both sides
+/// would print as the same text. The window moves onto the difference instead,
+/// the same window on both sides, and the note above the verdict says where the
+/// whole value is (`docs/plan.md` §13).
+#[test]
+fn a_value_cut_past_the_difference_is_printed_from_the_difference() {
+    let (report, code) = report("reworded-prompt");
+    assert_eq!(
+        report,
+        "\
+components
+  ~ agent.reviewer  reworded-prompt/after/main.yml:13:1
+      prompt: …hen say alpha.\" -> …hen say beta.\"
+
+note: a value longer than one line is cut, with a `…` where the cut is; \
+`--format json` carries every value whole
+`reworded-prompt/after/main.yml` differs from `reworded-prompt/before/main.yml` (target `local`): \
+1 component change
+"
+    );
+    assert_eq!(code, 0);
+
+    // …and the machine document carries the two prompts whole, which is what the
+    // note points at.
+    let (document, code) = document("reworded-prompt");
+    assert!(
+        document
+            .contains("\"Review the draft with great care and much attention, then say alpha.\""),
+        "{document}"
+    );
+    assert!(
+        document
+            .contains("\"Review the draft with great care and much attention, then say beta.\""),
+        "{document}"
     );
     assert_eq!(code, 0);
 }
@@ -547,7 +628,12 @@ fn a_project_directory_names_its_own_entrypoint() {
 /// makes the ordering rules a property rather than an accident.
 #[test]
 fn one_pair_produces_one_plan_however_often_it_is_asked() {
-    for project in ["rerouted-flow", "broken-routing", "widened-surface"] {
+    for project in [
+        "rerouted-flow",
+        "broken-routing",
+        "widened-surface",
+        "reordered",
+    ] {
         let (first, _) = report(project);
         let (second, _) = report(project);
         assert_eq!(first, second, "{project}: the human report is stable");

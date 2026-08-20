@@ -6,9 +6,9 @@
 //! [`Serialize`], so the comparison is written over
 //! [`Value`](serde_json::Value) rather than over sixty pairs of match arms. It
 //! is the same substrate the artifact itself is written in, so a path this
-//! module reports — `output.fields[0].type.form` — is a path into the artifact a
-//! reader can follow, and a field added to the IR is diffed the day it is added
-//! rather than the day somebody remembers to extend a walker.
+//! module reports — `output.fields[verdict].type.form` — is a path into the
+//! artifact a reader can follow, and a field added to the IR is diffed the day
+//! it is added rather than the day somebody remembers to extend a walker.
 //!
 //! # Why spans come out first
 //!
@@ -40,6 +40,42 @@
 //! region, which loses that one key from the comparison; nothing else in the
 //! artifact can reach either shape by accident.
 //!
+//! # Which arrays carry an order
+//!
+//! Some of the artifact's arrays are **sequences** whose order the composition
+//! behaves differently for, and some are **sets** whose order carries nothing. A
+//! plan has to tell them apart in both directions: an order it reports where
+//! none exists is a line about an edit nobody made, and an order it hides where
+//! one exists is the plan saying two compositions agree when they do not.
+//!
+//! The line is drawn at what a reordering *does*, and the key an array sits
+//! under is what decides it:
+//!
+//! * three keys are sets. `optional:` (grammar 3.4) names the properties an
+//!   object does not require, `expect_exit:` (6.1, 8.2) the exit statuses a
+//!   process may end with, and `expect_status:` (6.1, 8.3) the response statuses
+//!   a request may return. Each is parsed as a **distinct** membership and
+//!   membership-tested at run time, so [`normalize`] sorts all three: their
+//!   order never reaches a comparison at all;
+//! * `fields:` and `variants:` are sequences, and the ones that would otherwise
+//!   be missed. Both are matched by name — so a schema that gained a property is
+//!   one change at that property — and *both* orders reach the JSON Schema the
+//!   model is handed: a field map's order is the order of `properties` and of
+//!   `required`, a union's is the order of `oneOf`. So [`walk`] reports a move
+//!   through the same synthesized `order` key `sections::ordered` gives an edge;
+//! * every other array is compared by position already, which is right for the
+//!   ones whose order is plainly the author's: a model's `route:` (failover
+//!   order), an `exec:`'s `args:` (argv order), an `enum:`'s variants (the order
+//!   they reach a structured-output schema in).
+//!
+//! What is left silent on purpose is a reordering that changes the *layout* of
+//! the emitted project and nothing it does: a node `input:` binding map, a
+//! `writes:` remap, an `env:` or `headers:` map, a `map:`'s `routes:`. All of
+//! them are dispatched on by name — the generated code looks each up by the name
+//! it is written under — and a plan is a diff of compositions, not of files
+//! (`docs/plan.md` §11). `agent-compose build --check` is the command that
+//! notices a generated file whose bytes moved.
+//!
 //! # Depth
 //!
 //! [`normalize`] and [`walk`] recurse, and what they recurse over is the depth
@@ -50,12 +86,28 @@
 //! (`parse::schema`) and the serializer's, so nothing here adds a failure class
 //! a composition could not already reach one pass earlier.
 
-use std::collections::BTreeSet;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 use serde_json::{Map, Value};
 
 use super::document::FieldChange;
+
+/// The key a plan reports a declaration position under.
+///
+/// Not a key of the artifact: the IR carries a position as a position, and this
+/// is the plan's name for it — here for a named array's entries, and in
+/// [`sections::ordered`](super::sections) for a flow's edges.
+pub(super) const ORDER: &str = "order";
+
+/// The keys whose arrays are **sets**, canonicalized by [`normalize`] so that
+/// their order never reaches a comparison. See the module docs.
+const SETS: &[&str] = &["expect_exit", "expect_status", "optional"];
+
+/// The keys whose **named** arrays are sequences: matched by name, and reporting
+/// a move through [`ORDER`]. See the module docs.
+const SEQUENCES: &[&str] = &["fields", "variants"];
 
 /// One IR fragment as JSON, with its source coordinates taken out.
 ///
@@ -74,9 +126,16 @@ pub(super) fn semantic<T: Serialize>(value: &T) -> Value {
     )
 }
 
-/// The same value with every source region removed and every spanned value
-/// unwrapped. See the module docs for what is recognized and why.
+/// The same value with every source region removed, every spanned value
+/// unwrapped, and every set-valued array sorted. See the module docs for what is
+/// recognized and why.
 fn normalize(value: Value) -> Value {
+    held("", value)
+}
+
+/// The same, carrying the key the value was found under — which is what says
+/// whether an array below it is one of [`SETS`].
+fn held(key: &str, value: Value) -> Value {
     match value {
         Value::Object(map) => {
             if map.len() == 2
@@ -84,9 +143,9 @@ fn normalize(value: Value) -> Value {
                 && let Some(Value::String(text)) = map.get("span")
                 && crate::ir::leaf::parse_span(text).is_some()
             {
-                return normalize(inner.clone());
+                return held(key, inner.clone());
             }
-            let mut held = Map::new();
+            let mut kept = Map::new();
             for (key, value) in map {
                 if key == "span"
                     && let Value::String(text) = &value
@@ -94,13 +153,46 @@ fn normalize(value: Value) -> Value {
                 {
                     continue;
                 }
-                held.insert(key, normalize(value));
+                let value = held(&key, value);
+                kept.insert(key, value);
             }
-            Value::Object(held)
+            Value::Object(kept)
         }
-        Value::Array(items) => Value::Array(items.into_iter().map(normalize).collect()),
+        Value::Array(items) => {
+            let mut items: Vec<Value> = items.into_iter().map(|item| held(key, item)).collect();
+            if SETS.contains(&key) && scalars(&items) {
+                items.sort_by(order);
+            }
+            Value::Array(items)
+        }
         scalar => scalar,
     }
+}
+
+/// Whether every element is a scalar of one kind — all strings, or all numbers.
+///
+/// The three set keys hold exactly that: `optional:` a list of identifiers,
+/// `expect_exit:` and `expect_status:` a list of integers. Requiring it keeps
+/// the canonicalization off the surfaces where an author chooses the keys — a
+/// model's `settings:`, a schema's `default:`, a deploy backend's plugin config
+/// — where an array of objects written under a key spelled `optional` is data
+/// rather than one of the grammar's sets. The residual, an author's own flat
+/// array of scalars under one of the three names, is sorted like the set it is
+/// spelled as: the same class of residual the `span` rule above leaves, and the
+/// same reason it is tolerable.
+fn scalars(items: &[Value]) -> bool {
+    items.iter().all(Value::is_string) || items.iter().all(Value::is_number)
+}
+
+/// A total order over the scalars a set holds: numbers by their value, anything
+/// else by its JSON text, ties broken by that text so that the sort is decided
+/// by the values alone rather than by the order they arrived in.
+fn order(left: &Value, right: &Value) -> Ordering {
+    match (left.as_f64(), right.as_f64()) {
+        (Some(one), Some(two)) => one.partial_cmp(&two).unwrap_or(Ordering::Equal),
+        _ => Ordering::Equal,
+    }
+    .then_with(|| left.to_string().cmp(&right.to_string()))
 }
 
 /// The same object without these top-level keys — the ones another section of
@@ -141,18 +233,16 @@ pub(super) fn only(value: Value, keys: &[&str]) -> Value {
 ///   `fields`, a binding list's `entries`, a union's `variants`, a routed map's
 ///   `routes` — are matched on that name and compared entry by entry, so a
 ///   schema that gained a property is one change at that property rather than a
-///   rewrite of the whole map. The trade is that their declaration order is not
-///   reported, which is right for the four lists that have one: a JSON object's
-///   properties, a mapping's bindings, and a discriminator's variants are all
-///   dispatched on by name;
+///   rewrite of the whole map. Where the module docs say the order of one of
+///   those is the composition's rather than the file's ([`SEQUENCES`]), the
+///   entry also carries its position as [`ORDER`], so a swap is a change at the
+///   two entries that swapped;
 /// * two other arrays are compared element by element **when they are the same
 ///   length**, so the ones whose order *is* semantic — a model's `route:`
 ///   (failover order), an `exec:`'s `args:` (argv order), an `enum:`'s variants
 ///   (the order they reach a structured-output schema in) — report a move. The
-///   three that are really sets and not sequences (`optional:`,
-///   `expect_exit:`, `expect_status:`) report a reordering nobody meant, which
-///   is the direction to be wrong in: a line to skim, against a silently
-///   reordered failover route;
+///   three arrays that are sets rather than sequences never reach this arm in
+///   two orders, because [`normalize`] has already sorted them;
 /// * when the lengths differ and nothing names itself, the array is one change:
 ///   an element inserted in the middle shifts every index after it, and
 ///   reporting each shifted element would bury the insertion that caused them.
@@ -161,16 +251,20 @@ pub(super) fn only(value: Value, keys: &[&str]) -> Value {
 ///   `sections::edges`);
 /// * anything else is reported as it stands.
 ///
-/// The result is in path order, which is the key order of a
-/// [`Map`](serde_json::Map) — sorted — so the same pair of fragments always
-/// produces the same list.
+/// The result is in path order — an object's keys sorted, an array's entries in
+/// index order for a positional array and in sorted name order for a named one —
+/// so the same pair of fragments always produces the same list.
 pub(super) fn changes(before: &Value, after: &Value) -> Vec<FieldChange> {
     let mut found = Vec::new();
-    walk("", before, after, &mut found);
+    walk("", "", before, after, &mut found);
     found
 }
 
-fn walk(path: &str, before: &Value, after: &Value, found: &mut Vec<FieldChange>) {
+/// `key` is the object key this pair was found under, which is what says whether
+/// an array here carries an order a plan reports ([`SEQUENCES`]). It is passed
+/// on unchanged into an array's elements, so that the key of the array is what
+/// classifies it however the elements are shaped.
+fn walk(path: &str, key: &str, before: &Value, after: &Value, found: &mut Vec<FieldChange>) {
     if before == after {
         return;
     }
@@ -180,7 +274,7 @@ fn walk(path: &str, before: &Value, after: &Value, found: &mut Vec<FieldChange>)
             for key in keys {
                 let path = join(path, key);
                 match (old.get(key), new.get(key)) {
-                    (Some(old), Some(new)) => walk(&path, old, new, found),
+                    (Some(old), Some(new)) => walk(&path, key, old, new, found),
                     (old, new) => found.push(FieldChange {
                         path,
                         before: old.cloned(),
@@ -190,16 +284,22 @@ fn walk(path: &str, before: &Value, after: &Value, found: &mut Vec<FieldChange>)
             }
         }
         (Value::Array(old), Value::Array(new)) if identity(old, new).is_some() => {
-            let key = identity(old, new).expect("the arm matched on it");
+            let id = identity(old, new).expect("the arm matched on it");
             let names: BTreeSet<&str> = old
                 .iter()
                 .chain(new)
-                .filter_map(|item| name(item, key))
+                .filter_map(|item| name(item, id))
                 .collect();
+            let places = places(key, old, new, id);
             for held in names {
                 let path = format!("{path}[{held}]");
-                match (entry(old, key, held), entry(new, key, held)) {
-                    (Some(old), Some(new)) => walk(&path, old, new, found),
+                match (entry(old, id, held), entry(new, id, held)) {
+                    (Some(old), Some(new)) => match places.as_ref().and_then(|at| at.moved(held)) {
+                        Some((one, two)) => {
+                            walk(&path, key, &placed(old, one), &placed(new, two), found);
+                        }
+                        None => walk(&path, key, old, new, found),
+                    },
                     (old, new) => found.push(FieldChange {
                         path,
                         before: old.cloned(),
@@ -210,7 +310,7 @@ fn walk(path: &str, before: &Value, after: &Value, found: &mut Vec<FieldChange>)
         }
         (Value::Array(old), Value::Array(new)) if old.len() == new.len() => {
             for (at, (old, new)) in old.iter().zip(new).enumerate() {
-                walk(&format!("{path}[{at}]"), old, new, found);
+                walk(&format!("{path}[{at}]"), key, old, new, found);
             }
         }
         _ => found.push(FieldChange {
@@ -219,6 +319,72 @@ fn walk(path: &str, before: &Value, after: &Value, found: &mut Vec<FieldChange>)
             after: Some(after.clone()),
         }),
     }
+}
+
+/// Where each side declares the entries **both** of them declare.
+///
+/// Counted over the common names rather than over each array on its own, which
+/// is what keeps an insertion from reading as a move: a field added at the front
+/// of a schema shifts every index below it, and the entries that shifted are in
+/// the same order relative to each other as they were. A move is the case where
+/// that is no longer true, and it is reported at the entries that moved.
+struct Places<'a> {
+    before: BTreeMap<&'a str, u64>,
+    after: BTreeMap<&'a str, u64>,
+}
+
+impl Places<'_> {
+    /// This entry's two positions, when it has one on each side and they differ.
+    fn moved(&self, held: &str) -> Option<(u64, u64)> {
+        let one = *self.before.get(held)?;
+        let two = *self.after.get(held)?;
+        (one != two).then_some((one, two))
+    }
+}
+
+/// The positions to report for a named array, or `None` when this one carries no
+/// order a plan reports.
+///
+/// The second refusal is the collision guard: [`ORDER`] is the plan's key rather
+/// than the artifact's, so an array whose entries already carry one is author
+/// data (a model's `settings:`, a plugin config) shaped like a named list, and
+/// is compared as it stands rather than overwritten with a position.
+fn places<'a>(key: &str, old: &'a [Value], new: &'a [Value], id: &str) -> Option<Places<'a>> {
+    if !SEQUENCES.contains(&key) {
+        return None;
+    }
+    if old.iter().chain(new).any(|item| item.get(ORDER).is_some()) {
+        return None;
+    }
+    let held: BTreeSet<&str> = new.iter().filter_map(|item| name(item, id)).collect();
+    let common: BTreeSet<&str> = old
+        .iter()
+        .filter_map(|item| name(item, id))
+        .filter(|at| held.contains(at))
+        .collect();
+    Some(Places {
+        before: counted(old, id, &common),
+        after: counted(new, id, &common),
+    })
+}
+
+fn counted<'a>(items: &'a [Value], id: &str, common: &BTreeSet<&str>) -> BTreeMap<&'a str, u64> {
+    items
+        .iter()
+        .filter_map(|item| name(item, id))
+        .filter(|held| common.contains(held))
+        .enumerate()
+        .map(|(at, held)| (held, at as u64))
+        .collect()
+}
+
+/// The same entry carrying its position, so that a move is one field of it.
+fn placed(item: &Value, at: u64) -> Value {
+    let mut held = item.clone();
+    if let Value::Object(map) = &mut held {
+        map.insert(ORDER.to_string(), Value::from(at));
+    }
+    held
 }
 
 /// The keys an array's elements can name themselves by, in the order they are
@@ -362,6 +528,87 @@ mod tests {
         );
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].path, "args");
+    }
+
+    /// A field map's order reaches the schema the model is handed, so a swap is
+    /// a change — at the two entries that swapped, and nowhere else.
+    #[test]
+    fn a_named_sequence_reports_the_entries_that_moved() {
+        let before = json!({ "fields": [{ "name": "a" }, { "name": "b" }] });
+        let after = json!({ "fields": [{ "name": "b" }, { "name": "a" }] });
+        assert_eq!(
+            changes(&before, &after),
+            [
+                FieldChange {
+                    path: "fields[a].order".to_string(),
+                    before: Some(json!(0)),
+                    after: Some(json!(1)),
+                },
+                FieldChange {
+                    path: "fields[b].order".to_string(),
+                    before: Some(json!(1)),
+                    after: Some(json!(0)),
+                },
+            ]
+        );
+    }
+
+    /// …and an entry inserted at the front is one change, not one per entry it
+    /// pushed down: the positions are counted over the names both sides declare.
+    #[test]
+    fn an_insertion_into_a_named_sequence_moves_nothing() {
+        let before = json!({ "variants": [{ "tag": "a" }, { "tag": "b" }] });
+        let after = json!({ "variants": [{ "tag": "x" }, { "tag": "a" }, { "tag": "b" }] });
+        let found = changes(&before, &after);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].path, "variants[x]");
+    }
+
+    /// A named array whose order is dispatched on by name rather than read as a
+    /// sequence keeps reporting nothing about it.
+    #[test]
+    fn a_named_map_reports_no_order() {
+        assert_eq!(
+            changes(
+                &json!({ "entries": [{ "name": "a" }, { "name": "b" }] }),
+                &json!({ "entries": [{ "name": "b" }, { "name": "a" }] }),
+            ),
+            []
+        );
+    }
+
+    /// The three set-valued keys are canonicalized, so a reordering of one is
+    /// not a change — and a membership edit still is.
+    #[test]
+    fn a_set_is_compared_by_membership_rather_than_by_position() {
+        for key in ["optional", "expect_exit", "expect_status"] {
+            let one = semantic(&serde_json::json!({ key: ["b", "a"] }));
+            let two = semantic(&serde_json::json!({ key: ["a", "b"] }));
+            assert_eq!(changes(&one, &two), [], "{key}");
+
+            let three = semantic(&serde_json::json!({ key: ["a", "c"] }));
+            let found = changes(&two, &three);
+            assert_eq!(found.len(), 1, "{key}: {found:?}");
+            assert_eq!(found[0].path, format!("{key}[1]"), "{key}");
+        }
+    }
+
+    /// A set of numbers sorts by its numbers rather than by their text, so
+    /// `[2, 10]` and `[10, 2]` are one set and the reported one reads as one.
+    #[test]
+    fn a_set_of_numbers_is_canonicalized_numerically() {
+        let one = semantic(&serde_json::json!({ "expect_exit": [10, 2] }));
+        let two = semantic(&serde_json::json!({ "expect_exit": [2, 10] }));
+        assert_eq!(changes(&one, &two), []);
+        assert_eq!(one, json!({ "expect_exit": [2, 10] }));
+    }
+
+    /// The set rule is stated over flat scalars, so an author's own array of
+    /// objects under one of the three names is left as it stands.
+    #[test]
+    fn an_authors_array_of_objects_is_not_taken_for_a_set() {
+        let value = json!({ "settings": { "optional": [{ "b": 1 }, { "a": 1 }] } });
+        assert_eq!(normalize(value.clone()), value);
     }
 
     #[test]

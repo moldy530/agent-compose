@@ -5,4 +5,4 @@ version: "0.1"
 placements:
   agent.writer:
     runtime: colocated
-    description: In-process locally, where there is one process.
+    description: In-process, where there is one process.

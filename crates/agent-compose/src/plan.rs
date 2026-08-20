@@ -33,12 +33,22 @@
 //!
 //! # Long values
 //!
-//! A field's before and after are written as compact JSON and cut at
-//! [`WIDTH`] characters, with a `…` and no closing quote so that a cut is
-//! visible rather than plausible. A changed `prompt:` is a paragraph, and a
-//! report that printed both copies of it in full would be unreadable for the one
-//! line it was run to find. `--format json` carries every value whole, which is
-//! what the note under a cut line says.
+//! A field's before and after are written as compact JSON and cut to [`WIDTH`]
+//! characters, with a `…` and no closing quote so that a cut is visible rather
+//! than plausible. A changed `prompt:` is a paragraph, and a report that printed
+//! both copies of it in full would be unreadable for the one line it was run to
+//! find.
+//!
+//! What a cut may not do is hide the change. Two values that agree for the first
+//! fifty characters and differ after them would both cut to the same text, and
+//! the one line the command was run to produce would read as a non-change — so
+//! the window **moves**: when the first difference falls past the end of the
+//! cut, both sides are printed from [`LEAD`] characters before it instead, with
+//! a leading `…` saying so. The window is the same on both sides, so the two
+//! stay aligned.
+//!
+//! A report that cut anything says so once, above the verdict ([`NOTE`]), and
+//! points at `--format json`, which carries every value whole.
 
 use std::path::Path;
 
@@ -52,54 +62,65 @@ use serde_json::Value;
 /// How much of one value a report prints before cutting it.
 const WIDTH: usize = 48;
 
+/// How much of the text the two sides agree on is kept in front of the first
+/// difference, when the cut has to move off the head of the value.
+const LEAD: usize = 8;
+
+/// What a report says once when it printed a value it had to cut.
+const NOTE: &str = "note: a value longer than one line is cut, with a `…` where the cut is; \
+                    `--format json` carries every value whole\n";
+
 /// The human report, as one string ready for stderr.
 ///
 /// `before_root` and `after_root` are the two compositions' project roots, which
 /// are their entrypoints' own directories (grammar 1.4).
 pub(crate) fn human(before_root: &Path, after_root: &Path, plan: &Plan) -> String {
+    // Whether any value on the page was cut, which is what [`NOTE`] is about.
+    // A finding is never cut — its message is a whole sentence and is printed as
+    // one — so the validation section cannot set it.
+    let mut cut = false;
+    let components: String = plan
+        .components
+        .iter()
+        .map(|change| component(before_root, after_root, change, &mut cut))
+        .collect();
+    let topology: String = plan
+        .topology
+        .iter()
+        .map(|change| topology(before_root, after_root, change, &mut cut))
+        .collect();
+    let interfaces: String = plan
+        .interfaces
+        .iter()
+        .map(|change| interface(after_root, change, &mut cut))
+        .collect();
+    let mut validation = String::new();
+    for finding in &plan.validation.introduced {
+        validation.push_str(&reported(after_root, ChangeKind::Added, finding));
+    }
+    for finding in &plan.validation.resolved {
+        validation.push_str(&reported(before_root, ChangeKind::Removed, finding));
+    }
+
     let mut report = String::new();
-    let mut section = |name: &str, lines: String| {
+    for (name, lines) in [
+        ("components", components),
+        ("topology", topology),
+        ("interfaces", interfaces),
+        ("validation", validation),
+    ] {
         if lines.is_empty() {
-            return;
+            continue;
         }
         report.push_str(name);
         report.push('\n');
         report.push_str(&lines);
         report.push('\n');
-    };
+    }
 
-    section(
-        "components",
-        plan.components
-            .iter()
-            .map(|change| component(before_root, after_root, change))
-            .collect(),
-    );
-    section(
-        "topology",
-        plan.topology
-            .iter()
-            .map(|change| topology(before_root, after_root, change))
-            .collect(),
-    );
-    section(
-        "interfaces",
-        plan.interfaces
-            .iter()
-            .map(|change| interface(after_root, change))
-            .collect(),
-    );
-    section("validation", {
-        let mut lines = String::new();
-        for finding in &plan.validation.introduced {
-            lines.push_str(&reported(after_root, ChangeKind::Added, finding));
-        }
-        for finding in &plan.validation.resolved {
-            lines.push_str(&reported(before_root, ChangeKind::Removed, finding));
-        }
-        lines
-    });
-
+    if cut {
+        report.push_str(NOTE);
+    }
     report.push_str(&verdict(plan));
     report
 }
@@ -134,33 +155,46 @@ fn verdict(plan: &Plan) -> String {
     )
 }
 
-fn component(before_root: &Path, after_root: &Path, change: &ComponentChange) -> String {
+fn component(
+    before_root: &Path,
+    after_root: &Path,
+    change: &ComponentChange,
+    cut: &mut bool,
+) -> String {
     entry(
         root(before_root, after_root, change.change),
         change.change,
         &change.address,
         &change.span,
         &change.fields,
+        cut,
     )
 }
 
-fn topology(before_root: &Path, after_root: &Path, change: &TopologyChange) -> String {
+fn topology(
+    before_root: &Path,
+    after_root: &Path,
+    change: &TopologyChange,
+    cut: &mut bool,
+) -> String {
     entry(
         root(before_root, after_root, change.change),
         change.change,
         &change.address,
         &change.span,
         &change.fields,
+        cut,
     )
 }
 
-fn interface(after_root: &Path, change: &InterfaceChange) -> String {
+fn interface(after_root: &Path, change: &InterfaceChange, cut: &mut bool) -> String {
     entry(
         after_root,
         change.change,
         &change.address,
         &change.span,
         &change.fields,
+        cut,
     )
 }
 
@@ -180,18 +214,19 @@ fn entry(
     address: &str,
     span: &Span,
     fields: &[FieldChange],
+    cut: &mut bool,
 ) -> String {
     let mut held = format!("  {} {address}  {}\n", mark(change), at(root, span));
     for field in fields {
+        let (before, after, was_cut) = sides(field);
+        *cut |= was_cut;
         held.push_str(&format!(
-            "      {}: {} -> {}\n",
+            "      {}: {before} -> {after}\n",
             if field.path.is_empty() {
                 "(value)"
             } else {
                 field.path.as_str()
             },
-            value(field.before.as_ref()),
-            value(field.after.as_ref()),
         ));
     }
     held
@@ -227,21 +262,51 @@ fn at(root: &Path, span: &Span) -> String {
     )
 }
 
+/// One field change's two sides as the report prints them, and whether either
+/// had to be cut.
+///
+/// The window is chosen from the **pair** rather than from each side on its own,
+/// which is the whole point: two values that agree past the end of the cut would
+/// otherwise print as the same text twice, and the line the reader came for
+/// would say nothing. When the first difference falls outside the first [`WIDTH`]
+/// characters, both sides are printed from [`LEAD`] characters ahead of it —
+/// the same offset on both, so the two lines still read against each other.
+fn sides(field: &FieldChange) -> (String, String, bool) {
+    let before = value(field.before.as_ref());
+    let after = value(field.after.as_ref());
+    if before.chars().count() <= WIDTH && after.chars().count() <= WIDTH {
+        return (before, after, false);
+    }
+    let shared = before
+        .chars()
+        .zip(after.chars())
+        .take_while(|(one, two)| one == two)
+        .count();
+    let skip = if shared < WIDTH { 0 } else { shared - LEAD };
+    (cut(&before, skip), cut(&after, skip), true)
+}
+
 /// One side of a field change, as compact JSON — or `(absent)`, which is what a
 /// field the spec does not declare at all reads as. That is a real distinction:
 /// an absent `timeout:` inherits the next level of grammar 9.3's chain, and one
 /// written `null` does not parse at all.
 fn value(held: Option<&Value>) -> String {
-    held.map_or_else(|| "(absent)".to_string(), |value| elide(&value.to_string()))
+    held.map_or_else(|| "(absent)".to_string(), Value::to_string)
 }
 
-/// A value cut to [`WIDTH`] characters, with the cut made visible.
-fn elide(text: &str) -> String {
-    if text.chars().count() <= WIDTH {
-        return text.to_string();
+/// A value from `skip` characters in, at most [`WIDTH`] of them, with a `…` on
+/// whichever end was cut — and no closing quote, so that a cut looks like one
+/// rather than like a whole value.
+fn cut(text: &str, skip: usize) -> String {
+    let mut held = String::new();
+    if skip > 0 {
+        held.push('…');
     }
-    let mut held: String = text.chars().take(WIDTH).collect();
-    held.push('…');
+    let mut rest = text.chars().skip(skip);
+    held.extend(rest.by_ref().take(WIDTH));
+    if rest.next().is_some() {
+        held.push('…');
+    }
     held
 }
 
@@ -316,16 +381,25 @@ pub(crate) fn refusal(failed: &[Failed<'_>]) -> Refusal {
 mod tests {
     use super::*;
 
+    /// A field change over two values, as the report renders them.
+    fn rendered(before: &str, after: &str) -> (String, String, bool) {
+        sides(&FieldChange {
+            path: "prompt".to_string(),
+            before: Some(Value::String(before.to_string())),
+            after: Some(Value::String(after.to_string())),
+        })
+    }
+
     #[test]
     fn a_value_is_cut_at_the_reports_width_and_says_so() {
-        assert_eq!(elide("\"short\""), "\"short\"");
+        assert_eq!(cut("\"short\"", 0), "\"short\"");
         let long = format!("\"{}\"", "a".repeat(80));
-        let cut = elide(&long);
-        assert_eq!(cut.chars().count(), WIDTH + 1);
-        assert!(cut.ends_with('…'), "the cut is visible: {cut}");
+        let held = cut(&long, 0);
+        assert_eq!(held.chars().count(), WIDTH + 1);
+        assert!(held.ends_with('…'), "the cut is visible: {held}");
         assert!(
-            !cut.ends_with("\"…"),
-            "…and the value is left unterminated rather than looking whole: {cut}"
+            !held.ends_with("\"…"),
+            "…and the value is left unterminated rather than looking whole: {held}"
         );
     }
 
@@ -333,8 +407,45 @@ mod tests {
     #[test]
     fn a_multibyte_value_is_cut_between_characters() {
         let long = format!("\"{}\"", "é".repeat(80));
-        let cut = elide(&long);
-        assert_eq!(cut.chars().count(), WIDTH + 1);
+        assert_eq!(cut(&long, 0).chars().count(), WIDTH + 1);
+    }
+
+    /// Two values that differ inside the first line are printed from the start,
+    /// and the pair is reported as cut only when something was actually taken
+    /// off it.
+    #[test]
+    fn a_difference_inside_the_line_leaves_the_window_where_it_is() {
+        let (before, after, cut) = rendered("alpha", "beta");
+        assert_eq!(
+            (before.as_str(), after.as_str(), cut),
+            ("\"alpha\"", "\"beta\"", false)
+        );
+
+        let (before, after, cut) = rendered("a", &"b".repeat(80));
+        assert_eq!(before, "\"a\"");
+        assert!(after.starts_with("\"bbb"), "{after}");
+        assert!(after.ends_with('…'), "{after}");
+        assert!(cut);
+    }
+
+    /// …and two values that agree past the end of the cut are printed from the
+    /// difference instead, so the line the report was run to find says
+    /// something. This is the failure the moving window exists for: both sides
+    /// cut at the same prefix render as the same text.
+    #[test]
+    fn a_difference_past_the_cut_moves_the_window_onto_it() {
+        let shared = "Review the draft with great care and much attention, then say ";
+        let (before, after, cut) = rendered(&format!("{shared}alpha"), &format!("{shared}beta"));
+        assert!(cut);
+        assert_ne!(before, after, "the two sides do not print as one text");
+        assert!(before.starts_with('…'), "{before}");
+        assert!(after.starts_with('…'), "{after}");
+        assert!(before.ends_with("say alpha\""), "{before}");
+        assert!(after.ends_with("say beta\""), "{after}");
+        // The window is the same on both sides, so the two lines read against
+        // each other: they still share their first LEAD characters of text.
+        let lead: String = before.chars().skip(1).take(LEAD).collect();
+        assert_eq!(lead, after.chars().skip(1).take(LEAD).collect::<String>());
     }
 
     #[test]

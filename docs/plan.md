@@ -62,7 +62,9 @@ UX, so a definition moved between files, an `imports:` list reordered, a comment
 added, a mapping reflowed, and two definitions swapped in one file are changes to
 files and to nothing the composition does. A plan reports none of them. What
 follows from that is §10: source regions are taken out of the comparison before
-anything is compared, and carried alongside as locations instead.
+anything is compared, and carried alongside as locations instead. What it does
+*not* cover is a declaration order the composition behaves differently for, which
+§3 reports and §11 draws the line for.
 
 **A diagnostic is content, not a refusal.** The whole check phase runs over both
 sides, and the difference between the two reports is §7. "The after spec
@@ -177,12 +179,31 @@ compared key by key, so a key on one side only is one change at that key. Two
 arrays whose elements name themselves — a field map's `fields`, a binding list's
 `entries`, a union's `variants`, a routed map's `routes` — are matched on that
 name and compared entry by entry, which is what makes a schema that gained a
-property one change at that property; their declaration order is not reported,
-because all four are dispatched on by name. Every other array is compared element
-by element when the two are the same length, so the lists whose order *is*
-semantic — a model's `route:`, an `exec:`'s `args:`, an `enum:`'s variants —
-report a move; when the lengths differ, the array is one change, because an
-insertion shifts every index after it.
+property one change at that property. Every other array is compared element by
+element when the two are the same length, so the lists whose order *is* semantic
+— a model's `route:`, an `exec:`'s `args:`, an `enum:`'s variants — report a
+move; when the lengths differ, the array is one change, because an insertion
+shifts every index after it.
+
+**A declaration order is reported when the composition behaves differently for
+it.** Two of the named arrays do: a field map's `fields` is the order of a JSON
+Schema's `properties` and of its `required`, and a union's `variants` is the
+order of its `oneOf` — both of which are handed to the model as written. An entry
+of one of those whose position moved carries one extra field record, whose `path`
+is the entry's own path with `.order` on the end
+(`output.fields[verdict].order`), holding its position on each side as a number.
+Positions are counted over the names **both**
+specs declare, so an entry inserted ahead of others is one addition rather than a
+move of everything below it. `order` is this format's key rather than the
+artifact's; §5 gives an edge one for the same reason.
+
+Three keys are the opposite of that: `optional:`, `expect_exit:` and
+`expect_status:` are parsed as distinct memberships and membership-tested at run
+time, so their order is not compared at all and a spec that only reshuffles one
+of them has changed nothing. The remaining named arrays — a node's `input:`
+bindings, a `writes:` remap, an `env:` or `headers:` map, a routed map's
+`routes:` — are dispatched on by name, and §11 is where their order is accounted
+for.
 
 ## 4. Components
 
@@ -378,8 +399,12 @@ a plan is ordered by the order anything was visited in.
   the `address` itself for a channel and for the defaults — then nodes before
   edges, then by `address`. So one flow's changes read together, its nodes before
   the edges between them.
-* **`fields`** within one record are in path order, which is the sorted key order
-  of the objects they were found in.
+* **`fields`** within one record are in the order the comparison walks them: an
+  object's keys sorted, a positional array's elements by index, and a named
+  array's entries by name, sorted. That is not the same as sorting the `path`
+  strings — index `[9]` is walked before `[10]`, which sorts after it — so a
+  consumer reproducing the order walks the subject rather than re-sorting the
+  paths. Either way it is decided by the two artifacts and by nothing else.
 * **`introduced`** and **`resolved`** are each in the source order their own
   side's report is written in: by file, then by position, then by code.
 
@@ -411,8 +436,23 @@ so that a reader can go and look, not so that they can be diffed.
 
 ## 11. What is not compared
 
-Four things in the artifact are outside this version of the format, and each for
+Five things in the artifact are outside this version of the format, and each for
 a reason:
+
+* **an ordering nothing dispatches on.** This is the one item here that is a
+  judgement rather than a gap, and it is worth reading before relying on the
+  verdict line. §3 reports the declaration order of a field map and of a union,
+  because both reach the schema the model is handed. It does not report the order
+  of the arrays the generated code looks entries up in **by name** — a node's
+  `input:` bindings, a `writes:` remap, an `env:` or `headers:` map, a routed
+  map's `routes:` — nor of the three sets `optional:`, `expect_exit:` and
+  `expect_status:`. Reshuffling one of those is a change to the *layout* of the
+  generated project (a route descriptor moves in `src/graph.ts`, an
+  `expectExit: [0, 1]` literal is written `[1, 0]`, and the failure message that
+  quotes it back reads in the new order) and to nothing the composition decides:
+  every one of them is selected by name or tested for membership. A plan is a
+  diff of compositions, so it stays silent, and `agent-compose build --check` is
+  the command that notices a generated file whose bytes moved;
 
 * **`sources`** — the list of files the composition was read from. It is the one
   part of the IR that is *about* file layout, which §1 excludes by construction.
@@ -488,7 +528,8 @@ What that check cannot decide is whether a sentence here is *true*. That is what
 `crates/agent-compose/tests/plan_cli.rs` is for: it pins whole documents,
 byte for byte, over a corpus of spec pairs — a pair that differs only in
 formatting, a rename, a topology edit, a policy edit, a surface edit, a deploy
-edit, and a pair where the after spec introduces errors.
+edit, a pair that only reorders declarations, a pair whose one edit falls past
+the end of a report line, and a pair where the after spec introduces errors.
 
 ## 13. The human report
 
@@ -506,11 +547,19 @@ command ran in. A changed subject is followed by one indented line per field,
 `path: before -> after`, where a field the spec does not declare reads
 `(absent)`.
 
-Values are written as compact JSON and **cut** at 48 characters, with a `…` and
+Values are written as compact JSON and **cut** to 48 characters, with a `…` and
 no closing quote so that a cut is visible rather than plausible: a changed
 `prompt:` is a paragraph, and a report that printed both copies of it in full
-would be unreadable for the one line it was run to find. `--format json` carries
-every value whole.
+would be unreadable for the one line it was run to find.
+
+What the cut may not do is hide the change. Two values agreeing for more than a
+line — a prompt reworded at its end — would both cut to the same text, and the
+one line the command was run to produce would read as a non-change. So the window
+**moves**: when the first difference falls past the end of the cut, both sides
+are printed from a few characters ahead of it instead, with a leading `…` saying
+so. It is the same window on both sides, so the two still read against each
+other. A report that cut anything says so in one note above the verdict, and
+points at `--format json`, which carries every value whole.
 
 The closing line is the verdict, and every run prints one: either the two specs
 describe the same composition, or they differ — followed by a count per section.

@@ -1,0 +1,38 @@
+# A composition whose `after` edits one prompt, past the end of a report line.
+#
+# The two prompts agree for their first sixty-odd characters, which is more than
+# a report prints of one value: cut from the head, both sides would come out as
+# the same text and the one line the command was run to find would read as a
+# non-change. The window moves onto the difference instead.
+version: "0.1"
+
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+
+model.fast:
+  provider: provider.anthropic
+  id: some-fast-model
+
+agent.reviewer:
+  model: model.fast
+  prompt: Review the draft with great care and much attention, then say alpha.
+  input:
+    draft: { type: string }
+  output:
+    verdict: { enum: [approve, revise] }
+
+flow.review:
+  description: Review one draft.
+  inputs:
+    draft: { type: string }
+  outputs:
+    verdict: { enum: [approve, revise] }
+  nodes:
+    review:
+      agent: agent.reviewer
+      input:
+        draft: "input.draft"
+  edges:
+    - { from: start, to: review }
+    - { from: review, to: end }

@@ -6,4 +6,4 @@ placements:
     runtime: colocated
   agent.writer:
     runtime: isolated
-    description: In-process locally, where there is one process.
+    description: Its own process, even locally.
