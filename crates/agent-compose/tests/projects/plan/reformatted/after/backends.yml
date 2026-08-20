@@ -1,0 +1,26 @@
+version: "0.1"
+
+# An imported file may repeat the entrypoint's `version:` and must not disagree
+# with it (Decision D4).
+tool.spell_check:
+  description: Check the spelling of a draft.
+  input:
+    text: { type: string }
+  output:
+    ok: { type: boolean }
+  exec:
+    command: spell
+    args:
+      - "--stdin"
+
+model.smart:
+  provider: provider.anthropic
+  id: some-smart-model
+
+model.fast:
+  provider: provider.anthropic
+  id: some-fast-model
+
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}

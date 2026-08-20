@@ -1,0 +1,34 @@
+# The same composition as `../before`, written differently on purpose: the
+# definitions are imported rather than inline, the sections are in another
+# order, the node keys of `flow.review_loop` are swapped, and there are comments
+# everywhere. None of it is a change to the composition, and a plan over this
+# pair reports nothing.
+version: "0.1"
+
+imports:
+  # Resolution order is the entrypoint, then its imports sorted by path
+  # (grammar 1.4), so this list's own order is not observable either.
+  - flows.yml
+  - agents.yml
+  - backends.yml
+
+triggers:
+  on_request:
+    type: http
+    flow: flow.review_loop
+
+    # The route the app serves this on.
+    path: /review
+    respond: sync
+    input:
+      goal: "payload.body.goal"
+
+defaults:
+  timeout: 120s
+  on_error: fail
+
+state:
+  draft:
+    description: The current draft, rewritten on every pass.
+    type: string
+    default: ""

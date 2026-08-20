@@ -1,0 +1,8 @@
+# The built-in target's own deploy file, which is optional and which `local`
+# admits everything of except `storage_backends:` (grammar 14, Decision D87).
+version: "0.1"
+
+placements:
+  agent.writer:
+    runtime: colocated
+    description: In-process locally, where there is one process.
