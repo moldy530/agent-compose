@@ -26,8 +26,8 @@ never installed.**
 > private and has cut no release — so `curl` answers `404`. Until then there are
 > two routes: build from source (`cargo build --release -p agent-compose`, and
 > the [section below](#build-from-source)), or take a tarball from the Actions
-> tab, where every pull request's *Release dry run* uploads the same archives a
-> release would publish.
+> tab, where the *Release dry run* uploads the two Linux archives on a pull
+> request; all four from a manual *Release dry run* (`workflow_dispatch`).
 
 Two things it takes:
 
