@@ -208,6 +208,13 @@ fn root<'a>(before: &'a Path, after: &'a Path, change: ChangeKind) -> &'a Path {
 }
 
 /// One subject, and a line per field of it that moved.
+///
+/// Every field has a path to print, and there is no line here for one that does
+/// not: a subject reaching a comparison is a JSON **object** — a definition, a
+/// trigger, a placement, an event source, a node, an edge, a channel, the
+/// defaults, or a projection of one — so the walk enters its object arm and
+/// joins at least one key before it records anything (`compose_core::plan`).
+/// "The subject as a whole changed" is not a shape a plan can hold.
 fn entry(
     root: &Path,
     change: ChangeKind,
@@ -220,14 +227,7 @@ fn entry(
     for field in fields {
         let (before, after, was_cut) = sides(field);
         *cut |= was_cut;
-        held.push_str(&format!(
-            "      {}: {before} -> {after}\n",
-            if field.path.is_empty() {
-                "(value)"
-            } else {
-                field.path.as_str()
-            },
-        ));
+        held.push_str(&format!("      {}: {before} -> {after}\n", field.path));
     }
     held
 }
