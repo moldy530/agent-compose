@@ -35,16 +35,34 @@ store.docs:
 ## The fix
 
 Name a provider whose kind serves what you are asking for. For embeddings that
-means a second `provider.*` beside the inference one:
-
-```yaml
-provider.embeddings:
-  kind: openai
-  api_key: ${OPENAI_API_KEY}
-```
+means a second `provider.*` beside the inference one — and it is **two** edits,
+because declaring the provider changes nothing until `embed.provider` points at
+it.
 
 Providers are cheap — they are a connection, not a deployment — and having two
 is the normal shape for a project that both calls a model and embeds text.
+
+## The fix, applied
+
+The spec above with the second provider declared and the store's
+`embed.provider` repointed at it. Both, in one block, because the declaration
+alone leaves this diagnostic exactly where it was.
+
+```yaml spec
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+provider.embeddings:
+  kind: openai
+  api_key: ${OPENAI_API_KEY}
+store.docs:
+  kind: vector
+  scope: global
+  embed:
+    model: text-embedding-3-small
+    provider: provider.embeddings
+```
 
 Grammar: `docs/grammar.md` §11.2, §12.2, Decision D116. Topics:
 `agent-compose docs stores`, `agent-compose docs models`.

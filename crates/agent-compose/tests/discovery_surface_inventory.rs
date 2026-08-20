@@ -1115,7 +1115,7 @@ fn walk(directory: &Path, found: &mut BTreeSet<String>) {
     }
 }
 
-/// The skill names every verb the CLI has.
+/// The skill's verb table names every verb the CLI has.
 ///
 /// The skill is installed into somebody else's agent and cannot be re-published
 /// from here, so a verb it does not mention is one that agent will not reach
@@ -1123,15 +1123,27 @@ fn walk(directory: &Path, found: &mut BTreeSet<String>) {
 /// the topics — and to nothing else on purpose: the skill teaches the loop, and
 /// a check over grammar rules would be asking it to restate what it
 /// deliberately does not.
+///
+/// Scoped to the `Verbs` section, the way
+/// [`the_skill_lists_the_curriculum_in_reading_order`] is scoped to `The
+/// topics`. Over the whole document the check is satisfiable by prose — "Run
+/// `agent-compose docs` for the list" would keep it green with the `docs` row
+/// deleted — and the table is the part a reader consults for the verb they have
+/// not met.
 #[test]
 fn the_skill_names_every_verb() {
+    let section = docs::SKILL
+        .split_once("\n## Verbs\n")
+        .expect("the skill has a `Verbs` section")
+        .1
+        .split("\n## ")
+        .next()
+        .expect("the section ends");
     for verb in verbs() {
-        // In code voice, which is how the skill's verb table writes them. A
-        // looser match would be satisfied by prose: `run` appears in an
-        // ordinary English sentence three times before the table.
+        // In code voice, which is how the table writes them: bare or followed by
+        // the arguments the verb takes.
         assert!(
-            docs::SKILL.contains(&format!("`{verb}`"))
-                || docs::SKILL.contains(&format!("`{verb} ")),
+            section.contains(&format!("`{verb}`")) || section.contains(&format!("`{verb} ")),
             "the skill's verb table does not name `{verb}`"
         );
     }

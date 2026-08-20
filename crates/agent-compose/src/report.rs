@@ -309,14 +309,18 @@ pub(crate) fn human(root: &Path, diagnostics: &[Diagnostic], color: bool) -> Str
 
 /// The one line that turns a code into a next command, or nothing.
 ///
-/// `validate`'s human output ends with it whenever it reported anything. **Once
-/// per run, not once per diagnostic**: a report of forty diagnostics would
-/// otherwise carry forty copies of one sentence, which is noise on the surface
-/// PRD G3 cares most about. It names no particular code for the same reason —
-/// the reader has the codes, one per diagnostic, right above it.
+/// A human report ends with it whenever it reported anything. **Once per run,
+/// not once per diagnostic**: a report of forty diagnostics would otherwise
+/// carry forty copies of one sentence, which is noise on the surface PRD G3
+/// cares most about. It names no particular code for the same reason — the
+/// reader has the codes, one per diagnostic, right above it.
 ///
-/// It is `validate`'s alone. The JSON report gains nothing: a machine reader
-/// already has the code as data and does not need to be told a verb exists.
+/// Every verb that renders diagnostics for a person prints it, not `validate`
+/// alone. `build`, `run` and `serve` validate first and print the same block
+/// through the same renderer, and a reader who met a code that way is *further*
+/// from `validate` than one who typed it — the pointer is worth most exactly
+/// there. The JSON reports gain nothing: a machine reader already has the code
+/// as data and does not need to be told a verb exists.
 ///
 /// It goes through no renderer. The verdict above it is a *finding* and is
 /// styled like one; this is an instruction to the reader, and it reads as one

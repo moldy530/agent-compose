@@ -129,7 +129,19 @@ const TOPICS_WITHOUT_A_RUNNABLE_EXAMPLE: &[(&str, &str)] = &[
 /// A set equality rather than a floor, for the reason every other list in this
 /// file is one: dropping the block would otherwise be a silent loss of the only
 /// check the fix has.
-const EXPLANATIONS_WITH_A_CORRECTED_EXAMPLE: &[&str] = &["unkeyed-map-write"];
+///
+/// The entries are the fixes with a *neighbour* to fail — a repair that clears
+/// the rule it is about and lands the reader on a second diagnostic. Each was a
+/// shipped one: `unkeyed-map-write` offered `key: "execution.item_index"`,
+/// which type-checks as an integer where a string is required;
+/// `undefined-channel` offered a channel declared as an array of strings for a
+/// binding into a `string`; `missing-capability` offered a provider declaration
+/// with nothing repointed at it, which leaves the code firing untouched.
+const EXPLANATIONS_WITH_A_CORRECTED_EXAMPLE: &[&str] = &[
+    "missing-capability",
+    "undefined-channel",
+    "unkeyed-map-write",
+];
 
 /// The topics that teach a deploy file, and must keep one that resolves.
 ///

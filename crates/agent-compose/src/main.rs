@@ -91,8 +91,9 @@
 //! `docs` prints the topic index or one topic — the curriculum, sized for a
 //! reader with a context window rather than for completeness, which is the
 //! grammar's job. `explain` prints the expanded account of one diagnostic code;
-//! `validate`'s human output ends with a line pointing at it whenever it
-//! reported anything (see [`report::explain_hint`]). `schema` writes the
+//! every human report that said anything — `validate`'s, and the ones `build`,
+//! `run` and `serve` print before refusing — ends with a line pointing at it
+//! (see [`report::explain_hint`]). `schema` writes the
 //! published JSON Schema — the document an editor's `$schema` points at
 //! (grammar Appendix B) — byte for byte. `init` writes a project that
 //! validates, which is the loop's first step. `skill` prints or installs the
@@ -470,12 +471,14 @@ fn launch(
                 let color = report::color_enabled();
                 let root = entrypoint.parent().unwrap_or_else(|| Path::new(""));
                 let mut stream = io::stderr().lock();
-                write(&mut stream, &report::human(root, &diagnostics, color)).and_then(|()| {
-                    write(
-                        &mut stream,
-                        &report::verdict(entrypoint, target, &diagnostics, color),
-                    )
-                })
+                write(&mut stream, &report::human(root, &diagnostics, color))
+                    .and_then(|()| {
+                        write(
+                            &mut stream,
+                            &report::verdict(entrypoint, target, &diagnostics, color),
+                        )
+                    })
+                    .and_then(|()| write(&mut stream, &report::explain_hint(&diagnostics)))
             }
         };
         let _ = written;
@@ -845,12 +848,14 @@ fn build_project(
             let color = report::color_enabled();
             let root = entrypoint.parent().unwrap_or_else(|| Path::new(""));
             let mut stream = io::stderr().lock();
-            write(&mut stream, &report::human(root, &diagnostics, color)).and_then(|()| {
-                write(
-                    &mut stream,
-                    &report::build_verdict(entrypoint, target, out, &built, color),
-                )
-            })
+            write(&mut stream, &report::human(root, &diagnostics, color))
+                .and_then(|()| {
+                    write(
+                        &mut stream,
+                        &report::build_verdict(entrypoint, target, out, &built, color),
+                    )
+                })
+                .and_then(|()| write(&mut stream, &report::explain_hint(&diagnostics)))
         }
     };
 

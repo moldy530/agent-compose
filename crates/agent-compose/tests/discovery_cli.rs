@@ -323,6 +323,61 @@ fn validate_points_at_explain_once_per_run() {
     );
 }
 
+/// The verbs that *launch* end their human report with the same line.
+///
+/// `build`, `run` and `serve` validate before they emit anything, so a reader
+/// meets a diagnostic through them as readily as through `validate` — and
+/// having not typed `validate`, is further from the verb that would explain it,
+/// not closer. Pinned on `build` and `run` because they are the two a reader
+/// reaches first; all three print the report from one place.
+#[test]
+fn the_launching_verbs_point_at_explain_too() {
+    let directory = scratch("launch-hint");
+    std::fs::write(
+        directory.join("main.yml"),
+        "version: \"0.1\"\nstate:\n  output: { type: string }\n",
+    )
+    .expect("can write");
+
+    for arguments in [
+        ["build", "main.yml"].as_slice(),
+        ["run", "main.yml", "flow.f"].as_slice(),
+    ] {
+        let output = run(&directory, arguments);
+        let reported = stderr(&output);
+        assert_eq!(code(&output), 1, "{reported}");
+        assert!(
+            reported.contains("reserved-name"),
+            "`{}` reported the diagnostic: {reported}",
+            arguments.join(" ")
+        );
+        assert!(
+            reported.ends_with("for more about a code, run: agent-compose explain <code>\n"),
+            "`{}` ends with the hint: {reported}",
+            arguments.join(" ")
+        );
+    }
+}
+
+/// A `build` that reported nothing says nothing about `explain` either.
+///
+/// The guard is one `is_empty` shared by every caller, and this is the half of
+/// it the launching verbs exercise: a clean `build` still writes a verdict — and
+/// a list of what it wrote — so a hint appended unconditionally would show up
+/// under a success.
+#[test]
+fn a_clean_build_prints_no_hint() {
+    let directory = scratch("build-clean-hint");
+    run(&directory, &["init"]);
+    let output = run(&directory, &["build", "main.yml"]);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(
+        !stderr(&output).contains("explain"),
+        "a clean build carries no hint: {}",
+        stderr(&output)
+    );
+}
+
 /// A clean run says nothing about `explain`: there is no code to explain.
 #[test]
 fn a_clean_validate_prints_no_hint() {

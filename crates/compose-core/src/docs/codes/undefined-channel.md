@@ -42,20 +42,55 @@ flow.f:
 
 ## The fix
 
-Read the `help:` line for a near miss, or declare the channel:
+Read the `help:` line first. Above, `drafts` is one letter from the declared
+`draft`, and where the report names a near miss the repair is the name: `text:
+"state.draft"`, and `state:` is left alone.
 
-```yaml
-state:
-  drafts:
-    type: array
-    max_items: 10
-    items: { type: string }
-    reduce: append
-```
+Where the channel is genuinely missing, declare it — and declare it with a type
+the reads can use. That is the half with something to get wrong: this check only
+asks whether the name exists, so a `drafts` declared as an array of strings
+clears it and hands the next check the same binding, which wants the `string`
+`text:` is declared as. The repair below is the one that clears both.
 
 For a flow output whose producing node writes a differently-named field, the
 other fix is a `writes:` remap on that node — `writes: { summary: draft }` feeds
 the `draft` channel the `outputs:` field reads.
+
+## The fix, applied
+
+The spec above with `state:` gaining the channel the node reads, and nothing
+else changed. It is the declare-it fix rather than the near-miss one because it
+is the one with a type to get wrong, and it is written out rather than described
+because a repair a reader cannot run is a repair they have to trust.
+
+```yaml spec
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+state:
+  draft: { type: string, default: "" }
+  drafts: { type: string, default: "" }
+agent.a:
+  model: model.m
+  prompt: Do the thing.
+  input:
+    text: { type: string }
+  output:
+    result: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.a
+      input: { text: "state.drafts" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }
+```
 
 Grammar: `docs/grammar.md` §7.5, §10.1, §10.3, Decision D53. Topic:
 `agent-compose docs state`.

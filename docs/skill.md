@@ -58,7 +58,7 @@ needed. Node or Bun is needed only to *run* a compiled project.
 | `explain <code>` | the expanded account of one diagnostic code |
 | `schema` | the published JSON Schema, for an editor's `$schema` |
 | `init [<dir>]` | scaffold a project that validates |
-| `skill [--agent <name>]` | print this document, or install it |
+| `skill [--agent <name>] [--global]` | print this document, or install it; `--global` installs under `$HOME` |
 
 Add `--format json` to any verb that reports — `validate`, `plan`, `build`,
 `run`, `serve` — when a script is reading the output. Add `--target <name>` to

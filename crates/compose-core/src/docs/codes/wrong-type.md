@@ -25,8 +25,9 @@ state:
   draft: { type: string, default: "" }
 ```
 
-The shorthand that does exist is the flow form `{ type: string }`, which is the
-same mapping written on one line.
+The shorthand that does exist is the inline — YAML calls it *flow-style* —
+form `{ type: string }`, which is the same mapping written on one line. It has
+nothing to do with a `flow.*` definition.
 
 Grammar: `docs/grammar.md` §3.2, §10.1. Topic:
 `agent-compose docs schemas`.
