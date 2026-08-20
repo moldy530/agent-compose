@@ -6084,10 +6084,20 @@ model already corrected.
 
 Three consequences are stated where a reader meets them rather than derived:
 
-- **every call of an answer is answered.** Both wire surfaces refuse a request
-  that leaves a `tool_use` id or a `tool_call_id` unanswered, so a refusal does
-  not stop the loop over the calls of one answer — the calls after it still run.
-  A failure still does stop it, because the node is ending;
+- **every call of an answer comes back to the model, refused or not.** A refusal
+  does not stop the loop over the calls of one answer — the calls after it still
+  run, and each one's result or refusal is handed back. On the wire that is the
+  call's own id being answered, because both surfaces refuse a request that
+  leaves a `tool_use` id or a `tool_call_id` unanswered — with one exception,
+  which is the surface's own rather than this runtime's choice: Chat Completions
+  re-validates a replayed assistant turn's `tool_calls` against the request's
+  `tools`, so a call naming a tool the agent was never offered may not be
+  replayed there at all. That `tool_call` is dropped from the replayed turn and
+  its refusal travels as a `user` turn instead, while the Messages API replays
+  the `tool_use` and answers it with an `is_error` `tool_result`
+  (`crates/mock-provider/WIRE-NOTES.md` (18)). The sentence the model is handed
+  is the same either way. A failure still does stop the loop, because the node is
+  ending;
 - **a refused call spends no call ordinal** (§9.4). That ordinal counts how many
   times a flow-tool has been *invoked*, and a refused call reaches no flow: it is
   the next call that takes the frame the refused one was offered. A frame counted

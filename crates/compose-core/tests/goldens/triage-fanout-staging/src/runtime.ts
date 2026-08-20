@@ -2300,10 +2300,14 @@ export async function callSubflowTool(
  * model call, so a model that never corrects spends `max_tool_iterations` and
  * fails the node with the last refusal in hand.
  *
- * Every call of an answer is answered, refused or not, because both surfaces
- * refuse a request that leaves a `tool_use` / `tool_call_id` unanswered — so a
- * refusal does not stop the loop over the calls of one answer, while a failure
- * still does.
+ * Every call of an answer comes back to the model, refused or not — so a refusal
+ * does not stop the loop over the calls of one answer, while a failure still
+ * does. On the wire that is the call's own id being answered, because both
+ * surfaces refuse a request that leaves a `tool_use` / `tool_call_id`
+ * unanswered; the one exception is a call naming a tool the agent never offered,
+ * which Chat Completions will not let a request name at all, so
+ * [`callChatCompletions`] drops it from the replayed assistant turn and sends
+ * its refusal as a `user` turn instead (`WIRE-NOTES` (18)).
  *
  * The final call still offers the agent's tools beside the pinned one: the
  * history it carries holds `tool_use`/`tool_result` blocks, and both surfaces
