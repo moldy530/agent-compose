@@ -70,12 +70,16 @@ flow.f:
 
 The diagnostic's second label points at the **binding** that flipped the field
 to not-item-derived, which may be an instantiation away from the store node.
-Above, `doc_id: "state.topic"` is the site to edit, and three things fix it:
+Above, `doc_id: "state.topic"` is the site to edit, and two things fix it:
 
 - bind from the item: `doc_id: "task"`;
-- key off the index: `key: "execution.item_index"`;
-- drop the map's `input:` entirely, so the whole item is the instance's input
-  and every `input.<field>` is item-derived.
+- key off the index: `key: "execution.item_index"`.
+
+A third fix exists where the item is an **object** schema-compatible with the
+target's inputs: drop the map's `input:` entirely, so the whole item is the
+instance's input and every `input.<field>` is item-derived. It does not apply
+above — `state.tasks` holds strings and `flow.ingest` takes `{doc_id, text}`, so
+dropping `input:` there trades this diagnostic for a `type-mismatch`.
 
 Grammar: `docs/grammar.md` §11.4, Decisions D67, D83. Topics:
 `agent-compose docs stores`, `agent-compose docs maps`.

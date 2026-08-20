@@ -11,13 +11,13 @@ kinds are disjoint — a spec file declaring `placements:`, `storage_backends:` 
 `event_sources:` is an error, and so is a deploy file declaring definitions,
 `imports:`, `state:`, `triggers:` or `defaults:`.
 
-```yaml
+```yaml deploy staging
 # deploy/staging.yml
 version: "0.1"
 
 placements:
   agent.researcher: { runtime: isolated, network: egress }
-  flow.review_loop: { runtime: colocated }
+  flow.ingest: { runtime: colocated }
 
 storage_backends:
   defaults:
@@ -33,14 +33,26 @@ event_sources:
     consumer_group: agent-compose
 ```
 
-The spec side of this project needs nothing unusual — a store names an alias and
+The spec side of that project needs nothing unusual — a store names an alias and
 that is all:
 
 ```yaml spec
 version: "0.1"
-provider.embeddings:
+provider.openai:
   kind: openai
   api_key: ${OPENAI_API_KEY}
+
+model.smart:
+  provider: provider.openai
+  id: gpt-4o-mini
+
+agent.researcher:
+  model: model.smart
+  prompt: Answer the question from the documents you are given.
+  input:
+    text: { type: string }
+  output:
+    answer: { type: string }
 
 store.docs:
   kind: vector
@@ -48,7 +60,7 @@ store.docs:
   backend: docs_db              # an abstract slot, resolved per target
   embed:
     model: text-embedding-3-small
-    provider: provider.embeddings
+    provider: provider.openai
 
 flow.ingest:
   inputs:
@@ -66,7 +78,9 @@ flow.ingest:
 ```
 
 That file validates under `--target local` with no deploy file at all, and under
-`--target staging` against the aliases above.
+`--target staging` against the aliases above. The two are checked together: the
+addresses `placements:` names — `agent.researcher`, `flow.ingest` — have to
+resolve in the composition the deploy file is a target of.
 
 ## `local` is reserved and built in
 

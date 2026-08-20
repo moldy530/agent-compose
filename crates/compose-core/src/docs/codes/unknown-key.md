@@ -35,4 +35,4 @@ objects under `storage_backends` and `event_sources`, and even there the keys
 are checked against the plugin's published schema.
 
 Grammar: `docs/grammar.md` §1.5, §11.4, §12.1, Decisions D50, D106. Topic:
-`agent-compose docs cli`.
+`agent-compose docs getting-started`.

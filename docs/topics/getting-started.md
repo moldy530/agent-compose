@@ -47,7 +47,7 @@ triggers:
 ## The loop
 
 ```
-agent-compose init my-project        # this file, in a new directory
+agent-compose init my-project        # a project like this one, in a new directory
 agent-compose validate main.yml      # every static check, in milliseconds
 agent-compose explain <code>         # what a reported code means and how to fix it
 agent-compose docs <topic>           # a construct you have not met before

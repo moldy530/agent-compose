@@ -26,6 +26,10 @@ the project's data directory, and names the path on stderr under
 `--format human`. `AGENT_COMPOSE_DATA_DIR` moves that directory. A run that made
 no entries writes no file.
 
+The two are not the same document. This is `run --format json`'s, whose array of
+entries is `trace` and which carries the run's `outputs` and the path of the
+file:
+
 ```json
 {
   "flow": "flow.review_loop",
@@ -40,6 +44,7 @@ no entries writes no file.
 
 ## The envelope
 
+The **file**'s document, and the one to write a consumer against:
 `trace_version`, `flow`, `execution_id`, `status`, `entries` — always — plus
 `error` on a run that carried no answer. `status` is `"completed"`, `"failed"`,
 or `"interrupted"`; the third is told apart from the second because they ask

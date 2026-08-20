@@ -42,11 +42,13 @@ pub const NAME: &str = "agent-compose";
 /// a user who already knows the product's name, which is the one user who does
 /// not need it.
 ///
-/// One sentence, and short enough for the conventions of a skill description:
-/// `crates/agent-compose/tests/discovery_surface_inventory.rs` holds it there.
+/// **One** sentence, and short enough for the conventions of a skill
+/// description: `crates/agent-compose/tests/discovery_surface_inventory.rs`
+/// holds it to both, the sentence count included, so the value and this comment
+/// cannot drift apart.
 pub const DESCRIPTION: &str = "Author, validate, and run agent-compose specs — the YAML DSL for \
-                               agent graphs that compiles to LangGraph TypeScript. Use when \
-                               working with agent-compose projects, main.yml agent graphs, or the \
+                               agent graphs that compiles to LangGraph TypeScript — for any work \
+                               on an agent-compose project, a main.yml agent graph, or the \
                                agent-compose CLI.";
 
 /// The skill itself, agent-agnostic.

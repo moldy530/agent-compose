@@ -61,8 +61,10 @@ needed. Node or Bun is needed only to *run* a compiled project.
 
 Add `--format json` to any verb that reports — `validate`, `plan`, `build`,
 `run`, `serve` — when a script is reading the output. Add `--target <name>` to
-select a `deploy/<name>.yml`; the built-in `local` target needs no deploy file,
-and is what every verb resolves when none is named.
+the four verbs that resolve a composition against an environment — `validate`,
+`build`, `run`, `serve` — to select a `deploy/<name>.yml`; the built-in `local`
+target needs no deploy file and is what those four resolve when none is named.
+`plan` takes no `--target`: it answers what changed in the composition.
 
 ## Exit codes
 
@@ -105,9 +107,10 @@ normative text.
   span, and a `help:` line naming the fix. The help line is written to be acted
   on.
 - **Prefer a topic to a guess.** Constructs here have precise rules that are
-  cheap to look up and expensive to get subtly wrong — `else:` is not
-  first-match-wins, `append` channels take one element per write, a detached
-  dispatch may not write state.
+  cheap to look up and expensive to get subtly wrong. Before guessing at an
+  edge, at a channel write, or at what a fan-out may do, read
+  `agent-compose docs routing`, `agent-compose docs state`, and
+  `agent-compose docs maps`.
 - **Do not hand-edit generated code.** It is a build artifact; `build --check`
   in CI is what keeps the spec the source of truth.
 - **Never put a credential in a spec.** Secret-bearing fields take `${NAME}`

@@ -50,9 +50,11 @@ flow.f:
 ## The fix
 
 Send one of them somewhere else. Either remap the colliding sibling to a channel
-of its own, or drop the remap and let each field write its same-named channel —
-remember a remapped field is **not** also written to its same-named channel, so
-the collision above disappears the moment `result` goes to `result`.
+of its own — `writes: { result: verdict }`, with a `verdict` channel declared —
+or drop the remap, which leaves `result` node-scoped and `summary` writing the
+one channel there is. Remember a remapped field is **not** also written to its
+same-named channel: the collision above is `result → summary` meeting
+`summary → summary`, and either write moving settles it.
 
 Grammar: `docs/grammar.md` §7.6.4, §8.0, Decision D93. Topic:
 `agent-compose docs state`.
