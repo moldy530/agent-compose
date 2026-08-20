@@ -245,7 +245,10 @@ mkdir -p "$ac_into" || ac_die "could not create \`$ac_into\`"
 # is not atomic, so an interrupted install leaves half a compiler on PATH. A
 # rename inside one directory is neither: it replaces the name in one step, and
 # a running process keeps the file it already opened.
-ac_staged="$(mktemp "$ac_into/.$ac_bin.XXXXXX" 2>/dev/null)" ||
+# `mktemp`'s own diagnostic is left to print: this is the one step whose
+# failure is about the *directory* — read-only, full, not yours — and the
+# reason it gives is the reason the install cannot proceed.
+ac_staged="$(mktemp "$ac_into/.$ac_bin.XXXXXX")" ||
   ac_die "could not stage the binary in \`$ac_into\`"
 cp "$ac_tmp/$ac_bin" "$ac_staged" ||
   ac_die "could not write \`$ac_into/$ac_bin\`"
