@@ -202,8 +202,17 @@ const REPORTED: u8 = 1;
 /// The command could not run.
 const UNUSABLE: u8 = 2;
 
+/// What `--version` prints after the program name.
+///
+/// The crate version, the commit, and the target triple — `build.rs` composes
+/// it and says why all three are there. A binary that was downloaded rather
+/// than built is the case it exists for: the version alone does not say which
+/// build of it a reader is holding, and a bug report that cannot name the
+/// commit is a bug report about a moving target.
+const VERSION: &str = env!("COMPOSE_VERSION_LINE");
+
 #[derive(Parser)]
-#[command(name = "agent-compose", version, about)]
+#[command(name = "agent-compose", version = VERSION, about)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
