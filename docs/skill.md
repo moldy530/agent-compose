@@ -16,9 +16,11 @@ read the topic.
 agent-compose --version
 ```
 
-If that fails, the binary is not on `PATH`. It is a single static executable and
-is the whole of the compiler: nothing else to install, and no Rust toolchain
-needed. Node or Bun is needed only to *run* a compiled project.
+If that fails, the binary is not on `PATH`; the project's README has the install
+script and the tarball route (https://github.com/moldy530/agent-compose#install).
+It is a single static executable and is the whole of the compiler: nothing else
+to install, and no Rust toolchain needed. Node or Bun is needed only to *run* a
+compiled project.
 
 ## The loop
 
