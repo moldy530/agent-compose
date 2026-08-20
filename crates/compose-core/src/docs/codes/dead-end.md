@@ -44,8 +44,7 @@ flow.f:
 
 ## The fix
 
-Give the node an exit that is guaranteed to fire — one that is unconditional, or
-carries `else: true`:
+Give the node an exit that is guaranteed to fire — one that is unconditional:
 
 ```yaml
 - { from: sink, to: end }
@@ -55,5 +54,10 @@ carries `else: true`:
 here", and it is the fix for all three shapes: an escape for a budgeted cycle, a
 catch-all for a skipping node, an exit for a leaf.
 
-Grammar: `docs/grammar.md` §7.3, §7.4, §7.6.3, Decisions D19, D71. Topics:
+`else: true` is guaranteed to fire too, but only where the node already carries a
+`when:`-guarded edge for it to be else to — with none it is `invalid-value`
+(D107). The two shapes that arrive here with guards already written can use it;
+a leaf like `sink` above takes the unconditional spelling.
+
+Grammar: `docs/grammar.md` §7.3, §7.4, §7.6.3, Decisions D19, D71, D107. Topics:
 `agent-compose docs routing`, `agent-compose docs cycles`.

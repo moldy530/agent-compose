@@ -136,9 +136,14 @@ const TOPICS_WITHOUT_A_RUNNABLE_EXAMPLE: &[(&str, &str)] = &[
 /// which type-checks as an integer where a string is required;
 /// `undefined-channel` offered a channel declared as an array of strings for a
 /// binding into a `string`; `missing-capability` offered a provider declaration
-/// with nothing repointed at it, which leaves the code firing untouched.
+/// with nothing repointed at it, which leaves the code firing untouched;
+/// `unbalanced-convergence` offered `else: true` on one edge of a pair that
+/// carried no guard at all, which is `invalid-value` (D107) — an `else:` edge
+/// requires a `when:`-guarded sibling, so that spelling makes a pair exclusive
+/// only where a guard was already written.
 const EXPLANATIONS_WITH_A_CORRECTED_EXAMPLE: &[&str] = &[
     "missing-capability",
+    "unbalanced-convergence",
     "undefined-channel",
     "unkeyed-map-write",
 ];

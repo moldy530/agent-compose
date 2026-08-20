@@ -79,11 +79,21 @@ the entries in the same order. One entry is outside that ordering and is always
 last: the entry of the node a **failed** run aborted at. Nested entries have
 step numbers of their own instance, starting again at 1.
 
-**Outcomes** are `"completed"`, `"skipped"` (the activity failed and
-`on_error: skip` absorbed it — it carries an `error` too) and `"failed"`. A
+**An entry's `outcome`** is `"completed"`, `"skipped"` (the activity failed and
+`on_error: skip` absorbed it — it carries an `error` too) or `"failed"`. A
 failed entry has two shapes told apart by `fallback`: with it, the failure
 routed to the named node and the run continues; without it, the failure ended
 the run.
+
+Three record types carry an `outcome` and each closes over its own set, so read
+the enumeration for the field you are holding: an **entry**'s is the three
+above, a **dispatch record**'s adds `"detached"` (a `detach: true` delivery,
+resolved at issue — no outcome was ever observed, which is why its `attempts` is
+`0`), and a **tool call**'s is `"completed"`, `"refused"` or `"failed"`.
+`"refused"` is the one to know when a tool loop misbehaves: the tool's declared
+contract did not admit the call — arguments its schema refuses, or a name the
+agent never offered — so the model was handed the refusal and asked again, and
+the node did not end.
 
 A flow whose `start` edges carry guards gets a synthetic entry node,
 `node: "$start"`. The `$` sigil is outside the identifier grammar, so it
@@ -119,6 +129,12 @@ by its instance path, and the tool-call entry inside the agent's model call
 records the call, the result the model saw, and that instance path as a **link**.
 Both invariants survive — every subflow instance in a trace is findable as a
 dispatch record, and the tool loop's story is complete inside the model call.
+
+A `"refused"` flow-as-tool call is the exception that proves the pairing: its
+arguments failed the flow's own `inputs:` before an instance existed, so the
+record carries neither `instance` nor `result` and there is no dispatch record
+to link to. It spends no call ordinal either — the call after it gets the
+instance path it would have had with no refusal ahead of it.
 
 Dispatch records and store records carry `idempotencyKey`, which is the one
 place the flattened instance path of a nested fan-out can be read back at all —

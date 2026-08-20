@@ -113,6 +113,15 @@ fn a_scaffolded_project_validates_clean() {
         "the next step is named: {}",
         stderr(&initialized)
     );
+    // Both lines are meant to be retyped, so the path is spelled the way a
+    // reader would type it — the same `no ./` posture the `skill` install has,
+    // and the reason `init`'s defaulted `.` is stripped back off before either
+    // line is written.
+    assert_eq!(
+        stderr(&initialized),
+        "wrote `main.yml`\n\nnext: `agent-compose validate main.yml`, then `agent-compose docs` \
+         for the topics\n",
+    );
 
     let validated = run(&directory, &["validate", "main.yml"]);
     assert_eq!(

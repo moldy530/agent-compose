@@ -249,7 +249,7 @@ enum Command {
         #[arg(long, value_enum, default_value_t = Format::Human)]
         format: Format,
     },
-    /// Run one flow through its manual trigger (validates, builds, then launches)
+    /// Run one flow, declared manual trigger or not (validates, builds, then launches)
     Run {
         /// Path to the spec entrypoint (conventionally `main.yml`)
         path: PathBuf,
@@ -1022,9 +1022,14 @@ fn unknown(
 /// point is the *loop*, and naming the command that starts it is what turns a
 /// file into a first step. They go to **stderr**: `init`'s answer is the file,
 /// and stdout stays free for the one thing a caller might redirect.
+///
+/// The `.` the argument defaults to is stripped back off before the path is
+/// printed, for the reason [`skill`] never joins one on: both lines are meant to
+/// be read and retyped, and `./main.yml` is not how a reader would type it.
 fn init(directory: &Path) -> ExitCode {
     match discover::init(directory) {
         Ok(path) => {
+            let path = path.strip_prefix(".").unwrap_or(&path);
             let _ = write(
                 &mut io::stderr().lock(),
                 &format!(
