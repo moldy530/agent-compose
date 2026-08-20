@@ -12,7 +12,8 @@ The compiler is one Rust binary with no runtime dependency. A JavaScript runtime
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/moldy530/agent-compose/main/install.sh | sh
+curl -fsSLO https://raw.githubusercontent.com/moldy530/agent-compose/main/install.sh
+sh install.sh
 ```
 
 That picks the artifact for this machine, checks it against the release's
@@ -20,21 +21,32 @@ That picks the artifact for this machine, checks it against the release's
 that directory is not on yours. **A tarball whose checksum does not match is
 never installed.**
 
+> **Until the first release.** Those URLs resolve once this repository has a
+> published release *and* is publicly readable. Today it is neither — it is
+> private and has cut no release — so `curl` answers `404`. Until then there are
+> two routes: build from source (`cargo build --release -p agent-compose`, and
+> the [section below](#build-from-source)), or take a tarball from the Actions
+> tab, where every pull request's *Release dry run* uploads the same archives a
+> release would publish.
+
 Two things it takes:
 
 ```sh
 # a particular release rather than the latest
-curl -fsSL https://raw.githubusercontent.com/moldy530/agent-compose/main/install.sh | sh -s -- 0.1.0
+sh install.sh 0.1.0
 
 # somewhere else to put it
-curl -fsSL https://raw.githubusercontent.com/moldy530/agent-compose/main/install.sh | AGENT_COMPOSE_INSTALL="$HOME/bin" sh
+AGENT_COMPOSE_INSTALL="$HOME/bin" sh install.sh
 ```
 
 Name a directory you can write to. A system one like `/usr/local/bin` needs
-`sudo`, and `sudo` does not carry that variable — download the script, then run
+`sudo`, and `sudo` does not carry that variable — run
 `sudo env AGENT_COMPOSE_INSTALL=/usr/local/bin sh install.sh`.
 
-Piping a script into a shell is worth reading first: the script is
+Two commands rather than `curl … | sh`, for two reasons. A pipe throws `curl`'s
+exit status away: a URL that answers `404` pipes an empty body into a shell,
+which runs the nothing it was given and exits `0` — no compiler installed, no
+failure reported. And a script about to run as you is worth reading first. It is
 [`install.sh`](install.sh) in this repository, and it is the same file the
 release pipeline runs against freshly built artifacts on every pull request.
 

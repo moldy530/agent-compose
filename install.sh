@@ -10,9 +10,15 @@
 #
 # Usage:
 #
-#   curl -fsSL https://raw.githubusercontent.com/moldy530/agent-compose/main/install.sh | sh
-#   curl -fsSL https://raw.githubusercontent.com/moldy530/agent-compose/main/install.sh | sh -s -- 0.1.0
+#   curl -fsSLO https://raw.githubusercontent.com/moldy530/agent-compose/main/install.sh
 #   sh install.sh [<version>]
+#
+# Fetched to a file and then run, rather than piped into a shell, and that is
+# what the README documents too: a pipe throws `curl`'s exit status away. A URL
+# that answers 404 pipes an empty body into `sh`, which runs the nothing it was
+# given, exits 0, and installs no compiler while reporting no failure. Two
+# commands fail where the failure is — and leave the script somewhere it can be
+# read before it is run.
 #
 # The version may be given as the first argument or as AGENT_COMPOSE_VERSION,
 # with or without a leading `v`; the argument wins, and with neither the latest
@@ -70,6 +76,18 @@ case "$ac_machine" in
   *) ac_die "no released binary for \`$ac_machine\` — releases carry x86_64 and aarch64" ;;
 esac
 
+# Rosetta reports the architecture it is *emulating*. A shell translated on
+# Apple silicon answers `x86_64` to `uname -m`, so taking that answer would
+# install the Intel binary on an arm64 machine — which runs, slowly, under
+# translation, for as long as nobody notices. macOS answers the real question
+# directly: `sysctl.proc_translated` is `1` in a translated process, `0` in a
+# native one, and absent on a machine that has no Rosetta at all — hence the
+# fallback, which reads that absence as "not translated".
+if [ "$ac_system" = "Darwin" ] && [ "$ac_arch" = "x86_64" ] &&
+  [ "$(sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)" = "1" ]; then
+  ac_arch="aarch64"
+fi
+
 ac_target="$ac_arch-$ac_platform"
 
 # --- the tools this needs ----------------------------------------------------
@@ -100,6 +118,11 @@ else
 fi
 
 # Fetch <url> to <path>, or copy <basename> out of the artifact directory.
+#
+# Always to a file, never to standard output, so that every caller can test the
+# *fetch's* own exit status. Reading a download inside a pipeline would report
+# the last command in that pipeline instead, which is how a network failure
+# gets misreported as whatever the parser made of an empty body.
 ac_fetch() {
   case "$ac_get" in
     curl) curl -fsSL --retry 3 -o "$2" "$1" ;;
@@ -107,6 +130,20 @@ ac_fetch() {
     local) cp "$ac_artifacts/$1" "$2" ;;
   esac
 }
+
+# --- somewhere to put what is downloaded --------------------------------------
+
+# Before anything is fetched, because everything fetched lands here: the release
+# document, the archive, the checksums. Removed on every exit — including the
+# refusals, which is what makes "nothing was installed" true of the temporary
+# directory as well as of the install directory.
+ac_tmp="$(mktemp -d 2>/dev/null || mktemp -d -t agent-compose)"
+ac_staged=""
+ac_clean() {
+  rm -rf "$ac_tmp"
+  [ -z "$ac_staged" ] || rm -f "$ac_staged"
+}
+trap ac_clean EXIT INT TERM
 
 # --- which release ------------------------------------------------------------
 
@@ -129,12 +166,16 @@ if [ -z "$ac_version" ] && [ "$ac_get" = "local" ]; then
 fi
 
 if [ -z "$ac_version" ]; then
-  ac_latest="$(
-    case "$ac_get" in
-      curl) curl -fsSL "https://api.github.com/repos/$ac_repo/releases/latest" ;;
-      wget) wget -qO- "https://api.github.com/repos/$ac_repo/releases/latest" ;;
-    esac | sed -n 's/.*"tag_name" *: *"\([^"]*\)".*/\1/p' | head -n 1
-  )" || ac_die "could not reach the GitHub releases API. Name a version to install instead: \`AGENT_COMPOSE_VERSION=<version> sh install.sh\`"
+  # Downloaded first, parsed second, and the two are separate statements on
+  # purpose. A pipeline answers with its *last* command's status, so a fetch
+  # read straight into `sed` reports the parser: an unreachable API, a 404 from
+  # a repository that is private or renamed, a proxy's error page — every one of
+  # them would arrive as "named no release", which sends the reader to check a
+  # version number when the thing that failed was the network.
+  ac_document="$ac_tmp/releases-latest.json"
+  ac_fetch "https://api.github.com/repos/$ac_repo/releases/latest" "$ac_document" ||
+    ac_die "could not reach the GitHub releases API for \`$ac_repo\`. Name a version to install instead: \`AGENT_COMPOSE_VERSION=<version> sh install.sh\`"
+  ac_latest="$(sed -n 's/.*"tag_name" *: *"\([^"]*\)".*/\1/p' "$ac_document" | head -n 1)"
   ac_version="${ac_latest#v}"
   [ -n "$ac_version" ] || ac_die "the GitHub releases API named no release. Name a version to install instead: \`AGENT_COMPOSE_VERSION=<version> sh install.sh\`"
 fi
@@ -142,9 +183,6 @@ fi
 ac_archive="$ac_bin-$ac_version-$ac_target.tar.gz"
 
 # --- download and verify ------------------------------------------------------
-
-ac_tmp="$(mktemp -d 2>/dev/null || mktemp -d -t agent-compose)"
-trap 'rm -rf "$ac_tmp"' EXIT INT TERM
 
 if [ "$ac_get" = "local" ]; then
   [ -f "$ac_artifacts/$ac_archive" ] ||
@@ -198,11 +236,26 @@ if [ -z "$ac_into" ]; then
 fi
 mkdir -p "$ac_into" || ac_die "could not create \`$ac_into\`"
 
-chmod 0755 "$ac_tmp/$ac_bin"
-# `mv` replaces the directory entry, which is what makes re-installing over a
-# copy that is currently running work; `cp` onto a running binary is refused.
-mv -f "$ac_tmp/$ac_bin" "$ac_into/$ac_bin" ||
+# **Staged inside the install directory, then renamed within it.** The unpacked
+# binary is in a temporary directory, and a temporary directory is routinely on
+# another filesystem — `/tmp` is a tmpfs on most Linux distributions — where
+# `mv` cannot rename and falls back to copying over the destination in place.
+# That fallback is the failure this avoids: copying onto a binary that is
+# currently running truncates the file the kernel is paging from, and the copy
+# is not atomic, so an interrupted install leaves half a compiler on PATH. A
+# rename inside one directory is neither: it replaces the name in one step, and
+# a running process keeps the file it already opened.
+ac_staged="$(mktemp "$ac_into/.$ac_bin.XXXXXX" 2>/dev/null)" ||
+  ac_die "could not stage the binary in \`$ac_into\`"
+cp "$ac_tmp/$ac_bin" "$ac_staged" ||
   ac_die "could not write \`$ac_into/$ac_bin\`"
+chmod 0755 "$ac_staged" ||
+  ac_die "could not make \`$ac_into/$ac_bin\` executable"
+mv -f "$ac_staged" "$ac_into/$ac_bin" ||
+  ac_die "could not write \`$ac_into/$ac_bin\`"
+# Renamed, so there is no longer a staged file for the exit trap to remove —
+# and no window in which a later failure deletes what was just installed.
+ac_staged=""
 
 printf 'installed %s\n' "$ac_into/$ac_bin"
 "$ac_into/$ac_bin" --version ||
