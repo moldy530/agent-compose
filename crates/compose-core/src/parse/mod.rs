@@ -534,7 +534,7 @@ fn version(node: &Node, cx: &mut Cx) -> Option<Spanned<String>> {
                 format!("`{text}` is not a spec version this compiler supports"),
             )
             .with_help(format!(
-                "this build supports {}; run `agent-compose migrate` to update a spec written for another version",
+                "this build supports {}; a spec written for another version has its syntax brought forward, not just this field",
                 list(SUPPORTED_SPEC_VERSIONS)
             )),
         );

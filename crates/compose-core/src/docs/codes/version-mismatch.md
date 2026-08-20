@@ -18,9 +18,10 @@ Make them match, or drop the key from the imported file: it is optional there,
 and leaving it out is the usual choice, since the entrypoint is the one place
 the composition's version is worth stating.
 
-If the imported file really was written against another version, run
-`agent-compose migrate` on it rather than editing the field — the mismatch is
-the symptom, not the problem.
+If the imported file really was written against another version, bringing its
+syntax forward is the work and the key is the last edit — the mismatch is the
+symptom, not the problem. Overwriting the field on a file nobody has read since
+is how a stale document joins a composition claiming to belong to it.
 
 Grammar: `docs/grammar.md` §1.3. Topic:
 `agent-compose docs getting-started`.

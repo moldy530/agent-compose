@@ -2,5 +2,5 @@
 # code: unsupported-version
 # message: `9.9` is not a spec version this compiler supports
 # at: 6:10
-# help: this build supports `0.1`; run `agent-compose migrate` to update a spec written for another version
+# help: this build supports `0.1`; a spec written for another version has its syntax brought forward, not just this field
 version: "9.9"

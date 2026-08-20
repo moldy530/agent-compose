@@ -101,8 +101,9 @@ version: "0.1"
   entrypoint's value, otherwise a compile error naming both files.
 - The accepted set is exactly the compiler build's `SUPPORTED_SPEC_VERSIONS`
   (`crates/compose-core/src/lib.rs`). For this build: `["0.1"]`.
-- A version outside the supported set is refused with a pointer to
-  `agent-compose migrate`; old syntax is never silently reinterpreted (PRD §9.5).
+- A version outside the supported set is refused, and told the set this build
+  accepts; old syntax is never silently reinterpreted. The codemod PRD §9.5
+  commits to is a future verb, and is not named by any message this build emits.
 
 ### 1.4 `imports`
 
