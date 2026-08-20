@@ -21,6 +21,11 @@
 //! * ```` ```yaml triggers ```` — a complete spec that must **report** the code
 //!   its explanation file is named for. Anything else it reports is fine; a
 //!   minimal example of one failure often carries a second.
+//! * an explanation may also carry a ```` ```yaml spec ```` block, which is its
+//!   **repair** written out: the triggering spec with the fix applied, held to
+//!   the same clean verdict a topic's example is. A fix stated only in prose is
+//!   the one part of an explanation nothing runs, and a bullet naming a
+//!   spelling the compiler refuses looks exactly like a bullet that works.
 //! * ```` ```yaml deploy <target> ```` — a complete **deploy file**, which is
 //!   the one document kind that is not a spec and cannot be checked on its own:
 //!   it is written to `deploy/<target>.yml` beside the topic's `yaml spec`
@@ -111,6 +116,20 @@ const TOPICS_WITHOUT_A_RUNNABLE_EXAMPLE: &[(&str, &str)] = &[
         "orientation on what a run writes; its block is a trace document, not a spec",
     ),
 ];
+
+/// The explanations that write their repair out as a spec that runs.
+///
+/// [`every_explanation_example_reports_its_code`] runs the failure, not the
+/// cure, so a fix bullet naming a spelling the compiler refuses ships inside a
+/// binary looking exactly like a bullet that works — which is how
+/// `unkeyed-map-write` came to offer `key: "execution.item_index"`, a repair
+/// that satisfies its own rule and then fails type-checking. An explanation
+/// closes that by carrying the repaired spec as a ```` ```yaml spec ```` block.
+///
+/// A set equality rather than a floor, for the reason every other list in this
+/// file is one: dropping the block would otherwise be a silent loss of the only
+/// check the fix has.
+const EXPLANATIONS_WITH_A_CORRECTED_EXAMPLE: &[&str] = &["unkeyed-map-write"];
 
 /// The topics that teach a deploy file, and must keep one that resolves.
 ///
@@ -444,6 +463,39 @@ fn every_explanation_example_reports_its_code() {
     }
 }
 
+/// Every repair an explanation writes out validates clean.
+///
+/// The other half of an explanation's honesty. Its example is required to
+/// *report* the code; this requires the fix beside it to *clear* it — and to
+/// clear every other check too, which is the part prose cannot promise. A
+/// repair that satisfies the rule it is about and then fails a neighbouring one
+/// is worse than no repair: the reader has followed the instruction they were
+/// given and is now holding a second diagnostic.
+#[test]
+fn every_corrected_explanation_example_validates_clean() {
+    let mut carrying = Vec::new();
+    for (code, document) in explanations() {
+        let corrections = blocks(&document, "spec");
+        if corrections.is_empty() {
+            continue;
+        }
+        carrying.push(code.clone());
+        for (index, source) in corrections.into_iter().enumerate() {
+            validates(&format!("explain-corrected-{code}-{index}"), &source);
+        }
+    }
+    carrying.sort();
+    let expected: Vec<String> = EXPLANATIONS_WITH_A_CORRECTED_EXAMPLE
+        .iter()
+        .map(|code| (*code).to_string())
+        .collect();
+    assert_eq!(
+        carrying, expected,
+        "an explanation gained or lost its written-out repair; `yaml spec` is the marker, and \
+         EXPLANATIONS_WITH_A_CORRECTED_EXAMPLE is the list"
+    );
+}
+
 /// An explanation carries a runnable example unless it is one of the five that
 /// cannot.
 ///
@@ -475,12 +527,14 @@ fn only_the_named_explanations_lack_a_runnable_example() {
     );
 }
 
-/// The exemption list names codes that exist.
+/// Both explanation lists name codes that exist.
 ///
-/// A stale entry would silently excuse nothing while looking like it excused
-/// something.
+/// A stale entry in the exemption list would silently excuse nothing while
+/// looking like it excused something; a stale entry in the corrections list
+/// would require a block of a document that is not there, which is a failure
+/// that names the wrong thing.
 #[test]
-fn every_exempt_explanation_names_a_real_code() {
+fn every_listed_explanation_names_a_real_code() {
     let known: Vec<&str> = compose_core::DiagnosticCode::ALL
         .iter()
         .map(|code| code.as_str())
@@ -488,6 +542,9 @@ fn every_exempt_explanation_names_a_real_code() {
     for (code, reason) in EXPLANATIONS_WITHOUT_A_RUNNABLE_EXAMPLE {
         assert!(known.contains(code), "`{code}` is not a diagnostic code");
         assert!(!reason.is_empty(), "`{code}`'s exemption states a reason");
+    }
+    for code in EXPLANATIONS_WITH_A_CORRECTED_EXAMPLE {
+        assert!(known.contains(code), "`{code}` is not a diagnostic code");
     }
 }
 

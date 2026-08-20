@@ -172,9 +172,10 @@ A `vector` store with **no** `metadata_schema` derives matches with no
 A store **write** performed inside a `map`-dispatched instance must be one of
 two forms:
 
-1. an **item-derived key** — the `key:` expression references
-   `execution.item_index`, or an `input.<field>` whose binding *at that dispatch
-   site* references the item binding or the index. Legal for every kind.
+1. an **item-derived key** — the `key:` expression *reads*
+   `execution.item_index`, or reads an `input.<field>` whose binding *at that
+   dispatch site* references the item binding or the index. Legal for every
+   kind.
 2. a **keyed `kv` write** — `set` or `delete` on a `kv` store with any legal
    key, including one constant across instances.
 
@@ -182,6 +183,12 @@ Anything else — a `vector` or `blob` write whose key is not item-derived — i
 `unkeyed-map-write`. A field bound from `state.*`, from the enclosing flow's
 `input.*`, or from a literal is **not** item-derived, however item-derived its
 *name* looks: N documents would land on one vector key.
+
+*Reads* the index, not *is* it: every op's `key` is a CEL string and
+`execution.item_index` is an integer, so `key: "execution.item_index"` satisfies
+this rule and then fails type-checking with `type-mismatch`. The spelling that
+satisfies both is a string-valued expression that reads the index —
+`key: "state.tasks[execution.item_index]"`.
 
 The `kv` exemption is not a loophole. A `kv` write replaces the whole value at a
 slot the author named, so concurrent instances writing one key are a declared

@@ -73,7 +73,11 @@ to not-item-derived, which may be an instantiation away from the store node.
 Above, `doc_id: "state.topic"` is the site to edit, and two things fix it:
 
 - bind from the item: `doc_id: "task"`;
-- key off the index: `key: "execution.item_index"`.
+- key off the index — by **reading** it, not by being it. `execution.item_index`
+  is item-derived, but it is an integer and every op's `key` is a CEL string, so
+  the bare `key: "execution.item_index"` clears this rule and fails the next one
+  with `type-mismatch`. A string-valued expression that reads the index clears
+  both: `key: "state.tasks[execution.item_index]"`.
 
 A third fix exists where the item is an **object** schema-compatible with the
 target's inputs: drop the map's `input:` entirely, so the whole item is the
@@ -81,5 +85,60 @@ instance's input and every `input.<field>` is item-derived. It does not apply
 above — `state.tasks` holds strings and `flow.ingest` takes `{doc_id, text}`, so
 dropping `input:` there trades this diagnostic for a `type-mismatch`.
 
-Grammar: `docs/grammar.md` §11.4, Decisions D67, D83. Topics:
+## The fix, applied
+
+The spec above with one line changed — `save`'s `key:` — and nothing else. It is
+the second fix rather than the first because it is the one with a type to get
+wrong, and it is written out rather than described because a repair a reader
+cannot run is a repair they have to trust.
+
+```yaml spec
+version: "0.1"
+provider.local:
+  kind: openai_compatible
+  base_url: ${U}
+store.docs:
+  kind: vector
+  scope: global
+  embed:
+    model: text-embedding-3-small
+    provider: provider.local
+state:
+  tasks:
+    type: array
+    max_items: 5
+    items: { type: string }
+  topic: { type: string, default: "" }
+flow.ingest:
+  inputs:
+    doc_id: { type: string }
+    text:   { type: string }
+  outputs: {}
+  nodes:
+    save:
+      store: store.docs
+      op: upsert
+      key: "state.tasks[execution.item_index]"
+      value: "input.text"
+  edges:
+    - { from: start, to: save }
+    - { from: save, to: end }
+flow.f:
+  outputs: {}
+  nodes:
+    fan:
+      map:
+        over: "state.tasks"
+        as: task
+        node: flow.ingest
+        max_concurrency: 4
+        input:
+          doc_id: "state.topic"
+          text:   "task"
+  edges:
+    - { from: start, to: fan }
+    - { from: fan, to: end }
+```
+
+Grammar: `docs/grammar.md` §4.1, §11.4, Decisions D67, D83. Topics:
 `agent-compose docs stores`, `agent-compose docs maps`.

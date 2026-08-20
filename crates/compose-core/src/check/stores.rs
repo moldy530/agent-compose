@@ -299,11 +299,12 @@ pub(crate) fn check_map_writes(ctx: &mut Ctx) {
                 diagnostic
                 // Every repair named here has to type-check as a `key` as well
                 // as satisfy this rule, which the bare index does not: grammar
-                // 11.4's worked example offers `key: "execution.item_index"`,
-                // and the same section types every `key` as a CEL string while
-                // 4.1 types the index as an integer. Naming it as a repair
-                // would send the author from this diagnostic straight into a
-                // `type-mismatch`, so it is named as what it is instead.
+                // 11.4 types every op's `key` as a CEL string and 4.1 types the
+                // index as an integer. Naming `key: "execution.item_index"` as
+                // a repair would send the author from this diagnostic straight
+                // into a `type-mismatch`, so it is named as what it is instead
+                // — item-derived, and a key only from inside a string-valued
+                // expression, which is the spelling 11.4's fix list carries.
                 .with_help(
                     "concurrent instances would address one key, so N items' content would land in one slot: key the write from the item — an `input.<field>` the dispatch binds from the item, or the whole item passed through — or use a `kv` store, whose write is a declared overwrite; `execution.item_index` is item-derived too, but a `key` is a string and the index is an integer, so it keys a write only from inside a string-valued expression (grammar 4.1, 11.4, Decisions D67, D83)",
                 ),
