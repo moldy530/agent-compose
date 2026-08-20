@@ -72,8 +72,11 @@
 //! The remaining verbs take no spec at all (PRD §7 M2, resolved q23):
 //!
 //! ```text
+//! agent-compose docs [<topic>]
+//! agent-compose explain <code>
 //! agent-compose init [<dir>]
 //! agent-compose schema
+//! agent-compose skill [--agent <name>] [--global]
 //! ```
 //!
 //! They exist because a coding agent is this product's second audience (PRD
@@ -85,10 +88,23 @@
 //! what keeps a surface measured in hundreds of kilobytes off the millisecond
 //! budget.
 //!
-//! `init` writes a project that validates, which is the loop's first step and
-//! the only one that needs a file rather than a document (see [`discover`]).
-//! `schema` writes the published JSON Schema — the document an editor's
-//! `$schema` points at (grammar Appendix B) — byte for byte.
+//! `docs` prints the topic index or one topic — the curriculum, sized for a
+//! reader with a context window rather than for completeness, which is the
+//! grammar's job. `explain` prints the expanded account of one diagnostic code;
+//! `validate`'s human output ends with a line pointing at it whenever it
+//! reported anything (see [`report::explain_hint`]). `init` writes a project
+//! that validates, which is the loop's first step. `schema` writes the
+//! published JSON Schema — the document an editor's `$schema` points at
+//! (grammar Appendix B) — byte for byte. `skill` prints or installs the
+//! document a user hands their agent.
+//!
+//! Three of the five take a **name** — a topic, a code, an agent — and answer
+//! one nobody defines the way a diagnostic would, with a suggestion where the
+//! spelling is close. Two of them also print the vocabulary (see [`unknown`]);
+//! `explain` does not, because there are dozens of codes and a reader typing
+//! one has a report in front of them carrying the right spelling. All three
+//! exit `2`: a name outside a closed set is the command failing to be runnable,
+//! not a composition being refused.
 //!
 //! # Exit codes
 //!
@@ -173,6 +189,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use compose_core::docs;
 use compose_core::plan::SpecSide;
 use compose_core::{Composition, DEFAULT_TARGET, Diagnostics, Ir, resolve_with_target};
 
@@ -253,6 +270,18 @@ enum Command {
         #[arg(long, value_enum, default_value_t = Format::Human)]
         format: Format,
     },
+    /// Print the topic index, or one topic: the grammar, sized to be read
+    Docs {
+        /// The topic to print; omit for the index
+        #[arg(value_name = "TOPIC")]
+        topic: Option<String>,
+    },
+    /// Explain one diagnostic code: what it protects, what triggers it, the fix
+    Explain {
+        /// The code, exactly as a diagnostic reports it
+        #[arg(value_name = "CODE")]
+        code: String,
+    },
     /// Write a minimal project that validates: one agent, one flow, one trigger
     Init {
         /// Where to write it; must be empty or absent [default: the current directory]
@@ -261,6 +290,15 @@ enum Command {
     },
     /// Print the published JSON Schema, for an editor's `$schema` or a linter
     Schema,
+    /// Print the agent skill, or install it for a named coding agent
+    Skill {
+        /// Install for this agent instead of printing the bare document
+        #[arg(long, value_name = "NAME")]
+        agent: Option<String>,
+        /// Install under `$HOME` rather than under the current directory
+        #[arg(long)]
+        global: bool,
+    },
     /// Serve the project's `http` triggers (validates, builds, then launches the app)
     Serve {
         /// Path to the spec entrypoint (conventionally `main.yml`)
@@ -351,8 +389,11 @@ fn main() -> ExitCode {
             );
             launch(&path, "run", &target, &out, format, &arguments)
         }
+        Command::Docs { topic } => docs(topic.as_deref()),
+        Command::Explain { code } => explain(&code),
         Command::Init { directory } => init(&directory),
         Command::Schema => emit_text(compose_core::docs::SCHEMA),
+        Command::Skill { agent, global } => skill(agent.as_deref(), global),
         Command::Serve {
             path,
             host,
@@ -510,12 +551,14 @@ fn validate(entrypoint: &Path, target: &str, format: Format) -> ExitCode {
             let color = report::color_enabled();
             let root = entrypoint.parent().unwrap_or_else(|| Path::new(""));
             let mut stream = io::stderr().lock();
-            write(&mut stream, &report::human(root, &diagnostics, color)).and_then(|()| {
-                write(
-                    &mut stream,
-                    &report::verdict(entrypoint, target, &diagnostics, color),
-                )
-            })
+            write(&mut stream, &report::human(root, &diagnostics, color))
+                .and_then(|()| {
+                    write(
+                        &mut stream,
+                        &report::verdict(entrypoint, target, &diagnostics, color),
+                    )
+                })
+                .and_then(|()| write(&mut stream, &report::explain_hint(&diagnostics)))
         }
     };
 
@@ -811,6 +854,153 @@ fn build_project(
         Err(error) if departed(&error) => ExitCode::from(verdict),
         Err(error) => fail(&format!("cannot write the report: {error}")),
     }
+}
+
+/// `agent-compose docs [<topic>]`: the index, or one topic.
+///
+/// A name nobody defines is the command's own precondition failing, so it exits
+/// `2` — there is no composition here to be right or wrong about. It still
+/// answers the way a diagnostic would (PRD G3): the valid names, and a
+/// suggestion where one is close.
+fn docs(topic: Option<&str>) -> ExitCode {
+    let Some(name) = topic else {
+        return emit_text(&docs::index());
+    };
+    match docs::topic(name) {
+        Some(topic) => emit_text(topic.body),
+        None => fail(&unknown(
+            "a topic",
+            "topics",
+            name,
+            docs::topics::nearest(name),
+            &docs::topics::names(),
+        )),
+    }
+}
+
+/// `agent-compose explain <code>`: the expanded account of one diagnostic.
+///
+/// The argument is the code exactly as a report spells it, because that is what
+/// a reader copies — and what `validate`'s own trailing line tells them to
+/// paste (see [`report::explain_hint`]).
+fn explain(code: &str) -> ExitCode {
+    match docs::codes::named(code) {
+        Some(code) => emit_text(docs::explanation(code)),
+        // The one name that is *not* answered with its vocabulary. There are
+        // dozens of codes, and a reader typing one already has a report in
+        // front of them with the right spelling in its header — a wall of every
+        // failure class this compiler has would bury the suggestion that is
+        // actually useful.
+        None => fail(&format!(
+            "`{code}` is not a diagnostic code{}. Every code this compiler reports has an \
+             explanation: copy the one from a report's `error[<code>]` header",
+            docs::codes::nearest(code)
+                .map_or_else(String::new, |near| format!(" (did you mean `{near}`?)")),
+        )),
+    }
+}
+
+/// `agent-compose skill [--agent <name>] [--global]`: print the skill, or
+/// install it.
+///
+/// Bare, it prints the agent-agnostic document. `--agent` selects an install
+/// posture, and the two differ because the two agents' conventions do — see
+/// [`compose_core::docs::skill`]. `--global` is only meaningful to a posture
+/// that writes, so it is refused beside one that does not: a flag that was
+/// silently ignored would leave a user believing they had installed something
+/// under `$HOME`.
+fn skill(agent: Option<&str>, global: bool) -> ExitCode {
+    let Some(agent) = agent else {
+        if global {
+            return fail(
+                "`--global` needs an `--agent`: it names where an install writes, and printing \
+                 the skill writes nowhere",
+            );
+        }
+        return emit_text(docs::skill::SKILL);
+    };
+    match agent {
+        "claude" => {
+            let root = if global {
+                match std::env::var_os("HOME") {
+                    Some(home) => PathBuf::from(home),
+                    None => {
+                        return fail(
+                            "`--global` needs `HOME`, which is not set: run without it to install \
+                             under the current directory",
+                        );
+                    }
+                }
+            } else {
+                PathBuf::from(".")
+            };
+            let path = root.join(docs::skill::CLAUDE_PATH);
+            match discover::install(&path, &docs::skill::claude()) {
+                Ok(discover::Wrote::Created(path)) => {
+                    let _ = write(
+                        &mut io::stderr().lock(),
+                        &format!("wrote `{}`\n", path.display()),
+                    );
+                    ExitCode::from(CLEAN)
+                }
+                Ok(discover::Wrote::Unchanged(path)) => {
+                    let _ = write(
+                        &mut io::stderr().lock(),
+                        &format!("`{}` is already this skill\n", path.display()),
+                    );
+                    ExitCode::from(CLEAN)
+                }
+                Err(discover::Refusal::Occupied(reason)) => {
+                    let _ = write(&mut io::stderr().lock(), &format!("error: {reason}\n"));
+                    ExitCode::from(REPORTED)
+                }
+                Err(discover::Refusal::Unusable(reason)) => fail(&reason),
+            }
+        }
+        "codex" => {
+            if global {
+                return fail(
+                    "`--global` is not meaningful for `--agent codex`: this posture prints the \
+                     skill rather than writing it, because `AGENTS.md` is yours",
+                );
+            }
+            emit_text(&docs::skill::codex())
+        }
+        _ => fail(&unknown(
+            "an agent this command has an install posture for",
+            "agents",
+            agent,
+            docs::skill::nearest(agent),
+            docs::skill::AGENTS,
+        )),
+    }
+}
+
+/// The sentence a discovery verb answers a name nobody defines with.
+///
+/// The vocabulary, and a suggestion where the spelling is close. It is written
+/// like a diagnostic's `help:` for the reason PRD G3 gives — error UX is a
+/// product feature, and a coding agent reads this as its next instruction.
+///
+/// `noun`/`plural` are both taken rather than one pluralized, because English
+/// does not pluralize by suffix reliably and a message reading "is not a agent"
+/// is a message somebody stopped proofreading.
+fn unknown(
+    noun: &str,
+    plural: &str,
+    written: &str,
+    nearest: Option<&str>,
+    known: &[&str],
+) -> String {
+    let suggestion = nearest.map_or_else(String::new, |near| format!(" (did you mean `{near}`?)"));
+    format!(
+        "`{written}` is not {noun}{suggestion}. The {plural} are: {}",
+        known
+            .iter()
+            .map(|name| format!("`{name}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 /// `agent-compose init [<dir>]`: write the scaffold, then say what to run.

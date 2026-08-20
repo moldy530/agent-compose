@@ -307,6 +307,27 @@ pub(crate) fn human(root: &Path, diagnostics: &[Diagnostic], color: bool) -> Str
     report
 }
 
+/// The one line that turns a code into a next command, or nothing.
+///
+/// `validate`'s human output ends with it whenever it reported anything. **Once
+/// per run, not once per diagnostic**: a report of forty diagnostics would
+/// otherwise carry forty copies of one sentence, which is noise on the surface
+/// PRD G3 cares most about. It names no particular code for the same reason —
+/// the reader has the codes, one per diagnostic, right above it.
+///
+/// It is `validate`'s alone. The JSON report gains nothing: a machine reader
+/// already has the code as data and does not need to be told a verb exists.
+///
+/// It goes through no renderer. The verdict above it is a *finding* and is
+/// styled like one; this is an instruction to the reader, and it reads as one
+/// line of plain text on a terminal and in a CI log alike.
+pub(crate) fn explain_hint(diagnostics: &[Diagnostic]) -> String {
+    if diagnostics.is_empty() {
+        return String::new();
+    }
+    "for more about a code, run: agent-compose explain <code>\n".to_string()
+}
+
 /// A one-line verdict, rendered through the same styling as the diagnostics.
 ///
 /// Both outcomes go through the renderer, and the clean one takes a level with

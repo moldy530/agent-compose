@@ -1,10 +1,19 @@
-//! The discovery verbs that touch the file system.
+//! The two discovery verbs that touch the file system.
 //!
 //! Everything else in the discovery surface writes a document to stdout and is
-//! therefore one line in `main.rs`. `init` **writes a file**, which makes it
-//! one of the two that need a refusal story: a compiler that silently replaced
-//! a file a person wrote is worse than one that did nothing, and this runs in a
-//! directory the user already lives in.
+//! therefore one line in `main.rs`. `init` and `skill --agent claude` **write
+//! files**, which makes them the two that need a refusal story: a compiler that
+//! silently replaced a file a person wrote is worse than one that did nothing,
+//! and both of these run in a directory the user already lives in.
+//!
+//! The two refusals differ because what they are protecting differs. `init`
+//! scaffolds a *project*, so what it protects is the **directory**: anything
+//! already in it is somebody's, and this command has no way to tell a stale
+//! build from a checkout. `skill` installs one known document into a directory
+//! whose whole purpose is holding such documents, so what it protects is that
+//! one file's **contents** — a re-install of the same skill is the common case
+//! and must not be a failure, while a file that differs is a customization
+//! nobody asked this command to discard.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,6 +27,14 @@ pub(crate) enum Refusal {
     /// There was something here already, and it is not this command's to
     /// replace — exit `1`.
     Occupied(String),
+}
+
+/// What a write did, for the line the command prints afterwards.
+pub(crate) enum Wrote {
+    /// The file was created.
+    Created(PathBuf),
+    /// The file was already exactly this document.
+    Unchanged(PathBuf),
 }
 
 /// `agent-compose init [<dir>]`: write the scaffold into an empty directory.
@@ -79,4 +96,46 @@ fn named(held: &[String]) -> String {
         0 => shown.join(", "),
         rest => format!("{}, and {rest} more", shown.join(", ")),
     }
+}
+
+/// Write `document` to `path`, creating the directories above it.
+///
+/// **Identical content is success and writes nothing.** Re-running an install
+/// is how a user picks up a newer skill, and the run that finds nothing to do
+/// should say so rather than fail — a refusal there would make "keep this in
+/// step" a command that fails whenever it is already in step.
+///
+/// A file that **differs** is refused with its path. This command cannot tell a
+/// customization from a stale copy and the user can, so it names the file and
+/// leaves the decision with them; `agent-compose skill` prints the document for
+/// a merge.
+pub(crate) fn install(path: &Path, document: &str) -> Result<Wrote, Refusal> {
+    match fs::read_to_string(path) {
+        Ok(existing) if existing == document => return Ok(Wrote::Unchanged(path.to_path_buf())),
+        Ok(_) => {
+            return Err(Refusal::Occupied(format!(
+                "`{}` already holds a different document: this command replaces nothing it did \
+                 not write. Move it aside, or print the skill with `agent-compose skill` and \
+                 merge it yourself",
+                path.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(Refusal::Unusable(format!(
+                "cannot read `{}`: {error}",
+                path.display()
+            )));
+        }
+    }
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            Refusal::Unusable(format!("cannot create `{}`: {error}", parent.display()))
+        })?;
+    }
+    fs::write(path, document).map_err(|error| {
+        Refusal::Unusable(format!("cannot write `{}`: {error}", path.display()))
+    })?;
+    Ok(Wrote::Created(path.to_path_buf()))
 }

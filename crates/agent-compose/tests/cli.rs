@@ -114,6 +114,7 @@ error[unknown-key]: unknown key `descriptio` in agent definition `agent.reviewer
    = help: did you mean `description`?
 
 error: `main.yml` is not valid (target `local`): 1 error
+for more about a code, run: agent-compose explain <code>
 "
     );
     assert_eq!(stdout(&output), "");
@@ -142,6 +143,7 @@ error[duplicate-definition]: `model.m` is defined twice in this composition
    = help: a typed address is global across the composition, whichever file declares it: rename one of the two, or drop the file that duplicates the other (grammar 2.2)
 
 error: `main.yml` is not valid (target `local`): 1 error
+for more about a code, run: agent-compose explain <code>
 "
     );
     assert_eq!(stdout(&output), "");
@@ -185,6 +187,7 @@ error[unbalanced-convergence]: node `merge` of `flow.diamond` is reached from th
    = help: a convergence reached in two different steps runs twice, once per arrival: route the short branch through the same depth, or make the two edges exclusive — `else: true` on one, or guards grammar 7.6.1 can prove disjoint (grammar 7.6.2, Decisions D69, D112)
 
 error: `main.yml` is not valid (target `local`): 1 error
+for more about a code, run: agent-compose explain <code>
 "
     );
     assert_eq!(stdout(&output), "");
@@ -246,6 +249,7 @@ error[unreduced-write]: the `map` of node `work` writes the unreduced channel `v
    = help: dispatched instances are concurrent writers, so the channel they write needs a declared `reduce:` policy — `append`, `merge`, or an explicit `last_wins` (grammar 8.6 rule 5, 10.2)
 
 error: `main.yml` is not valid (target `local`): 2 errors
+for more about a code, run: agent-compose explain <code>
 "
     );
     assert_eq!(stdout(&output), "");
@@ -280,6 +284,7 @@ error[duplicate-definition]: `model.m` is defined twice in this composition
    = help: a typed address is global across the composition, whichever file declares it: rename one of the two, or drop the file that duplicates the other (grammar 2.2)
 
 error: `crates/agent-compose/tests/projects/duplicate-across-files/main.yml` is not valid (target `local`): 1 error
+for more about a code, run: agent-compose explain <code>
 "
     );
     assert_eq!(code(&output), 1);
