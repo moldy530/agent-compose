@@ -12,9 +12,10 @@
 //!
 //! So this file states the account itself:
 //!
-//! > The three structural sections are empty **if and only if** the two
-//! > artifacts agree, once everything `docs/plan.md` §11 excuses is taken out of
-//! > them.
+//! > A plan names a **subject** — a component, a node, a flow's edges, a
+//! > channel, the policy defaults, a caller-visible surface — **if and only if**
+//! > the two artifacts differ in the part of them that subject owns, once
+//! > everything `docs/plan.md` §11 excuses is taken out.
 //!
 //! Both directions are load bearing, and each fails a different way:
 //!
@@ -30,18 +31,39 @@
 //!   each of those is accounted for. [`compared`] canonicalizes exactly those,
 //!   so a plan that started reporting one would fail the property here.
 //!
-//! # `compared` is written twice on purpose
+//! # Why it is stated per subject
 //!
-//! [`compared`] restates §11 independently of `crates/compose-core/src/plan/`.
-//! It is the same rules — take the source regions out, sort the sets, sort the
-//! arrays the generated code looks up by name, drop the keys no section owns,
-//! drop a section declared with no entries — written from the document rather
-//! than shared with the code under test, which is what keeps the property from
-//! agreeing with a bug by construction. Which is also how it can be wrong: a
-//! clause the document states and this file omits makes the property fail on
-//! documented behavior and name the compiler for it, and no golden anywhere
-//! would notice. [`CASES`] is where a clause is held to an actual edit rather
-//! than assumed.
+//! The weaker reading — *the three structural sections are empty exactly when
+//! the two artifacts agree* — is asserted too ([`holds`]), and on its own it has
+//! almost no grip. It can only fail on a pair that differs in **nothing else**:
+//! a rule that dropped every `description:` in the composition is invisible on
+//! any pair that also moved an edge, because the edge's own record keeps the
+//! count off zero and the biconditional is satisfied by the wrong record. Every
+//! pair of a corpus chosen for its variety is such a pair, so the whole class of
+//! "a field nobody compares any more" would sit under a green suite.
+//!
+//! Naming the subject removes the hiding place. The definition whose description
+//! moved still differs; the plan still says nothing about **it**; the sets do not
+//! match, and the failure names the address. That is why [`subjects`] restates
+//! §4–§6's partition — which record type owns which part of a definition, of a
+//! trigger, of a flow — beside [`compared`]'s restatement of §11, and it is what
+//! holds every field of every component and of every node to something, rather
+//! than only the fields some pair of the corpus happens to differ in twice.
+//!
+//! # `compared` and `subjects` are written twice on purpose
+//!
+//! Both restate `docs/plan.md` independently of
+//! `crates/compose-core/src/plan/`. [`compared`] is §11 — take the source
+//! regions out, sort the sets, sort the arrays the generated code looks up by
+//! name, drop the keys no section owns, drop a section declared with no entries
+//! — and [`subjects`] is §4–§6, the partition that says a flow's `inputs:` is
+//! read by `interfaces` and its `description:` by `components`. Both are written
+//! from the document rather than shared with the code under test, which is what
+//! keeps the property from agreeing with a bug by construction. Which is also
+//! how they can be wrong: a clause the document states and this file omits makes
+//! the property fail on documented behavior and name the compiler for it, and no
+//! golden anywhere would notice. [`CASES`] is where a clause is held to an actual
+//! edit rather than assumed.
 //!
 //! # Where the validation section is
 //!
@@ -53,10 +75,11 @@
 //! property is stated over, so an edit hidden from them fails here whatever the
 //! validator happened to notice.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use compose_core::plan::{FieldChange, TopologyKind};
 use compose_core::{Composition, Ir, Plan, plan, resolve};
 use serde_json::{Map, Value};
 
@@ -148,6 +171,24 @@ const SECTIONS: &[&[&str]] = &[
 /// Two artifacts whose `compared` forms agree differ in nothing a plan reports;
 /// two whose forms differ must produce at least one structural record. That is
 /// the whole property, and everything in this function is one clause of §11.
+///
+/// # The one clause this restatement inherits rather than states
+///
+/// §11's bullet on **the key order of an author's own mapping** is the one line
+/// of the document with no code of its own here. `serde_json::to_value` builds
+/// every object as a `BTreeMap`, so a `default: {alpha: 1, beta: 2}` and a
+/// `default: {beta: 2, alpha: 1}` are already one value by the time the first
+/// line below runs — and `plan::diff::semantic` opens with the same call, so the
+/// compiler is silent about it for the same mechanical reason. The two therefore
+/// agree here **by construction**, which is precisely the shape of agreement the
+/// module docs above say keeps nothing honest: this function cannot fail on that
+/// clause in either direction.
+///
+/// So the clause is carried by [`CASES`] instead — "an author's literal mapping
+/// reordered" plants the edit in a real composition and pins the silence to
+/// behavior — and the neighbouring clause it is easiest to confuse it with, an
+/// author's own *array* reordered, is planted right beside it and comes out the
+/// other way.
 fn compared(ir: &Ir) -> Value {
     let mut value = serde_json::to_value(ir).expect("the artifact is representable as JSON");
     if let Value::Object(map) = &mut value {
@@ -310,6 +351,364 @@ fn is_span(text: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// The document's §4–§6, restated as a partition of the artifact into subjects.
+// ---------------------------------------------------------------------------
+
+/// The three structural sections, spelled the way a plan names them.
+const COMPONENTS: &str = "components";
+const TOPOLOGY: &str = "topology";
+const INTERFACES: &str = "interfaces";
+
+/// One subject of a plan: the section that owns it (`docs/plan.md` §4–§6) and
+/// the address it is named by (§8).
+type Subject = (&'static str, String);
+
+/// One subject's own part of the artifact, and what has to hold for a plan to
+/// say anything about it at all.
+struct Slice {
+    /// The component whose presence on **both** sides is what makes this subject
+    /// comparable — §3's rule that a component which arrived brings nothing with
+    /// it, so a flow added to the composition is one line rather than one line
+    /// per node it declares. `None` when the subject *is* a component, which is
+    /// reported whichever side declares it.
+    owner: Option<String>,
+    /// What the plan compares for this subject.
+    value: Value,
+}
+
+impl Slice {
+    /// A subject that stands on its own: a definition, a trigger, a placement,
+    /// an event source, a channel, the defaults.
+    fn own(value: Value) -> Self {
+        Self { owner: None, value }
+    }
+
+    /// A subject only compared where its component sits on both sides: a node,
+    /// a flow's edges, either caller-visible surface.
+    fn under(owner: &str, value: Value) -> Self {
+        Self {
+            owner: Some(owner.to_string()),
+            value,
+        }
+    }
+}
+
+/// The artifact cut into the subjects a plan reports on, keyed the way a plan
+/// names them.
+///
+/// This is `docs/plan.md` §4–§6 restated: which record type owns which part of
+/// a definition, of a trigger, of a flow. Every part of [`compared`] lands in
+/// exactly one slice — the partition is what the plan's own module docs call
+/// "every change is reported once", read from the other end — so a field that
+/// stopped being compared leaves its subject differing with nothing to name it.
+///
+/// Two spellings here are this file's rather than the document's, and both are
+/// only ever compared against themselves: a section is named by the string a
+/// plan writes it under, and a flow's edges are one subject `"<flow> edges"`
+/// because §5 matches edges by identity rather than by address — restating that
+/// pairing would be copying the algorithm, while the *set* of a flow's edges is
+/// exactly what [`compared`]'s `grouped` already canonicalizes.
+fn subjects(ir: &Ir) -> BTreeMap<Subject, Slice> {
+    let artifact = compared(ir);
+    accounted(
+        &artifact,
+        &["defaults", "state", "triggers", "definitions", "deploy"],
+        "the artifact",
+    );
+    let mut found = BTreeMap::new();
+
+    // `defaults:` and the `state:` channels are the composition's own, and §5
+    // owns both.
+    if let Some(defaults) = artifact.get("defaults") {
+        found.insert(
+            (TOPOLOGY, "defaults".to_string()),
+            Slice::own(defaults.clone()),
+        );
+    }
+    for (name, channel) in section(&artifact, &["state"]) {
+        found.insert(
+            (TOPOLOGY, format!("state.{name}")),
+            Slice::own(without(channel, &["name"])),
+        );
+    }
+
+    // A trigger is split: which flow it runs and what it is for are §4's, and
+    // its whole delivery surface is §6's.
+    for (name, trigger) in section(&artifact, &["triggers"]) {
+        let address = format!("trigger.{name}");
+        found.insert(
+            (COMPONENTS, address.clone()),
+            Slice::own(only(trigger.clone(), &["flow", "description"])),
+        );
+        found.insert(
+            (INTERFACES, address.clone()),
+            Slice::under(&address, without(trigger, &["flow", "description", "name"])),
+        );
+    }
+
+    // The two reserved sections `local` admits are §4's entirely.
+    for (name, placement) in section(&artifact, &["deploy", "placements"]) {
+        found.insert(
+            (COMPONENTS, format!("placement.{name}")),
+            Slice::own(without(placement, &["address"])),
+        );
+    }
+    for (name, source) in section(&artifact, &["deploy", "event_sources"]) {
+        found.insert(
+            (COMPONENTS, format!("event_source.{name}")),
+            Slice::own(without(source, &["name"])),
+        );
+    }
+    accounted(
+        artifact.get("deploy").unwrap_or(&Value::Null),
+        &["placements", "event_sources"],
+        "the deploy layer",
+    );
+
+    // A definition is §4's, except that a flow's graph is §5's and its declared
+    // I/O is §6's.
+    let Some(Value::Object(definitions)) = artifact.get("definitions") else {
+        panic!("the artifact declares its definitions");
+    };
+    for (address, definition) in definitions {
+        if definition.get("namespace") != Some(&Value::from("flow")) {
+            found.insert(
+                (COMPONENTS, address.clone()),
+                Slice::own(without(definition.clone(), &["address"])),
+            );
+            continue;
+        }
+        found.insert(
+            (COMPONENTS, address.clone()),
+            Slice::own(without(
+                definition.clone(),
+                &["address", "inputs", "outputs", "nodes", "edges"],
+            )),
+        );
+        found.insert(
+            (INTERFACES, address.clone()),
+            Slice::under(address, only(definition.clone(), &["inputs", "outputs"])),
+        );
+        for node in items(definition, "nodes") {
+            let id = node
+                .get("id")
+                .and_then(Value::as_str)
+                .expect("a node of the artifact carries its id");
+            found.insert(
+                (TOPOLOGY, format!("{address}.{id}")),
+                Slice::under(address, without(node.clone(), &["id"])),
+            );
+        }
+        found.insert(
+            (TOPOLOGY, format!("{address} edges")),
+            Slice::under(
+                address,
+                definition.get("edges").cloned().unwrap_or(Value::Null),
+            ),
+        );
+    }
+
+    found
+}
+
+/// Every key of `value`, held to the ones a clause of [`subjects`] places.
+///
+/// A partition is only a partition if it covers what it partitions, so a key
+/// added to the IR that no section of `docs/plan.md` accounts for is a failure
+/// *of this file* — the property would otherwise go quiet about that key in both
+/// directions, which is the hole it exists to close.
+fn accounted(value: &Value, keys: &[&str], what: &str) {
+    let Value::Object(map) = value else {
+        panic!("{what} is an object of the artifact");
+    };
+    let extra: Vec<&str> = map
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !keys.contains(key))
+        .collect();
+    assert!(
+        extra.is_empty(),
+        "{what} holds {extra:?}, which no clause of `subjects` places. Either a section of \
+         `docs/plan.md` owns it — and this restatement has to say which — or `docs/plan.md` §11 \
+         excuses it and `compared` has to take it out."
+    );
+}
+
+/// The named entries of a section of the artifact at `place`, which may not have
+/// been declared at all.
+///
+/// A declared section reaches the artifact as `{entries, span}` and an empty one
+/// as no key at all once [`compared`] is through with it, so a missing key here
+/// is a section with nothing in it either way.
+fn section<'a>(artifact: &'a Value, place: &[&str]) -> Vec<(&'a str, Value)> {
+    let mut at = artifact;
+    for step in place {
+        let Some(next) = at.get(*step) else {
+            return Vec::new();
+        };
+        at = next;
+    }
+    accounted(
+        at,
+        &["entries"],
+        &format!("the `{}` section", place.join(".")),
+    );
+    let Some(Value::Object(entries)) = at.get("entries") else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.clone()))
+        .collect()
+}
+
+/// The array under this key, or nothing when the key holds no array.
+fn items<'a>(value: &'a Value, key: &str) -> &'a [Value] {
+    value
+        .get(key)
+        .and_then(Value::as_array)
+        .map_or(&[][..], Vec::as_slice)
+}
+
+/// The same object without these top-level keys — the ones another section of a
+/// plan owns, or the one repeating the key the entry sits under.
+fn without(value: Value, keys: &[&str]) -> Value {
+    let Value::Object(mut map) = value else {
+        return value;
+    };
+    for key in keys {
+        map.remove(*key);
+    }
+    Value::Object(map)
+}
+
+/// The same object with only these top-level keys.
+fn only(value: Value, keys: &[&str]) -> Value {
+    let Value::Object(map) = value else {
+        return Value::Object(Map::new());
+    };
+    let mut held = Map::new();
+    for key in keys {
+        if let Some(value) = map.get(*key) {
+            held.insert((*key).to_string(), value.clone());
+        }
+    }
+    Value::Object(held)
+}
+
+/// Every subject the two artifacts disagree about.
+///
+/// A subject whose component is missing from either side is not one of them:
+/// §3's rule is that what a component which arrived *contains* is not a diff, it
+/// is the spec, so its nodes, its edges and its surfaces are the flow's own
+/// arrival to report and nothing else's.
+fn differing(
+    before: &BTreeMap<Subject, Slice>,
+    after: &BTreeMap<Subject, Slice>,
+) -> BTreeSet<Subject> {
+    let both: BTreeSet<&str> = components(before)
+        .intersection(&components(after))
+        .copied()
+        .collect();
+    let mut found = BTreeSet::new();
+    for key in before.keys().chain(after.keys()) {
+        let owner = before
+            .get(key)
+            .or_else(|| after.get(key))
+            .and_then(|slice| slice.owner.as_deref());
+        if owner.is_some_and(|owner| !both.contains(owner)) {
+            continue;
+        }
+        match (before.get(key), after.get(key)) {
+            (Some(old), Some(new)) if old.value == new.value => {}
+            _ => {
+                found.insert(key.clone());
+            }
+        }
+    }
+    found
+}
+
+/// The addresses of the components one side declares, which is what §3's rule is
+/// stated over.
+fn components(subjects: &BTreeMap<Subject, Slice>) -> BTreeSet<&str> {
+    subjects
+        .keys()
+        .filter(|(section, _)| *section == COMPONENTS)
+        .map(|(_, address)| address.as_str())
+        .collect()
+}
+
+/// Every subject a plan names, keyed the way [`subjects`] keys them, and for
+/// each the **keys of the subject** its records reach into.
+///
+/// A path is `docs/plan.md` §3's — keys joined with `.`, array elements as
+/// `[i]`, named entries as `[<name>]` — and only its first step is taken. That
+/// step is a field of the subject itself, which is the granularity a plan can be
+/// held to from outside: everything below it is the walk's own business, and
+/// restating *that* would mean copying the entry-matching this file exists not
+/// to share (see [`subjects`]). A key of the subject is enough to catch the
+/// failure that matters — a field that stopped being compared reports at no key
+/// at all.
+fn named_subjects(plan: &Plan) -> BTreeMap<Subject, BTreeSet<String>> {
+    let mut found: BTreeMap<Subject, BTreeSet<String>> = BTreeMap::new();
+    for change in &plan.components {
+        found
+            .entry((COMPONENTS, change.address.clone()))
+            .or_default()
+            .extend(heads(&change.fields));
+    }
+    for change in &plan.topology {
+        let address = if change.site == TopologyKind::Edge {
+            let flow = change
+                .flow
+                .as_deref()
+                .expect("an edge belongs to a flow (`docs/plan.md` §5)");
+            format!("{flow} edges")
+        } else {
+            change.address.clone()
+        };
+        found
+            .entry((TOPOLOGY, address))
+            .or_default()
+            .extend(heads(&change.fields));
+    }
+    for change in &plan.interfaces {
+        found
+            .entry((INTERFACES, change.address.clone()))
+            .or_default()
+            .extend(heads(&change.fields));
+    }
+    found
+}
+
+/// The first step of each of these paths.
+fn heads(fields: &[FieldChange]) -> BTreeSet<String> {
+    fields
+        .iter()
+        .map(|field| {
+            let path = field.path.as_str();
+            path[..path.find(['.', '[']).unwrap_or(path.len())].to_string()
+        })
+        .collect()
+}
+
+/// Which keys of one subject the two artifacts differ at.
+///
+/// The mirror of [`heads`], read off the artifact instead of off the report. A
+/// key on one side only counts: `docs/plan.md` §3 makes an undeclared field a
+/// change like any other, because an absent `timeout:` inherits and a declared
+/// one does not.
+fn differing_keys(before: &Map<String, Value>, after: &Map<String, Value>) -> BTreeSet<String> {
+    before
+        .keys()
+        .chain(after.keys())
+        .filter(|key| before.get(*key) != after.get(*key))
+        .cloned()
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // The property.
 // ---------------------------------------------------------------------------
 
@@ -327,8 +726,12 @@ fn artifact(entrypoint: &Path) -> Option<Ir> {
     resolve(entrypoint).ir
 }
 
-/// The property, over one pair: the three structural sections are empty exactly
-/// when the two artifacts agree on everything §11 does not excuse.
+/// The property, over one pair: a plan names a subject exactly when the two
+/// artifacts differ in the part of them that subject owns, and — the weaker
+/// reading, which follows and is asserted anyway because it is stated over the
+/// **whole** artifact rather than over the partition — the three structural
+/// sections are empty exactly when the two artifacts agree on everything §11
+/// does not excuse.
 #[track_caller]
 fn holds(what: &str, before: &Ir, after: &Ir) -> usize {
     let plan = plan(
@@ -343,6 +746,49 @@ fn holds(what: &str, before: &Ir, after: &Ir) -> usize {
             resolution: &[],
         },
     );
+
+    let old = subjects(before);
+    let new = subjects(after);
+    let named = named_subjects(&plan);
+    let differing = differing(&old, &new);
+    let spoken: BTreeSet<Subject> = named.keys().cloned().collect();
+    let silent: Vec<&Subject> = differing.difference(&spoken).collect();
+    let invented: Vec<&Subject> = spoken.difference(&differing).collect();
+    assert!(
+        silent.is_empty(),
+        "{what}: a plan said two compositions agree about {silent:?} when they do not — the two \
+         artifacts differ there in something `docs/plan.md` §11 does not excuse, and no record of \
+         the owning section names it."
+    );
+    assert!(
+        invented.is_empty(),
+        "{what}: a plan named {invented:?}, which the two artifacts do not differ in — either \
+         `docs/plan.md` §11 excuses the difference and no record may name it, or §4–§6 give the \
+         field to a different section than `subjects` does."
+    );
+
+    // …and, for a subject both sides declare, down to which of its keys. The
+    // edges of a flow are one subject and not an object, so they are held to the
+    // paragraph above and no further: an edge is matched by identity rather than
+    // by address (§5), and reading its records back onto the artifact would mean
+    // restating that pairing here.
+    for (key, fields) in &named {
+        let (Some(old), Some(new)) = (old.get(key), new.get(key)) else {
+            continue;
+        };
+        let (Value::Object(old), Value::Object(new)) = (&old.value, &new.value) else {
+            continue;
+        };
+        let differing = differing_keys(old, new);
+        assert_eq!(
+            fields, &differing,
+            "{what}: a plan reports {key:?} changed at {fields:?}, and the two artifacts differ \
+             at {differing:?}. A key of the artifact missing from the report is a field nobody \
+             compares any more; a key of the report missing from the artifact is a line about an \
+             edit nobody made."
+        );
+    }
+
     let reported = structural(&plan);
     let agree = compared(before) == compared(after);
     assert_eq!(
@@ -486,6 +932,33 @@ const SEEDS_SWAPPED: &str = r#"  seeds:
 
   human_decision:"#;
 
+/// The same channel a third time, with the two **keys** of one of those elements
+/// written the other way round rather than the two elements.
+///
+/// The pair to read against [`SEEDS_SWAPPED`], because the two edits look alike
+/// and come out opposite ways. An array's positions are part of its value, so
+/// reversing the elements hands every caller a different one. A mapping's keys
+/// are not: `{name: alpha, weight: 1}` and `{weight: 1, name: alpha}` answer
+/// every lookup identically, and `docs/plan.md` §11 accounts for the one thing
+/// that does read differently — the order the literal is *written out* in the
+/// emitted project.
+///
+/// This is the clause [`compared`] inherits from `serde_json` rather than
+/// stating, so the case is the only place it is held to an edit at all.
+const SEEDS_REMAPPED: &str = r#"  seeds:
+    type: array
+    max_items: 4
+    items:
+      type: object
+      properties:
+        name: { type: string }
+        weight: { type: integer }
+    default:
+      - { weight: 1, name: alpha }
+      - { name: beta, weight: 2 }
+
+  human_decision:"#;
+
 /// A node's two input bindings, and the same two swapped. Dispatched on by name.
 const BINDINGS: &str = r#"        pattern: "input.pattern"
         max_matches: "25""#;
@@ -614,6 +1087,31 @@ const SIBLINGS: &str = r#"    - { from: approve, to: end, when: "approve.output.
 const SIBLINGS_SWAPPED: &str = r#"    - { from: approve, to: escalate, when: "approve.output.decision == 'reject'" }
     - { from: approve, to: end, when: "approve.output.decision == 'approve'" }"#;
 
+/// The last placement of the deploy layer, and the same file with an event
+/// source planted under it so that there is one to edit — `local` declares
+/// none, and `event_sources:` is one of the two reserved sections it admits
+/// (`docs/plan.md` §11).
+const PLACEMENT: &str = r#"  flow.triage:
+    runtime: colocated"#;
+const EVENT_SOURCE: &str = r#"  flow.triage:
+    runtime: colocated
+
+event_sources:
+  bug_reports:
+    kind: redis_streams
+    url: ${REDIS_URL}
+    stream: bug-reports
+    consumer_group: agent-compose"#;
+const EVENT_SOURCE_MOVED: &str = r#"  flow.triage:
+    runtime: colocated
+
+event_sources:
+  bug_reports:
+    kind: redis_streams
+    url: ${REDIS_URL}
+    stream: triage-reports
+    consumer_group: agent-compose"#;
+
 /// Two edges of **different** nodes, and the same two swapped. Neither node's
 /// own outgoing order moves, so neither node's routing decision reads
 /// differently.
@@ -631,6 +1129,12 @@ const CASES: &[Case] = &[
         before: &[("main.yml", "  human_decision:", SEEDS)],
         after: &[("main.yml", "  human_decision:", SEEDS_SWAPPED)],
         differs: true,
+    },
+    Case {
+        what: "an author's literal mapping reordered",
+        before: &[("main.yml", "  human_decision:", SEEDS)],
+        after: &[("main.yml", "  human_decision:", SEEDS_REMAPPED)],
+        differs: false,
     },
     Case {
         what: "a literal scalar default changed",
@@ -804,6 +1308,378 @@ const CASES: &[Case] = &[
         )],
         differs: false,
     },
+    // --- One field of one component, with nothing else moving. ----------------
+    //
+    // A section that stopped comparing a whole class of field reports nothing
+    // for a component whose *only* edit is one of that class — and every pair of
+    // the corpus above moves several constructs at once, so the record some
+    // other construct produces would cover for it. Each of these five is one
+    // key of one component and nothing else, so the class has nowhere to hide.
+    Case {
+        what: "a definition's description reworded",
+        before: &[],
+        after: &[(
+            "agents/triage.yml",
+            "  description: Classifies bug-report findings into routable variants.",
+            "  description: Sorts incoming bug-report findings into routable variants.",
+        )],
+        differs: true,
+    },
+    Case {
+        what: "a model's id retargeted",
+        before: &[],
+        after: &[(
+            "models.yml",
+            "  id: qwen3-coder-30b",
+            "  id: qwen3-coder-14b",
+        )],
+        differs: true,
+    },
+    Case {
+        what: "a model setting retuned",
+        before: &[],
+        after: &[("models.yml", "    temperature: 0.2", "    temperature: 0.3")],
+        differs: true,
+    },
+    Case {
+        what: "a store's agent access widened",
+        before: &[],
+        after: &[(
+            "stores/docs.yml",
+            "  agent_access: read\n",
+            "  agent_access: read_write\n",
+        )],
+        differs: true,
+    },
+    Case {
+        what: "an event source's stream repointed",
+        before: &[("deploy/local.yml", PLACEMENT, EVENT_SOURCE)],
+        after: &[("deploy/local.yml", PLACEMENT, EVENT_SOURCE_MOVED)],
+        differs: true,
+    },
+    // --- Every remaining key of one component, swept a component at a time. ---
+    //
+    // The property is stated over the **set** of keys a record names against the
+    // set the two artifacts differ at, so a case moving eight keys of one
+    // component holds all eight: swallow any one of them and the two sets differ
+    // by that key, whatever the other seven still report. One case per component
+    // kind is therefore what it takes to reach the keys a single-edit case would
+    // need a case each for.
+    Case {
+        what: "a store rewritten across the keys it declares",
+        before: &[],
+        after: &[
+            ("stores/docs.yml", "  scope: global", "  scope: session"),
+            (
+                "stores/docs.yml",
+                "  backend: docs_db",
+                "  backend: project_docs",
+            ),
+            (
+                "stores/docs.yml",
+                "    dimensions: 1536",
+                "    dimensions: 768",
+            ),
+            (
+                "stores/docs.yml",
+                "    source: { type: string }",
+                "    source: { type: string, min_length: 1 }",
+            ),
+            (
+                "stores/docs.yml",
+                "  description: Project documentation, chunked, for grounding triage decisions.",
+                "  description: Project documentation for grounding triage decisions.",
+            ),
+            (
+                "stores/triage_memory.yml",
+                "      minimum: 0",
+                "      minimum: 1",
+            ),
+        ],
+        differs: true,
+    },
+    Case {
+        what: "a provider re-keyed",
+        before: &[],
+        after: &[
+            ("providers.yml", "  kind: anthropic", "  kind: openai"),
+            (
+                "providers.yml",
+                "  api_key: ${ANTHROPIC_API_KEY}",
+                "  api_key: ${OPENAI_API_KEY}",
+            ),
+            (
+                "providers.yml",
+                "  base_url: ${LOCAL_LLM_URL}",
+                "  base_url: ${LLM_URL}",
+            ),
+        ],
+        differs: true,
+    },
+    Case {
+        what: "a model re-provisioned",
+        before: &[],
+        after: &[(
+            "models.yml",
+            "  provider: provider.local",
+            "  provider: provider.anthropic",
+        )],
+        differs: true,
+    },
+    Case {
+        what: "a tool's signature and its binding retuned",
+        before: &[],
+        after: &[
+            (
+                "tools/repo_grep.yml",
+                "  description: Search the repository for a pattern and return matching lines.",
+                "  description: Search the repository and return matching lines.",
+            ),
+            (
+                "tools/repo_grep.yml",
+                "      maximum: 200",
+                "      maximum: 100",
+            ),
+            (
+                "tools/repo_grep.yml",
+                "      max_items: 200",
+                "      max_items: 150",
+            ),
+            (
+                "tools/review_queue.yml",
+                "    expect_status: [201]",
+                "    expect_status: [200, 201]",
+            ),
+        ],
+        differs: true,
+    },
+    Case {
+        what: "an agent given a store and a tool",
+        before: &[],
+        after: &[
+            (
+                "agents/triage.yml",
+                "  stores: [store.docs]",
+                "  stores: [store.docs]\n  tools: [tool.repo_grep]",
+            ),
+            (
+                "agents/fixer.yml",
+                "  model: model.fast",
+                "  model: model.fast\n  stores: [store.docs]",
+            ),
+        ],
+        differs: true,
+    },
+    Case {
+        what: "a trigger's delivery surface rewritten",
+        before: &[],
+        after: &[
+            (
+                "triggers.yml",
+                "    cron: \"0 3 * * *\"",
+                "    cron: \"0 4 * * *\"",
+            ),
+            (
+                "triggers.yml",
+                "    timezone: UTC",
+                "    timezone: Europe/Berlin",
+            ),
+            (
+                "triggers.yml",
+                "    source: bug_reports",
+                "    source: triage_reports",
+            ),
+            (
+                "triggers.yml",
+                "    dedupe_key: \"payload.id\"",
+                "    dedupe_key: \"payload.message_id\"",
+            ),
+            (
+                "triggers.yml",
+                "    callback: \"payload.body.callback_url\"",
+                "    callback: \"payload.body.done_url\"",
+            ),
+            (
+                "triggers.yml",
+                "      report: \"payload.body.text\"",
+                "      report: \"payload.body.summary\"",
+            ),
+        ],
+        differs: true,
+    },
+    Case {
+        what: "a trigger pointed at another flow",
+        before: &[],
+        after: &[(
+            "triggers.yml",
+            "  cli:\n    type: manual\n    flow: flow.triage",
+            "  cli:\n    type: manual\n    flow: flow.enrich",
+        )],
+        differs: true,
+    },
+    Case {
+        what: "the policy defaults given another failure mode",
+        before: &[],
+        after: &[("main.yml", "  on_error: fail", "  on_error: skip")],
+        differs: true,
+    },
+    Case {
+        what: "a flow's description reworded",
+        before: &[],
+        after: &[(
+            "flows/triage.yml",
+            "  description: Triage a bug report, fan out fixes, and get a human sign-off.",
+            "  description: Triage a bug report and get a sign-off.",
+        )],
+        differs: true,
+    },
+    // --- The tag keys, which a construct's whole shape hangs off. -------------
+    //
+    // Each of these is one key of the artifact and a different construct on the
+    // two sides, so the record has to name the tag *and* every key that arrived
+    // or left with it. `namespace` is the one tag no case can move: it follows
+    // from the address (grammar 2.2), and two definitions are compared only
+    // where they sit at the same address.
+    Case {
+        what: "a bound model made a failover route",
+        before: &[],
+        after: &[(
+            "models.yml",
+            "model.offline:\n  provider: provider.local\n  id: qwen3-coder-30b\n  settings:\n    temperature: 0.2",
+            "model.offline:\n  route: [model.fast, model.smart]\n  route_on: [rate_limit]",
+        )],
+        differs: true,
+    },
+    Case {
+        what: "a kv store made a blob store",
+        before: &[],
+        after: &[
+            (
+                "stores/triage_memory.yml",
+                "  kind: kv\n  scope: session",
+                "  kind: blob\n  scope: session",
+            ),
+            (
+                "stores/triage_memory.yml",
+                "  value_schema:\n    last_report:\n      description: The most recent report triaged in this session.\n      type: string\n    patch_count:\n      description: How many patches the last run produced.\n      type: integer\n      minimum: 0\n",
+                "",
+            ),
+        ],
+        differs: true,
+    },
+    Case {
+        what: "an exec-bound tool made an http-bound one",
+        before: &[],
+        after: &[(
+            "tools/repo_grep.yml",
+            "  exec:\n    command: repo-grep\n    args: [\"--format\", \"json\"]\n    cwd: \"${REPO_ROOT}\"\n    env:\n      RIPGREP_CONFIG_PATH: \"${RG_CONFIG_PATH}\"",
+            "  http:\n    method: POST\n    url: \"https://${QUEUE_HOST}/v1/grep\"\n    body:\n      pattern: \"input.pattern\"",
+        )],
+        differs: true,
+    },
+    Case {
+        what: "a manual trigger made an http one",
+        before: &[],
+        after: &[(
+            "triggers.yml",
+            "  cli:\n    type: manual",
+            "  cli:\n    type: http\n    path: /cli\n    method: POST",
+        )],
+        differs: true,
+    },
+    Case {
+        what: "a subgraph node pointed at another flow",
+        before: &[],
+        after: &[(
+            "flows/triage.yml",
+            "      flow: flow.enrich",
+            "      flow: flow.triage",
+        )],
+        differs: true,
+    },
+    Case {
+        what: "a store-op node's operation changed",
+        before: &[],
+        after: &[(
+            "flows/triage.yml",
+            "      op: set\n      key: \"execution.session_key\"\n      value:\n        last_report: \"input.report\"\n        patch_count: \"size(state.patches)\"",
+            "      op: get\n      key: \"execution.session_key\"",
+        )],
+        differs: true,
+    },
+    // --- One field of one node, the same way. ---------------------------------
+    Case {
+        what: "a node re-kinded, and the rest of the graph's kinds moved with it",
+        before: &[],
+        after: &[
+            (
+                "flows/triage.yml",
+                "    summarize:\n      agent: agent.summarizer",
+                "    summarize:\n      function: tool.repo_grep",
+            ),
+            (
+                "flows/triage.yml",
+                "      context: isolated",
+                "      context: inherit",
+            ),
+            (
+                "flows/triage.yml",
+                "      store: store.triage_memory",
+                "      store: store.docs",
+            ),
+            (
+                "flows/triage.yml",
+                "        report: \"input.report\"",
+                "        report: \"state.report_normalized\"",
+            ),
+            (
+                "flows/triage.yml",
+                "        timeout: 30s",
+                "        timeout: 45s",
+            ),
+            (
+                "flows/triage.yml",
+                "      retry: { max: 3, backoff: 1s }",
+                "      retry: { max: 2, backoff: 1s }",
+            ),
+            (
+                "flows/triage.yml",
+                "\"https://${QUEUE_HOST}/v1/escalations\"",
+                "\"https://${QUEUE_HOST}/v1/escalate\"",
+            ),
+        ],
+        differs: true,
+    },
+    Case {
+        what: "a node's write remapped",
+        before: &[],
+        after: &[(
+            "flows/triage.yml",
+            "        decision: human_decision",
+            "        decision: summary",
+        )],
+        differs: true,
+    },
+    Case {
+        what: "a store-op node rekeyed",
+        before: &[],
+        after: &[(
+            "flows/triage.yml",
+            "      key: \"execution.session_key\"",
+            "      key: \"input.report\"",
+        )],
+        differs: true,
+    },
+    Case {
+        what: "a node's description reworded",
+        before: &[],
+        after: &[(
+            "flows/triage.yml",
+            "    summarize:\n      agent: agent.summarizer",
+            "    summarize:\n      description: Say what the run did.\n      agent: agent.summarizer",
+        )],
+        differs: true,
+    },
     // --- The rest of the surfaces, one edit each. -----------------------------
     Case {
         what: "a policy default retimed",
@@ -853,6 +1729,22 @@ const CASES: &[Case] = &[
         after: &[("main.yml", "    max_items: 200", "    max_items: 100")],
         differs: true,
     },
+    Case {
+        what: "a channel's reduce policy changed",
+        before: &[],
+        after: &[("main.yml", "    reduce: append", "    reduce: last_wins")],
+        differs: true,
+    },
+    Case {
+        what: "a flow's output surface documented",
+        before: &[],
+        after: &[(
+            "flows/triage.yml",
+            "    summary:\n      type: string",
+            "    summary:\n      description: What the run concluded.\n      type: string",
+        )],
+        differs: true,
+    },
 ];
 
 /// Copy the base composition into `into`, then apply the edits.
@@ -884,18 +1776,29 @@ fn copy(from: &Path, to: &Path) {
     }
 }
 
+/// The two artifacts one case describes, planted and resolved.
+///
+/// `under` names the caller, because the tests of this file run in one process
+/// and [`scratch`] is keyed by that process: two of them planting the same case
+/// into one directory would race.
+fn sides(under: &str, at: usize, case: &Case) -> (Ir, Ir) {
+    let before = scratch(&format!("{under}-{at}-before"));
+    let after = scratch(&format!("{under}-{at}-after"));
+    planted(&before, case.before);
+    planted(&after, case.after);
+    let old = artifact(&before.join("main.yml"))
+        .unwrap_or_else(|| panic!("{}: the before side resolves", case.what));
+    let new = artifact(&after.join("main.yml"))
+        .unwrap_or_else(|| panic!("{}: the after side resolves", case.what));
+    let _ = fs::remove_dir_all(&before);
+    let _ = fs::remove_dir_all(&after);
+    (old, new)
+}
+
 #[test]
 fn one_composition_edited_one_construct_at_a_time_reports_every_edit_and_no_other() {
     for (at, case) in CASES.iter().enumerate() {
-        let before = scratch(&format!("{at}-before"));
-        let after = scratch(&format!("{at}-after"));
-        planted(&before, case.before);
-        planted(&after, case.after);
-
-        let old = artifact(&before.join("main.yml"))
-            .unwrap_or_else(|| panic!("{}: the before side resolves", case.what));
-        let new = artifact(&after.join("main.yml"))
-            .unwrap_or_else(|| panic!("{}: the after side resolves", case.what));
+        let (old, new) = sides("reports", at, case);
 
         let reported = holds(case.what, &old, &new);
         assert_eq!(
@@ -906,8 +1809,106 @@ fn one_composition_edited_one_construct_at_a_time_reports_every_edit_and_no_othe
             if case.differs { "differ" } else { "agree" }
         );
         holds(&format!("{} (reversed)", case.what), &new, &old);
-
-        let _ = fs::remove_dir_all(&before);
-        let _ = fs::remove_dir_all(&after);
     }
+}
+
+// ---------------------------------------------------------------------------
+// …and the corpora are the coverage, so what they reach is asserted too.
+// ---------------------------------------------------------------------------
+
+/// The keys of the artifact no pair of specs can move, so none is asked to.
+///
+/// `namespace` is the tag a definition's body is written under, and it follows
+/// from the address (grammar 2.2). Two definitions are compared only where they
+/// sit at the same address (`docs/plan.md` §4), so it is equal on both sides of
+/// every comparison there is.
+const CONSTRUCTED: &[&str] = &["namespace"];
+
+/// Which kind of subject an address names, which is what coverage is counted
+/// over: every node of every flow is one bucket, and so is every agent.
+fn kind_of(subject: &Subject) -> String {
+    let (section, address) = subject;
+    format!(
+        "{section}/{}",
+        address.split('.').next().unwrap_or_default()
+    )
+}
+
+/// Every key the two artifacts differ at, into `found`, bucketed by [`kind_of`].
+fn moved(before: &Ir, after: &Ir, found: &mut BTreeMap<String, BTreeSet<String>>) {
+    let old = subjects(before);
+    let new = subjects(after);
+    for key in old.keys().chain(new.keys()) {
+        let (Some(one), Some(two)) = (old.get(key), new.get(key)) else {
+            continue;
+        };
+        let (Value::Object(one), Value::Object(two)) = (&one.value, &two.value) else {
+            continue;
+        };
+        found
+            .entry(kind_of(key))
+            .or_default()
+            .extend(differing_keys(one, two));
+    }
+}
+
+/// Every key of the base composition's artifact is moved by some pair, so the
+/// property above is **exercised** at each of them rather than merely stated
+/// over them.
+///
+/// [`holds`] compares the keys a plan's records name against the keys the two
+/// artifacts differ at, key for key — so it catches a field that stopped being
+/// compared exactly on the pairs whose two sides differ in *that field*. Which
+/// makes the two corpora the coverage, and this is the assertion that says so:
+/// a key of the artifact no pair moves is a key the property is silent about,
+/// and a refactor could stop comparing it under a green suite. That is the hole
+/// this whole file exists to close, one level up.
+///
+/// So a key added to the IR needs a case that moves it, the way a check added to
+/// the compiler needs a fixture (`static_check_inventory.rs`). The failure names
+/// the key and the kind of subject it sits on.
+#[test]
+fn every_key_of_the_base_composition_is_moved_by_some_pair() {
+    let mut found: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for name in corpus_pairs() {
+        let before = artifact(&corpus().join(&name).join("before/main.yml"));
+        let after = artifact(&corpus().join(&name).join("after/main.yml"));
+        if let (Some(before), Some(after)) = (before, after) {
+            moved(&before, &after, &mut found);
+        }
+    }
+    for (at, case) in CASES.iter().enumerate() {
+        let (old, new) = sides("moves", at, case);
+        moved(&old, &new, &mut found);
+    }
+
+    let base = scratch("base");
+    planted(&base, &[]);
+    let ir = artifact(&base.join("main.yml")).expect("the base composition resolves");
+    let _ = fs::remove_dir_all(&base);
+
+    let mut missed: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (subject, slice) in subjects(&ir) {
+        let Value::Object(map) = &slice.value else {
+            continue;
+        };
+        let kind = kind_of(&subject);
+        let reached = found.get(&kind).cloned().unwrap_or_default();
+        for key in map.keys() {
+            if !reached.contains(key) && !CONSTRUCTED.contains(&key.as_str()) {
+                missed.entry(kind.clone()).or_default().push(key.clone());
+            }
+        }
+    }
+    for keys in missed.values_mut() {
+        keys.sort();
+        keys.dedup();
+    }
+    assert!(
+        missed.is_empty(),
+        "no pair of either corpus moves {missed:?}, so nothing here would notice if a plan \
+         stopped comparing one of them. Add a case to `CASES` that edits it — beside the one \
+         for the construct it sits in — or, if it cannot differ between two comparable specs, \
+         name it in `CONSTRUCTED` and say why."
+    );
 }
