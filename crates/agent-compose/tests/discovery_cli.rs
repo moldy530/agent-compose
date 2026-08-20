@@ -169,6 +169,40 @@ fn init_refuses_a_directory_that_holds_anything() {
     );
 }
 
+/// PRD §7 M2's exit criterion, as far as one test can carry it: a directory
+/// with **nothing in it**, and every teaching verb still answers.
+///
+/// The point is what is *absent* — no `docs/grammar.md`, no `schemas/`, no
+/// checkout of this repository anywhere the command can see. Everything these
+/// verbs print is embedded, and a regression to reading a file beside the
+/// binary would pass every other test in this file and fail here.
+#[test]
+fn every_teaching_verb_answers_from_an_empty_directory() {
+    let directory = scratch("no-checkout");
+    for arguments in [
+        vec!["docs"],
+        vec!["docs", "getting-started"],
+        vec!["explain", "unbounded-cycle"],
+        vec!["schema"],
+        vec!["skill"],
+    ] {
+        let output = run(&directory, &arguments);
+        assert_eq!(code(&output), 0, "`{arguments:?}` answers");
+        assert!(
+            stdout(&output).len() > 200,
+            "`{arguments:?}` answers with a document"
+        );
+        assert_eq!(stderr(&output), "", "`{arguments:?}` says nothing else");
+    }
+    assert!(
+        std::fs::read_dir(&directory)
+            .expect("readable")
+            .next()
+            .is_none(),
+        "and none of them wrote anything"
+    );
+}
+
 /// `docs` with no topic prints the index, and the index is a *starting point*:
 /// it names every topic and then says what to do first.
 #[test]

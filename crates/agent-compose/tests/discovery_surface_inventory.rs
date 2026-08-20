@@ -426,9 +426,13 @@ fn walk(directory: &Path, found: &mut BTreeSet<String>) {
 #[test]
 fn the_skill_names_every_verb() {
     for verb in verbs() {
+        // In code voice, which is how the skill's verb table writes them. A
+        // looser match would be satisfied by prose: `run` appears in an
+        // ordinary English sentence three times before the table.
         assert!(
-            docs::SKILL.contains(&format!("`{verb}")) || docs::SKILL.contains(&format!("{verb} ")),
-            "the skill does not name `{verb}`"
+            docs::SKILL.contains(&format!("`{verb}`"))
+                || docs::SKILL.contains(&format!("`{verb} ")),
+            "the skill's verb table does not name `{verb}`"
         );
     }
 }

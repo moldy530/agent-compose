@@ -59,9 +59,10 @@ needed. Node or Bun is needed only to *run* a compiled project.
 | `init [<dir>]` | scaffold a project that validates |
 | `skill [--agent <name>]` | print this document, or install it |
 
-Add `--format json` to `validate`, `plan`, `build` and `run` when a script is
-reading the output. Add `--target <name>` to select a `deploy/<name>.yml`; the
-built-in `local` target needs no deploy file.
+Add `--format json` to any verb that reports — `validate`, `plan`, `build`,
+`run`, `serve` — when a script is reading the output. Add `--target <name>` to
+select a `deploy/<name>.yml`; the built-in `local` target needs no deploy file,
+and is what every verb resolves when none is named.
 
 ## Exit codes
 
