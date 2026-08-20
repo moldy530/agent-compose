@@ -137,6 +137,13 @@ fn checksum(directory: &Path) {
 
 /// A `uname` that answers as `system`/`machine`, in a directory to put on
 /// `PATH` ahead of the real one.
+///
+/// It carries a `sysctl` too. macOS decides "is this process being translated
+/// by Rosetta?" with `sysctl.proc_translated`, so a machine that answers `uname`
+/// but not that one is only half a machine — and a fixture that let the *host's*
+/// `sysctl` answer would behave differently on somebody's Mac than in CI. The
+/// answer here is a native process's, `0`; [`rosetta`] and [`intel_mac`]
+/// overwrite it with the other two.
 fn machine(purpose: &str, system: &str, machine: &str) -> PathBuf {
     let directory = scratch(purpose);
     write_executable(
@@ -145,6 +152,36 @@ fn machine(purpose: &str, system: &str, machine: &str) -> PathBuf {
             "#!/bin/sh\ncase \"$1\" in\n  -s) echo {system} ;;\n  -m) echo {machine} ;;\n  \
              *) echo \"the fixture uname was asked for $1\" >&2; exit 1 ;;\nesac\n"
         ),
+    );
+    write_executable(
+        &directory.join("sysctl"),
+        "#!/bin/sh\ncase \"$*\" in\n  *sysctl.proc_translated) echo 0 ;;\n  \
+         *) echo \"the fixture sysctl was asked for $*\" >&2; exit 1 ;;\nesac\n",
+    );
+    directory
+}
+
+/// A shell running **under Rosetta**: `uname -m` says `x86_64`, because x86_64
+/// is what is being emulated, and `sysctl.proc_translated` says `1`, because
+/// the machine underneath it is arm64.
+fn rosetta(purpose: &str) -> PathBuf {
+    let directory = machine(purpose, "Darwin", "x86_64");
+    write_executable(
+        &directory.join("sysctl"),
+        "#!/bin/sh\ncase \"$*\" in\n  *sysctl.proc_translated) echo 1 ;;\n  \
+         *) echo \"the fixture sysctl was asked for $*\" >&2; exit 1 ;;\nesac\n",
+    );
+    directory
+}
+
+/// An Intel Mac: x86_64 all the way down, and **no `proc_translated` oid at
+/// all**. That is an error rather than a `0`, and the installer has to read the
+/// error as "not translated" rather than as an answer it can compare.
+fn intel_mac(purpose: &str) -> PathBuf {
+    let directory = machine(purpose, "Darwin", "x86_64");
+    write_executable(
+        &directory.join("sysctl"),
+        "#!/bin/sh\necho \"sysctl: unknown oid '$2'\" >&2\nexit 1\n",
     );
     directory
 }
@@ -449,6 +486,121 @@ fn the_version_asked_for_is_the_version_installed() {
     assert!(!into.join("agent-compose").exists());
 }
 
+/// A shell under Rosetta installs the binary for the machine underneath it.
+///
+/// `uname -m` answers with the architecture the process is *running as*, which
+/// under translation is not the architecture of the machine: a `sh` translated
+/// on Apple silicon says `x86_64`. Taking that answer installs the Intel build
+/// on an arm64 Mac, where it works — slowly, under Rosetta, for as long as
+/// nobody looks. The other two Darwin answers are here beside it, because the
+/// oid's *absence* on an Intel Mac is a different thing from a `0` and must not
+/// be read as a translated process.
+#[test]
+fn a_translated_shell_installs_the_binary_for_the_machine_underneath() {
+    let artifacts = release("rosetta", &[RELEASED]);
+
+    let into = scratch("rosetta-into");
+    let output = install(&artifacts, &into, &rosetta("uname-rosetta"), &[]);
+    assert!(
+        output.status.success(),
+        "{}{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert!(
+        stdout(&output).contains(&format!(
+            "agent-compose {RELEASED} (fixture, aarch64-apple-darwin)"
+        )),
+        "a translated shell should be handed the native arm64 build: {}",
+        stdout(&output)
+    );
+
+    let into = scratch("intel-into");
+    let output = install(&artifacts, &into, &intel_mac("uname-intel"), &[]);
+    assert!(
+        output.status.success(),
+        "{}{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert!(
+        stdout(&output).contains(&format!(
+            "agent-compose {RELEASED} (fixture, x86_64-apple-darwin)"
+        )),
+        "a Mac whose kernel has no `proc_translated` at all is not a translated \
+         shell, and should be handed the x86_64 build: {}",
+        stdout(&output)
+    );
+}
+
+/// The install directory ends up holding the binary and nothing else.
+///
+/// The unpacked binary is staged **inside the install directory** and renamed
+/// into place, because a temporary directory is routinely on another filesystem
+/// — `/tmp` is a tmpfs on most Linux distributions — where `mv` cannot rename
+/// and copies over the destination instead: not atomic, and a truncating write
+/// onto a file that may be executing. Staging there makes the install directory
+/// the place a failed install would leave litter, so that is what is checked:
+/// an install, an install over it, and a refusal, and afterwards one file. The
+/// refusal is also held to leaving the *previous* install intact — a checksum
+/// that does not match is a reason to install nothing, not a reason to take
+/// away the compiler somebody already had.
+#[test]
+fn an_install_leaves_the_directory_holding_the_binary_and_nothing_else() {
+    let artifacts = release("staging", &[RELEASED]);
+    let into = scratch("staging-into");
+    for pass in ["first", "second"] {
+        let output = install(
+            &artifacts,
+            &into,
+            &machine(&format!("uname-staging-{pass}"), "Linux", "x86_64"),
+            &[],
+        );
+        assert!(
+            output.status.success(),
+            "the {pass} install failed: {}{}",
+            stdout(&output),
+            stderr(&output)
+        );
+    }
+
+    let corrupt = release("staging-corrupt", &[RELEASED]);
+    fs::write(
+        corrupt.join("SHA256SUMS"),
+        format!(
+            "{}  agent-compose-{RELEASED}-x86_64-unknown-linux-musl.tar.gz\n",
+            "0".repeat(64)
+        ),
+    )
+    .expect("the checksum file is writable");
+    let refused = install(
+        &corrupt,
+        &into,
+        &machine("uname-staging-refused", "Linux", "x86_64"),
+        &[],
+    );
+    assert!(
+        !refused.status.success(),
+        "an archive the checksum did not vouch for was installed"
+    );
+
+    let left: BTreeSet<String> = fs::read_dir(&into)
+        .expect("the install directory is readable")
+        .map(|entry| {
+            entry
+                .expect("its entries are readable")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    assert_eq!(
+        left,
+        BTreeSet::from(["agent-compose".to_string()]),
+        "the install directory should hold the binary alone"
+    );
+}
+
 /// A version nobody built is refused, rather than half-installed.
 #[test]
 fn a_version_nobody_built_is_refused() {
@@ -530,6 +682,127 @@ fn the_latest_release_is_resolved_downloaded_and_verified() {
     assert!(!missing.join("agent-compose").exists());
 }
 
+/// A fetch that failed is reported as a fetch that failed.
+///
+/// Resolving "the latest release" reads a document from the releases API, and
+/// every way that read can fail — an unreachable host, a proxy's error page,
+/// the `404` GitHub answers for a repository that is private, renamed or gone —
+/// has to arrive as *that*. Reading the download inside the same pipeline as
+/// the parse loses it: a pipeline answers with its last command's status, so
+/// `sed` finding no `tag_name` in an empty body succeeds, and the failure is
+/// reported as "the API named no release" — which sends the reader off to check
+/// a version number when what broke was the network. Both messages are pinned
+/// here, against each other, because each is the other's wrong answer.
+#[test]
+fn a_release_document_that_could_not_be_fetched_names_the_fetch() {
+    // `curl -f` exits 22 on a 404, which is what a private or renamed
+    // repository answers.
+    let refusing = scratch("curl-404");
+    write_executable(
+        &refusing.join("curl"),
+        "#!/bin/sh\necho \"curl: (22) The requested URL returned error: 404\" >&2\nexit 22\n",
+    );
+    let into = scratch("unreachable-into");
+    let output = install_from_github(
+        &refusing,
+        &into,
+        &machine("uname-unreachable", "Linux", "x86_64"),
+        &[],
+    );
+    assert!(
+        !output.status.success(),
+        "a release nobody could fetch is not an install"
+    );
+    assert!(
+        stderr(&output).contains("could not reach the GitHub releases API"),
+        "the refusal should name the fetch that failed: {}",
+        stderr(&output)
+    );
+    assert!(
+        !stderr(&output).contains("named no release"),
+        "a failed download is not an empty release list: {}",
+        stderr(&output)
+    );
+    assert!(!into.join("agent-compose").exists());
+
+    // The other half: the API answered, and what it answered carried no
+    // release. That is the message the case above must not take.
+    let empty = scratch("curl-empty");
+    write_executable(
+        &empty.join("curl"),
+        r#"#!/bin/sh
+# A GitHub that answers, with a document naming no release.
+destination=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o) destination="$2"; shift 2 ;;
+    --retry) shift 2 ;;
+    *) shift ;;
+  esac
+done
+if [ -n "$destination" ]; then : > "$destination"; else :; fi
+"#,
+    );
+    let into = scratch("no-release-into");
+    let output = install_from_github(
+        &empty,
+        &into,
+        &machine("uname-no-release", "Linux", "x86_64"),
+        &[],
+    );
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("named no release"),
+        "a document with no release in it should say so: {}",
+        stderr(&output)
+    );
+    assert!(!into.join("agent-compose").exists());
+}
+
+/// Every target triple a workflow's matrix names.
+fn triples(text: &str) -> BTreeSet<&str> {
+    text.split("\"triple\": \"")
+        .skip(1)
+        .filter_map(|rest| rest.split('"').next())
+        .collect()
+}
+
+/// What the dry run builds, and on which event.
+///
+/// A pull request builds the two Linux legs; a manual `workflow_dispatch`
+/// rehearsal builds all four, as does a tag (PRD q24). The reason is money —
+/// this repository is private, where a macOS runner minute bills at ten times a
+/// Linux one — and the price of it is that a macOS-only break is caught at the
+/// rehearsal or at the tag rather than on the pull request that caused it. Both
+/// arms are pinned: one that quietly lost its macOS legs would make the
+/// rehearsal pointless, and one that quietly gained them would put the bill
+/// back on every push of every pull request.
+#[test]
+fn a_pull_request_builds_the_linux_legs_and_a_rehearsal_builds_all_four() {
+    let text = fs::read_to_string(repo_root().join(".github/workflows/release-dry-run.yml"))
+        .expect("the dry-run workflow is readable");
+    let expression = text
+        .split_once("github.event_name == 'workflow_dispatch'")
+        .expect("the dry run picks its matrix by the event that started it")
+        .1;
+    // `… && '<rehearsal>' || '<pull request>'`: the quoted words of what
+    // follows, in order, are the two arms.
+    let arms: Vec<&str> = expression.split('\'').collect();
+    let rehearsal = arms.get(1).expect("the `workflow_dispatch` arm");
+    let pull_request = arms.get(3).expect("the pull-request arm");
+
+    assert_eq!(
+        triples(rehearsal),
+        TARGETS.into_iter().collect::<BTreeSet<_>>(),
+        "a rehearsal should build every leg a release does"
+    );
+    assert_eq!(
+        triples(pull_request),
+        BTreeSet::from(["aarch64-unknown-linux-musl", "x86_64-unknown-linux-musl"]),
+        "a pull request should build the two Linux legs and neither macOS one"
+    );
+}
+
 /// The workflows publish the artifacts the installer asks for.
 ///
 /// The artifact name is this pipeline's one shared convention, and it is
@@ -538,20 +811,22 @@ fn the_latest_release_is_resolved_downloaded_and_verified() {
 /// that name from `uname`, and the README's table. Nothing checks a workflow
 /// until a tag is pushed, so a rename on one side and not the other would be
 /// discovered by the first user to run the install line. Here it is a test.
+///
+/// What is held is the *vocabulary*: every triple either workflow names is one
+/// the installer asks for, and none is missing. Which of the dry run's two arms
+/// builds which of them is a separate question, and
+/// [`a_pull_request_builds_the_linux_legs_and_a_rehearsal_builds_all_four`] is
+/// where it is answered.
 #[test]
 fn the_workflows_publish_the_artifacts_the_installer_asks_for() {
     let expected: BTreeSet<&str> = TARGETS.into_iter().collect();
     for workflow in ["release.yml", "release-dry-run.yml"] {
         let text = fs::read_to_string(repo_root().join(".github/workflows").join(workflow))
             .unwrap_or_else(|error| panic!("`{workflow}` is readable: {error}"));
-        let named: BTreeSet<&str> = text
-            .split("\"triple\": \"")
-            .skip(1)
-            .filter_map(|rest| rest.split('"').next())
-            .collect();
         assert_eq!(
-            named, expected,
-            "`{workflow}` builds a different set of targets than the installer knows about"
+            triples(&text),
+            expected,
+            "`{workflow}` names a different set of targets than the installer knows about"
         );
     }
 
