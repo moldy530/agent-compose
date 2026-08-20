@@ -250,9 +250,16 @@ enum Command {
 }
 
 /// How a report is written.
+///
+/// One vocabulary for every verb, so `--format` reads the same wherever it is
+/// typed — which is why the two lines below say *where* a report goes rather
+/// than what it looks like. What it looks like is the verb's own: `validate` and
+/// `build` draw a snippet under the source each diagnostic points at, while
+/// `plan` writes a flat list of changes, which is a report rather than a
+/// diagnostic and goes through no snippet renderer at all (`docs/plan.md` §13).
 #[derive(Clone, Copy, ValueEnum)]
 enum Format {
-    /// Rendered snippets on stderr.
+    /// Written for a person, on stderr.
     Human,
     /// One JSON object on stdout.
     Json,

@@ -277,10 +277,23 @@ Concretely, two components have fields held elsewhere:
 Everything else — an agent, a tool, a store, a provider, a model, a placement, an
 event source — reports every field of its resolved definition here.
 
-One field of every definition is never reported: the `address` the artifact
-repeats beside the key it sits under, so that a definition read on its own still
-names itself. Two definitions are compared only when they sit at the same
-address, so it is equal by construction.
+One field of every entry is never reported: the key the artifact repeats
+**inside** the value, so that an entry read on its own still names what it is.
+Two entries are compared only when they sit under the same key, so that repeat
+is equal by construction, and a record naming it would be noise on every change.
+Which field it is depends on what the entry is, and this is all of them:
+
+| entry | the field that repeats its key |
+|---|---|
+| a definition | `address` |
+| a placement | `address` |
+| an event source | `name` |
+| a trigger | `name` |
+| a `state:` channel (§5) | `name` |
+
+A definition's `namespace` — the tag its body is written under (grammar 2.2) — is
+equal by construction for the same reason: it follows from the address. It is
+compared like any other field and can never differ.
 
 ## 5. Topology
 
@@ -309,6 +322,9 @@ kind opens, its `input:` bindings, its `writes:` remap, its own
 `retry`/`timeout`/`on_error`, and — on a `flow:` node — the `policy:` it hands
 the instance inside it. A `map:` node's dispatch, its routes, its bound, and its
 `detach:` are fields of that block, and are reported at the paths they sit at.
+The one field of a node never reported is its `id`, which is the key it is
+matched by; a channel's is its `name`, for the reason §4 gives about every entry
+that repeats its own key.
 
 **Nodes are matched by id, edges by identity.** A node has a name and that is
 what identifies it: a node renamed is one added and one removed, and a node whose
@@ -384,7 +400,9 @@ touched.
 | `"trigger"` | a trigger's delivery surface: its type, its route and method, its response mode and timeout, its callback, its `session_key:`, and its `input:` bindings |
 
 Paths on a flow's record are rooted at `inputs` or at `outputs`, so a reader
-never has to ask which surface a change is on.
+never has to ask which surface a change is on. A trigger's `name` is not on its
+record here either, for §4's reason: it repeats the key the trigger is declared
+under.
 
 ## 7. Validation
 
@@ -513,7 +531,7 @@ so that a reader can go and look, not so that they can be diffed.
 
 ## 11. What is not compared
 
-Seven things in the artifact are outside this version of the format, and each for
+Eight things in the artifact are outside this version of the format, and each for
 a reason:
 
 * **an ordering nothing dispatches on.** This is the one item here that is a
@@ -549,7 +567,32 @@ a reason:
   different node respells that key — in `src/graph.ts`, and in the `budget.key`
   and `counters` a trace writes — while leaving one counter per budgeted edge and
   every spend against the same edge. It is a generated name rather than something
-  the composition decides, so it lands in this bullet with the rest;
+  the composition decides, so it lands in this bullet with the rest.
+
+  The paragraph before that one is about an author's own **array**. Its
+  *mapping* is the bullet below, and the two come out opposite ways;
+
+* **the key order of an author's own mapping.** The same open surfaces hold
+  literal mappings — a `default: { alpha: 1, beta: 2 }`, a model's `settings:`,
+  a deploy backend's plugin config — and the composition does record the order
+  their keys were written in: `agent-compose build` emits
+  `.default({ "alpha": 1, "beta": 2 })` in that order, so rewriting the same two
+  keys the other way round moves bytes in `src/schemas.ts` and in `src/state.ts`.
+  A plan is silent about it. The comparison is over the artifact **as JSON**
+  (§1), where an object is a set of keys with values rather than a sequence of
+  pairs, so the two mappings are already one value before anything is compared.
+
+  It belongs in this section rather than among the three below for the first
+  bullet's reason: what a caller looks up under a key is the same on both sides,
+  and what reads differently is generated text — the emitted literal, and
+  anything that walks it in insertion order, exactly as an `expectExit: [1, 0]`
+  failure message does. `agent-compose build --check` is again the command that
+  notices.
+
+  Read it directly against the rule for an author's **array**, which is the
+  opposite verdict on the neighbouring construct, and note that the reason does
+  not carry over: reversing `[{name: alpha}, {name: beta}]` hands every caller a
+  different *value*, because an array's positions are part of what it is;
 
 * **`sources`** — the list of files the composition was read from. It is the one
   part of the IR that is *about* file layout, which §1 excludes by construction.
@@ -727,14 +770,21 @@ pair that only writes four of the grammar's own defaults out — and builds both
 sides to prove it decides nothing differently — a pair whose one edit falls past
 the end of a report line, and a pair where the after spec introduces errors.
 
-`crates/compose-core/tests/plan_completeness.rs` states §11 as a property, which
-is what holds the **silences** to it: the three structural sections are empty if
-and only if the two artifacts agree once everything this section excuses is taken
-out of them. A golden can only assert lines that are there; a rule that swallowed
-a whole class of edit would produce no line for any golden to miss, so the
-property is stated over one composition edited one construct at a time — an edit
-this document does not excuse and no section names fails it, and so does a record
-naming an edit this document says is not compared.
+`crates/compose-core/tests/plan_completeness.rs` states §4–§6 and §11 as a
+property, which is what holds the **silences** to them: a plan names a subject,
+and one of that subject's keys, if and only if the two artifacts differ there
+once everything §11 excuses is taken out of them. A golden can only assert lines
+that are there; a rule that swallowed a whole class of edit would produce no line
+for any golden to miss, so the property is stated over one composition edited one
+construct at a time — an edit this document does not excuse and no record names
+fails it, and so does a record naming an edit this document says is not compared.
+
+Because that property is stated key for key, the corpora are its coverage: it
+catches a field that stopped being compared on the pairs whose two sides differ
+in *that field*. So the same file also asserts that every key of the base
+composition's artifact is moved by some pair, which is what makes a key added to
+the IR arrive with a case that exercises it rather than with a silence nothing
+would notice.
 
 ## 13. The human report
 
