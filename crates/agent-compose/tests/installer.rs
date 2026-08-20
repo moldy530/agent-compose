@@ -46,6 +46,86 @@ const TARGETS: [&str; 4] = [
 /// depends on the build under it.
 const RELEASED: &str = "1.2.3";
 
+/// `GET /repos/{owner}/{repo}/releases/latest`, as GitHub answers it: the field
+/// order, the nesting and the surrounding keys of a real response, with
+/// `<VERSION>` standing in for the release's version.
+///
+/// Abridged only in the way a real one varies — two assets rather than five,
+/// and the `author`/`uploader` objects cut to the keys that show their shape.
+/// Everything the installer's `sed` has to read *past* to reach `tag_name` is
+/// here: a nested object before it, a `name` holding the same tag after it, an
+/// array of objects whose `name`s are archive file names, and a `body` that
+/// quotes `"tag_name"` back with a different version in it.
+const RELEASES_LATEST: &str = r###"{
+  "url": "https://api.github.com/repos/moldy530/agent-compose/releases/181927211",
+  "assets_url": "https://api.github.com/repos/moldy530/agent-compose/releases/181927211/assets",
+  "upload_url": "https://uploads.github.com/repos/moldy530/agent-compose/releases/181927211/assets{?name,label}",
+  "html_url": "https://github.com/moldy530/agent-compose/releases/tag/v<VERSION>",
+  "id": 181927211,
+  "author": {
+    "login": "moldy530",
+    "id": 1234567,
+    "node_id": "MDQ6VXNlcjEyMzQ1Njc=",
+    "html_url": "https://github.com/moldy530",
+    "type": "User",
+    "site_admin": false
+  },
+  "node_id": "RE_kwDOM1YkR84K3Xzr",
+  "tag_name": "v<VERSION>",
+  "target_commitish": "main",
+  "name": "v<VERSION>",
+  "draft": false,
+  "prerelease": false,
+  "created_at": "2026-08-04T18:11:07Z",
+  "published_at": "2026-08-04T18:19:42Z",
+  "assets": [
+    {
+      "url": "https://api.github.com/repos/moldy530/agent-compose/releases/assets/301122334",
+      "id": 301122334,
+      "node_id": "RA_kwDOM1YkR84R_5-e",
+      "name": "agent-compose-<VERSION>-x86_64-unknown-linux-musl.tar.gz",
+      "label": null,
+      "uploader": {
+        "login": "github-actions[bot]",
+        "id": 41898282,
+        "type": "Bot",
+        "site_admin": false
+      },
+      "content_type": "application/gzip",
+      "state": "uploaded",
+      "size": 4718592,
+      "download_count": 0,
+      "created_at": "2026-08-04T18:19:40Z",
+      "updated_at": "2026-08-04T18:19:41Z",
+      "browser_download_url": "https://github.com/moldy530/agent-compose/releases/download/v<VERSION>/agent-compose-<VERSION>-x86_64-unknown-linux-musl.tar.gz"
+    },
+    {
+      "url": "https://api.github.com/repos/moldy530/agent-compose/releases/assets/301122339",
+      "id": 301122339,
+      "node_id": "RA_kwDOM1YkR84R_5-j",
+      "name": "SHA256SUMS",
+      "label": null,
+      "uploader": {
+        "login": "github-actions[bot]",
+        "id": 41898282,
+        "type": "Bot",
+        "site_admin": false
+      },
+      "content_type": "text/plain",
+      "state": "uploaded",
+      "size": 412,
+      "download_count": 0,
+      "created_at": "2026-08-04T18:19:41Z",
+      "updated_at": "2026-08-04T18:19:42Z",
+      "browser_download_url": "https://github.com/moldy530/agent-compose/releases/download/v<VERSION>/SHA256SUMS"
+    }
+  ],
+  "tarball_url": "https://api.github.com/repos/moldy530/agent-compose/tarball/v<VERSION>",
+  "zipball_url": "https://api.github.com/repos/moldy530/agent-compose/zipball/v<VERSION>",
+  "body": "## Install\n\n```sh\ncurl -fsSLO https://raw.githubusercontent.com/moldy530/agent-compose/main/install.sh\nsh install.sh <VERSION>\n```\n\nThe installer reads \"tag_name\": \"v9.9.9\" out of this document, so a release note that quotes the field must not be read as the field.\n"
+}
+"###;
+
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
@@ -219,17 +299,18 @@ fn github(purpose: &str) -> PathBuf {
     let assets = release(&format!("{purpose}-assets"), &[RELEASED]);
     fs::rename(&assets, served.join(format!("v{RELEASED}"))).expect("the assets are movable");
 
-    // The order is the API's own: `tag_name` before `body`. The body carries the
-    // same words on purpose — a release note may quote them, and the reader must
-    // still take the field.
+    // **The document GitHub actually answers with.** The installer reads this
+    // with one `sed` line, and what makes that line right or wrong is the shape
+    // of the response around the field it wants: `tag_name` arriving after a
+    // nested `author` object, `name` carrying the same tag beside it, an
+    // `assets` array of objects with their own `name`s and `browser_download_url`s
+    // — and a `body` that quotes the field name back, because a release note may
+    // say what the installer reads and the reader must still take the *field*.
+    // A fixture trimmed to the three keys the parse happens to use would prove
+    // the parse against a document nobody serves.
     fs::write(
         served.join("latest.json"),
-        format!(
-            "{{\n  \"html_url\": \"https://github.com/moldy530/agent-compose/releases/tag/\
-             v{RELEASED}\",\n  \"tag_name\": \"v{RELEASED}\",\n  \"draft\": false,\n  \
-             \"body\": \"the installer reads \\\"tag_name\\\": \\\"v9.9.9\\\" out of this \
-             document\"\n}}\n"
-        ),
+        RELEASES_LATEST.replace("<VERSION>", RELEASED),
     )
     .expect("the release document is writable");
 
@@ -303,6 +384,148 @@ fn install_from_github(
         .env("AGENT_COMPOSE_INSTALL", into)
         .output()
         .expect("the installer runs")
+}
+
+/// Where a tool is on the `PATH` this test process inherited.
+fn found(tool: &str) -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .map(|directory| directory.join(tool))
+            .find(|candidate| candidate.is_file())
+    })
+}
+
+/// Every external command `install.sh` runs, minus the two it *chooses* — a
+/// hasher and a downloader — since choosing is what [`only`] takes away.
+///
+/// So this list is also the script's dependency surface written down: a new
+/// command in the script and not here fails the two tests below by name
+/// (`cut: not found`), which is the question worth asking of anything reached
+/// for in a script that runs before anything is installed, on whatever the
+/// machine has.
+const TOOLS: [&str; 15] = [
+    "sh", "uname", "mktemp", "sed", "head", "awk", "basename", "tar", "gzip", "cp", "mv", "rm",
+    "mkdir", "chmod", "cat",
+];
+
+/// A `PATH` carrying [`TOOLS`] and `also`, and **nothing else**.
+///
+/// Putting a fixture in front of the real tool is how one `uname` answers as
+/// six machines above, but shadowing cannot say what a machine does *not* have:
+/// `command -v sha256sum` finds a stub as readily as the real thing, and the
+/// installer picks its hasher and its downloader by exactly that question. The
+/// only way to run the branch a Mac takes — `shasum`, because macOS ships no
+/// `sha256sum` — is a `PATH` with no `sha256sum` on it.
+fn only(purpose: &str, also: &[&str]) -> PathBuf {
+    let directory = scratch(purpose);
+    for tool in TOOLS.iter().chain(also) {
+        if let Some(real) = found(tool) {
+            std::os::unix::fs::symlink(real, directory.join(tool))
+                .expect("a linkable scratch path");
+        }
+    }
+    directory
+}
+
+/// A `shasum` that writes down how it was called, in a directory to put on
+/// `PATH`.
+///
+/// macOS ships `shasum` — a perl script — and no `sha256sum`, so this is the
+/// hasher every macOS install runs. Where the test machine has a real `shasum`
+/// that is what answers; where it has none, the shim translates the one call
+/// the installer makes, `shasum -a 256 <file>`, into `sha256sum <file>`, which
+/// prints the same `<hash>  <name>` line. Either way the arguments are recorded,
+/// so "the installer took the `shasum` branch, and asked for SHA-256" is
+/// answered by what the hasher was asked rather than by reading the script.
+///
+/// Returns the directory and the file the calls are recorded in.
+fn shasum(purpose: &str) -> (PathBuf, PathBuf) {
+    let directory = scratch(purpose);
+    let calls = directory.join("calls");
+    let body = match found("shasum") {
+        Some(real) => format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nexec \"{}\" \"$@\"\n",
+            calls.display(),
+            real.display()
+        ),
+        None => format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\n\
+             if [ \"$1\" != \"-a\" ] || [ \"$2\" != \"256\" ] || [ \"$#\" -ne 3 ]; then\n  \
+             echo \"the shasum shim speaks \\`-a 256 <file>\\` alone, and was given: $*\" >&2\n  \
+             exit 2\nfi\nexec \"{}\" \"$3\"\n",
+            calls.display(),
+            found("sha256sum")
+                .expect("a machine with neither `shasum` nor `sha256sum` cannot run these tests")
+                .display()
+        ),
+    };
+    write_executable(&directory.join("shasum"), &body);
+    (directory, calls)
+}
+
+/// A `wget` serving the same fake GitHub the `curl` fixture does, in a
+/// directory to put on `PATH`.
+///
+/// It reads the one argument shape the installer composes — `-q -O <path>
+/// <url>` — and refuses every other, so the `wget` line drifting is a failed
+/// download *here* rather than at the terminal of the one user whose machine
+/// has no `curl`.
+fn wget(purpose: &str) -> PathBuf {
+    let directory = scratch(purpose);
+    write_executable(
+        &directory.join("wget"),
+        r#"#!/bin/sh
+if [ "$#" -ne 4 ] || [ "$1" != "-q" ] || [ "$2" != "-O" ]; then
+  echo "not how install.sh calls wget: $*" >&2
+  exit 2
+fi
+destination="$3"
+url="$4"
+
+case "$url" in
+  https://api.github.com/repos/moldy530/agent-compose/releases/latest)
+    cp "$FAKE_GITHUB/latest.json" "$destination"
+    ;;
+  https://github.com/moldy530/agent-compose/releases/download/*/*)
+    name="${url##*/}"
+    tag="${url%/*}"
+    tag="${tag##*/}"
+    if [ ! -f "$FAKE_GITHUB/$tag/$name" ]; then
+      echo "no such asset: $url" >&2
+      exit 8
+    fi
+    cp "$FAKE_GITHUB/$tag/$name" "$destination"
+    ;;
+  *)
+    echo "not a url this release serves: $url" >&2
+    exit 8
+    ;;
+esac
+"#,
+    );
+    directory
+}
+
+/// Run `install.sh` with `PATH` set to exactly `path`, nothing inherited, and
+/// `environment` on top of the install directory.
+fn install_with(
+    path: &[&Path],
+    into: &Path,
+    environment: &[(&str, &Path)],
+    arguments: &[&str],
+) -> Output {
+    let mut command = Command::new("sh");
+    command
+        .arg(repo_root().join("install.sh"))
+        .args(arguments)
+        .env("PATH", std::env::join_paths(path).expect("a joinable PATH"))
+        .env("AGENT_COMPOSE_INSTALL", into)
+        .env_remove("AGENT_COMPOSE_ARTIFACT_DIR")
+        .env_remove("AGENT_COMPOSE_VERSION");
+    for (name, value) in environment {
+        command.env(name, value);
+    }
+    command.output().expect("the installer runs")
 }
 
 #[track_caller]
@@ -757,6 +980,280 @@ if [ -n "$destination" ]; then : > "$destination"; else :; fi
         stderr(&output)
     );
     assert!(!into.join("agent-compose").exists());
+}
+
+/// A machine with no `sha256sum` verifies the download with `shasum`.
+///
+/// That machine is **every Mac**: macOS ships `shasum` and no `sha256sum`, so
+/// half the platforms a release publishes for take this branch and no other
+/// test here goes near it — a `PATH` that has `sha256sum` on it can only ever
+/// run the first arm. The whole Darwin path is exercised together, since it is
+/// one machine's story: `uname` answering `Darwin`/`arm64`, the aarch64 archive
+/// chosen, and `shasum -a 256` vouching for it.
+#[test]
+fn a_machine_without_sha256sum_verifies_the_download_with_shasum() {
+    let artifacts = release("shasum", &[RELEASED]);
+    let into = scratch("shasum-into");
+    let (hasher, calls) = shasum("shasum-fixture");
+    let uname = machine("uname-shasum", "Darwin", "arm64");
+    let output = install_with(
+        &[&hasher, &uname, &only("shasum-tools", &[])],
+        &into,
+        &[("AGENT_COMPOSE_ARTIFACT_DIR", &artifacts)],
+        &[],
+    );
+    assert!(
+        output.status.success(),
+        "a Mac's hasher should have verified the download: {}{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert!(
+        stdout(&output).contains(&format!(
+            "verified agent-compose-{RELEASED}-aarch64-apple-darwin.tar.gz against SHA256SUMS"
+        )),
+        "the archive should have been verified: {}",
+        stdout(&output)
+    );
+    assert!(
+        stdout(&output).contains(&format!(
+            "agent-compose {RELEASED} (fixture, aarch64-apple-darwin)"
+        )),
+        "the installed binary should be the arm64 macOS build: {}",
+        stdout(&output)
+    );
+    assert!(into.join("agent-compose").is_file());
+
+    // And it was `shasum` that was asked, for SHA-256 — not something that
+    // happened to agree with the sums file for another reason.
+    let asked = fs::read_to_string(&calls).expect("the hasher recorded its calls");
+    assert!(
+        asked.lines().any(|line| line.starts_with("-a 256 ")),
+        "`shasum` should have been asked for SHA-256: {asked:?}"
+    );
+}
+
+/// A machine with no `curl` downloads the release with `wget`.
+///
+/// The other fallback nothing reached: `curl` is the first choice and it is on
+/// every machine that has run these tests, so the `wget` line has never been
+/// composed by anything but a reader. Here the release is served over `wget`
+/// alone, by a fixture that refuses any argument shape but the one the script
+/// writes.
+#[test]
+fn a_machine_without_curl_downloads_the_release_with_wget() {
+    let serving = github("wget-github");
+    let into = scratch("wget-into");
+    let fetcher = wget("wget-fixture");
+    let uname = machine("uname-wget", "Linux", "x86_64");
+    let output = install_with(
+        // The served directory is *not* on this `PATH`: it carries the `curl`
+        // fixture, and a machine with a `curl` never asks `wget` anything.
+        &[&fetcher, &uname, &only("wget-tools", &["sha256sum"])],
+        &into,
+        &[("FAKE_GITHUB", &serving)],
+        &[],
+    );
+    assert!(
+        output.status.success(),
+        "the release should have come down over `wget`: {}{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert!(
+        stdout(&output).contains(&format!(
+            "downloading https://github.com/moldy530/agent-compose/releases/download/v{RELEASED}/\
+             agent-compose-{RELEASED}-x86_64-unknown-linux-musl.tar.gz"
+        )),
+        "the installer asked for a different URL: {}",
+        stdout(&output)
+    );
+    assert!(
+        stdout(&output).contains(&format!(
+            "agent-compose {RELEASED} (fixture, x86_64-unknown-linux-musl)"
+        )),
+        "the downloaded binary should be the one that ran: {}",
+        stdout(&output)
+    );
+    assert!(into.join("agent-compose").is_file());
+}
+
+/// A hasher that could not run says so, and is never reported as tampering.
+///
+/// "checksum mismatch" is the one message in this script that means *somebody
+/// may have changed your download*, and reading a dead hasher as one would send
+/// a reader to look for an attacker over a full disk. The two messages are
+/// pinned against each other, because each is the other's wrong answer.
+#[test]
+fn a_hasher_that_could_not_run_is_not_reported_as_a_tampered_download() {
+    let artifacts = release("broken-hasher", &[RELEASED]);
+    let into = scratch("broken-hasher-into");
+    let uname = machine("uname-broken-hasher", "Linux", "x86_64");
+    write_executable(
+        &uname.join("sha256sum"),
+        "#!/bin/sh\necho \"sha256sum: cannot read the archive\" >&2\nexit 1\n",
+    );
+    let output = install(&artifacts, &into, &uname, &[]);
+    assert!(
+        !output.status.success(),
+        "an archive nothing could hash is not a verified archive"
+    );
+    assert!(
+        stderr(&output).contains("`sha256sum` could not hash"),
+        "the refusal should name the tool that failed: {}",
+        stderr(&output)
+    );
+    assert!(
+        !stderr(&output).contains("checksum mismatch"),
+        "a hasher that would not run is not a tampered download: {}",
+        stderr(&output)
+    );
+    assert!(!into.join("agent-compose").exists());
+}
+
+/// `--help` answers with the file's own header, and answers on standard output.
+///
+/// Somebody who ran the script rather than reading it gets what the comment at
+/// the top says — and every line of it is held to being *in* that comment, so a
+/// header edited without the help text (or the other way round) is a failure
+/// here rather than two documents that disagree about how the script is run.
+#[test]
+fn asking_for_help_prints_the_header_the_script_carries() {
+    let source =
+        fs::read_to_string(repo_root().join("install.sh")).expect("the script is readable");
+    let header: Vec<&str> = source
+        .split_once("\nset -eu")
+        .expect("the header ends where the script sets its options")
+        .0
+        .lines()
+        .map(|line| {
+            line.strip_prefix("# ")
+                .or_else(|| line.strip_prefix('#'))
+                .unwrap_or(line)
+        })
+        .collect();
+
+    let artifacts = scratch("help-artifacts");
+    for asked in ["-h", "--help"] {
+        let into = scratch("help-into");
+        let output = install(
+            &artifacts,
+            &into,
+            &machine("uname-help", "Linux", "x86_64"),
+            &[asked],
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "`{asked}` should be an answer rather than a failure: {}",
+            stderr(&output)
+        );
+        assert!(
+            stderr(&output).is_empty(),
+            "`{asked}` is an answer, so it belongs on standard output: {}",
+            stderr(&output)
+        );
+        let printed = stdout(&output);
+        assert!(
+            printed.contains("sh install.sh [<version>]")
+                && printed.contains("AGENT_COMPOSE_INSTALL"),
+            "`{asked}` should say how the script is run and where it installs: {printed}"
+        );
+        for line in printed.lines().filter(|line| !line.trim().is_empty()) {
+            assert!(
+                header.contains(&line),
+                "`{asked}` printed a line the script's header does not carry: {line:?}"
+            );
+        }
+        assert!(
+            !into.join("agent-compose").exists(),
+            "`{asked}` installed something"
+        );
+    }
+}
+
+/// A second version is a usage error rather than an install of the first.
+///
+/// Two versions on one command line is somebody asking for something this
+/// script does not do, and taking the first would install *a* version while
+/// ignoring what else they asked for. It exits `2` — being called wrong is not
+/// the failure a release that would not install is, and a caller that tells
+/// them apart can.
+#[test]
+fn a_second_version_is_a_usage_error_rather_than_an_install() {
+    let artifacts = release("two-asked", &[RELEASED]);
+    let into = scratch("two-asked-into");
+    let output = install(
+        &artifacts,
+        &into,
+        &machine("uname-two-asked", "Linux", "x86_64"),
+        &[RELEASED, "4.5.6"],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a misuse should not exit like a refused release: {}",
+        stderr(&output)
+    );
+    assert!(
+        stderr(&output).contains("takes at most one version") && stderr(&output).contains("Usage:"),
+        "the refusal should say what went wrong and how the script is run: {}",
+        stderr(&output)
+    );
+    assert!(
+        !into.join("agent-compose").exists(),
+        "the first of two versions was installed anyway"
+    );
+}
+
+/// A name the binary cannot replace is refused before anything is staged.
+///
+/// `mv -f <file> <directory>` moves the file *into* the directory and reports
+/// success. So an `agent-compose` that is a directory — a half-unpacked archive,
+/// somebody's checkout — ends an install with "installed …/agent-compose"
+/// printed about a directory, a `--version` that fails for a reason nothing on
+/// screen explains, and the staged file left inside it under a name nobody will
+/// look for. Refused up front instead, naming what is in the way, with what was
+/// there left exactly as it was.
+#[test]
+fn a_directory_where_the_binary_goes_is_refused_before_anything_is_staged() {
+    let artifacts = release("occupied", &[RELEASED]);
+    let into = scratch("occupied-into");
+    let occupant = into.join("agent-compose");
+    fs::create_dir_all(&occupant).expect("a directory in the way");
+    fs::write(occupant.join("README"), "not the compiler\n").expect("a writable scratch file");
+
+    let output = install(
+        &artifacts,
+        &into,
+        &machine("uname-occupied", "Linux", "x86_64"),
+        &[],
+    );
+    assert!(
+        !output.status.success(),
+        "a directory is not somewhere the binary can be installed: {}",
+        stdout(&output)
+    );
+    assert!(
+        stderr(&output).contains(&format!("`{}` is a directory", occupant.display())),
+        "the refusal should name what is in the way: {}",
+        stderr(&output)
+    );
+    let left: BTreeSet<String> = fs::read_dir(&occupant)
+        .expect("the directory in the way is still readable")
+        .map(|entry| {
+            entry
+                .expect("its entries are readable")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    assert_eq!(
+        left,
+        BTreeSet::from(["README".to_string()]),
+        "the refusal should have left the directory as it found it"
+    );
 }
 
 /// Every target triple a workflow's matrix names.
