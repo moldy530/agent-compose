@@ -36,7 +36,12 @@
 //! than a second one; and every environment variable
 //! `compose_core::docs::ENVIRONMENT` declares, which is itself held to naming
 //! every `AGENT_COMPOSE_*` variable the sources mention. The skill is held to
-//! the verb half of the same rule, and to listing the curriculum.
+//! the verb half of the same rule, and to listing the curriculum. `--help`'s
+//! **order** is bound as well: clap prints subcommands in declaration order, so
+//! that order is where the two-group split — five verbs that act on a
+//! composition, then five that teach — is made rather than described, and it is
+//! what a coding agent reads before it reads any of the three documents that
+//! describe it.
 //!
 //! That direction — *the binary's vocabulary appears in the documents* — is
 //! only half a bind, and the half that catches an addition. The other half
@@ -112,6 +117,22 @@ fn documents(directory: &Path) -> BTreeMap<String, String> {
 /// file exists to prevent is two inventories that can disagree. `help` is
 /// clap's own and is dropped: it is not a verb of this compiler.
 fn verbs() -> BTreeSet<String> {
+    let found: BTreeSet<String> = listed_verbs().into_iter().collect();
+    assert!(
+        found.len() >= 8,
+        "the help parser still finds the verbs, found {found:?}"
+    );
+    found
+}
+
+/// The same verbs, **in the order `--help` prints them**.
+///
+/// Which is clap's declaration order, and is therefore a fact about the enum
+/// that a reader of the enum has no reason to think anything depends on. One
+/// thing does: the order is the grouping every document describes, and
+/// [`the_help_lists_the_verbs_that_act_before_the_verbs_that_teach`] is what
+/// holds the two together.
+fn listed_verbs() -> Vec<String> {
     let output: Output = Command::cargo_bin("agent-compose")
         .expect("the binary under test is built")
         .arg("--help")
@@ -125,17 +146,12 @@ fn verbs() -> BTreeSet<String> {
         .split("\n\n")
         .next()
         .expect("the command list ends");
-    let found: BTreeSet<String> = commands
+    commands
         .lines()
         .filter_map(|line| line.split_whitespace().next())
         .filter(|verb| *verb != "help")
         .map(str::to_string)
-        .collect();
-    assert!(
-        found.len() >= 8,
-        "the help parser still finds the verbs, found {found:?}"
-    );
-    found
+        .collect()
 }
 
 /// Every document the binary carries, by the name a failure should call it.
@@ -461,6 +477,56 @@ fn the_cli_topic_names_every_verb() {
             "the `cli` topic does not name `agent-compose {verb}`"
         );
     }
+}
+
+/// (c) …and `--help` prints them in the grouping the documents describe: the
+/// five that act on a composition, then the five that teach.
+///
+/// `--help` is the first thing a coding agent reads, and clap prints
+/// subcommands in **declaration order** — so `Command`'s variant order is the
+/// only place the grouping is *made* rather than described. Three documents
+/// describe it: this crate's module header, the `cli` topic's opening sentence,
+/// and the skill's verb table. None of the three would go red if a verb were
+/// declared in the wrong place, and a reader who meets `serve` among the
+/// teaching verbs has been told two different things about the surface before
+/// running a command.
+///
+/// The two lists here are not a second inventory: their union is held to the
+/// verb registry, so a new verb fails this test until somebody says which group
+/// it belongs to — the discipline
+/// [`every_grammar_section_is_claimed_by_a_topic`] applies to the grammar.
+#[test]
+fn the_help_lists_the_verbs_that_act_before_the_verbs_that_teach() {
+    const ACT: &[&str] = &["validate", "plan", "build", "run", "serve"];
+    const TEACH: &[&str] = &["docs", "explain", "init", "schema", "skill"];
+
+    let mut claimed: Vec<String> = ACT
+        .iter()
+        .chain(TEACH.iter())
+        .map(|verb| (*verb).to_string())
+        .collect();
+    claimed.sort();
+    let known: Vec<String> = verbs().into_iter().collect();
+    assert_eq!(
+        claimed, known,
+        "every verb is in one of the two groups the documents describe; a new one goes in the \
+         list it belongs to, and into the sentence in `docs/topics/cli.md` that counts them"
+    );
+
+    let listed = listed_verbs();
+    let last_acting = listed
+        .iter()
+        .rposition(|verb| ACT.contains(&verb.as_str()))
+        .expect("`--help` lists the verbs that act on a composition");
+    let first_teaching = listed
+        .iter()
+        .position(|verb| TEACH.contains(&verb.as_str()))
+        .expect("`--help` lists the verbs that teach");
+    assert!(
+        last_acting < first_teaching,
+        "`--help` prints {listed:?}, which interleaves the two groups; clap lists subcommands in \
+         declaration order, so the fix is the order of `Command`'s variants"
+    );
 }
 
 /// (c) …and every verb the documents name is one the binary has.

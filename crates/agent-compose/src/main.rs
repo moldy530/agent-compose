@@ -74,8 +74,8 @@
 //! ```text
 //! agent-compose docs [<topic>]
 //! agent-compose explain <code>
-//! agent-compose init [<dir>]
 //! agent-compose schema
+//! agent-compose init [<dir>]
 //! agent-compose skill [--agent <name>] [--global]
 //! ```
 //!
@@ -92,10 +92,10 @@
 //! reader with a context window rather than for completeness, which is the
 //! grammar's job. `explain` prints the expanded account of one diagnostic code;
 //! `validate`'s human output ends with a line pointing at it whenever it
-//! reported anything (see [`report::explain_hint`]). `init` writes a project
-//! that validates, which is the loop's first step. `schema` writes the
+//! reported anything (see [`report::explain_hint`]). `schema` writes the
 //! published JSON Schema — the document an editor's `$schema` points at
-//! (grammar Appendix B) — byte for byte. `skill` prints or installs the
+//! (grammar Appendix B) — byte for byte. `init` writes a project that
+//! validates, which is the loop's first step. `skill` prints or installs the
 //! document a user hands their agent.
 //!
 //! Three of the five take a **name** — a topic, a code, an agent — and answer
@@ -270,35 +270,6 @@ enum Command {
         #[arg(long, value_enum, default_value_t = Format::Human)]
         format: Format,
     },
-    /// Print the topic index, or one topic: the grammar, sized to be read
-    Docs {
-        /// The topic to print; omit for the index
-        #[arg(value_name = "TOPIC")]
-        topic: Option<String>,
-    },
-    /// Explain one diagnostic code: what it protects, what triggers it, the fix
-    Explain {
-        /// The code, exactly as a diagnostic reports it
-        #[arg(value_name = "CODE")]
-        code: String,
-    },
-    /// Write a minimal project that validates: one agent, one flow, one trigger
-    Init {
-        /// Where to write it; must be empty or absent [default: the current directory]
-        #[arg(value_name = "DIR", default_value = ".")]
-        directory: PathBuf,
-    },
-    /// Print the published JSON Schema, for an editor's `$schema` or a linter
-    Schema,
-    /// Print the agent skill, or install it for a named coding agent
-    Skill {
-        /// Install for this agent instead of printing the bare document
-        #[arg(long, value_name = "NAME")]
-        agent: Option<String>,
-        /// Install under `$HOME` rather than under the current directory
-        #[arg(long)]
-        global: bool,
-    },
     /// Serve the project's `http` triggers (validates, builds, then launches the app)
     Serve {
         /// Path to the spec entrypoint (conventionally `main.yml`)
@@ -318,6 +289,40 @@ enum Command {
         /// How to report what was found
         #[arg(long, value_enum, default_value_t = Format::Human)]
         format: Format,
+    },
+    // The five that teach, after the five that act on a composition. Clap lists
+    // subcommands in declaration order, and `--help` is the first thing a
+    // coding agent reads: the order it prints is the grouping this header, the
+    // `cli` topic and the skill's verb table all describe, or it contradicts
+    // all three (`tests/discovery_surface_inventory.rs`).
+    /// Print the topic index, or one topic: the grammar, sized to be read
+    Docs {
+        /// The topic to print; omit for the index
+        #[arg(value_name = "TOPIC")]
+        topic: Option<String>,
+    },
+    /// Explain one diagnostic code: what it protects, what triggers it, the fix
+    Explain {
+        /// The code, exactly as a diagnostic reports it
+        #[arg(value_name = "CODE")]
+        code: String,
+    },
+    /// Print the published JSON Schema, for an editor's `$schema` or a linter
+    Schema,
+    /// Write a minimal project that validates: one agent, one flow, one trigger
+    Init {
+        /// Where to write it; must be empty or absent [default: the current directory]
+        #[arg(value_name = "DIR", default_value = ".")]
+        directory: PathBuf,
+    },
+    /// Print the agent skill, or install it for a named coding agent
+    Skill {
+        /// Install for this agent instead of printing the bare document
+        #[arg(long, value_name = "NAME")]
+        agent: Option<String>,
+        /// Install under `$HOME` rather than under the current directory
+        #[arg(long)]
+        global: bool,
     },
 }
 
@@ -389,11 +394,6 @@ fn main() -> ExitCode {
             );
             launch(&path, "run", &target, &out, format, &arguments)
         }
-        Command::Docs { topic } => docs(topic.as_deref()),
-        Command::Explain { code } => explain(&code),
-        Command::Init { directory } => init(&directory),
-        Command::Schema => emit_text(compose_core::docs::SCHEMA),
-        Command::Skill { agent, global } => skill(agent.as_deref(), global),
         Command::Serve {
             path,
             host,
@@ -412,6 +412,11 @@ fn main() -> ExitCode {
             ];
             launch(&path, "serve", &target, &out, format, &arguments)
         }
+        Command::Docs { topic } => docs(topic.as_deref()),
+        Command::Explain { code } => explain(&code),
+        Command::Schema => emit_text(compose_core::docs::SCHEMA),
+        Command::Init { directory } => init(&directory),
+        Command::Skill { agent, global } => skill(agent.as_deref(), global),
     }
 }
 
@@ -921,9 +926,12 @@ fn skill(agent: Option<&str>, global: bool) -> ExitCode {
     };
     match agent {
         "claude" => {
-            let root = if global {
+            // Relative under the current directory, rather than joined onto a
+            // `.`: the path is the one line this verb prints, and `install`
+            // reports back what it was given.
+            let path = if global {
                 match std::env::var_os("HOME") {
-                    Some(home) => PathBuf::from(home),
+                    Some(home) => PathBuf::from(home).join(docs::skill::CLAUDE_PATH),
                     None => {
                         return fail(
                             "`--global` needs `HOME`, which is not set: run without it to install \
@@ -932,9 +940,8 @@ fn skill(agent: Option<&str>, global: bool) -> ExitCode {
                     }
                 }
             } else {
-                PathBuf::from(".")
+                PathBuf::from(docs::skill::CLAUDE_PATH)
             };
-            let path = root.join(docs::skill::CLAUDE_PATH);
             match discover::install(&path, &docs::skill::claude()) {
                 Ok(discover::Wrote::Created(path)) => {
                     let _ = write(

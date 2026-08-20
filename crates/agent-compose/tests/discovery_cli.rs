@@ -373,6 +373,11 @@ fn skill_installs_for_claude_under_the_current_directory() {
     let output = run(&directory, &["skill", "--agent", "claude"]);
     assert_eq!(code(&output), 0, "stderr: {}", stderr(&output));
     assert_eq!(stdout(&output), "", "the file is the answer");
+    assert_eq!(
+        stderr(&output),
+        "wrote `.claude/skills/agent-compose/SKILL.md`\n",
+        "the one line it prints is the path as a reader would type it, with no `./`"
+    );
     let path = directory.join(".claude/skills/agent-compose/SKILL.md");
     assert!(path.is_file(), "the skill landed at the conventional path");
     assert_eq!(
