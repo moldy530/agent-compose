@@ -187,19 +187,26 @@ const CODEGEN: &[Criterion] = &[
                 "a_tool_loop_whose_last_call_worked_spends_its_budget_claiming_no_refusal",
                 Status::Live,
             ),
-            // One answer, two calls, the first refused: the loop answers both,
-            // because a request leaving either unanswered is one both surfaces
-            // refuse (D119, `WIRE-NOTES` (18)). The second of the pair is the
-            // mixed answer on Chat Completions, the one place the two wires give
-            // the model different shapes for one answer — a `tool` message for
-            // the call the request may name and a `user` turn for the one it may
-            // not, which is an ordering only a mixed answer can observe.
+            // One answer, two calls, the first refused: every call of the answer
+            // comes back to the model, because a request leaving either
+            // unanswered is one both surfaces refuse (D119, `WIRE-NOTES` (18)).
+            // The last two are that answer with the refused call naming a tool
+            // the agent never offered — the one place the two wires give the
+            // model different shapes for one answer, so each wire gets its own
+            // test. Chat Completions splits it in two, a `tool` message for the
+            // call the request may name and a `user` turn for the one it may
+            // not; the Messages API carries both as `tool_result` blocks of one
+            // turn. Either way it takes a *mixed* answer to observe the ordering.
             (
                 "a_refused_call_does_not_stop_the_calls_beside_it_in_one_answer",
                 Status::Live,
             ),
             (
-                "an_answer_mixing_an_unoffered_call_with_an_offered_one_is_answered_on_both_shapes",
+                "an_answer_mixing_an_unoffered_call_with_an_offered_one_is_answered_in_both_chat_completions_shapes",
+                Status::Live,
+            ),
+            (
+                "an_answer_mixing_an_unoffered_call_with_an_offered_one_is_answered_in_one_messages_turn",
                 Status::Live,
             ),
             // What an agent node leaves behind for the next one: the implicit

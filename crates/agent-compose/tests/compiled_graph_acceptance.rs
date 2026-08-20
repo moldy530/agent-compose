@@ -3261,7 +3261,9 @@ fn a_call_to_a_tool_the_agent_does_not_offer_is_corrected_on_the_chat_completion
 }
 
 /// One Chat Completions answer carrying **both** an unoffered call and an
-/// offered one: both are answered, in the two shapes this surface has for them.
+/// offered one: both come back to the model, in the two shapes *this surface*
+/// has for them. The Messages twin below is the same answer on the other wire,
+/// where there is only one shape.
 ///
 /// This is the one place the two wires hand the model materially different
 /// things about one answer, and it is forced rather than chosen. The Messages
@@ -3275,11 +3277,12 @@ fn a_call_to_a_tool_the_agent_does_not_offer_is_corrected_on_the_chat_completion
 /// refusal second.
 ///
 /// With one call per answer the ordering is unobservable, which is why the two
-/// tests around this one do not pin it: it takes a **mixed** answer for the
+/// single-call tests above do not pin it: it takes a **mixed** answer for the
 /// rewrite to have two things to place, and a request this surface refuses is
 /// what a runtime that placed them wrongly would produce.
 #[test]
-fn an_answer_mixing_an_unoffered_call_with_an_offered_one_is_answered_on_both_shapes() {
+fn an_answer_mixing_an_unoffered_call_with_an_offered_one_is_answered_in_both_chat_completions_shapes()
+ {
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue_all([
         Script::new(
@@ -3429,6 +3432,164 @@ fn an_answer_mixing_an_unoffered_call_with_an_offered_one_is_answered_on_both_sh
     assert_eq!(refused["outcome"], "refused", "{refused}");
     assert_eq!(completed["name"], "lookup", "{completed}");
     assert_eq!(completed["outcome"], "completed", "{completed}");
+    assert!(
+        provider.snapshot().is_drained(),
+        "the loop ran to its pinned call"
+    );
+}
+
+/// The same mixed answer on the **Messages** wire, where one shape carries both:
+/// the refusal and the result are `tool_result` blocks of a single turn, each
+/// under the id its call was asked with, in the order the answer asked.
+///
+/// This is the half of `WIRE-NOTES` (18) the Chat Completions twin above cannot
+/// show, and it is what makes "every call of an answer comes back to the model"
+/// a claim about both wires rather than about one. Here the assistant turn is
+/// replayed **whole** — `summarise` and all — because this surface does not
+/// re-check a history's tool names against the request's `tools`, so the refusal
+/// needs no turn of its own and the divergence is entirely the other surface's.
+///
+/// `Outcome::raw` is what scripts it, for the reason both single-call twins need
+/// it: `crates/mock-provider` refuses to *render* a scripted call to a tool the
+/// request did not offer.
+#[test]
+fn an_answer_mixing_an_unoffered_call_with_an_offered_one_is_answered_in_one_messages_turn() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::raw(
+                200,
+                json!({
+                    "id": "msg_mixed",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": SONNET,
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_summarise",
+                            // `agent.answerer` offers `condense` and nothing else.
+                            "name": "summarise",
+                            "input": { "passage": "a long passage" },
+                        },
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_condense",
+                            "name": "condense",
+                            "input": { "passage": "a long passage" },
+                        },
+                    ],
+                    "stop_reason": "tool_use",
+                    "stop_sequence": null,
+                    "usage": { "input_tokens": 12, "output_tokens": 34 },
+                }),
+            ),
+        ),
+        // The instance the offered call of that same answer started.
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "line": "the only line" })),
+        ),
+        Script::new(SONNET, Outcome::text("I have the line.")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "answer": "it says one line" })),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke(
+        "flow-as-tool",
+        "flow.ask",
+        &[("question", "what does it say?")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(run.outputs()["answer"], "it says one line");
+
+    let recorded = provider.requests();
+    assert_eq!(
+        recorded.len(),
+        4,
+        "one answer corrected both calls, so the loop turned once more and ended"
+    );
+    for call in &recorded {
+        assert!(call.is_valid(), "{:?}", call.failures());
+    }
+
+    // The turn the model sent goes back whole, invented name and all — the
+    // rewrite the other wire forces has no counterpart here.
+    let messages = recorded[2].body()["messages"].clone();
+    let replayed = messages[1]["content"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the answer is replayed: {messages}"));
+    let names: Vec<&str> = replayed
+        .iter()
+        .filter(|block| block["type"] == "tool_use")
+        .filter_map(|block| block["name"].as_str())
+        .collect();
+    assert_eq!(
+        names,
+        ["summarise", "condense"],
+        "both calls are replayed, in the order the answer asked: {messages}"
+    );
+
+    // …and one turn answers both, under the ids they were asked with.
+    let answering = messages[2].clone();
+    assert_eq!(answering["role"], "user", "{answering}");
+    let blocks = answering["content"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the turn carries a block per call: {answering}"));
+    let [refusal, result] = blocks.as_slice() else {
+        panic!("exactly the answer's two calls are answered: {answering}");
+    };
+    assert_eq!(refusal["tool_use_id"], "toolu_summarise", "{refusal}");
+    assert_eq!(
+        refusal["is_error"],
+        json!(true),
+        "this surface has a flag for a result that is a refusal: {refusal}"
+    );
+    assert!(
+        refusal["content"].as_str().is_some_and(
+            |text| text.contains("not one of its tools") && text.contains("`condense`")
+        ),
+        "…naming what was called and what it could have called (PRD G3): {refusal}"
+    );
+    assert_eq!(result["tool_use_id"], "toolu_condense", "{result}");
+    assert!(
+        result.get("is_error").is_none(),
+        "the sibling's result is a result, with no flag on it: {result}"
+    );
+
+    // The trace is the one shape both wires share (`docs/trace.md` §7.3).
+    let entries = run.entries("ask");
+    let [entry] = entries.as_slice() else {
+        panic!("`ask` ran once: {entries:?}");
+    };
+    let asked = entry["models"][0]["toolCalls"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the answer's calls are recorded: {entry}"));
+    let [refused, completed] = asked.as_slice() else {
+        panic!("both calls of the answer are recorded: {entry}");
+    };
+    assert_eq!(refused["name"], "summarise", "{refused}");
+    assert!(
+        refused.get("target").is_none(),
+        "the one record with no `target`: {refused}"
+    );
+    assert_eq!(refused["outcome"], "refused", "{refused}");
+    assert_eq!(completed["name"], "condense", "{completed}");
+    assert_eq!(completed["target"], "flow.condense", "{completed}");
+    assert_eq!(completed["outcome"], "completed", "{completed}");
+    assert!(
+        completed["instance"]
+            .as_str()
+            .is_some_and(|key| key.ends_with("/ask/0/condense/0")),
+        "the refused call ahead of it spent no ordinal, so this one takes the \
+         frame it was offered: {completed}"
+    );
     assert!(
         provider.snapshot().is_drained(),
         "the loop ran to its pinned call"
