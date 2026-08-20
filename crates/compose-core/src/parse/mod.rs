@@ -533,8 +533,13 @@ fn version(node: &Node, cx: &mut Cx) -> Option<Spanned<String>> {
                 node.span.clone(),
                 format!("`{text}` is not a spec version this compiler supports"),
             )
+            // Named as an action rather than as a fact (PRD G3): the help line
+            // is the sentence a reader acts on. It does not name a codemod
+            // verb — PRD §9.5 commits to one and no build has shipped it, so
+            // pointing at a `migrate` this compiler does not have sent readers
+            // to a usage error (PRD §9.5's amendment, §7 M2).
             .with_help(format!(
-                "this build supports {}; a spec written for another version has its syntax brought forward, not just this field",
+                "set `version:` to one this build supports ({}), and bring forward any syntax the older version used — changing this field alone is not a migration",
                 list(SUPPORTED_SPEC_VERSIONS)
             )),
         );
