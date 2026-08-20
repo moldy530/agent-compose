@@ -48,8 +48,16 @@
 //! none exists is a line about an edit nobody made, and an order it hides where
 //! one exists is the plan saying two compositions agree when they do not.
 //!
-//! The line is drawn at what a reordering *does*, and the key an array sits
-//! under is what decides it:
+//! The line is drawn at what a reordering *does*, and **the key an array sits
+//! under is what decides it** — for all three of the rules below, without
+//! exception. That is not a stylistic preference: two surfaces of the artifact
+//! hold author-written data with author-chosen keys, a model's `settings:` and a
+//! schema's `default:` (both `Literal`), plus a deploy backend's plugin config,
+//! and nothing about an array's *shape* tells it apart from one of the grammar's
+//! own. A rule that read the shape would classify a `default: [{name: one},
+//! {name: two}]` as a name-keyed map and report its reversal as no change at
+//! all — which is the second failure above, on a value handed to every caller.
+//! So each of the three rules names its keys:
 //!
 //! * four keys are sets. `optional:` (grammar 3.4) names the properties an
 //!   object does not require, `expect_exit:` (6.1, 8.2) the exit statuses a
@@ -59,28 +67,55 @@
 //!   membership-tested at run time — `routeOn.includes(condition)` is the whole
 //!   of what the emitted runtime does with the fourth — so [`normalize`] sorts
 //!   all four: their order never reaches a comparison at all;
-//! * `fields:` and `variants:` are sequences, and the ones that would otherwise
-//!   be missed. Both are matched by name — so a schema that gained a property is
-//!   one change at that property — and *both* orders reach the JSON Schema the
-//!   model is handed: a field map's order is the order of `properties` and of
-//!   `required`, a union's is the order of `oneOf`. So [`walk`] reports a move
-//!   through the same synthesized `order` key `sections::ordered` gives an edge;
-//! * every other array is compared by position already, which is right for the
-//!   ones whose order is plainly the author's: a model's `route:` (failover
-//!   order), an `exec:`'s `args:` (argv order), an `enum:`'s variants (the order
-//!   they reach a structured-output schema in). `route:` and `route_on:` are the
-//!   pair worth reading twice, because they sit in one definition and land on
-//!   opposite sides of this line: the first is the order the members are *tried*
-//!   in, the second the set of conditions that decide whether to try the next
-//!   one at all.
+//! * six keys hold **named** arrays ([`NAMED`]), whose entries the grammar gives
+//!   a name of their own and whose entries are therefore matched by that name
+//!   rather than by position — so a schema that gained a property is one change
+//!   at that property. Two of the six are also sequences ([`SEQUENCES`]):
+//!   `fields:` and `variants:` are the orders that would otherwise be missed,
+//!   because *both* of them reach the JSON Schema the model is handed — a field
+//!   map's order is the order of `properties` and of `required`, a union's is the
+//!   order of `oneOf` — so [`walk`] reports a move through the same synthesized
+//!   `order` key `sections::ordered` gives an edge. The other four are silent on
+//!   purpose, and that is the third rule below;
+//! * every other array is compared by position, which is right for the ones whose
+//!   order is plainly the author's: a model's `route:` (failover order), an
+//!   `exec:`'s `args:` (argv order), an `enum:`'s variants (the order they reach
+//!   a structured-output schema in) — and for an author's own literal data, where
+//!   a reordering is a different value and reports as one. `route:` and
+//!   `route_on:` are the pair worth reading twice, because they sit in one
+//!   definition and land on opposite sides of this line: the first is the order
+//!   the members are *tried* in, the second the set of conditions that decide
+//!   whether to try the next one at all.
 //!
 //! What is left silent on purpose is a reordering that changes the *layout* of
 //! the emitted project and nothing it does: a node `input:` binding map, a
-//! `writes:` remap, an `env:` or `headers:` map, a `map:`'s `routes:`. All of
-//! them are dispatched on by name — the generated code looks each up by the name
-//! it is written under — and a plan is a diff of compositions, not of files
-//! (`docs/plan.md` §11). `agent-compose build --check` is the command that
-//! notices a generated file whose bytes moved.
+//! `writes:` remap, an `env:` or `headers:` map, a `map:`'s `routes:` — the four
+//! of [`NAMED`] that are not in [`SEQUENCES`]. All of them are dispatched on by
+//! name — the generated code looks each up by the name it is written under — and
+//! a plan is a diff of compositions, not of files (`docs/plan.md` §11).
+//! `agent-compose build --check` is the command that notices a generated file
+//! whose bytes moved.
+//!
+//! # A leaf the IR keeps as its source text is compared as that text
+//!
+//! Three leaves reach the artifact as what the author typed rather than as what
+//! the compiler decided: a `Duration` and a `Cel` are written out as their own
+//! spelling (`crate::ir::leaf`), and a `Number` keeps whether it was written as
+//! an integer or as a float. So `timeout: 120s` against `timeout: 2m`, `a == b`
+//! against `a==b`, and `minimum: 1` against `minimum: 1.0` are each a reported
+//! change, on three pairs the *decided* value is equal across.
+//!
+//! That is deliberate and it is the narrow reading. A plan is a diff of the
+//! resolved artifact (`docs/plan.md` §1), the artifact records what the
+//! composition says rather than what a later pass makes of it (`crate::ir`), and
+//! one of the three genuinely reaches the emitted project as written — a guard's
+//! CEL text is the string in `src/graph.ts` and the text a trace quotes back. The
+//! alternative is a rule that decides a duration from a string, which would have
+//! to read a key to know when to try — and a key-gated rule over the two open
+//! surfaces is exactly the mistake the section above exists to refuse: a
+//! `settings: { timeout: "2m" }` is data, and normalizing it would hide an edit
+//! rather than report a non-edit. `docs/plan.md` §11 states the residual for
+//! readers of the format.
 //!
 //! # Depth
 //!
@@ -111,8 +146,21 @@ pub(super) const ORDER: &str = "order";
 /// their order never reaches a comparison. See the module docs.
 const SETS: &[&str] = &["expect_exit", "expect_status", "optional", "route_on"];
 
+/// The keys whose arrays are **named**: every entry carries a name of its own
+/// (one of [`IDENTITY`]), so [`walk`] matches the two sides on that name rather
+/// than on position. See the module docs.
+///
+/// The list is closed, and being closed is the point: it is the grammar's own
+/// name-keyed arrays and nothing else — a field map's `fields` and a union's
+/// `variants` (grammar 3.1, 3.7), a `Bindings`/`Writes` map's `entries`
+/// (grammar 8.0, and Decision D16), an `exec:`'s `env` and an `http:`'s or a
+/// provider's `headers` (grammar 6.1, 8.3, 12.1), and a routed `map:`'s `routes`
+/// (grammar 8.6). An array under any other key is author data or an ordered list,
+/// and is compared by position.
+const NAMED: &[&str] = &["entries", "env", "fields", "headers", "routes", "variants"];
+
 /// The keys whose **named** arrays are sequences: matched by name, and reporting
-/// a move through [`ORDER`]. See the module docs.
+/// a move through [`ORDER`]. A subset of [`NAMED`]. See the module docs.
 const SEQUENCES: &[&str] = &["fields", "variants"];
 
 /// One IR fragment as JSON, with its source coordinates taken out.
@@ -235,9 +283,8 @@ pub(super) fn only(value: Value, keys: &[&str]) -> Value {
 /// * two objects are compared key by key, over the union of their keys, so a
 ///   key on one side only is one change at that key rather than a rewrite of
 ///   the whole object;
-/// * two arrays whose elements each **name themselves** — a field map's
-///   `fields`, a binding list's `entries`, a union's `variants`, a routed map's
-///   `routes` — are matched on that name and compared entry by entry, so a
+/// * two arrays under one of the six keys the grammar gives **named** entries
+///   ([`NAMED`]) are matched on that name and compared entry by entry, so a
 ///   schema that gained a property is one change at that property rather than a
 ///   rewrite of the whole map. Where the module docs say the order of one of
 ///   those is the composition's rather than the file's ([`SEQUENCES`]), the
@@ -246,7 +293,8 @@ pub(super) fn only(value: Value, keys: &[&str]) -> Value {
 /// * two other arrays are compared element by element **when they are the same
 ///   length**, so the ones whose order *is* semantic — a model's `route:`
 ///   (failover order), an `exec:`'s `args:` (argv order), an `enum:`'s variants
-///   (the order they reach a structured-output schema in) — report a move. The
+///   (the order they reach a structured-output schema in), and an author's own
+///   literal array under a `default:` or a `settings:` — report a move. The
 ///   four arrays that are sets rather than sequences never reach this arm in
 ///   two orders, because [`normalize`] has already sorted them;
 /// * when the lengths differ and nothing names itself, the array is one change:
@@ -289,8 +337,8 @@ fn walk(path: &str, key: &str, before: &Value, after: &Value, found: &mut Vec<Fi
                 }
             }
         }
-        (Value::Array(old), Value::Array(new)) if identity(old, new).is_some() => {
-            let id = identity(old, new).expect("the arm matched on it");
+        (Value::Array(old), Value::Array(new)) if identity(key, old, new).is_some() => {
+            let id = identity(key, old, new).expect("the arm matched on it");
             let names: BTreeSet<&str> = old
                 .iter()
                 .chain(new)
@@ -353,8 +401,8 @@ impl Places<'_> {
 ///
 /// The second refusal is the collision guard: [`ORDER`] is the plan's key rather
 /// than the artifact's, so an array whose entries already carry one is author
-/// data (a model's `settings:`, a plugin config) shaped like a named list, and
-/// is compared as it stands rather than overwritten with a position.
+/// data written under one of the grammar's own names — the residual [`identity`]
+/// names — and is compared as it stands rather than overwritten with a position.
 fn places<'a>(key: &str, old: &'a [Value], new: &'a [Value], id: &str) -> Option<Places<'a>> {
     if !SEQUENCES.contains(&key) {
         return None;
@@ -397,21 +445,43 @@ pub(super) fn placed(item: &Value, at: u64) -> Value {
     held
 }
 
-/// The keys an array's elements can name themselves by, in the order they are
-/// tried.
+/// The keys an entry of a [`NAMED`] array can name itself by, in the order they
+/// are tried.
 ///
-/// The four spellings the IR uses for "what this entry is called": `name` on a
+/// The three spellings the IR uses for "what this entry is called": `name` on a
 /// schema field, a binding, and an interpolated entry; `field` on a `writes:`
-/// remap; `tag` on a union variant and a routed map's route; `id` on a node.
-const IDENTITY: &[&str] = &["name", "field", "tag", "id"];
+/// remap; `tag` on a union variant and a routed map's route.
+///
+/// A node's `id` is not among them, and a flow's `nodes:` is not in [`NAMED`]:
+/// nodes are matched by id one level up, in `sections::graph`, which is also
+/// where the rule that their declaration order is not reported lives
+/// (`docs/plan.md` §5). Nothing reaches this walk holding a flow's node list.
+const IDENTITY: &[&str] = &["name", "field", "tag"];
 
 /// The key two arrays' elements can be matched on, if there is one.
 ///
-/// Every element of both must carry it as a **string**, and no two elements of
-/// one array may carry the same one: an array where a name repeats is not an
-/// array a name identifies an element of. An empty array qualifies vacuously,
-/// which is what makes the first field added to `{}` one change at that field.
-fn identity(old: &[Value], new: &[Value]) -> Option<&'static str> {
+/// The array must sit under one of the keys the grammar gives named entries
+/// ([`NAMED`]) — which is what keeps an author's own array of objects, written
+/// in a `settings:`, a `default:`, or a plugin config, from being compared as an
+/// unordered map on the strength of its elements happening to carry a `name`.
+/// Reversing such a literal is a different value handed to every caller, and it
+/// reports as one because this returns `None` for it.
+///
+/// Beyond the key: every element of both arrays must carry the identity as a
+/// **string**, and no two elements of one array may carry the same one — an
+/// array where a name repeats is not an array a name identifies an element of.
+/// An empty array qualifies vacuously, which is what makes the first field added
+/// to `{}` one change at that field.
+///
+/// The residual is an author's own array of objects written under one of the six
+/// names, nested inside one of those open surfaces: it is matched by name like
+/// the grammar's own. That is the same class of residual the `span` rule and the
+/// [`SETS`] rule leave, and tolerable for the same reason — every one of them
+/// needs author data to be spelled exactly like a construct of the grammar.
+fn identity(key: &str, old: &[Value], new: &[Value]) -> Option<&'static str> {
+    if !NAMED.contains(&key) {
+        return None;
+    }
     IDENTITY
         .iter()
         .copied()
@@ -585,6 +655,90 @@ mod tests {
             ),
             []
         );
+    }
+
+    /// Every key the grammar gives named entries is matched by that name, so an
+    /// entry added to one is one change at that entry rather than a rewrite —
+    /// and the four that are not sequences say nothing about a reordering.
+    #[test]
+    fn each_named_key_is_matched_on_the_name_its_entries_carry() {
+        for (key, id) in [
+            ("entries", "name"),
+            ("entries", "field"),
+            ("env", "name"),
+            ("fields", "name"),
+            ("headers", "name"),
+            ("routes", "tag"),
+            ("variants", "tag"),
+        ] {
+            let one = json!({ key: [{ id: "a", "v": 1 }, { id: "b", "v": 2 }] });
+            let two =
+                json!({ key: [{ id: "b", "v": 2 }, { id: "a", "v": 1 }, { id: "c", "v": 3 }] });
+            let found = changes(&one, &two);
+            let paths: Vec<&str> = found.iter().map(|held| held.path.as_str()).collect();
+            let order: Vec<String> = if SEQUENCES.contains(&key) {
+                vec![format!("{key}[a].order"), format!("{key}[b].order")]
+            } else {
+                Vec::new()
+            };
+            let mut expected: Vec<String> = order;
+            expected.push(format!("{key}[c]"));
+            expected.sort();
+            assert_eq!(paths, expected, "{key} by {id}: {found:?}");
+        }
+    }
+
+    /// An author's own array of objects is **not** a named map, however its
+    /// elements are spelled: the key it sits under is what decides, and a
+    /// `default:` is not one of the grammar's named arrays.
+    ///
+    /// Reversing a literal like this hands every caller a different value — it is
+    /// `.default([{"name":"two"},{"name":"one"}])` in the emitted schema — so a
+    /// plan that compared it as an unordered map would say two compositions
+    /// agree when they do not.
+    #[test]
+    fn an_authors_literal_array_of_objects_is_compared_by_position() {
+        let one = json!({ "default": [{ "name": "one" }, { "name": "two" }] });
+        let two = json!({ "default": [{ "name": "two" }, { "name": "one" }] });
+        assert_eq!(
+            changes(&semantic(&one), &semantic(&two)),
+            [
+                FieldChange {
+                    path: "default[0].name".to_string(),
+                    before: Some(json!("one")),
+                    after: Some(json!("two")),
+                },
+                FieldChange {
+                    path: "default[1].name".to_string(),
+                    before: Some(json!("two")),
+                    after: Some(json!("one")),
+                },
+            ]
+        );
+
+        // …and the same holds for the other two open surfaces, and for entries
+        // whose names repeat — which used to fall through to a different rule
+        // than their unique-named neighbours.
+        for key in ["settings", "extra"] {
+            let one = json!({ key: { "held": [{ "tag": "x" }, { "tag": "x" }] } });
+            let two = json!({ key: { "held": [{ "tag": "x" }, { "tag": "y" }] } });
+            let found = changes(&semantic(&one), &semantic(&two));
+            assert_eq!(found.len(), 1, "{key}: {found:?}");
+            assert_eq!(found[0].path, format!("{key}.held[1].tag"), "{key}");
+        }
+    }
+
+    /// A flow's `nodes:` never reaches this walk — `sections::graph` matches
+    /// nodes by id one level up — so `id` is not an identity here and a list of
+    /// them is compared by position like any other array.
+    #[test]
+    fn a_node_list_is_not_a_named_array_of_this_walk() {
+        let found = changes(
+            &json!({ "nodes": [{ "id": "a" }, { "id": "b" }] }),
+            &json!({ "nodes": [{ "id": "b" }, { "id": "a" }] }),
+        );
+        let paths: Vec<&str> = found.iter().map(|held| held.path.as_str()).collect();
+        assert_eq!(paths, ["nodes[0].id", "nodes[1].id"], "{found:?}");
     }
 
     /// The four set-valued keys are canonicalized, so a reordering of one is

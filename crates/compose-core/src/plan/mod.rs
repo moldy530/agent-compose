@@ -28,6 +28,15 @@
 //! agree in everything but their source coordinates produce an empty plan,
 //! byte for byte, every time.
 //!
+//! **That cuts both ways, and the one place it is worth knowing about is a leaf
+//! the artifact keeps as source text.** A duration, a CEL expression and the
+//! integer-or-float spelling of a number reach the IR as the author wrote them,
+//! so `timeout: 120s` against `timeout: 2m` is a reported change on a pair that
+//! builds to a byte-identical project. It is the narrow reading of "the diff is
+//! over the artifact" rather than an oversight — `diff`'s module docs work out
+//! why the alternative is worse, `docs/plan.md` §11 states it for a reader of
+//! the format, and `tests/projects/plan/respelled` pins all three.
+//!
 //! # Check diagnostics are content, not a refusal
 //!
 //! [`plan`] runs the **whole** check phase over both sides, and the difference

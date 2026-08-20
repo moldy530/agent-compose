@@ -1,0 +1,52 @@
+# Three leaves the artifact keeps as the text they were written as, and the
+# `after` spec respells all three without changing what any of them decides:
+# a duration, a CEL guard, and a numeric schema bound.
+#
+# `agent-compose build` emits a byte-identical project for two of the three — a
+# duration is lowered to milliseconds and a bound to its number — and a
+# different one for the guard, whose text is the string in `src/graph.ts`. A
+# plan reports all three, because the artifact records what the composition says
+# (`docs/plan.md` §11).
+version: "0.1"
+
+defaults:
+  timeout: 120s
+
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+
+model.fast:
+  provider: provider.anthropic
+  id: some-fast-model
+
+agent.writer:
+  model: model.fast
+  prompt: Write a draft.
+  input:
+    passes: { type: integer, minimum: 1 }
+  output:
+    draft: { type: string }
+
+agent.reviewer:
+  model: model.fast
+  prompt: Review the draft.
+  input:
+    draft: { type: string }
+  output:
+    verdict: { enum: [approve, revise] }
+
+flow.review_loop:
+  description: Draft and review until the reviewer approves.
+  inputs:
+    goal: { type: string }
+  outputs:
+    draft: { type: string }
+  nodes:
+    write: { agent: agent.writer, input: { passes: "1" } }
+    review: { agent: agent.reviewer, input: { draft: "write.output.draft" } }
+  edges:
+    - { from: start, to: write }
+    - { from: write, to: review }
+    - { from: review, to: write, when: "review.output.verdict == 'revise'", max_iterations: 3 }
+    - { from: review, to: end, else: true }

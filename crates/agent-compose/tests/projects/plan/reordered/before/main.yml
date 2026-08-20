@@ -1,12 +1,14 @@
-# Eight orders the `after` spec swaps, and nothing else.
+# Ten orders the `after` spec swaps, and nothing else.
 #
-# Three of the eight are orders the composition behaves differently for — a field
+# Four of the ten are orders the composition behaves differently for — a field
 # map's, which is the order of a JSON Schema's `properties` and `required`, a
-# discriminated union's, which is the order of its `oneOf`, and a model route's,
-# which is the order its members are tried in — so a plan reports them. The other
-# five are selected by name or tested for membership and their order says
+# discriminated union's, which is the order of its `oneOf`, a model route's,
+# which is the order its members are tried in, and a schema `default:`'s, which
+# is a literal value handed to every caller — so a plan reports them. The other
+# six are selected by name or tested for membership and their order says
 # nothing: a set of optional properties, a set of accepted exit statuses, a set
-# of failover conditions, a node's input bindings, and a routed map's routes.
+# of failover conditions, an `exec:`'s environment, a node's input bindings, and
+# a routed map's routes.
 version: "0.1"
 
 state:
@@ -22,6 +24,18 @@ state:
     max_items: 8
     items: { type: string }
     reduce: append
+  seeds:
+    description: Literal data, whose order is the value itself rather than a declaration.
+    type: array
+    max_items: 4
+    items:
+      type: object
+      properties:
+        name: { type: string }
+        weight: { type: integer }
+    default:
+      - { name: alpha, weight: 1 }
+      - { name: beta, weight: 2 }
 
 provider.anthropic:
   kind: anthropic
@@ -48,6 +62,9 @@ tool.spell_check:
   exec:
     command: spell
     args: ["--stdin"]
+    env:
+      LC_ALL: C
+      SPELL_DICT: en_GB
     expect_exit: [0, 2]
 
 agent.reviewer:

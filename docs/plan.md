@@ -181,14 +181,34 @@ chain, and a declared one does not.
 
 Paths descend as far as they can name what they descended into. Two objects are
 compared key by key, so a key on one side only is one change at that key. Two
-arrays whose elements name themselves — a field map's `fields`, a binding list's
-`entries`, a union's `variants`, a routed map's `routes` — are matched on that
-name and compared entry by entry, which is what makes a schema that gained a
-property one change at that property. Every other array is compared element by
-element when the two are the same length, so the lists whose order *is* semantic
-— a model's `route:`, an `exec:`'s `args:`, an `enum:`'s variants — report a
-move; when the lengths differ, the array is one change, because an insertion
-shifts every index after it.
+arrays under one of the six keys the grammar gives **named** entries are matched
+on that name and compared entry by entry, which is what makes a schema that
+gained a property one change at that property. That set is closed, and this is
+all of it:
+
+| key | what it holds | the name an entry carries |
+|---|---|---|
+| `fields` | a field map's properties (grammar 3.1) | `name` |
+| `variants` | a discriminated union's variants (grammar 3.7) | `tag` |
+| `entries` | a binding map's bindings (grammar 8.0), or a `writes:` remap's | `name`, `field` |
+| `env` | an `exec:` block's environment (grammar 6.1, 8.2) | `name` |
+| `headers` | an `http:` block's or a provider's headers (grammar 6.1, 8.3, 12.1) | `name` |
+| `routes` | a routed `map:`'s destinations (grammar 8.6) | `tag` |
+
+Every other array is compared element by element when the two are the same
+length, so the lists whose order *is* semantic — a model's `route:`, an
+`exec:`'s `args:`, an `enum:`'s variants — report a move; when the lengths
+differ, the array is one change, because an insertion shifts every index after
+it.
+
+**The key decides, never the shape of the elements.** Two surfaces of a
+composition hold author-written data under author-chosen keys — a schema's
+`default:` and a model's `settings:` — and a rule that read an array's elements
+rather than the key above them would take a `default: [{name: one}, {name: two}]`
+for a keyed map and report its reversal as no change at all. It is a different
+literal, handed to every caller, so it is compared by position like any other
+value and reports as `default[0].name` and `default[1].name`. The `[<name>]`
+spelling above therefore always means one of the six.
 
 **A declaration order is reported when the composition behaves differently for
 it.** Two of the named arrays do: a field map's `fields` is the order of a JSON
@@ -470,8 +490,8 @@ so that a reader can go and look, not so that they can be diffed.
 
 ## 11. What is not compared
 
-Six things in the artifact are outside this version of the format, and each for a
-reason:
+Seven things in the artifact are outside this version of the format, and each for
+a reason:
 
 * **an ordering nothing dispatches on.** This is the one item here that is a
   judgement rather than a gap, and it is worth reading before relying on the
@@ -479,7 +499,8 @@ reason:
   of a model's `route:`, because each of those decides something. It does not
   report the order of the arrays the generated code looks entries up in **by
   name** — a node's `input:` bindings, a `writes:` remap, an `env:` or `headers:`
-  map, a routed map's `routes:` — nor of the four sets `optional:`,
+  map, a routed map's `routes:`, and the `nodes:` mapping of a flow, whose graph
+  is its edges' and not that mapping's (§5) — nor of the four sets `optional:`,
   `expect_exit:`, `expect_status:` and `route_on:`. Reshuffling one of those is a
   change to the *layout* of the generated project (a route descriptor moves in
   `src/graph.ts`, an `expectExit: [0, 1]` literal is written `[1, 0]`, and the
@@ -487,7 +508,13 @@ reason:
   composition decides: every one of them is selected by name or tested for
   membership. A plan is a diff of compositions, so it stays silent, and
   `agent-compose build --check` is the command that notices a generated file
-  whose bytes moved;
+  whose bytes moved.
+
+  What this rule is stated over is the **key** an array sits under, never the
+  shape of its elements — §3's table is the closed list — so an author's own
+  array of objects in a `default:` or a `settings:` is not one of these, whatever
+  its elements are called. Reversing one is a different literal value, and it
+  reports;
 
 * **`sources`** — the list of files the composition was read from. It is the one
   part of the IR that is *about* file layout, which §1 excludes by construction.
@@ -500,6 +527,14 @@ reason:
   nearly every comparison (§2.2 carries the useful one instead), and the second is
   the same value on both sides by construction: one compiler produced both
   artifacts.
+* **`spec_version`** — the DSL version the composition declares. It is
+  **carried** rather than compared: §2.2 writes it on each side, and a reader
+  that cares compares `before.spec_version` against `after.spec_version` itself.
+  No section holds it, so it does not reach `components` and does not move the
+  verdict line of §13. This compiler supports one version, so no pair of
+  resolvable specs can differ in it; the day a second ships, a bump on its own
+  will read as "the same composition" until this rule is revisited, and revisiting
+  it is a version bump under §12.3.
 * **`storage_backends:`** — the deploy layer's backend bindings. `plan` resolves
   the built-in `local` target on both sides (§1), and grammar 14 makes
   `storage_backends:` a compile error under `local` (Decision D87), so no
@@ -511,6 +546,38 @@ reason:
   a plan reports the channels, the triggers and the placements themselves rather
   than the sections that hold them. The difference is invisible to a plan and
   visible to `validate`, which is the command that has a rule about it.
+
+One thing is compared **more literally** than a reader may expect, and it belongs
+here for the same reason the list above does: this section is what a plan will
+and will not tell you.
+
+**Three leaves are compared as the text they were written as.** A `timeout:`, a
+`when:` guard, and a numeric schema bound reach the artifact as the author's own
+spelling — a duration and a CEL expression are written out verbatim, and a number
+keeps whether it was written as an integer or as a float. So each of these is a
+reported change, on a pair the *decided* value is equal across:
+
+| written | against | reported as |
+|---|---|---|
+| `timeout: 120s` | `timeout: 2m` | `timeout: "120s" -> "2m"` |
+| `when: "a == b"` | `when: "a==b"` | `when: "a == b" -> "a==b"` |
+| `minimum: 1` | `minimum: 1.0` | `minimum: 1 -> 1.0` |
+
+That is the consequence of §1's first property rather than an oversight. The
+comparison is over the resolved artifact, the artifact records what the
+composition *says* rather than what a later pass makes of it, and one of the
+three reaches the emitted project as written — a guard's CEL text is the string
+in `src/graph.ts` and the text a trace quotes back, so respelling it is a change
+to what is shipped. The other two are not: `agent-compose build` emits a
+byte-identical project for `120s` and `2m`, and for `1` and `1.0`, because
+codegen reads the milliseconds and the number rather than the spelling. Deciding
+a duration from a string would mean reading
+the key above it to know when to try, and a key-gated rule over `settings:` and
+`default:` is the mistake §3's closing paragraph refuses — a
+`settings: { timeout: "2m" }` is data, and normalizing it would hide an edit
+rather than suppress a non-edit. A reviewer branching on `plan` should read these
+three the way they read a reformatted comment: real in the artifact, and nothing
+the composition does differently.
 
 ## 12. Stability
 
@@ -566,13 +633,24 @@ types and their two tables sit side by side — and every member of a closed
 vocabulary must have a row spelled with its JSON quotes. It also pins the version
 above to the constant the compiler emits, so a bump moves both or neither.
 
-What that check cannot decide is whether a sentence here is *true*. That is what
-`crates/agent-compose/tests/plan_cli.rs` is for: it pins whole documents,
-byte for byte, over a corpus of spec pairs — a pair that differs only in
-formatting, a rename, a topology edit, an edge-order edit, a policy edit, a
-surface edit, a deploy edit, a pair that only reorders declarations, a pair whose
-one edit falls past the end of a report line, and a pair where the after spec
-introduces errors.
+What that check cannot decide is whether a sentence here is *true*. Two files
+answer that, from opposite ends.
+
+`crates/agent-compose/tests/plan_cli.rs` pins whole documents, byte for byte,
+over a corpus of spec pairs — a pair that differs only in formatting, a rename, a
+topology edit, an edge-order edit, a policy edit, a surface edit, a deploy edit, a
+pair that only reorders declarations, a pair that only respells three leaves, a
+pair whose one edit falls past the end of a report line, and a pair where the
+after spec introduces errors.
+
+`crates/compose-core/tests/plan_completeness.rs` states §11 as a property, which
+is what holds the **silences** to it: the three structural sections are empty if
+and only if the two artifacts agree once everything this section excuses is taken
+out of them. A golden can only assert lines that are there; a rule that swallowed
+a whole class of edit would produce no line for any golden to miss, so the
+property is stated over one composition edited one construct at a time — an edit
+this document does not excuse and no section names fails it, and so does a record
+naming an edit this document says is not compared.
 
 ## 13. The human report
 

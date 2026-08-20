@@ -20,7 +20,8 @@
 //! | `retimed-policy` | §5's policy half, at all three sites that carry one |
 //! | `widened-surface` | §6: what a caller feels, and nothing else |
 //! | `redeployed` | §4's deploy-layer components, which the `local` target admits |
-//! | `reordered` | §3's order rule and §11's line under it, in both directions at once — including the two arrays of one model that fall on opposite sides of it |
+//! | `reordered` | §3's order rule and §11's line under it, in both directions at once — including the two arrays of one model that fall on opposite sides of it, and an author's literal array, which is neither |
+//! | `respelled` | §11's residual: the three leaves the artifact keeps as source text |
 //! | `reworded-prompt` | §13: a cut may not hide the change it was run to show |
 //! | `added-flow` | §3's rule that a component which arrived brings nothing with it |
 //! | `broken-routing` | §7 in both directions, and §1's second property: an error introduced is a plan, exit `0` |
@@ -365,15 +366,26 @@ components
 /// A declaration order is reported when the composition behaves differently for
 /// it, and not otherwise.
 ///
-/// The `after` of this pair swaps **eight** orders and edits nothing else. Three
-/// of them decide something — a field map's order is a JSON Schema's
-/// `properties` and `required`, a union's is its `oneOf`, and a model route's is
-/// the order its members are tried in — and are the six lines below. The other
-/// five are the assertion this test is really making, because what pins them is
-/// the lines that are *not* here: an `optional:` set, an `expect_exit:` set, a
-/// `route_on:` set, a node's `input:` bindings and a routed map's `routes:` are
-/// all selected by name or tested for membership, so `docs/plan.md` §11 leaves
-/// them out and a regression would show up as extra lines in this golden.
+/// The `after` of this pair swaps **ten** orders and edits nothing else. Four of
+/// them decide something and are the ten lines below:
+///
+/// * a field map's order is a JSON Schema's `properties` and `required`, a
+///   union's is its `oneOf`, and a model route's is the order its members are
+///   tried in — three orders the grammar gives a meaning to (§3);
+/// * the `seeds` channel's `default:` is not a declaration order at all. It is
+///   an author's literal array, whose order **is** the value: reversed, it is a
+///   different default handed to every caller, and it reports as four ordinary
+///   field changes rather than as an `order` record. The key an array sits under
+///   is what decides which rule it meets, and `default:` is not one of the
+///   grammar's named arrays — a plan that classified it by the shape of its
+///   elements would call this pair unchanged.
+///
+/// The other six are the assertion this test is really making, because what pins
+/// them is the lines that are *not* here: an `optional:` set, an `expect_exit:`
+/// set, a `route_on:` set, an `exec:`'s `env:`, a node's `input:` bindings and a
+/// routed map's `routes:` are all selected by name or tested for membership, so
+/// `docs/plan.md` §11 leaves them out and a regression would show up as extra
+/// lines in this golden.
 ///
 /// `model.resilient` is where both halves of the rule meet: `route:` and
 /// `route_on:` are two arrays of one definition, and one of them is reported.
@@ -384,18 +396,25 @@ fn a_declaration_order_is_reported_where_the_composition_reads_it() {
         report,
         "\
 components
-  ~ agent.reviewer  reordered/after/main.yml:53:1
+  ~ agent.reviewer  reordered/after/main.yml:69:1
       output.fields[reason].order: 1 -> 0
       output.fields[verdict].order: 0 -> 1
-  ~ agent.triage  reordered/after/main.yml:63:1
+  ~ agent.triage  reordered/after/main.yml:79:1
       output.fields[findings].type.items.variants[auto_fixable].order: 0 -> 1
       output.fields[findings].type.items.variants[needs_human].order: 1 -> 0
-  ~ model.resilient  reordered/after/main.yml:38:1
+  ~ model.resilient  reordered/after/main.yml:51:1
       route[0]: \"model.fast\" -> \"model.slow\"
       route[1]: \"model.slow\" -> \"model.fast\"
 
+topology
+  ~ state.seeds  reordered/after/main.yml:26:3
+      type.default[0].name: \"alpha\" -> \"beta\"
+      type.default[0].weight: 1 -> 2
+      type.default[1].name: \"beta\" -> \"alpha\"
+      type.default[1].weight: 2 -> 1
+
 `reordered/after/main.yml` differs from `reordered/before/main.yml` (target `local`): \
-3 component changes
+3 component changes, 1 topology change
 "
     );
     assert_eq!(code, 0);
@@ -511,6 +530,44 @@ topology
   }
 }
 "#
+    );
+    assert_eq!(code, 0);
+}
+
+/// A leaf the artifact keeps as source text is compared as that text, and this
+/// is the whole of what that costs a reader.
+///
+/// Three leaves reach the IR as the author's own spelling: a duration, a CEL
+/// expression, and whether a number was written as an integer or as a float. The
+/// `after` of this pair respells all three and decides nothing differently —
+/// `agent-compose build` emits a byte-identical project for two of them, and for
+/// the third the guard's text *is* the string in `src/graph.ts`. All three
+/// report, which is what `docs/plan.md` §11 states for a reader branching on the
+/// command: real in the artifact, and nothing the composition does differently.
+///
+/// This golden is the deliberate half of that. The alternative — deciding a
+/// duration from a string — needs the key above it to know when to try, and a
+/// key-gated rule over `settings:` and `default:` would hide an edit to author
+/// data rather than suppress a non-edit.
+#[test]
+fn a_leaf_the_artifact_keeps_as_source_text_is_compared_as_that_text() {
+    let (report, code) = report("respelled");
+    assert_eq!(
+        report,
+        "\
+components
+  ~ agent.writer  respelled/after/main.yml:20:1
+      input.fields[passes].type.minimum: 1 -> 1.0
+
+topology
+  ~ defaults  respelled/after/main.yml:10:3
+      timeout: \"120s\" -> \"2m\"
+  ~ flow.review_loop.review->write  respelled/after/main.yml:48:7
+      when: \"review.output.verdict == 'revise'\" -> \"review.output.verdict=='revise'\"
+
+`respelled/after/main.yml` differs from `respelled/before/main.yml` (target `local`): \
+1 component change, 2 topology changes
+"
     );
     assert_eq!(code, 0);
 }

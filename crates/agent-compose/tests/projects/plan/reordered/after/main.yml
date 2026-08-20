@@ -1,12 +1,13 @@
-# The same composition with eight orders swapped, and nothing else edited.
+# The same composition with ten orders swapped, and nothing else edited.
 #
-# Swapped here: `tool.spell_check`'s `expect_exit:`, `agent.reviewer`'s
-# `output:`, `agent.triage`'s union `variants:` and its `optional:`,
-# `model.resilient`'s `route:` and its `route_on:`, the `review` node's `input:`
-# bindings, and the `dispatch` map's `routes:`. Three of the eight decide
-# something — two reach the schema a model is handed, one is the order the route
-# is tried in — and are reported; the other five are selected by name or tested
-# for membership and are not.
+# Swapped here: the `seeds` channel's `default:` literal, `tool.spell_check`'s
+# `expect_exit:` and its `env:`, `agent.reviewer`'s `output:`, `agent.triage`'s
+# union `variants:` and its `optional:`, `model.resilient`'s `route:` and its
+# `route_on:`, the `review` node's `input:` bindings, and the `dispatch` map's
+# `routes:`. Four of the ten decide something — two reach the schema a model is
+# handed, one is the order the route is tried in, and one is a literal value the
+# order is part of — and are reported; the other six are selected by name or
+# tested for membership and are not.
 version: "0.1"
 
 state:
@@ -22,6 +23,18 @@ state:
     max_items: 8
     items: { type: string }
     reduce: append
+  seeds:
+    description: Literal data, whose order is the value itself rather than a declaration.
+    type: array
+    max_items: 4
+    items:
+      type: object
+      properties:
+        name: { type: string }
+        weight: { type: integer }
+    default:
+      - { name: beta, weight: 2 }
+      - { name: alpha, weight: 1 }
 
 provider.anthropic:
   kind: anthropic
@@ -48,6 +61,9 @@ tool.spell_check:
   exec:
     command: spell
     args: ["--stdin"]
+    env:
+      SPELL_DICT: en_GB
+      LC_ALL: C
     expect_exit: [2, 0]
 
 agent.reviewer:
