@@ -1,6 +1,6 @@
 //! `agent-compose` — the compiler's command line.
 //!
-//! Four commands exist. The first is the product's core loop (PRD §7 M0):
+//! Five commands exist. The first is the product's core loop (PRD §7 M0):
 //!
 //! ```text
 //! agent-compose validate <path> [--target <name>] [--format human|json]
@@ -25,6 +25,20 @@
 //! and have no TypeScript project. The work is all `compose-core`'s; what lives
 //! here is the surface — argument parsing, the choice of report format, writing
 //! the files, and the exit code.
+//!
+//! The third reads **two** specs rather than one (PRD §7 M2):
+//!
+//! ```text
+//! agent-compose plan <before> <after> [--format human|json]
+//! ```
+//!
+//! It resolves both and reports what moved between them — components, topology,
+//! interfaces, and what the validator now says that it did not. PRD §2's problem
+//! is that "reviewing what changed in the topology requires reading router
+//! functions"; this is the answer, and `docs/plan.md` is the normative account
+//! of the document it writes. The work is `compose-core`'s
+//! ([`compose_core::plan`]); what lives here is the two entrypoints, the choice
+//! of format, and the exit code.
 //!
 //! The last two are invocation (PRD 5.11):
 //!
@@ -55,10 +69,18 @@
 //!
 //! | code | meaning |
 //! |---|---|
-//! | `0` | clean: nothing was reported |
-//! | `1` | diagnostics were reported, `build --check` found drift, or a `run` produced no answer |
+//! | `0` | clean: nothing was reported, or a `plan` was produced |
+//! | `1` | diagnostics were reported, `build --check` found drift, a `run` produced no answer, or a `plan`'s spec did not resolve |
 //! | `2` | the command could not run: bad usage, an unreadable entrypoint, an output directory that could not be written, a missing environment variable or one carrying a value the command does not take (`AGENT_COMPOSE_INTERACTIVE`, grammar 8.7), an uninstalled dependency set, or no JavaScript runtime to launch |
 //! | `3` | a `run` with nobody to ask stopped at a `human` pause (grammar 8.7, PRD 5.11) |
+//!
+//! `plan` reads the first two differently from every other verb, and the
+//! difference is the point: a composition the validator rejects still has an
+//! artifact to diff, so "the after spec introduces three errors" is a plan that
+//! was produced — exit `0` — while a spec that does not **resolve** has no
+//! artifact at all and there is nothing to compare, which is exit `1`. A CI step
+//! branching on `plan` is asking "could this be planned", not "is it valid";
+//! `validate` is the verb that asks the second question.
 //!
 //! `3` is the emitted project's own — [`launch`] passes a child's exit code
 //! through — and it is a code rather than a shade of `1` because it asks for
@@ -117,6 +139,7 @@
 
 mod build;
 mod launch;
+mod plan;
 mod report;
 
 use std::io::{self, Write};
@@ -124,7 +147,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use compose_core::{DEFAULT_TARGET, Diagnostics, Ir, resolve_with_target};
+use compose_core::plan::SpecSide;
+use compose_core::{Composition, DEFAULT_TARGET, Diagnostics, Ir, resolve_with_target};
 
 /// Nothing was reported.
 const CLEAN: u8 = 0;
@@ -150,6 +174,16 @@ enum Command {
         #[arg(long, value_name = "NAME", default_value = DEFAULT_TARGET)]
         target: String,
         /// How to report what was found
+        #[arg(long, value_enum, default_value_t = Format::Human)]
+        format: Format,
+    },
+    /// Diff two specs: what changed in the components, the topology, the interfaces, and the report
+    Plan {
+        /// The spec compared from: an entrypoint, or a project directory holding `main.yml`
+        before: PathBuf,
+        /// The spec compared to
+        after: PathBuf,
+        /// How to report what changed
         #[arg(long, value_enum, default_value_t = Format::Human)]
         format: Format,
     },
@@ -231,6 +265,11 @@ fn main() -> ExitCode {
             target,
             format,
         } => validate(&path, &target, format),
+        Command::Plan {
+            before,
+            after,
+            format,
+        } => plan_specs(&before, &after, format),
         Command::Build {
             path,
             target,
@@ -443,6 +482,154 @@ fn validate(entrypoint: &Path, target: &str, format: Format) -> ExitCode {
         // asks (see the module header).
         Err(error) if departed(&error) => ExitCode::from(verdict),
         Err(error) => fail(&format!("cannot write the report: {error}")),
+    }
+}
+
+/// `agent-compose plan`: two specs in, one report on what moved.
+///
+/// Both sides are resolved, and a side that does not resolve is the one thing
+/// that stops the command: a plan is a diff of two **artifacts**, so a spec with
+/// no artifact leaves nothing to compare, and what there is to report is that
+/// spec's own diagnostics — rendered exactly as `validate` renders them,
+/// because they are the same diagnostics about the same file.
+///
+/// Everything the **validator** says is content rather than a refusal. "The
+/// after spec introduces two errors" is the sentence a plan exists to say
+/// (`compose_core::plan`), so a plan that says it still exits `0`.
+///
+/// The target is the built-in `local` on both sides. `plan` takes no
+/// `--target`: the question it answers is what changed in the composition, and
+/// comparing one target's artifact against another's would answer a different
+/// one — see `docs/plan.md`.
+fn plan_specs(before: &Path, after: &Path, format: Format) -> ExitCode {
+    let before_entrypoint = match entrypoint(before, SpecSide::Before) {
+        Ok(path) => path,
+        Err(reason) => return fail(&reason),
+    };
+    let after_entrypoint = match entrypoint(after, SpecSide::After) {
+        Ok(path) => path,
+        Err(reason) => return fail(&reason),
+    };
+
+    let before_resolution = resolve_with_target(&before_entrypoint, DEFAULT_TARGET);
+    let after_resolution = resolve_with_target(&after_entrypoint, DEFAULT_TARGET);
+    let before_root = root(&before_entrypoint);
+    let after_root = root(&after_entrypoint);
+    let before_name = before_entrypoint.display().to_string();
+    let after_name = after_entrypoint.display().to_string();
+
+    let held = match (&before_resolution.ir, &after_resolution.ir) {
+        (Some(before_ir), Some(after_ir)) => compose_core::plan(
+            Composition {
+                entrypoint: &before_name,
+                ir: before_ir,
+                resolution: &before_resolution.diagnostics,
+            },
+            Composition {
+                entrypoint: &after_name,
+                ir: after_ir,
+                resolution: &after_resolution.diagnostics,
+            },
+        ),
+        _ => {
+            let mut failed = Vec::new();
+            for (side, resolution, name, root) in [
+                (
+                    SpecSide::Before,
+                    &before_resolution,
+                    &before_name,
+                    before_root,
+                ),
+                (SpecSide::After, &after_resolution, &after_name, after_root),
+            ] {
+                if resolution.ir.is_none() {
+                    failed.push(plan::Failed {
+                        side,
+                        entrypoint: name.clone(),
+                        root,
+                        diagnostics: &resolution.diagnostics,
+                    });
+                }
+            }
+            let written = match format {
+                Format::Json => match plan::refusal(&failed).to_json() {
+                    Ok(text) => write(&mut io::stdout().lock(), &text),
+                    Err(error) => {
+                        return fail(&format!("cannot write the report as JSON: {error}"));
+                    }
+                },
+                Format::Human => write(
+                    &mut io::stderr().lock(),
+                    &plan::refused(&failed, DEFAULT_TARGET, report::color_enabled()),
+                ),
+            };
+            return match written {
+                Ok(()) => ExitCode::from(REPORTED),
+                Err(error) if departed(&error) => ExitCode::from(REPORTED),
+                Err(error) => fail(&format!("cannot write the report: {error}")),
+            };
+        }
+    };
+
+    let written = match format {
+        Format::Json => match held.to_json() {
+            Ok(text) => write(&mut io::stdout().lock(), &text),
+            Err(error) => return fail(&format!("cannot write the report as JSON: {error}")),
+        },
+        Format::Human => write(
+            &mut io::stderr().lock(),
+            &plan::human(before_root, after_root, &held),
+        ),
+    };
+
+    match written {
+        Ok(()) => ExitCode::from(CLEAN),
+        // The reader closed the pipe: it has as much of the plan as it asked
+        // for, and the plan was still produced (see the module header).
+        Err(error) if departed(&error) => ExitCode::from(CLEAN),
+        Err(error) => fail(&format!("cannot write the report: {error}")),
+    }
+}
+
+/// The project root a composition's spans are relative to: its entrypoint's own
+/// directory (grammar 1.4).
+fn root(entrypoint: &Path) -> &Path {
+    entrypoint.parent().unwrap_or_else(|| Path::new(""))
+}
+
+/// The spec file one side of a `plan` names: the file itself, or the `main.yml`
+/// inside a directory.
+///
+/// `validate` takes a file and only a file, because there is one spec and the
+/// path a person types is the one they mean. What a `plan` is given is usually
+/// two *trees* — a checkout and a worktree, a branch exported beside the working
+/// copy — so a directory carrying the conventional entrypoint (PRD 5.1) is taken
+/// as naming it. Nothing else is guessed: a directory with no `main.yml` is the
+/// command's own precondition failing, and says so.
+fn entrypoint(path: &Path, side: SpecSide) -> Result<PathBuf, String> {
+    let side = side.as_str();
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(path.to_path_buf()),
+        Ok(metadata) if metadata.is_dir() => {
+            let held = path.join("main.yml");
+            match std::fs::metadata(&held) {
+                Ok(metadata) if metadata.is_file() => Ok(held),
+                _ => Err(format!(
+                    "`{}` holds no `main.yml`: the {side} spec is a spec entrypoint, or a \
+                     project directory that holds one",
+                    path.display()
+                )),
+            }
+        }
+        Ok(_) => Err(format!(
+            "`{}` is neither a file nor a directory: the {side} spec is a spec entrypoint, \
+             conventionally `main.yml`",
+            path.display()
+        )),
+        Err(error) => Err(format!(
+            "cannot read the {side} spec `{}`: {error}",
+            path.display()
+        )),
     }
 }
 

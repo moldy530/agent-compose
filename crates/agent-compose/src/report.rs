@@ -360,7 +360,7 @@ pub(crate) fn verdict(
     )
 }
 
-fn plural(count: usize, noun: &str) -> String {
+pub(crate) fn plural(count: usize, noun: &str) -> String {
     if count == 1 {
         format!("1 {noun}")
     } else {
@@ -391,7 +391,7 @@ fn sources(root: &Path, diagnostics: &[Diagnostic]) -> BTreeMap<String, String> 
 /// project root joined onto the `/`-separated name the span carries
 /// (grammar 1.4). A run from inside the project has an empty root and the two
 /// are the same string.
-fn at(root: &Path, name: &str) -> PathBuf {
+pub(crate) fn at(root: &Path, name: &str) -> PathBuf {
     let mut path = PathBuf::from(root);
     path.extend(name.split('/'));
     path
