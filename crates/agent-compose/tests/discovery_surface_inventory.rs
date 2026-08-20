@@ -31,6 +31,15 @@
 //! unclaimed ones, so a new grammar subsection forces a decision about which
 //! topic teaches it rather than quietly falling out of the curriculum.
 //!
+//! The explanations cite the grammar as well — a closing
+//! `Grammar: docs/grammar.md §8.6, Decisions D31, D94` — through the same
+//! parser, and every section and every decision **they** name is held to
+//! existing too. Only *coverage* is the topics' alone: an explanation owes a
+//! pointer that resolves, not a share of the curriculum. Without this, a
+//! renumbered subsection or a retired decision leaves fifty-odd embedded
+//! documents pointing at nothing, which is the drift class this file exists
+//! for, one layer down.
+//!
 //! **(c) The CLI's own vocabulary, both ways round.** The `cli` topic names
 //! every verb the binary has, read out of `--help` so it is clap's list rather
 //! than a second one; and every environment variable
@@ -418,6 +427,77 @@ fn grammar_headings() -> BTreeSet<String> {
     found
 }
 
+/// Every decision the grammar's decision log records, as `D1`, `D2`, ….
+///
+/// Appendix A writes one per heading — `### D1. Imports are entrypoint-only and
+/// non-transitive` — so the log itself is the inventory, and no list here can
+/// disagree with it.
+fn grammar_decisions() -> BTreeSet<String> {
+    let text =
+        fs::read_to_string(repository().join("docs/grammar.md")).expect("the grammar is readable");
+    let mut found = BTreeSet::new();
+    for line in text.lines() {
+        let depth = line.len() - line.trim_start_matches('#').len();
+        if depth < 2 {
+            continue;
+        }
+        let Some(rest) = line[depth..].strip_prefix(' ') else {
+            continue;
+        };
+        let Some(rest) = rest.strip_prefix('D') else {
+            continue;
+        };
+        let number: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        if !number.is_empty() {
+            found.insert(format!("D{number}"));
+        }
+    }
+    assert!(
+        found.len() >= 100,
+        "the decision parser still finds the log's entries, found {}",
+        found.len()
+    );
+    found
+}
+
+/// Every decision `text` names.
+///
+/// A `D` that starts a word and is followed by digits — which is how both
+/// "Decision D43" and "Decisions D58, D111" are written, and which the word
+/// `Decisions` itself does not match.
+fn decisions(text: &str) -> BTreeSet<String> {
+    let held: Vec<char> = text.chars().collect();
+    let mut found = BTreeSet::new();
+    for (at, character) in held.iter().enumerate() {
+        if *character != 'D' || held[..at].last().is_some_and(|c| c.is_alphanumeric()) {
+            continue;
+        }
+        let number: String = held[at + 1..]
+            .iter()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if !number.is_empty() {
+            found.insert(format!("D{number}"));
+        }
+    }
+    found
+}
+
+/// One explanation's closing cross-reference: its `Grammar:` line and whatever
+/// follows.
+///
+/// Taken as the trailing block rather than as one line because the citation
+/// list is prose that wraps, and a `§` can land on either side of the wrap.
+fn cross_reference<'a>(code: &str, body: &'a str) -> &'a str {
+    assert_eq!(
+        body.matches("\nGrammar: ").count(),
+        1,
+        "`{code}`'s explanation closes with exactly one `Grammar:` line"
+    );
+    let at = body.find("\nGrammar: ").expect("the count above found one") + 1;
+    &body[at..]
+}
+
 /// The grammar sections one topic claims on its `Normative source` line.
 ///
 /// Returns nothing for a topic whose normative source is another document.
@@ -436,9 +516,18 @@ fn claims(topic: &str, body: &str) -> BTreeSet<String> {
         closing, line,
         "`{topic}`'s `Normative source:` line is its last line"
     );
+    sections(&format!("`{topic}`"), closing)
+}
 
+/// Every grammar section `text` names, expanding ranges.
+///
+/// Shared by the two documents that cite the grammar: a topic's
+/// `Normative source:` line and an explanation's `Grammar:` line. One parser
+/// rather than two, so a citation form one of them accepts is a citation the
+/// other is held to as well.
+fn sections(source: &str, text: &str) -> BTreeSet<String> {
     let mut found = BTreeSet::new();
-    for token in closing.split('§').skip(1) {
+    for token in text.split('§').skip(1) {
         let raw: String = token
             .chars()
             .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-' || *c == '\u{2013}')
@@ -448,7 +537,7 @@ fn claims(topic: &str, body: &str) -> BTreeSet<String> {
             Some((start, end)) => (start, Some(end)),
             None => (raw, None),
         };
-        assert!(!start.is_empty(), "`{topic}` claims an empty section");
+        assert!(!start.is_empty(), "{source} claims an empty section");
         found.insert(start.to_string());
         let Some(end) = end else { continue };
 
@@ -460,22 +549,22 @@ fn claims(topic: &str, body: &str) -> BTreeSet<String> {
         assert_eq!(
             head.len(),
             tail.len(),
-            "`{topic}`'s range `{start}–{end}` spans two depths"
+            "{source}'s range `{start}–{end}` spans two depths"
         );
         assert_eq!(
             head[..head.len() - 1],
             tail[..tail.len() - 1],
-            "`{topic}`'s range `{start}–{end}` is not between siblings"
+            "{source}'s range `{start}–{end}` is not between siblings"
         );
         let first: u32 = head[head.len() - 1]
             .parse()
-            .unwrap_or_else(|_| panic!("`{topic}`'s range starts at a number"));
+            .unwrap_or_else(|_| panic!("{source}'s range starts at a number"));
         let last: u32 = tail[tail.len() - 1]
             .parse()
-            .unwrap_or_else(|_| panic!("`{topic}`'s range ends at a number"));
+            .unwrap_or_else(|_| panic!("{source}'s range ends at a number"));
         assert!(
             first < last,
-            "`{topic}`'s range `{start}–{end}` does not go forwards"
+            "{source}'s range `{start}–{end}` does not go forwards"
         );
         let prefix = head[..head.len() - 1].join(".");
         for number in first..=last {
@@ -580,14 +669,99 @@ fn every_claimed_grammar_section_exists() {
     }
 }
 
+/// (b) …and so does every section and decision an **explanation** cites.
+///
+/// The explanations close the same way the topics do — `Grammar:
+/// `docs/grammar.md` §8.6, Decisions D31, D94` — and until this ran, that line
+/// was bound by nothing: a renumbered subsection or a retired decision would
+/// leave 57 embedded documents pointing at nothing, with the suite green. The
+/// coverage half stays the topics' alone, because that is what the curriculum
+/// is for; what an explanation owes is that the pointer it hands a reader
+/// resolves.
+#[test]
+fn every_grammar_reference_an_explanation_makes_exists() {
+    let headings = grammar_headings();
+    let recorded = grammar_decisions();
+    let mut cited = 0;
+    for code in DiagnosticCode::ALL {
+        let name = code.as_str();
+        let source = format!("`{name}`'s explanation");
+        let closing = cross_reference(name, docs::explanation(*code));
+
+        let claimed = sections(&source, closing);
+        assert!(
+            !claimed.is_empty(),
+            "{source} cites the grammar section its check comes from"
+        );
+        for claim in &claimed {
+            assert!(
+                headings.contains(claim),
+                "{source} cites `§{claim}`, which `docs/grammar.md` does not have"
+            );
+        }
+        for decision in decisions(closing) {
+            assert!(
+                recorded.contains(&decision),
+                "{source} cites `{decision}`, which `docs/grammar.md`'s decision log does not have"
+            );
+        }
+        cited += claimed.len();
+    }
+    // Every explanation cites at least one section and most cite several, so a
+    // scan that found a handful would mean the parser, not the documents,
+    // changed.
+    assert!(
+        cited >= 100,
+        "the scan still finds the explanations' cross-references, found {cited}"
+    );
+}
+
 /// (c) The `cli` topic names every verb the binary has.
 #[test]
 fn the_cli_topic_names_every_verb() {
     let topic = docs::topic("cli").expect("the curriculum has a `cli` topic");
     for verb in verbs() {
         assert!(
-            topic.body.contains(&format!("agent-compose {verb}")),
+            names_command(topic.body, &verb),
             "the `cli` topic does not name `agent-compose {verb}`"
+        );
+    }
+}
+
+/// Whether `document` names `agent-compose <verb>` **as that verb**.
+///
+/// A bare substring would let an existing verb document a future one that is a
+/// prefix of it: a verb named `doc` would be satisfied by the topic's own
+/// `agent-compose docs`, and the topic would ship claiming to cover every verb
+/// without a word written about it. So the match ends where a name ends —
+/// [`is_a_name`] spells a name as lowercase letters and hyphens, and anything
+/// else after the verb is the end of it.
+fn names_command(document: &str, verb: &str) -> bool {
+    let needle = format!("agent-compose {verb}");
+    document.match_indices(&needle).any(|(at, _)| {
+        document[at + needle.len()..]
+            .chars()
+            .next()
+            .is_none_or(|next| !next.is_ascii_lowercase() && next != '-')
+    })
+}
+
+/// (c) …and the check above is the one that catches that, pinned.
+///
+/// The rule it enforces is about a verb this binary does not have, so the only
+/// way to hold it is to ask about one: `doc` and `valid` are the prefixes the
+/// shipped topic would have answered for, and neither is documented.
+#[test]
+fn a_verb_is_not_documented_by_a_longer_one_that_starts_with_it() {
+    let topic = docs::topic("cli").expect("the curriculum has a `cli` topic");
+    assert!(
+        names_command(topic.body, "docs"),
+        "the `cli` topic names `agent-compose docs`"
+    );
+    for prefix in ["doc", "valid", "ini", "s"] {
+        assert!(
+            !names_command(topic.body, prefix),
+            "`agent-compose {prefix}` is not a command the `cli` topic names"
         );
     }
 }
