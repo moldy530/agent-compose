@@ -1,0 +1,10 @@
+# …and one that fails a file earlier: the entrypoint imports a spec file that
+# is not there.
+version: "0.1"
+
+imports:
+  - models.yml
+
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}

@@ -1,0 +1,11 @@
+# A spec that parses and does not resolve: the model names a provider this
+# composition does not define.
+version: "0.1"
+
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+
+model.fast:
+  provider: provider.bedrock
+  id: some-fast-model

@@ -264,10 +264,15 @@ pub(crate) struct Failed<'a> {
 /// One block per failed spec — its diagnostics, then a line naming which side of
 /// the comparison it is. Both sides are reported when both failed: a person
 /// diffing two branches wants to know that neither of them resolves, not to find
-/// out one at a time.
+/// out one at a time. The two blocks are separated by a blank line, because the
+/// line that closes one is a sentence and the line that opens the next is a
+/// diagnostic about a different project.
 pub(crate) fn refused(failed: &[Failed<'_>], target: &str, color: bool) -> String {
     let mut report = String::new();
     for spec in failed {
+        if !report.is_empty() {
+            report.push('\n');
+        }
         report.push_str(&crate::report::human(spec.root, spec.diagnostics, color));
         let errors = spec
             .diagnostics

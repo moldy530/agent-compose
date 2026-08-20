@@ -22,6 +22,7 @@
 //! | `added-flow` | §3's rule that a component which arrived brings nothing with it |
 //! | `broken-routing` | §7 in both directions, and §1's second property: an error introduced is a plan, exit `0` |
 //! | `unresolvable-after` | §2.3: a spec with no artifact leaves nothing to compare, exit `1` |
+//! | `unresolvable-both` | §2.3 again, when neither side resolves |
 //!
 //! Every run sets `NO_COLOR` and reads the streams through a pipe. The plan
 //! report itself is unstyled either way — it is a list, not a diagnostic
@@ -460,6 +461,54 @@ error: the after spec `unresolvable-after/after/main.yml` does not resolve (targ
 }
 "#
     );
+    assert_eq!(code, 1);
+}
+
+/// Both sides are reported when both of them failed.
+///
+/// A person diffing two branches wants to know that neither of them resolves,
+/// not to find out one at a time — so the two blocks are written in `before`,
+/// `after` order with a blank line between them, and the machine document
+/// carries two entries (`docs/plan.md` §2.3).
+#[test]
+fn two_specs_that_do_not_resolve_are_both_reported() {
+    let (report, code) = report("unresolvable-both");
+    assert_eq!(
+        report,
+        "\
+error[undefined-reference]: `provider.bedrock` is not defined in this composition
+  --> unresolvable-both/before/main.yml:10:13
+   |
+10 |   provider: provider.bedrock
+   |             ^^^^^^^^^^^^^^^^
+   |
+   = help: the composition defines `provider.anthropic`; a definition is part of it only when \
+the entrypoint imports the file that declares it (grammar 1.4)
+
+error: the before spec `unresolvable-both/before/main.yml` does not resolve (target `local`): \
+1 error
+
+error[io-error]: cannot read `models.yml`: No such file or directory (os error 2)
+ --> unresolvable-both/after/main.yml:6:5
+  |
+6 |   - models.yml
+  |     ^^^^^^^^^^
+  |
+  = help: imports are relative paths resolved against the entrypoint's directory, and there is \
+no directory scanning: the file has to be there (grammar 1.4)
+
+error: the after spec `unresolvable-both/after/main.yml` does not resolve (target `local`): 1 error
+"
+    );
+    assert_eq!(code, 1);
+
+    let (document, code) = document("unresolvable-both");
+    let failed: Vec<&str> = document
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("\"spec\": \""))
+        .map(|rest| rest.trim_end_matches("\","))
+        .collect();
+    assert_eq!(failed, ["before", "after"], "{document}");
     assert_eq!(code, 1);
 }
 
