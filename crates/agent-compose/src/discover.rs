@@ -109,9 +109,21 @@ fn named(held: &[String]) -> String {
 /// customization from a stale copy and the user can, so it names the file and
 /// leaves the decision with them; `agent-compose skill` prints the document for
 /// a merge.
+///
+/// The comparison is over **bytes**, not text, and that is the whole reason
+/// this reads with [`fs::read`]. What the refusal protects is that one file's
+/// contents, so a file whose bytes are not this document is the refusal's case
+/// whatever those bytes are — including a file that is not UTF-8 at all.
+/// Decoding first would sort that file under "cannot read", which exits `2` and
+/// tells a supervisor the command could not run, when the true answer is `1`:
+/// the command ran, and there is something here that is not ours to replace.
+/// A genuine I/O failure — no permission, a directory in the way — is still
+/// `2`, because then the question really was unanswerable.
 pub(crate) fn install(path: &Path, document: &str) -> Result<Wrote, Refusal> {
-    match fs::read_to_string(path) {
-        Ok(existing) if existing == document => return Ok(Wrote::Unchanged(path.to_path_buf())),
+    match fs::read(path) {
+        Ok(existing) if existing == document.as_bytes() => {
+            return Ok(Wrote::Unchanged(path.to_path_buf()));
+        }
         Ok(_) => {
             return Err(Refusal::Occupied(format!(
                 "`{}` already holds a different document: this command replaces nothing it did \

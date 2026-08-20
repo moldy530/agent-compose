@@ -195,10 +195,10 @@ key that would carry it — `body:` on a body-bearing method, `query:` on
 ## `function:` nodes
 
 ```yaml
-lookup:
-  function: tool.web_search
-  input: { query: "state.goal", max_results: "3" }
-  writes: { results: search_results }
+file:
+  function: tool.file_ticket
+  input: { title: "state.headline", summary: "state.detail" }
+  writes: { id: ticket_id }
 ```
 
 `input:` values are CEL, checked field by field against the tool's `input`

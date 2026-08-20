@@ -52,6 +52,27 @@
 //! undocumented verb — the reader spends a turn on a usage error, inside a
 //! binary they cannot correct.
 //!
+//! A verb that exists is not yet a command that runs, so the same direction
+//! also checks **arity**: an invocation names at least as many arguments as
+//! clap makes required, counted from that subcommand's own usage line.
+//! `agent-compose build` is every bit as much a usage error as
+//! `agent-compose migrate` would be, and it is the likelier mistake, because
+//! the verb is real and the sentence around it reads fine.
+//!
+//! Arity is checked where a reader is being told what to *type*, which is
+//! everywhere in these documents except a **table cell**. English names a verb
+//! as a noun — the `human` topic's "the terminal of an `agent-compose run`",
+//! the `trace` topic's row for an "`agent-compose serve` status" — and where it
+//! does, the invocation is the row's subject rather than a line to run; the
+//! table's other columns say what about it. That carve is a structural proxy
+//! for an intent, so it has a hole with a name: an invocation written inside a
+//! table *is* instructing and misses its arguments. The hole is bounded — a
+//! table cell is a poor place to put a command a reader should type — and the
+//! alternative, requiring the arguments everywhere, would force the referential
+//! sentences into prose that names the verb alone and reads worse for it.
+//! Everything else, tables included, is bound: a table cell still cannot name a
+//! verb that does not exist.
+//!
 //! # What a claim looks like
 //!
 //! A topic's last non-empty line is
@@ -67,10 +88,12 @@
 //! claim naming a heading that does not exist is itself a failure: an
 //! aspirational `§8.1–8.20` fails on `8.9`.
 //!
-//! Two topics claim documents other than the grammar (`docs/trace.md`,
-//! `docs/plan.md`) and carry no `§` at all. That is legal and contributes
-//! nothing to coverage, which is why the other sixteen have to cover the whole
-//! of it between them.
+//! A topic may claim documents other than the grammar, and two do: `trace`
+//! claims `docs/trace.md` **alone**, so it carries no `§` and contributes
+//! nothing to coverage; `cli` claims `docs/plan.md` and `docs/trace.md` *and*
+//! `§8.7, §14`, so it counts like any other topic. Coverage is therefore owned
+//! by every topic except `trace` — which is what the failure below reports,
+//! rather than a count in this comment that a new topic would falsify.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -152,6 +175,96 @@ fn listed_verbs() -> Vec<String> {
         .filter(|verb| *verb != "help")
         .map(str::to_string)
         .collect()
+}
+
+/// How many positional arguments clap **requires** of one verb.
+///
+/// Read out of that subcommand's own usage line — `Usage: agent-compose build
+/// [OPTIONS] <PATH>` — where clap writes a required positional in angle
+/// brackets and an optional one in square. Reading it rather than listing it
+/// here is the same discipline as [`verbs`]: a second inventory is a second
+/// thing to keep in step, and adding a required argument to a shipped verb is
+/// exactly the change that would make the documents wrong without touching
+/// them.
+fn required_arguments(verb: &str) -> usize {
+    let output: Output = Command::cargo_bin("agent-compose")
+        .expect("the binary under test is built")
+        .args([verb, "--help"])
+        .output()
+        .expect("the command runs");
+    let text = String::from_utf8(output.stdout).expect("help is UTF-8");
+    let usage = text
+        .lines()
+        .find(|line| line.starts_with("Usage:"))
+        .unwrap_or_else(|| panic!("`agent-compose {verb} --help` prints a usage line"));
+    usage
+        .split_whitespace()
+        .filter(|word| word.starts_with('<') && word.ends_with('>'))
+        .count()
+}
+
+/// How many positional arguments one written invocation supplies.
+///
+/// The leading run of words after the verb that are not flags, an optional
+/// group, or a trailing comment — because that is where a positional goes in
+/// every form these documents write, and stopping at the first flag keeps
+/// `agent-compose build --check` from counting `--check` as the path it is
+/// missing. A placeholder counts: `<path>` is a document saying *a path goes
+/// here*, which is the thing being checked.
+fn supplied_arguments(words: &[String]) -> usize {
+    words
+        .iter()
+        .skip(1)
+        .take_while(|word| {
+            let word = word.as_str();
+            !word.starts_with('-') && !word.starts_with('[') && word != "#"
+        })
+        .count()
+}
+
+/// A small count as the documents spell it.
+///
+/// They spell it in words — "Five verbs act on a composition" — so a bind on
+/// that sentence has to as well. The panic is the honest failure for a surface
+/// that outgrew the spelling: somebody rewrites the sentence, and this decides
+/// what it may say.
+fn spelled(count: usize) -> &'static str {
+    match count {
+        1 => "one",
+        2 => "two",
+        3 => "three",
+        4 => "four",
+        5 => "five",
+        6 => "six",
+        7 => "seven",
+        8 => "eight",
+        9 => "nine",
+        10 => "ten",
+        other => panic!("the documents count the verb groups in words, and {other} has no word"),
+    }
+}
+
+/// `document` with its table rows blanked out.
+///
+/// A table cell is where these documents name a verb as a noun — "the terminal
+/// of an `agent-compose run`" — so it is where an invocation is the subject
+/// under discussion rather than a line to type. Blanked rather than deleted so
+/// nothing runs together, and only outside a fence, where a leading `|` is
+/// somebody's YAML rather than a table.
+fn outside_tables(document: &str) -> String {
+    let mut kept = String::new();
+    let mut fenced = false;
+    for line in document.lines() {
+        if line.trim_start().starts_with("```") {
+            fenced = !fenced;
+        } else if !fenced && line.trim_start().starts_with('|') {
+            kept.push('\n');
+            continue;
+        }
+        kept.push_str(line);
+        kept.push('\n');
+    }
+    kept
 }
 
 /// Every document the binary carries, by the name a failure should call it.
@@ -513,6 +626,20 @@ fn the_help_lists_the_verbs_that_act_before_the_verbs_that_teach() {
          list it belongs to, and into the sentence in `docs/topics/cli.md` that counts them"
     );
 
+    // And that sentence is held to the counts, or the instruction above is one
+    // nothing enforces: a shipped topic would open by miscounting the surface
+    // an agent reads before anything else.
+    let counted = format!(
+        "{} verbs act on a composition; {} teach",
+        spelled(ACT.len()),
+        spelled(TEACH.len())
+    );
+    let cli = docs::topic("cli").expect("the curriculum has a `cli` topic");
+    assert!(
+        cli.body.to_lowercase().contains(&counted),
+        "the `cli` topic opens by counting the two groups and the count is now \"{counted}\""
+    );
+
     let listed = listed_verbs();
     let last_acting = listed
         .iter()
@@ -551,6 +678,65 @@ fn the_documents_name_only_verbs_the_binary_has() {
             );
         }
     }
+}
+
+/// (c) …and every command they tell a reader to run is one that would run.
+///
+/// A verb that exists still exits `2` when its required arguments are missing,
+/// and that failure is the likelier of the two: the verb is real, the sentence
+/// reads fine, and nothing but clap notices. The skill shipped
+/// `agent-compose build` in the middle of a loop step whose two siblings —
+/// `agent-compose run main.yml flow.<name>` and `agent-compose serve main.yml`
+/// — both carried their path, so it read as an invocation and was one word
+/// short of being one. The skill is installed into somebody else's agent, so
+/// there is no correcting it afterwards.
+///
+/// Both numbers come from clap: the required count from the verb's usage line,
+/// the supplied count from what the document wrote. Table cells are out of
+/// scope and the module header says why.
+#[test]
+fn every_command_the_documents_tell_a_reader_to_run_carries_its_arguments() {
+    let arity: BTreeMap<String, usize> = verbs()
+        .into_iter()
+        .map(|verb| {
+            let required = required_arguments(&verb);
+            (verb, required)
+        })
+        .collect();
+    let mut demanding = 0;
+    for (document, text) in embedded_documents() {
+        for words in invocations(&outside_tables(&text)) {
+            let Some(verb) = words.first() else { continue };
+            if !is_a_name(verb) {
+                continue;
+            }
+            // A verb this binary does not have is the sibling test's failure,
+            // reported there rather than as a confusing arity one here.
+            let Some(required) = arity.get(verb) else {
+                continue;
+            };
+            if *required == 0 {
+                continue;
+            }
+            demanding += 1;
+            let supplied = supplied_arguments(&words);
+            assert!(
+                supplied >= *required,
+                "{document} writes `agent-compose {}`, which exits 2: `{verb}` takes {required} \
+                 argument(s) and this names {supplied}. Name them — a placeholder counts — or, if \
+                 the sentence is about the verb rather than a command to run, write the verb \
+                 alone without the program name",
+                words.join(" ")
+            );
+        }
+    }
+    // Every loop the documents teach ends in a verb that takes a path, so a
+    // scan that found a handful would mean the scan, not the documents,
+    // changed.
+    assert!(
+        demanding >= 15,
+        "the scan still finds the commands that take arguments, found {demanding}"
+    );
 }
 
 /// (c) …and every topic the documents point at is one the curriculum has.

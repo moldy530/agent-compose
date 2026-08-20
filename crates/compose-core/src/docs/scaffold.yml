@@ -94,8 +94,8 @@ flow.summarize:
     - { from: summarize, to: end }
 
 # A project's entrypoints are exactly the flows its triggers name. `manual` is
-# the one `agent-compose run` uses; declaring it is optional, and it is written
-# out here so the file shows the shape (grammar 13.2).
+# the kind the `run` verb goes through; declaring it is optional, and it is
+# written out here so the file shows the shape (grammar 13.2).
 triggers:
   cli:
     type: manual

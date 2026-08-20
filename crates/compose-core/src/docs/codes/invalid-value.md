@@ -35,8 +35,8 @@ flow.f:
 ## The fix
 
 Read the message: it names the constraint and what was found, and often the
-default. Above, `path: /review` — the default would have been
-`/triggers/on_request`.
+default. Above, write `path: /review`; dropping the key entirely would have
+given the default, `/triggers/on_request`.
 
 Grammar: `docs/grammar.md` §3.3, §7.2, §13.3, Decisions D61, D100. Topic:
 `agent-compose docs triggers`.

@@ -425,6 +425,42 @@ fn skill_refuses_to_replace_a_document_it_did_not_write() {
     );
 }
 
+/// A file that is not text at all is still a file that differs, not a file the
+/// command could not read.
+///
+/// The distinction is the exit code, and the exit code is what a supervisor
+/// branches on: `2` says the command could not run and invites a retry, `1`
+/// says the answer is no and sends the user to look at the path. Comparing
+/// decoded text would put an existing `SKILL.md` of arbitrary bytes — a
+/// truncated download, somebody's binary note-taking format — under `2`
+/// forever, since no retry makes those bytes decode.
+#[test]
+fn skill_refuses_a_file_of_bytes_that_are_not_this_document() {
+    let directory = scratch("skill-not-text");
+    let path = directory.join(".claude/skills/agent-compose/SKILL.md");
+    std::fs::create_dir_all(path.parent().expect("a parent")).expect("can create");
+    let held: &[u8] = &[0xff, 0xfe, 0x00, b'n', b'o', b't', 0x80];
+    std::fs::write(&path, held).expect("can write");
+
+    let output = run(&directory, &["skill", "--agent", "claude"]);
+    assert_eq!(
+        code(&output),
+        1,
+        "the answer is no, not unreadable: {}",
+        stderr(&output)
+    );
+    assert!(
+        stderr(&output).contains("SKILL.md") && stderr(&output).contains("different document"),
+        "the refusal names the path and the reason: {}",
+        stderr(&output)
+    );
+    assert_eq!(
+        std::fs::read(&path).expect("readable"),
+        held,
+        "the refusal touched nothing"
+    );
+}
+
 /// `--global` writes under `$HOME` instead of the working directory.
 #[test]
 fn skill_installs_globally_under_home() {

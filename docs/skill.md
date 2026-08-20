@@ -40,9 +40,10 @@ needed. Node or Bun is needed only to *run* a compiled project.
    moved in the components, the topology, the interfaces, and the validation.
    Use it before and after a non-trivial edit, and put its output in a PR
    description rather than asking a reviewer to diff router logic.
-7. **Compile and run.** `agent-compose build` emits the TypeScript project;
-   `agent-compose run main.yml flow.<name> --input k=v` builds and runs one
-   flow; `agent-compose serve main.yml` starts the app for `http` triggers.
+7. **Compile and run.** `agent-compose build main.yml` emits the TypeScript
+   project; `agent-compose run main.yml flow.<name> --input k=v` builds and
+   runs one flow; `agent-compose serve main.yml` starts the app for `http`
+   triggers.
 
 ## Verbs
 

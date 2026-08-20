@@ -68,6 +68,11 @@ order), `toolDispatches` (what a *model* dispatched, one per flow-as-tool call),
 `inner` (a `flow:` node's subflow trace), `stores`, `models`, `human`, `error`,
 `fallback`.
 
+**The trace numbers supersteps from 1, where routing counts them from 0.** The
+nodes the taken `start` edges reach are routing's step 0
+(`agent-compose docs routing`) and carry `step: 1` here; a trace entry's step is
+one more than the step of the topology it belongs to, throughout.
+
 Entries are ordered by `(step, node)` — ascending superstep, then ascending node
 id. Node id rather than completion order, so two runs of one composition produce
 the entries in the same order. One entry is outside that ordering and is always
