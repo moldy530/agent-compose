@@ -55,7 +55,51 @@ ac_have() {
   command -v "$1" >/dev/null 2>&1
 }
 
+# What the header above says, for somebody who ran the script instead of
+# reading it. The two are held to each other by a test, so `--help` cannot
+# start describing a script the comment no longer documents.
+ac_usage() {
+  cat <<'EOF'
+Usage:
+
+  curl -fsSLO https://raw.githubusercontent.com/moldy530/agent-compose/main/install.sh
+  sh install.sh [<version>]
+
+The version may be given as the first argument or as AGENT_COMPOSE_VERSION,
+with or without a leading `v`; the argument wins, and with neither the latest
+release is installed.
+
+Environment:
+
+  AGENT_COMPOSE_VERSION       the release to install (default: the latest)
+  AGENT_COMPOSE_INSTALL       where to put the binary
+                              (default: $HOME/.local/bin)
+  AGENT_COMPOSE_ARTIFACT_DIR  install from a directory holding built tarballs
+                              and their SHA256SUMS instead of from GitHub.
+EOF
+}
+
+# Being called wrong is not the same failure as a release that would not
+# install, so it does not exit the same: `2` for "that is not how this is run",
+# with the usage after it, against `1` for everything `ac_die` reports.
+ac_usage_error() {
+  printf 'install %s: %s\n\n' "$ac_bin" "$1" >&2
+  ac_usage >&2
+  exit 2
+}
+
 # The version, before anything else touches the positional parameters.
+case "${1:-}" in
+  -h | --help)
+    ac_usage
+    exit 0
+    ;;
+esac
+# One version, or none. A second argument means the caller meant something this
+# script does not do — and reading only the first would install *a* version
+# while ignoring what else they asked for.
+[ "$#" -le 1 ] ||
+  ac_usage_error "takes at most one version, and was given $#: $*"
 ac_version="${1:-${AGENT_COMPOSE_VERSION:-}}"
 ac_version="${ac_version#v}"
 ac_artifacts="${AGENT_COMPOSE_ARTIFACT_DIR:-}"
