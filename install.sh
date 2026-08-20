@@ -100,11 +100,19 @@ else
   ac_die "neither \`sha256sum\` nor \`shasum\` is on PATH, so the download cannot be verified"
 fi
 
+# The hasher, and nothing else: its whole line comes back, and the caller
+# checks that it *ran* before taking a field out of it. Cutting the hash out
+# inside a pipeline here would report the last command in that pipeline
+# instead, so a hasher that died — missing, unreadable file, out of memory —
+# would arrive at the comparison below as an empty string, and an empty string
+# is not the expected sum: the reader would be told the download does not match
+# what the release vouched for, which is the one message in this script that
+# means "somebody may have tampered with your download".
 ac_checksum() {
   case "$ac_sha" in
     sha256sum) sha256sum "$1" ;;
     *) shasum -a 256 "$1" ;;
-  esac | cut -d ' ' -f 1
+  esac
 }
 
 if [ -n "$ac_artifacts" ]; then
@@ -139,11 +147,26 @@ ac_fetch() {
 # directory as well as of the install directory.
 ac_tmp="$(mktemp -d 2>/dev/null || mktemp -d -t agent-compose)"
 ac_staged=""
+# Runs more than once — the interrupt handlers below clean and then `exit`,
+# which runs the `EXIT` trap on top of them — so it forgets what it removed and
+# is safe to repeat.
 ac_clean() {
-  rm -rf "$ac_tmp"
+  [ -z "$ac_tmp" ] || rm -rf "$ac_tmp"
   [ -z "$ac_staged" ] || rm -f "$ac_staged"
+  ac_tmp=""
+  ac_staged=""
 }
-trap ac_clean EXIT INT TERM
+# **Cleaning up is not the same as stopping.** A handler that only removes the
+# temporary directory returns, and a shell resumes the script at the next
+# command: the download it was waiting on is gone, the directory it was writing
+# into is gone, and what the reader gets for their Ctrl-C is this script's
+# diagnosis of the wreckage — "the GitHub releases API named no release", or a
+# second download started after they interrupted the first. So the interrupt
+# handlers exit, at the status a shell killed by that signal reports (128 + the
+# signal number), and only the `EXIT` handler is the one that merely cleans.
+trap ac_clean EXIT
+trap 'ac_clean; exit 130' INT
+trap 'ac_clean; exit 143' TERM
 
 # --- which release ------------------------------------------------------------
 
@@ -212,7 +235,13 @@ ac_expected="$(awk -v name="$ac_archive" '{ sub(/^[*]/, "", $2); sub(/^\.\//, ""
 [ -n "$ac_expected" ] ||
   ac_die "\`$ac_sums\` says nothing about \`$ac_archive\`, and unvouched-for bytes are not installed"
 
-ac_actual="$(ac_checksum "$ac_tmp/$ac_archive")"
+ac_hashed="$(ac_checksum "$ac_tmp/$ac_archive")" ||
+  ac_die "\`$ac_sha\` could not hash \`$ac_archive\`, so the download cannot be verified"
+# `<hash>  <name>` is what both tools print; the name is dropped here rather
+# than by a `cut` that would have hidden the status above.
+ac_actual="${ac_hashed%% *}"
+[ -n "$ac_actual" ] ||
+  ac_die "\`$ac_sha\` printed no checksum for \`$ac_archive\`, so the download cannot be verified"
 if [ "$ac_actual" != "$ac_expected" ]; then
   ac_die "checksum mismatch for \`$ac_archive\`
   expected $ac_expected
@@ -235,6 +264,21 @@ if [ -z "$ac_into" ]; then
   ac_into="$HOME/.local/bin"
 fi
 mkdir -p "$ac_into" || ac_die "could not create \`$ac_into\`"
+
+# `mv -f file dir/` moves the file *into* the directory and reports success, so
+# an `agent-compose` that is a directory would end the script with "installed
+# …/agent-compose" printed about a directory holding the binary — and a
+# `--version` that fails for a reason nothing on screen explains. Checked
+# before anything is staged, so the refusal costs the reader nothing and names
+# what is in the way.
+if [ -e "$ac_into/$ac_bin" ] && [ ! -f "$ac_into/$ac_bin" ]; then
+  if [ -d "$ac_into/$ac_bin" ]; then
+    ac_occupant="a directory"
+  else
+    ac_occupant="not a regular file"
+  fi
+  ac_die "\`$ac_into/$ac_bin\` is $ac_occupant, so the binary cannot be installed over it. Remove it, or install somewhere else with AGENT_COMPOSE_INSTALL"
+fi
 
 # **Staged inside the install directory, then renamed within it.** The unpacked
 # binary is in a temporary directory, and a temporary directory is routinely on
