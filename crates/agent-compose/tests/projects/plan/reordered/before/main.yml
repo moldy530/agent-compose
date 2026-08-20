@@ -1,11 +1,12 @@
-# Six declarations whose order the `after` spec swaps, and nothing else.
+# Eight orders the `after` spec swaps, and nothing else.
 #
-# Two of the six are orders the composition behaves differently for — a field
-# map's, which is the order of a JSON Schema's `properties` and `required`, and a
-# discriminated union's, which is the order of its `oneOf` — so a plan reports
-# them. The other four are dispatched on by name and their order says nothing:
-# a set of optional properties, a set of accepted exit statuses, a node's input
-# bindings, and a routed map's routes.
+# Three of the eight are orders the composition behaves differently for — a field
+# map's, which is the order of a JSON Schema's `properties` and `required`, a
+# discriminated union's, which is the order of its `oneOf`, and a model route's,
+# which is the order its members are tried in — so a plan reports them. The other
+# five are selected by name or tested for membership and their order says
+# nothing: a set of optional properties, a set of accepted exit statuses, a set
+# of failover conditions, a node's input bindings, and a routed map's routes.
 version: "0.1"
 
 state:
@@ -29,6 +30,14 @@ provider.anthropic:
 model.fast:
   provider: provider.anthropic
   id: some-fast-model
+
+model.slow:
+  provider: provider.anthropic
+  id: some-slow-model
+
+model.resilient:
+  route: [model.fast, model.slow]
+  route_on: [rate_limit, overloaded, timeout]
 
 tool.spell_check:
   description: Check the spelling of a draft.

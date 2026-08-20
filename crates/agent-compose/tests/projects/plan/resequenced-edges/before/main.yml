@@ -1,0 +1,82 @@
+# Three nodes that branch, and one edit apiece in the `after` spec.
+#
+# `triage` loses the first of its four outgoing edges, `fix` has two of its
+# guarded edges swapped, and `ask` gains one ahead of the two it has. Each is the
+# same shape of edit — an edge list rewritten — and grammar 7.3 reads only the
+# middle one as a change of precedence.
+#
+# Every one of the three is written between edges that run to the **same node**,
+# so no edge here is identified by its endpoints alone: what tells them apart is
+# their guards, which is what a plan has to match them on.
+version: "0.1"
+
+state:
+  summary:
+    description: What the sweep concluded.
+    type: string
+    default: ""
+
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+
+model.fast:
+  provider: provider.anthropic
+  id: some-fast-model
+
+agent.triage:
+  model: model.fast
+  prompt: Classify the finding.
+  input:
+    report: { type: string }
+  output:
+    kind: { enum: [auto, human, none] }
+
+agent.fixer:
+  model: model.fast
+  prompt: Patch exactly the defect described.
+  input:
+    report: { type: string }
+  output:
+    patch: { type: string }
+    ok: { type: boolean }
+
+agent.escalator:
+  model: model.fast
+  prompt: Write one ticket line for the finding.
+  input:
+    report: { type: string }
+  output:
+    ticket: { type: string }
+
+agent.reporter:
+  model: model.fast
+  prompt: Say in one line what was done.
+  input:
+    report: { type: string }
+  output:
+    summary: { type: string }
+
+flow.sweep:
+  description: Classify one finding and route it.
+  inputs:
+    report: { type: string }
+  outputs:
+    summary: { type: string }
+  nodes:
+    triage: { agent: agent.triage, input: { report: "input.report" } }
+    fix: { agent: agent.fixer, input: { report: "input.report" } }
+    ask: { agent: agent.escalator, input: { report: "input.report" } }
+    report: { agent: agent.reporter, input: { report: "input.report" } }
+  edges:
+    - { from: start, to: triage }
+    - { from: triage, to: report, when: "triage.output.kind == 'none'" }
+    - { from: triage, to: fix, when: "triage.output.kind == 'auto'" }
+    - { from: triage, to: ask, when: "triage.output.kind == 'human'" }
+    - { from: triage, to: report, else: true }
+    - { from: fix, to: report, when: "size(fix.output.patch) > 0" }
+    - { from: fix, to: end, when: "!fix.output.ok" }
+    - { from: fix, to: end, else: true }
+    - { from: ask, to: end, when: "size(ask.output.ticket) > 0" }
+    - { from: ask, to: end, else: true }
+    - { from: report, to: end }

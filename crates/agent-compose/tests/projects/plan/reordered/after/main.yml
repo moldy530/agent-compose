@@ -1,10 +1,12 @@
-# The same composition with six declarations swapped, and nothing else edited.
+# The same composition with eight orders swapped, and nothing else edited.
 #
 # Swapped here: `tool.spell_check`'s `expect_exit:`, `agent.reviewer`'s
-# `output:`, `agent.triage`'s union `variants:` and its `optional:`, the `review`
-# node's `input:` bindings, and the `dispatch` map's `routes:`. Two of the six
-# reach the schema a model is handed and are reported; the other four are
-# dispatched on by name and are not.
+# `output:`, `agent.triage`'s union `variants:` and its `optional:`,
+# `model.resilient`'s `route:` and its `route_on:`, the `review` node's `input:`
+# bindings, and the `dispatch` map's `routes:`. Three of the eight decide
+# something — two reach the schema a model is handed, one is the order the route
+# is tried in — and are reported; the other five are selected by name or tested
+# for membership and are not.
 version: "0.1"
 
 state:
@@ -28,6 +30,14 @@ provider.anthropic:
 model.fast:
   provider: provider.anthropic
   id: some-fast-model
+
+model.slow:
+  provider: provider.anthropic
+  id: some-slow-model
+
+model.resilient:
+  route: [model.slow, model.fast]
+  route_on: [timeout, overloaded, rate_limit]
 
 tool.spell_check:
   description: Check the spelling of a draft.

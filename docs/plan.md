@@ -139,7 +139,12 @@ Each entry is a `Refused`:
 Both entries are present when both specs failed. A person comparing two branches
 wants to know that neither of them resolves, not to find out one at a time.
 
-`SpecSide` is the closed vocabulary `spec` draws on: `"before"` and `"after"`.
+`SpecSide` is the closed vocabulary `spec` draws on:
+
+| member | what it names |
+|---|---|
+| `"before"` | the composition compared **from** |
+| `"after"` | the composition compared **to** |
 
 ## 3. What a change record says
 
@@ -197,13 +202,16 @@ specs declare, so an entry inserted ahead of others is one addition rather than 
 move of everything below it. `order` is this format's key rather than the
 artifact's; §5 gives an edge one for the same reason.
 
-Three keys are the opposite of that: `optional:`, `expect_exit:` and
-`expect_status:` are parsed as distinct memberships and membership-tested at run
+Four keys are the opposite of that: `optional:`, `expect_exit:`, `expect_status:`
+and `route_on:` are parsed as distinct memberships and membership-tested at run
 time, so their order is not compared at all and a spec that only reshuffles one
-of them has changed nothing. The remaining named arrays — a node's `input:`
-bindings, a `writes:` remap, an `env:` or `headers:` map, a routed map's
-`routes:` — are dispatched on by name, and §11 is where their order is accounted
-for.
+of them has changed nothing. `route_on:` is the one worth naming beside its own
+neighbour: a model's `route:` is the order its members are **tried** in and is
+reported, while the `route_on:` next to it is the set of conditions that decide
+whether to try the next member at all, and is not. The remaining named arrays — a
+node's `input:` bindings, a `writes:` remap, an `env:` or `headers:` map, a
+routed map's `routes:` — are dispatched on by name, and §11 is where their order
+is accounted for.
 
 ## 4. Components
 
@@ -287,19 +295,31 @@ order the `nodes:` mapping declares them in is not reported, because the graph i
 the edges' and not that mapping's. An edge has no name, so what identifies it is
 where it runs from, where it runs to, and what guards it — and an edit changes
 exactly one of those. The match runs in three passes over what is still unpaired:
-edges that agree in every field, then edges agreeing in `from` and `to` (the
-guard, the `else:`, or the budget moved), then edges agreeing in `from` and guard
-— which is an edge **retargeted**, the edit a pair of added/removed lines would
-hide. What is left really arrived or really left.
+edges that agree in every field **of the artifact**, then edges agreeing in
+`from` and `to` (the guard, the `else:`, or the budget moved), then edges
+agreeing in `from` and guard — which is an edge **retargeted**, the edit a pair of
+added/removed lines would hide. What is left really arrived or really left.
 
 One key an edge record can report is not a key of the artifact: `order`, the
 edge's position among the outgoing edges of its own source node. Grammar 7.3
 evaluates a node's outgoing edges in declaration order and takes the first whose
 guard passes, so swapping two of them changes which one fires on a composition
 where every edge is otherwise untouched; the IR carries that as list position,
-and this is the plan's name for it. It counts per source node, because that is
-what the rule is stated over — an edge inserted between two edges of a *different*
-node changes nobody's precedence.
+and this is the plan's name for it. Two rules say what it counts:
+
+* **per source node**, because that is what grammar 7.3 is stated over — an edge
+  inserted between two edges of a *different* node changes nobody's precedence;
+* **over the edges both specs declare**, which is §3's rule for a named sequence
+  applied here — an edge inserted ahead of others is one addition rather than a
+  move of everything below it, and a genuine swap still reports, because a swap
+  moves an edge past another edge that is also on both sides.
+
+A position is therefore **not** part of what identifies an edge: it is compared
+after the pairing above is settled, not during it. Folding it in would defeat the
+first pass — an untouched edge that sits one place lower would fail to match
+itself, the genuinely new edge beside it would be paired with it by `from`/`to`
+instead, and the plan would report an arrival as a guard edit on an edge nobody
+touched.
 
 ## 6. Interfaces
 
@@ -356,10 +376,24 @@ with its labels, its help, and the snippet under it.
 span moves when anything above it in its file does, so a plan that keyed on one
 would report an inserted comment as an error resolved and the same error
 introduced two lines down — which is the exact class of noise §1 exists to
-remove. What a diagnostic *says* is what identifies it: the message names the
-construct it is about, and the code names the failure class. The match is a
-multiset, so a composition that really is told the same thing twice reports two,
-and one that grew a third reports one introduced.
+remove. What a diagnostic *says* is what identifies it: the code names the
+failure class, and the message states what is wrong. The match is a multiset, so
+a composition that really is told the same thing twice reports two, and one that
+grew a third reports one introduced.
+
+That is a trade with a residual, and this is it. Most messages name the construct
+they are about — `` node `merge` of `flow.diamond` … `` — but the compiler does
+not guarantee it, and some are stated about the offending text alone:
+`unknown-root` reads `` `bogus` is not a root in scope here `` and names no
+construct. So one failure that *moved* from one construct to another — fixed in
+`flow.first`, introduced identically in `flow.second` — is one finding on each
+side that reads the same, matches itself, and leaves both `introduced` and
+`resolved` empty. `agent-compose validate` reports an error on each side; a plan
+says the verdict did not move. The structural sections still carry both edits, so
+what a reader loses is the validator's verdict having moved with them — and the
+alternative is keying on a location, which costs the whole class of noise this
+paragraph opens with. The trade is taken deliberately, and stated here rather
+than left to be discovered.
 
 ## 8. Addresses
 
@@ -436,26 +470,32 @@ so that a reader can go and look, not so that they can be diffed.
 
 ## 11. What is not compared
 
-Five things in the artifact are outside this version of the format, and each for
-a reason:
+Six things in the artifact are outside this version of the format, and each for a
+reason:
 
 * **an ordering nothing dispatches on.** This is the one item here that is a
   judgement rather than a gap, and it is worth reading before relying on the
-  verdict line. §3 reports the declaration order of a field map and of a union,
-  because both reach the schema the model is handed. It does not report the order
-  of the arrays the generated code looks entries up in **by name** — a node's
-  `input:` bindings, a `writes:` remap, an `env:` or `headers:` map, a routed
-  map's `routes:` — nor of the three sets `optional:`, `expect_exit:` and
-  `expect_status:`. Reshuffling one of those is a change to the *layout* of the
-  generated project (a route descriptor moves in `src/graph.ts`, an
-  `expectExit: [0, 1]` literal is written `[1, 0]`, and the failure message that
-  quotes it back reads in the new order) and to nothing the composition decides:
-  every one of them is selected by name or tested for membership. A plan is a
-  diff of compositions, so it stays silent, and `agent-compose build --check` is
-  the command that notices a generated file whose bytes moved;
+  verdict line. §3 reports the declaration order of a field map, of a union, and
+  of a model's `route:`, because each of those decides something. It does not
+  report the order of the arrays the generated code looks entries up in **by
+  name** — a node's `input:` bindings, a `writes:` remap, an `env:` or `headers:`
+  map, a routed map's `routes:` — nor of the four sets `optional:`,
+  `expect_exit:`, `expect_status:` and `route_on:`. Reshuffling one of those is a
+  change to the *layout* of the generated project (a route descriptor moves in
+  `src/graph.ts`, an `expectExit: [0, 1]` literal is written `[1, 0]`, and the
+  failure message that quotes it back reads in the new order) and to nothing the
+  composition decides: every one of them is selected by name or tested for
+  membership. A plan is a diff of compositions, so it stays silent, and
+  `agent-compose build --check` is the command that notices a generated file
+  whose bytes moved;
 
 * **`sources`** — the list of files the composition was read from. It is the one
   part of the IR that is *about* file layout, which §1 excludes by construction.
+* **`deploy.source`** — the deploy file the active target's layer was read from,
+  for the same reason: it is a file path, and which file a layer is written in is
+  not something the composition does. What the layer *declares* is compared, and
+  appears in §4. (`deploy.target` is likewise uncompared and needs no entry here:
+  §2.2's `target` carries it, on both sides.)
 * **`entrypoint`**, **`ir_version`** — the first is `main.yml` on both sides of
   nearly every comparison (§2.2 carries the useful one instead), and the second is
   the same value on both sides by construction: one compiler produced both
@@ -520,16 +560,19 @@ comparison*, not across compiler releases.
 `crates/compose-core/tests/plan_format_inventory.rs` reads the record types out
 of `crates/compose-core/src/plan/` and holds each of them to this file: every
 type must be introduced in exactly one section, every field must have a row in
-that section, and every member of a closed vocabulary must have a row spelled
-with its JSON quotes. It also pins the version above to the constant the
-compiler emits, so a bump moves both or neither.
+**that type's own table** — the first table after the sentence naming it, not
+merely somewhere under the same heading, because most sections here specify two
+types and their two tables sit side by side — and every member of a closed
+vocabulary must have a row spelled with its JSON quotes. It also pins the version
+above to the constant the compiler emits, so a bump moves both or neither.
 
 What that check cannot decide is whether a sentence here is *true*. That is what
 `crates/agent-compose/tests/plan_cli.rs` is for: it pins whole documents,
 byte for byte, over a corpus of spec pairs — a pair that differs only in
-formatting, a rename, a topology edit, a policy edit, a surface edit, a deploy
-edit, a pair that only reorders declarations, a pair whose one edit falls past
-the end of a report line, and a pair where the after spec introduces errors.
+formatting, a rename, a topology edit, an edge-order edit, a policy edit, a
+surface edit, a deploy edit, a pair that only reorders declarations, a pair whose
+one edit falls past the end of a report line, and a pair where the after spec
+introduces errors.
 
 ## 13. The human report
 

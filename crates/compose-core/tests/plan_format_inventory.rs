@@ -19,19 +19,28 @@
 //! `docs/plan.md` — and named *where it belongs*, which is the load-bearing
 //! half.
 //!
-//! A field is looked for in a **table row of the section that introduces its
-//! record type**, never anywhere in the file. Searching the whole document is
+//! A field is looked for in **the record type's own table**, never anywhere in
+//! the file and never anywhere in the section. Searching the whole document is
 //! the obvious implementation and it does not work: `docs/plan.md` backticks
 //! `before`, `after`, `change`, `span` and a dozen other of its own words for
 //! reasons of its own, so a field added to one record would find another
 //! record's row and pass — an undocumented field shipping on a versioned public
-//! surface with CI green. The section a type is specified in is found from the
-//! document itself: each record type is named once, as a bare backticked type
-//! name, in that section.
+//! surface with CI green.
+//!
+//! Scoping to the *section* is the next implementation and it does not work
+//! either, for a smaller version of the same reason: most sections of
+//! `docs/plan.md` specify two record types — a change record and the vocabulary
+//! it is tagged with, `Validation` and the `Finding` it holds, `Refusal` and the
+//! `Refused` it lists — and the two tables sit side by side under one heading.
+//! A `span` added to `Validation` would be satisfied by `Finding`'s row and pass.
+//! So the scope is one table: the type is named in the document as a bare
+//! backticked type name, and what specifies it is the first table after that
+//! mention.
 //!
 //! The rule this places on the document is the one it already follows: **every
-//! field gets a row in the table of its own section.** A field explained only in
-//! surrounding prose fails here, and the fix is a row.
+//! record type is introduced by name, and the table under that sentence lists
+//! every one of its fields.** A field explained only in surrounding prose fails
+//! here, and so does one listed only under the type next door; the fix is a row.
 //!
 //! The other direction is deliberately not checked, for
 //! `trace_format_inventory.rs`'s reason: a specification says more than the type
@@ -323,30 +332,56 @@ fn sections(document: &str) -> Vec<Section> {
     found
 }
 
-/// Where a record type is specified: the section whose body names it as a bare
-/// backticked type name.
-fn introduces<'a>(sections: &'a [Section], name: &str) -> Vec<&'a Section> {
+/// Where one record type is specified: the heading it was introduced under, and
+/// the rows of its own table.
+struct Home {
+    heading: String,
+    rows: Vec<String>,
+}
+
+/// Where a record type is specified: for each section whose body names it as a
+/// bare backticked type name, the first table after that mention.
+///
+/// The table rather than the whole section, because a section of `docs/plan.md`
+/// routinely specifies two record types and their two tables sit under one
+/// heading — see this file's module docs.
+fn introduces(sections: &[Section], name: &str) -> Vec<Home> {
+    let token = format!("`{name}`");
     sections
         .iter()
-        .filter(|section| {
-            section
-                .body
-                .iter()
-                .any(|line| line.contains(&format!("`{name}`")))
+        .filter_map(|section| {
+            let at = section.body.iter().position(|line| line.contains(&token))?;
+            Some(Home {
+                heading: section.heading.clone(),
+                rows: table(&section.body[at..]),
+            })
         })
         .collect()
 }
 
-/// Whether a **table row** of this section names `token`.
+/// The first table in `lines`: every line from the first that opens with a `|`
+/// to the first after it that does not.
 ///
-/// A row rather than the section's prose, because the prose is where a field is
+/// A table rather than the prose around it, because the prose is where a field is
 /// *discussed* and the table is where it is *specified*. The pipe is the test:
 /// `docs/plan.md` writes every record type's fields as one table.
-fn row_names(section: &Section, token: &str) -> bool {
-    section
-        .body
+fn table(lines: &[String]) -> Vec<String> {
+    lines
         .iter()
-        .any(|line| line.trim_start().starts_with('|') && line.contains(&format!("`{token}`")))
+        .skip_while(|line| !is_row(line))
+        .take_while(|line| is_row(line))
+        .cloned()
+        .collect()
+}
+
+fn is_row(line: &str) -> bool {
+    line.trim_start().starts_with('|')
+}
+
+/// Whether a row of this type's own table names `token`.
+fn row_names(home: &Home, token: &str) -> bool {
+    let token = format!("`{token}`");
+    home.rows.iter().any(|row| row.contains(&token))
 }
 
 /// The same, for a member of a closed vocabulary, which is a JSON **string** —
@@ -354,8 +389,8 @@ fn row_names(section: &Section, token: &str) -> bool {
 /// that, `"flow"` would be read as satisfied by every place the word `flow` is
 /// backticked as itself, and `docs/plan.md` backticks it as a field name in the
 /// section next door.
-fn row_names_member(section: &Section, member: &str) -> bool {
-    row_names(section, &format!("\"{member}\""))
+fn row_names_member(home: &Home, member: &str) -> bool {
+    row_names(home, &format!("\"{member}\""))
 }
 
 /// Every record type of `declarations` the document does not introduce exactly
@@ -372,7 +407,7 @@ fn unintroduced(document: &str, declarations: &BTreeMap<String, Declaration>) ->
                 found.len(),
                 found
                     .iter()
-                    .map(|section| section.heading.clone())
+                    .map(|home| home.heading.clone())
                     .collect::<Vec<_>>()
                     .join(", ")
             )),
@@ -382,7 +417,7 @@ fn unintroduced(document: &str, declarations: &BTreeMap<String, Declaration>) ->
 }
 
 /// Every `<type>.<field>` the document does not give a row of that type's own
-/// section.
+/// table.
 fn undocumented_fields(
     document: &str,
     declarations: &BTreeMap<String, Declaration>,
@@ -447,14 +482,14 @@ fn every_plan_record_type_is_documented() {
     );
 }
 
-/// Every field of every one of them is specified, in that type's own section.
+/// Every field of every one of them is specified, in that type's own table.
 #[test]
 fn every_plan_record_field_is_documented() {
     let missing = undocumented_fields(&specification(), &reachable(&module()));
     assert!(
         missing.is_empty(),
         "these plan fields are written by `src/plan/` and have no row in the \
-         `docs/plan.md` section that specifies their record type, so a reader pinning \
+         `docs/plan.md` table that specifies their record type, so a reader pinning \
          `plan_version` has not been told about them: {missing:?}"
     );
 }
@@ -471,7 +506,7 @@ fn every_vocabulary_member_is_documented() {
     assert!(
         missing.is_empty(),
         "these vocabulary members are written by `src/plan/` and have no row in the \
-         `docs/plan.md` section that specifies their record type: {missing:?}"
+         `docs/plan.md` table that specifies their record type: {missing:?}"
     );
 }
 
@@ -609,7 +644,7 @@ pub enum ChangeKind {
 
     assert!(
         undocumented_fields(document, &declared).is_empty(),
-        "each field has a row in its own type's section"
+        "each field has a row in its own type's table"
     );
     assert!(undocumented_members(document, &declared).is_empty());
 
@@ -626,6 +661,60 @@ pub enum ChangeKind {
         ],
         "a member with no row in its own section is missing, whatever the rest of the \
          file backticks"
+    );
+}
+
+/// …and it is looked for in its **own** table, not in the one belonging to the
+/// type specified next to it.
+///
+/// Scoping to the section is not enough, because most sections of
+/// `docs/plan.md` specify two record types under one heading: a change record
+/// and its vocabulary, `Validation` and the `Finding` it holds, `Refusal` and
+/// the `Refused` it lists. A `span` added to the first would find the second's
+/// row and pass — the same false pass the test above rules out at whole-file
+/// scope, one heading further in.
+#[test]
+fn a_field_named_only_in_a_sibling_types_table_is_undocumented() {
+    let declared = declarations(
+        r#"
+#[derive(Serialize)]
+pub struct Validation {
+    pub introduced: Vec<Finding>,
+    pub resolved: Vec<Finding>,
+    pub span: Span,
+}
+
+#[derive(Serialize)]
+pub struct Finding {
+    pub message: String,
+    pub span: Span,
+}
+"#,
+    );
+
+    // One section, two tables — which is how every section of §3–§7 is written.
+    let document = "\
+## 7. Validation
+
+`Validation`, under the plan's `validation` key.
+
+| field | meaning |
+|---|---|
+| `introduced` | what the after spec is told and the before spec is not |
+| `resolved` | what the before spec is told and the after spec is not |
+
+Each entry is a `Finding`:
+
+| field | meaning |
+|---|---|
+| `message` | the one-line statement of what is wrong |
+| `span` | where it is reported |
+";
+
+    assert_eq!(
+        undocumented_fields(document, &declared),
+        ["Validation.span (looked for in ## 7. Validation)"],
+        "`Finding`'s row does not document `Validation`'s field of the same name"
     );
 }
 

@@ -1,0 +1,79 @@
+# The same composition, with three edge lists rewritten and nothing else edited.
+#
+# `triage` loses the first of its four outgoing edges, leaving behind the `else:`
+# one that runs to the same node and shares its address. `fix` has its two
+# guarded edges swapped, which is the one edit here that changes which edge
+# fires. `ask` gains an edge ahead of the two it had, to the node they both
+# already run to.
+version: "0.1"
+
+state:
+  summary:
+    description: What the sweep concluded.
+    type: string
+    default: ""
+
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+
+model.fast:
+  provider: provider.anthropic
+  id: some-fast-model
+
+agent.triage:
+  model: model.fast
+  prompt: Classify the finding.
+  input:
+    report: { type: string }
+  output:
+    kind: { enum: [auto, human, none] }
+
+agent.fixer:
+  model: model.fast
+  prompt: Patch exactly the defect described.
+  input:
+    report: { type: string }
+  output:
+    patch: { type: string }
+    ok: { type: boolean }
+
+agent.escalator:
+  model: model.fast
+  prompt: Write one ticket line for the finding.
+  input:
+    report: { type: string }
+  output:
+    ticket: { type: string }
+
+agent.reporter:
+  model: model.fast
+  prompt: Say in one line what was done.
+  input:
+    report: { type: string }
+  output:
+    summary: { type: string }
+
+flow.sweep:
+  description: Classify one finding and route it.
+  inputs:
+    report: { type: string }
+  outputs:
+    summary: { type: string }
+  nodes:
+    triage: { agent: agent.triage, input: { report: "input.report" } }
+    fix: { agent: agent.fixer, input: { report: "input.report" } }
+    ask: { agent: agent.escalator, input: { report: "input.report" } }
+    report: { agent: agent.reporter, input: { report: "input.report" } }
+  edges:
+    - { from: start, to: triage }
+    - { from: triage, to: fix, when: "triage.output.kind == 'auto'" }
+    - { from: triage, to: ask, when: "triage.output.kind == 'human'" }
+    - { from: triage, to: report, else: true }
+    - { from: fix, to: end, when: "!fix.output.ok" }
+    - { from: fix, to: report, when: "size(fix.output.patch) > 0" }
+    - { from: fix, to: end, else: true }
+    - { from: ask, to: end, when: "ask.output.ticket == ''" }
+    - { from: ask, to: end, when: "size(ask.output.ticket) > 0" }
+    - { from: ask, to: end, else: true }
+    - { from: report, to: end }

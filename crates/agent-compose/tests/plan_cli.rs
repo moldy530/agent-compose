@@ -16,10 +16,11 @@
 //! | `reformatted` | §1's first property: imports, ordering, and comments are not changes |
 //! | `renamed-model` | a rename is one removal, one addition, and the references that followed it |
 //! | `rerouted-flow` | §5: a node added, an edge retargeted, a guard and a cycle budget moved, a channel edited |
+//! | `resequenced-edges` | §5's edge identity and its `order`: an edge inserted, two swapped, one deleted, all between siblings sharing an address |
 //! | `retimed-policy` | §5's policy half, at all three sites that carry one |
 //! | `widened-surface` | §6: what a caller feels, and nothing else |
 //! | `redeployed` | §4's deploy-layer components, which the `local` target admits |
-//! | `reordered` | §3's order rule and §11's line under it, in both directions at once |
+//! | `reordered` | §3's order rule and §11's line under it, in both directions at once — including the two arrays of one model that fall on opposite sides of it |
 //! | `reworded-prompt` | §13: a cut may not hide the change it was run to show |
 //! | `added-flow` | §3's rule that a component which arrived brings nothing with it |
 //! | `broken-routing` | §7 in both directions, and §1's second property: an error introduced is a plan, exit `0` |
@@ -364,15 +365,18 @@ components
 /// A declaration order is reported when the composition behaves differently for
 /// it, and not otherwise.
 ///
-/// The `after` of this pair swaps **six** declarations and edits nothing else.
-/// Two of them reach the schema the model is handed — a field map's order is a
-/// JSON Schema's `properties` and `required`, a union's is its `oneOf` — and are
-/// the four lines below. The other four are the assertion this test is really
-/// making, because what pins them is the lines that are *not* here: an
-/// `optional:` set, an `expect_exit:` set, a node's `input:` bindings and a
-/// routed map's `routes:` are all selected by name or tested for membership, so
-/// `docs/plan.md` §11 leaves them out and a regression would show up as extra
-/// lines in this golden.
+/// The `after` of this pair swaps **eight** orders and edits nothing else. Three
+/// of them decide something — a field map's order is a JSON Schema's
+/// `properties` and `required`, a union's is its `oneOf`, and a model route's is
+/// the order its members are tried in — and are the six lines below. The other
+/// five are the assertion this test is really making, because what pins them is
+/// the lines that are *not* here: an `optional:` set, an `expect_exit:` set, a
+/// `route_on:` set, a node's `input:` bindings and a routed map's `routes:` are
+/// all selected by name or tested for membership, so `docs/plan.md` §11 leaves
+/// them out and a regression would show up as extra lines in this golden.
+///
+/// `model.resilient` is where both halves of the rule meet: `route:` and
+/// `route_on:` are two arrays of one definition, and one of them is reported.
 #[test]
 fn a_declaration_order_is_reported_where_the_composition_reads_it() {
     let (report, code) = report("reordered");
@@ -380,16 +384,133 @@ fn a_declaration_order_is_reported_where_the_composition_reads_it() {
         report,
         "\
 components
-  ~ agent.reviewer  reordered/after/main.yml:43:1
+  ~ agent.reviewer  reordered/after/main.yml:53:1
       output.fields[reason].order: 1 -> 0
       output.fields[verdict].order: 0 -> 1
-  ~ agent.triage  reordered/after/main.yml:53:1
+  ~ agent.triage  reordered/after/main.yml:63:1
       output.fields[findings].type.items.variants[auto_fixable].order: 0 -> 1
       output.fields[findings].type.items.variants[needs_human].order: 1 -> 0
+  ~ model.resilient  reordered/after/main.yml:38:1
+      route[0]: \"model.fast\" -> \"model.slow\"
+      route[1]: \"model.slow\" -> \"model.fast\"
 
 `reordered/after/main.yml` differs from `reordered/before/main.yml` (target `local`): \
-2 component changes
+3 component changes
 "
+    );
+    assert_eq!(code, 0);
+}
+
+/// An edge's **position** is compared, and it is compared over the edges both
+/// specs declare.
+///
+/// The three edits of this pair are each an edge list rewritten, and each one
+/// sits between edges running to the same node — so no edge here is identified
+/// by its endpoints alone (`docs/plan.md` §5, §8):
+///
+/// * `triage` lost the first of four outgoing edges, and the `else:` one that
+///   survived shares its address. The `-` names the edge that *left*, at the
+///   line it was written on, and the survivor is not reported at all;
+/// * `fix` had its two guarded edges swapped, which is the one edit here that
+///   changes which edge fires — two `order` records, one per edge that moved;
+/// * `ask` gained an edge ahead of the two it had, to the node they both already
+///   run to. One `+`, and nothing about the two it pushed down: positions are
+///   counted over the edges both sides declare, which is §3's rule for a named
+///   sequence and §5's for an edge.
+///
+/// What pins the pairing is as much what is *absent* here: fold a position into
+/// the identity an edge is matched on and every one of these three lists reads
+/// as a rewrite — the untouched siblings report guard edits, and the `-` lands
+/// on the edge that stayed.
+#[test]
+fn an_edge_that_only_shifted_is_the_edge_that_was_already_there() {
+    let (report, code) = report("resequenced-edges");
+    assert_eq!(
+        report,
+        "\
+topology
+  + flow.sweep.ask->end  resequenced-edges/after/main.yml:76:7
+  ~ flow.sweep.fix->end  resequenced-edges/after/main.yml:73:7
+      order: 1 -> 0
+  ~ flow.sweep.fix->report  resequenced-edges/after/main.yml:74:7
+      order: 0 -> 1
+  - flow.sweep.triage->report  resequenced-edges/before/main.yml:73:7
+
+`resequenced-edges/after/main.yml` differs from `resequenced-edges/before/main.yml` \
+(target `local`): 4 topology changes
+"
+    );
+    assert_eq!(code, 0);
+
+    let (document, code) = document("resequenced-edges");
+    assert_eq!(
+        document,
+        r#"{
+  "plan_version": 1,
+  "before": {
+    "entrypoint": "resequenced-edges/before/main.yml",
+    "target": "local",
+    "spec_version": "0.1"
+  },
+  "after": {
+    "entrypoint": "resequenced-edges/after/main.yml",
+    "target": "local",
+    "spec_version": "0.1"
+  },
+  "components": [],
+  "topology": [
+    {
+      "change": "added",
+      "site": "edge",
+      "address": "flow.sweep.ask->end",
+      "flow": "flow.sweep",
+      "fields": [],
+      "span": "main.yml:76:7..76:62"
+    },
+    {
+      "change": "changed",
+      "site": "edge",
+      "address": "flow.sweep.fix->end",
+      "flow": "flow.sweep",
+      "fields": [
+        {
+          "path": "order",
+          "before": 1,
+          "after": 0
+        }
+      ],
+      "span": "main.yml:73:7..73:53"
+    },
+    {
+      "change": "changed",
+      "site": "edge",
+      "address": "flow.sweep.fix->report",
+      "flow": "flow.sweep",
+      "fields": [
+        {
+          "path": "order",
+          "before": 0,
+          "after": 1
+        }
+      ],
+      "span": "main.yml:74:7..74:68"
+    },
+    {
+      "change": "removed",
+      "site": "edge",
+      "address": "flow.sweep.triage->report",
+      "flow": "flow.sweep",
+      "fields": [],
+      "span": "main.yml:73:7..73:73"
+    }
+  ],
+  "interfaces": [],
+  "validation": {
+    "introduced": [],
+    "resolved": []
+  }
+}
+"#
     );
     assert_eq!(code, 0);
 }
@@ -633,6 +754,7 @@ fn one_pair_produces_one_plan_however_often_it_is_asked() {
         "broken-routing",
         "widened-surface",
         "reordered",
+        "resequenced-edges",
     ] {
         let (first, _) = report(project);
         let (second, _) = report(project);

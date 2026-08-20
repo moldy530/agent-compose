@@ -51,12 +51,14 @@
 //! The line is drawn at what a reordering *does*, and the key an array sits
 //! under is what decides it:
 //!
-//! * three keys are sets. `optional:` (grammar 3.4) names the properties an
+//! * four keys are sets. `optional:` (grammar 3.4) names the properties an
 //!   object does not require, `expect_exit:` (6.1, 8.2) the exit statuses a
-//!   process may end with, and `expect_status:` (6.1, 8.3) the response statuses
-//!   a request may return. Each is parsed as a **distinct** membership and
-//!   membership-tested at run time, so [`normalize`] sorts all three: their
-//!   order never reaches a comparison at all;
+//!   process may end with, `expect_status:` (6.1, 8.3) the response statuses a
+//!   request may return, and `route_on:` (12.2) the infrastructure conditions a
+//!   model route fails over on. Each is parsed as a **distinct** membership and
+//!   membership-tested at run time — `routeOn.includes(condition)` is the whole
+//!   of what the emitted runtime does with the fourth — so [`normalize`] sorts
+//!   all four: their order never reaches a comparison at all;
 //! * `fields:` and `variants:` are sequences, and the ones that would otherwise
 //!   be missed. Both are matched by name — so a schema that gained a property is
 //!   one change at that property — and *both* orders reach the JSON Schema the
@@ -66,7 +68,11 @@
 //! * every other array is compared by position already, which is right for the
 //!   ones whose order is plainly the author's: a model's `route:` (failover
 //!   order), an `exec:`'s `args:` (argv order), an `enum:`'s variants (the order
-//!   they reach a structured-output schema in).
+//!   they reach a structured-output schema in). `route:` and `route_on:` are the
+//!   pair worth reading twice, because they sit in one definition and land on
+//!   opposite sides of this line: the first is the order the members are *tried*
+//!   in, the second the set of conditions that decide whether to try the next
+//!   one at all.
 //!
 //! What is left silent on purpose is a reordering that changes the *layout* of
 //! the emitted project and nothing it does: a node `input:` binding map, a
@@ -103,7 +109,7 @@ pub(super) const ORDER: &str = "order";
 
 /// The keys whose arrays are **sets**, canonicalized by [`normalize`] so that
 /// their order never reaches a comparison. See the module docs.
-const SETS: &[&str] = &["expect_exit", "expect_status", "optional"];
+const SETS: &[&str] = &["expect_exit", "expect_status", "optional", "route_on"];
 
 /// The keys whose **named** arrays are sequences: matched by name, and reporting
 /// a move through [`ORDER`]. See the module docs.
@@ -171,15 +177,15 @@ fn held(key: &str, value: Value) -> Value {
 
 /// Whether every element is a scalar of one kind — all strings, or all numbers.
 ///
-/// The three set keys hold exactly that: `optional:` a list of identifiers,
-/// `expect_exit:` and `expect_status:` a list of integers. Requiring it keeps
-/// the canonicalization off the surfaces where an author chooses the keys — a
-/// model's `settings:`, a schema's `default:`, a deploy backend's plugin config
-/// — where an array of objects written under a key spelled `optional` is data
-/// rather than one of the grammar's sets. The residual, an author's own flat
-/// array of scalars under one of the three names, is sorted like the set it is
-/// spelled as: the same class of residual the `span` rule above leaves, and the
-/// same reason it is tolerable.
+/// The four set keys hold exactly that: `optional:` a list of identifiers and
+/// `route_on:` a list of keywords, `expect_exit:` and `expect_status:` a list of
+/// integers. Requiring it keeps the canonicalization off the surfaces where an
+/// author chooses the keys — a model's `settings:`, a schema's `default:`, a
+/// deploy backend's plugin config — where an array of objects written under a
+/// key spelled `optional` is data rather than one of the grammar's sets. The
+/// residual, an author's own flat array of scalars under one of the four names,
+/// is sorted like the set it is spelled as: the same class of residual the
+/// `span` rule above leaves, and the same reason it is tolerable.
 fn scalars(items: &[Value]) -> bool {
     items.iter().all(Value::is_string) || items.iter().all(Value::is_number)
 }
@@ -241,7 +247,7 @@ pub(super) fn only(value: Value, keys: &[&str]) -> Value {
 ///   length**, so the ones whose order *is* semantic — a model's `route:`
 ///   (failover order), an `exec:`'s `args:` (argv order), an `enum:`'s variants
 ///   (the order they reach a structured-output schema in) — report a move. The
-///   three arrays that are sets rather than sequences never reach this arm in
+///   four arrays that are sets rather than sequences never reach this arm in
 ///   two orders, because [`normalize`] has already sorted them;
 /// * when the lengths differ and nothing names itself, the array is one change:
 ///   an element inserted in the middle shifts every index after it, and
@@ -379,7 +385,11 @@ fn counted<'a>(items: &'a [Value], id: &str, common: &BTreeSet<&str>) -> BTreeMa
 }
 
 /// The same entry carrying its position, so that a move is one field of it.
-fn placed(item: &Value, at: u64) -> Value {
+///
+/// One definition of what [`ORDER`] does to a value, shared with
+/// [`sections::edges`](super::sections), which places an edge among the outgoing
+/// edges of its source node.
+pub(super) fn placed(item: &Value, at: u64) -> Value {
     let mut held = item.clone();
     if let Value::Object(map) = &mut held {
         map.insert(ORDER.to_string(), Value::from(at));
@@ -577,11 +587,11 @@ mod tests {
         );
     }
 
-    /// The three set-valued keys are canonicalized, so a reordering of one is
+    /// The four set-valued keys are canonicalized, so a reordering of one is
     /// not a change — and a membership edit still is.
     #[test]
     fn a_set_is_compared_by_membership_rather_than_by_position() {
-        for key in ["optional", "expect_exit", "expect_status"] {
+        for key in ["optional", "expect_exit", "expect_status", "route_on"] {
             let one = semantic(&serde_json::json!({ key: ["b", "a"] }));
             let two = semantic(&serde_json::json!({ key: ["a", "b"] }));
             assert_eq!(changes(&one, &two), [], "{key}");

@@ -40,7 +40,7 @@ use crate::ir::flow::Flow;
 use crate::ir::{Definition, Ir};
 
 use super::Composition;
-use super::diff::{ORDER, changes, only, semantic, without};
+use super::diff::{changes, only, placed, semantic, without};
 use super::document::{
     ChangeKind, ComponentChange, ComponentKind, Finding, InterfaceChange, InterfaceKind,
     TopologyChange, TopologyKind, Validation,
@@ -443,9 +443,9 @@ fn graph(found: &mut Vec<TopologyChange>, address: &str, before: &Flow, after: &
 /// of those. So the match runs in three passes over what is still unpaired,
 /// each pass a different answer to "is this the same edge":
 ///
-/// 1. **identical** — every field agrees. Nothing to report, and matching these
-///    first keeps a duplicated `from`/`to` pair from stealing its twin's
-///    partner;
+/// 1. **identical** — every field of the artifact agrees. Nothing to report,
+///    and matching these first keeps a duplicated `from`/`to` pair from stealing
+///    its twin's partner;
 /// 2. **same `from` and `to`** — the guard, the `else:`, or the iteration
 ///    budget moved. That is a changed edge, not a removed one beside an added
 ///    one;
@@ -455,17 +455,37 @@ fn graph(found: &mut Vec<TopologyChange>, address: &str, before: &Flow, after: &
 /// Whatever is left is an edge that really arrived or really left. Each pass is
 /// an index rather than a scan, so a flow with thousands of edges costs the
 /// sort rather than the square (`tests/plan_scale.rs`).
+///
+/// **The position is not one of the fields the passes match on**, and the order
+/// of the three steps here is what says so: an edge is paired first, and only
+/// then given the [`ORDER`](super::diff::ORDER) it carries into the comparison
+/// ([`ordered`]). An edge that sits one place further down because something was
+/// inserted above it is the same edge, so folding its position into pass 1 would
+/// defeat the pass — the untouched edge would fail to match its twin, the
+/// genuinely new edge would be paired with it by `from`/`to` instead, and the
+/// plan would report an arrival as a guard edit on an edge nobody touched.
 fn edges(found: &mut Vec<TopologyChange>, flow: &str, before: &Flow, after: &Flow) {
-    let old = ordered(before);
-    let new = ordered(after);
+    let old: Vec<Value> = before.edges.iter().map(semantic).collect();
+    let new: Vec<Value> = after.edges.iter().map(semantic).collect();
     let paired = pair(&old, &new);
+
+    let mut kept = vec![false; old.len()];
+    for at in paired.iter().flatten() {
+        kept[*at] = true;
+    }
+    let arrived: Vec<bool> = paired.iter().map(Option::is_some).collect();
+    let old_order = ordered(&old, &kept);
+    let new_order = ordered(&new, &arrived);
 
     let mut held: Vec<TopologyChange> = Vec::new();
     for (at, edge) in after.edges.iter().enumerate() {
         let address = edge_address(flow, &new[at]);
         match paired[at] {
             Some(from) => {
-                let fields = changes(&old[from], &new[at]);
+                let fields = changes(
+                    &placed(&old[from], old_order[from]),
+                    &placed(&new[at], new_order[at]),
+                );
                 if !fields.is_empty() {
                     held.push(TopologyChange {
                         change: ChangeKind::Changed,
@@ -506,8 +526,8 @@ fn edges(found: &mut Vec<TopologyChange>, flow: &str, before: &Flow, after: &Flo
     found.append(&mut held);
 }
 
-/// One flow's edges as JSON, each carrying the one thing the artifact records
-/// as a position rather than as a key: `order`.
+/// Each edge's position among the outgoing edges of its own source node: the one
+/// thing the artifact records as a position rather than as a key.
 ///
 /// Grammar 7.3 evaluates **a node's outgoing edges in declaration order**, and
 /// takes the first whose guard passes — so swapping two guarded edges from one
@@ -515,27 +535,33 @@ fn edges(found: &mut Vec<TopologyChange>, flow: &str, before: &Flow, after: &Flo
 /// untouched. The IR carries that as the position of the edge in `edges:`, which
 /// a diff matching edges by identity would never see.
 ///
-/// [`ORDER`] is the plan's own key for it — the same one a named array's entries
-/// carry when their order is the composition's (`diff`) — and it counts **per
-/// source node** rather than over the whole list, because that is what the rule
-/// is stated over: an edge inserted between two edges of a different node
-/// changes nobody's precedence, and reporting it as though it had would make
-/// every insertion look like a routing change.
-fn ordered(flow: &Flow) -> Vec<Value> {
-    let mut counted: BTreeMap<String, u64> = BTreeMap::new();
-    flow.edges
-        .iter()
-        .map(|edge| {
-            let mut value = semantic(edge);
-            let from = text(&value, "from").to_string();
-            let at = counted.entry(from).or_insert(0);
-            if let Value::Object(map) = &mut value {
-                map.insert(ORDER.to_string(), Value::from(*at));
-            }
-            *at += 1;
-            value
-        })
-        .collect()
+/// [`ORDER`](super::diff::ORDER) is the plan's own key for it — the same one a
+/// named array's entries carry when their order is the composition's (`diff`) —
+/// and two rules narrow what it counts, each keeping out of the report a
+/// position no composition reads differently:
+///
+/// * **per source node** rather than over the whole list, because that is what
+///   grammar 7.3 is stated over: an edge inserted between two edges of a
+///   *different* node changes nobody's precedence, and reporting it as though it
+///   had would make every insertion look like a routing change;
+/// * **over the edges both specs declare** — `paired` is what says which, one
+///   flag per edge of this side — for `diff::places`'s reason, and it is the
+///   same rule: an edge inserted ahead of others is one addition rather than a
+///   move of everything below it. A genuine precedence swap still reports,
+///   because a swap moves an edge past another edge that is *also* on both
+///   sides.
+fn ordered(edges: &[Value], paired: &[bool]) -> Vec<u64> {
+    let mut counted: BTreeMap<&str, u64> = BTreeMap::new();
+    let mut found = vec![0; edges.len()];
+    for (at, edge) in edges.iter().enumerate() {
+        if !paired[at] {
+            continue;
+        }
+        let seat = counted.entry(text(edge, "from")).or_insert(0);
+        found[at] = *seat;
+        *seat += 1;
+    }
+    found
 }
 
 /// `<flow>.<from>-><to>`, which is what a reader looks an edge up by.
@@ -593,6 +619,10 @@ fn pair(before: &[Value], after: &[Value]) -> Vec<Option<usize>> {
 }
 
 /// The three keys one edge is matched on, one per pass of [`pair`].
+///
+/// The first is the whole edge as the **artifact** holds it. Its position is not
+/// part of that and must not become part of it: [`ordered`] is applied after this
+/// pairing rather than before it, for the reason [`edges`] gives.
 fn keys(edge: &Value) -> [String; 3] {
     let from = part(edge, "from");
     let to = part(edge, "to");
