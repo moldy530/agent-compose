@@ -29,7 +29,7 @@ expression: document(&run)
           "servedBy": "model.smart",
           "toolCalls": [
             {
-              "instance": "<execution-id>/ask/0/condense/1",
+              "instance": "<execution-id>/ask/0/condense/0",
               "name": "condense",
               "outcome": "completed",
               "result": {
@@ -71,8 +71,8 @@ expression: document(&run)
       "toolDispatches": [
         {
           "attempts": 1,
-          "idempotencyKey": "<execution-id>/ask/0/condense/1",
-          "index": 1,
+          "idempotencyKey": "<execution-id>/ask/0/condense/0",
+          "index": 0,
           "inner": [
             {
               "attempts": 1,
@@ -97,7 +97,7 @@ expression: document(&run)
                 {
                   "deduped": false,
                   "effect": "write",
-                  "idempotencyKey": "<execution-id>/ask/0/condense/1/note/0",
+                  "idempotencyKey": "<execution-id>/ask/0/condense/0/note/0",
                   "key": "last",
                   "op": "set",
                   "scope": "execution",

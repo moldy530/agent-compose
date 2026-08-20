@@ -939,9 +939,10 @@ A call that is **refused** — its arguments, above, or a name this agent does n
 offer — is handed back as an error tool result and costs the loop one of its
 `max_tool_iterations` (D51, §5), because the correction is another model call.
 A model that never corrects therefore spends the bound and fails the node exactly
-as one that never answered does. A refused call still spends its **call ordinal**
-(§9.4): the model made the call, so the frame counts it, and an instance path is
-not moved by a refusal being inserted before it.
+as one that never answered does. A refused call spends **no call ordinal**
+(§9.4): that ordinal counts invocations and a refusal invokes nothing, so the
+next call takes the frame the refused one was offered and an instance path is not
+moved by a refusal being inserted before it.
 
 `docs/trace.md` §5 and §7.3 are where the call, the instance and the link between
 them are recorded — a refused call under `outcome: "refused"`, carrying the very
@@ -2821,14 +2822,24 @@ identifier (§2.1) and the ordinal is decimal, so no component can contain the
 separator, and a tool frame can collide with no node frame — the frame beneath an
 `agent:` node's is a tool call's or there is none, because an agent has no nodes.
 
+**Invoked**, not called, and the difference is one call wide: §5.4 hands a call
+whose arguments the flow's `inputs:` refuses back to the model rather than
+running it
+([D119](#d119-a-refused-tool-call-returns-to-the-model-and-a-failed-one-ends-the-node)),
+and it never reached the flow, so it counts for nothing and the next call takes
+the ordinal it was offered. A loop that called wrongly and then corrected
+derives exactly the keys a loop that called correctly the first time derives, and
+that holds across a re-run too: an attempt whose model needed no correction
+re-derives the keys of an attempt whose model did.
+
 Two consequences, and the second is a compromise stated openly rather than left
 to be discovered:
 
 - **distinct calls in one tool loop get distinct instance paths.** Two calls to
   one flow-tool are two instances with two sets of effects, and a bare node frame
   would give them one key — the collision this section exists to prevent;
-- **a re-run of the tool loop restarts the ordinals**, so the Nth call of the
-  second run reuses the Nth key of the first. That reuse is **positional, not
+- **a re-run of the tool loop restarts the ordinals**, so the Nth invocation of
+  the second run reuses the Nth key of the first. That reuse is **positional, not
   semantic**: the emitter is a nondeterministic model, and what it asks for the
   Nth time on a second run need not be the work it asked for the Nth time on
   the first. It is accepted because the alternatives are worse — a provider's
@@ -6068,10 +6079,13 @@ Three consequences are stated where a reader meets them rather than derived:
   that leaves a `tool_use` id or a `tool_call_id` unanswered, so a refusal does
   not stop the loop over the calls of one answer — the calls after it still run.
   A failure still does stop it, because the node is ending;
-- **a refused call spends its call ordinal** (§9.4). The model made the call, and
-  a frame counted from the calls that *succeeded* would move every instance path
-  behind a refusal — turning a model's mistake into a change of idempotency key
-  for work that has nothing to do with it;
+- **a refused call spends no call ordinal** (§9.4). That ordinal counts how many
+  times a flow-tool has been *invoked*, and a refused call reaches no flow: it is
+  the next call that takes the frame the refused one was offered. A frame counted
+  from the calls a model *made* would move every instance path behind a refusal —
+  turning a mistake into a changed idempotency key for work that has nothing to
+  do with it, and, under a node `retry:`, re-firing every child flow's effects on
+  an attempt whose model simply got it right sooner;
 - **the refusal names what a diagnostic would name** — the tool, the failing
   field, the constraint, and an excerpt of the offending value (PRD G3). It is
   one sentence written for two readers: the model, which has to act on it, and

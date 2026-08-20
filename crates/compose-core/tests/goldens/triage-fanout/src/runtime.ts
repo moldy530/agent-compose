@@ -276,13 +276,18 @@ export class ResultMismatch extends Error {
  *    tool, and fails the agent node the way it always has, with grammar §9's
  *    chain deciding the run. Rephrasing the call would not fix any of those.
  *
- * The `message` is therefore two things at once and is written for both: the
- * text a reader sees on [`ToolCallRecord.error`], and the text the *model* is
- * handed. So it names what the compiler's own diagnostics would name — the tool,
- * the field, the constraint it failed, and an excerpt of the offending value
- * (PRD G3). The excerpt is the model's own arguments coming back to it, which is
- * why quoting them here costs nothing this format was protecting
- * (`docs/trace.md` §11).
+ * The `message` is therefore written for two readers at once: the *model*, which
+ * is handed it verbatim as the error tool result, and the person reading
+ * [`ToolCallRecord.error`], which carries it through [`describe`] — so the
+ * record reads `ToolCallRefused: <message>`, `docs/trace.md` §3's shape for
+ * every error this format spells, and the model's copy is the bare sentence
+ * with no class in front of it. One sentence, two spellings of the same
+ * envelope.
+ *
+ * It names what the compiler's own diagnostics would name — the tool, the field,
+ * the constraint it failed, and an excerpt of the offending value (PRD G3). The
+ * excerpt is the model's own arguments coming back to it, which is why quoting
+ * them here costs nothing this format was protecting (`docs/trace.md` §11).
  */
 export class ToolCallRefused extends Error {
   constructor(message: string) {
@@ -2102,12 +2107,19 @@ export interface ToolCallSite {
   /** The calling agent execution's own frames ([`AgentSite.path`]). */
   readonly path: readonly string[];
   /**
-   * How many times **this tool** has already been called in this agent
+   * How many times **this tool** has already been *invoked* in this agent
    * execution, `0` on the first — grammar 9.4's flow-tool ordinal (PRD §9.19).
    *
+   * Invoked, not called, and the word is grammar 9.4's own: a call the tool's
+   * contract **refused** (Decision D119) never reached the tool, so it claims no
+   * ordinal and the next call takes the frame the refused one was offered. That
+   * is what keeps a model's mistake from re-keying work that has nothing to do
+   * with it — a loop that refused once and then got it right derives the same
+   * key as one that got it right first time.
+   *
    * It counts within one agent-node *execution*, so a node-level `retry:`
-   * restarts it: the Nth call of a retried attempt reuses the Nth key of the
-   * failed one, which is the positional — not semantic — reuse the grammar
+   * restarts it: the Nth invocation of a retried attempt reuses the Nth key of
+   * the failed one, which is the positional — not semantic — reuse the grammar
    * states openly.
    */
   readonly ordinal: number;
@@ -2326,9 +2338,9 @@ export async function callAgent(
   // order before it answers — [`merged`] then reconciles the two by identity,
   // exactly as it does for `models` above.
   const dispatches: DispatchRecord[] = [];
-  // How many times each tool has been called, which is the ordinal grammar 9.4
-  // gives a flow-tool's frame (PRD §9.19). It starts empty **per call of this
-  // function**, and that is the whole of "an agent-node retry restarts the
+  // How many times each tool has been **invoked**, which is the ordinal grammar
+  // 9.4 gives a flow-tool's frame (PRD §9.19). It starts empty **per call of
+  // this function**, and that is the whole of "an agent-node retry restarts the
   // ordinals": a retry is a second call of the node's activity.
   const ordinals = new Map<string, number>();
 
@@ -2425,6 +2437,12 @@ export async function callAgent(
           );
           continue;
         }
+        // Claimed here and **handed back** where the contract refuses the call:
+        // grammar §9.4's ordinal counts how many times this tool has already
+        // been *invoked*, and a refusal never reaches the tool. Claiming it up
+        // front is what lets the site — and so the key the invocation derives —
+        // be built before `invoke` is entered, which is the only moment it could
+        // be built at.
         const ordinal = ordinals.get(call.name) ?? 0;
         ordinals.set(call.name, ordinal + 1);
         const site: ToolCallSite = {
@@ -2462,6 +2480,14 @@ export async function callAgent(
           // call really filed, so a refusal reports no instance because it
           // started none rather than because this branch assumed so.
           if (error instanceof ToolCallRefused) {
+            // The ordinal goes back, because nothing was invoked under it
+            // (grammar §9.4, Decision D119). The next call of this tool takes
+            // the frame this one was offered, so a loop that got it wrong and
+            // then got it right derives the very key a loop that got it right
+            // first time derives — and a node `retry:` whose second attempt
+            // needs no correction re-derives its first attempt's keys instead
+            // of firing every child flow's effects again.
+            ordinals.set(call.name, ordinal);
             refuse(call, error, tool.address, started());
             continue;
           }

@@ -609,8 +609,8 @@ fn a_flow_tool_runs_trace_document_keeps_its_shape() {
 /// the absence §7.3 makes a record in its own right. The other is what follows
 /// it: a record after a refusal *exists*, which is the whole of how version `4`'s
 /// third member differs from `"failed"`, and the instance the corrected call ran
-/// is keyed `condense/1` because a refused call spends its ordinal (grammar §9.4,
-/// D119).
+/// is keyed `condense/0` because a refused call spends **no** ordinal — grammar
+/// §9.4 counts a flow-tool's invocations, and this one reached no flow (D119).
 ///
 /// A snapshot rather than an assertion because the claim is about the document's
 /// shape: a release that started writing `result: null` on a refusal, or that

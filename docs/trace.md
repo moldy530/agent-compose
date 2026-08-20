@@ -442,7 +442,7 @@ key's absence (§3).
 
 | field | type | presence | meaning |
 |---|---|---|---|
-| `index` | integer | always | What identifies this dispatch within the array that holds it, and orders the array. On `dispatches` it is the **source-item index**, which is also what orders every write the item made (PRD 5.6, grammar §7.6.4 clause 2). On `toolDispatches` it is the **call ordinal** grammar §9.4 gives the call — how many times that tool had already been called in this agent execution — so two records under one key can repeat an index where a `map` dispatched the agents that made them, and `idempotencyKey` is what tells those apart. |
+| `index` | integer | always | What identifies this dispatch within the array that holds it, and orders the array. On `dispatches` it is the **source-item index**, which is also what orders every write the item made (PRD 5.6, grammar §7.6.4 clause 2). On `toolDispatches` it is the **call ordinal** grammar §9.4 gives the call — how many times that tool had already been *invoked* in this agent execution, which is a count of the calls that got past the tool's contract rather than of the calls the model made (grammar D119) — so two records under one key can repeat an index where a `map` dispatched the agents that made them, and `idempotencyKey` is what tells those apart. |
 | `route` | string | routed maps | The **route** the item was dispatched through: its variant tag, or `"$default"` for the `default:` catch-all (grammar §8.6 rule 4, Decision D30). Absent on the homogeneous form, which has one target and no tags, and on every `toolDispatches` record, which no `map` routed. |
 | `variant` | string | routed maps | The **discriminator value the item carried** — the value at the map's `route_by:` field. On a named route it repeats `route`; on the catch-all it is the only record of which variant fell through, since `route` names the catch-all rather than the variant. It is always one of the union's declared variant tags, and that is also what makes the key present on **every** record a routed map files: the item was parsed against its producer's declared schema before any of this ran (PRD 5.2), so its discriminator is one of those tags. An item whose discriminator is not a string — which no artifact `build` accepted can produce — is left unrecorded rather than rendered, since a number written as a string would be a `variant` that is not a declared tag. Absent on every `toolDispatches` record, for `route`'s reason. |
 | `target` | string | always | The component the dispatch went to, as a typed address — the item's target on `dispatches`, and the `flow.*` the model called on `toolDispatches`. |
@@ -690,7 +690,7 @@ cost of one indirection for the part that is a run of its own.
 | `name` | string | always | The tool the model called, spelled as the request offered it — a `tool.*`'s local name, a `flow.*`'s (grammar §5.4), or a synthesized store tool's (grammar §11.5). |
 | `target` | string | when the agent offers a tool of that name | The component behind the name, as a typed address (grammar §2.2). Absent on the one call that has none: a name the agent does not offer, which is a model answering with a tool that was never on the wire. That call is recorded `"refused"` and handed back to the model with the names it does have (grammar D119). |
 | `outcome` | `"completed"` \| `"refused"` \| `"failed"` | always | What the loop did with the call. `"completed"` handed the model the tool's result. `"refused"` handed it the **refusal** instead: the tool's declared contract did not admit the call — arguments its schema refuses, on any of the three surfaces, or a name the agent never offered — and grammar D119 makes that a call the model is asked to make again, so the node did not end and records after it exist. `"failed"` is the tool's *execution* failing, which ended the node: the failure left the tool, the node's own `on_error:` decided the run (grammar §9.2), and the model saw nothing back. §5.1 names the one failure no `on_error:` decided: a `human` node inside the flow the call ran, on a run that could not answer it. |
-| `instance` | string | flow-as-tool calls that started an instance | The **link**: the subflow instance this call ran, named exactly as the dispatch record carrying that instance's trace names itself in `idempotencyKey`, so the join between the two is string equality (§5, §8). Absent on every call that instantiated nothing — a `tool.*`, a store tool — and on a `"refused"` flow-as-tool call, which is arguments that failed the flow's own `inputs:` before an instance existed. A refused call still **spends** its call ordinal (grammar §9.4), so the instance path of the call that follows it is the one it would have had anyway. |
+| `instance` | string | flow-as-tool calls that started an instance | The **link**: the subflow instance this call ran, named exactly as the dispatch record carrying that instance's trace names itself in `idempotencyKey`, so the join between the two is string equality (§5, §8). Absent on every call that instantiated nothing — a `tool.*`, a store tool — and on a `"refused"` flow-as-tool call, which is arguments that failed the flow's own `inputs:` before an instance existed. A refused call spends **no** call ordinal (grammar §9.4, D119) — that ordinal counts invocations and this call reached no flow — so the instance path of the call that follows it is the one it would have had with no refusal ahead of it. |
 | `result` | any | `"completed"` flow-as-tool calls, with `instance` | **The result the model saw**: the value the loop handed back, which for this tool is the instance's declared `outputs:` (grammar §5.4). PRD §9.20 asks the tool-call entry to record it, and it is the one tool result this format carries — §11 is where the rule it is carved out of is stated, and where the other two tool surfaces are left under it. Its calls are a **subset** of `instance`'s, not the same set: `instance` says an instance ran, `result` says the loop handed that instance's outputs back, so a call carrying `result` carries `instance` and not the other way round. Absent on a `"failed"` call and on a `"refused"` one, where the absence is the record — the first left the tool and the second never entered it, and in neither did the model see a result. A flow-as-tool call whose instance failed is exactly that call with an `instance` and no `result`. |
 | `error` | string | `"failed"`, `"refused"` | What went wrong, in §3's `<error name>: <message>` shape. On a `"refused"` call it is also the text the **model** was handed back, so it names the tool, the field and the constraint the way a compiler diagnostic would (PRD G3) and may quote an excerpt of the arguments — see §11. |
 
@@ -776,18 +776,18 @@ already been applied, rather than some other write colliding.
 
 The second property is **positional** across a flow-tool frame, and grammar §9.4
 says so openly: an agent-node `retry:` restarts the call ordinals, so the Nth
-call of a retried attempt derives the Nth key of the failed one — while what a
-nondeterministic model asks for the Nth time is not guaranteed to be the same
-work. That is the at-least-once compromise the grammar accepts; nothing in this
-format hides it, and the two attempts' records are both on the entry, in the
+*invocation* of a retried attempt derives the Nth key of the failed one — while
+what a nondeterministic model asks for the Nth time is not guaranteed to be the
+same work. That is the at-least-once compromise the grammar accepts; nothing in
+this format hides it, and the two attempts' records are both on the entry, in the
 order they were made.
 
 **Two policies re-run a tool loop, and both reuse its keys.** A node's own
 `retry:` is the one above. The other is a `map`'s
 `on_item_error: { retry: … }` (grammar §8.6 rule 10), which re-executes a
 dispatched `agent.*` from its entry at the same source index — so the item's
-frames are unchanged, the loop starts counting from zero again, and the Nth call
-of the second attempt derives the first attempt's Nth key exactly as a node
+frames are unchanged, the loop starts counting from zero again, and the Nth
+invocation of the second attempt derives the first attempt's Nth key as a node
 retry does. A reader meets it as repeated keys under one `toolDispatches` array,
 `DispatchRecord.attempts` on the *item's* record being where the retry itself is
 recorded (§5).
@@ -1046,11 +1046,13 @@ PRD §9.22). That is a change to the *runtime*, but it reaches a reader of versi
   one call with no `target` — a name the agent does not offer — is still the one
   call with no `target`, and what happens to it is no longer "ends the node".
   The *presence* rule is unchanged;
-* **an instance path is derived from the same count as before.** A refused
-  flow-as-tool call spends its call ordinal, so grammar §9.4's frame still counts
-  the calls a model made — §10.3's "changing the derivation of an idempotency
-  key" is not engaged, and every path a version `3` composition produced is the
-  path it produces now for the calls it made.
+* **an instance path is derived from the same count as before.** Grammar §9.4's
+  frame counts a flow-tool's *invocations*, as it always did, and a refused call
+  invokes nothing — so it spends no ordinal and §10.3's "changing the derivation
+  of an idempotency key" is not engaged. Every path a version `3` composition
+  produced is the path it produces now, which is the strong form of the claim
+  rather than a compatible reading of a weak one: under `3` a refusal ended the
+  node, so no version-`3` run ever had a call standing behind one.
 
 Nothing was removed or renamed, no field was added, and no order changed.
 

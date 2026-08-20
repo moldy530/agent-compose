@@ -189,9 +189,17 @@ const CODEGEN: &[Criterion] = &[
             ),
             // One answer, two calls, the first refused: the loop answers both,
             // because a request leaving either unanswered is one both surfaces
-            // refuse (D119, `WIRE-NOTES` (18)).
+            // refuse (D119, `WIRE-NOTES` (18)). The second of the pair is the
+            // mixed answer on Chat Completions, the one place the two wires give
+            // the model different shapes for one answer — a `tool` message for
+            // the call the request may name and a `user` turn for the one it may
+            // not, which is an ordering only a mixed answer can observe.
             (
                 "a_refused_call_does_not_stop_the_calls_beside_it_in_one_answer",
+                Status::Live,
+            ),
+            (
+                "an_answer_mixing_an_unoffered_call_with_an_offered_one_is_answered_on_both_shapes",
                 Status::Live,
             ),
             // What an agent node leaves behind for the next one: the implicit
@@ -483,17 +491,22 @@ const CODEGEN: &[Criterion] = &[
                 "a_call_to_a_tool_the_agent_does_not_offer_is_corrected_on_the_chat_completions_wire",
                 Status::Live,
             ),
-            // …and four more over the *frame* a call derives (grammar 9.4, PRD
+            // …and five more over the *frame* a call derives (grammar 9.4, PRD
             // resolved q19), which is the half of this call site that no other
-            // construct has: the ordinal counts calls rather than answers, a
-            // node `retry:` restarts it, a `map` puts an item frame above it,
-            // and a raced deadline leaves a call with no record at all.
+            // construct has: the ordinal counts invocations rather than answers,
+            // a node `retry:` restarts it, a refusal spends none of it even
+            // across a retry, a `map` puts an item frame above it, and a raced
+            // deadline leaves a call with no record at all.
             (
                 "two_flow_tool_calls_in_one_model_answer_get_distinct_ordinals",
                 Status::Live,
             ),
             (
                 "an_agent_node_retry_restarts_the_flow_tool_call_ordinals",
+                Status::Live,
+            ),
+            (
+                "a_refusal_does_not_move_the_key_a_retried_attempt_re_derives",
                 Status::Live,
             ),
             (
