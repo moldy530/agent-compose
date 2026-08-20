@@ -852,7 +852,7 @@ agent.reviewer:
 | `tools` | array of `tool.*` / `flow.*` | no | `[]` | PRD 5.5, 5.1 |
 | `stores` | array of `store.*` | no | `[]` | PRD 5.8 |
 | `description` | string | no | — | documentation only; not LLM-facing (agents are not tools) |
-| `max_tool_iterations` | integer 1..50 | no | `8` | bounds the intra-agent tool loop (D51) |
+| `max_tool_iterations` | integer 1..50 | no | `8` | bounds the intra-agent tool loop — *turns* of it, so a refused call spends one exactly as a call that ran does (D51, D119) |
 
 Additional keys are a compile error.
 
@@ -945,8 +945,11 @@ next call takes the frame the refused one was offered and an instance path is no
 moved by a refusal being inserted before it.
 
 `docs/trace.md` §5 and §7.3 are where the call, the instance and the link between
-them are recorded — a refused call under `outcome: "refused"`, carrying the very
-text the model was handed.
+them are recorded — a refused call under `outcome: "refused"`, whose `error`
+carries the sentence the model was handed as the `<message>` half of that
+format's `<error name>: <message>` shape. The model's copy is that sentence with
+no class in front of it; the record's is the same sentence under the envelope
+every error in a trace wears.
 
 ---
 
@@ -4360,9 +4363,15 @@ event-source configs) are exactly the objects whose schemas live in plugins.
 
 **Rationale**: PRD 5.4 bounds graph cycles statically; the intra-agent tool loop
 is the one remaining unbounded loop in a compiled graph, and a declarative bound
-keeps termination reasoning complete. **Status**: ratified — PRD §9.14 accepts
+keeps termination reasoning complete. What it bounds is **turns of the loop**,
+not calls that reached a tool: since
+[D119](#d119-a-refused-tool-call-returns-to-the-model-and-a-failed-one-ends-the-node)
+a call the tool's contract refuses goes back to the model, the correction is
+another model call, and so a mis-typed argument spends one of these iterations
+exactly as a call that ran does — which is *why* no second counter was needed to
+keep a bouncing loop terminating (§5.4). **Status**: ratified — PRD §9.14 accepts
 the bound and its default of 8; the 5.5 node taxonomy now names it. *PRD 5.4,
-5.5, §9.14.*
+5.5, §9.14, §9.22.*
 
 ### D52. `human` node shape
 
@@ -6089,9 +6098,12 @@ Three consequences are stated where a reader meets them rather than derived:
 - **the refusal names what a diagnostic would name** — the tool, the failing
   field, the constraint, and an excerpt of the offending value (PRD G3). It is
   one sentence written for two readers: the model, which has to act on it, and
-  the person reading `ToolCallRecord.error`, which carries it verbatim. Quoting
-  the arguments back costs nothing `docs/trace.md` §11 was protecting, because
-  the party being shown them is the party that composed them. The tool is named
+  the person reading `ToolCallRecord.error`, which carries it verbatim as the
+  `<message>` half of `docs/trace.md` §3's `<error name>: <message>` — so the two
+  strings differ by the `ToolCallRefused: ` that format prefixes and by nothing
+  else. Quoting the arguments back costs nothing `docs/trace.md` §11 was
+  protecting, because the party being shown them is the party that composed
+  them. The tool is named
   the way the **model** was offered it — a `tool.*`'s local name, not its address
   (§5.4, §6) — because a refusal is an instruction to call again and an
   identifier the model cannot call is not one. A mismatch on the *other* usage

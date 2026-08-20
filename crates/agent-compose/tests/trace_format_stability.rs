@@ -604,8 +604,11 @@ fn a_flow_tool_runs_trace_document_keeps_its_shape() {
 /// §10.3.3).
 ///
 /// Two shapes are pinned here that no other snapshot in this file can hold. The
-/// refused record is one of them — an `outcome: "refused"` carrying the very text
-/// the model was handed, with neither `instance` nor `result` beside it, which is
+/// refused record is one of them — an `outcome: "refused"` whose `error` carries
+/// the sentence the model was handed under §3's `<error name>:` envelope
+/// (`ToolCallRefused: …`, which the model's own copy does not carry — the two are
+/// pinned against each other in `compiled_graph_acceptance`), with neither
+/// `instance` nor `result` beside it, which is
 /// the absence §7.3 makes a record in its own right. The other is what follows
 /// it: a record after a refusal *exists*, which is the whole of how version `4`'s
 /// third member differs from `"failed"`, and the instance the corrected call ran

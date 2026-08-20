@@ -920,9 +920,16 @@ fn agents(
                 // local one the wire offered — a refusal naming `{tool_address}`
                 // would name an identifier the model cannot call. The tool then
                 // parses what it is given a second time, which is what keeps its
-                // own signature checked for every caller (grammar 6.1, 8.4); the
-                // value it re-parses has already satisfied the schema, and
-                // nothing `codegen::schema` emits coerces or strips.
+                // own signature checked for every caller (grammar 6.1, 8.4). The
+                // value it re-parses has already satisfied the schema and the
+                // second parse cannot move it: nothing `codegen::schema` emits
+                // coerces or strips — every object is `.strict()`, no `format:`
+                // normalizes, no field transforms — and its one exception,
+                // `.default(…)`, has already fired, so the property it fills is
+                // present and it does not fire again (see that module's doc,
+                // which states the premise and the exception together). A
+                // coercing or non-idempotent form emitted there would make this
+                // second parse observable, and would have to be answered here.
                 let input_schema = names.value(&format!("{tool_address}.input"));
                 imported.push(input_schema.to_string());
                 text.push_str(&format!(

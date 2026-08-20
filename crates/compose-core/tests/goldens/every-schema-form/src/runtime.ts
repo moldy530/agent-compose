@@ -1233,8 +1233,11 @@ export interface ToolCallRecord {
   readonly result?: unknown;
   /**
    * What went wrong, in `docs/trace.md` §3's `<error name>: <message>` shape —
-   * on a `"failed"` call and on a `"refused"` one, where it is the very text the
-   * model was handed back (Decision D119).
+   * on a `"failed"` call and on a `"refused"` one, where the `<message>` half is
+   * byte for byte the sentence the model was handed back and the `<error name>`
+   * half is `ToolCallRefused`, the envelope this format adds and the model's
+   * copy does not carry. The two differ by that prefix and by nothing else
+   * (Decision D119, [`ToolCallRefused`]).
    */
   readonly error?: string;
 }

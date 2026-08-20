@@ -692,7 +692,7 @@ cost of one indirection for the part that is a run of its own.
 | `outcome` | `"completed"` \| `"refused"` \| `"failed"` | always | What the loop did with the call. `"completed"` handed the model the tool's result. `"refused"` handed it the **refusal** instead: the tool's declared contract did not admit the call — arguments its schema refuses, on any of the three surfaces, or a name the agent never offered — and grammar D119 makes that a call the model is asked to make again, so the node did not end and records after it exist. `"failed"` is the tool's *execution* failing, which ended the node: the failure left the tool, the node's own `on_error:` decided the run (grammar §9.2), and the model saw nothing back. §5.1 names the one failure no `on_error:` decided: a `human` node inside the flow the call ran, on a run that could not answer it. |
 | `instance` | string | flow-as-tool calls that started an instance | The **link**: the subflow instance this call ran, named exactly as the dispatch record carrying that instance's trace names itself in `idempotencyKey`, so the join between the two is string equality (§5, §8). Absent on every call that instantiated nothing — a `tool.*`, a store tool — and on a `"refused"` flow-as-tool call, which is arguments that failed the flow's own `inputs:` before an instance existed. A refused call spends **no** call ordinal (grammar §9.4, D119) — that ordinal counts invocations and this call reached no flow — so the instance path of the call that follows it is the one it would have had with no refusal ahead of it. |
 | `result` | any | `"completed"` flow-as-tool calls, with `instance` | **The result the model saw**: the value the loop handed back, which for this tool is the instance's declared `outputs:` (grammar §5.4). PRD §9.20 asks the tool-call entry to record it, and it is the one tool result this format carries — §11 is where the rule it is carved out of is stated, and where the other two tool surfaces are left under it. Its calls are a **subset** of `instance`'s, not the same set: `instance` says an instance ran, `result` says the loop handed that instance's outputs back, so a call carrying `result` carries `instance` and not the other way round. Absent on a `"failed"` call and on a `"refused"` one, where the absence is the record — the first left the tool and the second never entered it, and in neither did the model see a result. A flow-as-tool call whose instance failed is exactly that call with an `instance` and no `result`. |
-| `error` | string | `"failed"`, `"refused"` | What went wrong, in §3's `<error name>: <message>` shape. On a `"refused"` call it is also the text the **model** was handed back, so it names the tool, the field and the constraint the way a compiler diagnostic would (PRD G3) and may quote an excerpt of the arguments — see §11. |
+| `error` | string | `"failed"`, `"refused"` | What went wrong, in §3's `<error name>: <message>` shape. On a `"refused"` call the `<message>` half is **byte for byte the sentence the model was handed back**, and the `<error name>` half — `ToolCallRefused` — is this format's own envelope, which the model's copy does not carry: the two strings differ by that prefix and by nothing else, so a reader joining a record to a provider transcript compares the record's message half, never the whole string. That sentence names the tool, the field and the constraint the way a compiler diagnostic would (PRD G3) and may quote an excerpt of the arguments — see §11. |
 
 **What is deliberately not here.** The **arguments** the model sent are absent
 as a field of their own, and that is §11's rule rather than an omission: this
@@ -1032,11 +1032,11 @@ PRD §9.22). That is a change to the *runtime*, but it reaches a reader of versi
   two-member vocabulary and record a refused call as `"failed"`, and it is
   **worse rather than cheaper**: version `3` defines `"failed"` as a call that
   ended the node and whose answer the model never saw, and both halves are false
-  of a refusal — the loop carried on, and the model was handed the text in
-  `error`. Reusing the member would have changed the meaning of a value a reader
-  was told to rely on, which §10.3 bumps for too, while leaving that reader
-  unable to tell the two apart at all. A new member costs the same bump and
-  leaves `"failed"` meaning exactly what it meant;
+  of a refusal — the loop carried on, and the model was handed the sentence
+  `error` spells under §3's envelope. Reusing the member would have changed the
+  meaning of a value a reader was told to rely on, which §10.3 bumps for too,
+  while leaving that reader unable to tell the two apart at all. A new member
+  costs the same bump and leaves `"failed"` meaning exactly what it meant;
 * **two presence rules widened with it**, and both are read off the row rather
   than added to it: `error` now appears on `"refused"` as well as `"failed"`, and
   `result`'s absence covers a third case. A reader of version `3` who treated
@@ -1100,11 +1100,13 @@ The version number alone is a promise; two tests make it a checkable one:
   the *caller* is a model rather than the graph.
 
   The one place an argument value appears is inside a message: a `"refused"`
-  call's `error`, which is the text the model itself was handed back so that it
-  could call again (grammar D119). That is the same excerpt rule the row below
-  states for every other contract failure, applied at the surface where the
-  reader of the message is the party that composed the value — see §11.1's
-  table, where the two sites are classified together.
+  call's `error`, which spells the sentence the model itself was handed back so
+  that it could call again — under §3's `<error name>:` envelope, which is the
+  one thing that sentence gains on its way here (grammar D119, §7.3). That is
+  the same excerpt rule the row below states for every other contract failure,
+  applied at the surface where the reader of the message is the party that
+  composed the value — see §11.1's table, where the two sites are classified
+  together.
 
   What a tool answered divides, and PRD §9.20 is what divides it. A
   flow-as-tool call's result **is** carried, on `ToolCallRecord.result`: the

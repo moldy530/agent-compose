@@ -2474,12 +2474,24 @@ fn arguments_a_flow_tools_inputs_refuses_come_back_to_the_model_as_a_tool_error(
         refused["result"].is_null(),
         "…and carries no result, because there was nothing to answer with: {refused}"
     );
+    // The two spellings of one sentence, pinned **against each other** rather
+    // than each against a substring: `docs/trace.md` §7.3 says the record's
+    // `<message>` half is byte for byte the model's copy and the `<error name>`
+    // half is the envelope the model never sees, so a release that reworded
+    // either, or that started handing the model the class too, changes this line
+    // (grammar D119, `runtime.ToolCallRefused`).
+    let handed = block["content"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the wire carried the refusal as text: {answering}"));
+    assert_eq!(
+        refused["error"],
+        json!(format!("ToolCallRefused: {handed}")),
+        "…and its `error` is the model's own copy under §3's envelope: {refused}"
+    );
     assert!(
-        refused["error"]
-            .as_str()
-            .is_some_and(|text| text.starts_with("ToolCallRefused: ")
-                && text.contains("the arguments `condense` was called with")),
-        "…and its `error` is the very text the model saw, in §3's shape: {refused}"
+        !handed.contains("ToolCallRefused"),
+        "…which the model's copy does not carry: a class it cannot act on is \
+         not part of the sentence it was asked to correct from: {answering}"
     );
 
     let corrected = &models[1]["toolCalls"][0];
@@ -2832,6 +2844,17 @@ fn a_tool_definitions_input_refuses_on_the_chat_completions_wire_and_an_exit_cod
         refused["result"].is_null() && refused["instance"].is_null(),
         "{refused}"
     );
+    // The record-to-wire relation `docs/trace.md` §7.3 states, pinned on this
+    // surface too: the envelope is the format's, not the wire's, so it does not
+    // change with the wire the sentence travelled on.
+    let handed = answering["content"]
+        .as_str()
+        .unwrap_or_else(|| panic!("this surface carries the refusal as text: {answering}"));
+    assert_eq!(
+        refused["error"],
+        json!(format!("ToolCallRefused: {handed}")),
+        "the record is the model's own copy under §3's envelope: {refused}"
+    );
     assert_eq!(
         entry["models"][1]["toolCalls"][0]["outcome"], "completed",
         "{entry}"
@@ -2853,8 +2876,11 @@ fn a_tool_definitions_input_refuses_on_the_chat_completions_wire_and_an_exit_cod
     .expect("the toolchain was there a moment ago");
     let failure = ended.failed();
     assert!(
-        failure.contains("false") || failure.contains("exit"),
-        "the child's exit code is what ended the node: {failure}"
+        failure.contains("`false` exited 1"),
+        "the child's exit code is what ended the node, and the message names \
+         both halves of it — the command as the composition spells it and the \
+         status it left. A substring like `false` on its own would be satisfied \
+         by any JSON `false` a nested detail happened to render: {failure}"
     );
     assert_eq!(
         failing.requests().len(),
