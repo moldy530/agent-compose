@@ -511,10 +511,10 @@ them does not spell it at all:
 
 *What is certain*: that the block or message has to be **sent at all**. Both
 surfaces refuse a request that leaves a `tool_use` id or a `tool_call_id`
-unanswered, and this server checks both directions (`check_messages` in
-`src/anthropic.rs`, `an_orphaned_tool_message_is_refused` in `src/openai.rs`) —
-so a runtime that answered only the calls that worked would be caught here on its
-next request rather than in production.
+unanswered, and this server checks both directions (`check_messages`, in
+`src/anthropic.rs` and in `src/openai.rs`) — so a runtime that answered only the
+calls that worked would be caught here on its next request rather than in
+production.
 
 *What is also certain, and is the one thing the two surfaces disagree about*:
 whether a tool **name** the current request does not declare may appear in the
