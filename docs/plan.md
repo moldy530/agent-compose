@@ -705,6 +705,30 @@ in the artifact, and nothing the composition does differently, the one exception
 being the respelled guard above, whose text is what is shipped — and the third as
 one edit written twice.
 
+**How much of this section is held to behaviour.**
+`crates/compose-core/tests/plan_completeness.rs` restates every clause above
+independently of the compiler and asserts the account as a biconditional: a plan
+names a subject, and a place inside it, exactly when the two artifacts differ
+there once this section is taken out. That is what keeps the section from
+drifting away from what the command does — but the property is stated over the
+artifacts two corpora of spec pairs produce, and those are finite. A key an
+author leaves out is a key the artifact does not hold (see *a default written
+out*, above), so a construct **no spec of either corpus declares** is a construct
+nothing there would notice a plan going quiet about. Of the 111 optional keys
+`schemas/agent-compose.schema.json` names, 39 are in that position today: about
+half are a deploy backend's plugin config, which this section excuses outright,
+and the rest are real — a model's `top_p:`, `seed:` and `thinking:`, a schema's
+`min_items:`, `multiple_of:` and its two exclusive bounds, a store op's
+`filter:`, `metadata:` and `top_k:`. It holds per construct rather than per key
+name: a `description:` is declared by every kind of subject in the corpora except
+a trigger, so a trigger's is the one the property does not currently reach.
+
+Everything §3 through §10 promise applies to those keys the same way — the
+comparison is over the artifact as JSON and has no table of keys in it — and this
+paragraph is about the *test* corpus rather than about the format. Growing the
+corpora is what closes it, and the test file's module docs say so beside the
+property.
+
 ## 12. Stability
 
 ### 12.1 What a reader may rely on

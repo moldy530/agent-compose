@@ -74,6 +74,36 @@
 //! that it never *saves* a case: the three structural sections are what the
 //! property is stated over, so an edit hidden from them fails here whatever the
 //! validator happened to notice.
+//!
+//! # What the corpora do not reach
+//!
+//! The property is a biconditional over the artifacts two corpora **produce**,
+//! and that is narrower than a biconditional over the grammar. Nearly every
+//! field of the IR is written `skip_serializing_if` — 126 of them across
+//! `crates/compose-core/src/ir/` — so a construct no spec of either corpus
+//! declares is no key of any artifact here: [`subjects`] never sees it,
+//! [`differing_keys`] never names it, and
+//! [`every_key_of_the_base_composition_is_moved_by_some_pair`] never asks for
+//! it. Of the 111 optional keys `schemas/agent-compose.schema.json` names, 39
+//! are declared by neither [`BASE`] nor any pair of either corpus. About half of
+//! those are a deploy backend's plugin config, which `docs/plan.md` §11 excuses
+//! from a plan outright; the rest are real — a model's `top_p:`, `seed:` and
+//! `thinking:`, a schema's `min_items:`, `multiple_of:` and its two exclusive
+//! bounds, a store op's `filter:`, `metadata:` and `top_k:`.
+//!
+//! It is stated per **construct** rather than per key name, which is what makes
+//! it easy to under-read: a `description:` is declared by every definition and
+//! by every kind of subject *except* a trigger, so dropping `"description"` from
+//! `plan::sections`'s `TRIGGER_IDENTITY` — which hands a trigger's documentation
+//! to `interfaces` instead of to `components`, against §4 — leaves this file
+//! green, while the same edit at any of the three places a definition or a node
+//! declares one fails it.
+//!
+//! Closing that is a matter of growing what the corpora declare — a key added to
+//! [`BASE`] needs a case moving it, because
+//! [`every_key_of_the_base_composition_is_moved_by_some_pair`] demands one —
+//! rather than anything about the property. `docs/plan.md` §11 carries the same
+//! statement for readers of the format.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -640,16 +670,29 @@ fn components(subjects: &BTreeMap<Subject, Slice>) -> BTreeSet<&str> {
 }
 
 /// Every subject a plan names, keyed the way [`subjects`] keys them, and for
-/// each the **keys of the subject** its records reach into.
+/// each the **places of the subject** its records reach into.
 ///
 /// A path is `docs/plan.md` §3's — keys joined with `.`, array elements as
-/// `[i]`, named entries as `[<name>]` — and only its first step is taken. That
-/// step is a field of the subject itself, which is the granularity a plan can be
-/// held to from outside: everything below it is the walk's own business, and
-/// restating *that* would mean copying the entry-matching this file exists not
-/// to share (see [`subjects`]). A key of the subject is enough to catch the
-/// failure that matters — a field that stopped being compared reports at no key
-/// at all.
+/// `[i]`, named entries as `[<name>]` — and it is taken as far as its **object
+/// keys** go: `exec.command.text` in full, `exec.args[0].text` cut back to
+/// `exec.args`. That is the granularity a plan can be held to from outside.
+///
+/// The cut is at the first `[` and not before, because the two sides of it are
+/// different kinds of thing. Descending through an object key needs nothing but
+/// the key: [`differing_keys`] reads the same key off the artifact, and the two
+/// agree or the property fails. Descending *into an array* would mean deciding
+/// which entry of one side is which entry of the other — by name for six keys of
+/// the grammar, by identity for a flow's edges, by position for everything else
+/// — and that pairing is precisely the algorithm this file exists not to share
+/// with the code under test (see [`subjects`]). So an array is one place, named
+/// by the key it sits under, and what a plan says *inside* it is held by
+/// [`CASES`] instead.
+///
+/// Cutting only at the first step, which is what this took before, left every
+/// key below one — `exec.command`, an `http:`'s `url`, a node's block, a
+/// schema's internals — with no pair anywhere forcing a record: a rule that
+/// swallowed one reported at the subject's first step all the same, and the sets
+/// matched.
 fn named_subjects(plan: &Plan) -> BTreeMap<Subject, BTreeSet<String>> {
     let mut found: BTreeMap<Subject, BTreeSet<String>> = BTreeMap::new();
     for change in &plan.components {
@@ -682,30 +725,93 @@ fn named_subjects(plan: &Plan) -> BTreeMap<Subject, BTreeSet<String>> {
     found
 }
 
-/// The first step of each of these paths.
+/// Each of these paths cut back to its object keys: everything up to the first
+/// `[`, which is where an array's entries begin. See [`named_subjects`].
 fn heads(fields: &[FieldChange]) -> BTreeSet<String> {
     fields
         .iter()
         .map(|field| {
             let path = field.path.as_str();
-            path[..path.find(['.', '[']).unwrap_or(path.len())].to_string()
+            path[..path.find('[').unwrap_or(path.len())].to_string()
         })
         .collect()
 }
 
-/// Which keys of one subject the two artifacts differ at.
+/// Which places of one subject the two artifacts differ at.
 ///
-/// The mirror of [`heads`], read off the artifact instead of off the report. A
-/// key on one side only counts: `docs/plan.md` §3 makes an undeclared field a
-/// change like any other, because an absent `timeout:` inherits and a declared
-/// one does not.
+/// The mirror of [`heads`], read off the artifact instead of off the report, and
+/// cut at the same place: two objects are descended into key by key, and
+/// anything that is not an object on both sides — an array, a scalar, a key one
+/// side does not declare at all — is the place itself. A key on one side only
+/// counts, and counts *there* rather than below: `docs/plan.md` §3 makes an
+/// undeclared field a change like any other, because an absent `timeout:`
+/// inherits and a declared one does not, and a plan reports it at the key rather
+/// than at each key inside it.
+///
+/// Two unequal objects always differ at some key, so descending never loses a
+/// difference: the recursion turns one place into at least one place, never into
+/// none.
 fn differing_keys(before: &Map<String, Value>, after: &Map<String, Value>) -> BTreeSet<String> {
-    before
-        .keys()
-        .chain(after.keys())
-        .filter(|key| before.get(*key) != after.get(*key))
-        .cloned()
-        .collect()
+    let mut found = BTreeSet::new();
+    differing_below("", before, after, &mut found);
+    found
+}
+
+fn differing_below(
+    path: &str,
+    before: &Map<String, Value>,
+    after: &Map<String, Value>,
+    found: &mut BTreeSet<String>,
+) {
+    // Over the union of the keys, each once: a key both sides declare would
+    // otherwise be descended into twice, and twice again one level down.
+    let keys: BTreeSet<&String> = before.keys().chain(after.keys()).collect();
+    for key in keys {
+        let at = below(path, key);
+        match (before.get(key), after.get(key)) {
+            (Some(old), Some(new)) if old == new => {}
+            (Some(Value::Object(old)), Some(Value::Object(new))) => {
+                differing_below(&at, old, new, found);
+            }
+            _ => {
+                found.insert(at);
+            }
+        }
+    }
+}
+
+/// Every place of one subject, whether or not any pair moves it — the same walk
+/// as [`differing_below`], against nothing.
+fn places(value: &Map<String, Value>) -> BTreeSet<String> {
+    let mut found = BTreeSet::new();
+    places_below("", value, &mut found);
+    found
+}
+
+fn places_below(path: &str, value: &Map<String, Value>, found: &mut BTreeSet<String>) {
+    for (key, held) in value {
+        let at = below(path, key);
+        match held {
+            Value::Object(inner) if !inner.is_empty() => places_below(&at, inner, found),
+            _ => {
+                found.insert(at);
+            }
+        }
+    }
+}
+
+/// A child place: the key on its own at the top of a subject, joined with a `.`
+/// below it.
+///
+/// The same spelling `plan::diff` writes a path in, including what it does with
+/// a key holding a `.` of its own — the two open surfaces admit one — which is
+/// written as it stands and read as a route rather than parsed back into keys.
+fn below(path: &str, key: &str) -> String {
+    if path.is_empty() {
+        key.to_string()
+    } else {
+        format!("{path}.{key}")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1120,6 +1226,97 @@ const STRANGERS: &str = r#"    - { from: dispatch, to: verify }
 const STRANGERS_SWAPPED: &str = r#"    - { from: announce, to: verify }
     - { from: dispatch, to: verify }"#;
 
+/// The `dispatch` map's `routes:` key and everything under it, and the
+/// homogeneous dispatch that replaces it.
+///
+/// Rewriting the block the other way is the only edit that moves `map.dispatch`,
+/// the tag `MapDispatch` is written under: the two forms are `route_by:` +
+/// `routes:` and a single `node:`, and nothing an author can type moves one to
+/// the other without moving the whole block (grammar 8.6 rule 2).
+const ROUTED: &str = r#"        routes:
+          auto_fixable:
+            node: agent.fixer
+            max_concurrency: 4
+            input:
+              file: "finding.file"
+              patch_hint: "finding.patch_hint"
+            writes:
+              patch: patches
+          needs_human:
+            node: tool.review_queue
+            input:
+              summary: "finding.summary"
+              severity: "finding.severity""#;
+const HOMOGENEOUS: &str = r#"        input:
+          file: "finding.file""#;
+
+/// The catch-all route, with the newline that follows it — taken out whole by
+/// the same case, because a `default:` is narrowed against the routes it is the
+/// complement of and there are none left.
+const CATCH_ALL: &str = r#"        default:
+          node: tool.dead_letter
+          detach: false
+          input:
+            kind: "finding.kind"
+            payload: "finding.of"
+"#;
+
+/// The catch-all's own bindings, and the one unnamed value that replaces them —
+/// which is the other form a `map` dispatch's `input:` takes (Decision D88).
+const CATCH_ALL_BINDINGS: &str = r#"          input:
+            kind: "finding.kind"
+            payload: "finding.of""#;
+const CATCH_ALL_VALUE: &str = r#"          input: "finding.of""#;
+
+/// A node's own bindings, and the same as one unnamed value — legal on an
+/// inline `exec:` node, whose stdin is where it goes (Decision D88).
+const STDIN_BINDINGS: &str = r#"      input:
+        patches: "state.patches""#;
+const STDIN_VALUE: &str = r#"      input: "state.patches""#;
+
+/// A `kv set`'s field map of expressions, and the single expression that
+/// replaces it — the two forms of a store op's `value:` (grammar 11.4).
+///
+/// The op moves with it, because the form is the op's: a `kv set` writes a field
+/// map matching the store's `value_schema`, and only a `vector upsert` or a
+/// `blob put` writes one expression. `key:` stays, which is what keeps the pair
+/// down to the three places the form itself moves.
+const STORE_FIELDS: &str = r#"      store: store.triage_memory
+      op: set
+      key: "execution.session_key"
+      value:
+        last_report: "input.report"
+        patch_count: "size(state.patches)""#;
+const STORE_EXPRESSION: &str = r#"      store: store.docs
+      op: upsert
+      key: "execution.session_key"
+      value: "input.report""#;
+
+/// The `matches` channel's element type, which is where a schema's *inside* is
+/// edited: `patches:` declares the same two lines under a `max_items:`, so the
+/// anchor is the pair rather than the `items:` line on its own.
+const ELEMENT: &str = r#"    type: array
+    items: { type: string }"#;
+const ELEMENT_RETYPED: &str = r#"    type: array
+    items: { type: integer }"#;
+const ELEMENT_REFORMED: &str = r#"    type: array
+    items: { enum: [hit, miss] }"#;
+const NO_ELEMENTS: &str = r#"    type: string"#;
+
+/// `verify`'s failure mode, anchored to the key above it because three other
+/// nodes of the flow declare the same one.
+const VERIFY_ON_ERROR: &str = r#"      timeout: 5m
+      on_error: skip"#;
+const VERIFY_ON_ERROR_FAILS: &str = r#"      timeout: 5m
+      on_error: fail"#;
+
+/// `escalate`'s request body, anchored to the key above it because `approve`
+/// binds the same channel to the same name.
+const ESCALATION_BODY: &str = r#"        body:
+          summary: "state.summary""#;
+const ESCALATION_BODY_MOVED: &str = r#"        body:
+          summary: "state.report_normalized""#;
+
 /// One edit per construct whose comparison rule is not the obvious one — and,
 /// beside each, the edit that looks like it and must come out the other way.
 const CASES: &[Case] = &[
@@ -1374,6 +1571,16 @@ const CASES: &[Case] = &[
                 "stores/docs.yml",
                 "  backend: docs_db",
                 "  backend: project_docs",
+            ),
+            (
+                "stores/docs.yml",
+                "    model: text-embedding-3-small",
+                "    model: text-embedding-3-large",
+            ),
+            (
+                "stores/docs.yml",
+                "    provider: provider.local",
+                "    provider: provider.anthropic",
             ),
             (
                 "stores/docs.yml",
@@ -1745,6 +1952,378 @@ const CASES: &[Case] = &[
         )],
         differs: true,
     },
+    // --- Inside a block: the places below a subject's first key. --------------
+    //
+    // Every case above moves a key at the **top** of its subject, and until this
+    // section existed that was the whole of what any pair forced: a plan's
+    // records were read back only as far as their first step, so a rule that
+    // swallowed a tool's `exec.command` while still comparing its `exec.args`
+    // named the tool at `exec` all the same and the sets matched.
+    //
+    // [`named_subjects`] now reads a path as far as its object keys go, so each
+    // place below one needs its own forcing pair for the same reason a key at
+    // the top does. What is still one place — an array, and everything the walk
+    // pairs up inside it — is the line that file's docs draw and this section
+    // does not cross.
+    Case {
+        what: "an exec-bound tool's command respelled",
+        before: &[],
+        after: &[(
+            "tools/repo_grep.yml",
+            "    command: repo-grep",
+            "    command: repo-search",
+        )],
+        differs: true,
+    },
+    Case {
+        what: "an exec-bound tool's argv, directory and environment retuned",
+        before: &[],
+        after: &[
+            (
+                "tools/repo_grep.yml",
+                "    args: [\"--format\", \"json\"]",
+                "    args: [\"--format\", \"jsonl\"]",
+            ),
+            (
+                "tools/repo_grep.yml",
+                "    cwd: \"${REPO_ROOT}\"",
+                "    cwd: \"${WORKSPACE_ROOT}\"",
+            ),
+            (
+                "tools/repo_grep.yml",
+                "      RIPGREP_CONFIG_PATH: \"${RG_CONFIG_PATH}\"",
+                "      RIPGREP_CONFIG_PATH: \"${RG_CONFIG}\"",
+            ),
+        ],
+        differs: true,
+    },
+    Case {
+        what: "an http-bound tool's method changed",
+        before: &[],
+        after: &[(
+            "tools/review_queue.yml",
+            "    method: POST",
+            "    method: PUT",
+        )],
+        differs: true,
+    },
+    Case {
+        what: "an http-bound tool's endpoint, headers and body repointed",
+        before: &[],
+        after: &[
+            (
+                "tools/review_queue.yml",
+                "    url: \"https://${QUEUE_HOST}/v1/tickets\"",
+                "    url: \"https://${TICKET_HOST}/v1/tickets\"",
+            ),
+            (
+                "tools/review_queue.yml",
+                "      authorization: \"Bearer ${QUEUE_TOKEN}\"",
+                "      authorization: \"Bearer ${TICKET_TOKEN}\"",
+            ),
+            (
+                "tools/review_queue.yml",
+                "      severity: \"input.severity\"",
+                "      severity: \"input.summary\"",
+            ),
+        ],
+        differs: true,
+    },
+    Case {
+        what: "a model's token budget lowered",
+        before: &[],
+        after: &[("models.yml", "    max_tokens: 8000", "    max_tokens: 6000")],
+        differs: true,
+    },
+    Case {
+        what: "the policy defaults' retry rebuilt",
+        before: &[],
+        after: &[(
+            "main.yml",
+            "  retry: { max: 1, backoff: 2s }",
+            "  retry: { max: 2, backoff: 5s }",
+        )],
+        differs: true,
+    },
+    // --- A schema's own insides, which are a subject's places like any other. -
+    Case {
+        what: "a channel's element type changed",
+        before: &[],
+        after: &[("main.yml", ELEMENT, ELEMENT_RETYPED)],
+        differs: true,
+    },
+    Case {
+        what: "a channel's element form changed",
+        before: &[],
+        after: &[("main.yml", ELEMENT, ELEMENT_REFORMED)],
+        differs: true,
+    },
+    Case {
+        what: "a channel re-formed",
+        before: &[],
+        after: &[("main.yml", ELEMENT, NO_ELEMENTS)],
+        differs: true,
+    },
+    Case {
+        what: "a channel's variants widened",
+        before: &[],
+        after: &[(
+            "main.yml",
+            "    enum: [approve, reject]",
+            "    enum: [approve, reject, defer]",
+        )],
+        differs: true,
+    },
+    // --- The inline blocks a node declares. -----------------------------------
+    Case {
+        what: "an inline subprocess's command respelled",
+        before: &[],
+        after: &[(
+            "flows/triage.yml",
+            "        command: \"${OPS_BIN}/log-event\"",
+            "        command: \"${OPS_HOME}/log-event\"",
+        )],
+        differs: true,
+    },
+    Case {
+        what: "an inline subprocess's directory moved",
+        before: &[],
+        after: &[(
+            "flows/triage.yml",
+            "        cwd: \"${REPO_ROOT}\"",
+            "        cwd: \"${CHECK_ROOT}\"",
+        )],
+        differs: true,
+    },
+    Case {
+        what: "an inline subprocess's declared output bounded",
+        before: &[],
+        after: &[(
+            "flows/triage.yml",
+            "          stdout: { type: string }",
+            "          stdout: { type: string, max_length: 8192 }",
+        )],
+        differs: true,
+    },
+    Case {
+        what: "an inline request rewritten across the keys it declares",
+        before: &[],
+        after: &[
+            (
+                "flows/enrich.yml",
+                "        method: POST",
+                "        method: PUT",
+            ),
+            (
+                "flows/enrich.yml",
+                "        url: \"https://${TRIAGE_HOST}/v1/normalize\"",
+                "        url: \"https://${NORMALIZE_HOST}/v1/normalize\"",
+            ),
+            (
+                "flows/enrich.yml",
+                "          authorization: \"Bearer ${TRIAGE_TOKEN}\"",
+                "          authorization: \"Bearer ${NORMALIZE_TOKEN}\"",
+            ),
+            (
+                "flows/enrich.yml",
+                "        expect_status: [200]",
+                "        expect_status: [200, 202]",
+            ),
+            (
+                "flows/enrich.yml",
+                "          report_normalized: { type: string }",
+                "          report_normalized: { type: string, max_length: 4000 }",
+            ),
+        ],
+        differs: true,
+    },
+    Case {
+        what: "an inline request's body repointed",
+        before: &[],
+        after: &[("flows/triage.yml", ESCALATION_BODY, ESCALATION_BODY_MOVED)],
+        differs: true,
+    },
+    Case {
+        what: "an inline node's retry envelope retuned",
+        before: &[],
+        after: &[(
+            "flows/enrich.yml",
+            "      retry: { max: 2, backoff: 1s, multiplier: 3.0, max_backoff: 20s }",
+            "      retry: { max: 2, backoff: 3s, multiplier: 2.5, max_backoff: 30s }",
+        )],
+        differs: true,
+    },
+    Case {
+        what: "a human pause's two surfaces and its expiry route rewritten",
+        before: &[],
+        after: &[
+            (
+                "flows/triage.yml",
+                "          summary: { type: string }",
+                "          summary: { type: string, max_length: 500 }",
+            ),
+            (
+                "flows/triage.yml",
+                "          note: { type: string }",
+                "          note: { type: string, max_length: 200 }",
+            ),
+            (
+                "flows/triage.yml",
+                "        on_timeout: escalate",
+                "        on_timeout: announce_failed",
+            ),
+        ],
+        differs: true,
+    },
+    Case {
+        what: "a node's bindings given as one unnamed value",
+        before: &[],
+        after: &[("flows/triage.yml", STDIN_BINDINGS, STDIN_VALUE)],
+        differs: true,
+    },
+    Case {
+        what: "a store-op node's value repointed",
+        before: &[],
+        after: &[(
+            "flows/triage.yml",
+            "        last_report: \"input.report\"",
+            "        last_report: \"input.pattern\"",
+        )],
+        differs: true,
+    },
+    Case {
+        what: "a store-op node's value given as one expression",
+        before: &[],
+        after: &[("flows/triage.yml", STORE_FIELDS, STORE_EXPRESSION)],
+        differs: true,
+    },
+    // --- The `map:` block, whose insides are a construct of their own. --------
+    Case {
+        what: "a map route's own bound lowered",
+        before: &[],
+        after: &[(
+            "flows/triage.yml",
+            "            max_concurrency: 4",
+            "            max_concurrency: 2",
+        )],
+        differs: true,
+    },
+    Case {
+        what: "a map's source array and discriminator repointed",
+        before: &[],
+        after: &[
+            (
+                "flows/triage.yml",
+                "        over: classify.output.findings",
+                "        over: state.patches",
+            ),
+            (
+                "flows/triage.yml",
+                "        route_by: kind",
+                "        route_by: tag",
+            ),
+        ],
+        differs: true,
+    },
+    Case {
+        what: "a map's item binding renamed",
+        before: &[],
+        after: &[(
+            "flows/triage.yml",
+            "        as: finding",
+            "        as: item",
+        )],
+        differs: true,
+    },
+    Case {
+        what: "a map's per-item retry retuned",
+        before: &[],
+        after: &[(
+            "flows/triage.yml",
+            "          retry: { max: 2, backoff: 2s }",
+            "          retry: { max: 3, backoff: 4s }",
+        )],
+        differs: true,
+    },
+    Case {
+        what: "a map's per-item error strategy replaced",
+        before: &[],
+        after: &[(
+            "flows/triage.yml",
+            "        on_item_error:\n          retry: { max: 2, backoff: 2s }",
+            "        on_item_error: skip",
+        )],
+        differs: true,
+    },
+    Case {
+        what: "a map's catch-all rerouted, detached, and rebound",
+        before: &[],
+        after: &[
+            (
+                "flows/triage.yml",
+                "          node: tool.dead_letter",
+                "          node: tool.review_queue",
+            ),
+            (
+                "flows/triage.yml",
+                "          detach: false",
+                "          detach: true",
+            ),
+            (
+                "flows/triage.yml",
+                "            kind: \"finding.kind\"",
+                "            kind: \"finding.summary\"",
+            ),
+        ],
+        differs: true,
+    },
+    Case {
+        what: "a map's catch-all given one unnamed value",
+        before: &[],
+        after: &[("flows/triage.yml", CATCH_ALL_BINDINGS, CATCH_ALL_VALUE)],
+        differs: true,
+    },
+    Case {
+        what: "a routed map made a homogeneous one",
+        before: &[],
+        after: &[
+            (
+                "flows/triage.yml",
+                "        route_by: kind",
+                "        node: agent.fixer",
+            ),
+            ("flows/triage.yml", ROUTED, HOMOGENEOUS),
+            ("flows/triage.yml", CATCH_ALL, ""),
+        ],
+        differs: true,
+    },
+    // --- The three places a node says what to do when it fails. ---------------
+    Case {
+        what: "a node's own failure mode changed",
+        before: &[],
+        after: &[("flows/triage.yml", VERIFY_ON_ERROR, VERIFY_ON_ERROR_FAILS)],
+        differs: true,
+    },
+    Case {
+        what: "a node's fallback retargeted",
+        before: &[],
+        after: &[(
+            "flows/triage.yml",
+            "      on_error: { fallback: announce_failed }",
+            "      on_error: { fallback: verify }",
+        )],
+        differs: true,
+    },
+    Case {
+        what: "a subgraph instantiation's policy given another failure mode",
+        before: &[],
+        after: &[(
+            "flows/triage.yml",
+            "        on_error: fail",
+            "        on_error: skip",
+        )],
+        differs: true,
+    },
 ];
 
 /// Copy the base composition into `into`, then apply the edits.
@@ -1816,13 +2395,36 @@ fn one_composition_edited_one_construct_at_a_time_reports_every_edit_and_no_othe
 // …and the corpora are the coverage, so what they reach is asserted too.
 // ---------------------------------------------------------------------------
 
-/// The keys of the artifact no pair of specs can move, so none is asked to.
+/// The places of the artifact no pair of specs can move, so none is asked to.
 ///
-/// `namespace` is the tag a definition's body is written under, and it follows
-/// from the address (grammar 2.2). Two definitions are compared only where they
-/// sit at the same address (`docs/plan.md` §4), so it is equal on both sides of
-/// every comparison there is.
-const CONSTRUCTED: &[&str] = &["namespace"];
+/// Both entries are tags the compiler writes from **where** a construct sits
+/// rather than from anything an author typed, at a place two comparable specs
+/// reach the same way:
+///
+/// * `namespace` is the tag a definition's body is written under, and it follows
+///   from the address (grammar 2.2). Two definitions are compared only where
+///   they sit at the same address (`docs/plan.md` §4), so it is equal on both
+///   sides of every comparison there is;
+/// * `surface` is which of grammar 3.5's and 3.6's opposite rules apply inside a
+///   field map (`crate::ir::schema::FieldMap`), and it follows from the key the
+///   map is written under — an `input:` is an input surface and an `output:` a
+///   result surface, wherever either is declared. So it is spelled out per
+///   place: every one of them is a field map the grammar fixes the surface of,
+///   and a **new** place holding a `surface` has to be added here deliberately
+///   rather than excused by the key's name.
+const CONSTRUCTED: &[&str] = &[
+    "exec.output.surface",
+    "http.output.surface",
+    "human.input.surface",
+    "human.output.surface",
+    "input.surface",
+    "inputs.surface",
+    "metadata_schema.surface",
+    "namespace",
+    "output.surface",
+    "outputs.surface",
+    "value_schema.surface",
+];
 
 /// Which kind of subject an address names, which is what coverage is counted
 /// over: every node of every flow is one bucket, and so is every agent.
@@ -1834,7 +2436,8 @@ fn kind_of(subject: &Subject) -> String {
     )
 }
 
-/// Every key the two artifacts differ at, into `found`, bucketed by [`kind_of`].
+/// Every place the two artifacts differ at, into `found`, bucketed by
+/// [`kind_of`].
 fn moved(before: &Ir, after: &Ir, found: &mut BTreeMap<String, BTreeSet<String>>) {
     let old = subjects(before);
     let new = subjects(after);
@@ -1852,21 +2455,28 @@ fn moved(before: &Ir, after: &Ir, found: &mut BTreeMap<String, BTreeSet<String>>
     }
 }
 
-/// Every key of the base composition's artifact is moved by some pair, so the
+/// Every place of the base composition's artifact is moved by some pair, so the
 /// property above is **exercised** at each of them rather than merely stated
 /// over them.
 ///
-/// [`holds`] compares the keys a plan's records name against the keys the two
-/// artifacts differ at, key for key — so it catches a field that stopped being
-/// compared exactly on the pairs whose two sides differ in *that field*. Which
-/// makes the two corpora the coverage, and this is the assertion that says so:
-/// a key of the artifact no pair moves is a key the property is silent about,
-/// and a refactor could stop comparing it under a green suite. That is the hole
-/// this whole file exists to close, one level up.
+/// [`holds`] compares the places a plan's records name against the places the
+/// two artifacts differ at, place for place — so it catches a field that stopped
+/// being compared exactly on the pairs whose two sides differ in *that field*.
+/// Which makes the two corpora the coverage, and this is the assertion that says
+/// so: a place of the artifact no pair moves is a place the property is silent
+/// about, and a refactor could stop comparing it under a green suite. That is
+/// the hole this whole file exists to close, one level up.
 ///
 /// So a key added to the IR needs a case that moves it, the way a check added to
 /// the compiler needs a fixture (`static_check_inventory.rs`). The failure names
-/// the key and the kind of subject it sits on.
+/// the place and the kind of subject it sits on.
+///
+/// # What it reaches
+///
+/// The base composition's own places, and only those. Nearly every field of the
+/// IR is written `skip_serializing_if`, so a key [`BASE`] declares nowhere is no
+/// key of its artifact and nothing here asks for it. The module docs' final
+/// section states that limitation, counts it, and says what closes it.
 #[test]
 fn every_key_of_the_base_composition_is_moved_by_some_pair() {
     let mut found: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -1894,9 +2504,9 @@ fn every_key_of_the_base_composition_is_moved_by_some_pair() {
         };
         let kind = kind_of(&subject);
         let reached = found.get(&kind).cloned().unwrap_or_default();
-        for key in map.keys() {
-            if !reached.contains(key) && !CONSTRUCTED.contains(&key.as_str()) {
-                missed.entry(kind.clone()).or_default().push(key.clone());
+        for key in places(map) {
+            if !reached.contains(&key) && !CONSTRUCTED.contains(&key.as_str()) {
+                missed.entry(kind.clone()).or_default().push(key);
             }
         }
     }
