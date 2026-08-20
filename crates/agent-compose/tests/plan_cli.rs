@@ -846,6 +846,10 @@ components
 /// before spec had that the after spec no longer does. A CI step branching on
 /// `plan` is asking "could this be planned", and `validate` is the verb that
 /// asks whether a composition is valid (`crates/agent-compose/src/main.rs`).
+///
+/// The report still ends with the pointer at `explain` every human report
+/// carrying a code ends with: a reader who met `dead-end` while reviewing a
+/// change never typed `validate` at all.
 #[test]
 fn diagnostics_introduced_and_resolved_are_content_rather_than_a_refusal() {
     let (report, code) = report("broken-routing");
@@ -867,6 +871,7 @@ broken-routing/before/main.yml:58:5
 
 `broken-routing/after/main.yml` differs from `broken-routing/before/main.yml` (target `local`): \
 3 topology changes, 3 validation changes
+for more about a code, run: agent-compose explain <code>
 "
     );
     assert_eq!(code, 0);
@@ -876,7 +881,8 @@ broken-routing/before/main.yml:58:5
 ///
 /// The report is the composition's own diagnostics, rendered exactly as
 /// `validate` renders them — the same snippet, the same help — followed by a
-/// line naming which side of the comparison failed. Exit `1`.
+/// line naming which side of the comparison failed, and then the run's one
+/// pointer at `explain`. Exit `1`.
 #[test]
 fn a_spec_that_does_not_resolve_is_reported_the_way_validate_reports_it() {
     let (report, code) = report("unresolvable-after");
@@ -893,6 +899,7 @@ error[undefined-reference]: `provider.bedrock` is not defined in this compositio
 the entrypoint imports the file that declares it (grammar 1.4)
 
 error: the after spec `unresolvable-after/after/main.yml` does not resolve (target `local`): 1 error
+for more about a code, run: agent-compose explain <code>
 "
     );
     assert_eq!(code, 1);
@@ -960,6 +967,7 @@ error[io-error]: cannot read `models.yml`: No such file or directory (os error 2
 no directory scanning: the file has to be there (grammar 1.4)
 
 error: the after spec `unresolvable-both/after/main.yml` does not resolve (target `local`): 1 error
+for more about a code, run: agent-compose explain <code>
 "
     );
     assert_eq!(code, 1);

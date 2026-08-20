@@ -91,9 +91,10 @@
 //! `docs` prints the topic index or one topic — the curriculum, sized for a
 //! reader with a context window rather than for completeness, which is the
 //! grammar's job. `explain` prints the expanded account of one diagnostic code;
-//! every human report that said anything — `validate`'s, and the ones `build`,
-//! `run` and `serve` print before refusing — ends with a line pointing at it
-//! (see [`report::explain_hint`]). `schema` writes the
+//! every human report that carried a code — `validate`'s, the ones `build`,
+//! `run` and `serve` print before refusing, and a `plan`'s, whose validation
+//! section is codes and whose refusal is a diagnostic block — ends with a line
+//! pointing at it (see [`report::explain_hint`]). `schema` writes the
 //! published JSON Schema — the document an editor's `$schema` points at
 //! (grammar Appendix B) — byte for byte. `init` writes a project that
 //! validates, which is the loop's first step. `skill` prints or installs the
@@ -478,7 +479,9 @@ fn launch(
                             &report::verdict(entrypoint, target, &diagnostics, color),
                         )
                     })
-                    .and_then(|()| write(&mut stream, &report::explain_hint(&diagnostics)))
+                    .and_then(|()| {
+                        write(&mut stream, &report::explain_hint(!diagnostics.is_empty()))
+                    })
             }
         };
         let _ = written;
@@ -566,7 +569,7 @@ fn validate(entrypoint: &Path, target: &str, format: Format) -> ExitCode {
                         &report::verdict(entrypoint, target, &diagnostics, color),
                     )
                 })
-                .and_then(|()| write(&mut stream, &report::explain_hint(&diagnostics)))
+                .and_then(|()| write(&mut stream, &report::explain_hint(!diagnostics.is_empty())))
         }
     };
 
@@ -855,7 +858,7 @@ fn build_project(
                         &report::build_verdict(entrypoint, target, out, &built, color),
                     )
                 })
-                .and_then(|()| write(&mut stream, &report::explain_hint(&diagnostics)))
+                .and_then(|()| write(&mut stream, &report::explain_hint(!diagnostics.is_empty())))
         }
     };
 
@@ -913,12 +916,12 @@ fn explain(code: &str) -> ExitCode {
 /// `agent-compose skill [--agent <name>] [--global]`: print the skill, or
 /// install it.
 ///
-/// Bare, it prints the agent-agnostic document. `--agent` selects an install
-/// posture, and the two differ because the two agents' conventions do — see
-/// [`compose_core::docs::skill`]. `--global` is only meaningful to a posture
-/// that writes, so it is refused beside one that does not: a flag that was
-/// silently ignored would leave a user believing they had installed something
-/// under `$HOME`.
+/// Bare, it prints the agent-agnostic document. `--agent` selects an install,
+/// and every install is the same write under a different root, because the
+/// agents read the same portable `SKILL.md` — see [`compose_core::docs::skill`].
+/// `--global` names where an install writes, so it is refused beside the bare
+/// posture, which writes nowhere: a flag that was silently ignored would leave a
+/// user believing they had installed something under `$HOME`.
 fn skill(agent: Option<&str>, global: bool) -> ExitCode {
     let Some(agent) = agent else {
         if global {
@@ -929,62 +932,51 @@ fn skill(agent: Option<&str>, global: bool) -> ExitCode {
         }
         return emit_text(docs::skill::SKILL);
     };
-    match agent {
-        "claude" => {
-            // Relative under the current directory, rather than joined onto a
-            // `.`: the path is the one line this verb prints, and `install`
-            // reports back what it was given.
-            let path = if global {
-                match std::env::var_os("HOME") {
-                    Some(home) => PathBuf::from(home).join(docs::skill::CLAUDE_PATH),
-                    None => {
-                        return fail(
-                            "`--global` needs `HOME`, which is not set: run without it to install \
-                             under the current directory",
-                        );
-                    }
-                }
-            } else {
-                PathBuf::from(docs::skill::CLAUDE_PATH)
-            };
-            match discover::install(&path, &docs::skill::claude()) {
-                Ok(discover::Wrote::Created(path)) => {
-                    let _ = write(
-                        &mut io::stderr().lock(),
-                        &format!("wrote `{}`\n", path.display()),
-                    );
-                    ExitCode::from(CLEAN)
-                }
-                Ok(discover::Wrote::Unchanged(path)) => {
-                    let _ = write(
-                        &mut io::stderr().lock(),
-                        &format!("`{}` is already this skill\n", path.display()),
-                    );
-                    ExitCode::from(CLEAN)
-                }
-                Err(discover::Refusal::Occupied(reason)) => {
-                    let _ = write(&mut io::stderr().lock(), &format!("error: {reason}\n"));
-                    ExitCode::from(REPORTED)
-                }
-                Err(discover::Refusal::Unusable(reason)) => fail(&reason),
-            }
-        }
-        "codex" => {
-            if global {
-                return fail(
-                    "`--global` is not meaningful for `--agent codex`: this posture prints the \
-                     skill rather than writing it, because `AGENTS.md` is yours",
-                );
-            }
-            emit_text(&docs::skill::codex())
-        }
-        _ => fail(&unknown(
+    let Some(relative) = docs::skill::path(agent) else {
+        return fail(&unknown(
             "an agent this command has an install posture for",
             "agents",
             agent,
             docs::skill::nearest(agent),
-            docs::skill::AGENTS,
-        )),
+            &docs::skill::agents(),
+        ));
+    };
+    // Relative under the current directory, rather than joined onto a `.`: the
+    // path is the one line this verb prints, and `install` reports back what it
+    // was given.
+    let path = if global {
+        match std::env::var_os("HOME") {
+            Some(home) => PathBuf::from(home).join(&relative),
+            None => {
+                return fail(
+                    "`--global` needs `HOME`, which is not set: run without it to install under \
+                     the current directory",
+                );
+            }
+        }
+    } else {
+        PathBuf::from(&relative)
+    };
+    match discover::install(&path, &docs::skill::installed()) {
+        Ok(discover::Wrote::Created(path)) => {
+            let _ = write(
+                &mut io::stderr().lock(),
+                &format!("wrote `{}`\n", path.display()),
+            );
+            ExitCode::from(CLEAN)
+        }
+        Ok(discover::Wrote::Unchanged(path)) => {
+            let _ = write(
+                &mut io::stderr().lock(),
+                &format!("`{}` is already this skill\n", path.display()),
+            );
+            ExitCode::from(CLEAN)
+        }
+        Err(discover::Refusal::Occupied(reason)) => {
+            let _ = write(&mut io::stderr().lock(), &format!("error: {reason}\n"));
+            ExitCode::from(REPORTED)
+        }
+        Err(discover::Refusal::Unusable(reason)) => fail(&reason),
     }
 }
 

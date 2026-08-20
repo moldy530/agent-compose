@@ -368,6 +368,101 @@ fn the_launching_verbs_point_at_explain_too() {
     }
 }
 
+/// `plan` points at `explain` too, by both routes it carries a code.
+///
+/// A reader who met `dead-end` through a `plan` was reviewing a change, not
+/// validating a spec, which makes them the reader *furthest* from the verb that
+/// would explain it. The `validation` section is one route; a spec that does not
+/// resolve — reported as the same diagnostic block `validate` prints — is the
+/// other.
+#[test]
+fn plan_points_at_explain_too() {
+    let directory = scratch("plan-hint");
+    run(&directory, &["init", "before"]);
+    let after = directory.join("after");
+    std::fs::create_dir_all(&after).expect("can create");
+    let scaffold = std::fs::read_to_string(directory.join("before/main.yml")).expect("readable");
+
+    // One node nothing routes to: the after spec still resolves, so this is a
+    // plan with a validation section rather than a refusal.
+    let orphaned = scaffold.replace(
+        "  edges:",
+        "    orphan:\n      agent: agent.summarizer\n      input:\n        document: \
+         \"input.document\"\n\n  edges:",
+    );
+    assert_ne!(orphaned, scaffold, "the scaffold still declares `edges:`");
+    std::fs::write(after.join("main.yml"), &orphaned).expect("can write");
+
+    let planned = run(&directory, &["plan", "before/main.yml", "after/main.yml"]);
+    let reported = stderr(&planned);
+    assert_eq!(code(&planned), 0, "a plan was produced: {reported}");
+    assert!(
+        reported.matches("error[").count() >= 2,
+        "the plan reported more than one code: {reported}"
+    );
+    assert_eq!(
+        reported.matches("agent-compose explain <code>").count(),
+        1,
+        "the hint is printed once per run, not once per finding: {reported}"
+    );
+    assert!(
+        reported.ends_with("for more about a code, run: agent-compose explain <code>\n"),
+        "the hint is the last line, under the verdict: {reported}"
+    );
+
+    // The other route: an after spec with no artifact at all.
+    std::fs::write(
+        after.join("main.yml"),
+        "version: \"0.1\"\nmodel.smart:\n  provider: provider.missing\n  id: x\n",
+    )
+    .expect("can write");
+    let refused = run(&directory, &["plan", "before/main.yml", "after/main.yml"]);
+    let reported = stderr(&refused);
+    assert_eq!(
+        code(&refused),
+        1,
+        "there was nothing to compare: {reported}"
+    );
+    assert!(
+        reported.contains("error[undefined-reference]"),
+        "the refusal is the composition's own diagnostics: {reported}"
+    );
+    assert!(
+        reported.ends_with("for more about a code, run: agent-compose explain <code>\n"),
+        "and it ends with the hint too: {reported}"
+    );
+}
+
+/// A `plan` that moved something the validator has no opinion about carries no
+/// hint.
+///
+/// The plan is not empty — a component changed — so this is the guard doing the
+/// work rather than a report with nothing in it: what the hint follows is a
+/// *code*, and a settings edit produces none.
+#[test]
+fn a_plan_with_no_findings_carries_no_hint() {
+    let directory = scratch("plan-clean-hint");
+    run(&directory, &["init", "before"]);
+    let after = directory.join("after");
+    std::fs::create_dir_all(&after).expect("can create");
+    let scaffold = std::fs::read_to_string(directory.join("before/main.yml")).expect("readable");
+    let retuned = scaffold.replace("temperature: 0.2", "temperature: 0.4");
+    assert_ne!(retuned, scaffold, "the scaffold still sets a temperature");
+    std::fs::write(after.join("main.yml"), &retuned).expect("can write");
+
+    let output = run(&directory, &["plan", "before/main.yml", "after/main.yml"]);
+    let reported = stderr(&output);
+    assert_eq!(code(&output), 0, "{reported}");
+    assert!(
+        reported.contains("settings.temperature"),
+        "the plan reported the change: {reported}"
+    );
+    assert!(
+        !reported.contains("explain"),
+        "a plan with no code carries no hint: {reported}"
+    );
+}
+
 /// A `build` that reported nothing says nothing about `explain` either.
 ///
 /// The guard is one `is_empty` shared by every caller, and this is the half of
@@ -429,24 +524,60 @@ fn skill_prints_the_bare_document() {
     );
 }
 
-/// `--agent claude` writes the project-level path, with the frontmatter its
-/// loader reads.
+/// Every agent's install, one row at a time.
+///
+/// The postures differ by the **root directory alone** — both agents load the
+/// same portable `SKILL.md` from `<root>/skills/agent-compose/SKILL.md` — so
+/// every install test below runs over
+/// [`compose_core::docs::skill::AGENTS`] rather than naming one agent. A row
+/// added to that table without a posture behind it fails these, which is the
+/// point: an agent the CLI accepts and an agent the CLI actually writes for
+/// have to be the same set.
+fn agents() -> &'static [(&'static str, &'static str)] {
+    compose_core::docs::skill::AGENTS
+}
+
+/// The path an install writes, under an agent's `root`.
+fn installed_path(root: &str) -> String {
+    format!("{root}/skills/agent-compose/SKILL.md")
+}
+
+/// `--agent <name>` writes that agent's project-level path, with the
+/// frontmatter its loader reads — and the same document for every agent.
 #[test]
-fn skill_installs_for_claude_under_the_current_directory() {
-    let directory = scratch("skill-claude");
-    let output = run(&directory, &["skill", "--agent", "claude"]);
-    assert_eq!(code(&output), 0, "stderr: {}", stderr(&output));
-    assert_eq!(stdout(&output), "", "the file is the answer");
-    assert_eq!(
-        stderr(&output),
-        "wrote `.claude/skills/agent-compose/SKILL.md`\n",
-        "the one line it prints is the path as a reader would type it, with no `./`"
-    );
-    let path = directory.join(".claude/skills/agent-compose/SKILL.md");
-    assert!(path.is_file(), "the skill landed at the conventional path");
-    assert_eq!(
-        std::fs::read_to_string(&path).expect("readable"),
-        compose_core::docs::skill::claude()
+fn skill_installs_under_each_agents_own_root() {
+    let mut written = Vec::new();
+    for &(agent, root) in agents() {
+        let directory = scratch(&format!("skill-{agent}"));
+        let output = run(&directory, &["skill", "--agent", agent]);
+        assert_eq!(code(&output), 0, "`{agent}`: {}", stderr(&output));
+        assert_eq!(stdout(&output), "", "`{agent}`: the file is the answer");
+        assert_eq!(
+            stderr(&output),
+            format!("wrote `{}`\n", installed_path(root)),
+            "the one line it prints is the path as a reader would type it, with no `./`"
+        );
+        let path = directory.join(installed_path(root));
+        assert!(
+            path.is_file(),
+            "`{agent}`: the skill landed at the conventional path"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("readable"),
+            compose_core::docs::skill::installed(),
+            "`{agent}`: the installed document"
+        );
+        for &(other, other_root) in agents() {
+            assert!(
+                other == agent || !directory.join(other_root).exists(),
+                "installing for `{agent}` wrote nothing under `{other}`'s `{other_root}`"
+            );
+        }
+        written.push(std::fs::read_to_string(&path).expect("readable"));
+    }
+    assert!(
+        written.windows(2).all(|pair| pair[0] == pair[1]),
+        "the format is portable, so every agent gets the same bytes"
     );
 }
 
@@ -454,39 +585,43 @@ fn skill_installs_for_claude_under_the_current_directory() {
 /// in step must not be a command that fails whenever it is already in step.
 #[test]
 fn reinstalling_the_same_skill_is_a_clean_no_op() {
-    let directory = scratch("skill-reinstall");
-    assert_eq!(code(&run(&directory, &["skill", "--agent", "claude"])), 0);
-    let output = run(&directory, &["skill", "--agent", "claude"]);
-    assert_eq!(code(&output), 0);
-    assert!(
-        stderr(&output).contains("already this skill"),
-        "it says nothing needed doing: {}",
-        stderr(&output)
-    );
+    for &(agent, _) in agents() {
+        let directory = scratch(&format!("skill-reinstall-{agent}"));
+        assert_eq!(code(&run(&directory, &["skill", "--agent", agent])), 0);
+        let output = run(&directory, &["skill", "--agent", agent]);
+        assert_eq!(code(&output), 0);
+        assert!(
+            stderr(&output).contains("already this skill"),
+            "`{agent}`: it says nothing needed doing: {}",
+            stderr(&output)
+        );
+    }
 }
 
 /// A file that differs is refused, with the exit code that means *the answer is
 /// no*, and is left exactly as it was.
 #[test]
 fn skill_refuses_to_replace_a_document_it_did_not_write() {
-    let directory = scratch("skill-occupied");
-    let path = directory.join(".claude/skills/agent-compose/SKILL.md");
-    std::fs::create_dir_all(path.parent().expect("a parent")).expect("can create");
-    std::fs::write(&path, "my own notes\n").expect("can write");
+    for &(agent, root) in agents() {
+        let directory = scratch(&format!("skill-occupied-{agent}"));
+        let path = directory.join(installed_path(root));
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("can create");
+        std::fs::write(&path, "my own notes\n").expect("can write");
 
-    let output = run(&directory, &["skill", "--agent", "claude"]);
-    assert_eq!(code(&output), 1);
-    assert_eq!(stdout(&output), "");
-    assert!(
-        stderr(&output).contains("SKILL.md"),
-        "the refusal names the path: {}",
-        stderr(&output)
-    );
-    assert_eq!(
-        std::fs::read_to_string(&path).expect("readable"),
-        "my own notes\n",
-        "the refusal touched nothing"
-    );
+        let output = run(&directory, &["skill", "--agent", agent]);
+        assert_eq!(code(&output), 1, "`{agent}`: {}", stderr(&output));
+        assert_eq!(stdout(&output), "");
+        assert!(
+            stderr(&output).contains(&installed_path(root)),
+            "`{agent}`: the refusal names the path: {}",
+            stderr(&output)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("readable"),
+            "my own notes\n",
+            "`{agent}`: the refusal touched nothing"
+        );
+    }
 }
 
 /// A file that is not text at all is still a file that differs, not a file the
@@ -500,71 +635,58 @@ fn skill_refuses_to_replace_a_document_it_did_not_write() {
 /// forever, since no retry makes those bytes decode.
 #[test]
 fn skill_refuses_a_file_of_bytes_that_are_not_this_document() {
-    let directory = scratch("skill-not-text");
-    let path = directory.join(".claude/skills/agent-compose/SKILL.md");
-    std::fs::create_dir_all(path.parent().expect("a parent")).expect("can create");
-    let held: &[u8] = &[0xff, 0xfe, 0x00, b'n', b'o', b't', 0x80];
-    std::fs::write(&path, held).expect("can write");
+    for &(agent, root) in agents() {
+        let directory = scratch(&format!("skill-not-text-{agent}"));
+        let path = directory.join(installed_path(root));
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("can create");
+        let held: &[u8] = &[0xff, 0xfe, 0x00, b'n', b'o', b't', 0x80];
+        std::fs::write(&path, held).expect("can write");
 
-    let output = run(&directory, &["skill", "--agent", "claude"]);
-    assert_eq!(
-        code(&output),
-        1,
-        "the answer is no, not unreadable: {}",
-        stderr(&output)
-    );
-    assert!(
-        stderr(&output).contains("SKILL.md") && stderr(&output).contains("different document"),
-        "the refusal names the path and the reason: {}",
-        stderr(&output)
-    );
-    assert_eq!(
-        std::fs::read(&path).expect("readable"),
-        held,
-        "the refusal touched nothing"
-    );
+        let output = run(&directory, &["skill", "--agent", agent]);
+        assert_eq!(
+            code(&output),
+            1,
+            "`{agent}`: the answer is no, not unreadable: {}",
+            stderr(&output)
+        );
+        assert!(
+            stderr(&output).contains("SKILL.md") && stderr(&output).contains("different document"),
+            "`{agent}`: the refusal names the path and the reason: {}",
+            stderr(&output)
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("readable"),
+            held,
+            "`{agent}`: the refusal touched nothing"
+        );
+    }
 }
 
 /// `--global` writes under `$HOME` instead of the working directory.
 #[test]
 fn skill_installs_globally_under_home() {
-    let directory = scratch("skill-global");
-    let home = directory.join("home");
-    std::fs::create_dir_all(&home).expect("can create");
-    let output = Command::cargo_bin("agent-compose")
-        .expect("the binary under test is built")
-        .current_dir(&directory)
-        .env("NO_COLOR", "1")
-        .env("HOME", &home)
-        .args(["skill", "--agent", "claude", "--global"])
-        .output()
-        .expect("the command runs");
-    assert_eq!(code(&output), 0, "stderr: {}", stderr(&output));
-    assert!(
-        home.join(".claude/skills/agent-compose/SKILL.md").is_file(),
-        "the global install lands under HOME"
-    );
-    assert!(
-        !directory.join(".claude").exists(),
-        "and not under the working directory"
-    );
-}
-
-/// The Codex posture **prints**: `AGENTS.md` is the user's file, and this
-/// command does not edit it.
-#[test]
-fn skill_for_codex_prints_and_writes_nothing() {
-    let directory = scratch("skill-codex");
-    let output = run(&directory, &["skill", "--agent", "codex"]);
-    assert_eq!(code(&output), 0);
-    let printed = stdout(&output);
-    assert!(printed.contains("AGENTS.md"), "it says where to put it");
-    assert!(printed.ends_with(compose_core::docs::SKILL));
-    let held: Vec<_> = std::fs::read_dir(&directory)
-        .expect("readable")
-        .filter_map(Result::ok)
-        .collect();
-    assert!(held.is_empty(), "the codex posture wrote nothing");
+    for &(agent, root) in agents() {
+        let directory = scratch(&format!("skill-global-{agent}"));
+        let home = directory.join("home");
+        std::fs::create_dir_all(&home).expect("can create");
+        let output = Command::cargo_bin("agent-compose")
+            .expect("the binary under test is built")
+            .current_dir(&directory)
+            .env("NO_COLOR", "1")
+            .env("HOME", &home)
+            .args(["skill", "--agent", agent, "--global"])
+            .output()
+            .expect("the command runs");
+        assert_eq!(code(&output), 0, "`{agent}`: {}", stderr(&output));
+        assert!(
+            home.join(installed_path(root)).is_file(),
+            "`{agent}`: the global install lands under HOME"
+        );
+        assert!(
+            !directory.join(root).exists(),
+            "`{agent}`: and not under the working directory"
+        );
+    }
 }
 
 /// An agent nobody has a posture for: exit `2`, listing the ones there are.
@@ -573,20 +695,17 @@ fn skill_refuses_an_unknown_agent_with_the_list() {
     let output = run(&repo_root(), &["skill", "--agent", "nano"]);
     assert_eq!(code(&output), 2);
     let reported = stderr(&output);
-    assert!(reported.contains("`claude`"), "{reported}");
-    assert!(reported.contains("`codex`"), "{reported}");
+    for &(agent, _) in agents() {
+        assert!(reported.contains(&format!("`{agent}`")), "{reported}");
+    }
 }
 
-/// `--global` beside a posture that writes nowhere is refused rather than
+/// `--global` beside the one posture that writes nowhere is refused rather than
 /// ignored: a flag silently dropped would leave a user believing they had
 /// installed something under `$HOME`.
 #[test]
-fn global_needs_an_agent_that_writes() {
+fn global_needs_an_agent_to_install_for() {
     let bare = run(&repo_root(), &["skill", "--global"]);
     assert_eq!(code(&bare), 2);
     assert!(stderr(&bare).contains("`--global` needs an `--agent`"));
-
-    let codex = run(&repo_root(), &["skill", "--agent", "codex", "--global"]);
-    assert_eq!(code(&codex), 2);
-    assert!(stderr(&codex).contains("not meaningful"));
 }

@@ -17,19 +17,20 @@
 //! to verify the install, the authoring loop, a verb table, the exit codes, and
 //! the pointer that the topics are the curriculum.
 //!
-//! # The two install postures
+//! # One install, two roots
 //!
-//! They differ because the two agents' conventions do, not because one is
-//! better served.
+//! Claude Code reads `.claude/skills/<name>/SKILL.md`; Codex reads
+//! `.codex/skills/<name>/SKILL.md`. The format is the same portable `SKILL.md`
+//! — YAML frontmatter, then the document — and both are auto-detected from a
+//! directory whose whole content is skills. So there is one [`installed`]
+//! document and one write, and the postures differ by the **root directory
+//! alone**: `--agent` picks a row of [`AGENTS`], `--global` picks whether that
+//! row's path hangs off the current directory or off `$HOME`, and a third agent
+//! that adopts the convention is a row here and no new code.
 //!
-//! * **Claude Code** reads `.claude/skills/<name>/SKILL.md`, a directory whose
-//!   whole content is skills. So [`claude`] is **written**: there is no file of
-//!   the user's to damage, and a refusal on a *differing* file plus a no-op on
-//!   an identical one covers both the customization and the re-install.
-//! * **Codex** reads `AGENTS.md`, a file the user writes, frequently holding
-//!   instructions this compiler knows nothing about. So [`codex`] is
-//!   **printed**, under a header saying where to put it. A compiler that edited
-//!   `AGENTS.md` would be writing into a document it does not own.
+//! Writing is safe in both because neither path is a file of the user's to
+//! damage: a refusal on a *differing* file plus a no-op on an identical one
+//! covers both the customization and the re-install.
 
 /// The name the skill installs under.
 pub const NAME: &str = "agent-compose";
@@ -53,51 +54,53 @@ pub const DESCRIPTION: &str = "Author, validate, and run agent-compose specs —
 
 /// The skill itself, agent-agnostic.
 ///
-/// No frontmatter: frontmatter is one agent's convention rather than the
+/// No frontmatter: frontmatter is a loader's convention rather than the
 /// document's own, so the bare `skill` verb prints something a reader can paste
-/// anywhere, and [`claude`] prepends the header its own loader wants.
+/// anywhere, and [`installed`] prepends the header an install wants.
 pub const SKILL: &str = include_str!("../../../../docs/skill.md");
 
-/// The agents `--agent` accepts.
-pub const AGENTS: &[&str] = &["claude", "codex"];
+/// The agents `--agent` installs for, each beside the directory it keeps its
+/// skills in — in the order a refusal lists them.
+///
+/// One row is the whole of a posture, because the postures differ by nothing
+/// else: both agents load the same portable `SKILL.md` from
+/// `<root>/skills/<name>/SKILL.md`, project-local or under `$HOME`.
+pub const AGENTS: &[(&str, &str)] = &[("claude", ".claude"), ("codex", ".codex")];
 
-/// The path `--agent claude` writes, relative to the current directory or to
-/// `$HOME`.
-pub const CLAUDE_PATH: &str = ".claude/skills/agent-compose/SKILL.md";
+/// The names `--agent` accepts, for the refusal that lists the vocabulary.
+#[must_use]
+pub fn agents() -> Vec<&'static str> {
+    AGENTS.iter().map(|(name, _)| *name).collect()
+}
+
+/// The path an install writes for `agent`, relative to the current directory or
+/// to `$HOME` — or `None` for an agent with no posture.
+///
+/// The one lookup: a caller that gets a path has an install to do, and a caller
+/// that gets `None` has a name to refuse, so there is no third state where an
+/// agent is supported but has nowhere to write.
+#[must_use]
+pub fn path(agent: &str) -> Option<String> {
+    AGENTS
+        .iter()
+        .find(|(name, _)| *name == agent)
+        .map(|(_, root)| format!("{root}/skills/{NAME}/SKILL.md"))
+}
 
 /// The closest supported agent to `name`, when one is close enough to suggest.
 #[must_use]
 pub fn nearest(name: &str) -> Option<&'static str> {
-    crate::parse::reader::suggest(name, AGENTS)
+    crate::parse::reader::suggest(name, &agents())
 }
 
-/// The skill as Claude Code installs it: its frontmatter, then the document.
-#[must_use]
-pub fn claude() -> String {
-    format!("---\nname: {NAME}\ndescription: {DESCRIPTION}\n---\n\n{SKILL}")
-}
-
-/// The skill as Codex takes it: the document under a header saying where it
-/// goes.
+/// The skill as an agent installs it: its frontmatter, then the document.
 ///
-/// Printed, never written — see the module header.
+/// One document for every posture. The frontmatter format is portable across
+/// the agents that read `SKILL.md`, so a per-agent variant would be a
+/// difference this project invented and then had to keep in step.
 #[must_use]
-pub fn codex() -> String {
-    format!(
-        "<!--\n\
-         agent-compose skill, for Codex.\n\
-         \n\
-         Codex reads `AGENTS.md` from the repository root. Either paste the document below into\n\
-         a section of your `AGENTS.md`, or save it beside it — say as\n\
-         `docs/agent-compose-skill.md` — and add one line to `AGENTS.md` pointing at it:\n\
-         \n\
-         \x20   When working with agent-compose specs, follow `docs/agent-compose-skill.md`.\n\
-         \n\
-         This command writes nothing: `AGENTS.md` is yours.\n\
-         -->\n\
-         \n\
-         {SKILL}"
-    )
+pub fn installed() -> String {
+    format!("---\nname: {NAME}\ndescription: {DESCRIPTION}\n---\n\n{SKILL}")
 }
 
 #[cfg(test)]
@@ -107,8 +110,8 @@ mod tests {
     /// The frontmatter is generated, so the two things a loader reads out of it
     /// have to be there and have to be one line each.
     #[test]
-    fn the_claude_install_carries_a_frontmatter_a_loader_can_read() {
-        let installed = claude();
+    fn the_install_carries_a_frontmatter_a_loader_can_read() {
+        let installed = installed();
         assert!(installed.starts_with("---\n"), "frontmatter comes first");
         let header = installed
             .split("\n---\n")
@@ -126,18 +129,30 @@ mod tests {
         );
     }
 
-    /// The Codex posture's whole content is the instruction, so it has to name
-    /// the file it is telling the reader to edit — and has to say it will not
-    /// edit it.
+    /// Every supported agent has a path, every path is that agent's own root,
+    /// and an unsupported name has none.
+    ///
+    /// This is what makes [`path`] the single lookup: an agent the CLI accepts
+    /// and an agent the CLI can write for are the same set, so `--agent` can
+    /// refuse on a `None` rather than consulting a second list that could
+    /// disagree with this one.
     #[test]
-    fn the_codex_install_says_where_the_document_goes() {
-        let printed = codex();
-        assert!(printed.contains("AGENTS.md"), "it names Codex's surface");
+    fn every_agent_installs_under_its_own_root() {
+        let mut seen = std::collections::BTreeSet::new();
+        for (name, root) in AGENTS {
+            let path = path(name).expect("a supported agent has a path");
+            assert_eq!(
+                path,
+                format!("{root}/skills/{NAME}/SKILL.md"),
+                "the path shape is the same under every root"
+            );
+            assert!(seen.insert(root), "`{root}` is two agents' root");
+        }
+        assert_eq!(agents(), vec!["claude", "codex"]);
         assert!(
-            printed.contains("writes nothing"),
-            "it says this command does not edit that file"
+            path("nano").is_none(),
+            "an agent with no posture has no path"
         );
-        assert!(printed.ends_with(SKILL), "the document itself follows");
     }
 
     /// The bare document is the one every posture is built from, so it carries
@@ -148,7 +163,11 @@ mod tests {
             !SKILL.starts_with("---"),
             "the agent-agnostic document carries no frontmatter"
         );
-        assert!(!SKILL.contains("AGENTS.md"), "and names no agent's surface");
-        assert!(!SKILL.contains(".claude/"), "nor another's");
+        for (name, root) in AGENTS {
+            assert!(
+                !SKILL.contains(&format!("{root}/")),
+                "and names no agent's skills directory, `{name}`'s included"
+            );
+        }
     }
 }

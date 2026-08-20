@@ -140,8 +140,14 @@ const TOPICS_WITHOUT_A_RUNNABLE_EXAMPLE: &[(&str, &str)] = &[
 /// `unbalanced-convergence` offered `else: true` on one edge of a pair that
 /// carried no guard at all, which is `invalid-value` (D107) — an `else:` edge
 /// requires a `when:`-guarded sibling, so that spelling makes a pair exclusive
-/// only where a guard was already written.
+/// only where a guard was already written; `invalid-path-expression` offered
+/// `over: "plan.output.ready_tasks"`, a field the producer in its own example
+/// does not declare, so the repointed map cleared the path rule and landed on
+/// the next one. That last is the shape a bare fragment cannot carry at all:
+/// the repair is two edits in two places, and a one-line `over:` is only ever
+/// the second of them.
 const EXPLANATIONS_WITH_A_CORRECTED_EXAMPLE: &[&str] = &[
+    "invalid-path-expression",
     "missing-capability",
     "unbalanced-convergence",
     "undefined-channel",

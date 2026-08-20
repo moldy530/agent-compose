@@ -1,7 +1,7 @@
 //! The two discovery verbs that touch the file system.
 //!
 //! Everything else in the discovery surface writes a document to stdout and is
-//! therefore one line in `main.rs`. `init` and `skill --agent claude` **write
+//! therefore one line in `main.rs`. `init` and `skill --agent <name>` **write
 //! files**, which makes them the two that need a refusal story: a compiler that
 //! silently replaced a file a person wrote is worse than one that did nothing,
 //! and both of these run in a directory the user already lives in.

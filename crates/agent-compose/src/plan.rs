@@ -74,6 +74,10 @@ const NOTE: &str = "note: a value longer than one line is cut, with a `…` wher
 ///
 /// `before_root` and `after_root` are the two compositions' project roots, which
 /// are their entrypoints' own directories (grammar 1.4).
+///
+/// A report whose validation section carried codes ends with the same pointer at
+/// `explain` every other human report ends with — a reader who met `dead-end`
+/// through a `plan` never typed `validate` at all.
 pub(crate) fn human(before_root: &Path, after_root: &Path, plan: &Plan) -> String {
     // Whether any value on the page was cut, which is what [`NOTE`] is about.
     // A finding is never cut — its message is a whole sentence and is printed as
@@ -122,6 +126,12 @@ pub(crate) fn human(before_root: &Path, after_root: &Path, plan: &Plan) -> Strin
         report.push_str(NOTE);
     }
     report.push_str(&verdict(plan));
+    // The validation section is this report's diagnostics, so it is what decides
+    // the hint — a plan of forty topology changes and no finding carries no code
+    // to explain. See [`crate::report::explain_hint`].
+    report.push_str(&crate::report::explain_hint(
+        !plan.validation.introduced.is_empty() || !plan.validation.resolved.is_empty(),
+    ));
     report
 }
 
@@ -332,7 +342,9 @@ pub(crate) struct Failed<'a> {
 /// diffing two branches wants to know that neither of them resolves, not to find
 /// out one at a time. The two blocks are separated by a blank line, because the
 /// line that closes one is a sentence and the line that opens the next is a
-/// diagnostic about a different project.
+/// diagnostic about a different project. The pointer at `explain` closes the
+/// report once, under both blocks: it is one line about the run, not about a
+/// spec.
 pub(crate) fn refused(failed: &[Failed<'_>], target: &str, color: bool) -> String {
     let mut report = String::new();
     for spec in failed {
@@ -360,6 +372,11 @@ pub(crate) fn refused(failed: &[Failed<'_>], target: &str, color: bool) -> Strin
             counted.join(", ")
         ));
     }
+    // Once for the run, under both blocks when both sides failed — the same
+    // rule `validate` follows, for a report built out of the same diagnostics.
+    report.push_str(&crate::report::explain_hint(
+        failed.iter().any(|spec| !spec.diagnostics.is_empty()),
+    ));
     report
 }
 

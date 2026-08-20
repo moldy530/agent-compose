@@ -28,9 +28,10 @@ one shape whatever the outcome.
 
 When it reported anything, the human output ends with one line pointing at
 `explain`, once per run rather than once per diagnostic. So does every other
-human report that carried diagnostics — `build`, `run` and `serve` validate
-first and print the same block. The JSON is untouched: a machine reader already
-has the code.
+human report that carried a code — `build`, `run` and `serve` validate first and
+print the same block, and a `plan` prints codes in its `validation` section and a
+whole diagnostic block for a spec that does not resolve. The JSON is untouched: a
+machine reader already has the code.
 
 ## `plan`
 
@@ -117,19 +118,19 @@ or absent**; an occupied one exits `1` naming what it found.
 ## `skill`
 
 Bare, prints the agent-agnostic skill document — what the CLI is and how the
-loop goes — on stdout. `--agent claude` **writes**
-`.claude/skills/agent-compose/SKILL.md` under the current directory, or under
+loop goes — on stdout. `--agent <name>` **installs** it instead: `claude` writes
+`.claude/skills/agent-compose/SKILL.md` and `codex` writes
+`.codex/skills/agent-compose/SKILL.md`, under the current directory or under
 `$HOME` with `--global`, refusing to overwrite a file that differs and no-opping
-on one that matches. `--agent codex` **prints** the document under a header
-saying where to put it, because Codex's surface is `AGENTS.md` — a file you
-wrote, which this compiler does not edit. An unknown `--agent` exits `2` listing
-the supported ones.
+on one that matches. The bytes are the same either way — both agents load the
+same portable `SKILL.md`, frontmatter and all — so the agent picks the root
+directory and nothing else. An unknown `--agent` exits `2` listing the supported
+ones.
 
 `--global` names where an install writes, so it is **refused** rather than
-ignored wherever nothing is written: bare `skill --global` exits `2`, and so
-does `skill --agent codex --global`. With `--agent claude` it needs `HOME`, and
-exits `2` saying so when that is unset. A flag silently dropped would leave you
-believing something had been installed under `$HOME`.
+ignored where nothing is written: bare `skill --global` exits `2`. An install
+needs `HOME`, and exits `2` saying so when that is unset. A flag silently
+dropped would leave you believing something had been installed under `$HOME`.
 
 ## Exit codes
 

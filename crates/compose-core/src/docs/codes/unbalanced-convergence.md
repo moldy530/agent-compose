@@ -59,8 +59,12 @@ because an `else:` edge is itself required to have a `when:`-guarded sibling
 does not make it exclusive; it trades this diagnostic for that one.
 
 A guard on an edge leaving `start` reads only `input`, `state` and `execution`,
-and the flow above declares neither `inputs:` nor `state:` — there is nothing
-for its two branches to disagree about. So this example takes the depth fix.
+and the flow above declares neither `inputs:` nor `state:`. That leaves
+`execution`, which is the run's own identity rather than anything the
+composition decided: `when: "execution.session_key == 'direct'"` against an
+`else: true` sibling does make this pair exclusive and does validate clean, and
+it decides which branch a graph takes by how the run was started. The route is
+open and it is the wrong one, so this example takes the depth fix.
 
 The diagnostic names the fork, the convergence, the two edges, and the two
 distances, so the shorter one is the edge to change.
