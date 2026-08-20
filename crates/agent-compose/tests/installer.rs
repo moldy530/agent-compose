@@ -1342,3 +1342,52 @@ fn the_workflows_publish_the_artifacts_the_installer_asks_for() {
         );
     }
 }
+
+/// Every third-party action is pinned by commit.
+///
+/// The sha pins on `dtolnay/rust-toolchain`, `Swatinem/rust-cache` and
+/// `oven-sh/setup-bun` are prd.md q24's posture: a branch or a tag is whatever
+/// it was moved to last night, and two of these workflows produce the bytes
+/// people download. A comment beside each pin says what it is, but a comment
+/// binds nobody — the next `@v2` would land in review as one more plausible
+/// line. Here the posture is the test: a `uses:` outside the `actions/*`
+/// namespace (and outside this repository's own `./` reusable workflows) names
+/// a 40-hex commit, or this fails naming the line.
+#[test]
+fn every_third_party_action_is_pinned_by_commit() {
+    let workflows = repo_root().join(".github/workflows");
+    let mut seen = 0;
+    for entry in fs::read_dir(&workflows).expect("the workflows directory is readable") {
+        let path = entry.expect("the workflows directory lists cleanly").path();
+        if path.extension().is_none_or(|extension| extension != "yml") {
+            continue;
+        }
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let text = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("`{name}` is readable: {error}"));
+        for (number, line) in text.lines().enumerate() {
+            let Some(action) = line
+                .trim()
+                .strip_prefix("- uses:")
+                .or_else(|| line.trim().strip_prefix("uses:"))
+            else {
+                continue;
+            };
+            let action = action.trim();
+            if action.starts_with("actions/") || action.starts_with("./") {
+                continue;
+            }
+            seen += 1;
+            let reference = action.split('@').nth(1).unwrap_or("");
+            assert!(
+                reference.len() == 40 && reference.chars().all(|c| c.is_ascii_hexdigit()),
+                "`{name}:{}` uses `{action}`, which is not pinned by a 40-hex commit",
+                number + 1
+            );
+        }
+    }
+    assert!(
+        seen >= 3,
+        "the sweep found only {seen} third-party `uses:` lines — if actions moved, move this test's reach with them"
+    );
+}
