@@ -1,6 +1,8 @@
 //! `agent-compose` — the compiler's command line.
 //!
-//! Five commands exist. The first is the product's core loop (PRD §7 M0):
+//! The verbs fall into two groups. Five act on a composition; the rest teach
+//! the reader about compositions in general and are described at the bottom of
+//! this header. The first is the product's core loop (PRD §7 M0):
 //!
 //! ```text
 //! agent-compose validate <path> [--target <name>] [--format human|json]
@@ -64,6 +66,26 @@
 //! nothing there; the build report goes to stderr, and to stdout only when the
 //! composition was refused and there is no run to answer for. `serve`'s stdout
 //! is the app's readiness line for the same reason.
+//!
+//! # Progressive discovery
+//!
+//! The remaining verbs take no spec at all (PRD §7 M2, resolved q23):
+//!
+//! ```text
+//! agent-compose schema
+//! ```
+//!
+//! They exist because a coding agent is this product's second audience (PRD
+//! §1), and the one that arrives with nothing: a released binary, a directory,
+//! and no checkout of this repository to read `docs/grammar.md` out of. So the
+//! binary carries what it would have read. Every document is embedded
+//! ([`compose_core::docs`]) and printed straight through — no file is looked
+//! for at run time, and nothing is parsed on a path `validate` walks, which is
+//! what keeps a surface measured in hundreds of kilobytes off the millisecond
+//! budget.
+//!
+//! `schema` writes the published JSON Schema — the document an editor's
+//! `$schema` points at (grammar Appendix B) — byte for byte.
 //!
 //! # Exit codes
 //!
@@ -227,6 +249,8 @@ enum Command {
         #[arg(long, value_enum, default_value_t = Format::Human)]
         format: Format,
     },
+    /// Print the published JSON Schema, for an editor's `$schema` or a linter
+    Schema,
     /// Serve the project's `http` triggers (validates, builds, then launches the app)
     Serve {
         /// Path to the spec entrypoint (conventionally `main.yml`)
@@ -317,6 +341,7 @@ fn main() -> ExitCode {
             );
             launch(&path, "run", &target, &out, format, &arguments)
         }
+        Command::Schema => emit_text(compose_core::docs::SCHEMA),
         Command::Serve {
             path,
             host,
@@ -774,6 +799,22 @@ fn build_project(
         Ok(()) => ExitCode::from(verdict),
         Err(error) if departed(&error) => ExitCode::from(verdict),
         Err(error) => fail(&format!("cannot write the report: {error}")),
+    }
+}
+
+/// Print one embedded document to stdout, and exit `0`.
+///
+/// The discovery verbs (`schema`, and the ones that follow it) answer with a
+/// document rather than with a verdict: there is no composition to be right or
+/// wrong about, so the only outcomes are "here it is" and a usage error clap
+/// already reports. A reader that stops reading — `| head`, `| less` then `q` —
+/// is not a failure for the same reason it is not one under `validate`: it took
+/// as much of the answer as it wanted (see the module header).
+fn emit_text(text: &str) -> ExitCode {
+    match write(&mut io::stdout().lock(), text) {
+        Ok(()) => ExitCode::from(CLEAN),
+        Err(error) if departed(&error) => ExitCode::from(CLEAN),
+        Err(error) => fail(&format!("cannot write to standard output: {error}")),
     }
 }
 
