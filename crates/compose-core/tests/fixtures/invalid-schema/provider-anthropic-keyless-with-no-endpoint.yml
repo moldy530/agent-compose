@@ -1,0 +1,5 @@
+# rule: an `anthropic` provider declares `api_key:` where no `base_url:` names a gateway - with neither, the connection reaches Anthropic's own endpoint holding nothing that authenticates (grammar 12.1 / Decision D120)
+# at: /provider.claude
+# via: /$defs/providerDef/allOf/0/then/allOf/0/then/required
+provider.claude:
+  kind: anthropic

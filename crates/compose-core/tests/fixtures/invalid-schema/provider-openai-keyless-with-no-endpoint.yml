@@ -1,0 +1,5 @@
+# rule: an `openai` provider declares `api_key:` where no `base_url:` names a gateway - the same conditional as the `anthropic` row, hand-duplicated in the schema and so pinned separately (grammar 12.1 / Decision D120)
+# at: /provider.gpt
+# via: /$defs/providerDef/allOf/1/then/allOf/0/then/required
+provider.gpt:
+  kind: openai
