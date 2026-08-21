@@ -388,10 +388,18 @@ Validator guarantees for this file: all refs resolve and are correctly typed; `v
 - `agent-compose build`, `agent-compose run` (manual trigger), `agent-compose serve` (generated Fastify app for http triggers: start/resume/status), golden-file codegen tests.
 - Mock provider server + e2e harness: compiled graphs execute end-to-end in CI with scripted model responses, no API keys.
 
-**M2 — Ergonomics**
+**M2 — Ergonomics & local adoption**
+
+Exit criterion: a user can download a released binary, hand their coding agent the skill, and build/run flows locally — no clone of this repo, no Rust toolchain.
+
 - `agent-compose plan` (topology + validation diff between two specs).
-- Tracing conventions in generated code (routing decisions as trace data).
+- Tracing conventions in generated code: a documented, stable trace format; routing decisions (which edge fired and the guard values that decided it, which map variant a discriminator chose, what terminated a cycle) as trace data.
 - `eject` command.
+- `human` node runtime (interrupt/resume through `serve`; grammar shipped in M0, runtime deferred here per resolved q4).
+- Flow-as-tool runtime (unblocked by resolved q19/q20).
+- Progressive discovery: the binary teaches its own grammar. CLI surfaces sized for coding-agent consumption — topic-scoped grammar docs, expanded explanations for diagnostics, schema emission — so an agent can go from zero to authoring specs against only the installed binary.
+- Installable agent skill: a packaged skill definition teaching the CLI and the discovery loop, installable into a user's agent (Claude Code, Codex, …).
+- Release distribution: tagged releases publish prebuilt binaries for Linux and macOS (x86_64 + arm64) on GitHub Releases.
 
 **M3 — Distribution (design-gated)**
 - `--target distributed` via `RemoteGraph`; execute `placements`.
@@ -434,12 +442,15 @@ Formerly open, now settled — rationale lives in the referenced sections:
 17. **Fan-out and subgraph shaping** → map instances run inside the map node's own LangGraph task (bounded admission, index-tagged joins) rather than via top-level `Send`, and `flow:` nodes invoke separately compiled graphs rather than in-graph subgraphs. Rationale: instance isolation (item-scoped context, per-instance history, §9.4 instance paths) and the grammar's per-node §7.6 semantics are guaranteed directly instead of recovered from scheduler internals; grammar 7.6.4 clause 1 was verified to hold under this shaping. The 5.5/5.6 codegen columns are updated; `Send`/subgraph remain available shapings if LangGraph's semantics ever make them cheaper to prove (codegen ledger).
 18. **Runtime and package manager for generated artifacts** → **Bun by default; Node >= 22.18 a supported fallback; generated code free of Bun-only APIs.** Owner decision ("default to bun runtimes and pkg manager for generated artifacts"), interpreted as a statement about the *surfaces around* an emitted project rather than about the code inside it. Bun is what the emitted `README.md` documents first, what the generated-code gates, the property harness and the acceptance suite execute compiled graphs with, and what `run`/`serve` will launch; the gates install from a committed `bun.lock` with `--frozen-lockfile`, and CI pins the Bun version exactly for the reason 5.12 pins LangGraph exactly — a runtime that moved underneath CI would change what a green suite means with no commit saying so. The fallback is not a courtesy: `engines.node` carries the floor, `@types/node` stays on the same major, one gate installs a golden with npm and type-checks, constructs and runs it under Node (including re-deriving the inherited-property refusal list, which is the JavaScript *engine's* and must hold on both), a second answers both shared conformance corpora under that engine (a `format:` is a `RegExp` and the emitted CEL evaluator is `BigInt` arithmetic, so a corpus run under one engine says nothing about a reader on the other), and a static gate refuses any emitted module that names a `Bun` global, a `bun:` specifier, or an import outside the pinned set. The manifest itself stays installer-neutral: no `packageManager` field — it is corepack's, corepack does not manage Bun, and emitting it would pin every generated project to one Bun release while buying no determinism the exact version pins do not already give — and no emitted lockfile, because the reader's lockfile is the reader's (5.12).
 
+19. **Instance identity for model-invoked subflows** → a per-call ordinal, fixed by the grammar. A flow-tool invocation contributes the frame `<tool_name>/<call_ordinal>` beneath the invoking agent node's own frame, where the ordinal counts prior invocations of that flow-tool within this agent-node execution. Distinct calls in one tool loop get distinct instance paths (the collision §9.4 exists to prevent), and an agent-node retry restarts the ordinals, so the Nth call of a retried attempt reuses the Nth key of the failed one. Because the emitter is a nondeterministic model, that reuse is **positional, not semantic** — the accepted at-least-once compromise, stated openly in the grammar. The alternatives lose outright: a provider tool-use id is fresh on every retry, so key-reuse dies and every agent retry re-fires every child flow's side effects; an argument hash merges two intentional identical calls. Like every other frame, the key is derived, never authored — no spec construct configures it and there is nothing for `validate` to check (grammar §9.4).
+
+20. **Trace join for model-invoked subflows** → both surfaces, split by role — the span-link pattern. The child instance's full trace attaches as a canonical **dispatch record** keyed by its instance path (q19), exactly as a `flow:` node's instance does; the tool-call entry inside the agent's `ModelCall` records the call, the result the model saw, and the child's instance path as a **link**. Both invariants survive: every subflow instance in a trace is findable as a dispatch record (one shape for `plan`, replay, and the M2 tracing conventions to walk), and the tool loop's story is complete inside the `ModelCall` at the cost of one indirection. Nesting the child under the `ModelCall` alone would break the first invariant; a bare dispatch record alone would leave a tool call whose result came from nowhere.
+
 ## 10. Open Questions
 
 _New questions raised during grammar/spec work land here and must be resolved (moved to §9) before implementation of the affected area begins._
 
-1. **Instance identity for model-invoked subflows** (raised by flow-as-tool codegen): a flow called as a tool has no `flow:` node, so no instance path — but §9.4 idempotency keys and store scoping derive from that path, and two calls in one tool loop must not share one. What frame does a tool-call instantiation contribute (a per-call ordinal? the tool-loop turn?), and which policy level governs it? Gates the flow-as-tool runtime; until resolved, the tool is emitted and visible but its invocation returns a documented not-implemented error.
-2. **Trace join for model-invoked subflows**: where does a tool-invoked subflow instance's trace attach — inside the agent node's `ModelCall` record (like a tool call) or as a dispatch record (like a `flow:` node)? Gates the same runtime.
+_None currently open._
 
 ## 11. References
 
