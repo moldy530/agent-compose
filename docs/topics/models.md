@@ -114,11 +114,17 @@ is what the opening spec's `provider.gateway` shows:
     authorization: "Bearer ${PROXY_TOKEN}"
 ```
 
-The other four kinds are unchanged. `azure_openai` reaches a per-resource
-deployment with no default endpoint to fall back to, so all three of its keys
-stay required; `openai_compatible` already paired an optional `api_key` with a
-required `base_url`; and `bedrock` and `vertex` authenticate through their
-cloud's own credential chain.
+The other four kinds keep the rows they had. `azure_openai` reaches a
+per-resource deployment with no default endpoint to fall back to, so all three
+of its keys stay required; `openai_compatible` already paired an optional
+`api_key` with a required `base_url`; and `bedrock` and `vertex` authenticate
+through their cloud's own credential chain.
+
+The **header** rule above still reaches one of them, because it is stated over
+the connection rather than over the kind: an `openai_compatible` provider that
+declares no `api_key:` — a local llama.cpp or ollama endpoint — now sends no
+`Authorization` header at all, where before it sent an empty `Bearer `. Same fix
+for the same reason, on a kind whose row did not move.
 
 **Credentials are never literals.** `api_key`, `api_secret`, `token`,
 `password`, `access_key_id`, `secret_access_key`, `session_token`,

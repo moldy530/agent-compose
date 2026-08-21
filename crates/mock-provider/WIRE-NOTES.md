@@ -348,12 +348,14 @@ and the run fails with the queue empty rather than passing.
 
 ### 12. Request-header checks are presence checks, and only where the grammar makes the header unconditional
 
-`content-type: application/json` and `anthropic-version` are required on every
-request that carries them at all; `api-key` (or a bearer token) is required on
-the Azure routes. Values are never compared: the harness needs **no API keys**
-(PRD §7 M1), so any non-empty placeholder passes. What is being checked is that
-generated code sends the header at all, which a live call would otherwise be the
-first to discover.
+`content-type: application/json` is required on **every** request, and
+`anthropic-version` on every request to the Messages route — unconditionally
+both, with nothing relaxed by D120 below: `src/anthropic.rs`'s `check_headers`
+fails an absent `anthropic-version`, and both surfaces fail a `content-type`
+that is not JSON. `api-key` (or a bearer token) is required on the Azure routes.
+Values are never compared: the harness needs **no API keys** (PRD §7 M1), so any
+non-empty placeholder passes. What is being checked is that generated code sends
+the header at all, which a live call would otherwise be the first to discover.
 
 **A credential's *presence* is required only where a composition must carry one;
 its *shape* is required everywhere.** Grammar 12.1's row is what decides the
