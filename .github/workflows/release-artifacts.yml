@@ -1,0 +1,276 @@
+name: Release artifacts
+
+# Build, check and package the released binaries — the *whole* of the release
+# except publishing it.
+#
+# It is a callable workflow so that the tag path (`release.yml`) and the gate
+# that runs on every pull request (`release-dry-run.yml`) are the same steps
+# rather than two copies that agree until one is edited. A release pipeline is
+# exercised, by definition, on the day it must not fail; the only way to know it
+# works is to have run it already.
+#
+# What each artifact is held to before it is packaged, and why:
+#
+#   * the binary is for the architecture the matrix leg claims — a mislabelled
+#     tarball is the failure a user cannot diagnose, because the file they
+#     downloaded is named for what they wanted;
+#   * a Linux binary is **statically linked** (PRD 5.12's single-binary posture:
+#     it must survive an alpine container and an old glibc alike), and a macOS
+#     one links nothing the system does not ship;
+#   * `--version` names the crate version the archive is named for and the
+#     target it was built for;
+#   * `init` then `validate` — the first two steps of the discovery loop
+#     (PRD §7 M2), run through the binary that is about to be published.
+
+on:
+  workflow_call:
+    inputs:
+      targets:
+        description: >-
+          The matrix, as a JSON array of `{"triple": …, "runner": …}` objects.
+        required: true
+        type: string
+      expected-version:
+        description: >-
+          The release tag these artifacts claim to be (`v0.1.0`). When it is
+          set, the crate version must equal it or nothing is built. Empty on the
+          dry-run path, which claims no version.
+        required: false
+        default: ''
+        type: string
+      cache:
+        description: >-
+          Restore and save a cargo cache. On for the pull-request gate, where
+          the point is a fast answer; off for a release, where the point is that
+          nothing a previous run left behind can reach a published artifact.
+        required: false
+        default: false
+        type: boolean
+    outputs:
+      version:
+        description: The crate version every artifact was built from and named for.
+        value: ${{ jobs.version.outputs.version }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The guard, and the single place the version is read. Everything downstream
+  # takes the number from here, so an artifact's name, the tag it was released
+  # under, and what `--version` prints cannot disagree.
+  version:
+    name: Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.crate.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      # `cargo metadata` rather than a hand-parse of `Cargo.toml`: the version
+      # lives in `[workspace.package]` and the package that names the binary
+      # inherits it, so the manifest a parse would reach for does not carry the
+      # number. It costs the pinned toolchain's install to read one string, and
+      # buys an answer that stays right when the manifests are rearranged.
+      - name: Read the crate version, and hold the tag to it
+        id: crate
+        env:
+          EXPECTED: ${{ inputs.expected-version }}
+        run: |
+          version="$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name == "agent-compose") | .version')"
+          if [ -z "$version" ] || [ "$version" = "null" ]; then
+            echo "::error::could not read the \`agent-compose\` version out of cargo metadata"
+            exit 1
+          fi
+          claimed="${EXPECTED#v}"
+          if [ -n "$claimed" ] && [ "$claimed" != "$version" ]; then
+            echo "::error::the tag says $EXPECTED and Cargo.toml says $version. A release names one build: retag, or bump the crate version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "building agent-compose $version"
+
+  build:
+    name: ${{ matrix.target.triple }}
+    needs: version
+    runs-on: ${{ matrix.target.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(inputs.targets) }}
+    env:
+      TRIPLE: ${{ matrix.target.triple }}
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # `dtolnay/rust-toolchain` and `Swatinem/rust-cache` (below) are the two
+      # non-`actions/*` actions this pipeline uses, and both are the ones
+      # `ci.yml` already runs: installing a *pinned* toolchain with an added
+      # target is what `rustup` does, and the alternative is hand-written
+      # `rustup` lines that would drift from CI's.
+      #
+      # **Pinned by commit, not by `@stable`.** A branch or a tag is whatever it
+      # was moved to last night, and this job produces the bytes people
+      # download — a mutable ref here is somebody else's push landing inside our
+      # release. The sha is the `stable` branch's head on 2026-08-04; the
+      # toolchain it installs is named below rather than by the branch, so the
+      # pin holds the action's own code still and nothing else. Bumping it is a
+      # commit that says so, in `ci.yml` and here together.
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.94.1
+          targets: ${{ matrix.target.triple }}
+
+      # Swatinem/rust-cache v2.9.2, pinned by commit for the same reason.
+      - if: inputs.cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          key: ${{ matrix.target.triple }}
+
+      # `qemu-aarch64-static` runs a *static* aarch64 binary directly — no
+      # container, no `binfmt` registration, no privileged step — which is
+      # exactly what makes the smoke test below affordable on the one leg an
+      # x86_64 runner cannot execute natively. Only the archive matters, so the
+      # install is retried rather than allowed to fail a release on a mirror
+      # hiccup.
+      - name: Install qemu, so the aarch64 binary can be run here
+        if: matrix.target.triple == 'aarch64-unknown-linux-musl'
+        run: |
+          for attempt in 1 2 3; do
+            if sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends qemu-user-static; then
+              exit 0
+            fi
+            echo "apt failed (attempt $attempt)"
+            sleep $((attempt * 5))
+          done
+          echo "::error::could not install qemu-user-static"
+          exit 1
+
+      - name: Build
+        env:
+          # The commit `--version` carries. The build script would ask the
+          # checkout for it; handing it over means the answer is the sha this
+          # run is *for*, whatever the checkout's depth or detachment.
+          GIT_SHA: ${{ github.sha }}
+          # The one target with no linker on its runner. `rust-lld` ships inside
+          # the toolchain and links a pure-Rust static binary for another
+          # architecture without a cross C toolchain, a container, or a
+          # third-party build action — and every dependency of this crate is
+          # pure Rust, which is what makes that hold. Cargo reads only the
+          # variable that matches the target being built, so this is inert on
+          # the other three legs.
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
+        run: cargo build --release --locked -p agent-compose --target "$TRIPLE"
+
+      - name: The binary is for the architecture this leg claims
+        run: |
+          binary="target/$TRIPLE/release/agent-compose"
+          file "$binary"
+          case "$TRIPLE" in
+            x86_64-*linux*) want="x86-64" ;;
+            aarch64-*linux*) want="ARM aarch64" ;;
+            x86_64-apple-*) want="x86_64" ;;
+            aarch64-apple-*) want="arm64" ;;
+            *) echo "::error::no architecture expected for $TRIPLE"; exit 1 ;;
+          esac
+          if ! file "$binary" | grep -q "$want"; then
+            echo "::error::$TRIPLE built something that is not $want"
+            exit 1
+          fi
+
+      # PRD 5.12: the compiler is a single static binary. On Linux that is
+      # checkable and is checked — a `musl` build that picked up a dynamic
+      # loader would run on this runner and fail on the alpine container the
+      # posture promises. `file` reports it two ways depending on whether the
+      # link was position-independent, and both are static.
+      - name: The Linux binary is static
+        if: contains(matrix.target.triple, 'linux')
+        run: |
+          binary="target/$TRIPLE/release/agent-compose"
+          if ! file "$binary" | grep -Eq 'static-pie linked|statically linked'; then
+            echo "::error::$TRIPLE is not statically linked: $(file "$binary")"
+            exit 1
+          fi
+          ldd "$binary" || true
+
+      # macOS has no static libSystem, so the equivalent promise is narrower and
+      # is the one Apple supports: nothing outside what the system itself ships
+      # — `/usr/lib` and the system frameworks, which are on every machine. A
+      # Homebrew dylib from `/opt/homebrew` or `/usr/local` finding its way in is
+      # the failure this catches, and it is the failure that would make an
+      # artifact run on the runner and nowhere else.
+      - name: The macOS binary links only what macOS ships
+        if: contains(matrix.target.triple, 'darwin')
+        run: |
+          binary="target/$TRIPLE/release/agent-compose"
+          otool -L "$binary"
+          outside="$(otool -L "$binary" | tail -n +2 | awk '{ print $1 }' \
+            | grep -Ev '^(/usr/lib/|/System/Library/Frameworks/)' || true)"
+          if [ -n "$outside" ]; then
+            echo "::error::$TRIPLE links against something macOS does not ship: $outside"
+            exit 1
+          fi
+
+      # The discovery loop's own first steps (PRD §7 M2), asked of the binary
+      # that is about to be packaged. `--version` is held to naming *this*
+      # version and *this* target, which is what catches an artifact that was
+      # built or labelled as something else.
+      - name: Smoke-test the binary
+        run: |
+          binary="$PWD/target/$TRIPLE/release/agent-compose"
+          launcher=()
+          case "$TRIPLE" in
+            aarch64-unknown-linux-musl)
+              launcher=(qemu-aarch64-static)
+              ;;
+            x86_64-apple-darwin)
+              # An arm64 runner needs Rosetta to run this one. When it has none
+              # the artifact keeps every check above and loses this one, which
+              # the warning says out loud rather than passing quietly.
+              if arch -x86_64 /usr/bin/true 2>/dev/null; then
+                launcher=(arch -x86_64)
+              else
+                echo "::warning::this runner cannot execute x86_64 binaries, so the $TRIPLE artifact was checked but not run"
+                exit 0
+              fi
+              ;;
+          esac
+
+          printed="$("${launcher[@]}" "$binary" --version)"
+          echo "$printed"
+          case "$printed" in
+            "agent-compose $VERSION ("*", $TRIPLE)") ;;
+            *)
+              echo "::error::--version says '$printed', which is not the $VERSION build for $TRIPLE"
+              exit 1
+              ;;
+          esac
+
+          work="$(mktemp -d)"
+          "${launcher[@]}" "$binary" init "$work/scaffold"
+          "${launcher[@]}" "$binary" validate "$work/scaffold/main.yml"
+
+      # One binary, plus the licence when the repository has one. Nothing else:
+      # there is nothing else to install.
+      - name: Package
+        run: |
+          stage="$RUNNER_TEMP/stage"
+          rm -rf "$stage"
+          mkdir -p "$stage" dist
+          cp "target/$TRIPLE/release/agent-compose" "$stage/agent-compose"
+          members=(agent-compose)
+          if [ -f LICENSE ]; then
+            cp LICENSE "$stage/LICENSE"
+            members+=(LICENSE)
+          fi
+          archive="agent-compose-$VERSION-$TRIPLE.tar.gz"
+          tar -czf "$PWD/dist/$archive" -C "$stage" "${members[@]}"
+          tar -tzf "$PWD/dist/$archive"
+          ls -l "dist/$archive"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-compose-${{ matrix.target.triple }}
+          path: dist/agent-compose-*.tar.gz
+          if-no-files-found: error
+          retention-days: 7

@@ -5,6 +5,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+# Declared rather than left to cargo's auto-detection, because this package has
+# *two* files called `build.rs` and only one of them is a build script: this one
+# stamps the commit and the target into `--version`, while `src/build.rs` is the
+# module behind the `build` verb. Naming the script here says which is which to
+# a reader who meets the other one first.
+build = "build.rs"
 
 [dependencies]
 compose-core = { workspace = true }

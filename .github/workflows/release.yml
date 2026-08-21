@@ -1,0 +1,78 @@
+name: Release
+
+# A tagged commit becomes downloadable binaries (PRD §7 M2).
+#
+# Push `v<version>` and this builds the four artifacts, checks each one, and
+# publishes them with a `SHA256SUMS` over all four. The tag must equal the crate
+# version — `release-artifacts.yml`'s `version` job is the guard, and it names
+# both numbers when they disagree.
+#
+# The build steps are not written here. They are `release-artifacts.yml`, which
+# every pull request runs too (`release-dry-run.yml`), so the day a release is
+# cut is not the day the pipeline is first exercised.
+
+on:
+  push:
+    tags:
+      - 'v[0-9]*'
+
+permissions:
+  contents: read
+
+jobs:
+  artifacts:
+    uses: ./.github/workflows/release-artifacts.yml
+    with:
+      expected-version: ${{ github.ref_name }}
+      # No cargo cache on this path: nothing a previous run left behind can
+      # reach a binary somebody downloads.
+      targets: >-
+        [
+          {"triple": "x86_64-unknown-linux-musl", "runner": "ubuntu-latest"},
+          {"triple": "aarch64-unknown-linux-musl", "runner": "ubuntu-latest"},
+          {"triple": "x86_64-apple-darwin", "runner": "macos-14"},
+          {"triple": "aarch64-apple-darwin", "runner": "macos-14"}
+        ]
+
+  publish:
+    name: Publish
+    needs: artifacts
+    runs-on: ubuntu-latest
+    permissions:
+      # The one write in the pipeline, and the only job that has it.
+      contents: write
+    env:
+      VERSION: ${{ needs.artifacts.outputs.version }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # Four archives and one file vouching for all of them, which is what
+      # `install.sh` verifies a download against. Bare names, because that is
+      # what the file's readers — `sha256sum -c`, `shasum -c`, the installer's
+      # own field match — expect beside the archive they are checking.
+      - name: Assemble, and checksum
+        run: |
+          cd dist
+          ls -l
+          found="$(find . -maxdepth 1 -name 'agent-compose-*.tar.gz' | wc -l)"
+          if [ "$found" -ne 4 ]; then
+            echo "::error::a release carries four archives; this run produced $found"
+            exit 1
+          fi
+          sha256sum agent-compose-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" \
+            --verify-tag \
+            --generate-notes \
+            dist/agent-compose-"$VERSION"-*.tar.gz dist/SHA256SUMS
