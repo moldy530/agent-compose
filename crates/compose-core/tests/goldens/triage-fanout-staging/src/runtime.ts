@@ -1041,6 +1041,12 @@ export type ProviderKind =
 export interface ProviderBinding {
   readonly address: string;
   readonly kind: ProviderKind;
+  /**
+   * `api_key:`, where the composition declared one. **Absent** is a connection
+   * through a gateway that injects the vendor credential itself (grammar 12.1,
+   * Decision D120), and [`credential`] sends no authentication header for it —
+   * so this stays optional rather than being defaulted to `""` anywhere.
+   */
   readonly apiKey?: string;
   readonly baseUrl?: string;
   readonly apiVersion?: string;
@@ -1411,6 +1417,34 @@ function baseUrl(provider: ProviderBinding): string {
   throw new Error(
     `\`${provider.address}\` is \`kind: ${provider.kind}\` and reached the wire with no \`base_url:\``,
   );
+}
+
+/**
+ * The authentication header one connection sends — or **no header at all**.
+ *
+ * A provider that declares no `api_key:` declared a `base_url:` instead
+ * (grammar 12.1, Decision D120): it points at a gateway that injects the vendor
+ * credential server-side, so the request this runtime sends must carry none.
+ * The header is *dropped*, not emptied. `x-api-key: ""` and
+ * `authorization: Bearer ` are requests that claim to authenticate and fail — a
+ * gateway is entitled to refuse one before injecting anything, and a gateway
+ * that forwards headers verbatim turns it into a 401 at the vendor, which is
+ * the one failure the keyless deployment was configured to avoid.
+ *
+ * `spelling` belongs to the **wire**, not to the kind: the Messages API reads
+ * `x-api-key`, Chat Completions a bearer `authorization`, and Azure its own
+ * `api-key` — whose `api_key:` grammar 12.1 still requires, so that branch
+ * always has a key to send. Whatever a provider's `headers:` declares wins over
+ * this, since `send` composes it as a later layer: a gateway wanting a token of
+ * its own is a declared header rather than a vendor credential.
+ */
+function credential(
+  provider: ProviderBinding,
+  spelling: "x-api-key" | "authorization" | "api-key",
+): Record<string, string> {
+  const key = provider.apiKey;
+  if (key === undefined) return {};
+  return { [spelling]: spelling === "authorization" ? `Bearer ${key}` : key };
 }
 
 /**
@@ -1797,7 +1831,7 @@ async function callMessages(
     model,
     `${baseUrl(model.provider)}/v1/messages`,
     {
-      "x-api-key": model.provider.apiKey ?? "",
+      ...credential(model.provider, "x-api-key"),
       "anthropic-version": "2023-06-01",
     },
     body,
@@ -1959,14 +1993,10 @@ function openAiRequest(provider: ProviderBinding): {
   headers: Record<string, string>;
   query: string;
 } {
-  const headers: Record<string, string> = {};
-  if (provider.kind === "azure_openai") {
-    headers["api-key"] = provider.apiKey ?? "";
-  } else {
-    headers["authorization"] = `Bearer ${provider.apiKey ?? ""}`;
-    if (provider.organization !== undefined) {
-      headers["openai-organization"] = provider.organization;
-    }
+  const azure = provider.kind === "azure_openai";
+  const headers: Record<string, string> = credential(provider, azure ? "api-key" : "authorization");
+  if (!azure && provider.organization !== undefined) {
+    headers["openai-organization"] = provider.organization;
   }
   const query =
     provider.kind === "azure_openai" && provider.apiVersion !== undefined
