@@ -3424,8 +3424,8 @@ v0 provider kinds and the keys each one takes, `kind:` and `description:` aside:
 
 | `kind` | Required | Optional |
 |---|---|---|
-| `anthropic` | `api_key` **or** `base_url` (below) | `base_url`, `headers` |
-| `openai` | `api_key` **or** `base_url` (below) | `base_url`, `headers`, `organization` |
+| `anthropic` | `api_key` — **or** a `base_url` naming the gateway that holds one (below) | `api_key` (beside a `base_url`), `base_url`, `headers` |
+| `openai` | `api_key` — **or** a `base_url` naming the gateway that holds one (below) | `api_key` (beside a `base_url`), `base_url`, `headers`, `organization` |
 | `openai_compatible` | `base_url` | `api_key`, `headers` |
 | `azure_openai` | `base_url`, `api_key`, `api_version` | `headers` |
 | `bedrock` | `region` | `access_key_id`, `secret_access_key`, `session_token`, `profile` |
