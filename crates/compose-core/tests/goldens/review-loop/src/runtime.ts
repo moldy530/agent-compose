@@ -145,7 +145,8 @@ export class NoViableRoute extends Error {
  *
  * What it does **not** wrap is the arguments failing the flow's own `inputs:`.
  * That failure happens before anything is instantiated, and it is reported the
- * way every other tool surface reports one — see [`callSubflowTool`].
+ * way every other tool surface reports one — as a [`ToolCallRefused`], which
+ * goes back to the model rather than out of the node (Decision D119).
  */
 export class ToolFailure extends Error {
   /** The name the model called it by (grammar 5.4). */
@@ -251,17 +252,47 @@ export class ResultMismatch extends Error {
   readonly subject: string;
 
   constructor(subject: string, value: unknown, issues: readonly ResultIssue[]) {
-    const described = issues
-      .map((issue) => {
-        const path = issue.path.map(String).join(".");
-        const found = valueAt(value, issue.path);
-        const at = path === "" ? "" : `${path}: `;
-        return found === undefined ? `${at}${issue.message}` : `${at}${issue.message} (found ${excerpt(found)})`;
-      })
-      .join("; ");
-    super(`${subject}: ${described}`);
+    super(`${subject}: ${describeIssues(value, issues)}`);
     this.name = "ResultMismatch";
     this.subject = subject;
+  }
+}
+
+/**
+ * A tool call the model can fix by **calling differently** (Decision D119, PRD
+ * §9.22).
+ *
+ * The class the tool loop reads to tell the two kinds of tool-call failure
+ * apart, and the whole of that distinction:
+ *
+ *  * a call the tool's declared contract **refuses** — arguments its schema does
+ *    not admit, on any of the three surfaces (grammar §6, §5.4, §11.5), or a name
+ *    the agent never offered — is raised as this, and the loop hands its
+ *    `message` back to the model as an error tool result so the model can answer
+ *    with a different call;
+ *  * a failure of the tool's **execution** — a subprocess that exited nonzero, an
+ *    HTTP request that was refused, a child flow instance that failed, a store
+ *    backend that could not answer — is raised as whatever it is, leaves the
+ *    tool, and fails the agent node the way it always has, with grammar §9's
+ *    chain deciding the run. Rephrasing the call would not fix any of those.
+ *
+ * The `message` is therefore written for two readers at once: the *model*, which
+ * is handed it verbatim as the error tool result, and the person reading
+ * [`ToolCallRecord.error`], which carries it through [`describe`] — so the
+ * record reads `ToolCallRefused: <message>`, `docs/trace.md` §3's shape for
+ * every error this format spells, and the model's copy is the bare sentence
+ * with no class in front of it. One sentence, two spellings of the same
+ * envelope.
+ *
+ * It names what the compiler's own diagnostics would name — the tool, the field,
+ * the constraint it failed, and an excerpt of the offending value (PRD G3). The
+ * excerpt is the model's own arguments coming back to it, which is why quoting
+ * them here costs nothing this format was protecting (`docs/trace.md` §11).
+ */
+export class ToolCallRefused extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ToolCallRefused";
   }
 }
 
@@ -297,6 +328,32 @@ function excerpt(value: unknown): string {
 }
 
 /**
+ * What a schema refused, in the voice [`ResultMismatch`] explains: the failing
+ * path, the constraint, and what was actually there.
+ *
+ * Written once and read twice, because a refusal a *model* has to act on and a
+ * mismatch a *person* has to fix want exactly the same sentence — see
+ * [`ToolCallRefused`], whose message is this text under a different class.
+ *
+ * A schema that refused without saying why still gets a sentence, because both
+ * readers are worse off with an empty one: a model handed `<subject>: ` has
+ * nothing to correct and will spend the loop's bound repeating itself, and a
+ * person reading it cannot tell a refusal from a truncation. The callers pass
+ * `issues` defensively (`?? []`) for the same reason this clause exists.
+ */
+function describeIssues(value: unknown, issues: readonly ResultIssue[]): string {
+  if (issues.length === 0) return "the schema refused it and reported no issue";
+  return issues
+    .map((issue) => {
+      const path = issue.path.map(String).join(".");
+      const found = valueAt(value, issue.path);
+      const at = path === "" ? "" : `${path}: `;
+      return found === undefined ? `${at}${issue.message}` : `${at}${issue.message} (found ${excerpt(found)})`;
+    })
+    .join("; ");
+}
+
+/**
  * Parse one result with the schema its contract declares, or say what was wrong
  * with it (PRD 5.2, and see [`ResultMismatch`]).
  */
@@ -304,6 +361,46 @@ export function parseResult<T>(schema: ResultSchema<T>, value: unknown, subject:
   const parsed = schema.safeParse(value);
   if (parsed.success) return parsed.data as T;
   throw new ResultMismatch(subject, value, parsed.error?.issues ?? []);
+}
+
+/**
+ * Parse the arguments a **model** called a tool with (Decision D119, PRD §9.22).
+ *
+ * [`parseResult`]'s sibling at the one parse site whose failure is not the run's
+ * problem to end: the model chose these arguments, so a schema that refuses them
+ * is a call it can make again differently. The message is byte-for-byte the one
+ * [`ResultMismatch`] would have raised — the same subject, the same issues, the
+ * same excerpt — under [`ToolCallRefused`], which is the class [`callAgent`]
+ * reads to decide that the failure goes back to the model instead of out of the
+ * node.
+ *
+ * All three tool surfaces parse here, and that uniformity is the rule rather
+ * than an implementation detail: grammar §5.4 makes "attached as a tool" mean one
+ * thing, so a `tool.*`'s declared `input:`, a synthesized store tool's argument
+ * surface and a `flow.*`'s `inputs:` refuse a call the same way. Each parses at
+ * its **attachment** — the entry in an agent's `tools:` — rather than inside the
+ * thing attached, which is what keeps the two `tool.*` call sites apart: the same
+ * `tool.*` reached from a `function:` node parses with [`parseResult`], because
+ * there the arguments are the composition's and grammar §8.4 has already checked
+ * them field-by-field, so a mismatch is the graph's own failure and there is
+ * nobody to hand it to.
+ *
+ * `subject` is therefore the name the **model** called, not the component's
+ * address: the sentence is going to a reader whose only way to call again is the
+ * name the wire offered it (`lookup`, not `tool.lookup`).
+ *
+ * What is *not* parsed here is any tool's **result** — that is [`parseResult`]
+ * still, because a tool that answered off-contract is not a call the model can
+ * rephrase.
+ */
+export function parseToolArguments<T>(
+  schema: ResultSchema<T>,
+  args: unknown,
+  subject: string,
+): T {
+  const parsed = schema.safeParse(args);
+  if (parsed.success) return parsed.data as T;
+  throw new ToolCallRefused(`${subject}: ${describeIssues(args, parsed.error?.issues ?? [])}`);
 }
 
 /** A provider answered something other than a completion. */
@@ -1090,11 +1187,22 @@ export interface ToolCallRecord {
   readonly name: string;
   /**
    * The component behind that name, as a typed address (grammar 2.2). Absent on
-   * the one call with no component behind it: a name the agent does not offer.
+   * the one call with no component behind it: a name the agent does not offer,
+   * which since Decision D119 is a call the model is asked to make again.
    */
   readonly target?: string;
-  /** Whether the loop handed the model a result, or the call ended the node. */
-  readonly outcome: "completed" | "failed";
+  /**
+   * What the loop did with the call (Decision D119, `docs/trace.md` §7.3):
+   *
+   *  * `"completed"` — it ran, and the model was handed its result;
+   *  * `"refused"` — the contract did not admit it, and the model was handed the
+   *    refusal instead: arguments a schema refused, or a name the agent never
+   *    offered. The loop carried on, so records **after** one of these exist;
+   *  * `"failed"` — the tool's execution failed, which left the tool and **ended
+   *    the node**; the model saw nothing back and the node's own `on_error:`
+   *    decided the run (grammar 9.2).
+   */
+  readonly outcome: "completed" | "refused" | "failed";
   /**
    * The child instance this call ran, as the dispatch record carrying its trace
    * spells itself in `idempotencyKey` — so the link is string equality.
@@ -1116,12 +1224,21 @@ export interface ToolCallRecord {
    * is what carves this one out — "a bare dispatch record alone would leave a
    * tool call whose result came from nowhere".
    *
-   * Absent on a call that **failed**, and that absence is the record: the
-   * failure left the tool, so the model saw nothing to record. A call whose
-   * instance failed is exactly that — an [`instance`] with no result beside it.
+   * Absent on a call that **failed** or was **refused**, and that absence is the
+   * record: a failure left the tool and a refusal never entered it, so in
+   * neither case did the model see a result. A call whose instance failed is
+   * exactly that — an [`instance`] with no result beside it — and a refused one
+   * carries neither.
    */
   readonly result?: unknown;
-  /** What went wrong, in `docs/trace.md` §3's `<error name>: <message>` shape. */
+  /**
+   * What went wrong, in `docs/trace.md` §3's `<error name>: <message>` shape —
+   * on a `"failed"` call and on a `"refused"` one, where the `<message>` half is
+   * byte for byte the sentence the model was handed back and the `<error name>`
+   * half is `ToolCallRefused`, the envelope this format adds and the model's
+   * copy does not carry. The two differ by that prefix and by nothing else
+   * (Decision D119, [`ToolCallRefused`]).
+   */
   readonly error?: string;
 }
 
@@ -1182,7 +1299,28 @@ export type Turn =
     }
   | {
       readonly role: "tool";
-      readonly results: readonly { id: string; name: string; content: string }[];
+      /**
+       * One entry per call the answer being replied to asked for, in that order.
+       *
+       * `isError` marks the ones the loop **refused** (Decision D119): the
+       * content is the refusal rather than a result, and each surface says so
+       * its own way — the Messages API with `is_error: true` on the
+       * `tool_result` block, Chat Completions with nothing, because a `tool`
+       * role message carries no such flag and the text is the whole of what it
+       * has (`WIRE-NOTES` (18)).
+       *
+       * `name` is carried for the one refusal that is not about arguments: a
+       * call to a tool the agent never offered. Chat Completions refuses a
+       * request whose history names an undeclared function, so
+       * [`callChatCompletions`] reads this to tell the results it may answer as
+       * `tool` messages from the one it has to carry another way.
+       */
+      readonly results: readonly {
+        id: string;
+        name: string;
+        content: string;
+        isError?: boolean;
+      }[];
     };
 
 /** What a model answered. */
@@ -1612,6 +1750,14 @@ async function callMessages(
           type: "tool_result",
           tool_use_id: result.id,
           content: result.content,
+          // The Messages API's own way of saying "this call did not work":
+          // the block is answered, so the `tool_use` it closes is not left
+          // dangling, and the flag is what tells the model the content is a
+          // refusal rather than a result (Decision D119, `WIRE-NOTES` (18)).
+          // Absent — not `false` — on every result that is one, because the key
+          // is optional and a request that spelled it out on every block would
+          // be sending a field no successful call has.
+          ...(result.isError === true ? { is_error: true } : {}),
         })),
       };
     }
@@ -1690,6 +1836,15 @@ async function callChatCompletions(
   },
   signal: AbortSignal,
 ): Promise<ModelAnswer> {
+  // What this request declares is also what its **history** may name on this
+  // surface, and that is the one rule the two wires do not share: Chat
+  // Completions re-validates an assistant turn's `tool_calls` against `tools`
+  // and refuses a name it does not find there, while the Messages API does not
+  // (`WIRE-NOTES` (18)). The only turn that can carry such a name is an answer
+  // that called a tool the agent never offered, which Decision D119 refuses and
+  // the loop then replays — so that turn is rendered here rather than sent as it
+  // stands.
+  const declared = new Set(request.tools.map((tool) => tool.name));
   const messages: Record<string, unknown>[] = [{ role: "system", content: request.system }];
   for (const turn of request.turns) {
     if (turn.role === "user") {
@@ -1697,14 +1852,43 @@ async function callChatCompletions(
       continue;
     }
     if (turn.role === "tool") {
+      // A refused call is answered here too, and with no flag beside it: the
+      // `tool` role message is closed to `role`, `content` and `tool_call_id`,
+      // so this surface has no `is_error` to set and the refusal text *is* the
+      // message (Decision D119, `WIRE-NOTES` (18)). Answering it at all is the
+      // load-bearing half — an unanswered `tool_call_id` is a request this
+      // surface refuses.
+      //
+      // Except for the calls whose `tool_call` this surface would not let the
+      // assistant turn carry: a `tool` message answering an id no assistant
+      // message asked for is refused just as loudly, so their refusals travel as
+      // a `user` turn — after the `tool` messages, so that nothing comes between
+      // an assistant turn and the answers to it.
+      const unoffered: string[] = [];
       for (const result of turn.results) {
+        if (!declared.has(result.name)) {
+          unoffered.push(result.content);
+          continue;
+        }
         messages.push({ role: "tool", tool_call_id: result.id, content: result.content });
       }
+      if (unoffered.length > 0) messages.push({ role: "user", content: unoffered.join("\n\n") });
       continue;
     }
-    const message: Record<string, unknown> = { role: "assistant", content: turn.text ?? null };
-    if (turn.toolCalls !== undefined && turn.toolCalls.length > 0) {
-      message["tool_calls"] = turn.toolCalls.map((call) => ({
+    const offered = (turn.toolCalls ?? []).filter((call) => declared.has(call.name));
+    const text = turn.text ?? null;
+    if (offered.length === 0 && (text === null || text === "")) {
+      // The whole of this turn was calls this request may not name, so there is
+      // nothing left of it to send: an assistant message carrying neither
+      // `content` nor `tool_calls` is one this surface refuses, and an empty
+      // `content` invented to carry it would be a turn the model did not send.
+      // Nothing is lost that the model needs — the refusal that follows names
+      // the call it made, in full.
+      continue;
+    }
+    const message: Record<string, unknown> = { role: "assistant", content: text };
+    if (offered.length > 0) {
+      message["tool_calls"] = offered.map((call) => ({
         id: call.id,
         type: "function",
         function: { name: call.name, arguments: JSON.stringify(call.args) },
@@ -1926,12 +2110,19 @@ export interface ToolCallSite {
   /** The calling agent execution's own frames ([`AgentSite.path`]). */
   readonly path: readonly string[];
   /**
-   * How many times **this tool** has already been called in this agent
+   * How many times **this tool** has already been *invoked* in this agent
    * execution, `0` on the first — grammar 9.4's flow-tool ordinal (PRD §9.19).
    *
+   * Invoked, not called, and the word is grammar 9.4's own: a call the tool's
+   * contract **refused** (Decision D119) never reached the tool, so it claims no
+   * ordinal and the next call takes the frame the refused one was offered. That
+   * is what keeps a model's mistake from re-keying work that has nothing to do
+   * with it — a loop that refused once and then got it right derives the same
+   * key as one that got it right first time.
+   *
    * It counts within one agent-node *execution*, so a node-level `retry:`
-   * restarts it: the Nth call of a retried attempt reuses the Nth key of the
-   * failed one, which is the positional — not semantic — reuse the grammar
+   * restarts it: the Nth invocation of a retried attempt reuses the Nth key of
+   * the failed one, which is the positional — not semantic — reuse the grammar
    * states openly.
    */
   readonly ordinal: number;
@@ -2004,12 +2195,12 @@ export interface SubflowTool {
  *
  *  * **the arguments are parsed** against the flow's own `inputs:` before an
  *    instance exists. A mismatch is reported exactly as one is for a `tool.*`
- *    and for a synthesized store tool — the failure leaves the tool, so the
- *    agent node fails and grammar 9's chain decides what happens next. It is
- *    deliberately *not* handed back to the model as a tool result: an argument
- *    the contract refuses is the same event on all three tool surfaces, and one
- *    surface answering it differently would make "attached as a tool" mean two
- *    things;
+ *    and for a synthesized store tool — as a [`ToolCallRefused`], which
+ *    [`callAgent`] hands **back to the model** as an error tool result so it can
+ *    call again with arguments the contract admits (Decision D119, PRD §9.22).
+ *    An argument the contract refuses is the same event on all three tool
+ *    surfaces, and one surface answering it differently would make "attached as
+ *    a tool" mean two things;
  *  * **the instance runs beneath this call's own frame** (grammar 9.4, PRD
  *    §9.19), so a store write inside it derives a key no other call of this loop
  *    derives, and the node's clock crosses the boundary the way a `flow:` node's
@@ -2029,11 +2220,13 @@ export async function callSubflowTool(
   site: ToolCallSite,
 ): Promise<unknown> {
   // Outside the `try`, and outside the record: nothing was instantiated, so
-  // there is no dispatch to report and no instance for a trace to come from.
+  // there is no dispatch to report and no instance for a trace to come from —
+  // and, since D119, nothing for the *model* to have caused beyond a call it can
+  // make again.
   const inputs =
     tool.inputs === undefined
       ? {}
-      : (parseResult(
+      : (parseToolArguments(
           tool.inputs,
           args,
           `the arguments \`${tool.name}\` was called with`,
@@ -2097,6 +2290,25 @@ export async function callSubflowTool(
  *    spending it is a node error rather than a silent stop, because a model that
  *    only ever asks for tools has not answered.
  *
+ * **A call the contract refuses goes back to the model** (Decision D119, PRD
+ * §9.22): arguments a tool's schema does not admit, on any of the three
+ * surfaces, and a name the agent never offered, are answered as an error tool
+ * result and the loop turns again. That is the whole of the split — a
+ * [`ToolCallRefused`] is a call the model can make differently, and every other
+ * failure is the tool's *execution* failing, which leaves the node the way it
+ * always has. The bound is what keeps it terminating: a correction is another
+ * model call, so a model that never corrects spends `max_tool_iterations` and
+ * fails the node with the last refusal in hand.
+ *
+ * Every call of an answer comes back to the model, refused or not — so a refusal
+ * does not stop the loop over the calls of one answer, while a failure still
+ * does. On the wire that is the call's own id being answered, because both
+ * surfaces refuse a request that leaves a `tool_use` / `tool_call_id`
+ * unanswered; the one exception is a call naming a tool the agent never offered,
+ * which Chat Completions will not let a request name at all, so
+ * [`callChatCompletions`] drops it from the replayed assistant turn and sends
+ * its refusal as a `user` turn instead (`WIRE-NOTES` (18)).
+ *
  * The final call still offers the agent's tools beside the pinned one: the
  * history it carries holds `tool_use`/`tool_result` blocks, and both surfaces
  * refuse a request that carries those without declaring the tools they name.
@@ -2133,18 +2345,32 @@ export async function callAgent(
   // order before it answers — [`merged`] then reconciles the two by identity,
   // exactly as it does for `models` above.
   const dispatches: DispatchRecord[] = [];
-  // How many times each tool has been called, which is the ordinal grammar 9.4
-  // gives a flow-tool's frame (PRD §9.19). It starts empty **per call of this
-  // function**, and that is the whole of "an agent-node retry restarts the
+  // How many times each tool has been **invoked**, which is the ordinal grammar
+  // 9.4 gives a flow-tool's frame (PRD §9.19). It starts empty **per call of
+  // this function**, and that is the whole of "an agent-node retry restarts the
   // ordinals": a retry is a second call of the node's activity.
   const ordinals = new Map<string, number>();
 
   if (agent.tools.length > 0) {
     let iterations = 0;
+    // The refusal this loop is **holding**, for the message a spent budget
+    // raises (Decision D119). A model that never corrects is the way a bounce
+    // reaches the bound, and a node failure that named only the bound would
+    // leave a reader with the symptom and none of the cause — the same run
+    // whose model called correctly and simply kept going produces the very same
+    // sentence.
+    //
+    // Held only for as long as the *last* call was one, which is why a call that
+    // completes clears it: a loop whose model corrected and then went on asking
+    // has no refusal outstanding, and a message that produced the last one it
+    // ever saw would say the opposite of what happened.
+    let refusal: string | undefined;
     for (;;) {
       if (iterations >= agent.maxToolIterations) {
         throw new Error(
-          `\`${agent.address}\` reached its \`max_tool_iterations\` bound of ${agent.maxToolIterations} without answering (Decision D51)`,
+          `\`${agent.address}\` reached its \`max_tool_iterations\` bound of ${agent.maxToolIterations} without answering (Decision D51)${
+            refusal === undefined ? "" : `; its last tool call was refused: ${refusal}`
+          }`,
         );
       }
       iterations += 1;
@@ -2177,21 +2403,53 @@ export async function callAgent(
         by.toolCalls = asked;
       };
 
-      const results: { id: string; name: string; content: string }[] = [];
+      const results: { id: string; name: string; content: string; isError?: boolean }[] = [];
+      // One refusal, recorded and answered: the record with no `result` and no
+      // `instance` (`docs/trace.md` §7.3), and the model handed the text so it
+      // can call again (Decision D119).
+      const refuse = (
+        call: { id: string; name: string },
+        why: ToolCallRefused,
+        target?: string,
+        instance?: { instance: string } | Record<string, never>,
+      ): void => {
+        record({
+          name: call.name,
+          ...(target === undefined ? {} : { target }),
+          outcome: "refused",
+          ...(instance ?? {}),
+          error: describe(why),
+        });
+        refusal = why.message;
+        results.push({ id: call.id, name: call.name, content: why.message, isError: true });
+      };
+
       for (const call of answer.toolCalls) {
         const tool = agent.tools.find((candidate) => candidate.name === call.name);
         if (tool === undefined) {
-          // Recorded before it is raised, and with no `target`: there is no
-          // component behind a name the agent does not offer, and a reader of
-          // the failed run should still see what the model asked for. The text
-          // goes through [`describe`] like every other message field, so it
-          // carries the class the way `docs/trace.md` §3 says one does.
-          const unknown = new Error(
-            `\`${agent.address}\` was answered with a call to \`${call.name}\`, which is not one of its tools`,
+          // Recorded with no `target`: there is no component behind a name the
+          // agent does not offer, and a reader should still see what the model
+          // asked for. The text goes through [`describe`] like every other
+          // message field, so it carries the class the way `docs/trace.md` §3
+          // says one does — and it names the tools that *are* on the wire,
+          // because this refusal is one the model corrects by picking one of
+          // them (PRD G3).
+          refuse(
+            call,
+            new ToolCallRefused(
+              `\`${agent.address}\` was answered with a call to \`${call.name}\`, which is not one of its tools: it offers ${agent.tools
+                .map((offered) => `\`${offered.name}\``)
+                .join(", ")}`,
+            ),
           );
-          record({ name: call.name, outcome: "failed", error: describe(unknown) });
-          throw unknown;
+          continue;
         }
+        // Claimed here and **handed back** where the contract refuses the call:
+        // grammar §9.4's ordinal counts how many times this tool has already
+        // been *invoked*, and a refusal never reaches the tool. Claiming it up
+        // front is what lets the site — and so the key the invocation derives —
+        // be built before `invoke` is entered, which is the only moment it could
+        // be built at.
         const ordinal = ordinals.get(call.name) ?? 0;
         ordinals.set(call.name, ordinal + 1);
         const site: ToolCallSite = {
@@ -2220,6 +2478,26 @@ export async function callAgent(
         try {
           result = await tool.invoke(call.args, context, site);
         } catch (error) {
+          // The one branch in this loop that reads a class rather than a value:
+          // a contract the model can satisfy differently goes back to it, and
+          // everything else — the exec that exited nonzero, the request that was
+          // refused, the child instance that failed, the store that could not
+          // answer — leaves the node (Decision D119). `started()` is read on
+          // both paths for the reason it is read at all: the link is what the
+          // call really filed, so a refusal reports no instance because it
+          // started none rather than because this branch assumed so.
+          if (error instanceof ToolCallRefused) {
+            // The ordinal goes back, because nothing was invoked under it
+            // (grammar §9.4, Decision D119). The next call of this tool takes
+            // the frame this one was offered, so a loop that got it wrong and
+            // then got it right derives the very key a loop that got it right
+            // first time derives — and a node `retry:` whose second attempt
+            // needs no correction re-derives its first attempt's keys instead
+            // of firing every child flow's effects again.
+            ordinals.set(call.name, ordinal);
+            refuse(call, error, tool.address, started());
+            continue;
+          }
           record({
             name: call.name,
             target: tool.address,
@@ -2236,6 +2514,10 @@ export async function callAgent(
           ...started(),
           ...(dispatches[before] === undefined ? {} : { result }),
         });
+        // The call worked, so the loop is holding no refusal: a budget spent
+        // after this says the bound stopped a model that was calling correctly
+        // and never answered, which is a different run to diagnose.
+        refusal = undefined;
         results.push({ id: call.id, name: call.name, content: JSON.stringify(result) });
       }
       turns.push({ role: "tool", results });
@@ -2920,7 +3202,7 @@ export function route(
  * `docs/trace.md`'s *Stability* section is the contract, and it is what a reader
  * is entitled to rely on.
  */
-export const TRACE_VERSION = 3;
+export const TRACE_VERSION = 4;
 
 /**
  * One run's whole trace, as a surface delivers it (`docs/trace.md`).

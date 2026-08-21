@@ -167,6 +167,48 @@ const CODEGEN: &[Criterion] = &[
                 "an_agent_node_bounds_its_tool_loop_at_max_tool_iterations",
                 Status::Live,
             ),
+            // What the loop does with a call the tool's own contract refuses
+            // (Decision D119, PRD §9.22): it goes back to the model as an error
+            // tool result, on both wire shapes, while a tool whose *execution*
+            // failed still ends the node. The second of the two is what stops
+            // the bound from becoming decorative — a model that never corrects
+            // spends it and fails holding the last refusal.
+            (
+                "a_tool_definitions_input_refuses_on_the_chat_completions_wire_and_an_exit_code_does_not",
+                Status::Live,
+            ),
+            (
+                "a_tool_loop_that_never_corrects_spends_its_budget_and_fails_holding_the_last_refusal",
+                Status::Live,
+            ),
+            // …and its twin, which is what keeps that message honest: the same
+            // bound spent by a loop whose last call *worked* claims no refusal.
+            (
+                "a_tool_loop_whose_last_call_worked_spends_its_budget_claiming_no_refusal",
+                Status::Live,
+            ),
+            // One answer, two calls, the first refused: every call of the answer
+            // comes back to the model, because a request leaving either
+            // unanswered is one both surfaces refuse (D119, `WIRE-NOTES` (18)).
+            // The last two are that answer with the refused call naming a tool
+            // the agent never offered — the one place the two wires give the
+            // model different shapes for one answer, so each wire gets its own
+            // test. Chat Completions splits it in two, a `tool` message for the
+            // call the request may name and a `user` turn for the one it may
+            // not; the Messages API carries both as `tool_result` blocks of one
+            // turn. Either way it takes a *mixed* answer to observe the ordering.
+            (
+                "a_refused_call_does_not_stop_the_calls_beside_it_in_one_answer",
+                Status::Live,
+            ),
+            (
+                "an_answer_mixing_an_unoffered_call_with_an_offered_one_is_answered_in_both_chat_completions_shapes",
+                Status::Live,
+            ),
+            (
+                "an_answer_mixing_an_unoffered_call_with_an_offered_one_is_answered_in_one_messages_turn",
+                Status::Live,
+            ),
             // What an agent node leaves behind for the next one: the implicit
             // `messages` channel of grammar 10.4 (PRD 5.7 tier 3), which is
             // state no composition declares and only the wire makes visible.
@@ -191,6 +233,14 @@ const CODEGEN: &[Criterion] = &[
             // The escape hatch of grammar 6.1, and the registration it costs.
             (
                 "a_host_registered_function_runs_and_an_unregistered_one_says_so",
+                Status::Live,
+            ),
+            // …and what a `tool.*`'s own `input:` does at that surface: a value
+            // constraint grammar 8.4's arity-and-types check does not cover
+            // fails the node, as a mismatch rather than as a refusal — the half
+            // of Decision D119's split with no model on it.
+            (
+                "a_function_nodes_unfit_argument_fails_the_node_as_a_mismatch",
                 Status::Live,
             ),
             // How those two inline kinds are *parameterised*: `input:` bindings
@@ -421,12 +471,15 @@ const CODEGEN: &[Criterion] = &[
             // instance ran, its arguments never fit, it failed inside, and the
             // name the model used was never on the wire — the last being the
             // one call whose record carries no `target` (`docs/trace.md` §7.3).
+            // Two of the four are **refusals** and go back to the model
+            // (Decision D119); the one between them is the tool's execution
+            // failing, which still ends the node — that split is the point.
             (
                 "a_flow_attached_as_a_tool_runs_one_instance_per_call_under_its_own_frame",
                 Status::Live,
             ),
             (
-                "arguments_a_flow_tools_inputs_refuses_fail_the_agent_node",
+                "arguments_a_flow_tools_inputs_refuses_come_back_to_the_model_as_a_tool_error",
                 Status::Live,
             ),
             (
@@ -434,20 +487,33 @@ const CODEGEN: &[Criterion] = &[
                 Status::Live,
             ),
             (
-                "a_call_to_a_tool_the_agent_does_not_offer_is_recorded_with_no_target_and_ends_the_node",
+                "a_call_to_a_tool_the_agent_does_not_offer_comes_back_with_the_names_it_has",
                 Status::Live,
             ),
-            // …and four more over the *frame* a call derives (grammar 9.4, PRD
+            // …and the same correction on the other wire, where the invented
+            // name may not be replayed at all: Chat Completions re-validates an
+            // assistant turn's `tool_calls` against the request's `tools`
+            // (`WIRE-NOTES` (18)), so the turn is rewritten rather than sent.
+            (
+                "a_call_to_a_tool_the_agent_does_not_offer_is_corrected_on_the_chat_completions_wire",
+                Status::Live,
+            ),
+            // …and five more over the *frame* a call derives (grammar 9.4, PRD
             // resolved q19), which is the half of this call site that no other
-            // construct has: the ordinal counts calls rather than answers, a
-            // node `retry:` restarts it, a `map` puts an item frame above it,
-            // and a raced deadline leaves a call with no record at all.
+            // construct has: the ordinal counts invocations rather than answers,
+            // a node `retry:` restarts it, a refusal spends none of it even
+            // across a retry, a `map` puts an item frame above it, and a raced
+            // deadline leaves a call with no record at all.
             (
                 "two_flow_tool_calls_in_one_model_answer_get_distinct_ordinals",
                 Status::Live,
             ),
             (
                 "an_agent_node_retry_restarts_the_flow_tool_call_ordinals",
+                Status::Live,
+            ),
+            (
+                "a_refusal_does_not_move_the_key_a_retried_attempt_re_derives",
                 Status::Live,
             ),
             (
@@ -530,6 +596,14 @@ const CODEGEN: &[Criterion] = &[
             // store tools" a composition actually depends on.
             (
                 "an_agent_calling_a_synthesized_store_tool_reaches_the_backend_with_its_arguments",
+                Status::Live,
+            ),
+            // …and what happens when it calls one *wrong*. Decision D119 splits
+            // this surface the way it splits the other two: arguments grammar
+            // 11.4's row does not admit go back to the model, and a backend that
+            // could not answer still ends the node.
+            (
+                "a_store_tool_refuses_arguments_to_the_model_and_still_fails_the_node_on_a_backend_error",
                 Status::Live,
             ),
         ],

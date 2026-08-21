@@ -46,5 +46,5 @@ expression: document(&run)
   "execution_id": "<execution-id>",
   "flow": "flow.ask",
   "status": "completed",
-  "trace_version": 3
+  "trace_version": 4
 }

@@ -1,6 +1,6 @@
 # agent-compose — Trace Format
 
-**Trace version:** `3`
+**Trace version:** `4`
 **Status:** Normative for the trace a compiled project emits
 **Companion artifacts:** [`docs/grammar.md`](grammar.md) (the DSL this describes runs of), [`prd.md`](../prd.md) §5.3, §5.6, §5.8, §5.9
 
@@ -102,7 +102,7 @@ documents and no grammar section defines — prints one document:
   "execution_id": "exec_0f1e…",
   "status": "completed",
   "outputs": { "draft": "…" },
-  "trace_version": 3,
+  "trace_version": 4,
   "trace": [ /* entries */ ],
   "trace_path": "/…/.agent-compose/traces/flow.review_loop-exec_0f1e….json"
 }
@@ -138,7 +138,7 @@ POSTs on completion, report an execution as (grammar §13.3):
   "trigger": "on_request",
   "status": "completed",
   "outputs": { "draft": "…" },
-  "trace_version": 3,
+  "trace_version": 4,
   "trace": [ /* entries */ ]
 }
 ```
@@ -202,7 +202,7 @@ in full, and what `run --format json` spreads into the record it prints.
 
 | field | type | presence | meaning |
 |---|---|---|---|
-| `trace_version` | integer | always | The format the `entries` are written in. `3` is this document, and a compiled project spells it `TRACE_VERSION` (exported from its `src/runtime.ts`). See [Stability](#10-stability). |
+| `trace_version` | integer | always | The format the `entries` are written in. `4` is this document, and a compiled project spells it `TRACE_VERSION` (exported from its `src/runtime.ts`). See [Stability](#10-stability). |
 | `flow` | string | always | The flow that was run, as its typed address (grammar §2.2). |
 | `execution_id` | string | always | The execution the entries belong to — grammar §4.1's `execution.id`, and the prefix of every idempotency key in the document (grammar §9.4). |
 | `status` | `"completed"` \| `"failed"` \| `"interrupted"` | always | How the run ended: with an answer, without one, or holding a `human` pause it had no way to answer (grammar §8.7, §9). The third is told apart from the second because the two ask different things of whoever is reading — one is a run to look into, the other a question to answer — and because a reader may not decide it from the message text (§10.1). |
@@ -442,7 +442,7 @@ key's absence (§3).
 
 | field | type | presence | meaning |
 |---|---|---|---|
-| `index` | integer | always | What identifies this dispatch within the array that holds it, and orders the array. On `dispatches` it is the **source-item index**, which is also what orders every write the item made (PRD 5.6, grammar §7.6.4 clause 2). On `toolDispatches` it is the **call ordinal** grammar §9.4 gives the call — how many times that tool had already been called in this agent execution — so two records under one key can repeat an index where a `map` dispatched the agents that made them, and `idempotencyKey` is what tells those apart. |
+| `index` | integer | always | What identifies this dispatch within the array that holds it, and orders the array. On `dispatches` it is the **source-item index**, which is also what orders every write the item made (PRD 5.6, grammar §7.6.4 clause 2). On `toolDispatches` it is the **call ordinal** grammar §9.4 gives the call — how many times that tool had already been *invoked* in this agent execution, which is a count of the calls that got past the tool's contract rather than of the calls the model made (grammar D119) — so two records under one key can repeat an index where a `map` dispatched the agents that made them, and `idempotencyKey` is what tells those apart. |
 | `route` | string | routed maps | The **route** the item was dispatched through: its variant tag, or `"$default"` for the `default:` catch-all (grammar §8.6 rule 4, Decision D30). Absent on the homogeneous form, which has one target and no tags, and on every `toolDispatches` record, which no `map` routed. |
 | `variant` | string | routed maps | The **discriminator value the item carried** — the value at the map's `route_by:` field. On a named route it repeats `route`; on the catch-all it is the only record of which variant fell through, since `route` names the catch-all rather than the variant. It is always one of the union's declared variant tags, and that is also what makes the key present on **every** record a routed map files: the item was parsed against its producer's declared schema before any of this ran (PRD 5.2), so its discriminator is one of those tags. An item whose discriminator is not a string — which no artifact `build` accepted can produce — is left unrecorded rather than rendered, since a number written as a string would be a `variant` that is not a declared tag. Absent on every `toolDispatches` record, for `route`'s reason. |
 | `target` | string | always | The component the dispatch went to, as a typed address — the item's target on `dispatches`, and the `flow.*` the model called on `toolDispatches`. |
@@ -627,7 +627,7 @@ reader infers from a provider's own logs.
 | `fallback` | integer | with `servedBy` | Its ordinal in the route, `0` for the first — so `1` reads as "fallback #1". |
 | `failovers` | array of [refusals](#71-refusals) | always, possibly empty | Every member that refused **and moved the ladder on**, in the order they were tried. Empty on every call that did not fail over — a direct binding's, and a route whose first member answered — which is most of them. |
 | `refused` | [refusal](#71-refusals) | when no member answered | What ended the call. Such a record carries no `servedBy` and no `fallback`. |
-| `toolCalls` | array of [tool calls](#73-tool-calls) | when this call's answer asked for at least one and the loop resolved it | What the model asked the agent's tools to do, in the order its answer asked, and what became of each (§7.3). Never empty: a call whose answer asked for none carries no key, and the pinned structured-output call that ends a loop is always one of those. A call that **ended the node** is the last entry rather than a missing one — the calls after it in the same answer never ran, and are absent because they did not happen. The one tool call with no entry is the one a node deadline caught **mid-flight** (§5.3), which resolved neither a result nor a failure; where it was the first the answer asked for, this key is absent rather than empty. |
+| `toolCalls` | array of [tool calls](#73-tool-calls) | when this call's answer asked for at least one and the loop resolved it | What the model asked the agent's tools to do, in the order its answer asked, and what became of each (§7.3). Never empty: a call whose answer asked for none carries no key, and the pinned structured-output call that ends a loop is always one of those. A call that **ended the node** — a `"failed"` one — is the last entry rather than a missing one: the calls after it in the same answer never ran, and are absent because they did not happen. A `"refused"` one is not the last of anything: every call of an answer comes back to the model, refused or not, so the records after it exist — grammar D119 is that rule, and names the one wire shape that carries a refusal outside its own call's id. The one tool call with no entry is the one a node deadline caught **mid-flight** (§5.3), which resolved neither a result nor a failure; where it was the first the answer asked for, this key is absent rather than empty. |
 
 Every record therefore carries exactly one of the two accounts of how it ended:
 `servedBy` with `fallback`, or `refused`. `failovers` is beside whichever it is,
@@ -688,21 +688,27 @@ cost of one indirection for the part that is a run of its own.
 | field | type | presence | meaning |
 |---|---|---|---|
 | `name` | string | always | The tool the model called, spelled as the request offered it — a `tool.*`'s local name, a `flow.*`'s (grammar §5.4), or a synthesized store tool's (grammar §11.5). |
-| `target` | string | when the agent offers a tool of that name | The component behind the name, as a typed address (grammar §2.2). Absent on the one call that has none: a name the agent does not offer, which is a model answering with a tool that was never on the wire. That call is recorded and then ends the node. |
-| `outcome` | `"completed"` \| `"failed"` | always | Whether the loop handed the model a result. `"failed"` is a call that ended the node — its failure left the tool, and the node's own `on_error:` is what decided the run (grammar §9.2) — so it is also the record that says the model saw nothing back. §5.1 names the one failure no `on_error:` decided: a `human` node inside the flow the call ran, on a run that could not answer it. |
-| `instance` | string | flow-as-tool calls that started an instance | The **link**: the subflow instance this call ran, named exactly as the dispatch record carrying that instance's trace names itself in `idempotencyKey`, so the join between the two is string equality (§5, §8). Absent on every call that instantiated nothing — a `tool.*`, a store tool — and on a flow-as-tool call refused before an instance existed, which is arguments that failed the flow's own `inputs:`. |
-| `result` | any | `"completed"` flow-as-tool calls, with `instance` | **The result the model saw**: the value the loop handed back, which for this tool is the instance's declared `outputs:` (grammar §5.4). PRD §9.20 asks the tool-call entry to record it, and it is the one tool result this format carries — §11 is where the rule it is carved out of is stated, and where the other two tool surfaces are left under it. Its calls are a **subset** of `instance`'s, not the same set: `instance` says an instance ran, `result` says the loop handed that instance's outputs back, so a call carrying `result` carries `instance` and not the other way round. Absent on a `"failed"` call, where the absence is the record — the failure left the tool and the model saw nothing — and a flow-as-tool call whose instance failed is exactly that call with an `instance` and no `result`. |
-| `error` | string | `"failed"` | What went wrong, in §3's `<error name>: <message>` shape. |
+| `target` | string | when the agent offers a tool of that name | The component behind the name, as a typed address (grammar §2.2). Absent on the one call that has none: a name the agent does not offer, which is a model answering with a tool that was never on the wire. That call is recorded `"refused"` and handed back to the model with the names it does have (grammar D119). |
+| `outcome` | `"completed"` \| `"refused"` \| `"failed"` | always | What the loop did with the call. `"completed"` handed the model the tool's result. `"refused"` handed it the **refusal** instead: the tool's declared contract did not admit the call — arguments its schema refuses, on any of the three surfaces, or a name the agent never offered — and grammar D119 makes that a call the model is asked to make again, so the node did not end and records after it exist. `"failed"` is the tool's *execution* failing, which ended the node: the failure left the tool, the node's own `on_error:` decided the run (grammar §9.2), and the model saw nothing back. §5.1 names the one failure no `on_error:` decided: a `human` node inside the flow the call ran, on a run that could not answer it. |
+| `instance` | string | flow-as-tool calls that started an instance | The **link**: the subflow instance this call ran, named exactly as the dispatch record carrying that instance's trace names itself in `idempotencyKey`, so the join between the two is string equality (§5, §8). Absent on every call that instantiated nothing — a `tool.*`, a store tool — and on a `"refused"` flow-as-tool call, which is arguments that failed the flow's own `inputs:` before an instance existed. A refused call spends **no** call ordinal (grammar §9.4, D119) — that ordinal counts invocations and this call reached no flow — so the instance path of the call that follows it is the one it would have had with no refusal ahead of it. |
+| `result` | any | `"completed"` flow-as-tool calls, with `instance` | **The result the model saw**: the value the loop handed back, which for this tool is the instance's declared `outputs:` (grammar §5.4). PRD §9.20 asks the tool-call entry to record it, and it is the one tool result this format carries — §11 is where the rule it is carved out of is stated, and where the other two tool surfaces are left under it. Its calls are a **subset** of `instance`'s, not the same set: `instance` says an instance ran, `result` says the loop handed that instance's outputs back, so a call carrying `result` carries `instance` and not the other way round. Absent on a `"failed"` call and on a `"refused"` one, where the absence is the record — the first left the tool and the second never entered it, and in neither did the model see a result. A flow-as-tool call whose instance failed is exactly that call with an `instance` and no `result`. |
+| `error` | string | `"failed"`, `"refused"` | What went wrong, in §3's `<error name>: <message>` shape. On a `"refused"` call the `<message>` half is **byte for byte the sentence the model was handed back**, and the `<error name>` half — `ToolCallRefused` — is this format's own envelope, which the model's copy does not carry: the two strings differ by that prefix and by nothing else, so a reader joining a record to a provider transcript compares the record's message half, never the whole string. That sentence names the tool, the field and the constraint the way a compiler diagnostic would (PRD G3) and may quote an excerpt of the arguments — see §11. |
 
-**What is deliberately not here.** The **arguments** the model sent are absent,
-and that is §11's rule rather than an omission: this format carries no provider
-transcript, and what the call did to the run is reachable through the instance
-`instance` links to. `result` is the one thing on the other side of that rule,
-and it is here because PRD §9.20 put it here — "a bare dispatch record alone
-would leave a tool call whose result came from nowhere". It is carried for the
-one tool whose result is the composition's own declared data; a `tool.*`'s answer
-and a store tool's stay out, the second of them because §6 already carries it in
-`StoreRecord.answer`.
+**What is deliberately not here.** The **arguments** the model sent are absent
+as a field of their own, and that is §11's rule rather than an omission: this
+format carries no provider transcript, and what the call did to the run is
+reachable through the instance `instance` links to. `result` is the one thing on
+the other side of that rule, and it is here because PRD §9.20 put it here — "a
+bare dispatch record alone would leave a tool call whose result came from
+nowhere". It is carried for the one tool whose result is the composition's own
+declared data; a `tool.*`'s answer and a store tool's stay out, the second of
+them because §6 already carries it in `StoreRecord.answer`.
+
+A `"refused"` call's `error` is where an excerpt of those arguments can appear,
+and it is not an exception to the rule above but the same one read where the
+message goes: the refusal is written **for the model**, which chose the
+arguments and is being asked to choose again, so quoting the offending value
+back at it costs nothing (grammar D119, §11.1).
 
 ---
 
@@ -770,18 +776,18 @@ already been applied, rather than some other write colliding.
 
 The second property is **positional** across a flow-tool frame, and grammar §9.4
 says so openly: an agent-node `retry:` restarts the call ordinals, so the Nth
-call of a retried attempt derives the Nth key of the failed one — while what a
-nondeterministic model asks for the Nth time is not guaranteed to be the same
-work. That is the at-least-once compromise the grammar accepts; nothing in this
-format hides it, and the two attempts' records are both on the entry, in the
+*invocation* of a retried attempt derives the Nth key of the failed one — while
+what a nondeterministic model asks for the Nth time is not guaranteed to be the
+same work. That is the at-least-once compromise the grammar accepts; nothing in
+this format hides it, and the two attempts' records are both on the entry, in the
 order they were made.
 
 **Two policies re-run a tool loop, and both reuse its keys.** A node's own
 `retry:` is the one above. The other is a `map`'s
 `on_item_error: { retry: … }` (grammar §8.6 rule 10), which re-executes a
 dispatched `agent.*` from its entry at the same source index — so the item's
-frames are unchanged, the loop starts counting from zero again, and the Nth call
-of the second attempt derives the first attempt's Nth key exactly as a node
+frames are unchanged, the loop starts counting from zero again, and the Nth
+invocation of the second attempt derives the first attempt's Nth key as a node
 retry does. A reader meets it as repeated keys under one `toolDispatches` array,
 `DispatchRecord.attempts` on the *item's* record being where the retry itself is
 recorded (§5).
@@ -1013,6 +1019,43 @@ of what §10.3's last bullet names — *where instance paths appear*:
 
 Nothing was removed or renamed, and no order changed.
 
+### 10.3.3 What version `4` changed
+
+A tool call the model can fix by calling differently now goes **back to the
+model** instead of ending the agent node (grammar
+[D119](grammar.md#d119-a-refused-tool-call-returns-to-the-model-and-a-failed-one-ends-the-node),
+PRD §9.22). That is a change to the *runtime*, but it reaches a reader of version
+`3` through one field, and in the one way §10.3 does not forgive:
+
+* **`ToolCallRecord.outcome` gained `"refused"`** — a member added to a closed
+  enumeration, which §10.3 names outright. The alternative was to keep the
+  two-member vocabulary and record a refused call as `"failed"`, and it is
+  **worse rather than cheaper**: version `3` defines `"failed"` as a call that
+  ended the node and whose answer the model never saw, and both halves are false
+  of a refusal — the loop carried on, and the model was handed the sentence
+  `error` spells under §3's envelope. Reusing the member would have changed the
+  meaning of a value a reader was told to rely on, which §10.3 bumps for too,
+  while leaving that reader unable to tell the two apart at all. A new member
+  costs the same bump and leaves `"failed"` meaning exactly what it meant;
+* **two presence rules widened with it**, and both are read off the row rather
+  than added to it: `error` now appears on `"refused"` as well as `"failed"`, and
+  `result`'s absence covers a third case. A reader of version `3` who treated
+  every record carrying `error` as one that ended the node is wrong under `4`;
+  `outcome` is what tells them apart;
+* **`ToolCallRecord.target`'s row reads differently in its last sentence.** The
+  one call with no `target` — a name the agent does not offer — is still the one
+  call with no `target`, and what happens to it is no longer "ends the node".
+  The *presence* rule is unchanged;
+* **an instance path is derived from the same count as before.** Grammar §9.4's
+  frame counts a flow-tool's *invocations*, as it always did, and a refused call
+  invokes nothing — so it spends no ordinal and §10.3's "changing the derivation
+  of an idempotency key" is not engaged. Every path a version `3` composition
+  produced is the path it produces now, which is the strong form of the claim
+  rather than a compatible reading of a weak one: under `3` a refusal ended the
+  node, so no version-`3` run ever had a call standing behind one.
+
+Nothing was removed or renamed, no field was added, and no order changed.
+
 ### 10.4 How the two are held together
 
 The version number alone is a promise; two tests make it a checkable one:
@@ -1052,9 +1095,18 @@ The version number alone is a promise; two tests make it a checkable one:
 * **Anything a store answered.** `StoreRecord.answer` is carried verbatim; its
   shape is the store's declared schema (grammar §11.4).
 * **What a model sent a tool.** A tool call is recorded — that it was made, to
-  what, and what became of it (§7.3) — and the **arguments** are not, at any of
-  the three tool surfaces. That half is §11's rule read where the *caller* is a
-  model rather than the graph.
+  what, and what became of it (§7.3) — and the **arguments** are not carried as a
+  field, at any of the three tool surfaces. That half is §11's rule read where
+  the *caller* is a model rather than the graph.
+
+  The one place an argument value appears is inside a message: a `"refused"`
+  call's `error`, which spells the sentence the model itself was handed back so
+  that it could call again — under §3's `<error name>:` envelope, which is the
+  one thing that sentence gains on its way here (grammar D119, §7.3). That is
+  the same excerpt rule the row below states for every other contract failure,
+  applied at the surface where the reader of the message is the party that
+  composed the value — see §11.1's table, where the two sites are classified
+  together.
 
   What a tool answered divides, and PRD §9.20 is what divides it. A
   flow-as-tool call's result **is** carried, on `ToolCallRecord.result`: the
@@ -1088,8 +1140,10 @@ The version number alone is a promise; two tests make it a checkable one:
   completion" would be read as covering it: an answer that failed the contract
   its component declares (PRD 5.2) is reported with an excerpt of the offending
   value at the failing path — at most 120 characters — and so are the arguments a
-  model sent to a tool. An answer that parsed is not recorded at all. §11.1's
-  table is where the excerpt is classified, as text this process did not compose.
+  model sent to a tool, on `ToolCallRecord.error` where its call was refused
+  (§7.3) and on `TraceEntry.error` where the refusals ran the loop out of its
+  budget. An answer that parsed is not recorded at all. §11.1's table is where
+  the excerpt is classified, as text this process did not compose.
 
   `ToolCallRecord.result` is not an exception to that and is worth reading
   beside it. What it carries is a subflow's `outputs:`, which is the
@@ -1139,9 +1193,9 @@ answered**, and a reader should treat that text as untrusted:
 
 | field | what it can carry from outside |
 |---|---|
-| `TraceEntry.error` | the failure the node's own activity raised — for an `http:` binding, the rejected response body truncated to 200 characters; for an `exec:` binding, the child's stderr; and on any surface parsed against a declared schema (PRD 5.2), an excerpt of the offending value at the failing path, truncated to 120 characters — a model's own answer, the arguments it sent to a tool, or a decoded `http:`/`exec:` payload that a non-2xx rule accepted and a schema did not |
+| `TraceEntry.error` | the failure the node's own activity raised — for an `http:` binding, the rejected response body truncated to 200 characters; for an `exec:` binding, the child's stderr; and on any surface parsed against a declared schema (PRD 5.2), an excerpt of the offending value at the failing path, truncated to 120 characters — a model's own answer, or a decoded `http:`/`exec:` payload that a non-2xx rule accepted and a schema did not. The arguments a **model** sent a tool reach this field one way only, since grammar D119: an agent node that spent `max_tool_iterations` says which refusal it was still holding, and that refusal is the excerpt |
 | `DispatchRecord.error` | the same text, raised by one dispatched item (§5). Under `on_item_error: skip` this is the **only** field it reaches: the run survives, so no entry carries an `error` for it — and, on the other carrier, raised inside the subflow a model's tool call ran |
-| `ToolCallRecord.error` | the same text, from the tool a model called (§7.3): a `tool.*`'s refused response or child stderr, a store op's failure, or a flow-as-tool call's — including the excerpt of the **arguments** the model sent when they failed the flow's own `inputs:` |
+| `ToolCallRecord.error` | the same text, from the tool a model called (§7.3). On a `"failed"` call, the tool's execution failing: a `tool.*`'s refused response or child stderr, a store op's failure, or one raised inside a flow-as-tool call's instance. On a `"refused"` one it is this runtime's own sentence rather than the other side's — the tool, the field and the constraint, with an excerpt of the **arguments** the model sent, at whichever of the three surfaces refused them (grammar D119) |
 | `TraceDocument.error` | the same text, when that failure is what stopped the run |
 | `Refusal.detail` | what a provider answered: a status and a response body, truncated, or the socket failure that came back instead. Never the request, so the key it was signed with is not in it |
 

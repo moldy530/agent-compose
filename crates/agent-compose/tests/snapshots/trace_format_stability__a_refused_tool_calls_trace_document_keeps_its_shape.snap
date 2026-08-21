@@ -15,12 +15,9 @@ expression: document(&run)
           "servedBy": "model.smart",
           "toolCalls": [
             {
-              "instance": "<execution-id>/ask/0/condense/0",
+              "error": "ToolCallRefused: the arguments `condense` was called with: passage: expected at least 1 character (found \"\")",
               "name": "condense",
-              "outcome": "completed",
-              "result": {
-                "line": "the first line"
-              },
+              "outcome": "refused",
               "target": "flow.condense"
             }
           ]
@@ -32,11 +29,11 @@ expression: document(&run)
           "servedBy": "model.smart",
           "toolCalls": [
             {
-              "instance": "<execution-id>/ask/0/condense/1",
+              "instance": "<execution-id>/ask/0/condense/0",
               "name": "condense",
               "outcome": "completed",
               "result": {
-                "line": "the second line"
+                "line": "the first line"
               },
               "target": "flow.condense"
             }
@@ -101,81 +98,6 @@ expression: document(&run)
                   "deduped": false,
                   "effect": "write",
                   "idempotencyKey": "<execution-id>/ask/0/condense/0/note/0",
-                  "key": "last",
-                  "op": "set",
-                  "scope": "execution",
-                  "store": "store.seen",
-                  "via": "node"
-                }
-              ],
-              "traversal": 0,
-              "writes": []
-            },
-            {
-              "attempts": 1,
-              "flow": "flow.condense",
-              "models": [
-                {
-                  "failovers": [],
-                  "fallback": 0,
-                  "model": "model.smart",
-                  "servedBy": "model.smart"
-                }
-              ],
-              "node": "reduce",
-              "outcome": "completed",
-              "routing": {
-                "counters": {},
-                "edges": [
-                  {
-                    "reason": "unconditional",
-                    "taken": true,
-                    "to": "__end__"
-                  }
-                ],
-                "targets": [
-                  "__end__"
-                ]
-              },
-              "step": 2,
-              "traversal": 0,
-              "writes": [
-                "line"
-              ]
-            }
-          ],
-          "outcome": "completed",
-          "target": "flow.condense"
-        },
-        {
-          "attempts": 1,
-          "idempotencyKey": "<execution-id>/ask/0/condense/1",
-          "index": 1,
-          "inner": [
-            {
-              "attempts": 1,
-              "flow": "flow.condense",
-              "node": "note",
-              "outcome": "completed",
-              "routing": {
-                "counters": {},
-                "edges": [
-                  {
-                    "reason": "unconditional",
-                    "taken": true,
-                    "to": "reduce"
-                  }
-                ],
-                "targets": [
-                  "reduce"
-                ]
-              },
-              "step": 1,
-              "stores": [
-                {
-                  "deduped": false,
-                  "effect": "write",
-                  "idempotencyKey": "<execution-id>/ask/0/condense/1/note/0",
                   "key": "last",
                   "op": "set",
                   "scope": "execution",

@@ -274,7 +274,7 @@ const storeTriageMemory: stores.StoreBinding = {
 };
 
 /**
- * `tool.dead_letter` — an HTTP request (grammar 6.1). Its arguments are parsed with its own declared `input:` before the implementation sees them, which is the checked signature grammar 8.4 asks for and the model's arguments are held to.
+ * `tool.dead_letter` — an HTTP request (grammar 6.1). Its arguments are parsed with its own declared `input:` before the implementation sees them, which is the checked signature grammar 8.4 asks for. This is the parse a `function:` node's binding faces, and it is a `ResultMismatch` that fails the node: the arguments are the composition's, checked field-by-field at compile time, so a value constraint they miss at runtime is the graph's own failure and there is nobody to hand it to. A **model's** arguments are refused one level out, at the entry in the agent's `tools:`, where `runtime.parseToolArguments` raises the `ToolCallRefused` the loop hands back (Decision D119). The tool's **result** is parsed with `runtime.parseResult` on both surfaces: a tool answering off-contract is not a call anybody can rephrase.
  */
 async function toolDeadLetter(args: unknown, context: runtime.RunContext): Promise<unknown> {
   const input = runtime.parseResult(toolDeadLetterInput, args, "the arguments `tool.dead_letter` was called with");
@@ -305,7 +305,7 @@ async function toolDeadLetter(args: unknown, context: runtime.RunContext): Promi
 }
 
 /**
- * `tool.repo_grep` — a subprocess (grammar 6.1). Its arguments are parsed with its own declared `input:` before the implementation sees them, which is the checked signature grammar 8.4 asks for and the model's arguments are held to.
+ * `tool.repo_grep` — a subprocess (grammar 6.1). Its arguments are parsed with its own declared `input:` before the implementation sees them, which is the checked signature grammar 8.4 asks for. This is the parse a `function:` node's binding faces, and it is a `ResultMismatch` that fails the node: the arguments are the composition's, checked field-by-field at compile time, so a value constraint they miss at runtime is the graph's own failure and there is nobody to hand it to. A **model's** arguments are refused one level out, at the entry in the agent's `tools:`, where `runtime.parseToolArguments` raises the `ToolCallRefused` the loop hands back (Decision D119). The tool's **result** is parsed with `runtime.parseResult` on both surfaces: a tool answering off-contract is not a call anybody can rephrase.
  */
 async function toolRepoGrep(args: unknown, context: runtime.RunContext): Promise<unknown> {
   const input = runtime.parseResult(toolRepoGrepInput, args, "the arguments `tool.repo_grep` was called with");
@@ -329,7 +329,7 @@ async function toolRepoGrep(args: unknown, context: runtime.RunContext): Promise
 }
 
 /**
- * `tool.review_queue` — an HTTP request (grammar 6.1). Its arguments are parsed with its own declared `input:` before the implementation sees them, which is the checked signature grammar 8.4 asks for and the model's arguments are held to.
+ * `tool.review_queue` — an HTTP request (grammar 6.1). Its arguments are parsed with its own declared `input:` before the implementation sees them, which is the checked signature grammar 8.4 asks for. This is the parse a `function:` node's binding faces, and it is a `ResultMismatch` that fails the node: the arguments are the composition's, checked field-by-field at compile time, so a value constraint they miss at runtime is the graph's own failure and there is nobody to hand it to. A **model's** arguments are refused one level out, at the entry in the agent's `tools:`, where `runtime.parseToolArguments` raises the `ToolCallRefused` the loop hands back (Decision D119). The tool's **result** is parsed with `runtime.parseResult` on both surfaces: a tool answering off-contract is not a call anybody can rephrase.
  */
 async function toolReviewQueue(args: unknown, context: runtime.RunContext): Promise<unknown> {
   const input = runtime.parseResult(toolReviewQueueInput, args, "the arguments `tool.review_queue` was called with");
@@ -553,7 +553,7 @@ const agentTriage: runtime.AgentBinding = {
         stores.runStoreTool(
           storeDocs,
           "search",
-          runtime.parseResult(storeDocsToolSearchInput, args, "the arguments `docs_search` was called with") as Record<string, unknown>,
+          runtime.parseToolArguments(storeDocsToolSearchInput, args, "the arguments `docs_search` was called with") as Record<string, unknown>,
           context,
         ),
     },

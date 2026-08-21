@@ -749,8 +749,16 @@ fn tools(
             &[format!(
                 "`{address}` — {} (grammar 6.1). Its arguments are parsed with its own \
                  declared `input:` before the implementation sees them, which is the \
-                 checked signature grammar 8.4 asks for and the model's arguments are \
-                 held to.",
+                 checked signature grammar 8.4 asks for. This is the parse a \
+                 `function:` node's binding faces, and it is a `ResultMismatch` that \
+                 fails the node: the arguments are the composition's, checked \
+                 field-by-field at compile time, so a value constraint they miss at \
+                 runtime is the graph's own failure and there is nobody to hand it to. \
+                 A **model's** arguments are refused one level out, at the entry in the \
+                 agent's `tools:`, where `runtime.parseToolArguments` raises the \
+                 `ToolCallRefused` the loop hands back (Decision D119). The tool's \
+                 **result** is parsed with `runtime.parseResult` on both surfaces: a \
+                 tool answering off-contract is not a call anybody can rephrase.",
                 match &tool.implementation {
                     ToolImplementation::Exec { .. } => "a subprocess",
                     ToolImplementation::Http { .. } => "an HTTP request",
@@ -905,7 +913,32 @@ fn agents(
                     "      schema: {},\n",
                     json_literal(&schema::json_field_map(input.as_ref()), "      ")
                 ));
-                text.push_str(&format!("      invoke: {},\n", names.value(&tool_address)));
+                // The model's arguments are parsed **here**, at the attachment,
+                // rather than by the tool function the `function:` node shares
+                // with it: only this call site has a model to hand a refusal
+                // back to (Decision D119), and only here is the tool's name the
+                // local one the wire offered — a refusal naming `{tool_address}`
+                // would name an identifier the model cannot call. The tool then
+                // parses what it is given a second time, which is what keeps its
+                // own signature checked for every caller (grammar 6.1, 8.4). The
+                // value it re-parses has already satisfied the schema and the
+                // second parse cannot move it: nothing `codegen::schema` emits
+                // coerces or strips — every object is `.strict()`, no `format:`
+                // normalizes, no field transforms — and its one exception,
+                // `.default(…)`, has already fired, so the property it fills is
+                // present and it does not fire again (see that module's doc,
+                // which states the premise and the exception together). A
+                // coercing or non-idempotent form emitted there would make this
+                // second parse observable, and would have to be answered here.
+                let input_schema = names.value(&format!("{tool_address}.input"));
+                imported.push(input_schema.to_string());
+                text.push_str(&format!(
+                    "      invoke: (args, context) =>\n        {}(\n          \
+                     runtime.parseToolArguments({input_schema}, args, {}),\n          \
+                     context,\n        ),\n",
+                    names.value(&tool_address),
+                    names::string(&format!("the arguments `{local_name}` was called with"))
+                ));
                 text.push_str("    },\n");
             }
             text.push_str(&store_tools(ir, names, surfaces, agent, imported));
@@ -1012,7 +1045,9 @@ fn flow_tool(
 /// §9.13 accepts. The arguments are parsed against the emitted Zod for the tool's
 /// own surface before the store sees them, which is the same schema the JSON
 /// column below constrains the model with: constrain == parse, exactly as for an
-/// agent's own output (PRD §9.16).
+/// agent's own output (PRD §9.16). Through `runtime.parseToolArguments`, so a
+/// refusal returns to the model like every other tool surface's (Decision D119);
+/// a *backend* that then fails is the store's own failure and fails the node.
 ///
 /// They are **appended** to the declared tools rather than merged into them, so
 /// a transcript reads in the order the composition declares: `tools:` first,
@@ -1058,7 +1093,7 @@ fn store_tools(
             ));
             text.push_str(&format!(
                 "      invoke: async (args, context) =>\n        stores.runStoreTool(\n          \
-                 {},\n          {},\n          runtime.parseResult({schema_name}, args, {}) as Record<string, unknown>,\n          \
+                 {},\n          {},\n          runtime.parseToolArguments({schema_name}, args, {}) as Record<string, unknown>,\n          \
                  context,\n        ),\n",
                 names.value(&address),
                 names::string(op.as_str()),
@@ -4041,6 +4076,74 @@ flow.f:
         assert!(!emitted.contains("Unimplemented"), "{emitted}");
     }
 
+    /// A `tool.*`'s two usage surfaces parse its `input:` differently, and the
+    /// difference is who hears about a mismatch (grammar 6, Decision D119).
+    ///
+    /// One definition, two call sites: the emitted function is shared, so the
+    /// parse that can *bounce* has to sit where only a model reaches it. At the
+    /// attachment it is `parseToolArguments`, which raises the `ToolCallRefused`
+    /// the loop hands back, under the **local** name — the only spelling the
+    /// model can call again. Inside the function, which is also what a
+    /// `function:` node calls, it stays `parseResult`: grammar 8.4 has already
+    /// checked that binding field-by-field, nothing there proposes a call, and a
+    /// class whose whole meaning is "the model was handed this" would be a lie
+    /// on a node that just ended.
+    #[test]
+    fn a_tools_arguments_are_refused_to_a_model_and_mismatched_for_a_graph() {
+        let emitted = emit(&format!(
+            r#"{PREAMBLE}
+tool.lookup:
+  description: Look one thing up.
+  input: {{ query: {{ type: string, min_length: 1 }} }}
+  output: {{ snippet: {{ type: string }} }}
+  exec: {{ command: printf, args: ["a snippet"] }}
+
+agent.caller:
+  model: model.m
+  prompt: Answer.
+  output: {{ draft: {{ type: string }} }}
+  tools: [tool.lookup]
+
+flow.f:
+  inputs: {{ goal: {{ type: string }} }}
+  outputs: {{ draft: {{ type: string }} }}
+  nodes:
+    say: {{ agent: agent.caller }}
+    check:
+      function: tool.lookup
+      input: {{ query: "state.draft" }}
+  edges:
+    - {{ from: start, to: say }}
+    - {{ from: say, to: check }}
+    - {{ from: check, to: end }}
+"#
+        ));
+        // The graph's surface: the tool's own parse, naming the component the
+        // way a person reading a node failure needs it named.
+        assert!(
+            emitted.contains(
+                "  const input = runtime.parseResult(toolLookupInput, args, \"the arguments `tool.lookup` was called with\");"
+            ),
+            "{emitted}"
+        );
+        // The model's surface: one level out, refusable, and named `lookup` —
+        // the name the wire offered, which `name:` above is the same string as.
+        assert!(emitted.contains("      name: \"lookup\","), "{emitted}");
+        assert!(
+            emitted.contains(
+                "      invoke: (args, context) =>\n        toolLookup(\n          runtime.parseToolArguments(toolLookupInput, args, \"the arguments `lookup` was called with\"),\n          context,\n        ),"
+            ),
+            "{emitted}"
+        );
+        // …and nothing on the graph's side reaches the refusable parse.
+        assert!(
+            emitted.contains(
+                "  run: async (input, context) => ({ output: await toolLookup(input, context) }),"
+            ),
+            "{emitted}"
+        );
+    }
+
     /// An `agent:` node hands `callAgent` the site its tool loop instantiates
     /// beneath (grammar 9.4, PRD resolved q19).
     ///
@@ -4287,9 +4390,11 @@ flow.f:
         assert!(agent.contains("name: \"prefs_get\","), "{agent}");
         assert!(agent.contains("name: \"prefs_set\","), "{agent}");
         // The arguments are parsed against the emitted Zod for the tool's own
-        // surface — the same schema the JSON column constrains the model with.
+        // surface — the same schema the JSON column constrains the model with —
+        // and through `parseToolArguments`, so a refusal goes back to the model
+        // like every other tool surface's (Decision D119).
         assert!(
-            agent.contains("runtime.parseResult(storeDocsToolSearchInput, args,"),
+            agent.contains("runtime.parseToolArguments(storeDocsToolSearchInput, args,"),
             "{agent}"
         );
         assert!(

@@ -497,6 +497,59 @@ would name a member no answer here has.
 *If wrong*: a test scripting the missing reason is refused loudly, with the set
 in the message; nothing is served that a provider would not.
 
+### 18. How a tool result says it is an **error**, on each surface
+
+A compiled graph answers a tool call the tool's contract refused by handing the
+model the refusal rather than ending the node (grammar D119), so it sends a tool
+result that is not a result. The two surfaces spell that differently, and one of
+them does not spell it at all:
+
+| surface | how the refusal travels |
+|---|---|
+| Messages | the ordinary `tool_result` block with `is_error: true` beside its `content` — the key this server already accepts as an optional boolean |
+| Chat Completions | the ordinary `tool` role message, whose text *is* the refusal. There is nothing to set: the message is closed to `role`, `content` and `tool_call_id` |
+
+*What is certain*: that the block or message has to be **sent at all**. Both
+surfaces refuse a request that leaves a `tool_use` id or a `tool_call_id`
+unanswered, and this server checks both directions (`check_messages`, in
+`src/anthropic.rs` and in `src/openai.rs`) — so a runtime that answered only the
+calls that worked would be caught here on its next request rather than in
+production.
+
+*What is also certain, and is the one thing the two surfaces disagree about*:
+whether a tool **name** the current request does not declare may appear in the
+history. It comes up exactly once — a model answered with a name the agent never
+offered, the loop refused it (grammar D119), and the turn carrying that call
+would be replayed on the next request. The two answers are not symmetric, and
+both are this server's own behaviour rather than a guess:
+
+| surface | a history naming an undeclared tool | where |
+|---|---|---|
+| Messages | **accepted.** `tools` must be *present* when the messages carry tool blocks, which is the rule enforced; the names inside are not re-checked against it | `check_messages` in `src/anthropic.rs` |
+| Chat Completions | **refused**, `Invalid value: '<name>'. This message calls a function the request does not define.` at `messages.N.tool_calls.M.function.name` | `check_tool_calls` in `src/openai.rs`, reached for every assistant message |
+
+So a compiled graph may replay the model's own `tool_use` on the Messages API —
+which is also what that API wants, since a `thinking` block must come back
+unaltered beside the `tool_use` it preceded — and may **not** render it as a
+`tool_call` on Chat Completions. There the emitted runtime drops the undeclared
+call from the assistant message and sends the refusal as a `user` turn instead,
+because the alternative it cannot use is a `tool` message: that message must
+answer a `tool_call_id` the request no longer carries, which is the orphan the
+row above refuses.
+
+*What is assumed* is narrower, and it is about `api.openai.com` rather than about
+this server: that the real service performs the same re-validation this one does.
+It may not — nothing in the published documentation states the rule either way —
+in which case this server is **stricter** than the provider, and the runtime's
+per-surface rendering is doing work it need not. That is the direction a mock
+should err in, and it costs a correct composition nothing: every request that
+does not follow an invented tool name carries only declared names anyway.
+
+*If wrong in the other direction* — if the Messages API grows the same check —
+the first live run in which a model invents a tool name answers 400 on the
+request *after* the refusal, and the fix is one already written down: render that
+surface the way the Chat Completions path is rendered here.
+
 ---
 
 ## Accepted-key lists are curated, not exhaustive

@@ -14,6 +14,11 @@
 #     declaring `on_error: skip`, whose guard-over-its-own-output goes false while
 #     its `else:` sibling fires — Decision D97, which is the one thing a skip
 #     changes about routing.
+#   * `flow.unfit` — the other end of a `tool.*`'s two usage surfaces: a
+#     `function:` node whose bound value the tool's declared `input:` refuses.
+#     Grammar 8.4's static check covers arity and types, so a value constraint is
+#     a runtime mismatch — and one nobody can rephrase, because the arguments are
+#     the composition's rather than a model's (Decision D119).
 #   * `flow.deadline` — a node whose `timeout:` runs out while a child process
 #     sleeps, and whose `on_error: { fallback: … }` schedules another node instead
 #     of evaluating its own edges (grammar 9.2, Decision D21).
@@ -322,6 +327,32 @@ flow.hosted:
   edges:
     - { from: start, to: rank }
     - { from: rank, to: end }
+
+# A `function:` node bound to a value the tool's own `input:` refuses. Grammar
+# 8.4 checks a binding field-by-field for **arity and types**, so a `min_length:`
+# a CEL expression misses is a runtime mismatch — and it is the *graph's*, not a
+# model's: nothing here proposes a call, so nothing bounces (Decision D119). The
+# node fails and grammar 9's chain decides, which is what the class name in the
+# trace has to keep saying.
+#
+# `state.report` is `default: ""`, so the binding evaluates to the empty string
+# `tool.echo` declares `min_length: 1` against, with nothing running before it to
+# write something else.
+flow.unfit:
+  description: A function node bound to a value its tool's `input:` refuses.
+  outputs:
+    report:
+      type: string
+  nodes:
+    check:
+      function: tool.echo
+      input:
+        text: "state.report"
+      writes:
+        snippet: report
+  edges:
+    - { from: start, to: check }
+    - { from: check, to: end }
 
 flow.deadline:
   description: A node that runs out of time, and the fallback that takes over.
