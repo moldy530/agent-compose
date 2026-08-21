@@ -192,22 +192,86 @@ pub(crate) fn parse(
     }
 }
 
+/// The headers the surface requires, per route.
+///
+/// The **direct** route no longer requires a credential to be *there*, and that
+/// is a decision rather than an omission: see WIRE-NOTES (12). Grammar 12.1 lets
+/// an `openai` provider that names a `base_url:` declare no `api_key:` (Decision
+/// D120), and `openai_compatible` — which reaches this same route — has always
+/// made the key optional, so a compiled graph legitimately sends no
+/// `Authorization` at all and this server stands in for the gateway as much as
+/// for the vendor.
+///
+/// **Only the presence requirement was dropped.** An `authorization` that *is*
+/// on the wire is still held to a shape that could authenticate something,
+/// because the keyless posture the runtime promises is a header that is
+/// *absent*, not one that is malformed: `authorization: Bearer ` and a raw key
+/// under `authorization:` are requests that claim to authenticate and fail, and
+/// `api.openai.com` answers both 401. That is the codegen bug this check is now
+/// for.
+///
+/// **What "a shape that could authenticate something" admits is one scheme more
+/// than `Bearer`**, and that is the same concession `src/anthropic.rs` makes on
+/// the Messages wire, arrived at from the other side. A keyless provider is
+/// entitled to declare the gateway's own token through `headers:` (grammar 12.1,
+/// `docs/topics/models.md`, "Keyless providers behind a gateway"), and nothing
+/// says that token is a bearer one — `authorization: "Basic ${GW_TOKEN}"` is an
+/// ordinary composition. From one request this server cannot tell that apart
+/// from codegen having mangled the vendor key, exactly as the Messages route
+/// cannot tell a declared `authorization:` apart from a misplaced `x-api-key`.
+/// So `<scheme> <token>` with any scheme is **served** when nothing else on the
+/// request is a credential, and where it *is* decidable — the recorded request
+/// read against the spec that produced it — is
+/// `compiled_graph_acceptance.rs`'s
+/// `a_provider_with_no_key_sends_no_authentication_header_on_either_wire`.
+///
+/// Three shapes stay refused because one request decides them: a `Bearer` with
+/// no token (`Bearer`, `Bearer `), which is the `?? ""` this rule exists to
+/// catch; a value with no scheme at all (`sk-…`), which is the vendor key that
+/// lost its prefix and authenticates nothing; and a non-`Bearer` scheme beside
+/// an `api-key` header, which is not the gateway reading — it is two credentials
+/// on a route that reads neither of them.
+///
+/// The **Azure** routes keep the presence check too. `azure_openai` requires
+/// `api_key:` outright (grammar 12.1), so a request reaching a deployment route
+/// with neither spelling of the credential is a codegen bug there as well — and
+/// a malformed `authorization` with no `api-key` beside it lands on the same
+/// refusal, since a bearer token that is not one leaves the route with nothing.
 fn check_headers(checker: &mut Checker, route: Route, headers: &BTreeMap<String, String>) {
     let value = |name: &str| headers.get(name).filter(|value| !value.is_empty());
-    let bearer = value("authorization").is_some_and(|value| value.starts_with("Bearer "));
+    let bearer = value("authorization")
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .is_some_and(|token| !token.trim().is_empty());
     // A credential, not a field: answered 401 rather than 400 (see `rejected`),
     // because that is the status the `openai` SDK's `AuthenticationError` comes
     // from and generated code may well classify the two apart.
-    match route {
-        Route::Direct if !bearer => checker.credential(
-            "headers.authorization",
-            "You didn't provide an API key. You need to provide your API key in an Authorization header using Bearer auth (i.e. Authorization: Bearer YOUR_KEY).",
-        ),
-        route if route.is_azure() && !bearer && value("api-key").is_none() => checker.credential(
-            "headers.api-key",
-            "Access denied due to missing subscription key. Make sure to include subscription key when making requests to an API.",
-        ),
-        _ => {}
+    if route.is_azure() {
+        if !bearer && value("api-key").is_none() {
+            checker.credential(
+                "headers.api-key",
+                "Access denied due to missing subscription key. Make sure to include subscription key when making requests to an API.",
+            );
+        }
+    } else if let Some(authorization) = headers.get("authorization") {
+        // A credential is `<scheme> <token>`. A value carrying no space carries
+        // no scheme, and is read as a bare token — the shape a lost `Bearer `
+        // prefix leaves behind — so it fails the empty-token test below rather
+        // than being mistaken for a scheme of its own.
+        let (scheme, token) = match authorization.split_once(' ') {
+            Some((scheme, token)) => (scheme, token.trim()),
+            None => (authorization.as_str(), ""),
+        };
+        let authenticates = !token.is_empty()
+            && (scheme == "Bearer"
+                // The gateway-token reading, which only holds while this is the
+                // one credential on the request.
+                || value("api-key").is_none());
+        if !authenticates {
+            checker.credential(
+                "headers.authorization",
+                "You didn't provide an API key. You need to provide your API key in an Authorization header using Bearer auth (i.e. Authorization: Bearer YOUR_KEY).",
+            );
+        }
     }
     let json = headers
         .get("content-type")
@@ -2098,11 +2162,16 @@ mod tests {
         ));
     }
 
-    /// The envelope and the auth header.
+    /// The envelope, the credential the Azure routes still require, and the one
+    /// the direct route no longer does.
     #[test]
     fn the_required_envelope_is_required() {
         assert_eq!(check(&json!({ "messages": [] })), ["model", "messages"]);
 
+        // The direct route accepts a request with no `Authorization`: all three
+        // kinds that reach it may declare no `api_key:` (grammar 12.1, Decision
+        // D120, WIRE-NOTES (12)), so its absence is a wire shape rather than a
+        // codegen bug. The body is still checked.
         let mut anonymous = headers();
         anonymous.remove("authorization");
         let parsed = parse(
@@ -2110,16 +2179,50 @@ mod tests {
             &anonymous,
             "",
             None,
+            Some(&request(
+                json!({ "messages": [{ "role": "user", "content": "go" }] }),
+            )),
+        );
+        assert!(
+            parsed.failures.is_empty(),
+            "a keyless request is a legal shape on the direct route: {:?}",
+            parsed.failures
+        );
+
+        // A *malformed* one is not. Only the presence requirement was dropped:
+        // an `authorization` that is on the wire is still held to the spelling
+        // the service accepts, so a raw key and a bearer prefix with nothing
+        // after it are both the 401 they draw live.
+        for malformed in ["mock-provider-key", "Bearer ", "Bearer   ", ""] {
+            let mut wrong = headers();
+            wrong.insert("authorization".to_string(), malformed.to_string());
+            let parsed = parse(
+                Route::Direct,
+                &wrong,
+                "",
+                None,
+                Some(&request(
+                    json!({ "messages": [{ "role": "user", "content": "go" }] }),
+                )),
+            );
+            assert_eq!(
+                parsed.failures[0].pointer, "headers.authorization",
+                "`authorization: {malformed}` is a malformed credential"
+            );
+            assert!(parsed.failures[0].authentication);
+        }
+
+        // Azure's is still required, and is still a credential: the refusal is
+        // a 401 rather than the 400 a bad body draws — the distinction
+        // generated code classifies on.
+        let parsed = parse(
+            Route::AzureV1,
+            &anonymous,
+            "",
+            None,
             Some(&request(json!({}))),
         );
-        let failures: Vec<String> = parsed
-            .failures
-            .iter()
-            .map(|failure| failure.pointer.clone())
-            .collect();
-        assert_eq!(failures, ["headers.authorization"]);
-        // A credential, so the refusal is a 401 rather than the 400 a bad body
-        // draws — the distinction generated code classifies on.
+        assert_eq!(parsed.failures[0].pointer, "headers.api-key");
         assert!(parsed.failures[0].authentication);
         let Answer::Respond(response) = rejected(1, &parsed.failures) else {
             panic!("a rejection is a response");

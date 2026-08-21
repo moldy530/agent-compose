@@ -1052,6 +1052,190 @@ fn each_chat_completions_kind_authenticates_and_routes_the_way_its_row_says() {
     assert!(provider.snapshot().is_drained());
 }
 
+/// A provider that declares no `api_key:` sends **no** authentication header,
+/// on either vendor wire — and one that declares a key still sends it.
+///
+/// Grammar 12.1 makes the key conditional on the two kinds with a default
+/// endpoint (Decision D120): a `base_url:` names a gateway that injects the
+/// vendor credential server-side, so the compiled graph must send none. "None"
+/// is the load-bearing word. `x-api-key: ""` and `authorization: Bearer ` are
+/// requests that claim to authenticate and fail, which a gateway may refuse
+/// before injecting anything and which a header-forwarding gateway turns into a
+/// 401 at the vendor — and both spellings are exactly what a `?? ""` in the
+/// emitted runtime produces, which is what the code said before this rule
+/// landed. Nothing about a flow's outputs can tell the two apart: the header is
+/// only visible in the transcript, which is why this is an acceptance test and
+/// not a unit test about a string.
+///
+/// The first run carries the other half of that rule, which is the half a
+/// deployment actually runs: dropping the vendor credential is what makes room
+/// for the gateway's *own* token, and `headers:` is where every account of D120
+/// — grammar 12.1, `explain missing-credential`, `docs/topics/models.md` — says
+/// that token goes. So `provider.claude_gateway` declares one, and the recorded
+/// request is read for both facts at once: no `x-api-key`, and the declared
+/// `authorization` present with the value the composition interpolated. They
+/// are different env vars (`MOCK_GATEWAY_TOKEN` is not `MOCK_API_KEY`) so the
+/// assertion names which layer the header came from. Without this, the whole
+/// documented repair would be proved only by the mock's willingness to *serve*
+/// that shape (`anthropic_wire.rs`'s
+/// `an_empty_api_key_is_refused_while_a_gateway_token_is_served`), never by the
+/// emitter's producing it.
+///
+/// The third run is the kind D120 **did not** move, and it is the reason the
+/// rule is stated over the connection rather than over the row.
+/// `openai_compatible` paired an optional `api_key:` with a required `base_url:`
+/// before the decision and still does, so nothing in grammar 12.1's table
+/// changed for it — and yet a keyless one used to reach the wire holding
+/// `authorization: Bearer `, because the emitter's `?? ""` was written per wire
+/// and not per kind. `docs/topics/models.md` says in so many words that this
+/// kind now sends no `Authorization` header either; this run is what makes that
+/// sentence true rather than merely written, on the one row whose grammar gives
+/// no other reason to look.
+///
+/// The last run is the other direction, and it is not decoration: it is the
+/// only place the suite asserts that the Messages surface sends its credential
+/// when the composition has one. The mock no longer requires it
+/// (`crates/mock-provider/WIRE-NOTES.md` (12) — a keyless request is a legal
+/// wire shape, so the server cannot be what enforces this), so an emitter that
+/// dropped the header for *every* provider would pass every other test in this
+/// file.
+#[test]
+fn a_provider_with_no_key_sends_no_authentication_header_on_either_wire() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "verdict": "revise", "feedback": "tighten it" })),
+        ),
+        Script::new(
+            OPENAI_DIRECT,
+            Outcome::structured(json!({ "summary": "the reviewer asked for one change" })),
+        ),
+        Script::new(
+            LOCAL,
+            Outcome::structured(json!({ "summary": "one change, and the endpoint holds no key" })),
+        ),
+        Script::new(
+            HAIKU,
+            Outcome::structured(json!({ "verdict": "approve", "feedback": "" })),
+        ),
+    ]);
+
+    let Some(messages) = harness::invoke(
+        "keyless-gateway",
+        "flow.messages",
+        &[("goal", "ship it")],
+        &provider,
+    ) else {
+        return;
+    };
+    messages.succeeded();
+    assert_eq!(messages.outputs()["verdict"], "revise");
+
+    let chat = harness::invoke(
+        "keyless-gateway",
+        "flow.chat",
+        &[("notes", "tighten it")],
+        &provider,
+    )
+    .expect("the toolchain was there a moment ago");
+    chat.succeeded();
+    assert_eq!(
+        chat.outputs()["summary"],
+        "the reviewer asked for one change"
+    );
+
+    let compatible = harness::invoke(
+        "keyless-gateway",
+        "flow.compatible",
+        &[("notes", "tighten it")],
+        &provider,
+    )
+    .expect("the toolchain was there a moment ago");
+    compatible.succeeded();
+    assert_eq!(
+        compatible.outputs()["summary"],
+        "one change, and the endpoint holds no key"
+    );
+
+    let keyed = harness::invoke(
+        "keyless-gateway",
+        "flow.keyed",
+        &[("goal", "ship it")],
+        &provider,
+    )
+    .expect("the toolchain was there a moment ago");
+    keyed.succeeded();
+    assert_eq!(keyed.outputs()["verdict"], "approve");
+
+    let recorded = provider.requests();
+    assert_eq!(recorded.len(), 4, "one agent node each");
+
+    let keyless_messages = &recorded[0];
+    assert!(
+        keyless_messages.is_valid(),
+        "{:?}",
+        keyless_messages.failures()
+    );
+    assert_eq!(keyless_messages.surface, Surface::Anthropic);
+    assert_eq!(keyless_messages.model, SONNET);
+    assert!(
+        !keyless_messages.headers.contains_key("x-api-key"),
+        "a keyless `anthropic` provider sends no credential, not an empty one: {:?}",
+        keyless_messages.headers
+    );
+    assert_eq!(
+        keyless_messages.headers["authorization"], "Bearer mock-gateway-token",
+        "…and the token its `headers:` declares is what authenticates it instead"
+    );
+    assert_eq!(
+        keyless_messages.headers["anthropic-version"], "2023-06-01",
+        "…while the headers that are not credentials are unaffected"
+    );
+
+    let keyless_chat = &recorded[1];
+    assert!(keyless_chat.is_valid(), "{:?}", keyless_chat.failures());
+    assert_eq!(keyless_chat.surface, Surface::OpenAi);
+    assert_eq!(keyless_chat.model, OPENAI_DIRECT);
+    assert_eq!(keyless_chat.path, "/v1/chat/completions");
+    assert!(
+        !keyless_chat.headers.contains_key("authorization"),
+        "a keyless `openai` provider sends no bearer token, not an empty one: {:?}",
+        keyless_chat.headers
+    );
+    assert!(
+        !keyless_chat.headers.contains_key("api-key"),
+        "…and not the Azure spelling either: {:?}",
+        keyless_chat.headers
+    );
+
+    let keyless_compatible = &recorded[2];
+    assert!(
+        keyless_compatible.is_valid(),
+        "{:?}",
+        keyless_compatible.failures()
+    );
+    assert_eq!(keyless_compatible.surface, Surface::OpenAi);
+    assert_eq!(keyless_compatible.model, LOCAL);
+    assert!(
+        !keyless_compatible.headers.contains_key("authorization"),
+        "a keyless `openai_compatible` provider sends no header either — the rule \
+         is over the connection, not over the kind's row: {:?}",
+        keyless_compatible.headers
+    );
+
+    let keyed_messages = &recorded[3];
+    assert!(keyed_messages.is_valid(), "{:?}", keyed_messages.failures());
+    assert_eq!(keyed_messages.surface, Surface::Anthropic);
+    assert_eq!(keyed_messages.model, HAIKU);
+    assert_eq!(
+        keyed_messages.headers["x-api-key"], "mock-provider-key",
+        "a provider that declares `api_key:` still sends it"
+    );
+
+    assert!(provider.snapshot().is_drained());
+}
+
 /// A model that declines to answer says why, and the node error repeats it.
 ///
 /// Chat Completions states a refusal as `content: null` beside a `refusal`

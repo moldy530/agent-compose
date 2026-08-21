@@ -22,7 +22,11 @@
 //!   object schema, and `tools` present whenever a tool block appears anywhere
 //!   in the conversation;
 //! * the **required envelope** — `model`, `messages`, `max_tokens`, the
-//!   `x-api-key` and `anthropic-version` headers, and a JSON content type;
+//!   `anthropic-version` header, and a JSON content type. Not the *presence* of
+//!   `x-api-key`: a keyless provider behind a gateway is a legal composition and
+//!   sends none (grammar 12.1, Decision D120), so its absence is a wire shape
+//!   rather than a codegen bug — WIRE-NOTES (12). Its *shape* is still checked,
+//!   because an empty `x-api-key` is neither posture;
 //! * the **sampling knobs** — grammar 12.2's `settings:` vocabulary, checked for
 //!   type *and* range, because the compiler range-checks them and nothing else
 //!   watches what reaches the wire.
@@ -131,12 +135,36 @@ pub(crate) fn parse(headers: &BTreeMap<String, String>, body: Option<&Value>) ->
 
 /// The headers the API requires. A generated client that forgets one is a
 /// codegen bug the first live call would find; this finds it in CI instead.
+///
+/// **`x-api-key` is no longer required to be *there***, and that is a decision
+/// rather than an omission: see WIRE-NOTES (12). A `base_url:` points a
+/// connection at whatever it names, and grammar 12.1 lets an `anthropic`
+/// provider that names one declare no `api_key:` at all (Decision D120) — a
+/// gateway injects the credential server-side and the compiled graph sends no
+/// authentication header. This server stands in for that endpoint as much as for
+/// the vendor's, so an unauthenticated request is a wire shape it has to accept.
+///
+/// **Only the presence requirement was dropped.** A credential that *is* on the
+/// wire is still held to its shape, because the keyless posture the runtime
+/// promises is a header that is *absent*, not one that is empty: `x-api-key: ""`
+/// is a request that claims to authenticate and fails, which a gateway may
+/// refuse before injecting anything and a forwarding gateway turns into a 401 at
+/// the vendor. So an empty `x-api-key` is the codegen bug this check is now for,
+/// and it is answered the way a live 401 is.
+///
+/// What this surface cannot decide is a credential sent under the *wrong*
+/// header. `authorization: Bearer …` on the Messages wire is the documented
+/// gateway shape (`docs/topics/models.md`, "Keyless providers behind a
+/// gateway"), so it is indistinguishable here from a proxy token a composition
+/// declared through `headers:`. Where it *is* decidable is the acceptance suite,
+/// which reads the recorded request against the spec that produced it — see
+/// `a_provider_with_no_key_sends_no_authentication_header_on_either_wire`.
 fn check_headers(checker: &mut Checker, headers: &BTreeMap<String, String>) {
     let present = |name: &str| headers.get(name).is_some_and(|value| !value.is_empty());
-    if !present("x-api-key") {
-        // A credential, not a field: answered 401 rather than 400 (see
-        // `rejected`), because that is the status the SDK's `AuthenticationError`
-        // comes from and generated code may well classify the two apart.
+    // A credential, not a field: answered 401 rather than 400 (see `rejected`),
+    // because that is the status the SDK's `AuthenticationError` comes from and
+    // generated code may well classify the two apart.
+    if headers.contains_key("x-api-key") && !present("x-api-key") {
         checker.credential(
             "headers.x-api-key",
             "x-api-key header is required: authentication failed.",
@@ -1341,11 +1369,24 @@ mod tests {
         assert_eq!(response.status, 400);
         assert_eq!(response.body["error"]["type"], "invalid_request_error");
 
-        // The api key is: a missing one is authentication, and it is answered
-        // 401 — the status the SDK raises `AuthenticationError` from.
+        // The *presence* of `x-api-key` is not among them: a provider that names
+        // a `base_url:` may declare no `api_key:` and then sends no header at
+        // all (grammar 12.1, Decision D120, WIRE-NOTES (12)), so its absence is
+        // a wire shape this server accepts rather than a codegen bug it reports.
         let mut anonymous = headers();
         anonymous.remove("x-api-key");
-        let parsed = parse(&anonymous, Some(&request));
+        assert!(
+            parse(&anonymous, Some(&request)).failures.is_empty(),
+            "a keyless request is a legal shape on this surface"
+        );
+
+        // Its *shape* still is. An empty header is neither posture — not the
+        // keyless request D120 admits and not a credential — so it is refused,
+        // and refused as a credential: 401, the status the SDK raises
+        // `AuthenticationError` from.
+        let mut empty = headers();
+        empty.insert("x-api-key".to_string(), String::new());
+        let parsed = parse(&empty, Some(&request));
         assert_eq!(parsed.failures[0].pointer, "headers.x-api-key");
         assert!(parsed.failures[0].authentication);
         let Answer::Respond(response) = rejected(1, &parsed.failures) else {

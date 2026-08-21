@@ -398,6 +398,7 @@ fn provider(fields: &mut Fields<'_>, subject: &str, cx: &mut Cx) -> ProviderDef 
                 );
             }
         }
+        credential(fields, kind, subject, cx);
     }
 
     ProviderDef {
@@ -417,6 +418,48 @@ fn provider(fields: &mut Fields<'_>, subject: &str, cx: &mut Cx) -> ProviderDef 
         headers,
         description,
     }
+}
+
+/// A connection pointed at a vendor's own endpoint declares a key (grammar
+/// 12.1, Decision D120).
+///
+/// The one *conditional* required key, which is why it is not a row of
+/// [`ProviderKind::required_keys`]: on the two kinds with a default endpoint,
+/// omitting `base_url:` is not an omission at all — the connection resolves to
+/// `https://api.anthropic.com` or `https://api.openai.com`, where nothing but
+/// `api_key:` authenticates — while declaring one says the traffic goes to a
+/// gateway that supplies the credential server-side. So what is refused is the
+/// **pair** being absent together, and the message names both repairs because
+/// either one alone is a complete fix.
+///
+/// Decided from `contains` rather than from the parsed values, exactly as the
+/// unconditional rows above are: a declared `api_key:` holding a literal is an
+/// `invalid-env-ref` about the value, and piling a second report about the key
+/// being *absent* on top of it would be a report about a key the author wrote.
+fn credential(fields: &Fields<'_>, kind: &Spanned<ProviderKind>, subject: &str, cx: &mut Cx) {
+    let Some(endpoint) = kind.value.default_endpoint() else {
+        return;
+    };
+    if fields.contains("api_key") || fields.contains("base_url") {
+        return;
+    }
+    cx.push(
+        Diagnostic::error(
+            DiagnosticCode::MissingCredential,
+            fields.span.clone(),
+            format!(
+                "{subject} declares `kind: {}` and neither `api_key:` nor `base_url:`",
+                kind.value.as_str()
+            ),
+        )
+        .with_label(kind.span.clone(), "the kind is declared here")
+        .with_help(format!(
+            "with no `base_url:` this connection reaches `{endpoint}`, where only a key \
+             authenticates: declare `api_key:`, or name the gateway that supplies one with \
+             `base_url:` — a provider carrying a `base_url:` and no key sends no authentication \
+             header at all (grammar 12.1, Decision D120)"
+        )),
+    );
 }
 
 /// Read one provider key, rejecting it when the declared kind has no such key

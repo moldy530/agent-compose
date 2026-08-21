@@ -78,6 +78,7 @@ pub fn explanation(code: DiagnosticCode) -> &'static str {
         DiagnosticCode::ValueOutOfRange => include_str!("codes/value-out-of-range.md"),
         DiagnosticCode::UnknownVariant => include_str!("codes/unknown-variant.md"),
         DiagnosticCode::ConflictingKeys => include_str!("codes/conflicting-keys.md"),
+        DiagnosticCode::MissingCredential => include_str!("codes/missing-credential.md"),
         DiagnosticCode::InvalidIdentifier => include_str!("codes/invalid-identifier.md"),
         DiagnosticCode::InvalidReference => include_str!("codes/invalid-reference.md"),
         DiagnosticCode::InvalidDuration => include_str!("codes/invalid-duration.md"),

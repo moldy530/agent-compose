@@ -131,6 +131,7 @@ pub const FIXTURES: &[&str] = &[
     "fanout",
     "flow-as-tool",
     "http-trigger",
+    "keyless-gateway",
     "model-failover",
     "provider-kinds",
     "stores",
@@ -141,6 +142,11 @@ pub const BASE_URL: &str = "MOCK_BASE_URL";
 /// The `${MOCK_API_KEY}` they send. Any non-empty value: the harness needs no
 /// API keys, but a request still has to carry the header a client sends.
 pub const API_KEY: &str = "MOCK_API_KEY";
+/// The `${MOCK_GATEWAY_TOKEN}` a keyless provider's `headers:` map carries
+/// (`keyless-gateway`). Deliberately *not* [`API_KEY`]: a gateway's own token is
+/// not the vendor credential, and giving the two different values is what lets
+/// an assertion say which layer of the request a header came from.
+pub const GATEWAY_TOKEN: &str = "MOCK_GATEWAY_TOKEN";
 /// The directory of ordinary commands an `exec:` fixture reaches
 /// (`http-trigger`'s `escalate` node, `activities`' `false` and `sleep`),
 /// supplied so a run is not stopped by an unrelated presence check.
@@ -193,6 +199,7 @@ pub fn environment(provider: &MockProvider) -> Vec<(String, String)> {
     vec![
         (BASE_URL.to_string(), provider.base_url()),
         (API_KEY.to_string(), "mock-provider-key".to_string()),
+        (GATEWAY_TOKEN.to_string(), "mock-gateway-token".to_string()),
         (OPS_BIN.to_string(), "/bin".to_string()),
         (OPS_URL.to_string(), provider.base_url()),
     ]

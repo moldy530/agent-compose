@@ -61,7 +61,11 @@
 //! parser's — the `start` edge of grammar 7.6.3 rule 2, an `else:` edge's
 //! guarded sibling (Decision D107), a duplicate edge — and a rule decidable from
 //! names and addresses is the resolver's. `docs/grammar.md` Appendix B is the
-//! normative account of the split.
+//! normative account of the split. Grammar 12.1's conditional credential rule
+//! (Decision D120) is one file's business and so is the parser's; the table its
+//! message reads is
+//! [`ProviderKind::default_endpoint`](crate::ast::ProviderKind::default_endpoint),
+//! and neither half of it is in [`providers`].
 
 pub(crate) mod bindings;
 pub(crate) mod channels;

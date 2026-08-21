@@ -149,6 +149,7 @@ const TOPICS_WITHOUT_A_RUNNABLE_EXAMPLE: &[(&str, &str)] = &[
 const EXPLANATIONS_WITH_A_CORRECTED_EXAMPLE: &[&str] = &[
     "invalid-path-expression",
     "missing-capability",
+    "missing-credential",
     "unbalanced-convergence",
     "undefined-channel",
     "unkeyed-map-write",

@@ -17,6 +17,16 @@ provider.local:
   base_url: ${LOCAL_LLM_URL}
   api_key: ${LOCAL_LLM_KEY}
 
+provider.gateway:
+  kind: anthropic
+  base_url: ${LLM_GATEWAY}
+  headers:
+    authorization: "Bearer ${PROXY_TOKEN}"
+
+model.gateway:
+  provider: provider.gateway
+  id: claude-sonnet-4-5
+
 model.smart:
   provider: provider.anthropic
   id: claude-sonnet-4-5
@@ -55,8 +65,8 @@ other key belongs to the rows its `kind` names.
 
 | `kind` | Required | Optional |
 |---|---|---|
-| `anthropic` | `api_key` | `base_url`, `headers` |
-| `openai` | `api_key` | `base_url`, `headers`, `organization` |
+| `anthropic` | `api_key` — **or** a `base_url` naming the gateway that holds one | `api_key` (beside a `base_url`), `base_url`, `headers` |
+| `openai` | `api_key` — **or** a `base_url` naming the gateway that holds one | `api_key` (beside a `base_url`), `base_url`, `headers`, `organization` |
 | `openai_compatible` | `base_url` | `api_key`, `headers` |
 | `azure_openai` | `base_url`, `api_key`, `api_version` | `headers` |
 | `bedrock` | `region` | `access_key_id`, `secret_access_key`, `session_token`, `profile` |
@@ -72,6 +82,49 @@ connection setting is in effect that is not.
 through a cloud SDK has no bare endpoint and no request the spec composes
 headers onto. A deployment that genuinely needs either is reaching a compatible
 HTTP endpoint, which is what `openai_compatible` is for.
+
+## Keyless providers behind a gateway
+
+`anthropic` and `openai` are the two kinds with a **default endpoint**: omit
+`base_url:` and the connection reaches `https://api.anthropic.com` or
+`https://api.openai.com`, where nothing but a key authenticates. So on those two
+kinds `api_key:` is required when `base_url:` is absent and **optional when it is
+present** — which is the shape a corporate deployment writes, where a gateway
+injects the vendor credential server-side and nobody running the graph holds a
+key:
+
+```yaml
+provider.gateway:
+  kind: anthropic
+  base_url: ${LLM_GATEWAY}
+```
+
+A provider declaring **neither** is `missing-credential`, and the message names
+both repairs: add the key, or name the gateway.
+`agent-compose explain missing-credential` prints the worked pair.
+
+When the key is absent the compiled graph sends **no authentication header at
+all** — no `x-api-key`, no `authorization` — rather than an empty one, so the
+gateway sees a request that never claimed to authenticate. A gateway that wants
+a token of its *own* takes it through `headers:`, whose values interpolate, which
+is what the opening spec's `provider.gateway` shows:
+
+```yaml
+  headers:
+    authorization: "Bearer ${PROXY_TOKEN}"
+```
+
+The other four kinds keep the rows they had. `azure_openai` reaches a
+per-resource deployment with no default endpoint to fall back to, so all three
+of its keys stay required; `openai_compatible` already paired an optional
+`api_key` with a required `base_url`; and `bedrock` and `vertex` authenticate
+through their cloud's own credential chain.
+
+The **header** rule above still reaches one of them, because it is stated over
+the connection rather than over the kind: an `openai_compatible` provider that
+declares no `api_key:` — a local llama.cpp or ollama endpoint — now sends no
+`Authorization` header at all, where before it sent an empty `Bearer `. Same fix
+for the same reason, on a kind whose row did not move.
 
 **Credentials are never literals.** `api_key`, `api_secret`, `token`,
 `password`, `access_key_id`, `secret_access_key`, `session_token`,

@@ -156,6 +156,17 @@ const CODEGEN: &[Criterion] = &[
                 "each_chat_completions_kind_authenticates_and_routes_the_way_its_row_says",
                 Status::Live,
             ),
+            // The conditional half of the same row (grammar 12.1, Decision
+            // D120): a provider that names a `base_url:` may hold no key, and
+            // then the node fn must send no auth header rather than an empty
+            // one. Only the transcript can tell those apart, and the mock does
+            // not enforce it — a keyless request is a legal wire shape — so an
+            // emitter that dropped the header for every provider would pass
+            // every other test here, which is what the keyed third run closes.
+            (
+                "a_provider_with_no_key_sends_no_authentication_header_on_either_wire",
+                Status::Live,
+            ),
             // The other thing that surface can answer with: a refusal, which
             // carries its reason and is otherwise indistinguishable from a
             // `max_tokens` cut.

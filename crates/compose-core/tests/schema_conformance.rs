@@ -9,6 +9,11 @@
 //! * every fixture under `tests/fixtures/invalid-schema/` must be rejected —
 //!   each is a minimal file violating one named grammar rule.
 //!
+//! A rule the example corpus happens not to exercise is covered by neither, and
+//! then only its negative half is pinned. Where that matters the accepted shape
+//! is asserted directly — see
+//! [`the_published_schema_accepts_a_keyless_provider_that_names_its_endpoint`].
+//!
 //! The schema is deliberately looser than `agent-compose validate` (no
 //! cross-file reference or static-analysis checks); see `docs/grammar.md`
 //! Appendix B.
@@ -17,8 +22,9 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use compose_core::ast::definition::ProviderKind;
 use jsonschema::Validator;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 /// Node kind keys the grammar defines (grammar 7.1 / PRD 5.5, 5.8). The example
 /// corpus is required to exercise all of them.
@@ -490,4 +496,64 @@ fn invalid_fixture_corpus_covers_at_least_twelve_rules() {
         count >= 12,
         "the negative corpus must cover at least 12 rules, found {count}"
     );
+}
+
+/// Decision D120's conditional in the direction neither corpus reaches: the
+/// shapes the schema must **accept**.
+///
+/// Every `anthropic` or `openai` provider under `examples/` declares an
+/// `api_key:`, and both keyless fixtures in `invalid-schema/` omit the
+/// `base_url:` as well — so the connection the rule exists to admit, keyless
+/// because it names its gateway, is pinned by neither. Hoisting
+/// `required: ["api_key"]` back out of the inner `then` would then make the
+/// published schema refuse every legal gateway provider with the workspace
+/// green, and since the schema is what editors read, the only place that would
+/// show is a red squiggle on correct YAML in someone's editor.
+///
+/// Asserted per kind because the conditional is hand-duplicated per kind —
+/// grammar 12.1 gives each row its own closed key list, so the two branches
+/// cannot share one subschema and one instance would only ever prove one of
+/// them. The kinds are *derived* from
+/// [`ProviderKind::default_endpoint`](compose_core::ast::definition::ProviderKind::default_endpoint)
+/// rather than listed, for the same reason: a seventh kind with a vendor
+/// endpoint of its own has to grow a conditional in the published schema too,
+/// and a hardcoded pair would let that ship accepting a credential-less
+/// provider with the workspace green.
+#[test]
+fn the_published_schema_accepts_a_keyless_provider_that_names_its_endpoint() {
+    let validator = compile_schema();
+    let defaulted: Vec<&str> = ProviderKind::ALL
+        .iter()
+        .filter(|kind| kind.default_endpoint().is_some())
+        .map(|kind| kind.as_str())
+        .collect();
+    assert!(
+        !defaulted.is_empty(),
+        "the conditional credential rule is about the kinds with a default endpoint"
+    );
+    for kind in defaulted {
+        let legal = [
+            // The gateway supplies the vendor credential itself.
+            json!({ "kind": kind, "base_url": "${LLM_GATEWAY}" }),
+            // …and wants a token of its own, which rides `headers:`.
+            json!({
+                "kind": kind,
+                "base_url": "${LLM_GATEWAY}",
+                "headers": { "authorization": "Bearer ${PROXY_TOKEN}" },
+            }),
+            // The other repair the diagnostic offers, and the vendor-endpoint
+            // shape the two negative fixtures are the counter-example to.
+            json!({ "kind": kind, "api_key": "${VENDOR_API_KEY}" }),
+        ];
+        for provider in legal {
+            let instance = json!({ "version": "0.1", "provider.gateway": provider });
+            let errors = validation_errors(&validator, &instance);
+            assert!(
+                errors.is_empty(),
+                "the published schema must accept this legal `{kind}` provider:\n{}\n{}",
+                serde_json::to_string_pretty(&instance).expect("a printable instance"),
+                errors.join("\n")
+            );
+        }
+    }
 }
