@@ -1,0 +1,17 @@
+# The two agents, in the other order.
+agent.reviewer:
+  model: model.fast
+  prompt: Review the draft.
+  input:
+    draft: { type: string }
+  output:
+    verdict: { enum: [approve, revise] }
+
+agent.writer:
+  model: model.fast
+
+  # Written out rather than inline; the same text either way.
+  prompt: Write a draft.
+  output:
+    draft:
+      type: string

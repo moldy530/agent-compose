@@ -393,7 +393,7 @@ Validator guarantees for this file: all refs resolve and are correctly typed; `v
 
 Exit criterion: a user can download a released binary, hand their coding agent the skill, and build/run flows locally — no clone of this repo, no Rust toolchain.
 
-- `agent-compose plan` (topology + validation diff between two specs).
+- `agent-compose plan` (topology + validation diff between two specs); `docs/plan.md` is normative for the document it writes, and is what a consumer pins `plan_version` on.
 - Tracing conventions in generated code: a documented, stable trace format; routing decisions (which edge fired and the guard values that decided it, which map variant a discriminator chose, what terminated a cycle) as trace data.
 - `human` node runtime (interrupt/resume through `serve`, and the same answer typed at an interactive `run`; grammar shipped in M0, runtime deferred here per resolved q4, second delivery surface per resolved q21).
 - Flow-as-tool runtime (unblocked by resolved q19/q20).

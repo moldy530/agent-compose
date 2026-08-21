@@ -1,0 +1,70 @@
+# Four keys the grammar supplies a default for, left unwritten — the way an
+# author writes them when the default is the value they want: an `exec:` block
+# with no `expect_exit:` (grammar 6.1), an agent with no `max_tool_iterations:`
+# (grammar 5, Decision D51), an array channel with no `unique_items:` (grammar
+# 3.5), and an `http` trigger with no `method:` (grammar 13.3, Decision D45).
+#
+# The `after` spec writes all four out, spelled as the value the grammar already
+# supplies. `docs/plan.md` §11 is where a reader branching on the command is told
+# what that costs them.
+version: "0.1"
+
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+
+model.fast:
+  provider: provider.anthropic
+  id: some-fast-model
+
+state:
+  draft:
+    description: The draft as it stands.
+    type: string
+    default: ""
+  notes:
+    description: Every note the checker has raised so far.
+    type: array
+    items: { type: string }
+    max_items: 20
+    default: []
+
+tool.spell_check:
+  description: Check the spelling of a draft.
+  input:
+    text: { type: string }
+  output:
+    notes: { type: array, items: { type: string }, max_items: 20 }
+  exec:
+    command: spell
+    args: ["--stdin"]
+
+agent.writer:
+  model: model.fast
+  prompt: Write a draft.
+  output:
+    draft: { type: string }
+
+flow.review_loop:
+  description: Draft, then check the spelling of what was drafted.
+  inputs:
+    goal: { type: string }
+  outputs:
+    draft: { type: string }
+    notes: { type: array, items: { type: string }, max_items: 20 }
+  nodes:
+    write: { agent: agent.writer, input: "input.goal" }
+    check: { function: tool.spell_check, input: { text: "state.draft" } }
+  edges:
+    - { from: start, to: write }
+    - { from: write, to: check }
+    - { from: check, to: end }
+
+triggers:
+  on_request:
+    type: http
+    flow: flow.review_loop
+    path: /review
+    respond: sync
+    input:
+      goal: "payload.body.goal"

@@ -1,0 +1,49 @@
+# The same composition with all three leaves respelled and nothing else edited:
+# `120s` written `2m`, the guard's spaces closed up, and `1` written `1.0`.
+#
+# Every one of the three decides exactly what it decided before. A plan reports
+# them all the same, and `docs/plan.md` §11 is where that is stated for a reader
+# branching on the command.
+version: "0.1"
+
+defaults:
+  timeout: 2m
+
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+
+model.fast:
+  provider: provider.anthropic
+  id: some-fast-model
+
+agent.writer:
+  model: model.fast
+  prompt: Write a draft.
+  input:
+    passes: { type: integer, minimum: 1.0 }
+  output:
+    draft: { type: string }
+
+agent.reviewer:
+  model: model.fast
+  prompt: Review the draft.
+  input:
+    draft: { type: string }
+  output:
+    verdict: { enum: [approve, revise] }
+
+flow.review_loop:
+  description: Draft and review until the reviewer approves.
+  inputs:
+    goal: { type: string }
+  outputs:
+    draft: { type: string }
+  nodes:
+    write: { agent: agent.writer, input: { passes: "1" } }
+    review: { agent: agent.reviewer, input: { draft: "write.output.draft" } }
+  edges:
+    - { from: start, to: write }
+    - { from: write, to: review }
+    - { from: review, to: write, when: "review.output.verdict=='revise'", max_iterations: 3 }
+    - { from: review, to: end, else: true }

@@ -1,0 +1,25 @@
+flow.review_loop:
+  description: Draft and review until the reviewer approves.
+  inputs:
+    goal: { type: string }
+  outputs:
+    draft: { type: string }
+
+  nodes:
+    # Declared in the other order. The graph is the edges', not this mapping's.
+    review:
+      agent: agent.reviewer
+      input:
+        draft: "state.draft"
+    write: { agent: agent.writer, input: "input.goal" }
+
+  edges:
+    # Each node's own outgoing edges keep the order grammar 7.3 evaluates them
+    # in; nothing here moves one.
+    - { from: start, to: write }
+    - { from: write, to: review }
+    - from: review
+      to: write
+      when: "review.output.verdict == 'revise'"
+      max_iterations: 3
+    - { from: review, to: end, else: true }

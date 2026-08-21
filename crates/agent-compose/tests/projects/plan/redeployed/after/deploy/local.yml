@@ -1,0 +1,9 @@
+# The same target, with one placement retimed and a second one added.
+version: "0.1"
+
+placements:
+  agent.reviewer:
+    runtime: colocated
+  agent.writer:
+    runtime: isolated
+    description: Its own process, even locally.

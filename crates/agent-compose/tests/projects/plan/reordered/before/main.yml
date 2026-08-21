@@ -1,0 +1,168 @@
+# Ten orders the `after` spec swaps, and nothing else.
+#
+# Four of the ten are orders the composition behaves differently for — a field
+# map's, which is the order of a JSON Schema's `properties` and `required`, a
+# discriminated union's, which is the order of its `oneOf`, a model route's,
+# which is the order its members are tried in, and a schema `default:`'s, which
+# is a literal value handed to every caller — so a plan reports them. The other
+# six are selected by name or tested for membership and their order says
+# nothing: a set of optional properties, a set of accepted exit statuses, a set
+# of failover conditions, an `exec:`'s environment, a node's input bindings, and
+# a routed map's routes.
+version: "0.1"
+
+state:
+  patches:
+    description: One patch per mechanically fixable finding.
+    type: array
+    max_items: 8
+    items: { type: string }
+    reduce: append
+  tickets:
+    description: One ticket per finding a human must look at.
+    type: array
+    max_items: 8
+    items: { type: string }
+    reduce: append
+  seeds:
+    description: Literal data, whose order is the value itself rather than a declaration.
+    type: array
+    max_items: 4
+    items:
+      type: object
+      properties:
+        name: { type: string }
+        weight: { type: integer }
+    default:
+      - { name: alpha, weight: 1 }
+      - { name: beta, weight: 2 }
+
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+
+model.fast:
+  provider: provider.anthropic
+  id: some-fast-model
+
+model.slow:
+  provider: provider.anthropic
+  id: some-slow-model
+
+model.resilient:
+  route: [model.fast, model.slow]
+  route_on: [rate_limit, overloaded, timeout]
+
+tool.spell_check:
+  description: Check the spelling of a draft.
+  input:
+    text: { type: string }
+  output:
+    ok: { type: boolean }
+  exec:
+    command: spell
+    args: ["--stdin"]
+    env:
+      LC_ALL: C
+      SPELL_DICT: en_GB
+    expect_exit: [0, 2]
+
+agent.reviewer:
+  model: model.fast
+  prompt: Review the draft against the goal.
+  input:
+    draft: { type: string }
+    goal: { type: string }
+  output:
+    verdict: { enum: [approve, revise] }
+    reason: { type: string }
+
+agent.triage:
+  model: model.fast
+  prompt: Classify each finding in the report.
+  input:
+    report: { type: string }
+  output:
+    findings:
+      type: array
+      max_items: 8
+      items:
+        discriminator: kind
+        variants:
+          auto_fixable:
+            file: { type: string }
+            hint: { type: string }
+          needs_human:
+            summary: { type: string }
+            severity: { enum: [low, high] }
+    counts:
+      type: object
+      properties:
+        fixed: { type: integer }
+        raised: { type: integer }
+      optional: [fixed, raised]
+
+agent.fixer:
+  model: model.fast
+  prompt: Patch exactly the defect described.
+  input:
+    file: { type: string }
+    hint: { type: string }
+  output:
+    patch: { type: string }
+
+agent.escalator:
+  model: model.fast
+  prompt: Write one ticket line for the finding.
+  input:
+    summary: { type: string }
+    severity: { enum: [low, high] }
+  output:
+    ticket: { type: string }
+
+flow.sweep:
+  description: Review a draft, classify what it turned up, and route each finding.
+  inputs:
+    goal: { type: string }
+    draft: { type: string }
+  outputs:
+    patches:
+      type: array
+      max_items: 8
+      items: { type: string }
+  nodes:
+    review:
+      agent: agent.reviewer
+      input:
+        draft: "input.draft"
+        goal: "input.goal"
+    classify:
+      agent: agent.triage
+      input:
+        report: "input.draft"
+    dispatch:
+      map:
+        over: classify.output.findings
+        as: finding
+        route_by: kind
+        max_concurrency: 2
+        routes:
+          auto_fixable:
+            node: agent.fixer
+            input:
+              file: "finding.file"
+              hint: "finding.hint"
+            writes:
+              patch: patches
+          needs_human:
+            node: agent.escalator
+            input:
+              summary: "finding.summary"
+              severity: "finding.severity"
+            writes:
+              ticket: tickets
+  edges:
+    - { from: start, to: review }
+    - { from: review, to: classify }
+    - { from: classify, to: dispatch }
+    - { from: dispatch, to: end }

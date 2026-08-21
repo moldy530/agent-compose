@@ -1,0 +1,34 @@
+# The same composition, saying `beta` where the `before` spec says `alpha` —
+# sixty-odd characters into a prompt, which is past the end of a report line.
+version: "0.1"
+
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+
+model.fast:
+  provider: provider.anthropic
+  id: some-fast-model
+
+agent.reviewer:
+  model: model.fast
+  prompt: Review the draft with great care and much attention, then say beta.
+  input:
+    draft: { type: string }
+  output:
+    verdict: { enum: [approve, revise] }
+
+flow.review:
+  description: Review one draft.
+  inputs:
+    draft: { type: string }
+  outputs:
+    verdict: { enum: [approve, revise] }
+  nodes:
+    review:
+      agent: agent.reviewer
+      input:
+        draft: "input.draft"
+  edges:
+    - { from: start, to: review }
+    - { from: review, to: end }

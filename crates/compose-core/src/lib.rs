@@ -25,6 +25,11 @@
 //!   deterministic set of `(path, contents)` files: a LangGraph TypeScript
 //!   project, pinned per compiler release (PRD 5.12).
 //!
+//! One pass reads two artifacts rather than one: [`plan`](plan()) diffs a
+//! composition against another, which is what makes a change to a graph
+//! reviewable as a change rather than as a rewritten router (PRD §2, §7 M2).
+//! `docs/plan.md` is the normative account of the document it produces.
+//!
 //! Everything the parser reports is decidable from a single file, and
 //! everything the resolver reports is decidable from names, files, and
 //! addresses. Everything [`check`] reports needs the whole artifact: its
@@ -40,8 +45,10 @@
 //!
 //! The CLI over all of it is the `agent-compose` crate: `agent-compose validate
 //! <path> [--target <name>] [--format human|json]`, which is the product's core
-//! loop (PRD §7 M0), and `agent-compose build <path> [--target <name>]
-//! [--out <dir>] [--check]`, which is codegen (PRD §7 M1).
+//! loop (PRD §7 M0), `agent-compose build <path> [--target <name>]
+//! [--out <dir>] [--check]`, which is codegen (PRD §7 M1), and
+//! `agent-compose plan <before> <after> [--format human|json]`, which is the
+//! diff (PRD §7 M2).
 
 pub mod ast;
 pub mod cel;
@@ -50,6 +57,7 @@ pub mod codegen;
 pub mod diag;
 pub mod ir;
 pub mod parse;
+pub mod plan;
 pub mod resolve;
 pub mod yaml;
 
@@ -59,6 +67,7 @@ pub use codegen::{COMPILER_VERSION, GeneratedFile, GeneratedProject, emit};
 pub use diag::{Diagnostic, DiagnosticCode, Diagnostics, Severity, Span, Spanned};
 pub use ir::{IR_VERSION, Ir};
 pub use parse::{ParsedFile, parse_file, parse_str};
+pub use plan::{Composition, PLAN_VERSION, Plan, plan};
 pub use resolve::{DEFAULT_TARGET, Resolution, resolve, resolve_with_target};
 
 /// The spec versions this compiler build supports, as accepted values of a

@@ -1,0 +1,71 @@
+version: "0.1"
+
+defaults:
+  timeout: 120s
+  on_error: fail
+
+state:
+  draft:
+    description: The current draft, rewritten on every pass.
+    type: string
+    default: ""
+
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+
+model.default:
+  provider: provider.anthropic
+  id: some-fast-model
+
+model.smart:
+  provider: provider.anthropic
+  id: some-smart-model
+
+tool.spell_check:
+  description: Check the spelling of a draft.
+  input:
+    text: { type: string }
+  output:
+    ok: { type: boolean }
+  exec:
+    command: spell
+    args: ["--stdin"]
+
+agent.writer:
+  model: model.default
+  prompt: Write a draft.
+  output:
+    draft: { type: string }
+
+agent.reviewer:
+  model: model.default
+  prompt: Review the draft.
+  input:
+    draft: { type: string }
+  output:
+    verdict: { enum: [approve, revise] }
+
+flow.review_loop:
+  description: Draft and review until the reviewer approves.
+  inputs:
+    goal: { type: string }
+  outputs:
+    draft: { type: string }
+  nodes:
+    write: { agent: agent.writer, input: "input.goal" }
+    review: { agent: agent.reviewer, input: { draft: "state.draft" } }
+  edges:
+    - { from: start, to: write }
+    - { from: write, to: review }
+    - { from: review, to: write, when: "review.output.verdict == 'revise'", max_iterations: 3 }
+    - { from: review, to: end, else: true }
+
+triggers:
+  on_request:
+    type: http
+    flow: flow.review_loop
+    path: /review
+    respond: sync
+    input:
+      goal: "payload.body.goal"
