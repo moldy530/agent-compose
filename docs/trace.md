@@ -1,6 +1,6 @@
 # agent-compose — Trace Format
 
-**Trace version:** `2`
+**Trace version:** `3`
 **Status:** Normative for the trace a compiled project emits
 **Companion artifacts:** [`docs/grammar.md`](grammar.md) (the DSL this describes runs of), [`prd.md`](../prd.md) §5.3, §5.6, §5.8, §5.9
 
@@ -102,7 +102,7 @@ documents and no grammar section defines — prints one document:
   "execution_id": "exec_0f1e…",
   "status": "completed",
   "outputs": { "draft": "…" },
-  "trace_version": 2,
+  "trace_version": 3,
   "trace": [ /* entries */ ],
   "trace_path": "/…/.agent-compose/traces/flow.review_loop-exec_0f1e….json"
 }
@@ -138,7 +138,7 @@ POSTs on completion, report an execution as (grammar §13.3):
   "trigger": "on_request",
   "status": "completed",
   "outputs": { "draft": "…" },
-  "trace_version": 2,
+  "trace_version": 3,
   "trace": [ /* entries */ ]
 }
 ```
@@ -201,7 +201,7 @@ in full, and what `run --format json` spreads into the record it prints.
 
 | field | type | presence | meaning |
 |---|---|---|---|
-| `trace_version` | integer | always | The format the `entries` are written in. `2` is this document, and a compiled project spells it `TRACE_VERSION` (exported from its `src/runtime.ts`). See [Stability](#10-stability). |
+| `trace_version` | integer | always | The format the `entries` are written in. `3` is this document, and a compiled project spells it `TRACE_VERSION` (exported from its `src/runtime.ts`). See [Stability](#10-stability). |
 | `flow` | string | always | The flow that was run, as its typed address (grammar §2.2). |
 | `execution_id` | string | always | The execution the entries belong to — grammar §4.1's `execution.id`, and the prefix of every idempotency key in the document (grammar §9.4). |
 | `status` | `"completed"` \| `"failed"` \| `"interrupted"` | always | How the run ended: with an answer, without one, or holding a `human` pause it had no way to answer (grammar §8.7, §9). The third is told apart from the second because the two ask different things of whoever is reading — one is a run to look into, the other a question to answer — and because a reader may not decide it from the message text (§10.1). |
@@ -235,6 +235,7 @@ retries are attempts at one execution, and `attempts` is where they are recorded
 | `writes` | array of strings | `"completed"`, `"skipped"`, possibly empty | The state channels this node wrote, by name (grammar §10.1). Empty on a skipped node, which writes nothing — and on a **completed** node that landed no channel: one whose `writes:` maps nothing, and one whose result omitted every field that is mapped (grammar §8.0, Decision D110). An empty array is therefore not a statement about `outcome`; read `outcome` for that. Absent on a failed entry: a node that failed produced no output to write from, and where the failure ended the run the superstep it died in lands nothing at all (§9). |
 | `routing` | [routing decision](#4-routing-decisions) | `"completed"`, `"skipped"`; on `"failed"` in the one case §9 names | What this node's outgoing edges answered. The one failed case is *no viable route*, where the edge decisions are the whole explanation; every other failure abandoned or never reached the decision. See §4 and §9. |
 | `dispatches` | array of [dispatch records](#5-dispatch-records) | `map` nodes with a fan-out to report, possibly empty | What a fan-out dispatched, one record per source item in **index** order (grammar §8.6, PRD 5.6). A map over an **empty** array records `[]` — present and empty. The key is absent, rather than empty, exactly where the fan-out has nothing resolved to report: a map whose input binding failed, so no plan was ever built, and a map whose failure abandoned its plan with no dispatch resolved in it — which §5.2's `timeout:` is the reachable case of. A node that is not a `map` never carries the key. See §5. |
+| `toolDispatches` | array of [dispatch records](#5-dispatch-records) | nodes that ran an agent — an `agent:` node, or a `map` dispatching `agent.*` targets — whose tool loop resolved an outcome for a `flow.*` attached to that agent's `tools:` | What a **model** dispatched: one record per flow-as-tool call (grammar §5.4, PRD 5.1), in the order the calls were made — with the hedge §5 states for the records a `map` node could not put in source-item order. The same record type `dispatches` holds and a key of its own, because the two are different fan-outs a single entry can carry at once: a `map` over source items and a tool loop over the calls a model asked for. Present on every entry whose tool loop resolved an outcome for something, whatever became of the node — a call that ended it is in here with the ones before it — and never empty: a node that resolved none carries no key. The one call a record can be missing for is the one a node deadline caught **mid-flight** — caught while the instance it started was still running, so no outcome had resolved when the entry was written. A call the deadline catches earlier started no instance either, and has no half anywhere. §5.2 describes the shape for the other carrier and §5.3 for this one, and §5.3 is the binding account. See §5. |
 | `inner` | array of entries | `flow:` nodes that ran an instance | The trace of the subflow instance this node ran (grammar §8.5). Absent on a `flow:` node that ran none — one whose *input* could not be built — and on one whose own `timeout:` abandoned its instance mid-flight, which leaves no trace to carry. A **dispatched** instance is never here: a `map`'s items report under their own dispatch records (§5), including the item whose failure ended the map node. See §8. |
 | `stores` | array of [store records](#6-store-records) | when the node performed any | Every store op this node performed, in the order it performed them (PRD 5.8). Never empty: a node that performed none carries no key. See §6. |
 | `models` | array of [model calls](#7-model-calls) | when the node made any | Every model call this node execution made (PRD 5.9). Never empty: a node that made none carries no key. See §7. |
@@ -403,29 +404,52 @@ the ceiling, and every traversal it did make in `entries`.
 
 ## 5. Dispatch records
 
-`DispatchRecord`, on `TraceEntry.dispatches`. PRD 5.6 makes a fan-out's
-cardinality and destination *data*; this is that data. One record per source
-item, in ascending `index` — never completion order. "One record per source
-item" is the whole array on every fan-out that reached its join, however it left
-it; §5.2 is the one path that reports fewer, and it says which.
+`DispatchRecord`. **Two fields carry it**, and a reader that walks both has every
+instance a run started under something that dispatched it:
 
-A fan-out over an **empty** array has no source items, and its entry carries
-`dispatches: []` — the key present, the array empty. Grammar §8.6 rule 11 makes a
-zero-instance dispatch a completion, and the entry reads as one: the map node
-ran, dispatched nothing, and its outgoing edge fired. The *absent* key is a
-different statement, and §5.2 is where it is made.
+| carrier | one record per | order |
+|---|---|---|
+| `TraceEntry.dispatches` | source item of a `map`'s fan-out (§5.2 is the one path that reports fewer, and it says which) | ascending `index` — never completion order |
+| `TraceEntry.toolDispatches` | flow-as-tool call an agent's loop made (grammar §5.4, PRD 5.1) | the order the calls were made — see the hedge below, which is §7.2's for `models` |
+
+PRD 5.6 makes a fan-out's cardinality and destination *data*, and PRD §9.20 makes
+a model-invoked subflow findable as one shape rather than two; the record is that
+shape, and the two keys are what keep the two dispatchers' `index` spaces apart
+on the one entry that can hold both — a `map` whose target is an `agent.*` with a
+`flow.*` in its `tools:`.
+
+**`toolDispatches` carries §7.2's hedge**, and for the same reason `models`
+does: the entry holds every record the node execution produced, and only some of
+them are records the node can put in an order. On a plain `agent:` node the loop
+made them one at a time and the array is that order, entire. On a `map` node the
+records of the items that **landed** are concatenated in ascending source-item
+index — and the records of an item the fan-out did not land, one
+`on_item_error: skip` absorbed or an exhausted `retry:` attempt made, could not
+be attributed to a position and come **ahead** of them in the order they were
+made. With concurrent items that leading portion is in whatever order the
+scheduler produced, so it is the one part of this array two runs of one
+composition may spell differently. `idempotencyKey` is what identifies a record
+there, as it is for the repeated `index` the row below describes.
+
+A **`map` fan-out over an empty array** has no source items, and its entry
+carries `dispatches: []` — the key present, the array empty. Grammar §8.6 rule 11
+makes a zero-instance dispatch a completion, and the entry reads as one: the map
+node ran, dispatched nothing, and its outgoing edge fired. The *absent* key is a
+different statement, and §5.2 is where it is made. `toolDispatches` has no such
+value: how many times a model calls a tool is the model's, and none is simply the
+key's absence (§3).
 
 | field | type | presence | meaning |
 |---|---|---|---|
-| `index` | integer | always | The source-item index, which is what identifies the item and orders every write it made (PRD 5.6, grammar §7.6.4 clause 2). |
-| `route` | string | routed maps | The **route** the item was dispatched through: its variant tag, or `"$default"` for the `default:` catch-all (grammar §8.6 rule 4, Decision D30). Absent on the homogeneous form, which has one target and no tags. The catch-all's sigil is not a name an author could have written, because a union may declare a variant *called* `default` beside a `default:` catch-all. |
-| `variant` | string | routed maps | The **discriminator value the item carried** — the value at the map's `route_by:` field. On a named route it repeats `route`; on the catch-all it is the only record of which variant fell through, since `route` names the catch-all rather than the variant. It is always one of the union's declared variant tags, and that is also what makes the key present on **every** record a routed map files: the item was parsed against its producer's declared schema before any of this ran (PRD 5.2), so its discriminator is one of those tags. An item whose discriminator is not a string — which no artifact `build` accepted can produce — is left unrecorded rather than rendered, since a number written as a string would be a `variant` that is not a declared tag. |
-| `target` | string | always | The component the item was dispatched to, as a typed address. |
-| `outcome` | `"completed"` \| `"skipped"` \| `"failed"` \| `"detached"` | always | See §5.1. |
-| `attempts` | integer | always | How many attempts the item's `on_item_error: { retry: … }` policy **made** (grammar §8.6 rule 10). `0` for a detached dispatch, which has no observed outcome for a policy to have acted on. |
+| `index` | integer | always | What identifies this dispatch within the array that holds it, and orders the array. On `dispatches` it is the **source-item index**, which is also what orders every write the item made (PRD 5.6, grammar §7.6.4 clause 2). On `toolDispatches` it is the **call ordinal** grammar §9.4 gives the call — how many times that tool had already been called in this agent execution — so two records under one key can repeat an index where a `map` dispatched the agents that made them, and `idempotencyKey` is what tells those apart. |
+| `route` | string | routed maps | The **route** the item was dispatched through: its variant tag, or `"$default"` for the `default:` catch-all (grammar §8.6 rule 4, Decision D30). Absent on the homogeneous form, which has one target and no tags, and on every `toolDispatches` record, which no `map` routed. |
+| `variant` | string | routed maps | The **discriminator value the item carried** — the value at the map's `route_by:` field. On a named route it repeats `route`; on the catch-all it is the only record of which variant fell through, since `route` names the catch-all rather than the variant. It is always one of the union's declared variant tags, and that is also what makes the key present on **every** record a routed map files: the item was parsed against its producer's declared schema before any of this ran (PRD 5.2), so its discriminator is one of those tags. An item whose discriminator is not a string — which no artifact `build` accepted can produce — is left unrecorded rather than rendered, since a number written as a string would be a `variant` that is not a declared tag. Absent on every `toolDispatches` record, for `route`'s reason. |
+| `target` | string | always | The component the dispatch went to, as a typed address — the item's target on `dispatches`, and the `flow.*` the model called on `toolDispatches`. |
+| `outcome` | `"completed"` \| `"skipped"` \| `"failed"` \| `"detached"` | always | See §5.1. A `toolDispatches` record takes the first two of the four only: there is no per-call error policy to skip a call and no `detach:` on a tool attachment. |
+| `attempts` | integer | always | How many attempts were **made** at this dispatch. On `dispatches` that is what the item's `on_item_error: { retry: … }` policy made (grammar §8.6 rule 10), and `0` for a detached dispatch, which has no observed outcome for a policy to have acted on. On `toolDispatches` it is always `1`: a tool attachment carries no per-call policy, so one call is one attempt — a *node*-level `retry:` re-runs the whole tool loop and files fresh records instead (§9.4 of the grammar, and §8 below). |
 | `idempotencyKey` | string | always | The key this dispatch's effect site derives (grammar §9.4). See §8. |
-| `inner` | array of [entries](#3-entries) | **joined** `flow.*` targets | The dispatched instance's own trace, whether it completed or failed — a joined `flow.*` dispatch always has one, because the instance either answered with its trace or failed carrying it. Absent on every other target, which ran no instance, and on a `"detached"` record whatever its target: see below. This is the **only** place a dispatched instance's trace appears; the map node's own `inner` is for a `flow:` node's instance and a `map` is not one (§3, §8). |
-| `error` | string | `"skipped"`, `"failed"` | Why the item did not complete. On both, and in §3's `<error name>: <message>` shape: `on_item_error` decides which of the two outcomes a failed item takes (§5.1), not whether there was a failure to describe. |
+| `inner` | array of [entries](#3-entries) | **joined** `flow.*` targets, and every `toolDispatches` record | The instance's own trace, whether it completed or failed — such a dispatch always has one, because the instance either answered with its trace or failed carrying it. Absent on every other `map` target, which ran no instance, and on a `"detached"` record whatever its target: see below. With `TraceEntry.inner` this is the **only** place an instance's trace appears; the node's own `inner` is for a `flow:` node's instance, and neither a `map` nor an agent's tool loop is one (§3, §8). |
+| `error` | string | `"skipped"`, `"failed"` | Why the dispatch did not complete. On both, and in §3's `<error name>: <message>` shape: `on_item_error` decides which of the two outcomes a failed item takes (§5.1), not whether there was a failure to describe. |
 
 A **detached** dispatch is the one target shape that carries no `inner` even
 where it points at a `flow.*`. Grammar §8.6 rule 7 admits `detach: true` on a
@@ -462,6 +486,31 @@ makes reliable.
   model call that node execution made" is bounded by the same join that bounds
   the outcomes.
 
+A `toolDispatches` record takes `"completed"` or `"failed"` and neither of the
+other two, and the two read as they do everywhere else: the instance answered and
+its `outputs:` went back to the model as the tool's result, or it did not and
+nothing went back at all. A flow-as-tool call that failed **never** reaches the
+model as a plausible result — the failure leaves the tool and the agent node's
+own `on_error:` decides the run (grammar §9.2), which is the same shape a
+`tool.*` whose request was refused has.
+
+One failure is **not** the agent node's `on_error:`'s, and it is the record a
+reader is likeliest to misread: a `human` node inside the flow the model called,
+on a run with no way to answer it. A pause leaves ahead of every strategy
+(grammar §8.7), so nothing decides it — but the record the call had already
+filed stays on the entry, reading `outcome: "failed"` with a `HumanInterrupt`
+`error` while the document's `status` is `"interrupted"`. Read that pair the way
+§9 reads the aborting entry it sits on: the instance did not go wrong, it is
+parked at a question nobody could answer, and the document's `status` — never
+the record's outcome — is what says which. The `toolCalls` entry naming this
+record is on the entry's `models` beside it and reads the same way (§7.3, §9).
+
+The sibling carrier does not file one at that moment, and the asymmetry is an
+invariant's rather than an accident: PRD §9.20 makes every instance a **model**
+started findable as a dispatch record, so a flow-as-tool call files its record
+whichever way it ended, while a `map`'s records are the outcomes that
+**resolved** (§5.2) and a pause resolves none.
+
 ### 5.2 A map node that failed
 
 A map node that failed still dispatched, and its entry still carries what it
@@ -486,6 +535,31 @@ in what survives:
   leave no records at all, and the entry then carries no `dispatches` key rather
   than an empty array — an absent key says "nothing resolved", where an empty
   array would say "nothing was dispatched".
+
+### 5.3 An agent node a deadline caught mid-call
+
+The same thing happens one carrier over, and it is worth stating separately
+because the two keys have different vocabularies of absence. An `agent:` node's
+own `timeout:` (grammar §9.2) is raced against its tool loop, so a call the
+deadline catches **while the instance is still running** has no outcome at the
+moment the budget runs out: `toolDispatches` carries the calls that had settled
+and not that one, and where it was the only call the key is absent rather than
+empty. `ModelCall.toolCalls` (§7.3) is absent on the same call for the same
+reason, and where that call was the first its answer asked for, the model call's
+key is absent too.
+
+Read those absences as §5.2 says to read its own — "no outcome resolved for this
+call", never "this call never ran". The abandoned instance is not stopped dead:
+it unwinds against the aborted signal, and whether that unwinding lands a record
+before the entry is written is a matter of scheduling. What is **not** a matter
+of scheduling is the entry: it is complete when it is written, and an outcome
+that resolves afterwards does not appear on it. So an absence here is a fact
+about the entry rather than a value a reader might see change.
+
+`toolDispatches` has no counterpart to `dispatches: []` here, because a tool loop
+that dispatched nothing and a tool loop that resolved nothing are the same
+absence: how many times a model calls a tool is the model's, and none of them is
+the key's absence (§3).
 
 ---
 
@@ -552,6 +626,7 @@ reader infers from a provider's own logs.
 | `fallback` | integer | with `servedBy` | Its ordinal in the route, `0` for the first — so `1` reads as "fallback #1". |
 | `failovers` | array of [refusals](#71-refusals) | always, possibly empty | Every member that refused **and moved the ladder on**, in the order they were tried. Empty on every call that did not fail over — a direct binding's, and a route whose first member answered — which is most of them. |
 | `refused` | [refusal](#71-refusals) | when no member answered | What ended the call. Such a record carries no `servedBy` and no `fallback`. |
+| `toolCalls` | array of [tool calls](#73-tool-calls) | when this call's answer asked for at least one and the loop resolved it | What the model asked the agent's tools to do, in the order its answer asked, and what became of each (§7.3). Never empty: a call whose answer asked for none carries no key, and the pinned structured-output call that ends a loop is always one of those. A call that **ended the node** is the last entry rather than a missing one — the calls after it in the same answer never ran, and are absent because they did not happen. The one tool call with no entry is the one a node deadline caught **mid-flight** (§5.3), which resolved neither a result nor a failure; where it was the first the answer asked for, this key is absent rather than empty. |
 
 Every record therefore carries exactly one of the two accounts of how it ended:
 `servedBy` with `fallback`, or `refused`. `failovers` is beside whichever it is,
@@ -600,6 +675,34 @@ they were made. This format does **not** attribute a call to a source item: a ma
 node's `models` is the concatenation, and the item that made a given call is not
 recorded.
 
+### 7.3 Tool calls
+
+`ToolCallRecord`, on `ModelCall.toolCalls`. An agent's tool loop is the one place
+a compiled graph does work a *model* asked for, and without this the trace says a
+call was made and nothing about what it set off. PRD §9.20 fixes the division:
+the loop's story is complete inside the [model call](#7-model-calls) it belongs
+to — what was asked for, what came of it, and the result the model saw — at the
+cost of one indirection for the part that is a run of its own.
+
+| field | type | presence | meaning |
+|---|---|---|---|
+| `name` | string | always | The tool the model called, spelled as the request offered it — a `tool.*`'s local name, a `flow.*`'s (grammar §5.4), or a synthesized store tool's (grammar §11.5). |
+| `target` | string | when the agent offers a tool of that name | The component behind the name, as a typed address (grammar §2.2). Absent on the one call that has none: a name the agent does not offer, which is a model answering with a tool that was never on the wire. That call is recorded and then ends the node. |
+| `outcome` | `"completed"` \| `"failed"` | always | Whether the loop handed the model a result. `"failed"` is a call that ended the node — its failure left the tool, and the node's own `on_error:` is what decided the run (grammar §9.2) — so it is also the record that says the model saw nothing back. §5.1 names the one failure no `on_error:` decided: a `human` node inside the flow the call ran, on a run that could not answer it. |
+| `instance` | string | flow-as-tool calls that started an instance | The **link**: the subflow instance this call ran, named exactly as the dispatch record carrying that instance's trace names itself in `idempotencyKey`, so the join between the two is string equality (§5, §8). Absent on every call that instantiated nothing — a `tool.*`, a store tool — and on a flow-as-tool call refused before an instance existed, which is arguments that failed the flow's own `inputs:`. |
+| `result` | any | `"completed"` flow-as-tool calls, with `instance` | **The result the model saw**: the value the loop handed back, which for this tool is the instance's declared `outputs:` (grammar §5.4). PRD §9.20 asks the tool-call entry to record it, and it is the one tool result this format carries — §11 is where the rule it is carved out of is stated, and where the other two tool surfaces are left under it. Its calls are a **subset** of `instance`'s, not the same set: `instance` says an instance ran, `result` says the loop handed that instance's outputs back, so a call carrying `result` carries `instance` and not the other way round. Absent on a `"failed"` call, where the absence is the record — the failure left the tool and the model saw nothing — and a flow-as-tool call whose instance failed is exactly that call with an `instance` and no `result`. |
+| `error` | string | `"failed"` | What went wrong, in §3's `<error name>: <message>` shape. |
+
+**What is deliberately not here.** The **arguments** the model sent are absent,
+and that is §11's rule rather than an omission: this format carries no provider
+transcript, and what the call did to the run is reachable through the instance
+`instance` links to. `result` is the one thing on the other side of that rule,
+and it is here because PRD §9.20 put it here — "a bare dispatch record alone
+would leave a tool call whose result came from nowhere". It is carried for the
+one tool whose result is the composition's own declared data; a `tool.*`'s answer
+and a store tool's stay out, the second of them because §6 already carries it in
+`StoreRecord.answer`.
+
 ---
 
 ## 8. Nesting, instance paths, and idempotency keys
@@ -613,27 +716,33 @@ subgraph's routing decisions or pretend they were the caller's. So they nest:
   the boundary the way the node's own `attempts` says to: an instance starts at
   `step: 1`, so a second `step: 1` entry for the same node is the next attempt
   beginning.
-* `DispatchRecord.inner` — the instance a `map` dispatched to a `flow.*`
-  (grammar §8.6), whether it completed or failed.
+* `DispatchRecord.inner` — the instance something *dispatched*, whether it
+  completed or failed: an item a `map` sent to a `flow.*` (grammar §8.6), on
+  `TraceEntry.dispatches`, and a flow-as-tool call a model made (grammar §5.4),
+  on `TraceEntry.toolDispatches`.
 
-**One instance appears in one of those two places, never in both.** A `map` is
-not a `flow:` node, and its own entry carries no `inner` however its dispatches
-went — including the item whose failure ended the map node, whose instance is
-under its own record like every other. So a reader walking a trace for every
-subgraph run visits `TraceEntry.inner` and `DispatchRecord.inner` and counts each
-instance once.
+**One instance appears in one of those two places, never in both.** Neither a
+`map` nor an agent is a `flow:` node, and neither carries `inner` on its own
+entry however its dispatches went — including the item whose failure ended the
+map node, and the tool call whose failure ended the agent node, each of whose
+instances is under its own record like every other. So a reader walking a trace
+for every subgraph run visits `TraceEntry.inner` and both carriers of
+`DispatchRecord.inner`, and counts each instance once.
 
 Nesting moves nobody's step numbers: an inner instance numbers its own supersteps
 from `1`. An instance that **failed** carries the entry it aborted at last, the
 way §3.1 says a failed run does — the ordering rule is the instance's, not only
 the root's.
 
-**Instance paths surface in exactly two fields**, and in neither of them alone:
+**Instance paths surface in exactly three fields**, and in none of them alone:
 each is an idempotency key, of which the path is the **remainder** after the
-execution id. The two are `DispatchRecord.idempotencyKey`, which every dispatch
-record carries, and `StoreRecord.idempotencyKey`, which a store-op **node**'s
-write carries and a write through a synthesized store tool does not (§6). Both
-are
+execution id. Two are keys a delivery really carried —
+`DispatchRecord.idempotencyKey`, on every dispatch record under either carrier,
+and `StoreRecord.idempotencyKey`, which a store-op **node**'s write carries and a
+write through a synthesized store tool does not (§6). The third is a **link**
+rather than a key: `ToolCallRecord.instance` (§7.3) repeats the
+`idempotencyKey` of the dispatch record its call filed, so a reader joins a tool
+call to the instance that answered it by string equality. All three are
 
 ```
 <execution.id> "/" <frame> { "/" <frame> }
@@ -641,12 +750,15 @@ are
 
 where each frame is `<node id> "/" <traversal ordinal>` — plus `"/" <item index>`
 for a `map` node — for every node crossed from the **root** flow instance down to
-the effect site, outermost first. The envelope's `execution_id` is that first
-component, so a reader can strip it and read the remainder as the path.
+the effect site, outermost first, and where a **flow-as-tool call** contributes
+one more frame of its own beneath the agent node's, `<tool name> "/" <call
+ordinal>` (grammar §9.4, PRD resolved q19). The envelope's `execution_id` is that
+first component, so a reader can strip it and read the remainder as the path.
 
 ```
 exec_01/dispatch/0/7                 the detached dispatch of item 7 by map node `dispatch`
 exec_01/outer/0/3/inner/0/0/save/0   store node `save`, under item 0 of `inner`, itself item 3 of `outer`
+exec_01/ask/0/condense/1             the second call agent node `ask` made to its `condense` flow-tool
 ```
 
 Grammar §9.4 is normative for the derivation; this document only fixes where it
@@ -654,6 +766,24 @@ appears. Two properties are what make it worth reading out of a trace: distinct
 effects get distinct keys, and a repeated attempt at one effect reuses its key —
 so `deduped: true` on a store write means an earlier attempt of *this* effect had
 already been applied, rather than some other write colliding.
+
+The second property is **positional** across a flow-tool frame, and grammar §9.4
+says so openly: an agent-node `retry:` restarts the call ordinals, so the Nth
+call of a retried attempt derives the Nth key of the failed one — while what a
+nondeterministic model asks for the Nth time is not guaranteed to be the same
+work. That is the at-least-once compromise the grammar accepts; nothing in this
+format hides it, and the two attempts' records are both on the entry, in the
+order they were made.
+
+**Two policies re-run a tool loop, and both reuse its keys.** A node's own
+`retry:` is the one above. The other is a `map`'s
+`on_item_error: { retry: … }` (grammar §8.6 rule 10), which re-executes a
+dispatched `agent.*` from its entry at the same source index — so the item's
+frames are unchanged, the loop starts counting from zero again, and the Nth call
+of the second attempt derives the first attempt's Nth key exactly as a node
+retry does. A reader meets it as repeated keys under one `toolDispatches` array,
+`DispatchRecord.attempts` on the *item's* record being where the retry itself is
+recorded (§5).
 
 ---
 
@@ -687,12 +817,17 @@ ways, both consequences of how a superstep dies rather than choices:
   complete set of edge decisions to hand over. The entry's `error` names the
   guard.
 
-Everything else the node did is still there: `stores`, `models`, `dispatches` and
-`inner` reach the aborting entry like any other, because those effects really
-happened and the failure alone says nothing about them. Failing is not a fifth
-presence rule — each of the four is on this entry exactly when §3's row for it
-says, so a node that made no model call still has no `models`, and a `map` whose
-deadline resolved nothing still has no `dispatches` (§5.2).
+Everything else the node did is still there: `stores`, `models`, `dispatches`,
+`toolDispatches` and `inner` reach the aborting entry like any other, because
+those effects really happened and the failure alone says nothing about them.
+Failing is not a sixth presence rule — each of the five is on this entry exactly
+when §3's row for it says, so a node that made no model call still has no
+`models`, a `map` whose deadline resolved nothing still has no `dispatches`
+(§5.2), and an agent node whose deadline caught its only tool call still has no
+`toolDispatches` (§5.3). The agent node a flow-as-tool call ended is the shape
+that reads oddest and is the ordinary reading of the same rules: its
+`toolDispatches` holds the instances the loop ran, the last of them `"failed"`,
+and its `models` holds the call whose `toolCalls` names it (§7.3).
 
 A run stopped by the **superstep ceiling** has no aborting node at all: the
 ceiling is the compiler's safety net rather than one of the composition's own
@@ -737,7 +872,8 @@ At a given `trace_version`, a reader MAY rely on:
   the field is present only with something in it, and a reader may treat an empty
   value there as impossible rather than as a case to handle;
 * the vocabularies of the closed enumerations: `TraceDocument.status`,
-  `TraceEntry.outcome`, `DispatchRecord.outcome`, `HumanPause.settled`,
+  `TraceEntry.outcome`, `DispatchRecord.outcome`, `ToolCallRecord.outcome`,
+  `HumanPause.settled`,
   `StoreRecord.op`,
   `StoreRecord.effect`, `StoreRecord.via`, `StoreRecord.scope`, a refusal's
   `condition`, and an edge decision's `reason` — the last being a closed
@@ -747,8 +883,12 @@ At a given `trace_version`, a reader MAY rely on:
   the emitted `src/stores.ts`'s `StoreOp`, and a record type declared under the
   runtime cannot name it without inverting that dependency — so §6's seven are
   its vocabulary, and the inventory checks them against `StoreOp` itself;
-* the orders §3.1, §4.1 and §5 fix — entries by `(step, node)`, edge decisions in
-  declaration order, dispatch records in source-item index order;
+* the orders §3.1, §4.1, §5 and §7.3 fix — entries by `(step, node)`, edge
+  decisions in declaration order, a `map`'s dispatch records in source-item index
+  order, a tool loop's in call order, and a model call's `toolCalls` in the
+  order its own answer asked. Two of those carry a hedge where the node could
+  not order every record it has to report, and the hedge is part of what is
+  fixed: §7.2's for `models` and §5's for `toolDispatches`;
 * the nesting structure of §8, and the shape of the keys it describes.
 
 A reader MUST NOT rely on:
@@ -771,7 +911,9 @@ A reader MUST NOT rely on:
   edge decision is the exception, and only because §4.1 enumerates its values: it
   is a closed vocabulary that happens to be spelled as a sentence.
 * **anything printed by the human report.** See §11.
-* **the shape of `StoreRecord.answer`**, which is the store's, not this format's.
+* **the shape of `StoreRecord.answer`**, which is the store's, not this
+  format's, or of `ToolCallRecord.result`, which is the subflow's `outputs:`
+  (grammar §5.4) and moves when the composition does.
 
 ### 10.2 What is a compatible change
 
@@ -838,6 +980,38 @@ rather than an addition:
 
 Nothing was removed or renamed, and no order changed.
 
+### 10.3.2 What version `3` changed
+
+The flow-as-tool runtime (grammar §5.4, PRD 5.1, resolved q19 and q20) added two
+record surfaces and moved one promise a reader of version `2` had been given.
+Only the last of the three needed a bump; it is here rather than in §10.2 because
+of what §10.3's last bullet names — *where instance paths appear*:
+
+* **`TraceEntry.toolDispatches` was added**, holding the same dispatch record
+  §5 already specified. That half is a §10.2 addition;
+* **`ModelCall.toolCalls` was added**, and with it the tool-call record §7.3
+  specifies — a new field, and a new record type reachable from an existing one,
+  which §10.2 makes compatible twice over. `ToolCallRecord.result` is part of
+  that record rather than a change to an older one: PRD §9.20 asks the entry to
+  carry the result the model saw, and §11's rule about results is amended to say
+  so at the one surface this record covers. A reader of version `2` meets it
+  nowhere, because it is reached only through the key version `3` added;
+* **an instance path surfaces in a third field.** Version `2`'s §8 opened with
+  "instance paths surface in exactly two fields" and named both, which §10.1
+  makes a reader entitled to rely on; `ToolCallRecord.instance` is a third, and
+  §10.3 names widening that promise as a bump in its own right. The
+  **derivation** did not change — grammar §9.4 gained a frame for a call site it
+  had not had, and every path a version `2` composition produced is the path it
+  produces now;
+* two rows of §5 read wider with the second carrier, and both are the same field
+  meaning one thing per carrier rather than a changed meaning: `index` is a
+  source-item index on `dispatches` and a call ordinal on `toolDispatches`, and
+  `attempts` is an item policy's attempts on the first and always `1` on the
+  second. A reader of version `2` meets neither, because both are reached only
+  through the key version `3` added.
+
+Nothing was removed or renamed, and no order changed.
+
 ### 10.4 How the two are held together
 
 The version number alone is a promise; two tests make it a checkable one:
@@ -876,6 +1050,20 @@ The version number alone is a promise; two tests make it a checkable one:
   project's, described in its own `README.md`.
 * **Anything a store answered.** `StoreRecord.answer` is carried verbatim; its
   shape is the store's declared schema (grammar §11.4).
+* **What a model sent a tool.** A tool call is recorded — that it was made, to
+  what, and what became of it (§7.3) — and the **arguments** are not, at any of
+  the three tool surfaces. That half is §11's rule read where the *caller* is a
+  model rather than the graph.
+
+  What a tool answered divides, and PRD §9.20 is what divides it. A
+  flow-as-tool call's result **is** carried, on `ToolCallRecord.result`: the
+  resolved question asks the tool-call entry to record the result the model saw,
+  and what that result is is the child flow's declared `outputs:` — the
+  composition's own data under a schema the composition wrote, which is the same
+  standing `StoreRecord.answer` has two bullets below. The other two surfaces
+  stay under the rule: a `tool.*`'s answer is an external system's, and a store
+  tool's is already in `StoreRecord.answer`, so recording it twice would buy
+  nothing.
 * **What a human answered.** A `human` node's pause is recorded — that it began,
   how long it had, and how it ended (§3.4) — and the answer itself is not. It is
   the same rule as the one below for a model's completion and is stated
@@ -901,6 +1089,15 @@ The version number alone is a promise; two tests make it a checkable one:
   value at the failing path — at most 120 characters — and so are the arguments a
   model sent to a tool. An answer that parsed is not recorded at all. §11.1's
   table is where the excerpt is classified, as text this process did not compose.
+
+  `ToolCallRecord.result` is not an exception to that and is worth reading
+  beside it. What it carries is a subflow's `outputs:`, which is the
+  composition's own declared surface — but a composition whose subflow ends at
+  an `agent:` node has *filled* that surface from a model's structured answer,
+  so a parsed completion can reach this format that way. The difference from the
+  sentence above is what the format promises: a completion is never carried
+  because a model answered, and this value is carried because the composition
+  declared an output and the tool call returned it.
 
 ### 11.1 Secrets
 
@@ -942,7 +1139,8 @@ answered**, and a reader should treat that text as untrusted:
 | field | what it can carry from outside |
 |---|---|
 | `TraceEntry.error` | the failure the node's own activity raised — for an `http:` binding, the rejected response body truncated to 200 characters; for an `exec:` binding, the child's stderr; and on any surface parsed against a declared schema (PRD 5.2), an excerpt of the offending value at the failing path, truncated to 120 characters — a model's own answer, the arguments it sent to a tool, or a decoded `http:`/`exec:` payload that a non-2xx rule accepted and a schema did not |
-| `DispatchRecord.error` | the same text, raised by one dispatched item (§5). Under `on_item_error: skip` this is the **only** field it reaches: the run survives, so no entry carries an `error` for it |
+| `DispatchRecord.error` | the same text, raised by one dispatched item (§5). Under `on_item_error: skip` this is the **only** field it reaches: the run survives, so no entry carries an `error` for it — and, on the other carrier, raised inside the subflow a model's tool call ran |
+| `ToolCallRecord.error` | the same text, from the tool a model called (§7.3): a `tool.*`'s refused response or child stderr, a store op's failure, or a flow-as-tool call's — including the excerpt of the **arguments** the model sent when they failed the flow's own `inputs:` |
 | `TraceDocument.error` | the same text, when that failure is what stopped the run |
 | `Refusal.detail` | what a provider answered: a status and a response body, truncated, or the socket failure that came back instead. Never the request, so the key it was signed with is not in it |
 
@@ -950,9 +1148,13 @@ A target that echoes back what it was sent puts that echo in the trace — a 404
 body naming the path it did not route, a command that prints its own arguments
 on stderr. This format records what it was answered; it does not audit it.
 
-One field is the composition's own to fill: `StoreRecord.answer` is what a read
-answered, verbatim (§6). A run that reads a secret out of a store has put it
-there itself, and the trace records the read like any other.
+Two fields are the composition's own to fill, and both are carried verbatim:
+`StoreRecord.answer` is what a read answered (§6), and `ToolCallRecord.result`
+is the `outputs:` a subflow a model called answered with (§7.3). A run that
+reads a secret out of a store, or writes one into a flow's declared outputs, has
+put it there itself; the trace records both like any other value. Neither is
+derived from a resolved `${ENV}` reference by this runtime, which is what §11.1
+opens by promising.
 
 ### 11.2 Where a resolved value would otherwise have escaped
 

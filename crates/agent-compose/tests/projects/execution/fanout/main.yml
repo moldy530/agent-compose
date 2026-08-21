@@ -34,6 +34,11 @@
 #     fails, the map node fails with it, and the node's own `on_error: skip`
 #     absorbs the fan-out — which is where a fan-out's record of what it
 #     dispatched matters most and is easiest to lose;
+#   * `flow.brittle` and `flow.enclose` — the same `fail` half with nothing to
+#     absorb it, reached through a `flow:` node: the child's fan-out fails, the
+#     child instance fails with it, and what the caller's entry owes is the
+#     child's whole trace under `inner` and no `dispatches` key of its own —
+#     only a `map` node has one (`docs/trace.md` §3);
 #   * `flow.expire` — the same question one rung harder: a map node's own
 #     `timeout:` (grammar 9.2, 8.6 rule 9), which is a *raced* deadline, so the
 #     map's promise is abandoned and there is no failure for its record to ride
@@ -79,6 +84,17 @@ state:
     max_items: 40
     items: { type: string }
     reduce: append
+
+  # What a `flow:` node's child instance produced, written **whole** rather than
+  # one element at a time: a subgraph's output crosses the boundary as one value,
+  # so an `append` channel could not take it (grammar 10.2, Decision D58).
+  enclosed:
+    description: One `flow:` node's child instance's whole result.
+    type: array
+    max_items: 40
+    items: { type: string }
+    default: []
+    reduce: last_wins
 
   # The other two reduce policies a fan-out may write (grammar 8.6 rule 5). Both
   # are written by instances that complete in the reverse of source order, so
@@ -775,6 +791,82 @@ flow.expire:
     # Unconditional, for the reason `flow.absorb`'s is: a skipped node has no
     # result for a guard to read, and `skip` still routes (grammar 7.3, 9.2, D97).
     - { from: fan, to: end }
+
+# The `fail` half of grammar 8.6 rule 10 with nothing to absorb it: one item
+# fails, the map node fails with it, and the node's `on_error:` is the default
+# `fail`, so the whole instance stops. Instantiated by `flow.enclose` below,
+# which is the only reason it is its own flow.
+flow.brittle:
+  description: Fan out over a plan and let one item fail the whole instance.
+  inputs:
+    goal:
+      type: string
+      min_length: 1
+  outputs:
+    drafts:
+      type: array
+      max_items: 40
+      items: { type: string }
+  nodes:
+    plan:
+      agent: agent.planner
+      input:
+        goal: "input.goal"
+
+    # `max_concurrency: 1` because the scripted provider answers a queue in
+    # order: what this fixture asserts about is which records land on which
+    # entry, not what the scheduler interleaved.
+    work:
+      map:
+        over: plan.output.tasks
+        as: task
+        node: agent.worker
+        max_concurrency: 1
+        input:
+          title: "task.title"
+          body: "task.body"
+        writes:
+          result: drafts
+  edges:
+    - { from: start, to: plan }
+    - { from: plan, to: work }
+    - { from: work, to: end }
+
+# A `flow:` node over a child that fans out and fails — the one composition
+# where the two things a failed instance carries out of the boundary can be
+# confused for each other (`docs/trace.md` §3, §8).
+#
+# `inside` is a `flow:` node, so its entry owes `inner`: the child instance's
+# whole trace, the failing `work` entry with its own `dispatches` included. What
+# it does **not** owe is a `dispatches` key of its own — it dispatched nothing,
+# and only a `map` node carries one. The records under the child's failure are
+# already reported inside `inner`, where they belong, so a caller that walked
+# past the boundary to find them would report a fan-out this node never ran and
+# report the child's twice.
+flow.enclose:
+  description: Instantiate a flow whose fan-out fails, at a `flow:` node.
+  inputs:
+    goal:
+      type: string
+      min_length: 1
+  outputs:
+    enclosed:
+      type: array
+      max_items: 40
+      items: { type: string }
+  nodes:
+    inside:
+      flow: flow.brittle
+      input:
+        goal: "input.goal"
+      # The child's whole `drafts` output, set as one value — an `append`
+      # channel takes one element per write and a subgraph hands back one
+      # value, so the destination is the `last_wins` channel above (D58).
+      writes:
+        drafts: enclosed
+  edges:
+    - { from: start, to: inside }
+    - { from: inside, to: end }
 
 flow.continue:
   description: Open a conversation and hand it to a subflow that continues it.

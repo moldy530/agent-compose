@@ -288,11 +288,13 @@ const flowReviewLoopNodeWrite: runtime.NodeDescriptor = {
       input,
       runtime.historyTurns(view.state["messages"] as unknown[]),
       context,
+      { path: runtime.instancePath(view, "write"), policy: view.run.policy },
     );
     return {
       output: runtime.parseResult(agentResearcherOutput, answer.output, "the answer of `agent.researcher`"),
       history: answer.history,
       models: answer.models,
+      toolDispatches: answer.toolDispatches,
     };
   },
   writes: [
@@ -323,11 +325,13 @@ const flowReviewLoopNodeReview: runtime.NodeDescriptor = {
       input,
       runtime.historyTurns(view.state["messages"] as unknown[]),
       context,
+      { path: runtime.instancePath(view, "review"), policy: view.run.policy },
     );
     return {
       output: runtime.parseResult(agentReviewerOutput, answer.output, "the answer of `agent.reviewer`"),
       history: answer.history,
       models: answer.models,
+      toolDispatches: answer.toolDispatches,
     };
   },
   writes: [

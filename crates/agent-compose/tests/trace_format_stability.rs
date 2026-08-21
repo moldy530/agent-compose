@@ -31,7 +31,7 @@
 //! INSTA_UPDATE=always cargo test -p agent-compose --test trace_format_stability
 //! ```
 //!
-//! # Why these six runs
+//! # Why these seven runs
 //!
 //! Between them they reach every record **type** the format has, every member of
 //! `TraceDocument.status`, and the entry shapes a reader meets first: a bounded
@@ -42,8 +42,10 @@
 //! model call that was served by its second member; a spent route for a
 //! **failed** run — the shape a reader most often opens a trace for, and the one
 //! whose rules (no writes, routing only where routing failed) exist nowhere
-//! else; and a run that ended holding a `human` pause, for the `human` record
-//! and the `"interrupted"` document status version `2` introduced (§10.3.1).
+//! else; a run that ended holding a `human` pause, for the `human` record
+//! and the `"interrupted"` document status version `2` introduced (§10.3.1);
+//! and a flow attached as a tool and called twice, for the tool-call record and
+//! the second dispatch-record carrier version `3` introduced (§10.3.2).
 //!
 //! A run added here is what keeps that first sentence true: the count is a claim
 //! about coverage, so a record type or a status member added to the format
@@ -326,12 +328,13 @@ fn nodes_holding_a_pause(document: &Value) -> Vec<(String, String)> {
 /// A rule rather than a shape, and one a snapshot is a poor keeper of, because
 /// the entries a `human` record can wrongly reach are the ones nested runs put
 /// *outside* the flow a snapshot was written for. It is checkable without
-/// knowing which nodes a composition declares as `human`, because §3 gives two
+/// knowing which nodes a composition declares as `human`, because §3 gives three
 /// other keys the same kind of presence rule over a **different** kind of node:
-/// `inner` is a `flow:` node's and `dispatches` is a `map` node's. A node is one
-/// kind, so an entry carrying `human` beside either is an entry claiming to be
-/// two — and that is exactly the shape the mistake takes, since a pause is
-/// reached below one of those two constructs or not nested at all.
+/// `inner` is a `flow:` node's, `dispatches` is a `map` node's, and
+/// `toolDispatches` is an `agent:` node's (§5). A node is one kind, so an entry
+/// carrying `human` beside any of them is an entry claiming to be two — and that
+/// is exactly the shape the mistake takes, since a pause is reached below one of
+/// those three constructs or not nested at all.
 ///
 /// The failure it guards is a real one and is invisible to every other check
 /// here: an error raised inside a subflow or a dispatched instance travels up
@@ -354,6 +357,12 @@ fn every_human_record_is_on_the_node_that_paused(document: &Value) {
             "a `map` node's entry carries a pause that belongs to a node inside \
              an instance it dispatched, which `docs/trace.md` §3 says it never \
              does: {entry}"
+        );
+        assert!(
+            entry.get("toolDispatches").is_none(),
+            "an `agent:` node's entry carries a pause that belongs to a node \
+             inside a flow its model called, which `docs/trace.md` §3 says it \
+             never does: {entry}"
         );
     }
 }
@@ -528,6 +537,60 @@ fn a_routed_fan_outs_trace_document_keeps_its_shape() {
         "fanout",
         "flow.triage",
         &[("report", "a raw report")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    insta::assert_snapshot!(document(&run));
+}
+
+/// A flow attached to an agent as a tool, called twice: the two record surfaces
+/// version `3` added (`docs/trace.md` §5, §7.3, §10.3.2).
+///
+/// One run reaches all three halves of PRD §9.20's join at once — the dispatch
+/// records under `toolDispatches`, each carrying an instance path no other call
+/// derives (PRD §9.19) and the instance's whole trace, and the `toolCalls` entry
+/// inside each model call linking to one by its key. It is also the only
+/// snapshot here whose entries hold a nested trace reached from something other
+/// than a `map`, which is what §8's two-place rule is about.
+#[test]
+fn a_flow_tool_runs_trace_document_keeps_its_shape() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "condense",
+                json!({ "passage": "the first passage" }),
+            )]),
+        ),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "line": "the first line" })),
+        ),
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "condense",
+                json!({ "passage": "the second passage" }),
+            )]),
+        ),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "line": "the second line" })),
+        ),
+        Script::new(SONNET, Outcome::text("I have both lines.")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "answer": "it says two lines" })),
+        ),
+    ]);
+
+    let Some(run) = harness::run(
+        "flow-as-tool",
+        "flow.ask",
+        &[("question", "what does it say?")],
         &provider,
     ) else {
         return;
@@ -729,15 +792,17 @@ fn an_interrupted_runs_trace_document_keeps_its_shape() {
 /// (`docs/trace.md` §3).
 ///
 /// The presence rule §3's `human` row ends on — "a node that is not a `human`
-/// node never carries it" — read at the two places a pause is reached from
+/// node never carries it" — read at the three places a pause is reached from
 /// *under* another node, which is where it can be broken without any snapshot
 /// here changing. `flow.assisted`, which
 /// [`an_interrupted_runs_trace_document_keeps_its_shape`] pins, pauses at the
 /// top level of the flow it triggered, so its document has no enclosing entry
-/// for a wait to leak onto; these two have one each. `flow.patient` wraps the
-/// pause in a `flow:` node and `flow.batch` dispatches it from a `map`, and the
-/// error that carries the interrupt out of the run passes through both on its
-/// way — which is the reason a node that held no wait can end up reporting one.
+/// for a wait to leak onto; these three have one each. `flow.patient` wraps the
+/// pause in a `flow:` node, `flow.batch` dispatches it from a `map`, and
+/// `flow.decide` reaches it through a flow a **model** called (grammar §5.4),
+/// and the error that carries the interrupt out of the run passes through each
+/// on its way — which is the reason a node that held no wait can end up
+/// reporting one.
 ///
 /// What a leak would look like to a reader is why this is a `must` rather than
 /// tidiness: one wait would be reported by N+1 entries, and the extra copies
@@ -785,6 +850,36 @@ fn a_pause_is_recorded_on_the_node_that_held_it_and_on_no_node_above_it() {
         [("flow.sign_off".to_string(), "sign".to_string())],
         "`fan` dispatched the instance that paused and held no wait of its own: \
          {held}"
+    );
+
+    // …and the third: an `agent:` node whose model called a flow that pauses.
+    // The enclosing entry here is the one that also carries the loop's own
+    // account — the dispatch record for the instance holding the question, and
+    // the model call whose `toolCalls` names it (PRD §9.20) — so it is the entry
+    // with the most to leak and the one a reader would most readily believe.
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::tool_calls(vec![ToolCall::new(
+            "sign",
+            json!({ "draft": "a drafted answer" }),
+        )]),
+    ));
+    let Some(called) = harness::run(
+        "flow-as-tool",
+        "flow.decide",
+        &[("question", "ship it?")],
+        &provider,
+    ) else {
+        return;
+    };
+    called.failed();
+    let held = called.trace_document();
+    every_human_record_is_on_the_node_that_paused(&held);
+    assert_eq!(
+        nodes_holding_a_pause(&held),
+        [("flow.sign".to_string(), "approve".to_string())],
+        "`draft` ran the loop that started the instance that paused, and held no \
+         wait of its own: {held}"
     );
 
     // The rule is an absence, so it is worth one positive beside it: the entry
@@ -1105,7 +1200,7 @@ fn the_status_route_carries_the_version_beside_its_trace() {
     );
     assert_eq!(
         finished["trace_version"],
-        json!(2),
+        json!(3),
         "…and the version that describes them, beside them (`docs/trace.md` §1): \
          {finished}"
     );

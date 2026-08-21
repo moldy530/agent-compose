@@ -49,13 +49,27 @@ expression: document(&run)
           "failovers": [],
           "fallback": 0,
           "model": "model.smart",
-          "servedBy": "model.smart"
+          "servedBy": "model.smart",
+          "toolCalls": [
+            {
+              "name": "prefs_get",
+              "outcome": "completed",
+              "target": "store.prefs"
+            }
+          ]
         },
         {
           "failovers": [],
           "fallback": 0,
           "model": "model.smart",
-          "servedBy": "model.smart"
+          "servedBy": "model.smart",
+          "toolCalls": [
+            {
+              "name": "prefs_set",
+              "outcome": "completed",
+              "target": "store.prefs"
+            }
+          ]
         },
         {
           "failovers": [],
@@ -192,5 +206,5 @@ expression: document(&run)
   "execution_id": "<execution-id>",
   "flow": "flow.answer",
   "status": "completed",
-  "trace_version": 2
+  "trace_version": 3
 }

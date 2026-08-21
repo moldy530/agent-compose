@@ -56,7 +56,7 @@ Prior art validates the declarative direction but leaves gaps:
 - Layout: `main.yml` + `agents/*.yml`, `tools/*.yml`, `flows/*.yml`, `state.yml`, `deploy.yml`.
 - **Explicit imports** in `main.yml` — no directory scanning. "What is in this graph" must be unambiguous, and multiple entrypoints may share a definitions library.
 - **Typed global address scheme**: `agent.researcher`, `tool.web_search`, `flow.review_loop`. References are type-checked ("this edge expects an agent, you gave it a tool").
-- **Flows are modules**: a subgraph declares an input/output schema; its I/O surface is interchangeable with a tool's, so flows are callable as tools by agents (the Agent Spec / PayPal recursion). Instantiable with bindings like Terraform modules.
+- **Flows are modules**: a subgraph declares an input/output schema; its I/O surface is interchangeable with a tool's, so flows are callable as tools by agents (the Agent Spec / PayPal recursion). Instantiable with bindings like Terraform modules. Both call sites run: a `flow:` node instantiates deterministically, and a `flow.*` in an agent's `tools:` instantiates once per model tool call — under the instance identity §9.19 fixes and joined to the trace the way §9.20 fixes, with the flow's `inputs`/`outputs` as the tool's parameter/result schemas.
 - The compiler resolves all files into **one flat IR artifact** (JSON): the diffable, versionable deploy artifact. Multi-file is authoring UX; the runtime/codegen sees a single resolved document.
 
 ### 5.2 Structured I/O — mandatory outputs, optional inputs
@@ -92,7 +92,7 @@ Loops are prominent (evaluator-optimizer, ReAct, plan-revise); DAG-only loses. D
 | `exec` | shell command (map input → env vars; string input → stdin) | child-process wrapper |
 | `http` | HTTP request | fetch wrapper |
 | `function` | host-registered function by name (escape hatch; breaks spec portability — documented) | registry lookup |
-| `flow` | subgraph instantiation | separate compiled graph, invoked per instantiation (§9.17) |
+| `flow` | subgraph instantiation; also an agent's tool, one instance per model tool call (5.1, §9.19) | separate compiled graph, invoked per instantiation (§9.17) and per flow-as-tool call, whose instance joins the trace as a dispatch record (§9.20) |
 | `map` | fan-out over an agent-produced collection, homogeneous or discriminator-routed (see 5.6) | in-task dispatch inside the map node (§9.17) |
 | `human` | human-in-the-loop pause: input schema (what the human sees), output schema (what they return, routable like any structured output), `timeout` + `on_timeout` route | the node's task parks on a promise the resume route settles (M2; **not** LangGraph `interrupt()` — see resolved q4) |
 

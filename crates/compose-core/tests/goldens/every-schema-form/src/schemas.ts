@@ -204,6 +204,20 @@ export const agentShaperOutput = z.object({
 }).strict();
 export type AgentShaperOutput = z.infer<typeof agentShaperOutput>;
 
+/** `agent.spreader` — its declared input (grammar 5.3). */
+export const agentSpreaderInput = z.object({
+  goal: z.string(),
+}).strict();
+export type AgentSpreaderInput = z.infer<typeof agentSpreaderInput>;
+
+/**
+ * `agent.spreader` — the structured output the model is constrained to, and what routing reads (PRD 5.2, 5.3).
+ */
+export const agentSpreaderOutput = z.object({
+  note: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }),
+}).strict();
+export type AgentSpreaderOutput = z.infer<typeof agentSpreaderOutput>;
+
 /** `flow.condense` — the module's parameters (grammar 7.5). */
 export const flowCondenseInputs = z.object({
   passage: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }).refine((value) => codePoints(value) <= 4096, { message: "expected at most 4096 characters" }),
@@ -229,6 +243,9 @@ export type FlowCondenseNodeReduceOutput = z.infer<typeof flowCondenseNodeReduce
 /** `flow.shape` — the module's parameters (grammar 7.5). */
 export const flowShapeInputs = z.object({
   goal: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }),
+  goals: z.array(z.object({
+    goal: z.string(),
+  }).strict()).max(8),
 }).strict();
 export type FlowShapeInputs = z.infer<typeof flowShapeInputs>;
 

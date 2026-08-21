@@ -1,0 +1,68 @@
+# rule: a detached dispatch reaches no `human` node (grammar 8.6 rule 7, 8.7, 7.7 clause 4, Decision D118)
+# code: detached-interrupt
+# message: the `map` of node `fan` in `flow.f` dispatches `agent.a` with `detach: true`, and `agent.a` reaches the `human` node `approve` of `flow.sign`
+# at: main.yml:63:17
+# label: main.yml:46:5 the `human` node is declared here
+# label: main.yml:62:15 the detached dispatch targets it here
+# help: a detached dispatch is resolved the moment it is issued: the join never observes its instance, and the execution that issued it can finish while the instance is still in flight — so a pause inside one is a question nothing is left to answer, and the wait is dropped when that execution ends. Drop `detach:` so the dispatch is joined, or take the `human` node out of what it dispatches — its own nodes, the flows it instantiates, and the `flow.*` tools of any agent it reaches (grammar 8.6 rule 7, 8.7, 7.7, Decisions D94, D118)
+#
+# The clause-4 edge of this rule, and the fourth row of grammar 7.7's table: the
+# dispatch target is an `agent.*` rather than a `flow.*`, and the pause is behind
+# its `tools:`. `detached-dispatch-reaches-a-human-node` pins the same rule over a
+# dispatched flow, and the walk the two share stops at different clauses — that
+# one through the target's own nodes, this one through an agent's attachment — so
+# a change that narrowed the agent branch of the walk to stores would keep that
+# fixture green while admitting this composition.
+#
+# `sync-trigger-reaches-a-human-through-a-flow-tool` is the same edge under the
+# other construct grammar 8.7 names, and the two are worth having apart: a
+# trigger's flow reaches the attachment through `reached`, and a dispatch target
+# reaches it through `reached_by`, which starts at an address that is not a flow
+# at all.
+version: "0.1"
+state:
+  requests:
+    type: array
+    max_items: 9
+    items: { type: string }
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.a:
+  model: model.m
+  prompt: Do it.
+  tools: [flow.sign]
+  output:
+    verdict: { enum: [approve, revise, escalate] }
+flow.sign:
+  description: Have a person sign off before the answer is used.
+  inputs:
+    text: { type: string }
+  outputs: {}
+  nodes:
+    approve:
+      human:
+        input:
+          text: { type: string }
+        output:
+          decision: { enum: [approve, reject] }
+      input: { text: "input.text" }
+  edges:
+    - { from: start, to: approve }
+    - { from: approve, to: end }
+flow.f:
+  outputs: {}
+  nodes:
+    fan:
+      map:
+        over: "state.requests"
+        node: agent.a
+        detach: true
+        max_concurrency: 2
+        input: "item"
+  edges:
+    - { from: start, to: fan }
+    - { from: fan, to: end }

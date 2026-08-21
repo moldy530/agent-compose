@@ -1,20 +1,42 @@
-# M1 acceptance fixture: a flow attached to an agent as a tool (grammar 5.4).
+# Acceptance fixture: a flow attached to an agent as a tool (grammar 5.4).
 #
 # PRD 5.1's flow-as-tool equivalence gives a `flow.*` two call sites, and this
 # project has both over **one** subflow so the pair is comparable:
 #
 #   * `flow.ask` attaches `flow.condense` to `agent.answerer`'s `tools:`, where
-#     the model decides whether to call it. The tool is on the wire with the
-#     contract grammar 5.4 gives it — its local name, the `description:` the
-#     validator requires exactly here, and its `inputs:` as the parameter schema
-#     — and a call to it is what this compiler release refuses, by name;
-#   * `flow.pipe` instantiates the same subflow at a `flow:` node (grammar 8.5),
-#     where it runs. That is the half the refusal points a reader at, so it is
-#     exercised rather than asserted about.
+#     the model decides whether to call it, how many times, and with what. Each
+#     call starts an instance under the frame grammar 9.4 gives it (PRD resolved
+#     q19), and the instance's `outputs:` are what the model is handed back;
+#   * `flow.pipe` instantiates the same subflow at a `flow:` node (grammar 8.5).
+#     Same module, same store write, one deterministic instance — which is what
+#     makes the pair a comparison of *call sites* rather than of compositions.
 #
-# Nothing here fans out or loops: the subject is which call sites a `flow.*` can
-# be reached from, and a second construct in the project would only make a
-# transcript harder to read.
+# `flow.condense` writes to a `scope: execution` store, and that write is the
+# observable q19 exists for: its idempotency key is the flattened instance path
+# (grammar 9.4, D104), so two calls in one tool loop write under two keys and
+# neither is deduped — while a key built from the agent node alone would make the
+# second write a duplicate the backend drops.
+#
+# Three more flows put the same attachment under the three policies that change
+# what its frames come out as, each one a rule stated in grammar 9.4 that nothing
+# else here would exercise:
+#
+#   * `flow.retried` puts the agent node under a `retry:`, so the ordinals
+#     restart and the second attempt re-derives the first attempt's keys;
+#   * `flow.rush` puts it under a `timeout:` a call outlives, which is the raced
+#     deadline `docs/trace.md` §5.3 describes;
+#   * `flow.fan` dispatches the attachment through a `map`, so each child nests
+#     beneath its own item's frame.
+#
+# The last two flows compose two runtimes: `flow.decide` attaches `flow.sign`,
+# which holds a `human:` node. Nothing about that is a special case — the pause
+# is the child instance's, its wait id is its own instance path, and the resume
+# route addresses it like any other (grammar 8.7, 9.4). `flow.hold` is the same
+# composition with the agent node's own `timeout:` cut short, which is where the
+# two runtimes actually have to agree: Decision D102's hold has to reach the
+# third and last construct that can dispatch a pause, and it is the one where
+# the node holding the timer is also the node dividing the budget across a model
+# route (grammar 9.2, 9.3).
 version: "0.1"
 
 defaults:
@@ -30,6 +52,17 @@ state:
     description: The one line `flow.condense` reduces a passage to.
     type: string
     default: ""
+  decision:
+    description: What the human said about the draft `flow.decide` produced.
+    enum: [approve, reject]
+    default: approve
+  replies:
+    description: One entry per item `flow.fan` dispatched, in source-item order.
+    type: array
+    max_items: 8
+    items:
+      type: string
+    reduce: append
 
 provider.mock:
   kind: anthropic
@@ -41,6 +74,16 @@ model.smart:
   id: claude-sonnet-4-6
   settings:
     max_tokens: 4096
+
+# `scope: execution`, so what one run wrote is invisible to the next and the two
+# writes this fixture asserts about are this run's own (grammar 11.3).
+store.seen:
+  kind: kv
+  scope: execution
+  description: One entry per passage the condenser was asked about.
+  value_schema:
+    passage:
+      type: string
 
 agent.summariser:
   description: Reduces a passage to a single line.
@@ -58,6 +101,11 @@ agent.summariser:
 # The subflow both call sites reach. `description:` is REQUIRED of it because it
 # is attached as a tool below, and it is the selection signal the model reads
 # (grammar 5.4).
+#
+# `note` is a store-op **node**, so its write carries the idempotency key
+# grammar 9.4 derives (docs/trace.md §6) — under a key of the store's own that is
+# the *same* on every call, which is the point: what tells two calls apart is the
+# instance path, not the store key.
 flow.condense:
   description: Condense one passage into a single line.
   inputs:
@@ -68,12 +116,21 @@ flow.condense:
     line:
       type: string
   nodes:
+    note:
+      store: store.seen
+      op: set
+      key: "'last'"
+      value:
+        passage: "input.passage"
+
     reduce:
       agent: agent.summariser
       input:
         passage: "input.passage"
+
   edges:
-    - { from: start, to: reduce }
+    - { from: start, to: note }
+    - { from: note, to: reduce }
     - { from: reduce, to: end }
 
 agent.answerer:
@@ -90,8 +147,9 @@ agent.answerer:
       min_length: 1
   tools: [flow.condense]
 
-# Call site one: the model's. Whether `condense` is called at all is the model's
-# decision, which is what makes the tool list of the request the observable.
+# Call site one: the model's. Whether `condense` is called at all — and how often
+# — is the model's decision, which is what makes the tool list of the request,
+# and the instance paths of what it started, the observables.
 flow.ask:
   description: Answer a question, with the subflow offered to the model.
   inputs:
@@ -109,6 +167,109 @@ flow.ask:
   edges:
     - { from: start, to: ask }
     - { from: ask, to: end }
+
+# The same agent node under a `retry:`. Grammar 9.4 makes the call ordinals
+# restart with the attempt, so the second attempt's first `condense` call derives
+# the *first* attempt's first key — the positional, not semantic, reuse the
+# grammar states openly (PRD resolved q19). The observable is inside the child:
+# the store write under a repeated key is `deduped: true`, which is the
+# at-least-once compromise showing up where it actually costs something.
+flow.retried:
+  description: Answer a question, re-running the whole tool loop on a failure.
+  inputs:
+    question:
+      type: string
+      min_length: 1
+  outputs:
+    answer:
+      type: string
+  nodes:
+    ask:
+      agent: agent.answerer
+      input:
+        question: "input.question"
+      retry: { max: 1, backoff: 10ms }
+  edges:
+    - { from: start, to: ask }
+    - { from: ask, to: end }
+
+# The same agent node under a `timeout:` the tool call outlives. The deadline is
+# raced against the loop (grammar 9.2), so a call caught mid-flight resolves
+# neither a dispatch record nor a tool-call record — `docs/trace.md` §5.3 is
+# that shape, and the two keys are absent rather than empty.
+flow.rush:
+  description: Answer a question under a budget a tool call outlives.
+  inputs:
+    question:
+      type: string
+      min_length: 1
+  outputs:
+    answer:
+      type: string
+  nodes:
+    ask:
+      agent: agent.answerer
+      input:
+        question: "input.question"
+      timeout: 300ms
+  edges:
+    - { from: start, to: ask }
+    - { from: ask, to: end }
+
+# A **fan-out** over an agent that carries the attachment: the one node shape
+# whose entry holds both dispatch carriers at once (`docs/trace.md` §5). Each
+# item's tool call nests its instance beneath the item's own frame, so the two
+# items' children derive `<map node>/0/<item index>/condense/0` and are two
+# effect sites rather than one — the same property `flow.ask` shows across two
+# calls of one loop, shown here across two items of one fan-out.
+#
+# `max_concurrency: 1` because the scripted provider answers a queue in order: a
+# fan-out that interleaved its items' calls would be asserting about the
+# scheduler rather than about the frames.
+agent.batcher:
+  description: Answers one question of a batch, with the same flow attached.
+  model: model.smart
+  prompt: |
+    Answer the question. Condense anything long before you quote it.
+  input:
+    question:
+      type: string
+  output:
+    reply:
+      type: string
+      min_length: 1
+  tools: [flow.condense]
+
+flow.fan:
+  description: Answer a batch of questions, one agent instance per question.
+  inputs:
+    questions:
+      type: array
+      max_items: 8
+      items:
+        type: object
+        properties:
+          text: { type: string }
+  outputs:
+    replies:
+      type: array
+      max_items: 8
+      items:
+        type: string
+  nodes:
+    fan:
+      map:
+        over: input.questions
+        as: one
+        node: agent.batcher
+        max_concurrency: 1
+        input:
+          question: "one.text"
+        writes:
+          reply: replies
+  edges:
+    - { from: start, to: fan }
+    - { from: fan, to: end }
 
 # Call site two: the graph's. The same subflow, instantiated deterministically.
 flow.pipe:
@@ -128,3 +289,124 @@ flow.pipe:
   edges:
     - { from: start, to: condense }
     - { from: condense, to: end }
+
+# A `human:` node inside a flow a **model** calls. Grammar 8.7 names the two
+# constructs that may not reach one — a `respond: sync` trigger and a detached
+# dispatch — and a flow-as-tool call reached from an `async` trigger is neither,
+# so this is the composition that has to work rather than be refused.
+flow.sign:
+  description: Have a person sign off on one draft before it is used.
+  inputs:
+    draft:
+      type: string
+      min_length: 1
+  outputs:
+    decision:
+      enum: [approve, reject]
+  nodes:
+    # Named apart from the flow it lives in on purpose: a wait id is an instance
+    # path, so `draft/0/sign/0/approve/0` reads as "the `approve` node, inside
+    # the first `sign` call agent node `draft` made" — and two frames spelled the
+    # same would make the fixture's own assertion unreadable.
+    approve:
+      human:
+        input:
+          draft: { type: string }
+        output:
+          decision: { enum: [approve, reject] }
+      input:
+        draft: "input.draft"
+      writes:
+        decision: decision
+  edges:
+    - { from: start, to: approve }
+    - { from: approve, to: end }
+
+agent.drafter:
+  description: Drafts an answer and has it signed off before answering.
+  model: model.smart
+  prompt: |
+    Draft an answer and have it signed off before you answer.
+  input:
+    question:
+      type: string
+  output:
+    answer:
+      type: string
+      min_length: 1
+  tools: [flow.sign]
+
+flow.decide:
+  description: Answer a question, with sign-off offered to the model.
+  inputs:
+    question:
+      type: string
+      min_length: 1
+  outputs:
+    answer:
+      type: string
+  nodes:
+    draft:
+      agent: agent.drafter
+      input:
+        question: "input.question"
+  edges:
+    - { from: start, to: draft }
+    - { from: draft, to: end }
+
+# The same composition under a budget the wait outlives. `flow.decide`'s agent
+# node resolves `defaults: { timeout: 60s }` and no test spends a minute, so the
+# hold Decision D102 asks for is unobserved there; here the node declares
+# `timeout: 2s` and the wait below it runs for twice that before anybody answers.
+#
+# Grammar 9.2 bounds the work **one node execution** does, and time spent waiting
+# on a human is not work it is doing — so the deadline is held still while a
+# pause at or under this node's instance is open, and resumes with exactly the
+# milliseconds it had left. What makes this the interesting one of the three
+# constructs that can reach a pause is that an `agent` node also *divides* the
+# same budget across a model route (grammar 9.3), so the node holding the timer
+# and the node reading it are one node: a budget that ran while the human was
+# thinking would fail this node before the answer arrived.
+flow.hold:
+  description: Answer a question under a budget the sign-off must not spend.
+  inputs:
+    question:
+      type: string
+      min_length: 1
+  outputs:
+    answer:
+      type: string
+  nodes:
+    draft:
+      agent: agent.drafter
+      input:
+        question: "input.question"
+      timeout: 2s
+  edges:
+    - { from: start, to: draft }
+    - { from: draft, to: end }
+
+triggers:
+  # `respond: async` because `flow.decide` reaches a `human` node through a
+  # `tools:` entry, and grammar 7.7 clause 4 walks that edge: a `sync` response
+  # here is a compile error, which is exactly the refusal that leaves this one
+  # legal.
+  on_decide_request:
+    type: http
+    flow: flow.decide
+    path: /decisions
+    method: POST
+    input:
+      question: "payload.body.question"
+    respond: async
+
+  # The same route one budget shorter, for the flow whose agent node declares a
+  # `timeout:` the wait outlives.
+  on_hold_request:
+    type: http
+    flow: flow.hold
+    path: /held-decisions
+    method: POST
+    input:
+      question: "payload.body.question"
+    respond: async

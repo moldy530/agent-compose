@@ -900,6 +900,38 @@ nodes:
   store's kind and schema (PRD 5.8). See §11.5 for the synthesized surface.
 - Duplicate entries in either list are a compile error.
 
+**What one flow-as-tool call is.** Grammar and runtime are both active: a call
+starts an instance of the flow, exactly as a `flow:` node does (§8.5), and the
+instance's `outputs:` are the result the model is handed. Six properties fix what
+that instance is, and each is another section's rule reaching this call site:
+
+- **its arguments are the flow's `inputs:`**, checked against that schema before
+  anything is instantiated. Arguments the schema refuses fail the *agent node* —
+  the same event, reported the same way, as arguments a `tool.*` or a synthesized
+  store tool refuses (§6, §11.5) — and §9's chain decides what happens next;
+- **its instance path** is the agent node's own frame plus `<tool name>/<call
+  ordinal>` (§9.4), so a store write inside it derives a key no other call of
+  this loop derives;
+- **its conversation history is isolated**, always: `context: inherit` is a
+  `flow:`-node key (D27), and PRD 5.1 makes a flow's behaviour independent of the
+  caller's conversation the reason there is no way to spell otherwise here;
+- **its `execution` is the caller's** (§4.1), so a `session`-scoped store inside
+  it addresses the caller's partition — which is what §7.7's session-coherence
+  check quantifies over when it walks clause 4;
+- **its level-1 policy is the one that reached the calling instance** (§9.3,
+  D79). A tool attachment declares no `policy:` of its own, and an outer
+  hardening of a module is not undone by the depth at which it is reached;
+- **the agent node's `timeout:` bounds it**: the node's deadline crosses the
+  boundary, as it does at a `flow:` node (§9.2) — with §8.7's exemption intact,
+  since a `human` node below still holds that budget still (D102).
+
+A call that fails — the instance failed, or it reached quiescence without an
+output — fails the agent node. It is never answered with a plausible result, and
+never quietly dropped: what the model asked for did not happen, and a run in
+which it silently appeared to would be the one outcome PRD 5.3's "the runtime
+decides every transition" is written against. `docs/trace.md` §5 and §7.3 are
+where the call, the instance and the link between them are recorded.
+
 ---
 
 ## 6. Tool definitions
@@ -2694,6 +2726,51 @@ the effect site, **outermost first**, joined with `/`. A `flow:` node and a `map
 node each contribute their own frame on the way in; integers are decimal; node
 ids are identifiers (§2.1), so no component can contain a separator.
 
+**A flow-as-tool call contributes a frame too**, and it is the one frame no node
+id names. A `flow.*` in an agent's `tools:` (§5.4) is a call, and a model may
+make it more than once in a single execution of the agent node, so the node's own
+frame does not address the instances apart. Beneath that frame, each invocation
+contributes
+
+```
+<tool name> "/" <call ordinal>
+```
+
+where the **tool name** is the flow's local name — the name the model calls it
+by — and the **call ordinal** counts how many times *that* flow-tool has already
+been invoked within *this* execution of the agent node (`0` on the first). Both
+components are of the same shapes a node frame is built from: a local name is an
+identifier (§2.1) and the ordinal is decimal, so no component can contain the
+separator, and a tool frame can collide with no node frame — the frame beneath an
+`agent:` node's is a tool call's or there is none, because an agent has no nodes.
+
+Two consequences, and the second is a compromise stated openly rather than left
+to be discovered:
+
+- **distinct calls in one tool loop get distinct instance paths.** Two calls to
+  one flow-tool are two instances with two sets of effects, and a bare node frame
+  would give them one key — the collision this section exists to prevent;
+- **a re-run of the tool loop restarts the ordinals**, so the Nth call of the
+  second run reuses the Nth key of the first. That reuse is **positional, not
+  semantic**: the emitter is a nondeterministic model, and what it asks for the
+  Nth time on a second run need not be the work it asked for the Nth time on
+  the first. It is accepted because the alternatives are worse — a provider's
+  tool-use id is fresh on every retry, so key reuse dies and every agent retry
+  re-fires every child flow's side effects, while an argument hash merges two
+  intentional identical calls into one (PRD resolved q19).
+
+  **Two policies re-run a loop**, and the rule is one rule over both. An
+  agent-node `retry:` (§9.1) re-executes the node's activity, loop and all. A
+  `map`'s `on_item_error: { retry: … }` (§8.6 rule 10) re-executes a dispatched
+  `agent.*` from its entry at the **same** source index, so nothing the item's
+  frames are built from changes and the ordinals restart under an unchanged
+  prefix — the same at-least-once compromise, reached through a policy that is
+  not the node's own. An author who writes either is choosing it.
+
+Like every other frame, this one is **derived**: no spec construct sets or
+overrides a tool name or an ordinal, so there is nothing here for `validate` to
+reject either.
+
 **Delivery surface.** How the key reaches the sink is fixed per binding kind, so
 sinks can be written against a stable contract: an `http:`-bound target receives
 it as the `Idempotency-Key` request header; an `exec:`-bound target receives it
@@ -2712,6 +2789,7 @@ exec_01/a/0/save/0          # store node `save`, in flow.ingest instantiated by 
 exec_01/b/0/save/0          # …and by node `b`: a different write, a different key
 exec_01/outer/0/3/inner/0/0/save/0   # `save` under item 0 of `inner`, itself item 3 of `outer`
 exec_01/dispatch/0/7        # the detached dispatch of item 7 by map node `dispatch`
+exec_01/ask/0/condense/1/save/0      # `save`, inside the second `condense` call agent node `ask` made
 ```
 
 Two properties follow, and they are the whole point of fixing the form:
@@ -5259,18 +5337,23 @@ considered and rejected to keep the chain as PRD 5.5 settles it. *PRD 5.5, G3.*
 The key an effect carries is the execution id followed by the frames of every
 node crossed from the root flow instance to the effect site, outermost first —
 each frame a node id, that node's traversal ordinal within its flow instance,
-and, for a `map` node, the source-item index of the instance it dispatches
+and, for a `map` node, the source-item index of the instance it dispatches — plus
+one frame per flow-as-tool call crossed on the way, `<tool name>/<call ordinal>`
 (§9.4). Its two carriers are a detached `map` dispatch (§8.6 rule 7) and a store
 write (§11.4).
 **Rationale**: PRD 5.6 and 5.8 both write the derivation as
 `execution_id + node + item_index` and 5.8 raises it to "a named cross-cutting
 rule", so the *principle* is settled; what "node" denotes is not, and this
-grammar makes three constructs under which a node id names several distinct
+grammar makes four constructs under which a node id names several distinct
 effects in one execution. A flow instantiated twice — `a: {flow: flow.ingest}`
 and `b: {flow: flow.ingest}` — puts the same store node `save` at two sites with
 no `item_index` at all; nested maps repeat the inner index across outer items, so
-inner item 0 under outer item 0 and inner item 0 under outer item 1 collide; and
-a node inside a bounded cycle (§7.4) executes twice in one instance. Under
+inner item 0 under outer item 0 and inner item 0 under outer item 1 collide; a
+node inside a bounded cycle (§7.4) executes twice in one instance; and an agent
+node whose `tools:` names a `flow.*` (§5.4) may have the model instantiate that
+flow any number of times in one execution, which is the fourth and the one no
+node id can address at all — hence the extra frame, and hence PRD resolved q19's
+positional key reuse across an agent-node retry, stated in §9.4. Under
 at-least-once delivery a collision is not a cosmetic defect: the sink or store
 dedupes the second write away, so the design meant to stop a message being lost
 loses one. Reading "node" as the *occurrence* — the path that identifies which

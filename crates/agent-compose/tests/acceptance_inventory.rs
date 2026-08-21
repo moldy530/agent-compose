@@ -334,6 +334,14 @@ const CODEGEN: &[Criterion] = &[
                 "a_dispatched_instances_trace_stays_under_its_own_record",
                 Status::Live,
             ),
+            // …and the same boundary read the other way round, at the other
+            // module boundary: a `flow:` node whose child's fan-out failed
+            // carries the child's whole trace and none of its dispatch records,
+            // because only a `map` node has that key (`docs/trace.md` §3).
+            (
+                "a_child_instances_fan_out_stays_inside_the_flow_nodes_inner_trace",
+                Status::Live,
+            ),
             // The same criterion over the *documented* project rather than a
             // fixture: `examples/triage-fanout` is what PRD 5.6 is written
             // about, and it reaches further than any fixture — a subgraph, a
@@ -407,11 +415,47 @@ const CODEGEN: &[Criterion] = &[
             // The subgraph's *other* call site. PRD 5.1's flow-as-tool
             // equivalence makes an agent's `tools:` entry a second way to reach
             // the same module, and grammar 7.7 clause 4 analyses it as one — so
-            // what the provider is offered, and what a call to it does in a
-            // release that does not instantiate from there, belong to this
-            // criterion rather than to the agent's.
+            // what the provider is offered, and what a call to it instantiates,
+            // belong to this criterion rather than to the agent's. Four tests,
+            // because a call has four outcomes worth pinning apart: the
+            // instance ran, its arguments never fit, it failed inside, and the
+            // name the model used was never on the wire — the last being the
+            // one call whose record carries no `target` (`docs/trace.md` §7.3).
             (
-                "a_flow_attached_as_a_tool_reaches_the_model_and_refuses_the_call",
+                "a_flow_attached_as_a_tool_runs_one_instance_per_call_under_its_own_frame",
+                Status::Live,
+            ),
+            (
+                "arguments_a_flow_tools_inputs_refuses_fail_the_agent_node",
+                Status::Live,
+            ),
+            (
+                "a_flow_tool_call_whose_instance_failed_fails_the_agent_node_carrying_its_trace",
+                Status::Live,
+            ),
+            (
+                "a_call_to_a_tool_the_agent_does_not_offer_is_recorded_with_no_target_and_ends_the_node",
+                Status::Live,
+            ),
+            // …and four more over the *frame* a call derives (grammar 9.4, PRD
+            // resolved q19), which is the half of this call site that no other
+            // construct has: the ordinal counts calls rather than answers, a
+            // node `retry:` restarts it, a `map` puts an item frame above it,
+            // and a raced deadline leaves a call with no record at all.
+            (
+                "two_flow_tool_calls_in_one_model_answer_get_distinct_ordinals",
+                Status::Live,
+            ),
+            (
+                "an_agent_node_retry_restarts_the_flow_tool_call_ordinals",
+                Status::Live,
+            ),
+            (
+                "a_map_dispatched_agents_flow_tool_calls_nest_under_the_items_frame",
+                Status::Live,
+            ),
+            (
+                "a_node_deadline_that_abandons_a_tool_call_records_neither_half_of_it",
                 Status::Live,
             ),
         ],
@@ -608,6 +652,15 @@ const COMMANDS: &[Criterion] = &[
                 "run_reports_the_pause_it_cannot_answer_and_exits_on_its_own_code",
                 Status::Live,
             ),
+            // …and the same exit taken from under an **agent** node, which is
+            // the one place the interrupt path has a trace entry to lose: a
+            // pause inside a flow the model called leaves the loop's dispatch
+            // records and the model calls that name them on one entry
+            // (PRD §9.20, `docs/trace.md` §9).
+            (
+                "a_pause_a_run_cannot_answer_leaves_the_loops_calls_on_the_agent_nodes_entry",
+                Status::Live,
+            ),
         ],
     },
     // The criterion's three verbs, plus what the app does with a request and
@@ -714,6 +767,23 @@ const COMMANDS: &[Criterion] = &[
             // while the pause is open.
             (
                 "an_enclosing_nodes_budget_does_not_run_while_a_pause_below_it_is_open",
+                Status::Live,
+            ),
+            // …and the third construct a pause can sit under, which grammar 8.7
+            // names and which arrived with the flow-as-tool runtime: a flow a
+            // **model** called (grammar 5.4, 7.7 clause 4). The wait id is the
+            // child instance's path with the node's frame on the end, so the
+            // status and resume routes address it with nothing new.
+            (
+                "a_pause_inside_a_flow_a_model_called_is_published_and_answered_like_any_other",
+                Status::Live,
+            ),
+            // …and D102's hold at that third construct, which is the one where
+            // the node holding the timer is also the node dividing the budget
+            // across a model route (grammar 9.2, 9.3): an `agent:` node's own
+            // `timeout:` outlived by the wait under its tool call.
+            (
+                "an_agent_nodes_budget_does_not_run_while_a_pause_below_its_tool_call_is_open",
                 Status::Live,
             ),
         ],
