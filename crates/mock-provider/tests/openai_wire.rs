@@ -721,24 +721,41 @@ fn a_request_without_credentials_is_served_on_the_direct_route() {
 /// pass the bug through to the first live call, which is the failure this whole
 /// file exists to prevent. The refusal names the credential and nothing else,
 /// and consumes no script.
+///
+/// Every shape here is decidable **from one request**, which is what separates
+/// them from the scheme the test below serves: a token-less `Bearer` in both of
+/// its spellings, a value carrying no scheme at all, a gateway scheme with
+/// nothing behind it, and a non-`Bearer` scheme riding beside an `api-key` —
+/// two credentials on a route that reads neither, which no keyless composition
+/// produces.
 #[test]
 fn a_request_whose_credential_is_malformed_is_refused_on_the_direct_route() {
     let provider = MockProvider::start().expect("a port");
     provider.enqueue(Script::new(MODEL, Outcome::text("never served")));
 
-    for malformed in ["mock-provider-key", "Basic bW9jaw==", "Bearer "] {
+    let malformed: [&[(&str, &str)]; 5] = [
+        &[("authorization", "mock-provider-key")],
+        &[("authorization", "Bearer")],
+        &[("authorization", "Bearer ")],
+        &[("authorization", "Basic ")],
+        &[
+            ("authorization", "Basic bW9jay1nYXRld2F5"),
+            ("api-key", "mock-provider-key"),
+        ],
+    ];
+    for headers in malformed {
+        let mut request = Request::post("/v1/chat/completions");
+        for (name, value) in headers {
+            request = request.header(name, *value);
+        }
         let response = provider
             .client()
-            .send(
-                Request::post("/v1/chat/completions")
-                    .header("authorization", malformed)
-                    .json(&json!({
-                        "model": MODEL,
-                        "messages": [{ "role": "user", "content": "go" }],
-                    })),
-            )
+            .send(request.json(&json!({
+                "model": MODEL,
+                "messages": [{ "role": "user", "content": "go" }],
+            })))
             .expect("the route answers");
-        assert_eq!(response.status, 401, "`authorization: {malformed}`");
+        assert_eq!(response.status, 401, "{headers:?}");
         let body = response.json();
         assert_eq!(body["error"]["code"], "invalid_api_key");
         assert_eq!(
@@ -750,7 +767,7 @@ fn a_request_whose_credential_is_malformed_is_refused_on_the_direct_route() {
     }
 
     let recorded = provider.requests();
-    assert_eq!(recorded.len(), 3);
+    assert_eq!(recorded.len(), malformed.len());
     for request in &recorded {
         assert!(!request.is_valid());
         assert_eq!(
@@ -769,7 +786,7 @@ fn a_request_whose_credential_is_malformed_is_refused_on_the_direct_route() {
         "a request refused for its credential consumes nothing"
     );
 
-    // …and the well-formed spelling of the same key is served, so what the three
+    // …and the well-formed spelling of the same key is served, so what the five
     // refusals measure is the shape and not the route.
     let response = send(
         &provider.client(),
@@ -783,6 +800,66 @@ fn a_request_whose_credential_is_malformed_is_refused_on_the_direct_route() {
     assert!(
         provider.snapshot().queues.is_empty(),
         "the well-formed call is the one that consumed the script"
+    );
+}
+
+/// A gateway's own token under a scheme that is **not** `Bearer` is served on
+/// the direct route, because from one request it is not a mistake.
+///
+/// This is the concession `src/anthropic.rs` already makes on the Messages wire,
+/// reached from the other side, and WIRE-NOTES (12) records both. A keyless
+/// provider declares the gateway's credential through `headers:`
+/// (`docs/topics/models.md`, "Keyless providers behind a gateway"), whose values
+/// are free strings — `authorization: "Basic ${GW_TOKEN}"` is an ordinary
+/// composition, and a gateway is entitled to any scheme it likes. Refusing it
+/// would make the harness stricter than the grammar for the one deployment shape
+/// D120 exists to admit, and in CI this server is the only endpoint a compiled
+/// graph reaches.
+///
+/// What keeps that from swallowing the check above is that the served shape is
+/// still a *shape*: `<scheme> <token>`, alone on the request. `Basic ` with no
+/// token and `Basic …` beside an `api-key` are both refused by the test above,
+/// so what this one buys is the scheme and nothing else.
+#[test]
+fn a_gateway_token_under_another_scheme_is_served_on_the_direct_route() {
+    let provider = MockProvider::start().expect("a port");
+    provider.enqueue_all([
+        Script::new(MODEL, Outcome::text("served for the gateway")),
+        Script::new(MODEL, Outcome::text("served for the other gateway")),
+    ]);
+
+    let body = json!({
+        "model": MODEL,
+        "messages": [{ "role": "user", "content": "go" }],
+    });
+    for (scheme, answer) in [
+        ("Basic bW9jay1nYXRld2F5", "served for the gateway"),
+        ("Token mock-gateway-token", "served for the other gateway"),
+    ] {
+        let response = provider
+            .client()
+            .send(
+                Request::post("/v1/chat/completions")
+                    .header("authorization", scheme)
+                    .json(&body),
+            )
+            .expect("the route answers");
+        assert_eq!(response.status, 200, "`authorization: {scheme}`");
+        assert_eq!(response.json()["choices"][0]["message"]["content"], answer);
+    }
+
+    let recorded = provider.requests();
+    assert_eq!(recorded.len(), 2);
+    for request in &recorded {
+        assert!(request.is_valid(), "{:?}", request.failures());
+    }
+    assert_eq!(
+        recorded[0].headers["authorization"], "Basic bW9jay1nYXRld2F5",
+        "…and the token the composition declared is what rode the request"
+    );
+    assert!(
+        provider.snapshot().is_drained(),
+        "both gateway calls were served"
     );
 }
 

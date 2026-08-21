@@ -364,7 +364,7 @@ first half, and since Decision D120 it is not the same answer on every route:
 | route | credential must be there | credential must be well formed |
 |---|---|---|
 | `POST /v1/messages` | no — an `anthropic` provider naming a `base_url:` may declare no `api_key:`, and then a compiled graph sends no `x-api-key` at all | yes — a present `x-api-key` must be non-empty |
-| `POST /v1/chat/completions` | no — the same for `openai`, and `openai_compatible`, which reaches this route, always made `api_key:` optional | yes — a present `authorization` must be `Bearer <token>`, with a token |
+| `POST /v1/chat/completions` | no — the same for `openai`, and `openai_compatible`, which reaches this route, always made `api_key:` optional | yes — a present `authorization` must be `<scheme> <token>`, with a token; `Bearer` is the vendor's spelling and any other scheme reads as the gateway's own (below) |
 | the Azure routes | **yes** — `azure_openai` requires `api_key:` outright, so a request without one is a codegen bug | yes — the same bearer rule, and `api-key` non-empty |
 
 The two relaxed cells are a **deliberate leniency**, and the only one in this
@@ -388,15 +388,35 @@ harness refuses them — `tests/anthropic_wire.rs`'s
 `a_request_whose_credential_is_malformed_is_refused_on_the_direct_route` are
 where that is pinned.
 
-What the leniency does cost is the one case that is *not* decidable from a
-request: a credential sent under the wrong header for its wire. On the Messages
-route `authorization: Bearer …` with no `x-api-key` beside it is the documented
-gateway composition (`docs/topics/models.md`, "Keyless providers behind a
-gateway", writes exactly that under `headers:`), so this server cannot tell it
-apart from codegen having put the vendor key in the wrong place. That is covered
-where it *is* decidable — `compiled_graph_acceptance.rs` reads the recorded
-request against the spec that produced it, asserting the credential header is
-present when the spec declares a key and absent when it does not.
+What the leniency does cost is the case that is *not* decidable from a request:
+a credential this server cannot tell apart from a token the composition declared
+itself. It arrives on each route in a different spelling, and both are served.
+
+On the **Messages** route it is the wrong *header*. `authorization: Bearer …`
+with no `x-api-key` beside it is the documented gateway composition
+(`docs/topics/models.md`, "Keyless providers behind a gateway", writes exactly
+that under `headers:`), so this server cannot tell it apart from codegen having
+put the vendor key in the wrong place.
+
+On **Chat Completions** it is the wrong *scheme*, and it is the same concession
+reached from the other side: the gateway's token rides the header the vendor
+also uses, and nothing says a gateway issues bearer tokens —
+`authorization: "Basic ${GW_TOKEN}"` under `headers:` on a keyless provider is
+an ordinary composition. So a present `authorization` is held to
+`<scheme> <token>` rather than to `Bearer` alone, and a non-`Bearer` scheme is
+served when it is the only credential on it. What stays refused is what one
+request still decides: `Bearer` with no token behind it (either spelling), a
+value with no scheme at all — the vendor key that lost its prefix, which
+authenticates nothing — and a non-`Bearer` scheme beside an `api-key`, which is
+two credentials on a route that reads neither and so is not the gateway reading.
+`tests/openai_wire.rs`'s
+`a_gateway_token_under_another_scheme_is_served_on_the_direct_route` pins the
+concession and the test above it pins the five shapes it does not reach.
+
+Both are covered where they *are* decidable — `compiled_graph_acceptance.rs`
+reads the recorded request against the spec that produced it, asserting the
+credential header is present when the spec declares a key and absent when it
+does not.
 
 A missing or malformed credential is 401 and a missing or wrong `content-type`
 is 400 — the split the Certain list states, and the one both SDKs classify on

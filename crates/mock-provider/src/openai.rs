@@ -203,13 +203,34 @@ pub(crate) fn parse(
 /// for the vendor.
 ///
 /// **Only the presence requirement was dropped.** An `authorization` that *is*
-/// on the wire is still held to the spelling the service accepts —
-/// `Bearer <token>`, with a token — because the keyless posture the runtime
-/// promises is a header that is *absent*, not one that is malformed:
-/// `authorization: Bearer ` and a raw key under `authorization:` are requests
-/// that claim to authenticate and fail, and `api.openai.com` answers both 401.
-/// That is the codegen bug this check is now for, and it is the check the direct
-/// route always had, minus the part a keyless composition legitimately trips.
+/// on the wire is still held to a shape that could authenticate something,
+/// because the keyless posture the runtime promises is a header that is
+/// *absent*, not one that is malformed: `authorization: Bearer ` and a raw key
+/// under `authorization:` are requests that claim to authenticate and fail, and
+/// `api.openai.com` answers both 401. That is the codegen bug this check is now
+/// for.
+///
+/// **What "a shape that could authenticate something" admits is one scheme more
+/// than `Bearer`**, and that is the same concession `src/anthropic.rs` makes on
+/// the Messages wire, arrived at from the other side. A keyless provider is
+/// entitled to declare the gateway's own token through `headers:` (grammar 12.1,
+/// `docs/topics/models.md`, "Keyless providers behind a gateway"), and nothing
+/// says that token is a bearer one — `authorization: "Basic ${GW_TOKEN}"` is an
+/// ordinary composition. From one request this server cannot tell that apart
+/// from codegen having mangled the vendor key, exactly as the Messages route
+/// cannot tell a declared `authorization:` apart from a misplaced `x-api-key`.
+/// So `<scheme> <token>` with any scheme is **served** when nothing else on the
+/// request is a credential, and where it *is* decidable — the recorded request
+/// read against the spec that produced it — is
+/// `compiled_graph_acceptance.rs`'s
+/// `a_provider_with_no_key_sends_no_authentication_header_on_either_wire`.
+///
+/// Three shapes stay refused because one request decides them: a `Bearer` with
+/// no token (`Bearer`, `Bearer `), which is the `?? ""` this rule exists to
+/// catch; a value with no scheme at all (`sk-…`), which is the vendor key that
+/// lost its prefix and authenticates nothing; and a non-`Bearer` scheme beside
+/// an `api-key` header, which is not the gateway reading — it is two credentials
+/// on a route that reads neither of them.
 ///
 /// The **Azure** routes keep the presence check too. `azure_openai` requires
 /// `api_key:` outright (grammar 12.1), so a request reaching a deployment route
@@ -231,11 +252,26 @@ fn check_headers(checker: &mut Checker, route: Route, headers: &BTreeMap<String,
                 "Access denied due to missing subscription key. Make sure to include subscription key when making requests to an API.",
             );
         }
-    } else if headers.contains_key("authorization") && !bearer {
-        checker.credential(
-            "headers.authorization",
-            "You didn't provide an API key. You need to provide your API key in an Authorization header using Bearer auth (i.e. Authorization: Bearer YOUR_KEY).",
-        );
+    } else if let Some(authorization) = headers.get("authorization") {
+        // A credential is `<scheme> <token>`. A value carrying no space carries
+        // no scheme, and is read as a bare token — the shape a lost `Bearer `
+        // prefix leaves behind — so it fails the empty-token test below rather
+        // than being mistaken for a scheme of its own.
+        let (scheme, token) = match authorization.split_once(' ') {
+            Some((scheme, token)) => (scheme, token.trim()),
+            None => (authorization.as_str(), ""),
+        };
+        let authenticates = !token.is_empty()
+            && (scheme == "Bearer"
+                // The gateway-token reading, which only holds while this is the
+                // one credential on the request.
+                || value("api-key").is_none());
+        if !authenticates {
+            checker.credential(
+                "headers.authorization",
+                "You didn't provide an API key. You need to provide your API key in an Authorization header using Bearer auth (i.e. Authorization: Bearer YOUR_KEY).",
+            );
+        }
     }
     let json = headers
         .get("content-type")
