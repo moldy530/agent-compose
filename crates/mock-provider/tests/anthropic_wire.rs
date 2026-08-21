@@ -289,19 +289,24 @@ fn an_assistant_turn_with_no_content_is_refused() {
     );
 }
 
-/// A call with no `x-api-key` is refused **401 `authentication_error`**, the
-/// status the Messages API answers and the one `@anthropic-ai/sdk` raises
-/// `AuthenticationError` from.
+/// A call with **no `x-api-key`** is served, because a composition is entitled
+/// to send none.
 ///
-/// The harness needs no API *keys* (WIRE-NOTES §12 — values are never compared),
-/// but the header still has to be there, and a missing one is an authentication
-/// failure rather than a malformed request: answering 400 would teach generated
-/// code to classify the two the same way. 401 is outside PRD 5.9's failover set
-/// and outside the SDK's retry set, so nothing else changes shape.
+/// Grammar 12.1 makes the key conditional on this kind (Decision D120): a
+/// provider that names a `base_url:` may declare none, and a compiled graph then
+/// sends no authentication header at all. This server stands in for whatever
+/// that `base_url:` names — routinely a gateway that injects the vendor
+/// credential itself — so requiring the header would refuse the one shape D120
+/// exists to admit, in CI, where this is the only endpoint a graph reaches
+/// (WIRE-NOTES (12)). The vendor's own host would answer 401; that divergence is
+/// the deliberate one this file records.
+///
+/// What is *not* relaxed is the rest of the envelope, which the second half
+/// pins: dropping the credential check did not drop the request check beside it.
 #[test]
-fn a_request_without_an_api_key_is_refused_as_authentication() {
+fn a_request_without_an_api_key_is_served() {
     let provider = MockProvider::start().expect("a port");
-    provider.enqueue(Script::new(MODEL, Outcome::text("never served")));
+    provider.enqueue(Script::new(MODEL, Outcome::text("served without a key")));
 
     let response = provider
         .client()
@@ -315,23 +320,23 @@ fn a_request_without_an_api_key_is_refused_as_authentication() {
                 })),
         )
         .expect("the route answers");
-    assert_eq!(response.status, 401);
-    let body = response.json();
-    assert_eq!(body["type"], "error");
-    assert_eq!(body["error"]["type"], "authentication_error");
-    assert_eq!(response.header(HARNESS_HEADER), Some(REFUSED_INVALID));
-
-    let recorded = provider.requests();
-    assert!(!recorded[0].is_valid());
-    assert_eq!(recorded[0].failures()[0].pointer, "headers.x-api-key");
+    assert_eq!(response.status, 200);
     assert_eq!(
-        provider.snapshot().queues[MODEL],
-        1,
-        "an unauthenticated call consumes nothing"
+        response.json()["content"][0]["text"],
+        "served without a key"
     );
 
-    // Authentication is settled before the body is: a request that is both
-    // unauthenticated and malformed is the 401, naming the credential only.
+    let recorded = provider.requests();
+    assert!(recorded[0].is_valid(), "{:?}", recorded[0].failures());
+    assert!(
+        !recorded[0].headers.contains_key("x-api-key"),
+        "the request really carried no credential: {:?}",
+        recorded[0].headers
+    );
+    assert!(provider.snapshot().is_drained(), "the call was served");
+
+    // The body is still checked, and so is `anthropic-version`: a keyless
+    // request is a legal shape, not an unchecked one.
     let response = provider
         .client()
         .send(
@@ -340,27 +345,24 @@ fn a_request_without_an_api_key_is_refused_as_authentication() {
                 .json(&json!({ "model": MODEL })),
         )
         .expect("the route answers");
-    assert_eq!(response.status, 401);
-    let message = response.json()["error"]["message"]
-        .as_str()
-        .expect("a message")
-        .to_string();
-    assert!(message.contains("x-api-key"), "{message}");
-    assert!(!message.contains("max_tokens"), "{message}");
+    assert_eq!(response.status, 400);
+    assert_eq!(response.json()["error"]["type"], "invalid_request_error");
+    assert_eq!(response.header(HARNESS_HEADER), Some(REFUSED_INVALID));
     assert_eq!(
         provider.requests()[1]
             .failures()
             .iter()
             .map(|failure| failure.pointer.as_str())
             .collect::<Vec<_>>(),
-        ["headers.x-api-key", "max_tokens", "messages"],
+        ["max_tokens", "messages"],
         "the transcript still records everything that was wrong"
     );
 
-    // …and a request that carries its key is refused at 400 as it always was.
     let response = send(&provider.client(), &json!({ "model": MODEL }));
-    assert_eq!(response.status, 400);
-    assert_eq!(response.json()["error"]["type"], "invalid_request_error");
+    assert_eq!(
+        response.status, 400,
+        "and a keyed request is refused the same way"
+    );
 }
 
 /// Every failover condition PRD 5.9 names, on the wire, with the status and body

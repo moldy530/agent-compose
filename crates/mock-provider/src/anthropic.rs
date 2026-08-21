@@ -22,7 +22,10 @@
 //!   object schema, and `tools` present whenever a tool block appears anywhere
 //!   in the conversation;
 //! * the **required envelope** — `model`, `messages`, `max_tokens`, the
-//!   `x-api-key` and `anthropic-version` headers, and a JSON content type;
+//!   `anthropic-version` header, and a JSON content type. Not `x-api-key`: a
+//!   keyless provider behind a gateway is a legal composition and sends none
+//!   (grammar 12.1, Decision D120), so its absence is a wire shape rather than a
+//!   codegen bug — WIRE-NOTES (12);
 //! * the **sampling knobs** — grammar 12.2's `settings:` vocabulary, checked for
 //!   type *and* range, because the compiler range-checks them and nothing else
 //!   watches what reaches the wire.
@@ -131,17 +134,17 @@ pub(crate) fn parse(headers: &BTreeMap<String, String>, body: Option<&Value>) ->
 
 /// The headers the API requires. A generated client that forgets one is a
 /// codegen bug the first live call would find; this finds it in CI instead.
+///
+/// **`x-api-key` is not among them**, and that is a decision rather than an
+/// omission: see WIRE-NOTES (12). A `base_url:` points a connection at whatever
+/// it names, and grammar 12.1 lets an `anthropic` provider that names one
+/// declare no `api_key:` at all (Decision D120) — a gateway injects the
+/// credential server-side and the compiled graph sends no authentication header.
+/// This server stands in for that endpoint as much as for the vendor's, so an
+/// unauthenticated request is a wire shape it has to accept. The Azure route,
+/// whose `api_key:` the grammar still requires, keeps its credential check.
 fn check_headers(checker: &mut Checker, headers: &BTreeMap<String, String>) {
     let present = |name: &str| headers.get(name).is_some_and(|value| !value.is_empty());
-    if !present("x-api-key") {
-        // A credential, not a field: answered 401 rather than 400 (see
-        // `rejected`), because that is the status the SDK's `AuthenticationError`
-        // comes from and generated code may well classify the two apart.
-        checker.credential(
-            "headers.x-api-key",
-            "x-api-key header is required: authentication failed.",
-        );
-    }
     if !present("anthropic-version") {
         checker.fail(
             "headers.anthropic-version",
@@ -1341,18 +1344,16 @@ mod tests {
         assert_eq!(response.status, 400);
         assert_eq!(response.body["error"]["type"], "invalid_request_error");
 
-        // The api key is: a missing one is authentication, and it is answered
-        // 401 — the status the SDK raises `AuthenticationError` from.
+        // `x-api-key` is not among them: a provider that names a `base_url:`
+        // may declare no `api_key:` and then sends no header at all (grammar
+        // 12.1, Decision D120, WIRE-NOTES (12)), so its absence is a wire shape
+        // this server accepts rather than a codegen bug it reports.
         let mut anonymous = headers();
         anonymous.remove("x-api-key");
-        let parsed = parse(&anonymous, Some(&request));
-        assert_eq!(parsed.failures[0].pointer, "headers.x-api-key");
-        assert!(parsed.failures[0].authentication);
-        let Answer::Respond(response) = rejected(1, &parsed.failures) else {
-            panic!("a rejection is a response");
-        };
-        assert_eq!(response.status, 401);
-        assert_eq!(response.body["error"]["type"], "authentication_error");
+        assert!(
+            parse(&anonymous, Some(&request)).failures.is_empty(),
+            "a keyless request is a legal shape on this surface"
+        );
     }
 
     /// An unknown top-level key is a refusal, not an ignored setting.

@@ -192,22 +192,29 @@ pub(crate) fn parse(
     }
 }
 
+/// The headers the surface requires, per route.
+///
+/// The **direct** route carries no credential check, and that is a decision
+/// rather than an omission: see WIRE-NOTES (12). Grammar 12.1 lets an `openai`
+/// provider that names a `base_url:` declare no `api_key:` (Decision D120), and
+/// `openai_compatible` — which reaches this same route — has always made the key
+/// optional, so a compiled graph legitimately sends no `Authorization` at all
+/// and this server stands in for the gateway as much as for the vendor.
+///
+/// The **Azure** routes keep theirs. `azure_openai` requires `api_key:` outright
+/// (grammar 12.1), so a request reaching a deployment route with neither
+/// spelling of the credential is the codegen bug this check was written for.
 fn check_headers(checker: &mut Checker, route: Route, headers: &BTreeMap<String, String>) {
     let value = |name: &str| headers.get(name).filter(|value| !value.is_empty());
     let bearer = value("authorization").is_some_and(|value| value.starts_with("Bearer "));
     // A credential, not a field: answered 401 rather than 400 (see `rejected`),
     // because that is the status the `openai` SDK's `AuthenticationError` comes
     // from and generated code may well classify the two apart.
-    match route {
-        Route::Direct if !bearer => checker.credential(
-            "headers.authorization",
-            "You didn't provide an API key. You need to provide your API key in an Authorization header using Bearer auth (i.e. Authorization: Bearer YOUR_KEY).",
-        ),
-        route if route.is_azure() && !bearer && value("api-key").is_none() => checker.credential(
+    if route.is_azure() && !bearer && value("api-key").is_none() {
+        checker.credential(
             "headers.api-key",
             "Access denied due to missing subscription key. Make sure to include subscription key when making requests to an API.",
-        ),
-        _ => {}
+        );
     }
     let json = headers
         .get("content-type")
@@ -2098,11 +2105,16 @@ mod tests {
         ));
     }
 
-    /// The envelope and the auth header.
+    /// The envelope, the credential the Azure routes still require, and the one
+    /// the direct route no longer does.
     #[test]
     fn the_required_envelope_is_required() {
         assert_eq!(check(&json!({ "messages": [] })), ["model", "messages"]);
 
+        // The direct route accepts a request with no `Authorization`: all three
+        // kinds that reach it may declare no `api_key:` (grammar 12.1, Decision
+        // D120, WIRE-NOTES (12)), so its absence is a wire shape rather than a
+        // codegen bug. The body is still checked.
         let mut anonymous = headers();
         anonymous.remove("authorization");
         let parsed = parse(
@@ -2110,16 +2122,27 @@ mod tests {
             &anonymous,
             "",
             None,
+            Some(&request(
+                json!({ "messages": [{ "role": "user", "content": "go" }] }),
+            )),
+        );
+        assert!(
+            parsed.failures.is_empty(),
+            "a keyless request is a legal shape on the direct route: {:?}",
+            parsed.failures
+        );
+
+        // Azure's is still required, and is still a credential: the refusal is
+        // a 401 rather than the 400 a bad body draws — the distinction
+        // generated code classifies on.
+        let parsed = parse(
+            Route::AzureV1,
+            &anonymous,
+            "",
+            None,
             Some(&request(json!({}))),
         );
-        let failures: Vec<String> = parsed
-            .failures
-            .iter()
-            .map(|failure| failure.pointer.clone())
-            .collect();
-        assert_eq!(failures, ["headers.authorization"]);
-        // A credential, so the refusal is a 401 rather than the 400 a bad body
-        // draws — the distinction generated code classifies on.
+        assert_eq!(parsed.failures[0].pointer, "headers.api-key");
         assert!(parsed.failures[0].authentication);
         let Answer::Respond(response) = rejected(1, &parsed.failures) else {
             panic!("a rejection is a response");
