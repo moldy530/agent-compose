@@ -66,13 +66,27 @@ jobs:
           sha256sum agent-compose-*.tar.gz > SHA256SUMS
           cat SHA256SUMS
 
-      - name: Create the release
+      # Create the release — or finish one a person started. Creating a release
+      # in the GitHub UI is the one way the web interface can mint a tag, and
+      # that tag firing this workflow is a supported path: when the release
+      # already exists, the artifacts are attached to it instead of failing the
+      # run as a duplicate. `--clobber` keeps a re-run of this job idempotent
+      # either way.
+      - name: Create the release, or attach to one a person created
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "$TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "$TAG" \
-            --verify-tag \
-            --generate-notes \
-            dist/agent-compose-"$VERSION"-*.tar.gz dist/SHA256SUMS
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "release $TAG exists; attaching the artifacts to it"
+            gh release upload "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber \
+              dist/agent-compose-"$VERSION"-*.tar.gz dist/SHA256SUMS
+          else
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$TAG" \
+              --verify-tag \
+              --generate-notes \
+              dist/agent-compose-"$VERSION"-*.tar.gz dist/SHA256SUMS
+          fi
