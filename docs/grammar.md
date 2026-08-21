@@ -3399,6 +3399,11 @@ provider.local:
   kind: openai_compatible
   base_url: ${LOCAL_LLM_URL}
   api_key: ${LOCAL_LLM_KEY}
+
+provider.gateway:
+  kind: anthropic          # the same plugin, reached through a corporate
+  base_url: ${LLM_GATEWAY}  # gateway that injects the vendor key server-side:
+                            # no `api_key:`, and no auth header on the wire
 ```
 
 ### 12.1 Provider definitions
@@ -3419,8 +3424,8 @@ v0 provider kinds and the keys each one takes, `kind:` and `description:` aside:
 
 | `kind` | Required | Optional |
 |---|---|---|
-| `anthropic` | `api_key` | `base_url`, `headers` |
-| `openai` | `api_key` | `base_url`, `headers`, `organization` |
+| `anthropic` | `api_key` **or** `base_url` (below) | `base_url`, `headers` |
+| `openai` | `api_key` **or** `base_url` (below) | `base_url`, `headers`, `organization` |
 | `openai_compatible` | `base_url` | `api_key`, `headers` |
 | `azure_openai` | `base_url`, `api_key`, `api_version` | `headers` |
 | `bedrock` | `region` | `access_key_id`, `secret_access_key`, `session_token`, `profile` |
@@ -3429,6 +3434,25 @@ v0 provider kinds and the keys each one takes, `kind:` and `description:` aside:
 `region`, `location`, `project`, `organization`, `profile`, and `api_version` are
 plain strings and MAY be interpolated; the credential keys listed in §4.3 MUST be
 env-ref values.
+
+**`api_key` is required where the connection points at the vendor.** `anthropic`
+and `openai` are the two kinds with a **default endpoint** — omit `base_url:` and
+the connection reaches `https://api.anthropic.com` or `https://api.openai.com` —
+and nothing but a key authenticates there. So on those two kinds, and on those
+two alone, `api_key:` is required when `base_url:` is absent and optional when it
+is present. A provider declaring neither is a compile error naming both repairs
+(`missing-credential`, Decision
+[D120](#d120-a-keyless-anthropic-or-openai-provider-names-its-endpoint)); a
+provider declaring a `base_url:` and no key is a **gateway** connection, and a
+compiled graph sends **no** authentication header at all for it — not an empty
+one — because the gateway injects the vendor credential server-side. A gateway
+that wants a token of its *own* takes it through `headers:`, whose values
+interpolate (§4.3 class 2), so `authorization: "Bearer ${PROXY_TOKEN}"` reaches
+the wire as a declared header rather than as a vendor credential. The other four
+kinds are unchanged: `azure_openai` has no default endpoint and keeps all three
+of its keys required, `openai_compatible` was already the fully flexible row, and
+the two SDK-reached kinds authenticate through their cloud's own credential
+chain.
 
 **A kind's row is closed.** Beyond `kind:` and `description:`, a provider MAY
 declare exactly the keys its own row names. A key that belongs to another kind's
@@ -6133,6 +6157,64 @@ a call that ended the node and whose answer the model never saw, and both halves
 are false of a refusal. `docs/trace.md` §10.3.3 is that reasoning in full.
 *PRD 5.1, 5.2, 5.3, 5.8, §9.14, §9.22, G3.*
 
+### D120. A keyless `anthropic` or `openai` provider names its endpoint
+
+On the two kinds with a default endpoint, `api_key:` is required when `base_url:`
+is absent and optional when it is present; a provider declaring neither is a
+compile error (`missing-credential`, §12.1). An absent key means the compiled
+runtime sends **no** authentication header — no `x-api-key`, no `authorization` —
+rather than an empty one. **Rationale**: §12.1's row made `api_key:` flatly
+required on both kinds, which refuses the shape a corporate deployment actually
+writes: model traffic goes through a gateway that injects the vendor credential
+server-side, and the employee running the graph holds no key at all. The only
+workaround was `kind: openai_compatible` with a re-pointed `model.*` — a
+different plugin, a different settings schema, and `thinking:` no longer
+type-checked — for a connection that is still talking to Claude. PRD 5.9's
+"swapping a project from hosted to local inference is a one-line provider edit"
+is the promise that row was breaking.
+
+Making the key **simply optional** was the obvious repair and is the rejected
+one. It admits `provider.x: { kind: anthropic }`, which validates, builds, ships,
+and 401s on its first live call against `https://api.anthropic.com` — moving a
+forgotten credential out of `validate` and into production. That is the failure
+this document's whole static layer exists to prevent, and G3 makes the
+diagnostic a product feature; trading it away to save one `if`/`then` is the
+wrong side of that trade. The conditional keeps the forgotten-key report exactly
+where it was and buys the gateway shape with a message that names both repairs —
+declare the key, or name the endpoint that supplies one.
+
+`base_url:` is the right discriminator because it is the only key in the
+definition that can say the traffic is not going to the vendor. It is not a
+proxy for intent: the runtime *resolves* an omitted `base_url:` to the vendor's
+own host, so "no `base_url:`" is literally "reaching Anthropic's or OpenAI's
+endpoint", where the key is not optional in any deployment. And a gateway that
+authenticates callers with a token of its own is already served: `headers:` is
+interpolable (§4.3 class 2), so `authorization: "Bearer ${PROXY_TOKEN}"` is a
+declared header that reaches the wire and reads as what it is, rather than an
+`api_key:` pretending to be a vendor credential.
+
+Sending **no header** rather than an empty one is the other half, and it is not
+cosmetic. `x-api-key: ""` and `authorization: Bearer ` are requests that *claim*
+to authenticate and fail, which a gateway is entitled to reject before it ever
+injects its own — and where the gateway forwards headers verbatim, an empty
+credential arrives at the vendor as a 401 that names authentication rather than
+as the absence the deployment intended. The rule is stated over the connection,
+not over the kind: whichever wire a compiled graph reaches, a provider that
+declares no `api_key:` sends no authentication header for it.
+
+The rule is decidable in one file — `kind:`, `api_key:` and `base_url:` are three
+literals in one mapping — so the published schema branches on it exactly as it
+branches on the required keys already
+([D106](#d106-a-provider-kinds-key-row-is-closed), Appendix B), and it is decided
+in the same pass as those keys, one report with the kind's own span beside it.
+The other four kinds keep their rows unchanged:
+`azure_openai` reaches a per-resource deployment that has no default endpoint to
+fall back to, so all three of its keys stay required;
+`openai_compatible` already made `api_key:` optional beside a required
+`base_url:`, which is the same posture arrived at from the other direction; and
+`bedrock` and `vertex` authenticate through their cloud's own credential chain
+with no header for this rule to be about. *PRD 5.9, G3.*
+
 ---
 
 ## Appendix B — Editor integration
@@ -6211,7 +6293,10 @@ as integers in their ranges, `content_type` as a string carrying no env ref
 requires and the ones it refuses, `metadata_schema` being `vector`'s alone
 (§11.1, D113) and the `provider:` a `vector` store's `embed:` block must name
 (§11.2, D116), provider key sets per `kind` — both halves, the required keys and
-the closed row the optional ones live in (§12.1, D106) — trigger
+the closed row the optional ones live in (§12.1, D106), including the one
+required key that is *conditional*, an `anthropic` or `openai` provider's
+`api_key:` where no `base_url:` names a gateway (§12.1, D120), which is a second
+`if`/`then` on the same object rather than a rule about another file — trigger
 keys per `type` (§13) including the `respond`/`timeout` and `respond`/`callback`
 pairings (§13.3), the map form rules and the `on_item_error` shape (§8.6) —
 including the confinement of `input:`/`writes:`/`detach:` to the homogeneous form
@@ -6327,6 +6412,8 @@ store.<name>:
 provider.<name>: { kind: ..., api_key: "${ENV}", base_url: "${ENV}", ... }
                  # keys beyond kind/description are per kind — 12.1's row is
                  # closed, and another kind's key is an error (D106)
+                 # anthropic/openai: api_key required unless base_url names a
+                 # gateway, and then no auth header is sent at all (D120)
 model.<name>:    { provider: provider.<p>, id: <string>, settings: {...} }
 model.<name>:    { route: [model.<a>, model.<b>], route_on: [...] }
 
