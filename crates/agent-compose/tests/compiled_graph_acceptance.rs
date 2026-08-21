@@ -1067,6 +1067,20 @@ fn each_chat_completions_kind_authenticates_and_routes_the_way_its_row_says() {
 /// only visible in the transcript, which is why this is an acceptance test and
 /// not a unit test about a string.
 ///
+/// The first run carries the other half of that rule, which is the half a
+/// deployment actually runs: dropping the vendor credential is what makes room
+/// for the gateway's *own* token, and `headers:` is where every account of D120
+/// — grammar 12.1, `explain missing-credential`, `docs/topics/models.md` — says
+/// that token goes. So `provider.claude_gateway` declares one, and the recorded
+/// request is read for both facts at once: no `x-api-key`, and the declared
+/// `authorization` present with the value the composition interpolated. They
+/// are different env vars (`MOCK_GATEWAY_TOKEN` is not `MOCK_API_KEY`) so the
+/// assertion names which layer the header came from. Without this, the whole
+/// documented repair would be proved only by the mock's willingness to *serve*
+/// that shape (`anthropic_wire.rs`'s
+/// `an_empty_api_key_is_refused_while_a_gateway_token_is_served`), never by the
+/// emitter's producing it.
+///
 /// The third run is the other direction, and it is not decoration: it is the
 /// only place the suite asserts that the Messages surface sends its credential
 /// when the composition has one. The mock no longer requires it
@@ -1141,6 +1155,10 @@ fn a_provider_with_no_key_sends_no_authentication_header_on_either_wire() {
         !keyless_messages.headers.contains_key("x-api-key"),
         "a keyless `anthropic` provider sends no credential, not an empty one: {:?}",
         keyless_messages.headers
+    );
+    assert_eq!(
+        keyless_messages.headers["authorization"], "Bearer mock-gateway-token",
+        "…and the token its `headers:` declares is what authenticates it instead"
     );
     assert_eq!(
         keyless_messages.headers["anthropic-version"], "2023-06-01",

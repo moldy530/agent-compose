@@ -10,8 +10,9 @@
 # So this fixture is written to be read from the transcript. Three flows, one
 # node each:
 #
-#   * `flow.messages` — a keyless `anthropic` provider, so the recorded request
-#     must carry no `x-api-key`;
+#   * `flow.messages` — a keyless `anthropic` provider that declares a gateway
+#     token through `headers:`, so the recorded request must carry no
+#     `x-api-key` and must carry that token;
 #   * `flow.chat` — a keyless `openai` provider, so it must carry no
 #     `authorization`;
 #   * `flow.keyed` — the same `anthropic` wire with `api_key:` declared, which is
@@ -37,10 +38,23 @@ state:
 
 # No `api_key:`. Legal because `base_url:` is declared, and the whole point of
 # the fixture: `${MOCK_BASE_URL}` is the gateway stand-in every fixture here
-# points at, and this one reaches it holding nothing.
+# points at, and this one reaches it holding no vendor credential.
+#
+# It does hold a token of its *own*, and that is not decoration. A gateway that
+# injects the vendor key server-side still has to decide who is calling it, and
+# `headers:` is the answer grammar 12.1, `explain missing-credential` and
+# `docs/topics/models.md` all give — so the deployment D120 exists to admit is
+# routinely this pair of lines, not the `base_url:` alone. On this wire the two
+# ride under different names (the Messages API reads `x-api-key`), so one
+# recorded request shows both halves at once: the vendor credential absent, the
+# declared token present. `${MOCK_GATEWAY_TOKEN}` is deliberately a different value from
+# the `${MOCK_API_KEY}` the keyed provider below sends, so an assertion can say
+# which of the two a header came from rather than merely that one arrived.
 provider.claude_gateway:
   kind: anthropic
   base_url: ${MOCK_BASE_URL}
+  headers:
+    authorization: "Bearer ${MOCK_GATEWAY_TOKEN}"
 
 provider.openai_gateway:
   kind: openai
@@ -106,7 +120,7 @@ agent.keyed_reviewer:
       type: string
 
 flow.messages:
-  description: "One agent node whose `anthropic` provider declares no `api_key:`."
+  description: "One node whose `anthropic` provider swaps `api_key:` for `headers:`."
   inputs:
     goal:
       type: string

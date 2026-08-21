@@ -122,6 +122,32 @@ mod tests {
         );
     }
 
+    /// A provider's declared `headers:` are composed **after** the credential
+    /// they may replace — the layering the keyless repair rides on.
+    ///
+    /// D120 drops the vendor credential and puts the gateway's own token in
+    /// `headers:` (grammar 12.1, `docs/topics/models.md`), so that map has to
+    /// reach the wire beside whatever `credential` composed and win wherever
+    /// the two spell the same name: a declared header is the author's word about
+    /// the connection, and the credential is this runtime's default for it.
+    /// `headerSet` decides that by position alone — later layers win — so the
+    /// argument order at the one call site in `send` *is* the rule.
+    ///
+    /// Pinned here because reordering it is silent everywhere else: a keyless
+    /// request's outputs do not change, and the acceptance suite's
+    /// `a_provider_with_no_key_sends_no_authentication_header_on_either_wire`
+    /// sees only the collision-free case, where an absent credential contributes
+    /// no entry for a later layer to overwrite.
+    #[test]
+    fn a_declared_header_is_composed_after_the_credential_it_may_replace() {
+        assert!(
+            SOURCE.contains(
+                "headerSet({ \"content-type\": \"application/json\" }, headers, model.provider.headers)"
+            ),
+            "`send` must compose a provider's `headers:` as the last layer, after the credential"
+        );
+    }
+
     /// The runtime is the same bytes for every composition: a project that
     /// declares nothing and one that declares everything differ in `graph.ts`,
     /// and this is what makes that true.
