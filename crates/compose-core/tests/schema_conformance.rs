@@ -22,6 +22,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use compose_core::ast::definition::ProviderKind;
 use jsonschema::Validator;
 use serde_json::{Value, json};
 
@@ -512,11 +513,25 @@ fn invalid_fixture_corpus_covers_at_least_twelve_rules() {
 /// Asserted per kind because the conditional is hand-duplicated per kind —
 /// grammar 12.1 gives each row its own closed key list, so the two branches
 /// cannot share one subschema and one instance would only ever prove one of
-/// them.
+/// them. The kinds are *derived* from
+/// [`ProviderKind::default_endpoint`](compose_core::ast::definition::ProviderKind::default_endpoint)
+/// rather than listed, for the same reason: a seventh kind with a vendor
+/// endpoint of its own has to grow a conditional in the published schema too,
+/// and a hardcoded pair would let that ship accepting a credential-less
+/// provider with the workspace green.
 #[test]
 fn the_published_schema_accepts_a_keyless_provider_that_names_its_endpoint() {
     let validator = compile_schema();
-    for kind in ["anthropic", "openai"] {
+    let defaulted: Vec<&str> = ProviderKind::ALL
+        .iter()
+        .filter(|kind| kind.default_endpoint().is_some())
+        .map(|kind| kind.as_str())
+        .collect();
+    assert!(
+        !defaulted.is_empty(),
+        "the conditional credential rule is about the kinds with a default endpoint"
+    );
+    for kind in defaulted {
         let legal = [
             // The gateway supplies the vendor credential itself.
             json!({ "kind": kind, "base_url": "${LLM_GATEWAY}" }),

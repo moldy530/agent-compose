@@ -402,7 +402,12 @@ mod provider_kind_tests {
     /// The day a seventh kind arrives with a vendor endpoint of its own, this is
     /// what fails until [`default_endpoint`](ProviderKind::default_endpoint) and
     /// [`keys`](ProviderKind::keys) above have been told about it — the two rows
-    /// `parse/definition.rs`'s `credential` reads.
+    /// `parse/definition.rs`'s `credential` reads. The published schema states
+    /// the same conditional a third time, hand-duplicated per kind
+    /// (`schemas/agent-compose.schema.json`); it is held to this table rather
+    /// than to a list of its own, because `schema_conformance.rs`'s
+    /// `the_published_schema_accepts_a_keyless_provider_that_names_its_endpoint`
+    /// derives the kinds it asserts over from `default_endpoint`.
     #[test]
     fn only_the_kinds_with_a_default_endpoint_leave_their_credential_conditional() {
         let mut defaulted = Vec::new();
