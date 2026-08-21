@@ -78,4 +78,19 @@ mod tests {
             )
         );
     }
+
+    /// …and a **question** is stderr's too, which is the half of that rule a run
+    /// answering a `human` pause could break (grammar 8.7, PRD §9.21).
+    ///
+    /// A prompt on stdout would put prose in front of the JSON object a caller
+    /// parses, so the one run that has to ask would be the one whose answer
+    /// cannot be read. The variable name is pinned here for a different reason:
+    /// it is a documented feature rather than an internal — the emitted
+    /// `README.md` and grammar 8.7 both name it — so a rename is a change to a
+    /// published surface.
+    #[test]
+    fn a_pause_is_asked_on_stderr_and_the_switch_keeps_its_name() {
+        assert!(SOURCE.contains("output: process.stderr,"));
+        assert!(SOURCE.contains(r#"const INTERACTIVE = "AGENT_COMPOSE_INTERACTIVE";"#));
+    }
 }

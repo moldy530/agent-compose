@@ -8518,6 +8518,418 @@ fn a_pause_a_run_cannot_answer_leaves_the_loops_calls_on_the_agent_nodes_entry()
     );
 }
 
+/// A `run` at a terminal asks the question, takes the answer, and finishes the
+/// flow (grammar 8.7, PRD 5.11).
+///
+/// The gap this closes: a flow with a `human` node in it and no `http` trigger
+/// on it was **un-completable** before this. `run` reached the pause and exited
+/// `3` pointing at `serve`'s resume route, and a wait lives in the serving
+/// process — so the route that answers it belongs to a process this one never
+/// started. The composition here is exactly that shape: `flow.assisted` has a
+/// pause in the middle and nobody is serving.
+///
+/// What is asserted is the whole loop and the fact that nothing else moved.
+/// stdout is still the run's answer and stderr is where the question went, so a
+/// caller parsing one stream is unaffected by a run that had to ask. The pause
+/// records what a **resumed** one records, because it was one: the same wait
+/// board, the same schema check, the same `deliverHumanAnswer` (grammar 8.7).
+#[test]
+fn a_run_at_a_terminal_asks_the_pause_it_reaches_and_finishes_the_flow() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "answer": "an answer" })),
+    ));
+
+    let Some(out) = harness::scratch_project("terminal-answer") else {
+        return;
+    };
+    let run = harness::run_answering(harness::Answering {
+        out: &out,
+        fixture: "http-trigger",
+        flow: "flow.assisted",
+        inputs: &[("question", "what is it?")],
+        format: None,
+        environment: &harness::environment(&provider),
+        answers: &[r#"{"decision":"approve","note":"reads right"}"#],
+        afterwards: harness::Answers::Closed,
+    });
+    let said = run.stderr();
+    run.succeeded();
+
+    // The question, as a person is given it: which pause, where it is, what they
+    // are shown, what their answer has to fit, and the deadline the node
+    // declares. It is on **stderr**.
+    for part in [
+        "pause `approve/0` — flow.assisted node `approve`",
+        "\"answer\": \"an answer\"",
+        "answer: { decision: \"approve\" | \"reject\", note: string }",
+        "answer `approve/0` with one line of JSON: ",
+        "  expires: ",
+    ] {
+        assert!(
+            said.contains(part),
+            "the prompt is missing `{part}`:\n{said}"
+        );
+    }
+
+    // …and stdout is still only the flow's outputs, which is what a caller
+    // reading one stream depends on.
+    assert_eq!(
+        run.outputs(),
+        json!({ "answer": "an answer", "decision": "approve" }),
+        "the answer reached the flow's `outputs:` through the node's `writes:`"
+    );
+
+    let document = run.trace_document();
+    assert_eq!(
+        document["status"], "completed",
+        "a run that asked and was answered is a run that finished: {document}"
+    );
+    assert!(document["error"].is_null(), "{document}");
+    let entry = run
+        .entries("approve")
+        .pop()
+        .unwrap_or_else(|| panic!("the `human` node has an entry: {document}"));
+    assert_eq!(
+        entry["outcome"], "completed",
+        "a terminal-answered pause records exactly like a resumed one: {entry}"
+    );
+    assert_eq!(entry["human"]["settled"], "resumed", "{entry}");
+    assert!(entry["human"]["pausedAt"].is_string(), "{entry}");
+    assert!(entry["human"]["settledAt"].is_string(), "{entry}");
+    assert!(entry["human"]["expiresAt"].is_string(), "{entry}");
+    assert!(
+        !serde_json::to_string(&entry)
+            .expect("the entry serializes")
+            .contains("reads right"),
+        "no field of the format carries what the human answered (docs/trace.md §11): {entry}"
+    );
+}
+
+/// One question per pause, asked one at a time and in wait-id order — and the
+/// refusals that do not consume a wait.
+///
+/// A `map` over a flow that pauses is the reachable way one execution holds more
+/// than one question at once (grammar 9.4), and it is where a terminal has to
+/// decide something a resume route does not: what order to ask in. Each question
+/// is the **lowest wait id open when it is asked**, which is what the status
+/// route publishes in — so the two instances here, which park together and are
+/// both waiting when the first question goes out, are asked in the
+/// composition's order rather than the one the scheduler parked them in.
+///
+/// The guarantee is that and not a total order over the run's pauses; a pause
+/// that opens while a question is on the screen is asked after it, which gate 20
+/// pins directly (`interactive-pause.mjs`, the `later` section) because it needs
+/// a pause opened at an instant a composition cannot ask for.
+///
+/// The refusals are here rather than in a test of their own because they are the
+/// same claim from the other side: two lines that do not answer the first
+/// question leave it waiting, so the answers that follow land on the pauses they
+/// were typed for and the outputs come back in source-item order.
+///
+/// `--format json` rides along, because the run *did* have to ask: the document
+/// on stdout is the one a completed run always prints, and every prompt went to
+/// stderr.
+#[test]
+fn a_terminal_asks_one_question_per_pause_and_a_refused_answer_asks_again() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let Some(out) = harness::scratch_project("terminal-batch") else {
+        return;
+    };
+    let run = harness::run_answering(harness::Answering {
+        out: &out,
+        fixture: "http-trigger",
+        flow: "flow.batch",
+        inputs: &[("questions", r#"["first","second"]"#)],
+        format: Some("json"),
+        environment: &harness::environment(&provider),
+        answers: &[
+            "not JSON at all",
+            r#"{"decision":"maybe"}"#,
+            r#"{"decision":"approve"}"#,
+            r#"{"decision":"reject"}"#,
+        ],
+        afterwards: harness::Answers::Closed,
+    });
+    let said = run.stderr();
+    run.succeeded();
+
+    let asked: Vec<&str> = said
+        .lines()
+        .filter_map(|line| line.strip_prefix("pause `"))
+        .filter_map(|line| line.split('`').next())
+        .collect();
+    assert_eq!(
+        asked,
+        ["fan/0/0/sign/0", "fan/0/1/sign/0"],
+        "one question per pause, in wait-id order:\n{said}"
+    );
+    assert!(
+        said.contains("an answer is one line of JSON, and this line is not one: "),
+        "a line that does not parse is refused as one:\n{said}"
+    );
+    assert!(
+        said.contains(
+            "that answer does not fit the `human` node's `output:`, so `fan/0/0/sign/0` is still \
+             waiting for one that does: "
+        ),
+        "…and one the node's `output:` refuses is refused as that, naming the wait it did \
+         not consume:\n{said}"
+    );
+
+    // Neither refusal spent a turn: the two answers after them are the two the
+    // two pauses took, in source-item order (grammar 8.6 rule 5).
+    let record = run.outputs();
+    assert_eq!(record["status"], "completed", "{record}");
+    assert_eq!(
+        record["outputs"],
+        json!({ "decisions": ["approve", "reject"] }),
+        "{record}"
+    );
+    assert_eq!(
+        record["trace_version"], 3,
+        "the JSON document a run prints is unchanged in shape by having asked: {record}"
+    );
+    assert!(
+        record["trace_path"].is_string(),
+        "…and it still names where the whole trace was written: {record}"
+    );
+}
+
+/// A wait that runs out while the terminal is asking routes exactly as it would
+/// under `serve`, and the withdrawn question says so (grammar 8.7, 9.2).
+///
+/// The budget is the composition's and it keeps running while a person thinks:
+/// nothing about being asked at a terminal holds a `timeout:` still. So this run
+/// is given a terminal nobody types at — standard input stays open and empty —
+/// and what has to happen is what happens under a resume route: the wait
+/// expires, `on_timeout: end` retires the branch (grammar 7.6.3), the run
+/// **completes**, and the entry records the expiry.
+///
+/// What is this surface's own is the last part: the question was on the screen
+/// when it stopped being answerable, so the prompt is withdrawn with the
+/// sentence a late answer would have been refused with rather than left standing
+/// over a wait nothing is holding.
+#[test]
+fn a_wait_that_expires_while_the_terminal_is_asking_withdraws_the_question() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let Some(out) = harness::scratch_project("terminal-expiry") else {
+        return;
+    };
+    let run = harness::run_answering(harness::Answering {
+        out: &out,
+        fixture: "http-trigger",
+        flow: "flow.lapsing",
+        inputs: &[("question", "ship it?")],
+        format: None,
+        environment: &harness::environment(&provider),
+        answers: &[],
+        afterwards: harness::Answers::Held,
+    });
+    let said = run.stderr();
+    run.succeeded();
+
+    assert!(
+        said.contains("pause `sign_off/0` — flow.lapsing node `sign_off`"),
+        "the question was asked:\n{said}"
+    );
+    assert!(
+        said.contains(
+            "this question is withdrawn: the wait at `sign_off/0` expired, and `on_timeout` has \
+             already routed the execution on (grammar 8.7)"
+        ),
+        "…and taken away saying what happened to it:\n{said}"
+    );
+
+    let document = run.trace_document();
+    assert_eq!(
+        document["status"], "completed",
+        "a wait that ran out is not a failed run — `on_timeout: end` retires the \
+         branch (grammar 7.6.3): {document}"
+    );
+    assert_eq!(
+        run.outputs(),
+        json!({ "signed": "" }),
+        "nothing ran after the sign-off, which is what `end` means in a control-transfer \
+         position"
+    );
+    let entry = run
+        .entries("sign_off")
+        .pop()
+        .unwrap_or_else(|| panic!("the `human` node has an entry: {document}"));
+    assert_eq!(entry["human"]["settled"], "expired", "{entry}");
+    assert!(entry["human"]["settledAt"].is_string(), "{entry}");
+}
+
+/// Standard input ending is the answer surface going away, and a run that loses
+/// it ends where a run that never had one ends (grammar 8.7).
+///
+/// Two questions and one answer: the script said everything it had to say and
+/// the second pause has nothing that can reach it. The alternatives are both
+/// worse than stopping — waiting for ever is a command that never returns, and
+/// carrying on is a graph that routed on a decision nobody made — so this is the
+/// exit-`3` path, reached from the *other* direction: not "there was never a
+/// surface" but "there is no longer one".
+///
+/// Which is why the whole report is asserted rather than only the code: the
+/// document's `status`, the entry of the node it stopped at, and the absence of
+/// a settlement on the pause. A reader cannot tell this run from a headless one,
+/// and that is the point.
+///
+/// It also asserts what the terminal **did not** print. The pipe held one line
+/// and its EOF from the moment the run started, so by the time the second pause
+/// comes up the surface is already gone — and a question that cannot be answered
+/// is not asked. What a reader sees is the first block, `taken.`, and the
+/// sentence saying the surface went away; a second block printed in full and
+/// withdrawn on the line under it would be a prompt that never existed.
+#[test]
+fn a_terminal_that_runs_out_of_answers_leaves_the_run_interrupted() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let Some(out) = harness::scratch_project("terminal-eof") else {
+        return;
+    };
+    let run = harness::run_answering(harness::Answering {
+        out: &out,
+        fixture: "http-trigger",
+        flow: "flow.batch",
+        inputs: &[("questions", r#"["first","second"]"#)],
+        format: None,
+        environment: &harness::environment(&provider),
+        answers: &[r#"{"decision":"approve"}"#],
+        afterwards: harness::Answers::Closed,
+    });
+    let said = run.failed();
+    assert_eq!(
+        run.output.status.code(),
+        Some(3),
+        "a run that stopped holding a question is neither a failed run nor a command that \
+         could not be run: {said}"
+    );
+    assert!(
+        said.contains("standard input ended, so nothing can answer this run's pauses any more."),
+        "…and it says which surface went away:\n{said}"
+    );
+    assert!(
+        said.contains("is waiting for a human and this run has no way to answer"),
+        "{said}"
+    );
+
+    // What ended the run is the second question rather than anything about the
+    // first: the first was asked in full and its answer taken. The second was
+    // never put on the screen at all — the pipe carried its EOF from the start,
+    // so the surface was gone before that pause came up, and the loop says so
+    // instead of printing a block it would have to withdraw.
+    let asked: Vec<&str> = said
+        .match_indices("pause `")
+        .map(|(at, _)| {
+            let rest = &said[at + "pause `".len()..];
+            &rest[..rest.find('`').expect("a rendered pause names its wait id")]
+        })
+        .collect();
+    assert_eq!(
+        asked,
+        ["fan/0/0/sign/0"],
+        "one question was asked, and it is the one the script had an answer for:\n{said}"
+    );
+    assert!(
+        said.contains("answer `fan/0/0/sign/0` with one line of JSON: taken.\n"),
+        "…and the line the script piped in answered it:\n{said}"
+    );
+
+    let document = run.trace_document();
+    assert_eq!(document["status"], "interrupted", "{document}");
+    let entries = run.entries("fan");
+    let [entry] = entries.as_slice() else {
+        panic!("the `map` node has one entry: {document}");
+    };
+    assert_eq!(entry["outcome"], "failed", "{entry}");
+
+    // The pause that stopped the run rides out on the failure, in the aborting
+    // entry's `inner` (docs/trace.md §9): it is recorded, and it has no
+    // settlement to record.
+    //
+    // Nothing is asserted about the *answered* instance's dispatch record,
+    // because how far it got is not this run's guarantee: a `map` fails as soon
+    // as an item does, an answer delivered and an instance run to quiescence are
+    // not the same moment, and the surface here goes away in the moment after
+    // the answer — so the fan-out is abandoned with that instance somewhere in
+    // it. What the answer did is asserted where it is decided, on the screen
+    // above. A test that read a record out of that race would be pinning the
+    // scheduler rather than the behaviour.
+    let unanswered = entry["inner"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the failing instance's trace is on the entry: {entry}"))
+        .iter()
+        .find(|inner| inner["node"] == "sign")
+        .unwrap_or_else(|| panic!("the parked instance's `human` node has an entry: {entry}"));
+    assert!(unanswered["human"]["pausedAt"].is_string(), "{unanswered}");
+    assert!(
+        unanswered["human"]["settled"].is_null() && unanswered["human"]["settledAt"].is_null(),
+        "a wait the run ended holding has no settlement to record: {unanswered}"
+    );
+}
+
+/// `AGENT_COMPOSE_INTERACTIVE=0` keeps a run to the headless path, standard
+/// input or no standard input.
+///
+/// The variable is what decides the surface where a terminal cannot, and it
+/// decides it **both ways**: a supervisor that reads exit `3` and hands the
+/// execution to a person needs a `run` that does not quietly start asking
+/// because it was given a pipe with something in it. The same invocation as the
+/// answering tests above, with the one variable turned off, reaches the pause
+/// and exits `3` with the answer unread.
+#[test]
+fn a_run_told_not_to_ask_reports_the_pause_instead_of_reading_the_answer() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let Some(out) = harness::scratch_project("terminal-refused") else {
+        return;
+    };
+    let mut environment = harness::environment(&provider);
+    environment.push((harness::INTERACTIVE.to_string(), "0".to_string()));
+    let run = harness::run_answering(harness::Answering {
+        out: &out,
+        fixture: "http-trigger",
+        flow: "flow.batch",
+        inputs: &[("questions", r#"["first"]"#)],
+        format: None,
+        environment: &environment,
+        answers: &[r#"{"decision":"approve"}"#],
+        afterwards: harness::Answers::Closed,
+    });
+    let said = run.failed();
+    assert_eq!(run.output.status.code(), Some(3), "{said}");
+    assert!(
+        !said.contains("pause `fan/0/0/sign/0`"),
+        "nothing was asked, so nothing was shown:\n{said}"
+    );
+    assert_eq!(run.trace_document()["status"], "interrupted", "{said}");
+
+    // …and a value the variable does not admit is a command that could not run
+    // rather than a setting nobody read (Decision D50).
+    let mut mistyped = harness::environment(&provider);
+    mistyped.push((harness::INTERACTIVE.to_string(), "yes".to_string()));
+    let refused = harness::run_formatted(
+        &out,
+        "http-trigger",
+        "flow.batch",
+        &[("questions", r#"["first"]"#)],
+        None,
+        None,
+        &mistyped,
+    );
+    let complaint = refused.failed();
+    assert_eq!(
+        refused.output.status.code(),
+        Some(2),
+        "an environment variable nothing can read is an invocation to fix: {complaint}"
+    );
+    assert!(
+        complaint.contains("`AGENT_COMPOSE_INTERACTIVE=yes` is not one of `1`"),
+        "{complaint}"
+    );
+}
+
 /// Poll the status route until it reports `status`, and answer with that report.
 ///
 /// [`harness::settled`] stops at the three states a run can rest in; this is for

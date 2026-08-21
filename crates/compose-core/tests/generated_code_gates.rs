@@ -2,18 +2,20 @@
 //! the **real** pinned JavaScript toolchain — under **Bun**, which PRD §9.18
 //! makes the default runtime and package manager of every emitted project.
 //!
-//! Eighteen gates. The first four are in increasing strength, each one existing
-//! because the one above it passes on code the one below it catches; the fifth
-//! is about a construct whose guarantees are only observable from inside the
-//! runtime; the next two are about the schemas rather than the graph; the eighth
-//! is about a composition that has no generated project at all; the next four
-//! are about what a binding does on the wire, which no amount of type-checking or
-//! graph construction reaches; the three after those are about the *other*
-//! runtime — the Node fallback the same decision keeps supported; the sixteenth
-//! is about the storage underneath a `store.*`; the seventeenth is about the
-//! argument parser every launch of an emitted project goes through; and the last
-//! is about what a failure *says*, which is the one subject here that is a
-//! published surface rather than a behaviour:
+//! Twenty-one gates. The first four are in increasing strength, each one
+//! existing because the one above it passes on code the one below it catches;
+//! the fifth is about a construct whose guarantees are only observable from
+//! inside the runtime; the next two are about the schemas rather than the graph;
+//! the eighth is about a composition that has no generated project at all; the
+//! next four are about what a binding does on the wire, which no amount of
+//! type-checking or graph construction reaches; the three after those are about
+//! the *other* runtime — the Node fallback the same decision keeps supported;
+//! the sixteenth is about the storage underneath a `store.*`; the seventeenth is
+//! about the argument parser every launch of an emitted project goes through;
+//! the eighteenth is about what a failure *says*, which is the one subject here
+//! that is a published surface rather than a behaviour; and the last three are
+//! about a `human` pause — the board a run holds one on, the terminal it answers
+//! one at, and the process's own standard input that terminal really is:
 //!
 //! 1. **`bun run typecheck`** — every golden project type-checks under its own
 //!    strict `tsconfig.json`, against installed `@langchain/langgraph`,
@@ -180,6 +182,36 @@
 //!     the expiry look alike. The timer claim has no observable consequence at
 //!     all: an `unref`ed timer keeps nothing alive, so the runner counts the
 //!     global `setTimeout`/`clearTimeout` calls instead.
+//! 20. **The terminal a pause is answered at** — `src/cli.ts`'s prompt loop,
+//!     driven over a stream this suite feeds. The acceptance suite drives the
+//!     real `agent-compose run`, which is where "the command behaves" is
+//!     decided; this is here because the loop is a **reader over
+//!     `process.stdin`** and this project supports two engines. A `data` event's
+//!     chunking, a stream's `end`, and what `setEncoding` does to a chunk are
+//!     Bun's and Node's separately, so a line reader that answered them
+//!     differently would leave one of the two supported readers with a `run`
+//!     that hangs on a question it had printed. Six claims: what a prompt shows,
+//!     that a malformed line and a refused answer both re-prompt without
+//!     consuming the wait, that two pauses are asked one at a time in wait-id
+//!     order — and that a pause opening *under* a question on the screen is
+//!     asked after it, which is the boundary of that order — that an expiry
+//!     withdraws the question and the loop moves on, that standard input ending
+//!     turns every pause into the interrupt a run with no surface raises,
+//!     whether it ends under a question or between two, and that a last line
+//!     with no newline on it is still an answer. Gate 13 asks the same of Node.
+//! 21. **The standard input that terminal really is** — the same loop over the
+//!     process's own `process.stdin` rather than over a stream this suite feeds.
+//!     Gate 20's stream is what lets it schedule a pause to the instant; what it
+//!     cannot ask is what an operating-system pipe wired into the runtime's
+//!     event loop does. Three claims, each the engine's: that a `data` listener
+//!     attached at the **first question** — never before, so a run with no
+//!     `human` node never drains a stream it was not given — still sees what
+//!     arrived ahead of it, that `end` fires on a pipe whose EOF is older than
+//!     that listener, and that letting go of the stream lets the **process
+//!     exit**. The last is why the gate holds the pipe open from its own side
+//!     and the runner arms a timer of its own: a run that printed its answer and
+//!     then sat there is the one failure a passing test cannot tell from a slow
+//!     one. Gate 13 asks both cases of Node.
 //!
 //! # The toolchain fixture
 //!
@@ -221,7 +253,7 @@ mod toolchain;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
 use goldens::{GOLDENS, Golden, artifact, emitted, files_under, golden, goldens_root};
@@ -1667,13 +1699,408 @@ fn the_wait_board_behaved(observed: &Value) {
     );
     assert_eq!(observed["answering"]["still_published"], json!([]));
 
-    // A run with no resume surface never registers a pause: `agent-compose run`
-    // has no way to answer one, so the node raises instead of parking, and there
-    // is nothing for a status route to publish (grammar 8.7).
+    // A run with no answer surface never registers a pause: an `agent-compose
+    // run` whose standard input is not a terminal has no way to answer one, so
+    // the node raises instead of parking, and there is nothing for a status
+    // route to publish (grammar 8.7).
     assert_eq!(
         observed["unanswerable"],
         json!({ "settled": "HumanInterrupt", "published": [] })
     );
+}
+
+/// Gate 20: the terminal a `run` answers a pause at, driven directly.
+///
+/// The acceptance suite answers pauses through the real `agent-compose run`,
+/// which is where "the command behaves" is decided. This gate exists for the
+/// half that is **the engine's**: the prompt loop is a reader over
+/// `process.stdin` — a `data` event, an `end` event, an encoding — and this
+/// project supports two runtimes (PRD §9.18). A line reader that chunked
+/// differently, or that never saw the `end` of a stream, would leave one of the
+/// two supported readers with a `run` that hangs on a question it printed.
+///
+/// So the same runner answers under Bun here and under Node in gate 13, with the
+/// same assertions ([`the_terminal_asked_and_took_every_answer`]), over
+/// `src/cli.ts` and `src/runtime.ts` — compiler constants, byte-identical in
+/// every project this release builds.
+#[test]
+fn the_terminal_prompt_loop_asks_reads_and_delivers_every_answer() {
+    let Some(root) = installed() else {
+        return;
+    };
+    let project = staged(goldens::golden("review-loop"), root, "interactive-pause");
+    let output = runner("interactive-pause.mjs")
+        .arg(&project)
+        .output()
+        .expect("bun runs");
+    assert!(
+        output.status.success(),
+        "the terminal answer surface did not run:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let observed: Value =
+        serde_json::from_slice(&output.stdout).expect("the runner prints its observations as JSON");
+    the_terminal_asked_and_took_every_answer(&observed);
+}
+
+/// Everything gate 20 asks of the terminal answer surface, as a function of the
+/// runner's answer.
+///
+/// Factored out for the reason [`the_wait_board_behaved`] is: gate 13 re-runs
+/// this runner under the Node fallback, and two columns that asserted separately
+/// could come to different verdicts by drifting apart rather than by the
+/// runtimes disagreeing.
+fn the_terminal_asked_and_took_every_answer(observed: &Value) {
+    // The prompt is what a person is given, so all four parts of it are pinned:
+    // which pause this is, where it is, what they are shown, and what their
+    // answer has to fit. The last is a *sketch* of the node's `output:` rather
+    // than its JSON Schema — the schema is what the status route hands a program
+    // — and `note?` is the half of it that says which properties the schema does
+    // not require.
+    let asked = observed["prompted"]["said"]
+        .as_str()
+        .expect("the prompt is text");
+    for part in [
+        "pause `review/0/sign/0` — flow.sign_off node `sign`",
+        "\"question\": \"ship it?\"",
+        "\"draft\": \"a draft\"",
+        "answer: { decision: \"approve\" | \"reject\", note?: string }",
+        "answer `review/0/sign/0` with one line of JSON: ",
+    ] {
+        assert!(
+            asked.contains(part),
+            "the prompt is missing `{part}`:\n{asked}"
+        );
+    }
+    assert!(
+        !asked.contains("expires:"),
+        "a node declaring no `timeout:` has no deadline to show (grammar 8.7):\n{asked}"
+    );
+
+    // …and one line of JSON answers it, exactly as a resume does: the value
+    // reaches the node's result and the pause records `"resumed"`.
+    assert_eq!(observed["prompted"]["settled"], json!("resolved"));
+    assert_eq!(
+        observed["prompted"]["output"],
+        json!({ "decision": "approve", "note": "looks right" })
+    );
+    assert_eq!(observed["prompted"]["pause"], json!("resumed"));
+    assert_eq!(observed["prompted"]["published"], json!([]));
+
+    // A line that is not JSON, an answer the node's `output:` refuses, and a
+    // blank line are three ways of not answering, and none of them consumes the
+    // wait: the fourth line does, which it could not if any of the three had.
+    let refused = observed["refused"]["said"]
+        .as_str()
+        .expect("the refusals are text");
+    assert!(
+        refused.contains("an answer is one line of JSON, and this line is not one: "),
+        "a line that does not parse is refused as one:\n{refused}"
+    );
+    assert!(
+        refused.contains(
+            "that answer does not fit the `human` node's `output:`, so `review/0/sign/0` is still \
+             waiting for one that does: "
+        ),
+        "…and one the schema refuses is the resume route's `400` at this surface:\n{refused}"
+    );
+    assert_eq!(
+        observed["refused"]["prompts"],
+        json!(4),
+        "the question, then one re-prompt after each of the three lines that did not answer \
+         it:\n{refused}"
+    );
+    assert_eq!(observed["refused"]["settled"], json!("resolved"));
+    assert_eq!(
+        observed["refused"]["output"],
+        json!({ "decision": "reject" })
+    );
+
+    // Two pauses **waiting together** are asked one at a time and in wait-id
+    // order — the order the status route publishes them in, which is the
+    // composition's rather than the scheduler's. They were opened in the other
+    // order.
+    assert_eq!(
+        observed["two"]["asked"],
+        json!(["fan/0/0/sign/0", "fan/0/1/sign/0"])
+    );
+    assert_eq!(
+        observed["two"]["after_the_first"],
+        json!({
+            "first": "resolved",
+            "second": "pending",
+            "published": ["fan/0/1/sign/0"],
+        }),
+        "answering one pause leaves the other waiting, and it is the one still published"
+    );
+    assert_eq!(
+        observed["two"]["outputs"],
+        json!([{ "decision": "approve" }, { "decision": "reject" }]),
+        "each answer reached the pause it was typed for"
+    );
+
+    // …and the boundary of that guarantee, which the section above cannot see:
+    // a pause that opens **while a question is on the screen** is asked after
+    // it, even though its id sorts first. The order is over the pauses open when
+    // a question is asked, not over every pause the run makes — the alternative
+    // is withdrawing a question somebody may already be answering, and grammar
+    // 8.7 and PRD §9.21 both say so in exactly these terms.
+    assert_eq!(
+        observed["later"]["asked"],
+        json!(["fan/0/1/sign/0", "fan/0/0/sign/0"]),
+        "a pause that opened under a question on the screen is asked after it"
+    );
+    assert_eq!(
+        observed["later"]["outputs"],
+        json!([{ "decision": "approve" }, { "decision": "reject" }]),
+        "…and the first line answered the question that was on the screen: a loop that \
+         re-ordered on the latecomer would have given `approve` to `fan/0/0/sign/0`"
+    );
+
+    // A budget that ran out while the question was on the screen withdraws it —
+    // with the sentence a late answer would have been refused with — and the
+    // loop asks the next pause rather than reading a line into a wait nothing is
+    // holding.
+    assert_eq!(observed["expired"]["settled"], json!("HumanExpiry"));
+    assert_eq!(
+        observed["expired"]["expires_at_was_shown"],
+        json!(true),
+        "a node declaring a `timeout:` shows the deadline it published"
+    );
+    let withdrawn = observed["expired"]["said"]
+        .as_str()
+        .expect("the withdrawal is text");
+    assert!(
+        withdrawn.contains(
+            "this question is withdrawn: the wait at `review/0/sign/0` expired, and `on_timeout` \
+             has already routed the execution on (grammar 8.7)"
+        ),
+        "the prompt says what happened to it:\n{withdrawn}"
+    );
+    assert_eq!(
+        observed["expired"]["next"],
+        json!("resolved"),
+        "…and the loop moved on: the pause after it was asked and answered on the same stream"
+    );
+    assert_eq!(
+        observed["expired"]["next_output"],
+        json!({ "decision": "approve" })
+    );
+
+    // Standard input ending is the answer surface going away, which is the same
+    // shape as a run that never had one (grammar 8.7): the pause it was showing
+    // becomes the interrupt, and so does the next pause the run opens.
+    assert!(
+        observed["input_ended"]["said"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("standard input ended, so nothing can answer this run's pauses any more."),
+        "{}",
+        observed["input_ended"]
+    );
+    assert_eq!(observed["input_ended"]["settled"], json!("HumanInterrupt"));
+    assert!(
+        observed["input_ended"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("is waiting for a human and this run has no way to answer"),
+        "{}",
+        observed["input_ended"]
+    );
+    assert_eq!(
+        observed["input_ended"]["later"],
+        json!("HumanInterrupt"),
+        "the board is unresumable from then on, so a later pause raises where it opens \
+         rather than parking on a question nothing can answer"
+    );
+    assert_eq!(observed["input_ended"]["published"], json!([]));
+
+    // An end that arrived **between** questions is noticed before the next one
+    // is rendered. The loop hears about it on the stream's own event, and parked
+    // with no pause open it has no read outstanding for that event to answer —
+    // so the check is the one thing standing between an operator and a whole
+    // prompt block printed under a surface that was already gone.
+    let between = observed["ended_between"]["said"]
+        .as_str()
+        .expect("the surface's last words are text");
+    assert_eq!(
+        observed["ended_between"]["answered"],
+        json!("resolved"),
+        "the pause before the end was answered normally: {between}"
+    );
+    assert!(
+        between.contains("pause `review/0/sign/0`"),
+        "…so its question was asked:\n{between}"
+    );
+    assert!(
+        !between.contains("pause `review/1/sign/0`"),
+        "…and the pause that opened after standard input ended is never rendered: a question \
+         printed and withdrawn on the line under it is one that was never askable:\n{between}"
+    );
+    assert!(
+        between.contains("standard input ended, so nothing can answer this run's pauses any more."),
+        "{between}"
+    );
+    assert_eq!(
+        observed["ended_between"]["later"],
+        json!("HumanInterrupt"),
+        "…and it raises where it opened, exactly as a pause a run with no surface reaches"
+    );
+
+    // A stream whose last line carries no newline is still an answer: `printf
+    // '{"decision":"approve"}'` is a script that answered, and a reader that only
+    // took lines up to a newline would sit on it until the stream closed.
+    assert_eq!(
+        observed["unterminated"],
+        json!({ "settled": "resolved", "output": { "decision": "approve" } })
+    );
+}
+
+/// Gate 21: the prompt loop over a **real** `process.stdin`.
+///
+/// Gate 20 drives the same loop over a `node:stream` `PassThrough`, which is
+/// what lets it schedule a pause to the instant. What it cannot ask is whether
+/// the loop works on the stream `src/cli.ts` actually hands it: a process's
+/// standard input is a pipe the operating system owns and the runtime wires
+/// into its event loop, and three of its properties are the engine's rather
+/// than the reader's — that a `data` listener attached at the *first question*
+/// still sees bytes that arrived before it, that `end` fires on a pipe whose
+/// EOF preceded that listener, and that `Lines.stop()` lets go of the handle so
+/// the process **exits**.
+///
+/// The last is why this gate spawns rather than calling `output()`: the pipe is
+/// held open from this side for the whole of the child's life, so nothing but
+/// the loop's own `pause()` can release it. A run that printed its answer and
+/// then sat on a stream it had finished with is the failure shape a test cannot
+/// tell from a slow one, and it is the one an operator meets as "it never came
+/// back" — so the runner arms an unref'd timer of its own and exits `9` on a
+/// loop that stayed alive, which arrives here as a code and a sentence.
+///
+/// Both cases run under Bun here and under Node in gate 13, with the same
+/// assertions ([`the_real_standard_input_was_read_and_released`]).
+#[test]
+fn the_prompt_loop_reads_and_releases_the_processs_own_standard_input() {
+    let Some(root) = installed() else {
+        return;
+    };
+    let project = staged(goldens::golden("review-loop"), root, "interactive-stdin");
+    the_real_standard_input_was_read_and_released(&|which, typed| {
+        over_a_real_pipe(runner("interactive-stdin.mjs"), &project, which, typed)
+    });
+}
+
+/// Everything gate 21 asks of the loop over a process's own standard input, as
+/// a function of a way to run the runner.
+///
+/// Factored out for the reason [`the_wait_board_behaved`] is: gate 13 re-runs
+/// both cases under the Node fallback, and two columns that asserted separately
+/// could come to different verdicts by drifting apart rather than by the
+/// runtimes disagreeing.
+fn the_real_standard_input_was_read_and_released(run: &dyn Fn(&str, Option<&str>) -> Value) {
+    // A line written into the child's pipe answers the pause, and the process
+    // ends — with this side still holding the write end open, so what let go of
+    // standard input was the loop.
+    let answered = run("answers", Some("{\"decision\":\"approve\"}\n"));
+    assert_eq!(
+        answered["settled"],
+        json!("resolved"),
+        "a line on the real pipe answers the pause: {answered}"
+    );
+    assert_eq!(answered["output"], json!({ "decision": "approve" }));
+    assert_eq!(
+        answered["pause"],
+        json!("resumed"),
+        "…and it records exactly as a resume does (docs/trace.md §3)"
+    );
+    assert!(
+        answered["said"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("answer `review/0/sign/0` with one line of JSON: "),
+        "the question really was asked: {answered}"
+    );
+
+    // A pipe closed before the loop ever attached to it: the EOF is older than
+    // the `data` listener, which is the one ordering a lazily-attached reader
+    // can miss. Missing it is a run that hangs on a question it printed, so it
+    // is asserted as the outcome a run with no surface has.
+    let ended = run("eof", None);
+    assert_eq!(
+        ended["settled"],
+        json!("HumanInterrupt"),
+        "an EOF that preceded the reader still ends the surface: {ended}"
+    );
+    // …and the whole of what it said is that sentence. The surface was gone
+    // before the run started, so a question was never askable, and a block
+    // printed in full — the wait id, the `shown:` payload, the schema, the
+    // deadline — with the withdrawal on the line under it is the shape
+    // `Lines.spent()` exists to prevent. Asserted as an equality rather than as
+    // an absence of "pause `": the `end` event cannot fire before the listener
+    // that hears it is attached, so *anything* written before this sentence
+    // means the loop asked its first question a turn too early.
+    assert_eq!(
+        ended["said"],
+        json!("\nstandard input ended, so nothing can answer this run's pauses any more.\n"),
+        "an EOF that preceded the reader withdraws the surface without rendering a prompt: {ended}"
+    );
+}
+
+/// Run `interactive-stdin.mjs` with a real pipe on the child's standard input.
+///
+/// `typed` is what is written into it: `Some` writes the line and **keeps the
+/// write end open** past the child's exit, so the only thing that can release
+/// the child's standard input is the child; `None` closes it immediately, which
+/// is the EOF-before-the-reader case.
+///
+/// `Child::wait` closes a child's standard input before waiting to avoid a
+/// deadlock, so the handle is taken out of the child first — this function's
+/// whole subject is what happens when nobody else closes it.
+fn over_a_real_pipe(
+    mut command: Command,
+    project: &Path,
+    which: &str,
+    typed: Option<&str>,
+) -> Value {
+    use std::io::{Read, Write};
+
+    let mut child = command
+        .arg(project)
+        .arg(which)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the runtime runs");
+    let mut writing = child.stdin.take().expect("the child's input is a pipe");
+    match typed {
+        Some(line) => {
+            writing
+                .write_all(line.as_bytes())
+                .expect("the pipe takes it");
+            writing.flush().expect("the pipe takes it");
+        }
+        None => drop(writing),
+    }
+    let status = child.wait().expect("the child ends");
+    let mut said = String::new();
+    child
+        .stdout
+        .take()
+        .expect("the child's output is a pipe")
+        .read_to_string(&mut said)
+        .expect("the report is text");
+    let mut complained = String::new();
+    child
+        .stderr
+        .take()
+        .expect("the child's errors are a pipe")
+        .read_to_string(&mut complained)
+        .expect("the complaint is text");
+    assert!(
+        status.success(),
+        "the `{which}` case of the real-standard-input runner failed ({status}):\n{complained}"
+    );
+    serde_json::from_str(&said).expect("the runner prints its observations as JSON")
 }
 
 /// Gate 2e: what the single string-typed property of a `tool.*` binds, on each
@@ -3184,6 +3611,34 @@ fn a_generated_project_installs_type_checks_and_runs_under_the_node_fallback() {
     // the whole of the pause runtime runs on one engine: the acceptance suite
     // serves under Bun as well.
     the_wait_board_behaved(&node_runner("human-waits.mjs", &project));
+
+    // Gate 20, and the one whose subject is *only* the engine: the prompt loop a
+    // `run` answers a pause with is a reader over `process.stdin`, and a `data`
+    // event's chunking, a stream's `end` and what `setEncoding` does to a chunk
+    // are Bun's and Node's separately. Without this column half the supported
+    // readers would have a `run` that could hang on a question it had printed,
+    // and nothing in the suite would say so.
+    the_terminal_asked_and_took_every_answer(&node_runner("interactive-pause.mjs", &project));
+
+    // Gate 21, and the reason that gate is not gate 20 with a different stream:
+    // everything above drives the loop over a `PassThrough`, and the stream
+    // `src/cli.ts` actually reads is the process's own. A pipe the operating
+    // system owns, wired into the runtime's event loop, decides three things
+    // this column cannot get from the other — that a `data` listener attached
+    // at the first question still sees what arrived before it, that `end` fires
+    // on a pipe whose EOF is older than that listener, and that `pause()` lets
+    // go of the handle so `node src/index.ts run` **exits** rather than sitting
+    // on a stream it has finished with. The Node launch above it is a load with
+    // no verb and no input, so without this the fallback runtime's `run` could
+    // hang on a printed question with every gate green.
+    the_real_standard_input_was_read_and_released(&|which, typed| {
+        over_a_real_pipe(
+            node_command("interactive-stdin.mjs"),
+            &project,
+            which,
+            typed,
+        )
+    });
 
     // Gate 16, asked of the other runtime. The local store backends are a
     // WebAssembly SQLite over `node:fs` and a directory of files, which is

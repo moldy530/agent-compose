@@ -4824,12 +4824,13 @@ function orderedChannels(
  *
  * The two schemas are both here because a pause has two audiences. `shown` — the
  * node's `input:`, built by the node's input phase like any other — is what the
- * *human* is handed, and [`schema`] is what a **resume payload** is held to
- * (PRD 5.11): the published JSON Schema of the node's `output:`, carried so the
- * status route can hand a UI the contract its answer has to fit without the UI
- * reading the composition. [`parse`] is the emitted Zod for the same surface,
- * which is what actually decides an answer — the pair the schema conformance
- * corpus proves equal, asked at the two ends it is needed at.
+ * *human* is handed, and [`schema`] is what an **answer** is held to, whichever
+ * surface it arrived on (PRD 5.11, §9.21): the published JSON Schema of the
+ * node's `output:`, carried so the status route can hand a UI the contract its
+ * answer has to fit without the UI reading the composition. [`parse`] is the
+ * emitted Zod for the same surface, which is what actually decides an answer —
+ * the pair the schema conformance corpus proves equal, asked at the two ends it
+ * is needed at.
  */
 export interface HumanDescriptor {
   readonly flow: string;
@@ -4854,12 +4855,18 @@ export interface HumanDescriptor {
   readonly onTimeout?: string;
   /** The published JSON Schema of the node's `output:` (grammar 3.8). */
   readonly schema: JsonSchema;
-  /** Hold a resume payload to that surface, answering the parsed result. */
+  /**
+   * Hold an answer to that surface, answering the parsed result.
+   *
+   * Both delivery surfaces call it and both end their refusal in its message,
+   * so what it names is the *node* rather than the route or the terminal the
+   * answer came from (grammar 8.7, PRD §9.21).
+   */
   parse(payload: unknown): unknown;
 }
 
 /**
- * One pause this process is holding, as a resume surface sees it.
+ * One pause this process is holding, as a surface that can answer it sees it.
  *
  * Everything here is what a caller needs to *ask the question and take the
  * answer*: which pause this is, what the human is shown, what their answer has
@@ -4884,7 +4891,7 @@ export interface HumanWait {
   readonly node: string;
   /** The node's `input:`, evaluated — what the human is shown (grammar 8.7). */
   readonly shown: Readonly<Record<string, unknown>>;
-  /** What a resume payload is validated against (PRD 5.11). */
+  /** What an answer is validated against (PRD 5.11). */
   readonly schema: JsonSchema;
   /** When the pause began, as an ISO 8601 instant. */
   readonly pausedAt: string;
@@ -4963,12 +4970,18 @@ export class HumanExpiry extends Error {
 /**
  * A pause this run has no way to deliver an answer to.
  *
- * Resume is an invocation (PRD 5.11) and the generated app is what exposes it,
- * so a run started **without** a resume surface — `agent-compose run`, and any
- * in-process caller of [`runFlow`] that did not ask for one — reaches a `human`
- * node and stops there. The alternative readings are both worse: waiting forever
- * is a command that never returns, and carrying on with no answer is a graph
- * that routed on a decision nobody made.
+ * A run started **without** an answer surface — an `agent-compose run` whose
+ * standard input is not a terminal, and any in-process caller of [`runFlow`]
+ * that did not ask for one — reaches a `human` node and stops there. So does one
+ * whose surface **went away** while it was running: `agent-compose run` prompts
+ * at the terminal it was given, and standard input ending is that surface
+ * closing (see [`closeHumanWaits`]). The alternative readings are both worse:
+ * waiting forever is a command that never returns, and carrying on with no
+ * answer is a graph that routed on a decision nobody made.
+ *
+ * The message names the delivery surfaces rather than the run's shape, because
+ * what a reader needs is where an answer *can* go: the app's resume route
+ * (PRD 5.11), or a `run` at a terminal (grammar 8.7).
  *
  * **`on_error:` does not govern it.** Grammar 9's policy is over an *activity* —
  * what the model, the process or the request did — and this is the run's own
@@ -4987,7 +5000,7 @@ export class HumanInterrupt extends Error {
 
   constructor(flow: string, node: string, wait: string, pause: HumanPause) {
     super(
-      `${flow} node \`${node}\` is waiting for a human and this run has no way to answer: \`agent-compose run\` cannot deliver a resume, which is \`agent-compose serve\`'s \`POST /executions/:id/resume\` (PRD 5.11)`,
+      `${flow} node \`${node}\` is waiting for a human and this run has no way to answer: an answer reaches a pause through \`agent-compose serve\`'s \`POST /executions/:id/resume\`, or at the terminal of an \`agent-compose run\` whose standard input is one (grammar 8.7, PRD 5.11)`,
     );
     this.name = "HumanInterrupt";
     this.flow = flow;
@@ -5067,15 +5080,22 @@ export type ResumeOutcome =
 /**
  * How a pause stopped waiting.
  *
- * Two of the three are outcomes the composition declared, and they are what the
- * trace records ([`HumanPause.settled`]). `"abandoned"` is neither: it is the
- * run saying nobody is listening for this answer any more — the node that
- * dispatched the instance holding it has stopped waiting for that instance, or
- * the run itself has ended — and it never reaches a trace entry, because the
- * entry it would have ridden out on belongs to a task whose result was
- * discarded. See [`abandonPausesUnder`].
+ * Two of the four are outcomes the composition declared, and they are what the
+ * trace records ([`HumanPause.settled`]). The other two are the run's own shape
+ * and neither reaches a `settled` key:
+ *
+ *   * `"abandoned"` is the run saying nobody is listening for this answer any
+ *     more — the node that dispatched the instance holding it has stopped
+ *     waiting for that instance, or the run itself has ended. It never reaches a
+ *     trace entry at all, because the entry it would have ridden out on belongs
+ *     to a task whose result was discarded (see [`abandonPausesUnder`]);
+ *   * `"interrupted"` is the run saying nothing can answer this pause — the
+ *     answer surface it started with has gone away (see [`closeHumanWaits`]).
+ *     Its entry *is* reported: it is the same [`HumanInterrupt`] a run started
+ *     with no surface raises, so the pause reaches the trace with `pausedAt` and
+ *     no settlement, exactly as [`HumanPause.settledAt`] describes.
  */
-type Settlement = "resumed" | "expired" | "abandoned";
+type Settlement = "resumed" | "expired" | "abandoned" | "interrupted";
 
 /** One pause, with the machinery that settles it exactly once. */
 interface Held {
@@ -5088,20 +5108,18 @@ interface Held {
 
 /** Every pause one execution is holding, in the order they began. */
 interface WaitBoard {
-  /** Whether a resume surface is attached to this run (PRD 5.11). */
-  readonly resumable: boolean;
-  readonly held: Map<string, Held>;
   /**
-   * Who is told when a pause opens or stops waiting.
+   * Whether a resume surface is attached to this run (PRD 5.11).
    *
-   * One caller: [`runActivity`], which holds a node's deadline still for as long
-   * as a pause under that node is pending (grammar 9.2, Decision D102). It is an
-   * *event* rather than a poll because the two ends are far apart — the deadline
-   * belongs to a `map` or `flow:` node and the pause happens some number of
-   * instances below it — and a budget that resumed on the next poll tick would
-   * make a node's remaining time depend on the tick rather than on the clock.
+   * Mutable, because a surface can go away while the run is still going: the
+   * terminal one `agent-compose run` attaches loses its answers when standard
+   * input ends, and a pause nothing can answer is exactly what [`HumanInterrupt`]
+   * is (see [`closeHumanWaits`]). It is only ever turned **off** — nothing
+   * attaches a surface to a run that started without one, because a `human` node
+   * reached before it attached would already have raised.
    */
-  readonly watchers: Set<() => void>;
+  resumable: boolean;
+  readonly held: Map<string, Held>;
 }
 
 /**
@@ -5122,15 +5140,69 @@ interface WaitBoard {
 const humanBoards = new Map<string, WaitBoard>();
 
 /**
+ * Who is told when one execution's set of open pauses moves.
+ *
+ * Kept **beside** the boards rather than on one, because a watcher may exist
+ * before the board does. `agent-compose run`'s terminal surface subscribes with
+ * the execution id it minted and then starts the run, and a subscription that
+ * only worked once a board existed would be a prompt loop whose correctness
+ * depended on how much of [`runFlow`] happens before its first `await` — the one
+ * failure mode a test cannot tell from a slow machine. The other subscriber,
+ * [`runActivity`], is inside the run and could not care; one registry serves
+ * both.
+ *
+ * It is an *event* rather than a poll because of what the second subscriber
+ * does: a node's deadline is held still for as long as a pause under that node
+ * is pending (grammar 9.2, Decision D102), and the two ends are far apart — the
+ * deadline belongs to a `map` or `flow:` node and the pause happens some number
+ * of instances below it. A budget that resumed on the next poll tick would make
+ * a node's remaining time depend on the tick rather than on the clock.
+ *
+ * Entries are the subscriber's to remove, and both remove theirs: `runActivity`
+ * in the `finally` that ends a node execution, the terminal surface in the
+ * `finally` that ends its prompt loop.
+ */
+const humanWatchers = new Map<string, Set<() => void>>();
+
+/**
  * Open the pause registry for one execution, saying whether it can be resumed.
  *
  * Called by [`runFlow`] at the top of every run, before the graph is streamed,
  * so a status route polling the moment after `start` answered already has
  * something to read. `resumable` is the run's, not the composition's: the same
- * compiled flow is resumable under `serve` and is not under `run`.
+ * compiled flow is resumable under `serve`, is resumable under an
+ * `agent-compose run` that can reach a terminal, and is not under one that
+ * cannot.
  */
 export function openHumanWaits(execution: string, resumable: boolean): void {
-  humanBoards.set(execution, { resumable, held: new Map(), watchers: new Set() });
+  humanBoards.set(execution, { resumable, held: new Map() });
+}
+
+/**
+ * Withdraw this run's answer surface: nothing can answer its pauses any more
+ * (grammar 8.7, PRD 5.11).
+ *
+ * The counterpart of [`openHumanWaits`]'s `resumable` argument, for a surface
+ * that is attached when the run starts and can still go away while it is
+ * running. One does: the terminal `agent-compose run` prompts at, whose answers
+ * stop arriving when standard input ends. A pause nothing can answer is not a
+ * new outcome — it is exactly the shape a run started with no surface at all
+ * has — so every pause still waiting is settled as a [`HumanInterrupt`] and the
+ * board is marked unresumable, which makes every *later* pause raise one where
+ * it opens rather than park on a promise nothing will settle.
+ *
+ * What that buys is one reported outcome rather than two: the run ends with the
+ * `status: "interrupted"` document, the exit code and the trace entry that a
+ * non-interactive run reaching the same node produces, because it is the same
+ * error class on the same chain.
+ */
+export function closeHumanWaits(execution: string): void {
+  const board = humanBoards.get(execution);
+  if (board === undefined) return;
+  board.resumable = false;
+  for (const one of [...board.held.values()]) {
+    if (one.settled === undefined) one.settle("interrupted", undefined);
+  }
 }
 
 /**
@@ -5194,16 +5266,27 @@ export function pausesUnder(execution: string, site: string): number {
  * Be told whenever one of `execution`'s pauses opens or stops waiting; answers
  * the unsubscribe.
  *
- * An execution this process is not running answers a no-op unsubscribe and is
- * never called: there is no board to watch, and there will not be one — a board
- * is opened before the graph is streamed and dropped when the run ends.
+ * Subscribing **before the run exists** is allowed and is what one caller does
+ * (see [`humanWatchers`]): the listener is registered against the execution id
+ * rather than against a board, so nothing turns on whether the board has been
+ * opened yet. An id no run ever uses costs one empty `Set` until its
+ * unsubscribe runs.
  */
 export function watchHumanPauses(execution: string, listener: () => void): () => void {
-  const board = humanBoards.get(execution);
-  if (board === undefined) return () => {};
-  board.watchers.add(listener);
+  let watchers = humanWatchers.get(execution);
+  if (watchers === undefined) {
+    watchers = new Set();
+    humanWatchers.set(execution, watchers);
+  }
+  const held = watchers;
+  held.add(listener);
   return () => {
-    board.watchers.delete(listener);
+    held.delete(listener);
+    // The empty set goes with the last subscriber, so a `serve` process that
+    // has answered many runs is not left holding one per execution id.
+    if (held.size === 0 && humanWatchers.get(execution) === held) {
+      humanWatchers.delete(execution);
+    }
   };
 }
 
@@ -5255,8 +5338,10 @@ export function abandonPausesUnder(execution: string, site: string): void {
 }
 
 /** Tell everyone watching that this execution's set of open pauses has moved. */
-function announce(board: WaitBoard): void {
-  for (const watcher of [...board.watchers]) watcher();
+function announce(execution: string): void {
+  const watchers = humanWatchers.get(execution);
+  if (watchers === undefined) return;
+  for (const watcher of [...watchers]) watcher();
 }
 
 /**
@@ -5318,6 +5403,14 @@ export function humanWaits(execution: string): readonly HumanWait[] {
 
 /**
  * Deliver a human's answer to one pause (PRD 5.11's third verb).
+ *
+ * **Two surfaces call it, and it is the whole of what they share.** The app's
+ * `POST /executions/:id/resume` is one; the terminal `agent-compose run` prompts
+ * at is the other (grammar 8.7). What a person is asked and how their answer
+ * arrives differs — a request body, a line typed at a prompt — but which pause it
+ * addresses, what schema it is held to, and what each refusal means are decided
+ * here for both, so the two cannot come to different answers about the same
+ * board.
  *
  * `wait` names which pause when the execution is holding more than one, and may
  * be omitted when it is holding exactly one — an execution with two pauses
@@ -5402,15 +5495,51 @@ export function deliverHumanAnswer(
   return { ok: true, wait: chosen.wait };
 }
 
-/** Why a pause that is no longer waiting cannot take this answer. */
-function settledDetail(id: string, settled: Settlement): string {
+/**
+ * Why a pause that is no longer waiting cannot be answered.
+ *
+ * `arrived` says which of the two surfaces is asking. A **delivery** has an
+ * answer in hand and lost a race for it, so the sentence names it; a surface
+ * that was *showing* the question and is being told it is over has no answer to
+ * name, and a refusal that mentioned one would describe something nobody did.
+ * One function rather than two, because everything else about the four
+ * sentences — which fact each states, and how it is worded — has to be the same
+ * on both.
+ */
+function settledDetail(id: string, settled: Settlement, arrived = true): string {
   if (settled === "expired") {
-    return `the wait at \`${id}\` expired before this answer arrived, and \`on_timeout\` has already routed the execution on (grammar 8.7)`;
+    return `the wait at \`${id}\` expired${arrived ? " before this answer arrived" : ""}, and \`on_timeout\` has already routed the execution on (grammar 8.7)`;
   }
   if (settled === "abandoned") {
-    return `the wait at \`${id}\` is no longer held: the execution stopped waiting for the node that was asking, so there is nothing left to deliver this answer to`;
+    return `the wait at \`${id}\` is no longer held: the execution stopped waiting for the node that was asking, so there is nothing left to ${arrived ? "deliver this answer to" : "answer"}`;
+  }
+  if (settled === "interrupted") {
+    return `the wait at \`${id}\` is no longer held: this run's answer surface went away, so the execution stopped there (grammar 8.7)`;
   }
   return `the wait at \`${id}\` has already been answered`;
+}
+
+/**
+ * Why a pause is no longer waiting, for a surface that is **showing** its
+ * question — and `undefined` while it still is.
+ *
+ * The other half of [`deliverHumanAnswer`]'s refusal taxonomy, for the one
+ * surface that can watch a pause rather than only address it. A resume route
+ * learns a wait has ended by trying to answer it; a terminal that has already
+ * printed the question has to be told, so that the prompt is withdrawn with the
+ * sentence the delivery would have refused it with rather than with a wording of
+ * its own. Same sentences, one place, so the two surfaces cannot drift.
+ *
+ * An id the execution is holding nothing under answers the sentence
+ * `deliverHumanAnswer` refuses an unknown wait with, because that is what it is:
+ * the board this process is running never held it, or the run has ended and
+ * taken the board with it.
+ */
+export function humanWaitEnded(execution: string, wait: string): string | undefined {
+  const held = humanBoards.get(execution)?.held.get(wait);
+  if (held === undefined) return `this execution is holding no pause \`${wait}\``;
+  if (held.settled === undefined) return undefined;
+  return settledDetail(wait, held.settled, false);
 }
 
 /**
@@ -5487,8 +5616,8 @@ export async function runHuman(
       if (timer !== undefined) clearTimeout(timer as Parameters<typeof clearTimeout>[0]);
       // Told before the promise is settled, so the deadline a `map` or `flow:`
       // node above this one has been holding still is running again by the time
-      // the node below it goes back to work (see [`WaitBoard.watchers`]).
-      announce(board);
+      // the node below it goes back to work (see [`humanWatchers`]).
+      announce(wait.execution);
       if (outcome === "resumed") {
         resolve({ output: value, human: { ...opened, ...stopped(outcome) } });
       } else if (outcome === "expired") {
@@ -5502,6 +5631,12 @@ export async function runHuman(
             { ...opened, ...stopped(outcome) },
           ),
         );
+      } else if (outcome === "interrupted") {
+        // The answer surface went away while this pause was open, which is the
+        // same thing as never having had one: the pause reaches the trace with
+        // no settlement, and the run ends on the interrupt (see
+        // [`closeHumanWaits`]).
+        reject(new HumanInterrupt(descriptor.flow, descriptor.node, id, opened));
       } else {
         // Nobody is reading this task's result — that is what abandoned means —
         // so what it rejects with is only ever an unwinding, never a report
@@ -5517,7 +5652,7 @@ export async function runHuman(
       settle: (outcome, value) => settle(outcome, value),
     };
     hold(board, id, mine);
-    announce(board);
+    announce(wait.execution);
 
     if (descriptor.timeoutMs !== undefined) {
       // Wall clock from the moment the pause begins (grammar 8.7), and `unref`ed

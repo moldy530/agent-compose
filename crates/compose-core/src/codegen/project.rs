@@ -413,13 +413,14 @@ one.
 
 /// The section a composition declaring a `human` node gets.
 ///
-/// A pause is the one thing an emitted app asks a *person* for, so the reader
-/// who has to answer one needs the whole loop written down: where the question
-/// is published, what an answer has to fit, what each refusal means, and what
-/// `run` does with a pause it cannot answer (grammar 8.7, PRD 5.11). A
-/// composition with no `human` node gets none of it, exactly as one with no
-/// store gets no store section — the resume route is still mounted, and the
-/// paragraph above already says so.
+/// A pause is the one thing an emitted project asks a *person* for, so the
+/// reader who has to answer one needs the whole loop written down — and there
+/// are **two** ways to answer, so it is written twice over: where the app
+/// publishes the question and what a resume's refusals mean, and what a `run` at
+/// a terminal shows, how a line answers it, and what decides whether it asks at
+/// all (grammar 8.7, PRD 5.11, §9.21). A composition with no `human` node gets
+/// none of it, exactly as one with no store gets no store section — the resume
+/// route is still mounted, and the paragraph above already says so.
 fn human_waits(ir: &Ir) -> String {
     let pauses = ir.definitions.values().any(|definition| {
         let crate::ir::definition::DefinitionBody::Flow(flow) = &definition.body else {
@@ -467,8 +468,8 @@ take their answer.
 
 `input` is the node's own `input:`, evaluated — what the human is shown.
 `output_schema` is the published JSON Schema of its `output:`, which is exactly
-what a resume payload is validated against, so a form can be built from the
-report rather than from the composition. `expires_at` is present only where the
+what an answer is validated against — at this route and at the terminal below —
+so a form can be built from the report rather than from the composition. `expires_at` is present only where the
 node declares a `timeout:`.
 
 POST the answer to `resume_url` as the JSON body:
@@ -521,11 +522,80 @@ from an earlier poll.
 gone with every other one that process was tracking. Durable waits arrive with
 durable execution.
 
-`agent-compose run` cannot answer a pause — resume is the app's route — so a run
-that reaches a `human` node reports the pause and exits **`3`**, its own code
-beside `1` for a run that produced no answer and `2` for a command that could not
-be run. The trace document is still written, with `status: "interrupted"` and the
-pause on the entry of the node it stopped at.
+## Answering a pause at the terminal
+
+The resume route is one way to answer a pause. The other is `run` itself: a run
+whose **standard input is a terminal** asks each pause it reaches, right there,
+and carries on with the answer. So a flow with a `human` node in it is runnable
+without serving anything.
+
+```text
+$ bun src/index.ts run flow.review --input goal=ship
+
+pause `approve/0` — flow.review node `approve`
+  shown:
+    {
+      "draft": "the drafted answer"
+    }
+  answer: { decision: "approve" | "reject", note?: string }
+  expires: 2025-01-02T12:00:00.000Z
+answer `approve/0` with one line of JSON: {"decision":"approve"}
+taken.
+```
+
+The prompt goes to **stderr**, so stdout is still only the flow's outputs and
+`--format json` still prints exactly the document it always did. `shown` is the
+node's `input:`, evaluated; `answer` is a sketch of its `output:` — the full JSON
+Schema is what the status route publishes, for a program rather than a person —
+and `expires` appears only where the node declares a `timeout:`.
+
+**One JSON value per line.** A value spanning lines has no terminator a prompt
+could recognize without either guessing or hanging on a malformed one, so an
+answer is a line. A line that is not JSON, and one the node's `output:` refuses,
+are both refused and the question is asked again — the wait is not consumed, the
+same rule the resume route's `400` follows. A blank line is not an answer at all
+and just re-prompts.
+
+**One question at a time.** An execution holding several pauses — a `map` over a
+flow that pauses — is asked them one after another, and each question is the
+lowest `wait_id` **open when it is asked**: the order the status route publishes
+them in, so pauses waiting together are asked in the composition's order rather
+than the one the scheduler parked them in. A pause that opens while a question
+is on the screen is asked after it, whatever its id sorts as — the question in
+front of you is never taken back to make room for it. Each prompt names its own
+wait id.
+
+**A budget keeps running while you think.** Nothing about being asked at a
+terminal holds a `timeout:` still: a wait that runs out while its question is on
+the screen routes through `on_timeout:` exactly as it would under `serve`, and
+the prompt is withdrawn saying so before the next question is asked. A line typed
+for a question that has just been withdrawn is read as the next question's
+answer — a stream of typed lines carries no addressing — which is why every
+prompt names the pause it belongs to.
+
+**Standard input ending ends the run.** Close it, or answer fewer questions than
+the run asks, and there is nothing left that could answer the rest: the run stops
+where it stood, with `status: "interrupted"` and exit `3`, exactly as a run with
+no terminal does.
+
+### When there is no terminal
+
+`AGENT_COMPOSE_INTERACTIVE` decides the surface where standard input cannot:
+
+| value | what a `run` does |
+|---|---|
+| `1` | asks at standard input whatever it is — which is how a **script** answers a pause: `printf '%s\n' '{"decision":"approve"}' \| AGENT_COMPOSE_INTERACTIVE=1 bun src/index.ts run flow.review --input goal=ship` |
+| `0` | never asks, even at a terminal — which is how a supervisor keeps a run on the exit-`3` path below |
+| unset | asks when standard input is a terminal |
+
+Any other value is refused before the run starts, naming the variable: a command
+that could not be run (exit `2`), rather than a setting nothing read.
+
+A run that is not asking reports the pause and exits **`3`**, its own code beside
+`1` for a run that produced no answer and `2` for a command that could not be
+run. The trace document is still written, with `status: "interrupted"` and the
+pause on the entry of the node it stopped at, and the answer goes to `serve`'s
+resume route instead.
 "##;
 
 /// The section a composition declaring a `store.*` gets.

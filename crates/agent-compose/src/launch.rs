@@ -35,9 +35,19 @@
 //! entrypoint, an unresolvable JavaScript runtime, an unresolved dependency set
 //! and a missing environment variable all are. The child's own code is passed
 //! through unchanged, and `src/cli.ts` gives the three the same meanings — plus
-//! the fourth only it can reach: `3`, a run that stopped at a `human` pause
-//! (grammar 8.7). Nothing here decides that one; it arrives as the child's code
-//! like the rest.
+//! the fourth only it can reach: `3`, a run with nobody to ask that stopped at a
+//! `human` pause (grammar 8.7). Nothing here decides that one; it arrives as the
+//! child's code like the rest.
+//!
+//! # Why standard input is inherited
+//!
+//! [`spawn`] inherits all three streams, and stdin is the one that has become
+//! load-bearing: a pause has a second delivery surface, and it is the terminal
+//! this command was launched from (grammar 8.7, PRD §9.21). The child asks its
+//! question there and reads the answer there, so `agent-compose run` at a
+//! terminal completes a flow with a `human` node in it — and a redirected or
+//! absent stdin is what leaves the child on the exit-`3` path above. This
+//! process reads nothing and copies nothing: the terminal *is* the child's.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};

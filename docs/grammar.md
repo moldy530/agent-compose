@@ -2437,14 +2437,54 @@ A **route** object takes `node` (required) plus optional `max_concurrency`,
 
 Human-in-the-loop pause (PRD 5.5). Grammar **and** runtime are active: a
 compiled project stops the execution at the node, reports it as `interrupted`,
-publishes what the human is shown and the schema their answer is held to, and
-takes that answer at `POST /executions/:id/resume` — the third verb of §13.3's
-invocation surface (PRD 5.11). `agent-compose run` has no resume surface, so a
-one-shot run that reaches a pause reports it and exits on a code of its own
-rather than waiting or carrying on. A wait lives in the serving **process**:
-durable execution is a later milestone, so a `serve` restarted while a human was
-thinking has lost it, and the emitted `README.md` says so where a reader meets
-the resume route.
+and publishes what the human is shown and the schema their answer is held to. A
+wait lives in the **process** that is holding it: durable execution is a later
+milestone, so a `serve` restarted while a human was thinking has lost it, and the
+emitted `README.md` says so where a reader meets the resume route.
+
+**Two surfaces deliver an answer**, and which one is available is a property of
+the *invocation* rather than of the composition — the way §9.4 fixes one
+idempotency-key delivery surface per binding kind (PRD §9.21). What differs
+between them is delivery and nothing else: both address a pause by the instance
+path of §9.4, both hold the answer to the node's `output:`, both refuse an answer
+that does not fit **without consuming the wait**, and both leave the same trace
+record.
+
+| surface | available when | how the answer arrives |
+|---|---|---|
+| `POST /executions/:id/resume` | the execution was started by the generated app — the third verb of §13.3's invocation surface (PRD 5.11) | the request body, with `?wait=` naming which pause where the execution holds more than one |
+| the terminal of an `agent-compose run` | the run's standard input is a terminal, or `AGENT_COMPOSE_INTERACTIVE=1` | one JSON value per line, at a prompt naming the pause it belongs to |
+
+A `run` with **neither** — standard input is not a terminal, or
+`AGENT_COMPOSE_INTERACTIVE=0` forces it — has no way to answer, so a run that
+reaches a pause reports it and exits on a code of its own rather than waiting or
+carrying on. So does one whose terminal goes away.
+
+Four details of the terminal surface are its own, because a stream of typed lines
+is not a request, and PRD §9.21 fixes the same four. The framing is **one JSON
+value per line** — a value spanning lines has no terminator a prompt could
+recognize without either guessing or hanging on a malformed one — and a line that
+is not JSON, or that the `output:` refuses, re-prompts. An execution holding more
+than one pause is asked **one at a time**, and each question is the **lowest-id
+pause open when it is asked** — §13.3's status-route order, so pauses waiting
+together are asked in the order the composition fixes rather than the one the
+scheduler happened to park them in. It is that rather than a total order over the
+run's pauses because a question already on the screen is not taken back: a pause
+that opens while one is being asked is asked after it, whatever its id sorts as.
+`AGENT_COMPOSE_INTERACTIVE` is what a *script* answers a pause with, and its only
+values are `1` and `0`; anything else is refused before the run starts, as a
+command that could not be run rather than a setting nobody read
+([D50](#d50-unknown-keys-are-errors-everywhere-except-plugin-config-objects)).
+And standard input **ending** withdraws the surface: every pause still waiting,
+and every one the run opens after it, becomes the same outcome a run with no
+surface has, so a script that answered too few questions ends where it stood
+instead of parking for ever.
+
+A `timeout:` is not one of the four. It keeps running while the prompt is on the
+screen exactly as it would under `serve`, and an expiry routes through
+`on_timeout:` there and then — taking the question with it, so the prompt is
+withdrawn and the next pause is asked. The emitted `README.md` documents the
+whole loop.
 
 ```yaml
 approve:

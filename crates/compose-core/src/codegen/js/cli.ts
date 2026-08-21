@@ -46,13 +46,41 @@
 //
 // # A run that stops at a `human` node
 //
-// `run` cannot answer a pause: resume is an invocation and the generated app is
-// what exposes it (PRD 5.11), so a run that reaches a `human` node reports what
-// it reached and exits `3` — its own code, beside `1` for a run that produced no
-// answer and `2` for a command that could not be run. The trace document is
-// still written, with `status: "interrupted"`; the entry of the node it stopped
-// at carries the pause, and `agent-compose serve` is where the question gets
-// answered.
+// A pause is a question, and this command answers it **where there is somebody
+// to ask**: standard input. A `run` whose stdin is a terminal renders each pause
+// it reaches — the wait id, the flow and node, the `input:` the human is shown,
+// the shape their answer has to fit, and the deadline where the node declares one
+// — reads one line of JSON back, holds it to the node's `output:` exactly as the
+// resume route does, and carries on in the same process (grammar 8.7). The
+// prompts go to **stderr**, because stdout is the run's answer.
+//
+// Everything that is not the delivery is unchanged, and deliberately so: it is
+// the same wait board, the same schema check, the same refusal sentences, and the
+// same trace record a resumed pause leaves. A `timeout:` budget keeps running
+// while the terminal waits, so a wait that expires mid-prompt routes through
+// `on_timeout:` exactly as it would under `serve` — the prompt is withdrawn
+// saying so, and the next pause is asked.
+//
+// A run whose stdin is **not** a terminal has nobody to ask, so it does what it
+// has always done: it reports what it reached and exits `3` — its own code,
+// beside `1` for a run that produced no answer and `2` for a command that could
+// not be run. The trace document is still written, with `status: "interrupted"`;
+// the entry of the node it stopped at carries the pause, and `agent-compose
+// serve` is where the question gets answered instead.
+//
+// `AGENT_COMPOSE_INTERACTIVE` decides it where a terminal cannot. `1` prompts
+// whatever stdin is, which is how a pause is answered from a script or a test
+// harness — one line of JSON per prompt, and each prompt names the pause it
+// belongs to; `0` never prompts, which is how a run under a terminal is kept to
+// the exit-`3` behaviour a supervisor may be reading. Unset, stdin's own `isTTY`
+// decides. A value that is neither is a command that could not be run (exit
+// `2`), rather than a setting nobody read.
+//
+// **Standard input ending withdraws the surface.** A script that answered fewer
+// pauses than the run reached leaves the run with nothing that can answer the
+// rest, which is the same shape as a run that never had a surface at all — so it
+// ends exactly there: `status: "interrupted"`, exit `3`, the pause on the entry
+// of the node it stopped at.
 //
 // Grammar 13.2 puts three failures in one sentence — "an unknown argument name,
 // a missing REQUIRED field, or a value that does not fit the declared type fails
@@ -80,7 +108,15 @@ import path from "node:path";
 import process from "node:process";
 
 import { type CompiledFlow, type FlowRun, flows, runFlow, sessionRefusal } from "./graph.ts";
-import { TRACE_VERSION, interruptOf } from "./runtime.ts";
+import {
+  TRACE_VERSION,
+  closeHumanWaits,
+  deliverHumanAnswer,
+  humanWaitEnded,
+  humanWaits,
+  interruptOf,
+  watchHumanPauses,
+} from "./runtime.ts";
 import type * as runtime from "./runtime.ts";
 import { dataRoot } from "./stores.ts";
 import { httpTriggers, manualTriggers } from "./triggers.ts";
@@ -128,17 +164,23 @@ async function flush(): Promise<void> {
  * Run the project's own command line, and answer with the exit code.
  *
  * `0` is a clean run, `1` is a run that produced no answer, `2` is a command
- * that could not run at all, and `3` is a run that stopped at a `human` pause —
- * the same four meanings `agent-compose` itself gives them, so a caller reads
- * one table rather than two.
+ * that could not run at all, and `3` is a run that stopped at a `human` pause
+ * with **nobody to ask** — the same four meanings `agent-compose` itself gives
+ * them, so a caller reads one table rather than two.
  *
  * `3` is a code of its own rather than a shade of `1` because the three ask for
  * different things. `2` is an invocation to fix and `1` is a run to look into;
  * this is neither — the run did everything it was asked to and is holding a
- * question, and what closes it is a person answering through `serve`'s resume
- * route (grammar 8.7, PRD 5.11). A supervisor that retried `1` would re-run a
- * graph whose effects have already happened, and one that reported `2` would
- * send someone to look at the command line.
+ * question. What closes a pause is a person answering it, and there are two
+ * surfaces they can (grammar 8.7, PRD §9.21): the terminal this command prompts
+ * at when standard input is one, where the run carries on and ends `0` like any
+ * other, and the app's `POST /executions/:id/resume`. `3` is what is left when
+ * neither was available — standard input was not a terminal,
+ * `AGENT_COMPOSE_INTERACTIVE=0` said not to ask, or the terminal went away
+ * mid-run — and it points at `serve`, which is where the same question can be
+ * asked of a process that has a surface for the answer. A supervisor that
+ * retried `1` would re-run a graph whose effects have already happened, and one
+ * that reported `2` would send someone to look at the command line.
  */
 export async function main(argv: readonly string[]): Promise<number> {
   const [verb, ...rest] = argv;
@@ -178,6 +220,7 @@ async function run(argv: readonly string[]): Promise<number> {
   const inputs = bindInputs(flow, options.repeated["input"] ?? []);
   const session = sessionOf(flow, options.single["session"] ?? "");
   const format = formatOf(options.single["format"]);
+  const asking = interactively();
   requireSession(address, flow, session);
 
   // Minted here rather than left to `runFlow`, because this command needs it on
@@ -185,10 +228,38 @@ async function run(argv: readonly string[]): Promise<number> {
   // [`writeTrace`]), and a failed run has no `FlowRun` to read one back off.
   const execution = `exec_${globalThis.crypto.randomUUID()}`;
 
+  // Started rather than awaited, because a run that pauses is one this command
+  // may have to *answer* while it is still going: the prompt loop reads the same
+  // wait board the graph is parked on (grammar 8.7), so the two run side by side
+  // in one process. A run with no `human` node in it never prompts and never
+  // reads stdin — [`answerPauses`] attaches to it at the first question.
+  const running = runFlow(address, inputs, {
+    executionId: execution,
+    sessionKey: session,
+    resumable: asking,
+  });
+  const prompting = asking
+    ? answerPauses(execution, settling(running), {
+        input: process.stdin,
+        output: process.stderr,
+      }).catch((error: unknown) => {
+        // The prompt loop is the only thing that can answer this run, so a
+        // failure inside it is a run with no answer surface rather than a
+        // command that should keep waiting for one: the pauses become the
+        // interrupt they already are, and the run ends the way a non-interactive
+        // one does (see `runtime.closeHumanWaits`).
+        process.stderr.write(
+          `\nthis run stopped being able to ask: ${describe(error)}\n`,
+        );
+        closeHumanWaits(execution);
+      })
+    : undefined;
+
   let produced: FlowRun;
   try {
-    produced = await runFlow(address, inputs, { executionId: execution, sessionKey: session });
+    produced = await running;
   } catch (error) {
+    await prompting;
     const trace = (error as { trace?: readonly runtime.TraceEntry[] }).trace ?? [];
     // A run that stopped at a `human` pause is not a run that failed, and the
     // whole way out is written for that difference: its own document `status`,
@@ -234,6 +305,7 @@ async function run(argv: readonly string[]): Promise<number> {
     return interrupt === undefined ? 1 : 3;
   }
 
+  await prompting;
   const written = writeTrace(address, execution, "completed", produced.trace);
   if (format === "json") {
     process.stdout.write(
@@ -257,6 +329,469 @@ async function run(argv: readonly string[]): Promise<number> {
   process.stderr.write(render(produced.trace));
   if (written !== undefined) process.stderr.write(`\ntrace: ${written}\n`);
   return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Answering a pause at the terminal
+// ---------------------------------------------------------------------------
+
+/**
+ * The variable that decides whether a `run` prompts, where stdin cannot.
+ *
+ * Not a test seam: a pause answered from a script is the same delivery a person
+ * makes, and both the emitted `README.md` and grammar 8.7 document this as a
+ * feature. `1` prompts whatever stdin is; `0` never prompts; unset, stdin's own
+ * `isTTY` decides.
+ */
+const INTERACTIVE = "AGENT_COMPOSE_INTERACTIVE";
+
+/**
+ * Whether this `run` may ask a person a question (grammar 8.7).
+ *
+ * A value that is neither `1` nor `0` is a **usage error** rather than a
+ * silently-ignored setting, which is D50's posture applied to an environment
+ * variable: `AGENT_COMPOSE_INTERACTIVE=true` accepted-and-ignored is a caller
+ * who believes their script will answer the pause it is piping into, watching it
+ * exit `3` with nothing anywhere to say why.
+ */
+function interactively(): boolean {
+  const forced = process.env[INTERACTIVE];
+  if (forced === undefined || forced === "") return process.stdin.isTTY === true;
+  if (forced === "1") return true;
+  if (forced === "0") return false;
+  throw new UsageError(
+    `\`${INTERACTIVE}=${forced}\` is not one of \`1\` (answer \`human\` pauses at standard input) or \`0\` (never): unset it to decide by whether standard input is a terminal`,
+  );
+}
+
+/** Where a prompt is written, and where the answer to it is read from. */
+export interface Terminal {
+  /** Answers arrive here, one JSON value per line. */
+  readonly input: NodeJS.ReadableStream;
+  /** Prompts and refusals go here — stderr, so stdout stays the run's answer. */
+  readonly output: { write(text: string): unknown };
+}
+
+/**
+ * A promise that says when the run stopped, and never rejects.
+ *
+ * The prompt loop needs the *moment* rather than the outcome — a run that failed
+ * has no more questions either — and a rejection nobody handled would end the
+ * process before the failure reached the reporting below.
+ */
+function settling(running: Promise<unknown>): Promise<void> {
+  return running.then(
+    () => {},
+    () => {},
+  );
+}
+
+/**
+ * Ask every pause this run opens, one at a time, and deliver the answers
+ * (grammar 8.7, PRD 5.11).
+ *
+ * Exported so an ejected project keeps the surface: this is the second delivery
+ * surface for a human answer, beside the app's resume route, and both go through
+ * `runtime.deliverHumanAnswer`. Nothing here decides which pause an answer
+ * addresses, what schema it is held to, or what a refusal means — those are the
+ * board's, and asking them here would be a second implementation of the resume
+ * route that could disagree with it.
+ *
+ * # What it does, in order
+ *
+ * Each question is the **lowest-id pause open when it is asked**, which is the
+ * order the status route publishes them in and for that function's reason
+ * (`runtime.humanWaits`): the order pauses *open* is the scheduler's, so a `map`
+ * over two items that parked in one instant would otherwise ask its two
+ * questions in a different order on a different machine. Ids are instance paths,
+ * derived from the composition, so pauses that are open together are asked in an
+ * order the composition fixes rather than the scheduler.
+ *
+ * It is "when it is asked" rather than a total order over the run's pauses, and
+ * the difference is a question already on the screen: a pause that opens while
+ * one is being asked is asked **after** it, even where its id sorts first,
+ * because the only way to put it first would be to take back a question a person
+ * is already answering. So a run whose pauses open at moments its own `agent:`
+ * and `http:` latencies decide can ask them in an order that latency decided;
+ * what is fixed is that no *set* of pauses waiting together is asked in the
+ * scheduler's order, and that every prompt names the id it belongs to.
+ *
+ * One line of JSON per answer, and that is the framing: a value spanning lines
+ * has no terminator a prompt could recognize without either guessing or hanging
+ * on a malformed one. A line that is not JSON, or that the node's `output:`
+ * refuses, is a refusal and a **re-prompt** — the wait is not consumed, exactly
+ * as a `400` from the resume route does not consume it. A blank line is not an
+ * answer at all and re-prompts without a refusal.
+ *
+ * # The two ways a prompt ends without an answer
+ *
+ * A pause can stop waiting while its question is on the screen, and both ways it
+ * can are the run's rather than this loop's: its `timeout:` ran out and
+ * `on_timeout:` routed the execution on, or the run ended some other way and the
+ * board was released. Either way the prompt is **withdrawn** — with the sentence
+ * the resume route would have refused a late answer with — and the next pause is
+ * asked. A line typed *for* the withdrawn question, arriving after it is gone, is
+ * read as the next question's answer: a stream of typed lines carries no
+ * addressing, so a line meant for a question that has just been taken away is
+ * indistinguishable from one meant for the question that replaced it. Every
+ * prompt names its own wait id for that reason (see [`Lines.abandon`]).
+ *
+ * And **standard input can end**, which is the surface itself going away:
+ * `runtime.closeHumanWaits` turns every pause still waiting, and every one this
+ * run opens later, into the interrupt a run with no surface raises — so the run
+ * ends where it stood instead of parking on a question nothing can answer.
+ */
+export async function answerPauses(
+  execution: string,
+  finished: Promise<unknown>,
+  terminal: Terminal,
+): Promise<void> {
+  // Subscribed **before** anything is read, and against the execution id rather
+  // than a board — `runtime.watchHumanPauses` takes it either way, so this does
+  // not race the run's own opening of the board.
+  const listeners = new Set<() => void>();
+  const wake = (): void => {
+    for (const listener of [...listeners]) listener();
+  };
+  const unwatch = watchHumanPauses(execution, wake);
+  let over = false;
+  const stop = (): void => {
+    over = true;
+    wake();
+  };
+  void finished.then(stop, stop);
+
+  // Built at the first question rather than here: a run with no `human` node in
+  // it must not attach a `data` listener to stdin, which would drain a stream
+  // this command was never given for itself.
+  let reading: Lines | undefined;
+
+  /** Resolve as soon as `ready` answers something, or when the run stops. */
+  const upon = <T,>(ready: () => T | undefined): Promise<T | undefined> =>
+    new Promise<T | undefined>((resolve) => {
+      const check = (): void => {
+        const answer = over ? undefined : ready();
+        if (answer === undefined && !over) return;
+        listeners.delete(check);
+        resolve(answer);
+      };
+      listeners.add(check);
+      check();
+    });
+
+  try {
+    for (;;) {
+      // The lowest id **open at this moment**: `runtime.humanWaits` orders the
+      // board, so a set of pauses waiting together is asked in the
+      // composition's order rather than the scheduler's. A pause that opens
+      // later is asked later, whatever its id sorts as — see the note above.
+      const wait = await upon((): runtime.HumanWait | undefined => {
+        const open = humanWaits(execution);
+        return open.length === 0 ? undefined : open[0];
+      });
+      if (wait === undefined) return;
+      if (reading === undefined) {
+        reading = lines(terminal.input);
+        // One turn of the event loop between attaching to the stream and asking
+        // anything of it, and only ever this once. A stream that is **already**
+        // at its end — a run launched with nothing on standard input, which is
+        // every `agent-compose run` in a script that forgot to pipe an answer —
+        // announces that end on the `end` event, and that event cannot have
+        // fired before the listener `lines` just attached existed. So the very
+        // first `spent()` would be read a turn too early and answer `false` for
+        // a surface that was gone before the run started: the whole block
+        // printed and withdrawn on the line under it, which is the one thing
+        // the guard in [`ask`] exists to prevent. Every later question is asked
+        // with the listener attached for the whole of the run behind it, so
+        // there is nothing left to wait for.
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        // Asked again rather than asked now: the board can have moved in that
+        // turn — the pause read above may have expired, and the run itself may
+        // have ended — and a question is owed to what is open when it is
+        // printed, not to what was open a turn before.
+        continue;
+      }
+      const ended = await ask(execution, wait, reading, terminal.output, upon);
+      if (ended === "input-ended") {
+        terminal.output.write(
+          `\nstandard input ended, so nothing can answer this run's pauses any more.\n`,
+        );
+        closeHumanWaits(execution);
+        return;
+      }
+    }
+  } finally {
+    unwatch();
+    reading?.stop();
+  }
+}
+
+/** How one prompt ended: with an answer, without one, or with no input left. */
+type Asked = "settled" | "input-ended";
+
+/**
+ * Ask one pause and read until it is answered, withdrawn, or stdin ends.
+ *
+ * `upon` is [`answerPauses`]'s subscription, passed in so the withdrawal watch
+ * and the pause watch are one registration on the wait board rather than two
+ * that could see different moments.
+ */
+async function ask(
+  execution: string,
+  wait: runtime.HumanWait,
+  reading: Lines,
+  output: Terminal["output"],
+  upon: <T>(ready: () => T | undefined) => Promise<T | undefined>,
+): Promise<Asked> {
+  // Asked before the block is rendered, because standard input can end while
+  // the loop is parked with no pause open — there is no read outstanding then,
+  // so nothing notices until the next question goes looking for an answer. A
+  // question printed in full and withdrawn on the line under it is a prompt
+  // that never existed; the surface was already gone. The same is true of a
+  // stream that had already ended when the reader attached, which is why
+  // [`answerPauses`] gives the `end` event a turn to arrive before it asks the
+  // first question — this check reads a stream's state, and a state nothing has
+  // reported yet is not one it can read.
+  if (reading.spent()) return "input-ended";
+  output.write(question(wait));
+  // One withdrawal watch for the whole prompt, resolving with the sentence the
+  // resume route refuses a late answer with. The `??` branch is the run ending:
+  // `upon` answers `undefined` for that rather than for a settlement, because the
+  // board goes with the run and there is no wait left to have one.
+  const withdrawn = upon(() => humanWaitEnded(execution, wait.id)).then(
+    (detail) => detail ?? `the wait at \`${wait.id}\` is no longer held: the run ended`,
+  );
+  for (;;) {
+    const read = await Promise.race([
+      reading.next(),
+      withdrawn.then((detail): Read => ({ kind: "withdrawn", detail })),
+    ]);
+    if (read.kind === "withdrawn") {
+      // The read this prompt had outstanding is dropped, so the next line to
+      // arrive is read by whatever question is being asked *then* rather than by
+      // a promise nobody is waiting on any more. A line already in hand is not
+      // affected: it reached the question it was typed for and was refused by it
+      // as settled, one branch below.
+      reading.abandon();
+      output.write(`\nthis question is withdrawn: ${read.detail}\n`);
+      return "settled";
+    }
+    if (read.kind === "end") return "input-ended";
+    const typed = read.line.trim();
+    // A stray newline is not an answer, and refusing it as malformed JSON would
+    // be a sentence about a value nobody typed.
+    if (typed === "") {
+      output.write(asked(wait));
+      continue;
+    }
+    let payload: unknown;
+    try {
+      payload = JSON.parse(typed) as unknown;
+    } catch (error) {
+      output.write(
+        `an answer is one line of JSON, and this line is not one: ${describe(error)}\n`,
+      );
+      output.write(asked(wait));
+      continue;
+    }
+    const outcome = deliverHumanAnswer(execution, wait.id, payload);
+    if (outcome.ok) {
+      output.write(`taken.\n`);
+      return "settled";
+    }
+    if (outcome.reason === "mismatch") {
+      // The wording the resume route refuses a `400` with, and the same fact
+      // behind it: the wait was not consumed, so the corrected answer goes to
+      // the same question.
+      output.write(
+        `that answer does not fit the \`human\` node's \`output:\`, so \`${wait.id}\` is still waiting for one that does: ${outcome.detail}\n`,
+      );
+      output.write(asked(wait));
+      continue;
+    }
+    // Every other refusal is about *which* pause rather than about what was
+    // typed, and each of them means this question is over — the answer raced an
+    // expiry and lost, or the board stopped holding it. Its own sentence, and on
+    // to the next.
+    output.write(`${outcome.detail}\n`);
+    return "settled";
+  }
+}
+
+/** The block one pause is presented as, on stderr. */
+function question(wait: runtime.HumanWait): string {
+  let block = `\npause \`${wait.id}\` — ${wait.flow} node \`${wait.node}\`\n`;
+  block += "  shown:\n";
+  for (const line of JSON.stringify(wait.shown, null, 2).split("\n")) {
+    block += `    ${line}\n`;
+  }
+  block += `  answer: ${outline(wait.schema)}\n`;
+  if (wait.expiresAt !== undefined) block += `  expires: ${wait.expiresAt}\n`;
+  return `${block}${asked(wait)}`;
+}
+
+/** The one-line prompt itself, repeated after every refusal. */
+function asked(wait: runtime.HumanWait): string {
+  return `answer \`${wait.id}\` with one line of JSON: `;
+}
+
+/**
+ * The node's `output:` schema, in one readable line.
+ *
+ * The published JSON Schema is what a *program* is given (the status route's
+ * `output_schema`), and printing it at a prompt would bury the two things a
+ * person needs — the field names and what each will take — in the keywords that
+ * carry the rest. So this is a sketch: `{ decision: "approve" | "reject", note?:
+ * string }`, where `?` is a property the schema does not require.
+ *
+ * Bounded in depth, because a prompt is a line: past three levels the shape is
+ * elided rather than wrapped, and the full schema is a poll of the status route
+ * away for anyone who needs it.
+ */
+function outline(schema: unknown, depth = 0): string {
+  if (typeof schema !== "object" || schema === null) return "any";
+  const node = schema as Record<string, unknown>;
+  const variants = node["enum"];
+  if (Array.isArray(variants)) {
+    return variants.map((variant) => JSON.stringify(variant)).join(" | ");
+  }
+  const union = node["oneOf"] ?? node["anyOf"];
+  if (Array.isArray(union)) {
+    return depth >= 3 ? "…" : union.map((one) => outline(one, depth + 1)).join(" | ");
+  }
+  const type = node["type"];
+  if (type === "array") return `${outline(node["items"], depth + 1)}[]`;
+  if (type === "object" || node["properties"] !== undefined) {
+    if (depth >= 3) return "{ … }";
+    const properties = (node["properties"] ?? {}) as Record<string, unknown>;
+    const required = new Set(
+      (Array.isArray(node["required"]) ? node["required"] : []).map((name) => String(name)),
+    );
+    const fields = Object.entries(properties).map(
+      ([name, property]) =>
+        `${name}${required.has(name) ? "" : "?"}: ${outline(property, depth + 1)}`,
+    );
+    return fields.length === 0 ? "{}" : `{ ${fields.join(", ")} }`;
+  }
+  if (typeof type === "string") return type;
+  if (Array.isArray(type)) return type.map((one) => String(one)).join(" | ");
+  return "any";
+}
+
+/** What one read off the answer stream produced. */
+type Read =
+  | { readonly kind: "line"; readonly line: string }
+  | { readonly kind: "end" }
+  | { readonly kind: "withdrawn"; readonly detail: string };
+
+/** Reading an answer stream one line at a time. */
+interface Lines {
+  /** The next line, or `end` once the stream has no more. */
+  next(): Promise<Read>;
+  /**
+   * Drop the outstanding read, so the next line goes to the next caller.
+   *
+   * What a withdrawn prompt does with the read it had open: nobody is waiting on
+   * that promise any more, and a queue entry left in front of the next question's
+   * read would swallow the line meant for it. The rule this leaves is the one a
+   * reader can hold in their head — **a line is answered by whatever question is
+   * being asked when it arrives** — and it is the honest one, because a stream of
+   * answers carries no addressing: a line typed for a question that has just been
+   * withdrawn is indistinguishable from one typed for the question that replaced
+   * it. Each prompt names its own wait id for exactly that reason.
+   */
+  abandon(): void;
+  /**
+   * Whether the stream has ended and holds nothing a read could still answer.
+   *
+   * What [`ask`] consults before it renders a question: the end arrives on the
+   * stream's own event, so a loop parked with no pause open learns about it
+   * with no read outstanding to be answered `end`. Without this a run whose
+   * standard input closed while it was busy would print a whole prompt — the
+   * wait id, the `shown:` block, the schema, the deadline — and withdraw the
+   * surface on the line under it.
+   */
+  spent(): boolean;
+  /** Stop reading the stream, and stop holding it open. */
+  stop(): void;
+}
+
+/**
+ * One line at a time off a stream, in the order the bytes arrive.
+ *
+ * Hand-rolled rather than `node:readline`, because what a prompt needs is
+ * exactly this and the module brings a terminal's worth of behaviour with it —
+ * echo, history, key handling — that would differ between the two supported
+ * runtimes on a surface where they must not (PRD §9.18). What is left is the
+ * seam that really is the engine's: a `data` event, a `end` event, and the
+ * encoding. Those are what the generated-code gates ask of both.
+ */
+function lines(input: Terminal["input"]): Lines {
+  let held = "";
+  let ended = false;
+  const waiting: ((read: Read) => void)[] = [];
+
+  const serve = (): void => {
+    for (;;) {
+      if (waiting.length === 0) return;
+      const at = held.indexOf("\n");
+      if (at >= 0) {
+        const line = held.slice(0, at);
+        held = held.slice(at + 1);
+        waiting.shift()!({ kind: "line", line });
+        continue;
+      }
+      if (!ended) return;
+      // The stream is over. A last line with no newline on it is still a line —
+      // `printf '{"decision":"approve"}'` is a script that answered — and every
+      // read after it is the end.
+      if (held.trim() !== "") {
+        const line = held;
+        held = "";
+        waiting.shift()!({ kind: "line", line });
+        continue;
+      }
+      held = "";
+      waiting.shift()!({ kind: "end" });
+    }
+  };
+
+  const onData = (chunk: unknown): void => {
+    held += typeof chunk === "string" ? chunk : String(chunk);
+    serve();
+  };
+  const onEnd = (): void => {
+    ended = true;
+    serve();
+  };
+  input.setEncoding("utf8");
+  input.on("data", onData);
+  input.on("end", onEnd);
+
+  return {
+    next(): Promise<Read> {
+      return new Promise<Read>((resolve) => {
+        waiting.push(resolve);
+        serve();
+      });
+    },
+    abandon(): void {
+      // Only ever the read at the head, and only ever one still waiting: a read
+      // that had a line was resolved and shifted off inside `serve`.
+      waiting.shift();
+    },
+    spent(): boolean {
+      // What is held matters as much as the end: a stream that ended on
+      // `printf '{"decision":"approve"}'` has no newline on it and still has an
+      // answer in hand, which is the line `serve` gives the next read.
+      return ended && held.trim() === "";
+    },
+    stop(): void {
+      input.removeListener("data", onData);
+      input.removeListener("end", onEnd);
+      input.pause();
+    },
+  };
 }
 
 /** `serve [--host <host>] [--port <port>]`. */
