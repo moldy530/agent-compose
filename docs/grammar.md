@@ -3401,7 +3401,7 @@ provider.local:
   api_key: ${LOCAL_LLM_KEY}
 
 provider.gateway:
-  kind: anthropic          # the same plugin, reached through a corporate
+  kind: anthropic           # the same plugin, reached through a corporate
   base_url: ${LLM_GATEWAY}  # gateway that injects the vendor key server-side:
                             # no `api_key:`, and no auth header on the wire
 ```

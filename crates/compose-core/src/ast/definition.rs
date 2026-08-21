@@ -263,8 +263,9 @@ impl ProviderKind {
     /// than an omission: their `api_key:` is required only where no `base_url:`
     /// points the connection away from the vendor's own endpoint, which is a
     /// disjunction this list cannot state. [`default_endpoint`] is the other
-    /// half, and `check::providers` is where the pair is decided (Decision
-    /// D120).
+    /// half, and the pair is decided one pass earlier — `parse/definition.rs`'s
+    /// `credential`, because two literals in one mapping is one file's business
+    /// (Decision D120, `docs/grammar.md` Appendix B).
     #[must_use]
     pub const fn required_keys(self) -> &'static [&'static str] {
         match self {
@@ -399,7 +400,9 @@ mod provider_kind_tests {
     /// own (grammar 12.1, Decision D120).
     ///
     /// The day a seventh kind arrives with a vendor endpoint of its own, this is
-    /// what fails until `check::providers` has been told about it.
+    /// what fails until [`default_endpoint`](ProviderKind::default_endpoint) and
+    /// [`keys`](ProviderKind::keys) above have been told about it — the two rows
+    /// `parse/definition.rs`'s `credential` reads.
     #[test]
     fn only_the_kinds_with_a_default_endpoint_leave_their_credential_conditional() {
         let mut defaulted = Vec::new();
@@ -427,7 +430,7 @@ mod provider_kind_tests {
             }
             assert!(
                 kind.required_keys().is_empty(),
-                "`{}`'s credential rule is `check::providers`', so nothing is required outright",
+                "`{}`'s credential rule is conditional and the parser's, so nothing is required outright",
                 kind.as_str()
             );
         }

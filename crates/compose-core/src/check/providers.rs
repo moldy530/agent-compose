@@ -1,13 +1,14 @@
 //! Provider settings and the three capability checks (grammar 11.2, 12).
 //!
-//! The **credential** rule of grammar 12.1 is not here and belongs where it is:
+//! The **credential** rule of grammar 12.1 is not here, and no part of it is:
 //! whether an `anthropic` or `openai` provider needs an `api_key:` turns on
 //! whether it declares a `base_url:`, which is two literals in one mapping, so
-//! it is the parser's (`parse/definition.rs`, Decision D120) and the published
-//! schema enforces it — the invariant `parse_invalid.rs`'s
-//! `the_parser_rejects_everything_the_published_schema_rejects` holds. What this
-//! module keeps of it is the table the message reads,
-//! [`ProviderKind::default_endpoint`].
+//! it is the parser's (`parse/definition.rs`'s `credential`, Decision D120) and
+//! the published schema enforces it — the invariant `parse_invalid.rs`'s
+//! `the_parser_rejects_everything_the_published_schema_rejects` holds. The table
+//! its message reads is [`ProviderKind::default_endpoint`], which lives on the
+//! kind itself in `ast/definition.rs`; a seventh provider kind is added there
+//! and nowhere in this file.
 //!
 //! # Settings
 //!
