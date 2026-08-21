@@ -25,6 +25,12 @@
 //!   deterministic set of `(path, contents)` files: a LangGraph TypeScript
 //!   project, pinned per compiler release (PRD 5.12).
 //!
+//! One module is not a pass at all: [`docs`] is what the binary knows how to
+//! teach about itself — the topic curriculum, an expanded explanation per
+//! diagnostic code, the published JSON Schema, the `init` scaffold, and the
+//! installable agent skill, all embedded so that a released binary needs no
+//! checkout beside it (PRD §7 M2, 5.12).
+//!
 //! One pass reads two artifacts rather than one: [`plan`](plan()) diffs a
 //! composition against another, which is what makes a change to a graph
 //! reviewable as a change rather than as a rewritten router (PRD §2, §7 M2).
@@ -55,6 +61,7 @@ pub mod cel;
 pub mod check;
 pub mod codegen;
 pub mod diag;
+pub mod docs;
 pub mod ir;
 pub mod parse;
 pub mod plan;

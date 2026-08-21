@@ -101,8 +101,9 @@ version: "0.1"
   entrypoint's value, otherwise a compile error naming both files.
 - The accepted set is exactly the compiler build's `SUPPORTED_SPEC_VERSIONS`
   (`crates/compose-core/src/lib.rs`). For this build: `["0.1"]`.
-- A version outside the supported set is refused with a pointer to
-  `agent-compose migrate`; old syntax is never silently reinterpreted (PRD §9.5).
+- A version outside the supported set is refused, and told the set this build
+  accepts; old syntax is never silently reinterpreted. The codemod PRD §9.5
+  commits to is a future verb, and is not named by any message this build emits.
 
 ### 1.4 `imports`
 
@@ -3323,12 +3324,18 @@ Rules (PRD 5.8):
   is a **compile error**: `doc_id` is bound from `state.topic`, which holds the
   same value in every instance, so N documents would land on one vector key —
   the hazard form 1 exists to prevent, reached through a binding that merely
-  *looks* item-derived at the store node. `key: "input.text"`,
-  `key: "execution.item_index"`, or dropping the map's `input:` so the whole item
-  is passed all satisfy it.
+  *looks* item-derived at the store node. `key: "input.text"`, a `key:` that
+  *reads* the index from inside a string-valued expression — say
+  `key: "state.tasks[execution.item_index]"` — or dropping the map's `input:` so
+  the whole item is passed all satisfy it. The bare
+  `key: "execution.item_index"` does **not**, and the reason is a type rather
+  than a derivation: item-derivation asks what an expression *reads*, and the
+  index answers it, but the index is an `int` (§4.1) while every op's `key` is a
+  CEL **string** (the table above), so that spelling clears this rule and then
+  fails type-checking with `type-mismatch`.
 
-  The per-site reading cuts the other way too, and the `execution.item_index`
-  spelling is where it shows. A site that **no** map encloses is not subject to
+  The per-site reading cuts the other way too, and an index-reading `key:` is
+  where it shows. A site that **no** map encloses is not subject to
   this rule at all (above) — and at such a site the index has no value, so a
   `key:` written that way fails the read there rather than keying anything
   (§4.1, Decision
@@ -5848,10 +5855,10 @@ with D110 repeating the same three. The index was a fourth case that neither
 list held, so what a read of it does outside a map had no answer, and the case
 is not exotic: [D83](#d83-item-derivation-is-traced-through-the-dispatch-binding)
 contemplates one flow "dispatched by several maps and instantiated outside every
-map as well", and §11.4's own fix list endorses `key: "execution.item_index"`
-inside such a flow. One implementer rejects that composition at compile time,
-one fails the read at run time, one emits `0` or `null`: different accept sets
-and different runtime values from one spec.
+map as well", and §11.4's own fix list endorses a `key:` that reads
+`execution.item_index` inside such a flow. One implementer rejects that
+composition at compile time, one fails the read at run time, one emits `0` or
+`null`: different accept sets and different runtime values from one spec.
 
 Failing the read is the same choice for the same reason as everywhere else in
 this cluster — a manufactured index is invented data, and `0` is worse than

@@ -1,0 +1,102 @@
+# A minimal agent-compose project.
+#
+#   agent-compose validate main.yml          # every static check, in milliseconds
+#   agent-compose run main.yml flow.summarize --input document="some text"
+#
+# `agent-compose docs` lists the topics; `agent-compose docs getting-started`
+# is the one to read next.
+
+# Required, and the same in every file of a project (grammar 1.3).
+version: "0.1"
+
+# How to reach a provider. Secrets are `${ENV}` references and never literals:
+# the value is read at process start, so `validate` and `build` need no key
+# (grammar 4.3, 12.1).
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+
+# What to call, and how it behaves. Agents name a `model.*`, never a provider,
+# so swapping the model behind a graph is one edit here (grammar 12.2).
+model.smart:
+  provider: provider.anthropic
+  id: claude-sonnet-4-5
+  settings:
+    temperature: 0.2
+
+# An agent is a model call with a declared contract. `output:` is a schema, not
+# a hope: the model is constrained by it on the wire and its answer is parsed
+# with it, so downstream nodes and edge guards read typed fields (grammar 5.1).
+agent.summarizer:
+  description: Summarize a document into a headline and a short abstract.
+  model: model.smart
+  prompt: |
+    Summarize the document you are given.
+    Write one headline of at most twelve words, then two or three sentences.
+  input:
+    document:
+      description: The text to summarize.
+      type: string
+      min_length: 1
+  output:
+    headline:
+      description: One line naming what the document is about.
+      type: string
+      max_length: 120
+    abstract:
+      description: Two or three sentences of summary.
+      type: string
+
+# Shared graph state. A node's output field lands on the channel of the same
+# name, and a flow's `outputs:` are read from channels of the same name when the
+# graph goes quiet — so these two names join the agent to the flow's interface
+# with no wiring to write (grammar 8.0, 10.1).
+state:
+  headline:
+    description: The headline the summarizer wrote.
+    type: string
+    default: ""
+  abstract:
+    description: The abstract the summarizer wrote.
+    type: string
+    default: ""
+
+# A flow is a module: `inputs:`/`outputs:` are its whole interface, which is
+# what lets it be run, triggered, or attached to an agent as a tool
+# (grammar 7, 8.5).
+flow.summarize:
+  description: Summarize one document.
+  inputs:
+    document:
+      description: The text to summarize.
+      type: string
+      min_length: 1
+  outputs:
+    headline:
+      description: The headline the summarizer wrote.
+      type: string
+    abstract:
+      description: The abstract the summarizer wrote.
+      type: string
+
+  nodes:
+    # `input:` bindings are CEL over what is in scope here — the flow's own
+    # inputs, declared state, and upstream node outputs (grammar 4.1, 8.0).
+    summarize:
+      agent: agent.summarizer
+      input:
+        document: "input.document"
+
+  # Every flow starts at `start` and every path must reach `end`. With one node
+  # there is one path (grammar 7.2, 7.8).
+  edges:
+    - { from: start, to: summarize }
+    - { from: summarize, to: end }
+
+# A project's entrypoints are exactly the flows its triggers name. `manual` is
+# the kind the `run` verb goes through; declaring it is optional, and it is
+# written out here so the file shows the shape (grammar 13.2).
+triggers:
+  cli:
+    type: manual
+    flow: flow.summarize
