@@ -1,5 +1,14 @@
 //! Provider settings and the three capability checks (grammar 11.2, 12).
 //!
+//! The **credential** rule of grammar 12.1 is not here and belongs where it is:
+//! whether an `anthropic` or `openai` provider needs an `api_key:` turns on
+//! whether it declares a `base_url:`, which is two literals in one mapping, so
+//! it is the parser's (`parse/definition.rs`, Decision D120) and the published
+//! schema enforces it — the invariant `parse_invalid.rs`'s
+//! `the_parser_rejects_everything_the_published_schema_rejects` holds. What this
+//! module keeps of it is the table the message reads,
+//! [`ProviderKind::default_endpoint`].
+//!
 //! # Settings
 //!
 //! `settings:` is the one open object in the logical layer: the editor schema

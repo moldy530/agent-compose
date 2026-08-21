@@ -171,8 +171,17 @@ const M0: &[Check] = &[
     },
 ];
 
-/// The validator-owned rules `docs/grammar.md` Appendix B names that PRD §7 M0's
-/// sentence does not enumerate individually.
+/// The rules `docs/grammar.md` Appendix B names that PRD §7 M0's sentence does
+/// not enumerate individually.
+///
+/// All but one are the validator's; grammar 12.1's conditional credential (D120)
+/// is the parser's, because a provider's `kind:`, `api_key:` and `base_url:` are
+/// three literals in one mapping and the published schema enforces it — which
+/// obliges the parser to as well (`tests/parse_invalid.rs`'s
+/// `the_parser_rejects_everything_the_published_schema_rejects`). It is listed
+/// here rather than left out because this file is the inventory of *static
+/// checks*, and which pass decides one is the second column, not the entry
+/// criterion.
 ///
 /// Two rows are the exception and label themselves. Half of `duplicate-route` —
 /// the half about two triggers rather than about the routes the app mounts for
@@ -271,6 +280,12 @@ const GRAMMAR: &[Check] = &[
         rule: "two attached tools do not share a local name (compiler rule over 5.4's attachment naming and 11.5's collision rule)",
         pass: "check/bindings.rs",
         codes: &["tool-name-collision"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        rule: "a provider with a default endpoint declares `api_key:` or a `base_url:` (12.1, D120)",
+        pass: "parse/definition.rs",
+        codes: &["missing-credential"],
         evidence: Evidence::Fixture,
     },
     Check {

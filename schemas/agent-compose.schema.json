@@ -1620,8 +1620,16 @@
         {
           "if": { "properties": { "kind": { "const": "anthropic" } }, "required": ["kind"] },
           "then": {
-            "description": "An `anthropic` provider takes `api_key` (required), `base_url`, and `headers`. Every other kind's key is refused here: a plugin never reads it, so an accepted one would be a connection setting its author believes is in effect and is not. Grammar 12.1 / Decision D106.",
-            "required": ["api_key"],
+            "description": "An `anthropic` provider takes `api_key`, `base_url`, and `headers`. `api_key` is required unless `base_url` is declared: with no `base_url` the connection reaches `https://api.anthropic.com`, where only a key authenticates, while a declared `base_url` names a gateway that injects the credential server-side (Decision D120). Every other kind's key is refused here: a plugin never reads it, so an accepted one would be a connection setting its author believes is in effect and is not. Grammar 12.1 / Decisions D106, D120.",
+            "allOf": [
+              {
+                "if": { "not": { "required": ["base_url"] } },
+                "then": {
+                  "description": "No `base_url`, so this connection points at Anthropic's own endpoint and MUST carry `api_key` (grammar 12.1 / Decision D120).",
+                  "required": ["api_key"]
+                }
+              }
+            ],
             "properties": {
               "api_version": false,
               "organization": false,
@@ -1639,8 +1647,16 @@
         {
           "if": { "properties": { "kind": { "const": "openai" } }, "required": ["kind"] },
           "then": {
-            "description": "An `openai` provider takes `api_key` (required), `base_url`, `headers`, and `organization`. Grammar 12.1 / Decision D106.",
-            "required": ["api_key"],
+            "description": "An `openai` provider takes `api_key`, `base_url`, `headers`, and `organization`. `api_key` is required unless `base_url` is declared: with no `base_url` the connection reaches `https://api.openai.com`, where only a key authenticates, while a declared `base_url` names a gateway that injects the credential server-side (Decision D120). Grammar 12.1 / Decisions D106, D120.",
+            "allOf": [
+              {
+                "if": { "not": { "required": ["base_url"] } },
+                "then": {
+                  "description": "No `base_url`, so this connection points at OpenAI's own endpoint and MUST carry `api_key` (grammar 12.1 / Decision D120).",
+                  "required": ["api_key"]
+                }
+              }
+            ],
             "properties": {
               "api_version": false,
               "region": false,

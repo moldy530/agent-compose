@@ -257,15 +257,45 @@ impl ProviderKind {
         }
     }
 
-    /// The keys this kind requires (grammar 12.1).
+    /// The keys this kind requires **unconditionally** (grammar 12.1).
+    ///
+    /// `anthropic` and `openai` name nothing here, and that is the rule rather
+    /// than an omission: their `api_key:` is required only where no `base_url:`
+    /// points the connection away from the vendor's own endpoint, which is a
+    /// disjunction this list cannot state. [`default_endpoint`] is the other
+    /// half, and `check::providers` is where the pair is decided (Decision
+    /// D120).
     #[must_use]
     pub const fn required_keys(self) -> &'static [&'static str] {
         match self {
-            Self::Anthropic | Self::OpenAi => &["api_key"],
+            Self::Anthropic | Self::OpenAi => &[],
             Self::OpenAiCompatible => &["base_url"],
             Self::AzureOpenAi => &["base_url", "api_key", "api_version"],
             Self::Bedrock => &["region"],
             Self::Vertex => &["project", "location"],
+        }
+    }
+
+    /// The endpoint a connection of this kind reaches when it declares no
+    /// `base_url:` (grammar 12.1, Decision D120).
+    ///
+    /// `Some` for exactly the two kinds that have one, and `None` for every kind
+    /// that does not: `openai_compatible` and `azure_openai` require `base_url:`
+    /// outright, and the two SDK-reached kinds have no bare endpoint at all.
+    /// This is what makes the conditional credential rule statable — "no
+    /// `base_url:`" means "reaching the vendor" only where a default exists to
+    /// fall back to — and the host is carried rather than merely the fact,
+    /// because the diagnostic names it: the key is required *because* of a
+    /// default the author cannot see in their own file. The emitted runtime
+    /// falls back to the same two hosts, which
+    /// `the_default_endpoints_are_the_ones_the_emitted_runtime_falls_back_to`
+    /// holds.
+    #[must_use]
+    pub const fn default_endpoint(self) -> Option<&'static str> {
+        match self {
+            Self::Anthropic => Some("https://api.anthropic.com"),
+            Self::OpenAi => Some("https://api.openai.com"),
+            Self::OpenAiCompatible | Self::AzureOpenAi | Self::Bedrock | Self::Vertex => None,
         }
     }
 
@@ -360,6 +390,48 @@ mod provider_kind_tests {
                 );
             }
         }
+    }
+
+    /// The two kinds the conditional credential rule is about, held to the two
+    /// properties that make it statable: each accepts both credential-shaped
+    /// keys, and neither key is required outright — while every kind *without* a
+    /// default endpoint still names required keys the parser can enforce on its
+    /// own (grammar 12.1, Decision D120).
+    ///
+    /// The day a seventh kind arrives with a vendor endpoint of its own, this is
+    /// what fails until `check::providers` has been told about it.
+    #[test]
+    fn only_the_kinds_with_a_default_endpoint_leave_their_credential_conditional() {
+        let mut defaulted = Vec::new();
+        for kind in ProviderKind::ALL {
+            let Some(endpoint) = kind.default_endpoint() else {
+                assert!(
+                    !kind.required_keys().is_empty(),
+                    "`{}` reaches no endpoint of its own, so its row requires keys outright",
+                    kind.as_str()
+                );
+                continue;
+            };
+            assert!(
+                endpoint.starts_with("https://"),
+                "`{}`'s default endpoint is a URL the diagnostic can quote",
+                kind.as_str()
+            );
+            defaulted.push(kind.as_str());
+            for key in ["api_key", "base_url"] {
+                assert!(
+                    kind.keys().contains(&key),
+                    "`{}` must accept `{key}` for the conditional rule to have two repairs",
+                    kind.as_str()
+                );
+            }
+            assert!(
+                kind.required_keys().is_empty(),
+                "`{}`'s credential rule is `check::providers`', so nothing is required outright",
+                kind.as_str()
+            );
+        }
+        assert_eq!(defaulted, ["anthropic", "openai"]);
     }
 
     /// The other half of the same row rule: every kind reached over plain HTTP

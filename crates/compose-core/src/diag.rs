@@ -337,6 +337,13 @@ pub enum DiagnosticCode {
     UnknownVariant,
     /// Two keys that may not appear together both appear.
     ConflictingKeys,
+    /// A provider that would reach a vendor's own endpoint declares neither
+    /// `api_key:` nor the `base_url:` of a gateway that supplies one — the one
+    /// *conditional* required key (grammar 12.1, Decision D120). Its own class
+    /// rather than a [`MissingKey`](Self::MissingKey), for the reason
+    /// [`MissingSessionKey`](Self::MissingSessionKey) is: what is absent is
+    /// decided by a sibling value, and the repair is a choice of two.
+    MissingCredential,
 
     // --- lexical forms ----------------------------------------------------
     /// A string is not a legal identifier (grammar 2.1).
@@ -480,6 +487,7 @@ impl DiagnosticCode {
         Self::ValueOutOfRange,
         Self::UnknownVariant,
         Self::ConflictingKeys,
+        Self::MissingCredential,
         Self::InvalidIdentifier,
         Self::InvalidReference,
         Self::InvalidDuration,
@@ -543,6 +551,7 @@ impl DiagnosticCode {
             Self::ValueOutOfRange => "value-out-of-range",
             Self::UnknownVariant => "unknown-variant",
             Self::ConflictingKeys => "conflicting-keys",
+            Self::MissingCredential => "missing-credential",
             Self::InvalidIdentifier => "invalid-identifier",
             Self::InvalidReference => "invalid-reference",
             Self::InvalidDuration => "invalid-duration",
