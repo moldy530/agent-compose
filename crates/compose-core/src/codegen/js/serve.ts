@@ -67,6 +67,7 @@ import Fastify from "fastify";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import { type CompiledFlow, flows, runFlow } from "./graph.ts";
+import { TRACE_VERSION } from "./runtime.ts";
 import type * as runtime from "./runtime.ts";
 import { type HttpTrigger, httpTriggers } from "./triggers.ts";
 
@@ -350,7 +351,23 @@ async function notify(callback: string, execution: Execution): Promise<void> {
   }
 }
 
-/** What both the status route and the callback report about an execution. */
+/**
+ * What both the status route and the callback report about an execution.
+ *
+ * `trace_version` travels **with** the trace and only with it (`docs/trace.md`):
+ * a version key describing nothing would be a number a reader could pin against
+ * no format at all. Two reports have nothing for it to describe — a run still
+ * going, which has recorded nothing yet, and a run that **failed** carrying no
+ * trace at all, which is a failure raised before the graph ran — and both carry
+ * neither key. The gate is whether a trace exists, not whether it has entries in
+ * it: a run that failed *inside* the graph having recorded nothing carries
+ * `trace: []` and the version beside it, because an empty trace is a statement
+ * about the run and an absent one is not. The rule a reader is given is the one
+ * this expresses — wherever a `trace` appears, the version that describes it
+ * appears beside it, and wherever one is absent so is the other — and it holds on
+ * the two surfaces this function feeds, the status route and the completion
+ * webhook, exactly as it does for `run`'s JSON record and the trace file.
+ */
 function report(execution: Execution): Record<string, unknown> {
   return {
     execution_id: execution.id,
@@ -359,7 +376,9 @@ function report(execution: Execution): Record<string, unknown> {
     status: execution.status,
     ...(execution.outputs === undefined ? {} : { outputs: execution.outputs }),
     ...(execution.error === undefined ? {} : { error: execution.error }),
-    ...(execution.trace === undefined ? {} : { trace: execution.trace }),
+    ...(execution.trace === undefined
+      ? {}
+      : { trace_version: TRACE_VERSION, trace: execution.trace }),
   };
 }
 

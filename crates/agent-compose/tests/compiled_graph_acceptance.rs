@@ -2661,6 +2661,16 @@ fn a_homogeneous_map_dispatches_one_instance_per_item() {
         4,
         "the planner plus three workers"
     );
+    // The homogeneous form declares no `route_by:`, so its items are not a
+    // union and no dispatch has a variant to name — neither a `route` (there is
+    // one target) nor a `variant` (there is no discriminator).
+    let dispatched = run.entries("work")[0]["dispatches"].clone();
+    for record in dispatched.as_array().expect("the map records its dispatch") {
+        assert!(
+            record["route"].is_null() && record["variant"].is_null(),
+            "a homogeneous dispatch names neither a route nor a variant: {record}"
+        );
+    }
     assert!(provider.snapshot().is_drained());
 }
 
@@ -2848,6 +2858,36 @@ fn a_sink_route_is_joined_and_a_detached_one_is_resolved_at_dispatch() {
         "a detached dispatch has no observed outcome, so `on_item_error` never \
          applied to it (grammar 8.6 rule 7)"
     );
+    // The same fact read off the other field it decides, which `docs/trace.md`
+    // §5 states as a presence rule: this record is written when the dispatch is
+    // *issued*, before the instance it names has run anything, so it carries no
+    // `inner` — and it would carry none if the route pointed at a `flow.*`,
+    // which rule 7 admits and which is the case a reader would otherwise expect
+    // a subgraph trace from.
+    assert!(
+        records[2].get("inner").is_none(),
+        "a detached dispatch's record is written before its delivery runs, so there \
+         is no inner trace to carry: {}",
+        records[2]
+    );
+    // …and which variant each item *was*, which the route alone does not say.
+    // A named route's tag is the variant tag, so the two agree there; the
+    // catch-all's is `$default`, and without this the one item that fell
+    // through to it would be the one item whose variant the trace never named
+    // (PRD §7 M2: "which map variant a discriminator chose" as trace data).
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record["variant"].clone())
+            .collect::<Vec<_>>(),
+        [
+            json!("auto_fixable"),
+            json!("needs_human"),
+            json!("duplicate"),
+            json!("auto_fixable"),
+        ],
+        "every dispatch names the discriminator its item carried: {dispatched}"
+    );
     assert!(
         records[3]["error"]
             .as_str()
@@ -2855,6 +2895,26 @@ fn a_sink_route_is_joined_and_a_detached_one_is_resolved_at_dispatch() {
         "the skipped item says what was wrong with it: {}",
         records[3]
     );
+    // The detached delivery's own model call is the *unscripted* one this
+    // fixture is built around, so the mock refuses it — and that refusal is not
+    // on this entry. `models` is what the join observed (`docs/trace.md` §5.1,
+    // §7.2), and a delivery the join never waited for would put its record here
+    // or not depending on when the provider answered.
+    // `a_detached_deliverys_effects_stay_off_the_map_nodes_entry` decides the
+    // same rule with the ordering pinned; this is it on the path where the
+    // delivery fails.
+    let routed = run.entries("route")[0].clone();
+    for call in routed["models"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+    {
+        assert!(
+            call.get("refused").is_none(),
+            "the map node's entry carries the joined items' calls, and the only refused \
+             call this run makes is the detached delivery's: {call}"
+        );
+    }
 
     // Grammar 9.4's form, for the one dispatch that delivers without observing
     // an outcome: the execution id, then this dispatch's flattened instance
@@ -2884,6 +2944,107 @@ fn a_sink_route_is_joined_and_a_detached_one_is_resolved_at_dispatch() {
             "every dispatch derives its own key: {record}"
         );
     }
+}
+
+/// A detached delivery's own effects stay **off** the map node's trace entry
+/// (`docs/trace.md` §5.1, §6, §7.2).
+///
+/// The entry is written when the join finishes, and by Decision D94 the join
+/// does not wait for a detached delivery. A model call or a store op made
+/// through the node's own collectors would therefore be on that entry or not
+/// depending on when the sink answered — two runs of one composition producing
+/// two trace documents, which is the one thing a versioned format cannot do
+/// (`docs/trace.md` §10). The record the format gives such a dispatch is
+/// `outcome: "detached"` with `attempts: 0`, and it says what the join observed:
+/// nothing.
+///
+/// The fixture decides the race rather than leaving it to the scheduler. The one
+/// joined item's model call is answered after 400ms and the delivery's at once,
+/// so the delivery has certainly answered — the assertion below reads its
+/// request off the provider — well before the join returns. Without that
+/// ordering an absence would pass on a runtime that shares the collectors,
+/// whenever the sink happened to be the slower of the two.
+///
+/// Model calls are the half a composition can reach: a detached route's target
+/// is a `node:`, and only an agent with attached stores would record store ops
+/// through one. Both travel on the same two fields of the delivery's context, so
+/// the reachable half is what holds the rule.
+#[test]
+fn a_detached_deliverys_effects_stay_off_the_map_nodes_entry() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({
+                "findings": [
+                    { "kind": "auto_fixable", "file": "a.rs", "hint": "rename it" },
+                    { "kind": "duplicate", "of": "issue-7" },
+                ],
+            })),
+        ),
+        // The joined item, deliberately slow…
+        Script::new(
+            HAIKU,
+            Outcome::structured(json!({ "patch": "patch-a" })).after(Duration::from_millis(400)),
+        )
+        .matching("a.rs"),
+        // …and the detached delivery's own call, deliberately immediate.
+        Script::new(HAIKU, Outcome::structured(json!({ "text": "a duplicate" })))
+            .matching("issue-7"),
+    ]);
+
+    let Some(run) = harness::invoke(
+        "fanout",
+        "flow.sort",
+        &[("report", "the build is red")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+
+    // The delivery was made and was answered: without this the absence below
+    // would be evidence about a call that never happened.
+    let requests = provider.requests();
+    assert_eq!(
+        requests.len(),
+        3,
+        "the sorter, the joined item and the detached delivery all reached the provider: \
+         {requests:?}"
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.body_text.contains("issue-7")),
+        "the detached delivery's own model call is one of them: {requests:?}"
+    );
+
+    // …and exactly one of the three is on the map node's entry: the joined
+    // item's. `models` is what the join observed, and the delivery is what it
+    // did not.
+    let entry = run.entries("route")[0].clone();
+    let calls = entry["models"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the map node made a model call: {entry}"))
+        .clone();
+    assert_eq!(
+        calls.len(),
+        1,
+        "the map node's entry carries the joined item's model call and not the detached \
+         delivery's, which the join never waited for (`docs/trace.md` §5.1): {entry}"
+    );
+    assert!(
+        entry.get("stores").is_none(),
+        "and nothing else the delivery did either: {entry}"
+    );
+    // The dispatch record is the whole account of that delivery, which is the
+    // other half of the same rule.
+    let detached = entry["dispatches"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the map records what it dispatched: {entry}"))[1]
+        .clone();
+    assert_eq!(detached["outcome"], json!("detached"), "{detached}");
+    assert_eq!(detached["attempts"], json!(0), "{detached}");
 }
 
 /// A map whose target is a `flow.*` that itself fans out: two frames of instance
@@ -2984,6 +3145,86 @@ fn a_nested_fan_out_keys_and_isolates_each_instance_by_its_whole_path() {
     );
 }
 
+/// A dispatched instance's trace is under **its own** dispatch record and
+/// nowhere else, including when its failure is what ended the map node
+/// (`docs/trace.md` §3, §8).
+///
+/// The format has two nesting fields and they say two different things:
+/// `TraceEntry.inner` is the instance a `flow:` node ran, and
+/// `DispatchRecord.inner` is the instance a `map` dispatched. A `map` is not a
+/// `flow:` node, so its own entry carries no `inner` however its dispatches
+/// went — otherwise a reader walking a trace for every subgraph run counts one
+/// instance twice, and counts *which* one by a rule the document does not state:
+/// the lowest-indexed failure, on the `on_error: fail` path alone.
+///
+/// The path is the one that reaches it. The failing item's error travels out of
+/// the fan-out inside an `ItemFailure`, which the node's failure wraps, so a
+/// walk of the `cause` chain that does not stop at that boundary finds the
+/// dispatched instance's `SubflowFailure` underneath and attaches its trace to
+/// the map node's own entry.
+#[test]
+fn a_dispatched_instances_trace_stays_under_its_own_record() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({
+                "tasks": [{ "steps": ["alpha"] }, { "steps": ["gamma"] }],
+            })),
+        ),
+        // Item 0 runs its instance through: one step, then the roll-up.
+        Script::new(HAIKU, Outcome::structured(json!({ "part": "made-alpha" }))).matching("alpha"),
+        Script::new(HAIKU, Outcome::structured(json!({ "line": "line-0" }))).matching("made-alpha"),
+        // Item 1's own step is refused, which fails the instance's inner map,
+        // the instance, the item, and — `on_item_error` and `on_error` both
+        // being `fail` here — the outer map node and the run.
+        Script::new(HAIKU, Outcome::server_error()).matching("gamma"),
+    ]);
+
+    let Some(run) = harness::invoke("fanout", "flow.nested", &[("goal", "ship it")], &provider)
+    else {
+        return;
+    };
+    run.failed();
+
+    let entries = run.entries("work");
+    assert_eq!(entries.len(), 1, "one map node, one entry: {entries:?}");
+    let entry = entries[0].clone();
+    assert_eq!(entry["outcome"], json!("failed"), "{entry}");
+
+    // The account of the fan-out survives the failure, one record per source
+    // item, and the failed one carries the instance it dispatched.
+    let records = entry["dispatches"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a failed map still says what it dispatched: {entry}"))
+        .clone();
+    assert_eq!(records.len(), 2, "one record per source item: {entry}");
+    assert_eq!(records[1]["outcome"], json!("failed"), "{}", records[1]);
+    let dispatched = records[1]["inner"]
+        .as_array()
+        .unwrap_or_else(|| {
+            panic!(
+                "the failed item's instance is under its record: {}",
+                records[1]
+            )
+        })
+        .clone();
+    assert!(
+        dispatched
+            .iter()
+            .any(|held| held["node"] == "steps" && held["outcome"] == "failed"),
+        "…and it is that instance's own trace, ending at the node it aborted at: {dispatched:?}"
+    );
+
+    // The one this test exists for: the same instance is not *also* on the map
+    // node's entry, where §3 says a `flow:` node's instance is.
+    assert!(
+        entry.get("inner").is_none(),
+        "a `map` node's entry carries no `inner`: a dispatched instance is under its \
+         own record (`docs/trace.md` §3, §8), and this one reports it twice: {entry}"
+    );
+}
+
 /// A fan-out over an empty array completes immediately, writes nothing, and its
 /// outgoing edge fires exactly as if every instance had finished (rule 6).
 #[test]
@@ -3012,7 +3253,13 @@ fn an_empty_fan_out_completes_and_its_downstream_edge_still_fires() {
 
     let work = run.entries("work");
     assert_eq!(work.len(), 1, "the map node ran");
-    assert_eq!(work[0]["dispatches"], json!([]));
+    assert_eq!(
+        work[0]["dispatches"],
+        json!([]),
+        "and the key is present and empty rather than absent: `docs/trace.md` §5 \
+         makes an empty array \"nothing was dispatched\" and an absent key \
+         \"nothing resolved\", and this map dispatched nothing"
+    );
     assert_eq!(
         work[0]["routing"]["targets"],
         json!(["__end__"]),
@@ -5570,10 +5817,20 @@ fn run_reports_its_whole_record_under_the_json_format() {
         &std::fs::read_to_string(written).expect("the path names a file that exists"),
     )
     .expect("the trace file holds the trace");
+    // The file is the envelope of `docs/trace.md` — a document that says which
+    // format it is in — and its `entries` are the record's `trace`, so the two
+    // surfaces carry one trace rather than two readings of it.
     assert_eq!(
-        held, record["trace"],
+        held["entries"], record["trace"],
         "and the file holds what the record does"
     );
+    assert_eq!(
+        held["trace_version"], record["trace_version"],
+        "…under the same declared format version: {record}"
+    );
+    assert_eq!(held["flow"], record["flow"], "{held}");
+    assert_eq!(held["execution_id"], record["execution_id"], "{held}");
+    assert_eq!(held["status"], json!("failed"), "{held}");
 }
 
 /// `run` refuses **before** it launches when a variable the composition

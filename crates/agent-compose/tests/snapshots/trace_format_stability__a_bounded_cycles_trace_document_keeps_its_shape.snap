@@ -1,0 +1,322 @@
+---
+source: crates/agent-compose/tests/trace_format_stability.rs
+expression: document(&run)
+---
+{
+  "entries": [
+    {
+      "attempts": 1,
+      "flow": "flow.review_loop",
+      "models": [
+        {
+          "failovers": [],
+          "fallback": 0,
+          "model": "model.smart",
+          "servedBy": "model.smart"
+        }
+      ],
+      "node": "write",
+      "outcome": "completed",
+      "routing": {
+        "counters": {},
+        "edges": [
+          {
+            "reason": "unconditional",
+            "taken": true,
+            "to": "review"
+          }
+        ],
+        "targets": [
+          "review"
+        ]
+      },
+      "step": 1,
+      "traversal": 0,
+      "writes": [
+        "draft"
+      ]
+    },
+    {
+      "attempts": 1,
+      "flow": "flow.review_loop",
+      "models": [
+        {
+          "failovers": [],
+          "fallback": 0,
+          "model": "model.smart",
+          "servedBy": "model.smart"
+        }
+      ],
+      "node": "review",
+      "outcome": "completed",
+      "routing": {
+        "counters": {
+          "flow.review_loop#2": 1
+        },
+        "edges": [
+          {
+            "budget": {
+              "key": "flow.review_loop#2",
+              "max": 3,
+              "used": 1
+            },
+            "taken": true,
+            "to": "write",
+            "value": true,
+            "when": "review.output.verdict == 'revise'"
+          },
+          {
+            "else": true,
+            "reason": "a guarded sibling was taken",
+            "taken": false,
+            "to": "__end__"
+          }
+        ],
+        "targets": [
+          "write"
+        ]
+      },
+      "step": 2,
+      "traversal": 0,
+      "writes": [
+        "feedback"
+      ]
+    },
+    {
+      "attempts": 1,
+      "flow": "flow.review_loop",
+      "models": [
+        {
+          "failovers": [],
+          "fallback": 0,
+          "model": "model.smart",
+          "servedBy": "model.smart"
+        }
+      ],
+      "node": "write",
+      "outcome": "completed",
+      "routing": {
+        "counters": {},
+        "edges": [
+          {
+            "reason": "unconditional",
+            "taken": true,
+            "to": "review"
+          }
+        ],
+        "targets": [
+          "review"
+        ]
+      },
+      "step": 3,
+      "traversal": 1,
+      "writes": [
+        "draft"
+      ]
+    },
+    {
+      "attempts": 1,
+      "flow": "flow.review_loop",
+      "models": [
+        {
+          "failovers": [],
+          "fallback": 0,
+          "model": "model.smart",
+          "servedBy": "model.smart"
+        }
+      ],
+      "node": "review",
+      "outcome": "completed",
+      "routing": {
+        "counters": {
+          "flow.review_loop#2": 2
+        },
+        "edges": [
+          {
+            "budget": {
+              "key": "flow.review_loop#2",
+              "max": 3,
+              "used": 2
+            },
+            "taken": true,
+            "to": "write",
+            "value": true,
+            "when": "review.output.verdict == 'revise'"
+          },
+          {
+            "else": true,
+            "reason": "a guarded sibling was taken",
+            "taken": false,
+            "to": "__end__"
+          }
+        ],
+        "targets": [
+          "write"
+        ]
+      },
+      "step": 4,
+      "traversal": 1,
+      "writes": [
+        "feedback"
+      ]
+    },
+    {
+      "attempts": 1,
+      "flow": "flow.review_loop",
+      "models": [
+        {
+          "failovers": [],
+          "fallback": 0,
+          "model": "model.smart",
+          "servedBy": "model.smart"
+        }
+      ],
+      "node": "write",
+      "outcome": "completed",
+      "routing": {
+        "counters": {},
+        "edges": [
+          {
+            "reason": "unconditional",
+            "taken": true,
+            "to": "review"
+          }
+        ],
+        "targets": [
+          "review"
+        ]
+      },
+      "step": 5,
+      "traversal": 2,
+      "writes": [
+        "draft"
+      ]
+    },
+    {
+      "attempts": 1,
+      "flow": "flow.review_loop",
+      "models": [
+        {
+          "failovers": [],
+          "fallback": 0,
+          "model": "model.smart",
+          "servedBy": "model.smart"
+        }
+      ],
+      "node": "review",
+      "outcome": "completed",
+      "routing": {
+        "counters": {
+          "flow.review_loop#2": 3
+        },
+        "edges": [
+          {
+            "budget": {
+              "key": "flow.review_loop#2",
+              "max": 3,
+              "used": 3
+            },
+            "taken": true,
+            "to": "write",
+            "value": true,
+            "when": "review.output.verdict == 'revise'"
+          },
+          {
+            "else": true,
+            "reason": "a guarded sibling was taken",
+            "taken": false,
+            "to": "__end__"
+          }
+        ],
+        "targets": [
+          "write"
+        ]
+      },
+      "step": 6,
+      "traversal": 2,
+      "writes": [
+        "feedback"
+      ]
+    },
+    {
+      "attempts": 1,
+      "flow": "flow.review_loop",
+      "models": [
+        {
+          "failovers": [],
+          "fallback": 0,
+          "model": "model.smart",
+          "servedBy": "model.smart"
+        }
+      ],
+      "node": "write",
+      "outcome": "completed",
+      "routing": {
+        "counters": {},
+        "edges": [
+          {
+            "reason": "unconditional",
+            "taken": true,
+            "to": "review"
+          }
+        ],
+        "targets": [
+          "review"
+        ]
+      },
+      "step": 7,
+      "traversal": 3,
+      "writes": [
+        "draft"
+      ]
+    },
+    {
+      "attempts": 1,
+      "flow": "flow.review_loop",
+      "models": [
+        {
+          "failovers": [],
+          "fallback": 0,
+          "model": "model.smart",
+          "servedBy": "model.smart"
+        }
+      ],
+      "node": "review",
+      "outcome": "completed",
+      "routing": {
+        "counters": {},
+        "edges": [
+          {
+            "budget": {
+              "key": "flow.review_loop#2",
+              "max": 3,
+              "used": 3
+            },
+            "reason": "the `max_iterations` budget is spent",
+            "taken": false,
+            "to": "write",
+            "value": true,
+            "when": "review.output.verdict == 'revise'"
+          },
+          {
+            "else": true,
+            "taken": true,
+            "to": "__end__"
+          }
+        ],
+        "targets": [
+          "__end__"
+        ]
+      },
+      "step": 8,
+      "traversal": 3,
+      "writes": [
+        "feedback"
+      ]
+    }
+  ],
+  "execution_id": "<execution-id>",
+  "flow": "flow.review_loop",
+  "status": "completed",
+  "trace_version": 1
+}

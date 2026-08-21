@@ -291,6 +291,15 @@ const CODEGEN: &[Criterion] = &[
                 "a_sink_route_is_joined_and_a_detached_one_is_resolved_at_dispatch",
                 Status::Live,
             ),
+            // …and what "resolved at dispatch" leaves in the record: the join
+            // never observed the delivery, so nothing it went on to do is on
+            // the map node's entry either. The sibling above decides that the
+            // run does not wait; this decides that the trace does not report a
+            // wait it did not make (`docs/trace.md` §5.1, PRD 5.3).
+            (
+                "a_detached_deliverys_effects_stay_off_the_map_nodes_entry",
+                Status::Live,
+            ),
             // Rule 6's other end: a dispatch of zero instances is a completion,
             // not a stall — its outgoing edge fires as if every instance had
             // finished.
@@ -304,6 +313,14 @@ const CODEGEN: &[Criterion] = &[
             // instance (grammar 10.1).
             (
                 "a_nested_fan_out_keys_and_isolates_each_instance_by_its_whole_path",
+                Status::Live,
+            ),
+            // …and where the trace puts a dispatched instance: under its own
+            // record, once. The sibling above decides that a nested instance is
+            // reported; this decides that the map node's entry is not a second
+            // place it is reported from (`docs/trace.md` §3, §8, PRD 5.3).
+            (
+                "a_dispatched_instances_trace_stays_under_its_own_record",
                 Status::Live,
             ),
             // The same criterion over the *documented* project rather than a

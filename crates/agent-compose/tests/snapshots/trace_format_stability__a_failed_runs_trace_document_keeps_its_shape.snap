@@ -1,0 +1,39 @@
+---
+source: crates/agent-compose/tests/trace_format_stability.rs
+expression: document(&run)
+---
+{
+  "entries": [
+    {
+      "attempts": 1,
+      "error": "NodeFailure: flow.ask node `ask` failed: Error: `model.default` spent its route: `model.smart` (rate_limit) failed over, and the next member also refused: ProviderFailure: `model.fast` answered 429: {\"error\":{\"message\":\"Number of requests has exceeded your per-minute rate limit.\",\"type\":\"rate_limit_error\"},\"request_id\":\"req_mock_00000002\",\"type\":\"error\"}",
+      "flow": "flow.ask",
+      "models": [
+        {
+          "failovers": [
+            {
+              "condition": "rate_limit",
+              "detail": "ProviderFailure: `model.smart` answered 429: {\"error\":{\"message\":\"Number of requests has exceeded your per-minute rate limit.\",\"type\":\"rate_limit_error\"},\"request_id\":\"req_mock_00000001\",\"type\":\"error\"}",
+              "model": "model.smart"
+            }
+          ],
+          "model": "model.default",
+          "refused": {
+            "condition": "rate_limit",
+            "detail": "ProviderFailure: `model.fast` answered 429: {\"error\":{\"message\":\"Number of requests has exceeded your per-minute rate limit.\",\"type\":\"rate_limit_error\"},\"request_id\":\"req_mock_00000002\",\"type\":\"error\"}",
+            "model": "model.fast"
+          }
+        }
+      ],
+      "node": "ask",
+      "outcome": "failed",
+      "step": 1,
+      "traversal": 0
+    }
+  ],
+  "error": "FlowFailure: `flow.ask` did not run to quiescence: NodeFailure: flow.ask node `ask` failed: Error: `model.default` spent its route: `model.smart` (rate_limit) failed over, and the next member also refused: ProviderFailure: `model.fast` answered 429: {\"error\":{\"message\":\"Number of requests has exceeded your per-minute rate limit.\",\"type\":\"rate_limit_error\"},\"request_id\":\"req_mock_00000002\",\"type\":\"error\"}",
+  "execution_id": "<execution-id>",
+  "flow": "flow.ask",
+  "status": "failed",
+  "trace_version": 1
+}

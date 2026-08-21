@@ -350,6 +350,24 @@ export function interpolate(parts: readonly Interpolation[]): string {
     .join("");
 }
 
+/**
+ * The same string **as its author wrote it**: `${NAME}` where a reference is,
+ * rather than what the reference resolved to.
+ *
+ * This is what an error message quotes. A class-2 surface is interpolable
+ * end to end (grammar 4.3) — an `http:` binding's `url`, the whole `exec:`
+ * block — so a composition may perfectly well write
+ * `url: "${SIGNED_ENDPOINT}/reports"`, and a message that quoted the resolved
+ * value would put a credential into a node's `error`, which is a field the
+ * trace carries, the run prints and a reader files (`docs/trace.md` §11.1).
+ * Naming the reference keeps the message diagnostic — it says which binding
+ * failed, spelled the way the file spells it — and keeps it reproducible: two
+ * environments produce one message.
+ */
+export function asWritten(parts: readonly Interpolation[]): string {
+  return parts.map((part) => (typeof part === "string" ? part : `\${${part.env}}`)).join("");
+}
+
 // ---------------------------------------------------------------------------
 // Policy: grammar 9
 // ---------------------------------------------------------------------------
@@ -487,6 +505,13 @@ export interface RunContext {
    * idempotency key they carried, and whether the backend had already seen it,
    * are the whole of what at-least-once delivery means at this store.
    *
+   * **Absent on one context, and it is the same one [`deadline`] is absent
+   * on**: a detached `map` delivery's. This array and its sibling below are
+   * read the moment the join returns, and the join never waits for such a
+   * delivery (D94), so a record it pushed would be on the node's entry or not
+   * depending on when the sink answered. See [`runMap`], and `docs/trace.md`
+   * §5.1.
+   *
    * Mutable behind a `readonly` field on purpose: the field is the channel, and
    * what flows through it is appended by whoever runs an op.
    */
@@ -505,7 +530,8 @@ export interface RunContext {
    * [`callModel`] is what writes it, on both of its ways out, and [`runNode`]
    * reads it on both of *its* ways out — see [`merged`]. What arrives here
    * arrives in the order the calls were made, across every attempt the node's
-   * `retry:` policy made and every instance a `map` dispatched, while an answer
+   * `retry:` policy made and every instance a `map` **joined** — a detached
+   * delivery is handed neither this nor its sibling above — while an answer
    * that carries `models` carries the subset it put in an order the node decided
    * (a `map`'s, which is source-item order). So the answer decides the order and
    * this decides the set.
@@ -830,9 +856,10 @@ export interface Failover extends Refusal {
  * with.
  *
  * A direct binding produces one too, with `model === servedBy`, `fallback: 0`
- * and no failovers: a trace that recorded only the interesting calls would leave
- * a reader unable to tell a call that did not fail over apart from a call
- * nothing recorded at all.
+ * and an **empty** `failovers` — the key is there holding nothing, which is a
+ * different record from one that omits it, and no record omits it. A trace that
+ * kept only the interesting calls would leave a reader unable to tell a call
+ * that did not fail over apart from a call nothing recorded at all.
  *
  * **A call nothing answered is recorded too**, and it is the one a reader most
  * often opens a trace for: a route that spent every member made a real call to
@@ -845,8 +872,13 @@ export interface ModelCall {
   readonly model: string;
   /** The member that answered. Absent when none did. */
   readonly servedBy?: string;
-  /** Its ordinal in the route, `0` for the first. Absent with `servedBy`. */
+  /** Its ordinal in the route, `0` for the first. Present with `servedBy`. */
   readonly fallback?: number;
+  /**
+   * Every member that refused and moved the ladder on, in the order they were
+   * tried. On every record, and **empty** where none did — a direct binding's,
+   * and a route whose first member answered.
+   */
   readonly failovers: readonly Failover[];
   /** What ended the call, when no member answered it. */
   readonly refused?: Refusal;
@@ -1032,13 +1064,30 @@ async function send(
   body: unknown,
   signal: AbortSignal,
 ): Promise<Record<string, unknown>> {
+  // Parsed here rather than left to `fetch`, which quotes what it could not
+  // parse: Node answers a malformed endpoint with `Failed to parse URL from
+  // <the resolved string>`. That string is built from the provider's
+  // `base_url:`, which grammar 4.3 class 1 makes a whole-value `${ENV}`
+  // reference — a connection string, and one `docs/trace.md` §11.1 keeps out of
+  // `Refusal.detail` and `TraceEntry.error`. So the provider is named and the
+  // value is not. Raised as a [`ProviderUnreachable`] because that is what a
+  // `fetch` refusing this URL already produced: only the message changes.
+  let endpoint: URL;
+  try {
+    endpoint = new URL(url);
+  } catch {
+    throw new ProviderUnreachable(
+      model.address,
+      new Error(`\`${model.provider.address}\`'s resolved \`base_url:\` is not a URL`),
+    );
+  }
   // The type is spelled from `fetch` itself rather than as `Response`: the
   // global type comes from the runtime's own library types, and naming it here
   // would tie this module to one of them.
   let response: Awaited<ReturnType<typeof fetch>>;
   let text: string;
   try {
-    response = await fetch(url, {
+    response = await fetch(endpoint, {
       method: "POST",
       headers: headerSet({ "content-type": "application/json" }, headers, model.provider.headers),
       body: JSON.stringify(body),
@@ -1854,6 +1903,24 @@ export const IDEMPOTENCY_ENV = "IDEMPOTENCY_KEY";
  */
 export const IDEMPOTENCY_HEADER = "Idempotency-Key";
 
+/**
+ * A write to a child's standard input that failed for a reason neither EPIPE nor
+ * a destroyed stream covers.
+ *
+ * Its own class because [`runExec`] has one promise and two rejections to tell
+ * apart: a spawn the platform refused, where the command never ran, and this,
+ * where it did. Restating this one as "could not be run" would assert something
+ * false — a reader chasing an `ENOENT` would go looking for a path that is
+ * there — so the message is composed at the reject site and carried through the
+ * catch untouched.
+ */
+class ExecInputFailure extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ExecInputFailure";
+  }
+}
+
 /** Run one `exec:` binding (grammar 6.1, 8.2). */
 export async function runExec(
   binding: ExecBinding,
@@ -1895,10 +1962,19 @@ export async function runExec(
 
   const command = interpolate(binding.command);
   const args = binding.args.map((argument) => interpolate(argument));
-  const result = await new Promise<{ code: number; stdout: string; stderr: string }>(
+  // Resolved **here**, beside the command and the args, rather than in the
+  // executor below. A `cwd:` whose `${ENV}` reference is unset makes
+  // [`environmentValue`] throw, and a throw inside a `new Promise` executor is a
+  // rejection — which the catch below restates as "`<command>` could not be
+  // run", a message that names the command for a fault in the working
+  // directory. Out here the precise `` `REPO_ROOT` is not set (referenced by
+  // …) `` propagates as raised, and the catch keeps its one meaning: the
+  // platform declined to start a command whose inputs all resolved.
+  const cwd = binding.cwd === undefined ? undefined : interpolate(binding.cwd);
+  const spawned = new Promise<{ code: number; stdout: string; stderr: string }>(
     (resolve, reject) => {
       const child = spawn(command, args, {
-        cwd: binding.cwd === undefined ? undefined : interpolate(binding.cwd),
+        cwd,
         env: environment,
         signal: context.signal,
       });
@@ -1923,9 +1999,20 @@ export async function runExec(
       // design — so the exit code and the streams stay the result; a destroyed
       // stream is this run being aborted, which the abort path already reports;
       // anything else fails the node through the same promise a spawn error
-      // does.
+      // does — but as its own class and with its own message, because the
+      // command *ran* and the catch below is written for one that did not
+      // (see [`ExecInputFailure`]). Restated here for the reason the spawn
+      // failure is restated there: the platform words this one too, and one
+      // composition should produce one message whatever environment it runs in.
       child.stdin.on("error", (error: NodeJS.ErrnoException) => {
-        if (error.code !== "EPIPE" && error.code !== "ERR_STREAM_DESTROYED") reject(error);
+        if (error.code === "EPIPE" || error.code === "ERR_STREAM_DESTROYED") return;
+        reject(
+          new ExecInputFailure(
+            `\`${asWritten(binding.command)}\`'s standard input could not be written${
+              error.code === undefined ? "" : ` (${error.code})`
+            }`,
+          ),
+        );
       });
       if (stdin !== undefined) {
         child.stdin.end(stdin);
@@ -1935,9 +2022,39 @@ export async function runExec(
     },
   );
 
-  if (!binding.expectExit.includes(result.code)) {
+  let result: { code: number; stdout: string; stderr: string };
+  try {
+    result = await spawned;
+  } catch (error) {
+    // A deadline, or a run somebody cancelled, arrives here as an abort rather
+    // than as a failure to start, and it is not this binding's failure — so it
+    // is raised as it came, the way [`send`] raises one.
+    if (context.signal.aborted) throw error;
+    // The other rejection this promise has, already restated where it was
+    // raised: the command started and its input could not be written, which is
+    // not what the restatement below says (see [`ExecInputFailure`]).
+    if (error instanceof ExecInputFailure) throw error;
+    // Everything else is the platform declining to run the command, and the
+    // message it declines with quotes the **resolved** path: Node says
+    // `spawn /opt/tokens/rg ENOENT`, Bun `ENOENT: no such file or directory,
+    // posix_spawn '/opt/tokens/rg'`. That string would reach `TraceEntry.error`,
+    // the trace file and stderr, which `docs/trace.md` §11.1 says no resolved
+    // `${ENV}` value does — so the failure is restated: the command as the
+    // composition spells it ([`asWritten`]), and the platform's own error
+    // **code**, which names what went wrong without naming what it went wrong
+    // on. The same restatement is what keeps one composition producing one
+    // message whatever environment it runs in.
+    const code = (error as NodeJS.ErrnoException | null | undefined)?.code;
     throw new Error(
-      `\`${command}\` exited ${result.code}, which is outside \`expect_exit: [${binding.expectExit.join(", ")}]\`${result.stderr === "" ? "" : `: ${result.stderr.trim()}`}`,
+      `\`${asWritten(binding.command)}\` could not be run${code === undefined ? "" : ` (${code})`}`,
+    );
+  }
+
+  if (!binding.expectExit.includes(result.code)) {
+    // The command as the composition spells it ([`asWritten`]): a resolved
+    // `${ENV}` value has no business in a field the trace carries.
+    throw new Error(
+      `\`${asWritten(binding.command)}\` exited ${result.code}, which is outside \`expect_exit: [${binding.expectExit.join(", ")}]\`${result.stderr === "" ? "" : `: ${result.stderr.trim()}`}`,
     );
   }
 
@@ -1968,7 +2085,32 @@ export async function runHttp(
   request: { readonly query?: Record<string, unknown>; readonly body?: unknown },
   context: RunContext,
 ): Promise<unknown> {
-  const url = new URL(interpolate(binding.url));
+  // Resolved **before** the `try`, not inside it. A `url:` whose `${ENV}`
+  // reference is unset makes [`environmentValue`] throw, and inside the `try`
+  // that throw would be restated as "is not a URL once its `${ENV}` references
+  // are resolved" — a message asserting something false, since the references
+  // were never resolved at all, and one indistinguishable from the message a
+  // reference that *is* set to a non-URL produces. Out here the precise
+  // `` `SIGNED_ENDPOINT` is not set (referenced by …) `` propagates as raised,
+  // and the `catch` keeps its one meaning: everything resolved, and what it
+  // resolved to is not a URL.
+  const resolved = interpolate(binding.url);
+  let url: URL;
+  try {
+    url = new URL(resolved);
+  } catch {
+    // The platform's own parse failure quotes the **resolved** string — Bun says
+    // `"secret/reports" cannot be parsed as a URL` — and grammar 4.3 class 2
+    // makes this surface interpolable, so that string can be a credential. It
+    // would reach `TraceEntry.error` and the trace file, which `docs/trace.md`
+    // §11.1 says no resolved `${ENV}` value does, so the binding is named as the
+    // composition spells it ([`asWritten`]) and the resolved value is not
+    // repeated. There is nothing else to say about it: the whole failure is that
+    // what the references resolved to is not a URL.
+    throw new Error(
+      `\`${asWritten(binding.url)}\` is not a URL once its \`\${ENV}\` references are resolved`,
+    );
+  }
   for (const [name, value] of Object.entries(request.query ?? {})) {
     url.searchParams.set(name, typeof value === "string" ? value : JSON.stringify(value));
   }
@@ -2008,8 +2150,11 @@ export async function runHttp(
       ? response.status >= 200 && response.status < 300
       : binding.expectStatus.includes(response.status);
   if (!accepted) {
+    // The URL as the composition spells it ([`asWritten`]), which is the whole
+    // of what this runtime puts in the message: `text` below is what the server
+    // answered, and is the server's to say.
     throw new Error(
-      `\`${url}\` answered ${response.status}, which is outside ${
+      `\`${asWritten(binding.url)}\` answered ${response.status}, which is outside ${
         binding.expectStatus === "2xx" ? "the 2xx range" : `\`expect_status: [${binding.expectStatus.join(", ")}]\``
       }: ${text.slice(0, 200)}`,
     );
@@ -2156,17 +2301,21 @@ export function route(
   counters: Readonly<Record<string, number>>,
   skipped: boolean,
 ): RoutingDecision {
-  const decisions: EdgeDecision[] = [];
-  const targets: string[] = [];
+  // One slot per edge, filled at the edge's **declaration index** rather than
+  // in the order the two passes below reach it. Declaration order is what the
+  // trace records (`docs/trace.md` §4), and an `else:` edge is decided in a
+  // second pass — it needs to know whether a guarded sibling was taken — so a
+  // list appended to in evaluation order would put an `else:` declared before an
+  // unconditional edge after it, in both `edges` and `targets`.
+  const slots: (EdgeDecision | undefined)[] = edges.map(() => undefined);
   const spent: Record<string, number> = {};
   let guardedTaken = false;
 
-  for (const edge of edges) {
-    if (edge.otherwise === true) continue;
+  edges.forEach((edge, index) => {
+    if (edge.otherwise === true) return;
     if (edge.when === undefined) {
-      decisions.push({ to: edge.to, taken: true, reason: "unconditional" });
-      if (!targets.includes(edge.to)) targets.push(edge.to);
-      continue;
+      slots[index] = { to: edge.to, taken: true, reason: "unconditional" };
+      return;
     }
 
     let value: boolean;
@@ -2183,81 +2332,125 @@ export function route(
     }
 
     if (!value) {
-      decisions.push({ to: edge.to, when: edge.when, value, taken: false });
-      continue;
+      slots[index] = { to: edge.to, when: edge.when, value, taken: false };
+      return;
     }
     if (edge.budget !== undefined) {
       const used = counters[edge.budget.key] ?? 0;
       if (used >= edge.budget.max) {
-        decisions.push({
+        slots[index] = {
           to: edge.to,
           when: edge.when,
           value,
           budget: { key: edge.budget.key, used, max: edge.budget.max },
           taken: false,
           reason: "the `max_iterations` budget is spent",
-        });
-        continue;
+        };
+        return;
       }
       spent[edge.budget.key] = used + 1;
-      decisions.push({
+      slots[index] = {
         to: edge.to,
         when: edge.when,
         value,
         budget: { key: edge.budget.key, used: used + 1, max: edge.budget.max },
         taken: true,
-      });
+      };
     } else {
-      decisions.push({ to: edge.to, when: edge.when, value, taken: true });
+      slots[index] = { to: edge.to, when: edge.when, value, taken: true };
     }
     guardedTaken = true;
-    if (!targets.includes(edge.to)) targets.push(edge.to);
-  }
+  });
 
-  for (const edge of edges) {
-    if (edge.otherwise !== true) continue;
-    if (guardedTaken) {
-      decisions.push({
-        to: edge.to,
-        else: true,
-        taken: false,
-        reason: "a guarded sibling was taken",
-      });
-      continue;
-    }
-    decisions.push({ to: edge.to, else: true, taken: true });
-    if (!targets.includes(edge.to)) targets.push(edge.to);
+  edges.forEach((edge, index) => {
+    if (edge.otherwise !== true) return;
+    slots[index] = guardedTaken
+      ? { to: edge.to, else: true, taken: false, reason: "a guarded sibling was taken" }
+      : { to: edge.to, else: true, taken: true };
+  });
+
+  const decisions = slots.filter((decision): decision is EdgeDecision => decision !== undefined);
+  // The targets in the order their edges are declared in, deduplicated: a
+  // multicast reads the way the file does, and so does the `goto` it becomes.
+  const targets: string[] = [];
+  for (const decision of decisions) {
+    if (!decision.taken) continue;
+    if (!targets.includes(decision.to)) targets.push(decision.to);
   }
 
   if (targets.length === 0) {
-    // Ordered the way a returned decision is (below), because the trace entry
-    // this ends up on is read the same way whether the run survived it or not.
-    throw new NoViableRoute(flow, node, ordered(decisions, edges));
+    // The decisions travel in the same order a returned one does, because the
+    // trace entry this ends up on is read the same way whether the run survived
+    // it or not.
+    throw new NoViableRoute(flow, node, decisions);
   }
-  return { edges: ordered(decisions, edges), targets, counters: spent };
-}
-
-/**
- * The decisions in declaration order.
- *
- * Declaration order is what the trace records; the targets are ordered by it
- * too, so a multicast reads the way the file does.
- */
-function ordered(
-  decisions: EdgeDecision[],
-  edges: readonly EdgeDescriptor[],
-): EdgeDecision[] {
-  decisions.sort(
-    (left, right) =>
-      edges.findIndex((edge) => edge.to === left.to && edge.when === left.when) -
-      edges.findIndex((edge) => edge.to === right.to && edge.when === right.when),
-  );
-  return decisions;
+  return { edges: decisions, targets, counters: spent };
 }
 
 // ---------------------------------------------------------------------------
 // The run channel: what the compiler keeps beside a composition's own state
 // ---------------------------------------------------------------------------
+
+/**
+ * The version of the trace format this compiler release emits
+ * (`docs/trace.md`, PRD §7 M2's "a documented, stable trace format").
+ *
+ * It sits on the **envelope** ([`TraceDocument`], and the `trace_version` key
+ * every delivery surface carries beside its `trace`) rather than on an entry: a
+ * run's entries are all of one format, and a version per entry would be a
+ * per-step cost for a fact about the release that produced them.
+ *
+ * The number is bumped when a reader that pinned it would be wrong: a field
+ * removed, renamed, or given a different meaning. Adding a field is not a bump —
+ * `docs/trace.md`'s *Stability* section is the contract, and it is what a reader
+ * is entitled to rely on.
+ */
+export const TRACE_VERSION = 1;
+
+/**
+ * One run's whole trace, as a surface delivers it (`docs/trace.md`).
+ *
+ * The **envelope**: the version a reader pins, the run it describes, and the
+ * entries themselves. `agent-compose run --format json` spreads these keys into
+ * the record it prints (its `trace` is this document's `entries`), the trace
+ * **file** is exactly one of these, and the generated app's status route carries
+ * `trace_version` beside the `trace` it already reported.
+ *
+ * Its keys are `snake_case` while an entry's are `camelCase`, and the seam is
+ * deliberate: these are document keys, alongside `execution_id`, `trace_path`
+ * and `status_url` on the same surfaces, while an entry is a runtime record —
+ * the very object `runFlow` answers with in `FlowRun.trace`, read by in-process
+ * callers as JavaScript rather than as a document.
+ */
+export interface TraceDocument {
+  /** [`TRACE_VERSION`]: the format the `entries` below are written in. */
+  readonly trace_version: number;
+  /** The flow that was run, as its typed address (grammar 2.2). */
+  readonly flow: string;
+  /** The execution the entries belong to (grammar 4.1's `execution.id`). */
+  readonly execution_id: string;
+  /** Whether the run produced an answer. */
+  readonly status: "completed" | "failed";
+  /**
+   * What stopped a run that produced none.
+   *
+   * Present exactly on `status: "failed"`, and there because a failed run's
+   * *last* entry does not always say why: a run stopped by the superstep ceiling
+   * ([`SuperstepCeiling`]) has no aborting node to carry one, and a file that
+   * held only `status: "failed"` would name no reason at all.
+   */
+  readonly error?: string;
+  /**
+   * Every entry the run recorded, ordered by `(step, node)` — the order
+   * [`mergeRun`] folds them in.
+   *
+   * A **failed** run appends one entry outside that fold: [`failedTrace`] puts
+   * the entry of the node the run aborted at last, wherever its `(step, node)`
+   * would have sorted to. Re-sorting this array moves that entry into the middle
+   * of the run.
+   */
+  readonly entries: readonly TraceEntry[];
+}
 
 /**
  * One entry of the routing trace (PRD 5.3: routing decisions are data).
@@ -2307,6 +2500,11 @@ export interface TraceEntry {
    * would either lose them or pretend they were the caller's. Nesting them keeps
    * PRD 5.3's record complete across a module boundary without moving anyone's
    * step numbers.
+   *
+   * A **dispatched** instance is not here. A `map`'s items each have a record of
+   * their own and the instance goes under [`DispatchRecord.inner`], including
+   * the item whose failure ended the map node — see [`traceOf`], which is what
+   * keeps the two apart, and `docs/trace.md` §3 and §8.
    */
   readonly inner?: readonly TraceEntry[];
   /**
@@ -2339,10 +2537,17 @@ export interface TraceEntry {
  * two are recorded for different reasons. A **read** is recorded because PRD 5.8
  * makes store ops effects whose reads replay from history rather than from the
  * live store: the answer is kept so a replay has something to consume. A
- * **write** is recorded because it is at-least-once — it carries the
- * idempotency key of grammar 9.4, and `deduped` says whether the backend had
- * already applied that key, which is the difference between "this run wrote it"
- * and "an earlier attempt of this same effect did".
+ * **write** is recorded because it is at-least-once — a store-op *node*'s write
+ * carries the idempotency key of grammar 9.4, and `deduped` says whether the
+ * backend had already applied that key, which is the difference between "this
+ * run wrote it" and "an earlier attempt of this same effect did".
+ *
+ * A write an agent made through a synthesized store tool (grammar 11.5) carries
+ * neither: grammar 9.4 names the store-op node catalog (§11.4) as the carrier,
+ * and a tool call's outcome goes straight back to the model that asked for it,
+ * so there is no unobserved effect for a key to substitute for. See
+ * `src/stores.ts`'s module header for the whole argument, and `docs/trace.md`
+ * §6 for the presence rule a reader is given.
  */
 export interface StoreRecord {
   /** The store's typed address (grammar 2.2). */
@@ -2359,7 +2564,7 @@ export interface StoreRecord {
   readonly key?: string;
   /** What a read answered — the history a replay consumes. */
   readonly answer?: unknown;
-  /** A write's idempotency key (grammar 9.4). */
+  /** A store-op node write's idempotency key (grammar 9.4). */
   readonly idempotencyKey?: string;
   /** Whether the backend had already applied that key (at-least-once). */
   readonly deduped?: boolean;
@@ -2382,6 +2587,31 @@ export interface DispatchRecord {
    * a target.
    */
   readonly route?: string;
+  /**
+   * The discriminator value the item itself carried, on the routed form
+   * (grammar 8.6 rule 8).
+   *
+   * Present on every record a `map` that declares `route_by:` files, and on no
+   * other. "Every" holds through [`variantOf`], which leaves a discriminator
+   * that is not a string unrecorded rather than rendering it: an item carrying
+   * one is an item the parse should have refused, and no artifact `build`
+   * accepted produces one. Recorded rather than read back off [`route`], because
+   * [`route`] is not always the same fact. PRD §7 M2 asks for "which map variant
+   * a discriminator chose" as trace data, and a route's tag answers that only
+   * while a *named* route was selected: an item the `default:` catch-all took is
+   * recorded as `"$default"`, which names the route and says nothing about the
+   * variant that fell through to it — and the item is not in the trace, so
+   * nothing else could be read to recover it. The producing node's own result
+   * is not either: only the nodes a `map.over` reads are kept
+   * ([`RunChannel.outputs`]), and they are kept in graph state rather than in
+   * the trace.
+   *
+   * It is a declared variant tag rather than anything a model chose freely: the
+   * item was parsed against the union its producer declares (PRD 5.2) before any
+   * of this ran, so the set of values that can appear here is the composition's
+   * own (grammar 3.2's `variants:`).
+   */
+  readonly variant?: string;
   /** The component the item was dispatched to. */
   readonly target: string;
   /**
@@ -2416,9 +2646,25 @@ export interface DispatchRecord {
    * observable at all.
    */
   readonly idempotencyKey: string;
-  /** The instance's own trace, when the target was a `flow.*`. */
+  /**
+   * The instance's own trace, when a **joined** dispatch's target was a
+   * `flow.*`.
+   *
+   * A `detach: true` route is the exception, and for the reason its whole
+   * record is: this record is written when the dispatch is *issued* (Decision
+   * D94), before the instance it names has run a node, and the join never comes
+   * back for it. So a detached dispatch carries no `inner` whatever its target
+   * is — see `docs/trace.md` §5.
+   */
   readonly inner?: readonly TraceEntry[];
-  /** Why the item did not complete, when `on_item_error` skipped it. */
+  /**
+   * Why the item did not complete.
+   *
+   * On **both** outcomes that did not: `skipped` and `failed` alike, because
+   * `on_item_error` decides which of the two an item's failure becomes and not
+   * whether there was one. Absent on `completed` and on `detached`, the second
+   * for the reason its whole record is thin — nothing was observed to fail.
+   */
   readonly error?: string;
 }
 
@@ -2469,10 +2715,20 @@ function dispatchesOf(error: unknown): readonly DispatchRecord[] | undefined {
  * followed for the reason [`dispatchesOf`] follows it: `runActivity` wraps
  * whatever the activity threw, so the [`SubflowFailure`] is rarely the outermost
  * error by the time anyone asks.
+ *
+ * An [`ItemFailure`] is where the walk **stops**, and that is the difference
+ * between the two recording sites above. Below one is a *dispatched* instance's
+ * failure, whose trace belongs to that item — [`runMap`] has already put it on
+ * the item's own [`DispatchRecord.inner`], reading from underneath this
+ * boundary. Walking past it would put one item's instance on the **map node's**
+ * `inner` as well: the lowest-indexed failure only, and only on the
+ * `on_error: fail` path, where `docs/trace.md` §3 says a `flow:` node's own
+ * instance is and §8 says a dispatched one is under its record instead.
  */
 function traceOf(error: unknown): readonly TraceEntry[] | undefined {
   for (let held: unknown = error; typeof held === "object" && held !== null; ) {
     if (held instanceof SubflowFailure) return held.trace;
+    if (held instanceof ItemFailure) return undefined;
     held = (held as { cause?: unknown }).cause;
   }
   return undefined;
@@ -2493,13 +2749,21 @@ function traceOf(error: unknown): readonly TraceEntry[] | undefined {
  * the entry's own `error`, which names the node and its budget, is what accounts
  * for it.
  *
- * Shaped rather than typed, because `runNode` holds a node's input as `unknown`:
- * a map node's is a [`MapPlan`] and nothing else's is.
+ * Recognised by its **brand** rather than by its shape, because `runNode` holds
+ * every node's input as `unknown` and reaches here for *any* node that failed.
+ * A structural test — an object carrying `instances` and `records` arrays — is
+ * one a node that is not a map can pass: `instances` and `records` are legal
+ * field names (grammar 2.1), so a composition declaring an `input:` with both
+ * would, on failure, have its own data attached to its entry as `dispatches`,
+ * where `docs/trace.md` §3 says only a `map` node has one and §5 says the
+ * elements are [`DispatchRecord`]s. The brand is [`MAP_PLAN`], which only
+ * [`mapPlan`] sets, so the only object that answers here is one this runtime
+ * built for a map.
  */
 function plannedDispatches(input: unknown): readonly DispatchRecord[] | undefined {
   if (typeof input !== "object" || input === null) return undefined;
-  const plan = input as Partial<MapPlan>;
-  if (!Array.isArray(plan.instances) || !Array.isArray(plan.records)) return undefined;
+  if ((input as Record<symbol, unknown>)[MAP_PLAN] !== true) return undefined;
+  const plan = input as MapPlan;
   if (plan.records.length === 0) return undefined;
   return [...plan.records].sort((left, right) => left.index - right.index);
 }
@@ -3322,11 +3586,21 @@ export interface MapDescriptor {
 interface PlannedInstance {
   readonly index: number;
   readonly route: MapRoute;
+  /** The discriminator the item carried, on the routed form (rule 8). */
+  readonly variant?: string;
   readonly input: unknown;
   readonly site: DispatchSite;
 }
 
-/** What a `map` node's input phase answers: every dispatch, already bound. */
+/**
+ * What a `map` node's input phase answers: every dispatch, already bound.
+ *
+ * Every plan also carries [`MAP_PLAN`], which is what [`plannedDispatches`]
+ * recognises one by. Not declared here on purpose: it is set with
+ * `Object.defineProperty` the way [`carryEntry`] sets [`ABORTED`], so no
+ * consumer of this type is shown a member it would have to spell a symbol to
+ * construct.
+ */
 export interface MapPlan {
   readonly instances: readonly PlannedInstance[];
   /**
@@ -3359,6 +3633,16 @@ export interface MapPlan {
 }
 
 /**
+ * What marks an object as a [`MapPlan`], for [`plannedDispatches`] to read.
+ *
+ * `Symbol.for` and non-enumerable for the two reasons [`ABORTED`] is both: a
+ * composition can spell any field name grammar 2.1 allows, and cannot spell
+ * this; and a plan carrying one still serializes and logs the way the same
+ * object without one does.
+ */
+const MAP_PLAN = Symbol.for("agent-compose.mapPlan");
+
+/**
  * Decide a `map`'s whole dispatch **before** anything runs: how many instances,
  * which route each takes, and what each is passed (grammar 8.6 rules 4, 11, 12).
  *
@@ -3387,13 +3671,22 @@ export function mapPlan(map: MapDescriptor, view: NodeView): MapPlan {
       execution: bindRoot(execution, EXECUTION_SHAPE),
       [map.as]: bindRoot(item, route.itemShape),
     };
-    return { index, route, input: route.input(roots), site };
+    const variant = variantOf(map, item);
+    return {
+      index,
+      route,
+      ...(variant === undefined ? {} : { variant }),
+      input: route.input(roots),
+      site,
+    };
   });
-  return {
+  const plan: MapPlan = {
     instances,
     admission: [view.run.execution.id, ...view.run.path, map.node].join("/"),
     records: [],
   };
+  Object.defineProperty(plan, MAP_PLAN, { value: true, enumerable: false });
+  return plan;
 }
 
 /**
@@ -3437,6 +3730,31 @@ function mapSource(map: MapDescriptor, view: NodeView): unknown[] {
 function routeKey(map: MapDescriptor, route: MapRoute): string {
   const at = map.routes.indexOf(route);
   return at < 0 ? "*" : String(at);
+}
+
+/**
+ * The discriminator one item carries, for its dispatch record (rule 8, and see
+ * [`DispatchRecord.variant`]).
+ *
+ * `undefined` on the homogeneous form, which declares no `route_by:` and whose
+ * items are not a union — there is no variant to name. On the routed form it is
+ * the value at the literal discriminator field, read as a string because that is
+ * what a variant tag is (grammar 3.2), and a validated artifact has no other
+ * kind: `route_by:` names the discriminator of a discriminated union, and the
+ * items were parsed against their producer's declared schema before the fan-out
+ * planned anything (PRD 5.2). So the narrowing below is what makes the read
+ * total rather than a policy about values that reach it.
+ *
+ * A non-string that reached here anyway is left **unrecorded** rather than
+ * rendered, and not because [`selectRoute`] would have refused it — with a
+ * `default:` catch-all it routes it (rule 4, D30) — but because a number spelled
+ * as a string would be a `variant` that is not one of the union's declared tags,
+ * which is the one thing [`DispatchRecord.variant`] promises it is.
+ */
+function variantOf(map: MapDescriptor, item: unknown): string | undefined {
+  if (map.routeBy === undefined) return undefined;
+  const tag = (item as Record<string, unknown> | null)?.[map.routeBy];
+  return typeof tag === "string" ? tag : undefined;
 }
 
 /** Which route one item takes (grammar 8.6 rules 2, 4). */
@@ -3581,7 +3899,13 @@ export async function runMap(
 
   for (const instance of plan.instances) {
     const { index, route, site } = instance;
-    const named = route.tag === undefined ? {} : { route: route.tag };
+    // What this dispatch is *about*, on every record it produces: the route the
+    // item took, and — on the routed form — the discriminator it carried, which
+    // the catch-all's own tag does not name (see [`DispatchRecord.variant`]).
+    const named = {
+      ...(route.tag === undefined ? {} : { route: route.tag }),
+      ...(instance.variant === undefined ? {} : { variant: instance.variant }),
+    };
     const scoped: RunContext = { ...context, execution: site.execution };
 
     if (route.detach) {
@@ -3603,10 +3927,26 @@ export async function runMap(
       // aborts, and no `deadline` either — a delivery that inherited the node's
       // expiry would hand a model route a share of a budget this delivery is
       // defined not to be bounded by (see `RunContext.deadline`, `callModel`).
+      //
+      // And off the node's **trace entry**, which is the same statement about
+      // the other pair a context carries. `storeRecords` and `modelCalls` are
+      // the node execution's collectors, created by [`runNode`] and read the
+      // moment the join below returns — and by D94 the join does not wait for
+      // this delivery. A record pushed through the node's copy would therefore
+      // land on the entry or not depending on when the sink answered, so two
+      // runs of one composition would produce two trace documents. `docs/trace.md`
+      // §5.1 and §7.2 both say they do not: an entry reports what the *join*
+      // observed, and a detached delivery's outcome is the one thing it never
+      // observes — `outcome: "detached"` and `attempts: 0` are already that
+      // statement, and an entry that carried the delivery's model call beside
+      // them would contradict both. Dropped rather than collected somewhere
+      // else, because there is no entry for a second collector to reach.
       const delivery: RunContext = {
         ...scoped,
         signal: new AbortController().signal,
         deadline: undefined,
+        storeRecords: undefined,
+        modelCalls: undefined,
       };
       void (async () => {
         // `max_concurrency` is an **admission** bound over every in-flight
@@ -3942,7 +4282,7 @@ const EXECUTION_SHAPE = {
  *
  * `made` is the node's own channel ([`RunContext.modelCalls`]): every call, in
  * the order it was made, across every attempt the node's `retry:` policy made
- * and every instance a `map` dispatched. `ordered` is what the *answer* carried,
+ * and every instance a `map` joined. `ordered` is what the *answer* carried,
  * which is the subset the node put in an order of its own — a `map`'s, which is
  * source-item order — and which is therefore the shape a reader of a successful
  * run expects.
@@ -3981,11 +4321,11 @@ function merged(
  *
  * The entries of two attempts sit in one list, as a retried node's model calls
  * and store records do, and a reader tells them apart the way the node's own
- * `attempts` count says to: an instance starts at `step: 0`, so a second `step:
- * 0` entry for the same node is the next attempt beginning. Nesting them per
- * attempt instead would put the attempt boundary in the trace's *shape*, and
- * every reader of `inner` — including a run that did not retry — would have to
- * learn it.
+ * `attempts` count says to: an instance numbers its own supersteps from `1`, so
+ * a second `step: 1` entry for the same node is the next attempt beginning.
+ * Nesting them per attempt instead would put the attempt boundary in the trace's
+ * *shape*, and every reader of `inner` — including a run that did not retry —
+ * would have to learn it.
  */
 function joined(
   collected: readonly TraceEntry[],
@@ -4063,6 +4403,20 @@ export async function runNode(
   let attempts = 0;
   let skipped = false;
   let failure: NodeFailure | undefined;
+  /**
+   * What a **skipped** entry's `error` says.
+   *
+   * Held here rather than read back off `failure` at the entry below, because
+   * `TraceEntry.error` is one field with one shape wherever it appears
+   * (`docs/trace.md` §3) and `failure.message` is not that shape. It is the
+   * message without the class [`describe`] puts in front of the text on the two
+   * entries that carry a failure the node did *not* absorb — the aborting one
+   * and the `fallback:` one — so a reader handed the same field on a skip would
+   * be handed a different form of it. And it is not there at all for a throw
+   * that reached the catch without having been wrapped in a [`NodeFailure`],
+   * which would leave a skipped entry with no account of what it absorbed.
+   */
+  let absorbed: string | undefined;
   // Every store op this node performs, across every attempt its policy makes:
   // an effect that happened is an effect that happened, and a record that kept
   // only the last attempt's would describe a run the store did not see
@@ -4085,7 +4439,13 @@ export async function runNode(
   /** This node's entry, for a failure that leaves nothing else behind. */
   const aborted = (error: unknown, made: number, routing?: RoutingDecision): TraceEntry => {
     // A subflow that failed still made a trace, and it is the only account of
-    // what happened inside the boundary (grammar 8.5, PRD 5.3).
+    // what happened inside the boundary (grammar 8.5, PRD 5.3). `inner` already
+    // holds every instance *this node* ran — `runActivity` collects one per
+    // failed attempt — so [`traceOf`] is the recovery for a [`SubflowFailure`]
+    // that arrived restated on the `cause` chain instead, the way
+    // [`abortedEntry`] recovers an entry from one. It stops at an
+    // [`ItemFailure`]: what is under one is a *dispatched* instance, whose trace
+    // is on its own record rather than on this entry.
     const held = inner ?? traceOf(error);
     const dispatched = dispatches ?? dispatchesOf(error) ?? plannedDispatches(input);
     return {
@@ -4160,7 +4520,9 @@ export async function runNode(
     // that failed inside the boundary put its instance's trace in `innerTraces`,
     // the one that ended the node included. A `SubflowFailure` reached only
     // through a chain — a `map`'s item, wrapped in an `ItemFailure` — is not one
-    // of this node's own attempts and is left to `traceOf` in [`aborted`].
+    // of this node's own attempts and is not one of these: it is a *dispatched*
+    // instance, already recorded under its own [`DispatchRecord.inner`], and
+    // [`traceOf`] stops at that boundary so it does not arrive here twice.
     inner = joined(innerTraces, undefined);
     // A `map` that failed still dispatched: the items that completed had their
     // effects and the detached ones were delivered, and the records are the only
@@ -4205,6 +4567,7 @@ export async function runNode(
         goto: [strategy.fallback],
       });
     }
+    absorbed = describe(error);
     skipped = true;
   }
 
@@ -4288,7 +4651,7 @@ export async function runNode(
     ...(inner === undefined ? {} : { inner }),
     ...(storeRecords.length === 0 ? {} : { stores: [...storeRecords] }),
     ...(models === undefined ? {} : { models }),
-    ...(failure === undefined ? {} : { error: failure.message }),
+    ...(absorbed === undefined ? {} : { error: absorbed }),
   };
   update["$run"] = {
     ...base,

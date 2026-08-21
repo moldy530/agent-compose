@@ -1,0 +1,196 @@
+---
+source: crates/agent-compose/tests/trace_format_stability.rs
+expression: document(&run)
+---
+{
+  "entries": [
+    {
+      "attempts": 1,
+      "flow": "flow.answer",
+      "node": "load",
+      "outcome": "completed",
+      "routing": {
+        "counters": {},
+        "edges": [
+          {
+            "reason": "unconditional",
+            "taken": true,
+            "to": "ask"
+          }
+        ],
+        "targets": [
+          "ask"
+        ]
+      },
+      "step": 1,
+      "stores": [
+        {
+          "answer": {
+            "found": false
+          },
+          "effect": "read",
+          "key": "preferences",
+          "op": "get",
+          "scope": "execution",
+          "store": "store.prefs",
+          "via": "node"
+        }
+      ],
+      "traversal": 0,
+      "writes": [
+        "prefs_found"
+      ]
+    },
+    {
+      "attempts": 1,
+      "flow": "flow.answer",
+      "models": [
+        {
+          "failovers": [],
+          "fallback": 0,
+          "model": "model.smart",
+          "servedBy": "model.smart"
+        },
+        {
+          "failovers": [],
+          "fallback": 0,
+          "model": "model.smart",
+          "servedBy": "model.smart"
+        },
+        {
+          "failovers": [],
+          "fallback": 0,
+          "model": "model.smart",
+          "servedBy": "model.smart"
+        },
+        {
+          "failovers": [],
+          "fallback": 0,
+          "model": "model.smart",
+          "servedBy": "model.smart"
+        }
+      ],
+      "node": "ask",
+      "outcome": "completed",
+      "routing": {
+        "counters": {},
+        "edges": [
+          {
+            "reason": "unconditional",
+            "taken": true,
+            "to": "remember"
+          }
+        ],
+        "targets": [
+          "remember"
+        ]
+      },
+      "step": 2,
+      "stores": [
+        {
+          "answer": {
+            "found": false
+          },
+          "effect": "read",
+          "key": "preferences",
+          "op": "get",
+          "scope": "execution",
+          "store": "store.prefs",
+          "via": "tool"
+        },
+        {
+          "effect": "write",
+          "key": "preferences",
+          "op": "set",
+          "scope": "execution",
+          "store": "store.prefs",
+          "via": "tool"
+        }
+      ],
+      "traversal": 0,
+      "writes": [
+        "answer"
+      ]
+    },
+    {
+      "attempts": 1,
+      "flow": "flow.answer",
+      "node": "remember",
+      "outcome": "completed",
+      "routing": {
+        "counters": {},
+        "edges": [
+          {
+            "reason": "unconditional",
+            "taken": true,
+            "to": "reread"
+          }
+        ],
+        "targets": [
+          "reread"
+        ]
+      },
+      "step": 3,
+      "stores": [
+        {
+          "deduped": false,
+          "effect": "write",
+          "idempotencyKey": "<execution-id>/remember/0",
+          "key": "preferences",
+          "op": "set",
+          "scope": "execution",
+          "store": "store.prefs",
+          "via": "node"
+        }
+      ],
+      "traversal": 0,
+      "writes": []
+    },
+    {
+      "attempts": 1,
+      "flow": "flow.answer",
+      "node": "reread",
+      "outcome": "completed",
+      "routing": {
+        "counters": {},
+        "edges": [
+          {
+            "reason": "unconditional",
+            "taken": true,
+            "to": "__end__"
+          }
+        ],
+        "targets": [
+          "__end__"
+        ]
+      },
+      "step": 4,
+      "stores": [
+        {
+          "answer": {
+            "found": true,
+            "value": {
+              "theme": "default",
+              "verbosity": "low"
+            }
+          },
+          "effect": "read",
+          "key": "preferences",
+          "op": "get",
+          "scope": "execution",
+          "store": "store.prefs",
+          "via": "node"
+        }
+      ],
+      "traversal": 0,
+      "writes": [
+        "recorded_prefs",
+        "prefs_found_after"
+      ]
+    }
+  ],
+  "execution_id": "<execution-id>",
+  "flow": "flow.answer",
+  "status": "completed",
+  "trace_version": 1
+}

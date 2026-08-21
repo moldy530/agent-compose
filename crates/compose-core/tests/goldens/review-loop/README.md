@@ -42,12 +42,22 @@ PRD 5.3 asks for: one entry per node execution, carrying the guards that were
 evaluated, what they answered, which edges were taken, and the state of any
 `max_iterations` budget they spent.
 
+The trace is a **versioned, documented format**, so a reader may be written
+against it rather than against whatever this release happened to record. Every
+machine surface that carries one carries its version beside it — the
+`trace_version` key of `run --format json`, of the trace file's envelope, and of
+the status route's report — and `runtime.TRACE_VERSION` is what a compiled
+project spells it with. What each field means, and what a bump to that number
+does and does not signal, is the compiler's `docs/trace.md`.
+
 A run that produces no answer throws a `FlowFailure`, and it carries that same
-record: `.trace` holds every step that completed plus one final entry for the
-node the run stopped at, and `.cause` is the error itself. Both ways a run can
-fail raise it — one that never reached quiescence, and one that reached
-quiescence holding no value for a field its `outputs:` declares — so `.trace` is
-readable without asking which happened.
+record: `.trace` holds every step that completed, plus one final entry for the
+node the run stopped at where there was one, and `.cause` is the error itself.
+Both ways a run can fail raise it — one that never reached quiescence, and one
+that reached quiescence holding no value for a field its `outputs:` declares —
+so `.trace` is readable without asking which happened. The failure with no final
+entry is the `SuperstepCeiling` below: the ceiling stops a run *between*
+supersteps, so no node aborted it and the error itself is the account.
 
 `recursionLimit` is the one option that is not about identity: it raises the
 superstep ceiling for a single run. The ceiling is a safety net rather than one

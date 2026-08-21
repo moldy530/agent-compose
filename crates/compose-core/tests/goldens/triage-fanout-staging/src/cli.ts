@@ -30,7 +30,16 @@
 //
 // The trace is also written to a file under the project's data directory and its
 // path is named on stderr, because a run of any size produces more of it than a
-// terminal is useful for.
+// terminal is useful for. The file is a whole `runtime.TraceDocument` rather than
+// a bare list of entries: it is the one surface that arrives without the record
+// around it, so it carries its own `trace_version` (`docs/trace.md`), the flow,
+// the execution id and how the run ended.
+//
+// Both machine surfaces carry that version — the JSON record beside its `trace`,
+// the file at the head of its envelope — so a reader pins one number and knows
+// which fields it may rely on. The **human** report is not one of them: it is a
+// summary written for a terminal, and `docs/trace.md` says outright that nothing
+// should be parsed out of it.
 //
 // # Why `--input` values are coerced
 //
@@ -67,6 +76,7 @@ import path from "node:path";
 import process from "node:process";
 
 import { type CompiledFlow, type FlowRun, flows, runFlow, sessionRefusal } from "./graph.ts";
+import { TRACE_VERSION } from "./runtime.ts";
 import type * as runtime from "./runtime.ts";
 import { dataRoot } from "./stores.ts";
 import { httpTriggers, manualTriggers } from "./triggers.ts";
@@ -167,7 +177,7 @@ async function run(argv: readonly string[]): Promise<number> {
     produced = await runFlow(address, inputs, { executionId: execution, sessionKey: session });
   } catch (error) {
     const trace = (error as { trace?: readonly runtime.TraceEntry[] }).trace ?? [];
-    const written = writeTrace(address, execution, trace);
+    const written = writeTrace(address, execution, "failed", trace, describe(error));
     if (format === "json") {
       // The same record the completed run answers with, `error` where its
       // `outputs` would be — the trace file's path included, because a run that
@@ -179,6 +189,7 @@ async function run(argv: readonly string[]): Promise<number> {
             execution_id: execution,
             status: "failed",
             error: describe(error),
+            trace_version: TRACE_VERSION,
             trace,
             ...(written === undefined ? {} : { trace_path: written }),
           },
@@ -198,7 +209,7 @@ async function run(argv: readonly string[]): Promise<number> {
     return 1;
   }
 
-  const written = writeTrace(address, execution, produced.trace);
+  const written = writeTrace(address, execution, "completed", produced.trace);
   if (format === "json") {
     process.stdout.write(
       `${JSON.stringify(
@@ -207,6 +218,7 @@ async function run(argv: readonly string[]): Promise<number> {
           execution_id: execution,
           status: "completed",
           outputs: produced.outputs,
+          trace_version: TRACE_VERSION,
           trace: produced.trace,
           ...(written === undefined ? {} : { trace_path: written }),
         },
@@ -469,6 +481,15 @@ function formatOf(given: string | undefined): Format {
  * A trace is the routing record PRD 5.3 asks for and it grows with the run, so
  * the terminal gets a summary and the file gets everything.
  *
+ * What lands is a `runtime.TraceDocument` — the **envelope** of `docs/trace.md`,
+ * not a bare array of entries. A file is the one delivery surface that arrives
+ * on its own: the JSON record `--format json` prints already names the flow, the
+ * execution and the version around its `trace`, and a reader who opens the file
+ * a month later has none of that unless the file carries it. `trace_version` is
+ * the load-bearing half — a reader pins it and knows which fields it may rely on
+ * — and `flow`, `execution_id` and `status` are what tie the document back to
+ * the run without parsing the file's own name.
+ *
  * The name is the flow's and the **execution id**, not a timestamp: two runs of
  * one flow started together — which is what a shell loop and a CI matrix both
  * do — land in the same millisecond often enough that a `Date.now()` name is a
@@ -479,7 +500,9 @@ function formatOf(given: string | undefined): Format {
 function writeTrace(
   address: string,
   execution: string,
+  status: "completed" | "failed",
   trace: readonly runtime.TraceEntry[],
+  error?: string,
 ): string | undefined {
   // A run that failed before it started made no routing decisions, and an empty
   // file named as a trace would be a file a reader opens for nothing.
@@ -491,7 +514,15 @@ function writeTrace(
       directory,
       `${address.replace(/[^A-Za-z0-9_.-]/g, "_")}-${execution.replace(/[^A-Za-z0-9_.-]/g, "_")}.json`,
     );
-    fs.writeFileSync(file, `${JSON.stringify(trace, null, 1)}\n`);
+    const document: runtime.TraceDocument = {
+      trace_version: TRACE_VERSION,
+      flow: address,
+      execution_id: execution,
+      status,
+      ...(error === undefined ? {} : { error }),
+      entries: trace,
+    };
+    fs.writeFileSync(file, `${JSON.stringify(document, null, 1)}\n`);
     return file;
   } catch {
     // A data directory that cannot be written is not a reason to lose a run that

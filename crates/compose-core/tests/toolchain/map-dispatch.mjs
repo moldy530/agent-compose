@@ -825,6 +825,42 @@ const observed = {};
     dispatches: (entry.dispatches ?? null)?.map((record) => [record.index, record.outcome]) ?? null,
     keys: (entry.dispatches ?? []).map((record) => record.idempotencyKey),
   };
+
+  // …and the other half of the same rule: the plan is read off a **map**, and
+  // nothing else. The block above is the only path that recovers records from a
+  // node's input rather than from its answer or its failure, and `runNode`
+  // reaches it for *every* node that fails — so what it recognises a plan by
+  // decides whether a node that is not a map can be made to file one.
+  // `instances` and `records` are field names grammar 2.1 allows, so a
+  // composition can declare an `input:` carrying both arrays; `docs/trace.md`
+  // §3 says only a `map` node's entry has `dispatches` and §5 says the elements
+  // are `DispatchRecord`s, and the composition's own data is neither.
+  const impostor = {
+    flow: "flow.probe",
+    node: "impostor",
+    policy: { onError: "skip" },
+    shapes: { input: { properties: {} }, state: { properties: {} }, output: "any" },
+    // Shaped exactly like a `MapPlan`, down to the `index` the sort reads.
+    input: () => ({
+      instances: [{ index: 0 }],
+      records: [{ index: 0, route: "$default", target: "agent.worker", outcome: "completed" }],
+      admission: "exec_impostor/impostor",
+    }),
+    run: async () => {
+      throw new Error("the activity failed");
+    },
+    writes: [],
+    edges: [{ to: "next" }],
+  };
+  const filed = entryOf(
+    await runtime.runNode(impostor, {
+      $run: { ...runtime.emptyRun(), execution: { id: "exec_impostor", session_key: "" } },
+    }),
+  );
+  observed.aPlanShapedInputIsNotAPlan = {
+    outcome: filed.outcome,
+    dispatches: filed.dispatches ?? null,
+  };
 }
 
 // --- The bound belongs to the node, not to the call (grammar 8.6's key table)
