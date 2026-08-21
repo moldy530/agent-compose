@@ -1081,7 +1081,18 @@ fn each_chat_completions_kind_authenticates_and_routes_the_way_its_row_says() {
 /// `an_empty_api_key_is_refused_while_a_gateway_token_is_served`), never by the
 /// emitter's producing it.
 ///
-/// The third run is the other direction, and it is not decoration: it is the
+/// The third run is the kind D120 **did not** move, and it is the reason the
+/// rule is stated over the connection rather than over the row.
+/// `openai_compatible` paired an optional `api_key:` with a required `base_url:`
+/// before the decision and still does, so nothing in grammar 12.1's table
+/// changed for it — and yet a keyless one used to reach the wire holding
+/// `authorization: Bearer `, because the emitter's `?? ""` was written per wire
+/// and not per kind. `docs/topics/models.md` says in so many words that this
+/// kind now sends no `Authorization` header either; this run is what makes that
+/// sentence true rather than merely written, on the one row whose grammar gives
+/// no other reason to look.
+///
+/// The last run is the other direction, and it is not decoration: it is the
 /// only place the suite asserts that the Messages surface sends its credential
 /// when the composition has one. The mock no longer requires it
 /// (`crates/mock-provider/WIRE-NOTES.md` (12) — a keyless request is a legal
@@ -1099,6 +1110,10 @@ fn a_provider_with_no_key_sends_no_authentication_header_on_either_wire() {
         Script::new(
             OPENAI_DIRECT,
             Outcome::structured(json!({ "summary": "the reviewer asked for one change" })),
+        ),
+        Script::new(
+            LOCAL,
+            Outcome::structured(json!({ "summary": "one change, and the endpoint holds no key" })),
         ),
         Script::new(
             HAIKU,
@@ -1130,6 +1145,19 @@ fn a_provider_with_no_key_sends_no_authentication_header_on_either_wire() {
         "the reviewer asked for one change"
     );
 
+    let compatible = harness::invoke(
+        "keyless-gateway",
+        "flow.compatible",
+        &[("notes", "tighten it")],
+        &provider,
+    )
+    .expect("the toolchain was there a moment ago");
+    compatible.succeeded();
+    assert_eq!(
+        compatible.outputs()["summary"],
+        "one change, and the endpoint holds no key"
+    );
+
     let keyed = harness::invoke(
         "keyless-gateway",
         "flow.keyed",
@@ -1141,7 +1169,7 @@ fn a_provider_with_no_key_sends_no_authentication_header_on_either_wire() {
     assert_eq!(keyed.outputs()["verdict"], "approve");
 
     let recorded = provider.requests();
-    assert_eq!(recorded.len(), 3, "one agent node each");
+    assert_eq!(recorded.len(), 4, "one agent node each");
 
     let keyless_messages = &recorded[0];
     assert!(
@@ -1181,7 +1209,22 @@ fn a_provider_with_no_key_sends_no_authentication_header_on_either_wire() {
         keyless_chat.headers
     );
 
-    let keyed_messages = &recorded[2];
+    let keyless_compatible = &recorded[2];
+    assert!(
+        keyless_compatible.is_valid(),
+        "{:?}",
+        keyless_compatible.failures()
+    );
+    assert_eq!(keyless_compatible.surface, Surface::OpenAi);
+    assert_eq!(keyless_compatible.model, LOCAL);
+    assert!(
+        !keyless_compatible.headers.contains_key("authorization"),
+        "a keyless `openai_compatible` provider sends no header either — the rule \
+         is over the connection, not over the kind's row: {:?}",
+        keyless_compatible.headers
+    );
+
+    let keyed_messages = &recorded[3];
     assert!(keyed_messages.is_valid(), "{:?}", keyed_messages.failures());
     assert_eq!(keyed_messages.surface, Surface::Anthropic);
     assert_eq!(keyed_messages.model, HAIKU);

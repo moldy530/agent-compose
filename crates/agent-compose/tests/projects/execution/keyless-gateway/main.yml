@@ -7,7 +7,7 @@
 # header at all — not an empty one — and that is a property of the *request*,
 # which no assertion about a flow's outputs can see.
 #
-# So this fixture is written to be read from the transcript. Three flows, one
+# So this fixture is written to be read from the transcript. Four flows, one
 # node each:
 #
 #   * `flow.messages` — a keyless `anthropic` provider that declares a gateway
@@ -15,6 +15,10 @@
 #     `x-api-key` and must carry that token;
 #   * `flow.chat` — a keyless `openai` provider, so it must carry no
 #     `authorization`;
+#   * `flow.compatible` — a keyless `openai_compatible` provider, the kind whose
+#     row D120 did not move. The header rule is stated over the *connection*
+#     rather than over the kind, so it reaches this one too, and this is the only
+#     place the suite says so on a wire whose `api_key:` was optional all along;
 #   * `flow.keyed` — the same `anthropic` wire with `api_key:` declared, which is
 #     the other direction of the same rule and the only place the suite asserts
 #     that the Messages surface sends its credential when the spec has one.
@@ -60,8 +64,19 @@ provider.openai_gateway:
   kind: openai
   base_url: ${MOCK_BASE_URL}
 
+# The same wire from the kind whose row D120 left alone: `openai_compatible`
+# paired an optional `api_key:` with a required `base_url:` before the decision
+# and still does. It is here because the *header* half of D120 is stated over the
+# connection, not over the kind — a provider that declares no key sends no
+# authentication header, whichever row it comes from — and this is the local
+# llama.cpp/ollama shape `docs/topics/models.md` names, which used to reach the
+# wire holding an empty `Bearer `.
+provider.local_gateway:
+  kind: openai_compatible
+  base_url: ${MOCK_BASE_URL}
+
 # The control: the same kind and the same endpoint, with the credential the
-# other two decline to hold.
+# other three decline to hold.
 provider.claude_direct:
   kind: anthropic
   base_url: ${MOCK_BASE_URL}
@@ -74,6 +89,10 @@ model.gateway_messages:
 model.gateway_chat:
   provider: provider.openai_gateway
   id: gpt-4o
+
+model.local_chat:
+  provider: provider.local_gateway
+  id: qwen3-coder-30b
 
 model.keyed_messages:
   provider: provider.claude_direct
@@ -96,6 +115,18 @@ agent.gateway_reviewer:
 agent.gateway_summarizer:
   description: Summarizes a review through a keyless Chat Completions connection.
   model: model.gateway_chat
+  prompt: |
+    You summarize reviews in one line.
+  input:
+    notes:
+      type: string
+  output:
+    summary:
+      type: string
+
+agent.local_summarizer:
+  description: Summarizes a review through a keyless compatible connection.
+  model: model.local_chat
   prompt: |
     You summarize reviews in one line.
   input:
@@ -151,6 +182,24 @@ flow.chat:
   nodes:
     summarize:
       agent: agent.gateway_summarizer
+      input:
+        notes: "input.notes"
+  edges:
+    - { from: start, to: summarize }
+    - { from: summarize, to: end }
+
+flow.compatible:
+  description: "One agent node whose `openai_compatible` provider declares no `api_key:`."
+  inputs:
+    notes:
+      type: string
+      min_length: 1
+  outputs:
+    summary:
+      type: string
+  nodes:
+    summarize:
+      agent: agent.local_summarizer
       input:
         notes: "input.notes"
   edges:
