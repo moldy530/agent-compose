@@ -154,6 +154,97 @@ script — so bun, npm and pnpm all resolve it to the same versions. The lockfil
 your installer writes is yours: `agent-compose build` never writes or removes
 one.
 
+## Answering a `human` node
+
+A flow that reaches a `human` node stops there and its execution reports
+`status: "interrupted"`. The status route is where the question is: an
+interrupted report carries an `interrupts` array, one entry per pause the
+execution is holding, and each entry has everything needed to ask a person and
+take their answer.
+
+```json
+{
+  "execution_id": "exec_0f1e…",
+  "flow": "flow.review",
+  "trigger": "on_request",
+  "status": "interrupted",
+  "interrupts": [
+    {
+      "wait_id": "approve/0",
+      "flow": "flow.review",
+      "node": "approve",
+      "paused_at": "2025-01-01T12:00:00.000Z",
+      "expires_at": "2025-01-02T12:00:00.000Z",
+      "input": { "draft": "…" },
+      "output_schema": { "type": "object", "properties": { "decision": { "enum": ["approve", "reject"] } }, "required": ["decision"], "additionalProperties": false },
+      "resume_url": "/executions/exec_0f1e…/resume?wait=approve%2F0"
+    }
+  ]
+}
+```
+
+`input` is the node's own `input:`, evaluated — what the human is shown.
+`output_schema` is the published JSON Schema of its `output:`, which is exactly
+what a resume payload is validated against, so a form can be built from the
+report rather than from the composition. `expires_at` is present only where the
+node declares a `timeout:`.
+
+POST the answer to `resume_url` as the JSON body:
+
+```sh
+curl -X POST "http://127.0.0.1:8787/executions/exec_0f1e…/resume?wait=approve%2F0" \
+  -H 'content-type: application/json' \
+  -d '{"decision":"approve"}'
+```
+
+A `202` means the answer was taken and the graph has gone back to work; poll the
+status route for the rest. A payload that does not fit the node's `output:` is a
+`400` and **does not consume the wait** — the execution is still interrupted and
+the corrected answer can be sent to the same URL. So is a request carrying
+`?wait=` more than once, and for the same reason: it names two pauses where a
+resume answers one, so it is refused as that — rather than joined into an id
+nothing is holding — and consumes neither. A `409` is about *which* pause
+rather than about the body: the execution has already completed or failed, so
+there is no run left to be waiting; the run is still going and nothing in it is
+waiting; the wait already expired and `on_timeout:` has routed the execution on;
+the execution is holding more than one pause and the request named none; or
+`?wait=` named a pause this execution is not holding — a stale id from an
+earlier poll. The last two carry a `pending` array of the ids that *are*
+waiting, and `?wait=` is how one of them is named. That id is a pause's
+`wait_id`: its instance path, which is stable across runs of one composition —
+`approve/0` at the top level of a flow, `review/0/2/approve/0` for the pause
+inside the third instance a `map` dispatched. `interrupts` is ordered by
+`wait_id`, and so is the list a `409` gives, so two runs of one composition
+publish the same questions in the same order however their instances happened
+to be scheduled.
+
+**A node above a pause does not spend its budget waiting.** A `timeout:` on the
+`flow:` node or `map` that dispatched the flow the pause is in — including one
+resolved from `defaults:` — bounds the work that node does, and the wait is not
+work it is doing: its clock is held still while a pause below it is open and
+resumes with the time it had left. This is what makes the rule "a `human` node
+resolves no `timeout` at any level" mean what it says for a pause that is not at
+the top level of the triggered flow.
+
+**A retry asks again.** A `retry:` on the node that dispatched the flow a pause
+is in re-executes the whole instance from its entry as a fresh attempt (grammar
+8.5), so an attempt that fails while somebody is still thinking takes its
+question with it: an answer arriving after that is a `409` saying the wait is no
+longer held, and the next attempt asks again at the same `wait_id`. Poll the
+status route for the question rather than holding on to an `interrupts` entry
+from an earlier poll.
+
+**A wait lives in this process.** It is a parked promise, not a checkpoint, so a
+`serve` restarted while a human was thinking has lost it and the execution is
+gone with every other one that process was tracking. Durable waits arrive with
+durable execution.
+
+`agent-compose run` cannot answer a pause — resume is the app's route — so a run
+that reaches a `human` node reports the pause and exits **`3`**, its own code
+beside `1` for a run that produced no answer and `2` for a command that could not
+be run. The trace document is still written, with `status: "interrupted"` and the
+pause on the entry of the node it stopped at.
+
 ## Where a store keeps its data
 
 `--target local` substitutes SQLite and local disk for every store

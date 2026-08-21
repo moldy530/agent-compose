@@ -44,6 +44,16 @@
 // be read that way fails the run naming the field rather than reaching Zod as a
 // string and failing about a type the author never wrote.
 //
+// # A run that stops at a `human` node
+//
+// `run` cannot answer a pause: resume is an invocation and the generated app is
+// what exposes it (PRD 5.11), so a run that reaches a `human` node reports what
+// it reached and exits `3` — its own code, beside `1` for a run that produced no
+// answer and `2` for a command that could not be run. The trace document is
+// still written, with `status: "interrupted"`; the entry of the node it stopped
+// at carries the pause, and `agent-compose serve` is where the question gets
+// answered.
+//
 // Grammar 13.2 puts three failures in one sentence — "an unknown argument name,
 // a missing REQUIRED field, or a value that does not fit the declared type fails
 // the run naming the field" — so all three are one kind of failure here: the
@@ -70,7 +80,7 @@ import path from "node:path";
 import process from "node:process";
 
 import { type CompiledFlow, type FlowRun, flows, runFlow, sessionRefusal } from "./graph.ts";
-import { TRACE_VERSION } from "./runtime.ts";
+import { TRACE_VERSION, interruptOf } from "./runtime.ts";
 import type * as runtime from "./runtime.ts";
 import { dataRoot } from "./stores.ts";
 import { httpTriggers, manualTriggers } from "./triggers.ts";
@@ -117,9 +127,18 @@ async function flush(): Promise<void> {
 /**
  * Run the project's own command line, and answer with the exit code.
  *
- * `0` is a clean run, `1` is a run that produced no answer, and `2` is a command
- * that could not run at all — the same three meanings `agent-compose` itself
- * gives them, so a caller reads one table rather than two.
+ * `0` is a clean run, `1` is a run that produced no answer, `2` is a command
+ * that could not run at all, and `3` is a run that stopped at a `human` pause —
+ * the same four meanings `agent-compose` itself gives them, so a caller reads
+ * one table rather than two.
+ *
+ * `3` is a code of its own rather than a shade of `1` because the three ask for
+ * different things. `2` is an invocation to fix and `1` is a run to look into;
+ * this is neither — the run did everything it was asked to and is holding a
+ * question, and what closes it is a person answering through `serve`'s resume
+ * route (grammar 8.7, PRD 5.11). A supervisor that retried `1` would re-run a
+ * graph whose effects have already happened, and one that reported `2` would
+ * send someone to look at the command line.
  */
 export async function main(argv: readonly string[]): Promise<number> {
   const [verb, ...rest] = argv;
@@ -171,7 +190,17 @@ async function run(argv: readonly string[]): Promise<number> {
     produced = await runFlow(address, inputs, { executionId: execution, sessionKey: session });
   } catch (error) {
     const trace = (error as { trace?: readonly runtime.TraceEntry[] }).trace ?? [];
-    const written = writeTrace(address, execution, "failed", trace, describe(error));
+    // A run that stopped at a `human` pause is not a run that failed, and the
+    // whole way out is written for that difference: its own document `status`,
+    // its own exit code, and a message that says where the answer goes rather
+    // than what went wrong (grammar 8.7, PRD 5.11). `runFlow` raises it as a
+    // `FlowFailure` like any other — nothing else about a parked run is
+    // different — so it is recognized by what is on the chain rather than by
+    // what class arrived.
+    const interrupt = interruptOf(error);
+    const status = interrupt === undefined ? "failed" : "interrupted";
+    const reason = interrupt === undefined ? describe(error) : describe(interrupt);
+    const written = writeTrace(address, execution, status, trace, reason);
     if (format === "json") {
       // The same record the completed run answers with, `error` where its
       // `outputs` would be — the trace file's path included, because a run that
@@ -181,8 +210,8 @@ async function run(argv: readonly string[]): Promise<number> {
           {
             flow: address,
             execution_id: execution,
-            status: "failed",
-            error: describe(error),
+            status,
+            error: reason,
             trace_version: TRACE_VERSION,
             trace,
             ...(written === undefined ? {} : { trace_path: written }),
@@ -193,14 +222,16 @@ async function run(argv: readonly string[]): Promise<number> {
       );
     } else {
       process.stderr.write(render(trace));
-      process.stderr.write(`\n${describe(error)}\n`);
-      for (let cause: unknown = (error as { cause?: unknown }).cause; cause !== undefined; ) {
-        process.stderr.write(`  cause: ${describe(cause)}\n`);
-        cause = (cause as { cause?: unknown }).cause;
+      process.stderr.write(`\n${reason}\n`);
+      if (interrupt === undefined) {
+        for (let cause: unknown = (error as { cause?: unknown }).cause; cause !== undefined; ) {
+          process.stderr.write(`  cause: ${describe(cause)}\n`);
+          cause = (cause as { cause?: unknown }).cause;
+        }
       }
       if (written !== undefined) process.stderr.write(`\ntrace: ${written}\n`);
     }
-    return 1;
+    return interrupt === undefined ? 1 : 3;
   }
 
   const written = writeTrace(address, execution, "completed", produced.trace);
@@ -494,7 +525,7 @@ function formatOf(given: string | undefined): Format {
 function writeTrace(
   address: string,
   execution: string,
-  status: "completed" | "failed",
+  status: "completed" | "failed" | "interrupted",
   trace: readonly runtime.TraceEntry[],
   error?: string,
 ): string | undefined {
@@ -551,6 +582,15 @@ function render(trace: readonly runtime.TraceEntry[]): string {
       const key = store.key === undefined ? "" : ` key=${JSON.stringify(store.key)}`;
       const deduped = store.deduped === true ? " (deduped)" : "";
       text += `    store ${store.store} ${store.op}${key} [${store.effect}, ${store.via}]${deduped}\n`;
+    }
+    if (entry.human !== undefined) {
+      const pause = entry.human;
+      const until = pause.expiresAt === undefined ? "no deadline" : `until ${pause.expiresAt}`;
+      const how =
+        pause.settled === undefined
+          ? "still waiting when the run ended"
+          : `${pause.settled} at ${pause.settledAt}`;
+      text += `    human — paused at ${pause.pausedAt} (${until}), ${how}\n`;
     }
     for (const decision of entry.routing?.edges ?? []) {
       const guard = decision.when === undefined ? (decision.else === true ? "else" : "always") : decision.when;

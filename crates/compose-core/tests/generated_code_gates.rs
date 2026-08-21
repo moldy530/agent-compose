@@ -166,6 +166,20 @@
 //!     could not parse and Node says only `Invalid URL`, while Node quotes what
 //!     `fetch` could not parse and Bun does not. Gate 13 asks Node the same
 //!     question for exactly that reason.
+//! 19. **The `human` wait board** — the pauses a run is holding, driven directly.
+//!     Four of grammar 8.7's guarantees are invisible from a served app: that a
+//!     pause belongs to the node whose instance path is a prefix of its own —
+//!     which is what holds an enclosing budget still (Decision D102) — that a
+//!     pause the run abandoned leaves the board rather than being published as a
+//!     question and answered into nothing, that a released wait's expiry timer
+//!     is cleared, and that an expiry and an interrupt are answered ahead of an
+//!     *explicit* `on_error:` on the same node. The first three are invisible
+//!     because the case that breaks them is a task nobody is awaiting; the last
+//!     because every composition that can reach an expiry resolves
+//!     `on_error: fail`, where routing the `on_timeout:` fallback and absorbing
+//!     the expiry look alike. The timer claim has no observable consequence at
+//!     all: an `unref`ed timer keeps nothing alive, so the runner counts the
+//!     global `setTimeout`/`clearTimeout` calls instead.
 //!
 //! # The toolchain fixture
 //!
@@ -1274,6 +1288,391 @@ fn the_fan_out_runtime_bounds_orders_and_resolves_every_dispatch() {
             "exempt": { "onError": "skip" },
             "plain": { "timeoutMs": 10_000, "onError": "fail" },
         })
+    );
+}
+
+/// Gate 19: the `human` wait board — addressing, abandonment, the timer a
+/// released wait leaves behind, and the budget a wait does not spend
+/// (grammar 8.7, 9.2, PRD 5.11).
+///
+/// The acceptance suite answers, expires and addresses pauses through a served
+/// app, which is where the composition's behaviour is decided. Eleven claims are
+/// not decidable there — eight because the case that breaks them is a task
+/// **nobody is awaiting**, one because the case that breaks it is a bug in the
+/// runtime rather than anything a composition can ask for, and two because every
+/// composition that can reach one declares an `on_error:` the orderings agree
+/// on:
+///
+///   * **a pause is addressed by, and belongs to, an instance path.** A node
+///     holds the pauses its own path is a prefix of, which is the whole of what
+///     links a wait to the node that dispatched the instance it happened in —
+///     and is what [`runActivity`] reads to hold its deadline still (D102);
+///   * **an abandoned pause leaves the board.** A wait whose node stopped
+///     waiting would otherwise be published by the status route as a question a
+///     person can still answer and taken by the resume route as an answer that
+///     goes nowhere. Reaching it from a composition needs a dispatch abandoned
+///     at a moment a test cannot schedule;
+///   * **a retry ladder abandons what its failed attempt left parked**, before
+///     the next attempt re-executes the instance at the same site — in both
+///     ladders, a node's `retry:` and an item's `on_item_error:`. The shape
+///     needs one branch of an instance to fail while a sibling is parked, which
+///     is a scheduling a composition cannot ask for;
+///   * **a settlement reaches its own pause and no other.** A wait id is an
+///     instance path and a path is re-run, so the board can hold a successor
+///     under an id a stale expiry timer still remembers. What breaks it is a
+///     timer firing after its entry was settled and replaced — an interleaving
+///     of one abandonment, one re-park and one callback that no served run can
+///     be asked for;
+///   * **the board refuses to displace a wait that is still waiting.** The
+///     abandon-first ordering the two ladders keep is the board's own rule
+///     rather than a convention held at their call sites: a pause that silently
+///     displaced an unsettled one would leave a task parked on a promise no
+///     resume, abandonment or release could reach — a run that hangs, which is
+///     the one failure indistinguishable from a slow machine. Unreachable from
+///     any composition by construction, which is exactly why it is asserted
+///     here;
+///   * **an abandonment is not an activity outcome.** `on_error:` governs what
+///     the model, the process or the request did; a pause nobody is waiting for
+///     any more is the run's own unwinding, and a `skip` that absorbed one would
+///     route a graph past a `human` node whose answer the composition declared
+///     it needed;
+///   * **an expiry and an interrupt are not activity outcomes either**, and the
+///     node that decides it is one declaring `on_timeout:` beside an *explicit*
+///     `on_error:` — the pair grammar 8.7 permits, since it is `timeout:` and
+///     `retry:` a `human` node refuses (D102). The expiry routes to
+///     `on_timeout:`'s target **instead of** the node's own edges (grammar 9.2)
+///     and the interrupt leaves the node, both over the top of a `skip` that
+///     absorbs an ordinary delivery failure at that same node. A served app
+///     cannot tell the orderings apart: every fixture that reaches an expiry
+///     resolves `on_error: fail`, where they agree;
+///   * **a released wait's expiry timer is cleared.** An `unref`ed timer keeps
+///     nothing alive, so it is invisible to `process.getActiveResourcesInfo()`
+///     and to the process exiting: the runner counts the global
+///     `setTimeout`/`clearTimeout` calls made with the pause's own budget, which
+///     is the only place that question has an answer at all;
+///   * **the budget an activity divides is held still with the timer.**
+///     `context.deadline` is what a model route subtracts the clock from
+///     ([`requestBudget`]), so a reading that stayed put while the node's own
+///     timer was held would hand the first call after the wait a budget the wait
+///     had spent. What a served app can show is the node not failing; what the
+///     reading *said* is only visible from inside the activity.
+///
+/// `src/runtime.ts` is a compiler constant, byte-identical in every project this
+/// release builds, so driving it directly is driving what every project runs.
+#[test]
+fn the_human_wait_board_addresses_abandons_and_releases_every_pause() {
+    let Some(root) = installed() else {
+        return;
+    };
+    let project = staged(goldens::golden("review-loop"), root, "human-waits");
+    let output = runner("human-waits.mjs")
+        .arg(&project)
+        .output()
+        .expect("bun runs");
+    assert!(
+        output.status.success(),
+        "the wait board did not run:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let observed: Value =
+        serde_json::from_slice(&output.stdout).expect("the runner prints its observations as JSON");
+    the_wait_board_behaved(&observed);
+}
+
+/// Everything gate 19 asks of the wait board, as a function of the runner's
+/// answer.
+///
+/// Factored out for the reason gates 9 to 12 are: gate 13 re-runs this runner
+/// under the Node fallback, and two columns that asserted separately could come
+/// to different verdicts by drifting apart rather than by the runtimes
+/// disagreeing.
+fn the_wait_board_behaved(observed: &Value) {
+    // Grammar 9.4, flattened: two instances of one `map` hold two pauses, told
+    // apart by the path that addresses them and published in id order rather
+    // than in the order the scheduler happened to park them.
+    assert_eq!(
+        observed["addressing"],
+        json!({
+            "ids": ["fan/0/0/sign/0", "fan/0/1/sign/0"],
+            "under_the_map": 2,
+            "under_one_instance": 1,
+            "under_the_wait_itself": 1,
+            "under_another_node": 0,
+            "both_pending": ["pending", "pending"],
+        })
+    );
+
+    // …and abandoning the node that dispatched them settles both: nothing is
+    // published, nothing is open, and a resume is refused as the abandonment it
+    // is rather than taken with a `202` that discards the answer.
+    assert_eq!(
+        observed["abandoning"]["both_settled"],
+        json!(["HumanAbandoned", "HumanAbandoned"])
+    );
+    assert_eq!(observed["abandoning"]["still_published"], json!([]));
+    assert_eq!(observed["abandoning"]["still_open"], json!(0));
+    assert_eq!(observed["abandoning"]["refusal"]["ok"], json!(false));
+    assert_eq!(
+        observed["abandoning"]["refusal"]["reason"],
+        json!("settled")
+    );
+    assert!(
+        observed["abandoning"]["refusal"]["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no longer held"),
+        "the refusal says what became of the wait: {observed}"
+    );
+
+    // …and it is `runActivity` that does it, on every way one node execution can
+    // end. The reachable shape is a node's own **deadline** racing an instance
+    // parked below it — the node is over, so the pause under it is one nothing
+    // will read the answer of — and the runner drives the same `finally` with a
+    // throwing activity, because what is under test is the wiring rather than
+    // which error reached it.
+    assert_eq!(
+        observed["orphans"],
+        json!({
+            "before": 1,
+            "after": 0,
+            "published": [],
+            "settled": "HumanAbandoned",
+            "node_failed": "NodeFailure",
+            "refusal": "settled",
+        })
+    );
+
+    // …and a **retry** is the other way one task stops waiting for a pause: the
+    // next attempt re-executes the instance at the same site, so an attempt that
+    // ended with a pause still parked would hand its successor a board already
+    // holding a wait under the id that successor is about to use. Every attempt
+    // begins with nothing held under its site, both pauses end abandoned, and
+    // the node fails the way a node whose every attempt failed does. Without the
+    // abandon between attempts the second entry reads `1`.
+    assert_eq!(
+        observed["retrying"],
+        json!({
+            "open_at_each_attempt": [0, 0],
+            "settled": ["HumanAbandoned", "HumanAbandoned"],
+            "published": [],
+            "node_failed": "NodeFailure",
+        }),
+        "a retry ladder left the pauses of a failed attempt on the board: {observed}"
+    );
+
+    // The same seam for `on_item_error: { retry: … }`, whose attempts all
+    // re-execute one dispatched instance at one site.
+    assert_eq!(
+        observed["item_retrying"],
+        json!({
+            "open_at_each_attempt": [0, 0],
+            "settled": ["HumanAbandoned", "HumanAbandoned"],
+            "published": [],
+            "node_failed": "NodeFailure",
+        }),
+        "an item's retry ladder left the pause of a failed attempt on the board: {observed}"
+    );
+
+    // And the half of that which is not an ordering: a settlement reaches the
+    // pause it belongs to and no other. A wait id is an instance path and a path
+    // is re-run, so a stale closure — an expiry timer above all — can outlive the
+    // entry it settles and find a *successor* answering to its id. Driven by
+    // abandoning a pause, opening its successor at the same site, and only then
+    // firing the budget the abandoned one had armed: what it must settle is
+    // itself, which is nothing, leaving the live question published, answerable,
+    // and answered. A settlement that went by id instead reports the live pause
+    // `expired`, publishes nothing, and refuses the honest answer.
+    assert_eq!(
+        observed["successor"],
+        json!({
+            "stale": "HumanAbandoned",
+            "open_after_the_stale_budget_ran_out": 1,
+            "published": ["wrap/0/sign/0"],
+            "taken": { "ok": true, "wait": "wrap/0/sign/0" },
+            "live": "resolved",
+        }),
+        "a stale pause's expiry settled the wait that succeeded it: {observed}"
+    );
+
+    // …and the ordering that section relies on is the board's rule rather than a
+    // convention: a pause opened under an id an **unsettled** wait still answers
+    // to is refused outright. Silently displacing it would take that wait off the
+    // board with nothing able to reach it — no resume, no abandonment, no release
+    // — leaving its task parked on a promise nothing can settle, which is a run
+    // that hangs rather than a run that fails. The standing pause is untouched by
+    // the refusal: published, open, and what the answer reaches.
+    assert_eq!(
+        observed["displacing"]["refused"],
+        json!("WaitBoardInvariant"),
+        "the board displaced a pause that was still waiting: {observed}"
+    );
+    assert!(
+        observed["displacing"]["said"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("`wrap/0/sign/0` is still waiting"),
+        "the refusal names the id it broke at: {observed}"
+    );
+    assert_eq!(
+        observed["displacing"]["published"],
+        json!(["wrap/0/sign/0"]),
+        "{observed}"
+    );
+    assert_eq!(observed["displacing"]["open"], json!(1), "{observed}");
+    assert_eq!(
+        observed["displacing"]["taken"],
+        json!({ "ok": true, "wait": "wrap/0/sign/0" }),
+        "{observed}"
+    );
+    assert_eq!(
+        observed["displacing"]["standing"],
+        json!("resolved"),
+        "the pause that was already there is the one the answer reached: {observed}"
+    );
+    assert_eq!(
+        observed["displacing"]["output"],
+        json!({ "decision": "approve" }),
+        "{observed}"
+    );
+
+    // An abandonment is an unwinding rather than an outcome, so it passes the
+    // node's `on_error:` untouched. The control above it is what makes this an
+    // assertion about the guard: the same node under the same `skip` really does
+    // absorb an ordinary delivery failure, entry, edges and all.
+    assert_eq!(
+        observed["absorbing"]["delivery_failure"],
+        json!({ "outcome": "skipped", "goto": ["__end__"] })
+    );
+    assert_eq!(observed["absorbing"]["pending"], json!(["sign/0"]));
+    assert_eq!(
+        observed["absorbing"]["abandoned"],
+        json!("HumanAbandoned"),
+        "`skip` absorbing this would route the graph past the human: {observed}"
+    );
+
+    // …and an **expiry** is not one either, which is the precedence a node
+    // declaring both keys turns on: `on_timeout:` transfers control to its route
+    // *instead of* the node's own edges (grammar 8.7, 9.2), over the top of an
+    // explicit `on_error: skip` that would otherwise mark the node skipped and
+    // send it down them. The node's edge goes to `__end__` and the route does
+    // not, so `goto` is the whole assertion: a `runNode` that consulted
+    // `policy.onError` first reports `["__end__"]` and `"skipped"` here. No
+    // served composition can decide it — every fixture that reaches an expiry
+    // resolves `on_error: fail`, where the two orderings agree.
+    assert_eq!(
+        observed["expiry_over_skip"],
+        json!({
+            "settled": "resolved",
+            "goto": ["note"],
+            "outcome": "failed",
+            "fallback": "note",
+            "pause_settled": "expired",
+            "published": [],
+        }),
+        "`on_error: skip` absorbed the expiry instead of `on_timeout:` routing it: {observed}"
+    );
+
+    // …and neither is an **interrupt**: a run with no way to answer stops at the
+    // pause rather than being skipped past it, under the same explicit `skip`.
+    // `runActivity` wraps it in a `NodeFailure` — the interrupt is on the cause
+    // chain, which is what `runNode` answers ahead of the policy and what
+    // `cli.ts` reads for its own exit path.
+    assert_eq!(
+        observed["interrupt_over_skip"],
+        json!({
+            "threw": true,
+            "name": "NodeFailure",
+            "interrupt": "HumanInterrupt",
+            "node": "sign",
+        }),
+        "`on_error: skip` absorbed the interrupt instead of the run stopping: {observed}"
+    );
+
+    // The budget reading moves with the hold: fixed while the timer is armed —
+    // it is the instant that timer will fire — and sliding with the clock while
+    // a pause below the node is open, which is the whole of "the budget does not
+    // run while a human is thinking" said to the activity that divides it.
+    assert_eq!(
+        observed["budget"]["armed_moved_by"],
+        json!(0),
+        "an armed budget expires at one instant: {observed}"
+    );
+    assert_eq!(
+        observed["budget"]["rearmed_moved_by"],
+        json!(0),
+        "…and so does the same budget re-armed after the answer: {observed}"
+    );
+    let held = observed["budget"]["held_moved_by"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("the runner reports how far the held budget moved: {observed}"));
+    assert!(
+        held >= 90,
+        "a budget held for 100ms of pause moved {held}ms, so the wait was spending it: {observed}"
+    );
+    assert_eq!(observed["budget"]["settled"], json!("resolved"));
+
+    // A 24-hour budget arms one timer, and releasing the run clears it — rather
+    // than leaving it, and the closure it holds, alive for the day.
+    assert_eq!(
+        observed["timer"],
+        json!({
+            "armed": 1,
+            "cleared_while_pending": 0,
+            "cleared_after_release": 1,
+            "settled": "HumanAbandoned",
+            "after_release": "not-waiting",
+        })
+    );
+
+    // The ordinary path, unchanged by any of it: the pause is published with
+    // what the human is shown and the schema their answer is held to, the answer
+    // is parsed against that schema, and the wait settles exactly once.
+    assert_eq!(
+        observed["answering"]["published"]["id"],
+        json!("review/0/sign/0")
+    );
+    assert_eq!(
+        observed["answering"]["published"]["shown"],
+        json!({ "question": "ship it?" })
+    );
+    assert_eq!(
+        observed["answering"]["published"]["schema"]["properties"]["decision"]["enum"],
+        json!(["approve", "reject"])
+    );
+    assert_eq!(
+        observed["answering"]["taken"],
+        json!({ "ok": true, "wait": "review/0/sign/0" })
+    );
+    assert_eq!(observed["answering"]["settled"], json!("resolved"));
+    assert_eq!(
+        observed["answering"]["output"],
+        json!({ "decision": "reject" })
+    );
+    assert_eq!(
+        observed["answering"]["pause"],
+        json!({
+            "settled": "resumed",
+            "paused_at_is_an_instant": true,
+            "settled_at_is_an_instant": true,
+            "expires_at": null,
+        })
+    );
+    assert_eq!(
+        observed["answering"]["twice"],
+        json!({ "ok": false, "reason": "settled" })
+    );
+    assert_eq!(
+        observed["answering"]["mismatched"],
+        json!({ "ok": false, "reason": "settled" })
+    );
+    assert_eq!(observed["answering"]["still_published"], json!([]));
+
+    // A run with no resume surface never registers a pause: `agent-compose run`
+    // has no way to answer one, so the node raises instead of parking, and there
+    // is nothing for a status route to publish (grammar 8.7).
+    assert_eq!(
+        observed["unanswerable"],
+        json!({ "settled": "HumanInterrupt", "published": [] })
     );
 }
 
@@ -2645,6 +3044,12 @@ fn the_toolchain_fixture_pins_what_the_emitter_pins() {
 /// release builds (see `codegen::runtime`), and `runExec`/`runHttp` are all the
 /// runners import.
 ///
+/// Gate 19's runner is re-run because a `human` pause is the runtime's most
+/// timer-dependent construct and a timer is the engine's — `setTimeout`,
+/// `unref`, `clearTimeout` and the arithmetic `runActivity` does around them.
+/// The pause runtime has no second column anywhere else: the acceptance suite
+/// serves under Bun too.
+///
 /// Gate 5 is deliberately **not** among them, and the reason is worth writing
 /// down so the omission stays a decision. Its subject is the emitted runtime's
 /// own scheduling rather than an engine API — `map-dispatch.mjs` answers
@@ -2766,6 +3171,19 @@ fn a_generated_project_installs_type_checks_and_runs_under_the_node_fallback() {
         "resolved-env-in-failures.mjs",
         &project,
     ));
+
+    // Gate 19, for the reason gate 5 is left out rather than against it: a
+    // `human` pause is the runtime's most **timer**-dependent construct, and a
+    // timer is the engine's. `runHuman` arms a `setTimeout` and probes for
+    // `unref`, which the two runtimes implement separately; `runActivity` holds
+    // and re-arms one, and what it re-arms it with is arithmetic over
+    // `clearTimeout`'s semantics and the timer's identity. Its margins are the
+    // opposite of gate 5's, too — a wait is settled by an event and the one
+    // budget it measures is held across a 100 ms tick it is *not* spending — so
+    // asking the fallback costs a second and no flakiness. Without this column
+    // the whole of the pause runtime runs on one engine: the acceptance suite
+    // serves under Bun as well.
+    the_wait_board_behaved(&node_runner("human-waits.mjs", &project));
 
     // Gate 16, asked of the other runtime. The local store backends are a
     // WebAssembly SQLite over `node:fs` and a directory of files, which is

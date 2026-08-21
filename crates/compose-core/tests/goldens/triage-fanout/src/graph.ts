@@ -1084,6 +1084,37 @@ const flowTriageNodeRemember: runtime.NodeDescriptor = {
   ],
 };
 
+/**
+ * `flow.triage` node `approve` — the pause it holds: what the human is shown, and what an answer has to fit (grammar 8.7, PRD 5.11).
+ */
+const flowTriageNodeApproveHuman: runtime.HumanDescriptor = {
+  flow: "flow.triage",
+  node: "approve",
+  timeoutMs: 86400000,
+  onTimeout: "escalate",
+  schema: {
+    "additionalProperties": false,
+    "properties": {
+      "decision": {
+        "enum": [
+          "approve",
+          "reject"
+        ],
+        "type": "string"
+      },
+      "note": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "decision",
+      "note"
+    ],
+    "type": "object"
+  },
+  parse: (payload) => runtime.parseResult(flowTriageNodeApproveOutput, payload, "the resume payload for `flow.triage` node `approve`"),
+};
+
 /** `flow.triage` node `approve` — a human-in-the-loop pause (grammar 8.7). */
 const flowTriageNodeApprove: runtime.NodeDescriptor = {
   flow: "flow.triage",
@@ -1094,10 +1125,12 @@ const flowTriageNodeApprove: runtime.NodeDescriptor = {
   },
   exempt: true,
   shapes: { input: flowTriageShape, state: stateShape, output: flowTriageNodeApproveShape },
-  input: () => null,
-  run: () => {
-    throw new runtime.Unimplemented("a `human` pause", "the `human` node runtime, which PRD §9's resolved question 4 schedules for M2");
-  },
+  input: (roots, view) => ({
+    "summary": runtime.toJson(runtime.evaluate("state.summary", roots)),
+    "patch_count": runtime.toJson(runtime.evaluate("size(state.patches)", roots)),
+  }),
+  run: async (input, context, view) =>
+    runtime.runHuman(flowTriageNodeApproveHuman, input, context, view),
   writes: [
     { field: "decision", channel: "human_decision", reduce: "set" },
   ],
@@ -1359,6 +1392,13 @@ export function sessionRefusal(address: string, stores: readonly string[]): stri
  * (grammar 10.1, Decision D78). The second is the one whose trace is complete —
  * every step landed — so dropping it there would lose the whole routing record
  * of a run that made one.
+ *
+ * A third way is a `human` node (grammar 8.7): a run that reaches one and was
+ * started with **no resume surface** stops there, and the `FlowFailure` carries
+ * a `runtime.HumanInterrupt` on its `cause` chain — `runtime.interruptOf` is how
+ * a caller tells that outcome from a failure. `resumable: true` is what says a
+ * resume surface is attached, and `src/serve.ts` is the caller that passes it:
+ * its `POST /executions/:id/resume` is what delivers the answer (PRD 5.11).
  */
 export async function runFlow(
   address: string,
@@ -1367,6 +1407,14 @@ export async function runFlow(
     readonly executionId?: string;
     readonly sessionKey?: string;
     readonly recursionLimit?: number;
+    /**
+     * Whether something is standing by to answer a `human` pause this run
+     * reaches (grammar 8.7, PRD 5.11).
+     *
+     * `false` — the default, and what `agent-compose run` leaves it at — makes
+     * a pause the end of the run rather than a wait nothing can settle.
+     */
+    readonly resumable?: boolean;
   } = {},
 ): Promise<FlowRun> {
   const flow = flows[address];
@@ -1390,6 +1438,11 @@ export async function runFlow(
     throw new Error(sessionRefusal(address, flow.sessionStores));
   }
   const executionId = options.executionId ?? `exec_${globalThis.crypto.randomUUID()}`;
+  // Opened before the graph is streamed, so a status route asked the instant
+  // after `start` answered already has somewhere to read this run's pauses from
+  // (grammar 8.7, PRD 5.11). Every instance nested inside the run registers
+  // against the same execution id and is told apart by its instance path.
+  runtime.openHumanWaits(executionId, options.resumable === true);
   // `runtime.quiesce` keeps the last state each superstep produced, which is
   // what makes a failure's trace survive; the one failure it restates on the way
   // out is LangGraph stopping the run at the ceiling.
@@ -1408,8 +1461,14 @@ export async function runFlow(
     // `scope: execution` means what it says: whatever this run's own stores held
     // is released when the run ends, however it ended (PRD 5.8, grammar 11.1).
     // A `serve` process runs many executions, so a store that stayed open would
-    // be both a leak and a lifetime the composition did not declare.
-    .finally(() => stores.releaseExecution(executionId));
+    // be both a leak and a lifetime the composition did not declare. A pause the
+    // run was holding goes the same way and for the same reason: a wait that
+    // outlived its run would be one a resume could still be delivered to, with
+    // no graph left to receive it (grammar 8.7).
+    .finally(() => {
+      stores.releaseExecution(executionId);
+      runtime.releaseHumanWaits(executionId);
+    });
   if (error !== undefined) {
     throw new runtime.FlowFailure(
       address,

@@ -670,6 +670,7 @@ fn the_walk_reaches_every_record_the_envelope_carries() {
         "DispatchRecord",
         "EdgeDecision",
         "Failover",
+        "HumanPause",
         "ModelCall",
         "Refusal",
         "RouteCondition",

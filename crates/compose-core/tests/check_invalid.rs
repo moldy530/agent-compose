@@ -82,6 +82,7 @@ const CHECK_CODES: &[&str] = &[
     "sync-trigger-interrupt",
     "non-dominating-source",
     "unsupported-detach",
+    "detached-interrupt",
     "conflicting-keys",
     "duplicate-route",
 ];

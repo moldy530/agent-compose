@@ -5,12 +5,14 @@
 //! A flow **reaches** the components its own nodes name, its maps' dispatch
 //! targets, the `human` nodes among them, the stores and tools of every agent it
 //! reaches, and everything the flows it reaches reach in turn. One relation
-//! serves three checks and each reads a different part of what [`reached`]
+//! serves four checks and each reads a different part of what [`reached`]
 //! returns: session coherence reads the stores ([`stores_of`], grammar 11.3),
-//! interrupt-freedom reads the `human` nodes (grammar 13.3), and recursion reads
-//! the flows — which it needs as *edges* with their invocation sites rather than
-//! as a set, so it walks [`calls`] instead (grammar 7.5). Stating the traversal
-//! once here is what keeps the three from drifting apart (Decision D86).
+//! sync-trigger interrupt-freedom reads the `human` nodes (grammar 13.3),
+//! detached-dispatch interrupt-freedom reads them from one dispatch target
+//! ([`reached_by`], grammar 8.6 rule 7), and recursion reads the flows — which
+//! it needs as *edges* with their invocation sites rather than as a set, so it
+//! walks [`calls`] instead (grammar 7.5). Stating the traversal once here is
+//! what keeps the four from drifting apart (Decision D86).
 //!
 //! # Dispatch sites (grammar 11.4, Decision D83)
 //!
@@ -69,11 +71,13 @@ pub(crate) fn flow_at<'a>(ir: &'a Ir, address: &str) -> Option<&'a Flow> {
 
 /// What one flow **reaches** (grammar 7.7).
 ///
-/// Three checks quantify over this one relation and each reads a different part
-/// of it: session coherence reads [`stores`](Self::stores) (grammar 11.3),
-/// sync-trigger interrupt-freedom reads [`humans`](Self::humans) (grammar 13.3),
-/// and recursion reads the flows — which it needs with their invocation sites
-/// rather than as a set, so it walks [`calls`] instead (grammar 7.5).
+/// Four checks quantify over this one relation and each reads a different part
+/// of it: session coherence reads [`stores`](Self::stores) (grammar 11.3), the
+/// two interrupt-freedom rules read [`humans`](Self::humans) — one over a
+/// `respond: sync` trigger's flow (grammar 13.3) and one over a **detached**
+/// dispatch's target (grammar 8.6 rule 7) — and recursion reads the flows, which
+/// it needs with their invocation sites rather than as a set, so it walks
+/// [`calls`] instead (grammar 7.5).
 #[derive(Debug, Default)]
 pub(crate) struct Reached {
     /// The `store.*` addresses.
@@ -101,6 +105,31 @@ pub(crate) fn reached(ir: &Ir, flow: &str) -> Reached {
 /// The store addresses a flow reaches (grammar 7.7, 11.3).
 pub(crate) fn stores_of(ir: &Ir, flow: &str) -> BTreeSet<String> {
     reached(ir, flow).stores
+}
+
+/// Everything one `map` dispatch **target** reaches (grammar 7.7 clause 2).
+///
+/// A target is an address rather than a flow, and the three namespaces §8.6
+/// admits reach different amounts: a `flow.*` reaches what the flow reaches, an
+/// `agent.*` reaches its stores and its `flow.*` tools (clauses 3 and 4), and a
+/// `tool.*` is a request or a process and reaches nothing this relation is
+/// about. Stated here rather than at the one check that asks, so a dispatch
+/// target's reachability is [`walk`]'s answer wherever it is asked for.
+pub(crate) fn reached_by(ir: &Ir, target: &Address) -> Reached {
+    let mut found = Reached::default();
+    let mut seen = BTreeSet::new();
+    match target.namespace {
+        Namespace::Flow => walk(ir, &target.to_string(), &mut seen, &mut found),
+        Namespace::Agent => {
+            let mut pending = Vec::new();
+            agent_reaches(ir, &target.to_string(), &mut pending, &mut found);
+            for address in pending {
+                walk(ir, &address, &mut seen, &mut found);
+            }
+        }
+        _ => {}
+    }
+    found
 }
 
 /// The traversal itself: a worklist of flow addresses, each visited once.

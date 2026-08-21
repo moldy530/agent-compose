@@ -14,11 +14,13 @@
 //! The trace **document** a run wrote to disk, with its volatile values
 //! redacted: the execution id becomes `<execution-id>` wherever it appears —
 //! including inside the idempotency keys, where the remainder is the instance
-//! path (grammar §9.4) and is exactly what should stay legible — and the built
-//! project's own directory becomes `<project>`. Everything else is kept, because
-//! everything else is deterministic: the fixtures script every model answer, and
-//! `docs/trace.md` fixes the order of entries, edge decisions and dispatch
-//! records so that two runs of one composition produce one document.
+//! path (grammar §9.4) and is exactly what should stay legible — the built
+//! project's own directory becomes `<project>`, and a wall clock reading becomes
+//! `<instant>`, which pins that the key is there and holds an RFC 3339 instant
+//! without pinning the second it was written in. Everything else is kept,
+//! because everything else is deterministic: the fixtures script every model
+//! answer, and `docs/trace.md` fixes the order of entries, edge decisions and
+//! dispatch records so that two runs of one composition produce one document.
 //!
 //! So an unannounced rename or removal is a diff in a pull request. A snapshot
 //! that changes is not by itself a failure — `docs/trace.md` §10.2 lists the
@@ -29,25 +31,39 @@
 //! INSTA_UPDATE=always cargo test -p agent-compose --test trace_format_stability
 //! ```
 //!
-//! # Why these five runs
+//! # Why these six runs
 //!
-//! Between them they reach every record **type** the format has, and the entry
-//! shapes a reader meets first: a bounded cycle for guarded edges, budgets and
-//! an `else:` escape; a routed fan-out for dispatch records, variants,
-//! idempotency keys and a nested subflow trace; a store round trip for
-//! read-replay and write-dedupe records, and for the tool-invoked write that
-//! carries neither key nor dedupe flag; a failover for a model call that was
-//! served by its second member; and a spent route for a **failed** run — the
-//! shape a reader most often opens a trace for, and the one whose rules (no
-//! writes, routing only where routing failed) exist nowhere else.
+//! Between them they reach every record **type** the format has, every member of
+//! `TraceDocument.status`, and the entry shapes a reader meets first: a bounded
+//! cycle for guarded edges, budgets and an `else:` escape; a routed fan-out for
+//! dispatch records, variants, idempotency keys and a nested subflow trace; a
+//! store round trip for read-replay and write-dedupe records, and for the
+//! tool-invoked write that carries neither key nor dedupe flag; a failover for a
+//! model call that was served by its second member; a spent route for a
+//! **failed** run — the shape a reader most often opens a trace for, and the one
+//! whose rules (no writes, routing only where routing failed) exist nowhere
+//! else; and a run that ended holding a `human` pause, for the `human` record
+//! and the `"interrupted"` document status version `2` introduced (§10.3.1).
+//!
+//! A run added here is what keeps that first sentence true: the count is a claim
+//! about coverage, so a record type or a status member added to the format
+//! without a run that reaches it is a claim this file stopped keeping.
 //!
 //! It is not every *shape* the format admits, and the header should not be read
 //! as claiming so: no snapshot here holds a `"skipped"` entry, a `fallback`
 //! entry, a no-viable-route entry, a dispatch that skipped, failed or detached,
-//! or the `"$default"` route sigil. Those are held by
+//! or the `"$default"` route sigil. `TraceEntry.fallback`'s **expiry** form is
+//! in that list too — the widening version `2` made, where the key names an
+//! `on_timeout:` route rather than an `on_error:` one — because reaching it
+//! needs a resume surface, which `agent-compose run` is not. Those are held by
 //! `tests/compiled_graph_acceptance.rs`, which asserts about them by name rather
-//! than by shape — the two files divide the surface, and a run added here is
-//! worth adding when a shape has no home in either. The first two are reached
+//! than by shape — the expiry form by
+//! [`an_expired_wait_takes_its_route_and_refuses_the_answer_that_arrives_after_it`]
+//! for a route naming a node and by
+//! [`a_wait_that_expires_into_end_retires_its_branch_and_completes_the_execution`]
+//! for the `"__end__"` spelling — the two files divide the surface, and a run
+//! added here is worth adding when a shape has no home in either. The first two
+//! are reached
 //! here all the same, by the §3 rule below rather than by a snapshot: a rule
 //! about a field on every entry is not kept by pinning the entries that happen
 //! to be in a golden.
@@ -58,7 +74,7 @@
 //!
 //! # …and the promises a snapshot cannot make
 //!
-//! Six claims of `docs/trace.md` are about a *rule* rather than about a shape,
+//! Seven claims of `docs/trace.md` are about a *rule* rather than about a shape,
 //! and each is asserted directly, because a snapshot of a document that happens
 //! to satisfy a rule would go on passing after the rule was dropped: that the
 //! third delivery surface carries the version beside its trace **and only
@@ -71,15 +87,19 @@
 //! carries it (§3) — which is three sites of the emitted runtime rather than
 //! one, so [`document`] holds every snapshot run to it and
 //! [`a_failure_a_run_survived_carries_its_class_like_one_that_ended_a_run`]
-//! reaches the two no snapshot here does — and that an edge decision carries a
+//! reaches the two no snapshot here does — that an edge decision carries a
 //! `reason` for the three decisions §4.1 tabulates and for no others, which
 //! [`document`] also holds every snapshot run to, because §10.1 makes a
 //! presence column a promise and a field appearing where the document says it
-//! does not is that promise broken.
+//! does not is that promise broken — and that a `human` record is on the node
+//! that held the wait and on no node above it (§3), which
+//! [`document`] holds every snapshot run to as well and
+//! [`a_pause_is_recorded_on_the_node_that_held_it_and_on_no_node_above_it`]
+//! reaches at the two constructs a pause can be nested under.
 //!
-//! Two of the six ride on a run this file already makes rather than on a run of
-//! their own: the §6 pair on the store run — a presence rule is a claim about a
-//! record the snapshot already holds, and the two are asserted before
+//! Two of the seven ride on a run this file already makes rather than on a run
+//! of their own: the §6 pair on the store run — a presence rule is a claim about
+//! a record the snapshot already holds, and the two are asserted before
 //! `assert_snapshot!` so a change to the rule fails as itself rather than as a
 //! diff in a document — and §4.1's presence rule on
 //! [`a_routing_records_edges_and_targets_are_both_in_declaration_order`]'s
@@ -102,8 +122,8 @@ const HAIKU: &str = "claude-haiku-4-5";
 
 /// The trace document a run wrote, as a snapshot reads it.
 ///
-/// Two substitutions, and only two, because only two things about a trace differ
-/// between runs of one composition:
+/// Three substitutions, and only three, because only three things about a trace
+/// differ between runs of one composition:
 ///
 ///  * the **execution id**, which is minted per run. It is replaced wherever it
 ///    appears rather than only at `execution_id`, which is the point: an
@@ -113,11 +133,25 @@ const HAIKU: &str = "claude-haiku-4-5";
 ///  * the **project directory**, which a scratch build puts under a temporary
 ///    path. Nothing in the document holds one today; it is redacted anyway, so a
 ///    field that starts carrying a path lands in the snapshot as `<project>`
-///    instead of as a value that changes every run.
+///    instead of as a value that changes every run;
+///  * an **instant**, which is a wall clock reading. §3.4's `pausedAt`,
+///    `expiresAt` and `settledAt` are the fields of the format that carry one,
+///    and a snapshot holding any of them would fail on the second run — so the
+///    *shape* is what is pinned: the key is there, with a value that was an
+///    RFC 3339 instant, which is exactly the promise §3.4's table makes about
+///    it. Recognized **by key** ([`INSTANTS`]) rather than by what a value looks
+///    like: a redaction that fired on any 24-character date-shaped string would
+///    hide a *datum* that happens to be spelled like a timestamp — a store's
+///    answer, a model's completion, an error's text — and hiding data is the one
+///    thing a golden must not do. What a key-based rule costs is that a field
+///    which starts carrying a clock reading has to be added here; what it buys
+///    is that the redaction never reaches beyond the fields the document says
+///    hold one.
 fn document(run: &harness::Run) -> String {
     let held = run.trace_document();
     every_entrys_error_is_in_one_shape(&held);
     every_edge_decisions_reason_follows_its_rule(&held);
+    every_human_record_is_on_the_node_that_paused(&held);
     let execution = held["execution_id"]
         .as_str()
         .unwrap_or_else(|| panic!("the trace document names its execution: {held}"))
@@ -136,7 +170,38 @@ fn document(run: &harness::Run) -> String {
     serde_json::to_string_pretty(&redacted).expect("the trace document serializes")
 }
 
-/// Replace the two volatile values everywhere in `value`.
+/// Every key of the format that carries a wall clock reading, enumerated from
+/// `docs/trace.md`.
+///
+/// §3.4's pause record is the whole list, and it is the only record in the
+/// document with a clock in it: `pausedAt`, `expiresAt` and `settledAt`.
+///
+/// Both spellings are here because §2's key seam runs through this list. An
+/// entry is a runtime record and spells its keys `camelCase`; a *document*
+/// spells its own `snake_case`, and the status route a `serve` report comes off
+/// publishes a pending pause as `paused_at`/`expires_at` (PRD 5.11). Only the
+/// `camelCase` three reach a snapshot here today — every run in this file goes
+/// through `agent-compose run`, which writes the trace document — so the other
+/// two are stated against the format rather than against the surface, and cost
+/// nothing while no key of that spelling appears. `settled_at` is deliberately
+/// absent: a settled wait is not a pending one, so no published pause has ever
+/// carried it.
+const INSTANTS: &[&str] = &[
+    "pausedAt",
+    "paused_at",
+    "expiresAt",
+    "expires_at",
+    "settledAt",
+];
+
+/// Replace the three volatile values everywhere in `value`.
+///
+/// An instant is replaced **by its key** rather than by what the value looks
+/// like, and the shape is asserted instead of being the trigger: a value under
+/// one of [`INSTANTS`] that is not an RFC 3339 instant is a broken promise of
+/// §3.4's table, and failing on it is the point. Everything else — including a
+/// datum that happens to be spelled like a timestamp, which a store's `answer`
+/// or a model's completion can hold — keeps its value and reaches the snapshot.
 fn redact(value: &mut Value, execution: &str, project: &str) {
     match value {
         Value::String(text) => {
@@ -152,8 +217,74 @@ fn redact(value: &mut Value, execution: &str, project: &str) {
             }
         }
         Value::Object(fields) => {
-            for (_, held) in fields.iter_mut() {
+            for (key, held) in fields.iter_mut() {
+                if INSTANTS.contains(&key.as_str()) {
+                    assert!(
+                        held.as_str().is_some_and(is_instant),
+                        "`{key}` carries an RFC 3339 instant (`docs/trace.md` §3.4): {held}"
+                    );
+                    *held = Value::String("<instant>".to_string());
+                    continue;
+                }
                 redact(held, execution, project);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether `text` is the instant `JSON.stringify(new Date(…))` writes.
+///
+/// `YYYY-MM-DDTHH:MM:SS.sssZ`, which is the one spelling the emitted runtime
+/// produces (`toISOString`) and the one `docs/trace.md` §3.4 names. Matched
+/// tightly, because it is what an [`INSTANTS`] key is *held to* rather than what
+/// selects a value for redaction: a field of that table that started answering
+/// with a second-resolution stamp, or with a local-time one, would be a change
+/// to a published surface.
+fn is_instant(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    if bytes.len() != 24 {
+        return false;
+    }
+    let digits = [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18, 20, 21, 22];
+    let dashes = [
+        (4, b'-'),
+        (7, b'-'),
+        (10, b'T'),
+        (13, b':'),
+        (16, b':'),
+        (19, b'.'),
+        (23, b'Z'),
+    ];
+    digits.iter().all(|at| bytes[*at].is_ascii_digit())
+        && dashes.iter().all(|(at, held)| bytes[*at] == *held)
+}
+
+/// Every `TraceEntry` in `document`, in document order — the entries a subflow
+/// nested under `inner` and a dispatched instance's under its record included.
+///
+/// An entry is told from the other records by `traversal`, which only an entry
+/// carries: a dispatch record has an `outcome` and an `error` of its own, and it
+/// is not what §3 speaks about.
+fn entries(document: &Value) -> Vec<&Value> {
+    let mut found: Vec<&Value> = Vec::new();
+    walk_entries(document, &mut found);
+    found
+}
+
+fn walk_entries<'a>(value: &'a Value, found: &mut Vec<&'a Value>) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                walk_entries(item, found);
+            }
+        }
+        Value::Object(fields) => {
+            if fields.contains_key("traversal") {
+                found.push(value);
+            }
+            for held in fields.values() {
+                walk_entries(held, found);
             }
         }
         _ => {}
@@ -162,35 +293,68 @@ fn redact(value: &mut Value, execution: &str, project: &str) {
 
 /// Every `TraceEntry.error` in `document`, node-qualified, nested entries
 /// included.
-///
-/// An entry is told from the other records by `traversal`, which only an entry
-/// carries: a dispatch record has an `outcome` and an `error` of its own, and it
-/// is not what §3 speaks about.
 fn entry_errors(document: &Value) -> Vec<(String, String)> {
-    let mut found: Vec<(String, String)> = Vec::new();
-    walk_entry_errors(document, &mut found);
-    found
+    entries(document)
+        .into_iter()
+        .filter_map(|entry| {
+            let node = entry["node"].as_str()?;
+            let error = entry["error"].as_str()?;
+            Some((node.to_string(), error.to_string()))
+        })
+        .collect()
 }
 
-fn walk_entry_errors(value: &Value, found: &mut Vec<(String, String)>) {
-    match value {
-        Value::Array(items) => {
-            for item in items {
-                walk_entry_errors(item, found);
-            }
+/// Every entry of `document` that carries a `human` record, as `(flow, node)`.
+fn nodes_holding_a_pause(document: &Value) -> Vec<(String, String)> {
+    entries(document)
+        .into_iter()
+        .filter(|entry| entry.get("human").is_some())
+        .map(|entry| {
+            let flow = entry["flow"]
+                .as_str()
+                .unwrap_or_else(|| panic!("an entry names the flow its node belongs to: {entry}"));
+            let node = entry["node"]
+                .as_str()
+                .unwrap_or_else(|| panic!("an entry names its node: {entry}"));
+            (flow.to_string(), node.to_string())
+        })
+        .collect()
+}
+
+/// `docs/trace.md` §3: a node that is not a `human` node never carries `human`.
+///
+/// A rule rather than a shape, and one a snapshot is a poor keeper of, because
+/// the entries a `human` record can wrongly reach are the ones nested runs put
+/// *outside* the flow a snapshot was written for. It is checkable without
+/// knowing which nodes a composition declares as `human`, because §3 gives two
+/// other keys the same kind of presence rule over a **different** kind of node:
+/// `inner` is a `flow:` node's and `dispatches` is a `map` node's. A node is one
+/// kind, so an entry carrying `human` beside either is an entry claiming to be
+/// two — and that is exactly the shape the mistake takes, since a pause is
+/// reached below one of those two constructs or not nested at all.
+///
+/// The failure it guards is a real one and is invisible to every other check
+/// here: an error raised inside a subflow or a dispatched instance travels up
+/// the `cause` chain, so an enclosing node that recovers the pause from it
+/// reports N+1 waits for one — each of the extra ones with no settlement, and so
+/// each reading as a wait the run ended holding.
+fn every_human_record_is_on_the_node_that_paused(document: &Value) {
+    for entry in entries(document) {
+        if entry.get("human").is_none() {
+            continue;
         }
-        Value::Object(fields) => {
-            let node = fields.get("node").and_then(Value::as_str);
-            let error = fields.get("error").and_then(Value::as_str);
-            if let (true, Some(node), Some(error)) = (fields.contains_key("traversal"), node, error)
-            {
-                found.push((node.to_string(), error.to_string()));
-            }
-            for held in fields.values() {
-                walk_entry_errors(held, found);
-            }
-        }
-        _ => {}
+        assert!(
+            entry.get("inner").is_none(),
+            "a `flow:` node's entry carries a pause that belongs to a node inside \
+             the instance it ran, which `docs/trace.md` §3 says it never does: \
+             {entry}"
+        );
+        assert!(
+            entry.get("dispatches").is_none(),
+            "a `map` node's entry carries a pause that belongs to a node inside \
+             an instance it dispatched, which `docs/trace.md` §3 says it never \
+             does: {entry}"
+        );
     }
 }
 
@@ -532,6 +696,112 @@ fn a_failed_runs_trace_document_keeps_its_shape() {
     insta::assert_snapshot!(document(&run));
 }
 
+/// A run that ended holding a pause (`docs/trace.md` §3.4, §9).
+///
+/// The third thing a document's `status` can say, and the record version `2`
+/// added, in the one run that produces both without a resume surface: an
+/// `agent-compose run` that reaches a `human` node stops there (grammar §8.7),
+/// so the document is `status: "interrupted"` and the node's entry carries a
+/// `human` record with a `pausedAt` and no settlement — the one case §3.4's
+/// presence column says `settled`/`settledAt` are absent in, which is a promise
+/// nothing else here holds.
+#[test]
+fn an_interrupted_runs_trace_document_keeps_its_shape() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "answer": "an answer" })),
+    ));
+
+    let Some(run) = harness::run(
+        "http-trigger",
+        "flow.assisted",
+        &[("question", "what is it?")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.failed();
+    insta::assert_snapshot!(document(&run));
+}
+
+/// A pause is recorded on the node that held it and on no node above it
+/// (`docs/trace.md` §3).
+///
+/// The presence rule §3's `human` row ends on — "a node that is not a `human`
+/// node never carries it" — read at the two places a pause is reached from
+/// *under* another node, which is where it can be broken without any snapshot
+/// here changing. `flow.assisted`, which
+/// [`an_interrupted_runs_trace_document_keeps_its_shape`] pins, pauses at the
+/// top level of the flow it triggered, so its document has no enclosing entry
+/// for a wait to leak onto; these two have one each. `flow.patient` wraps the
+/// pause in a `flow:` node and `flow.batch` dispatches it from a `map`, and the
+/// error that carries the interrupt out of the run passes through both on its
+/// way — which is the reason a node that held no wait can end up reporting one.
+///
+/// What a leak would look like to a reader is why this is a `must` rather than
+/// tidiness: one wait would be reported by N+1 entries, and the extra copies
+/// carry no `settledAt`, so each reads as §3.4's one settlement-free case — a
+/// wait the run ended holding — on a node that never waited for anything.
+#[test]
+fn a_pause_is_recorded_on_the_node_that_held_it_and_on_no_node_above_it() {
+    let provider = MockProvider::start().expect("a loopback port");
+
+    // One construct out: a `flow:` node whose subflow pauses.
+    let Some(wrapped) = harness::run(
+        "http-trigger",
+        "flow.patient",
+        &[("question", "what is it?")],
+        &provider,
+    ) else {
+        return;
+    };
+    wrapped.failed();
+    let held = wrapped.trace_document();
+    every_human_record_is_on_the_node_that_paused(&held);
+    assert_eq!(
+        nodes_holding_a_pause(&held),
+        [("flow.sign_off".to_string(), "sign".to_string())],
+        "`wrap` ran the instance that paused and held no wait of its own: {held}"
+    );
+
+    // …and the other: a `map` dispatching a flow that pauses. One item, because
+    // what is asserted is which entries carry the record rather than how many
+    // instances a fan-out gets as far as parking before the first interrupt ends
+    // the node.
+    let Some(dispatched) = harness::run(
+        "http-trigger",
+        "flow.batch",
+        &[("questions", r#"["what is it?"]"#)],
+        &provider,
+    ) else {
+        return;
+    };
+    dispatched.failed();
+    let held = dispatched.trace_document();
+    every_human_record_is_on_the_node_that_paused(&held);
+    assert_eq!(
+        nodes_holding_a_pause(&held),
+        [("flow.sign_off".to_string(), "sign".to_string())],
+        "`fan` dispatched the instance that paused and held no wait of its own: \
+         {held}"
+    );
+
+    // The rule is an absence, so it is worth one positive beside it: the entry
+    // that *does* carry the record is the one the run stopped at, and it carries
+    // the settlement-free shape §3.4 describes.
+    let paused = entries(&held)
+        .into_iter()
+        .find(|entry| entry.get("human").is_some())
+        .unwrap_or_else(|| panic!("the run ended holding a pause: {held}"));
+    assert!(
+        paused["human"]["pausedAt"].is_string()
+            && paused["human"]["settled"].is_null()
+            && paused["human"]["settledAt"].is_null(),
+        "{paused}"
+    );
+}
+
 /// Both halves of a routing record are in **declaration** order, including the
 /// one edge shape whose declaration order a router cannot decide in
 /// (`docs/trace.md` §4).
@@ -835,7 +1105,7 @@ fn the_status_route_carries_the_version_beside_its_trace() {
     );
     assert_eq!(
         finished["trace_version"],
-        json!(1),
+        json!(2),
         "…and the version that describes them, beside them (`docs/trace.md` §1): \
          {finished}"
     );
