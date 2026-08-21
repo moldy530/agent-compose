@@ -131,6 +131,7 @@ pub const FIXTURES: &[&str] = &[
     "fanout",
     "flow-as-tool",
     "http-trigger",
+    "keyless-gateway",
     "model-failover",
     "provider-kinds",
     "stores",

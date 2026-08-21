@@ -1,0 +1,164 @@
+# Acceptance fixture: providers that hold no key, and one that does.
+#
+# Grammar 12.1 makes `api_key:` conditional on the two kinds with a default
+# endpoint (Decision D120): a provider that names a `base_url:` may declare none,
+# because the gateway that `base_url:` points at injects the vendor credential
+# server-side. What a compiled graph must then do is send **no** authentication
+# header at all — not an empty one — and that is a property of the *request*,
+# which no assertion about a flow's outputs can see.
+#
+# So this fixture is written to be read from the transcript. Three flows, one
+# node each:
+#
+#   * `flow.messages` — a keyless `anthropic` provider, so the recorded request
+#     must carry no `x-api-key`;
+#   * `flow.chat` — a keyless `openai` provider, so it must carry no
+#     `authorization`;
+#   * `flow.keyed` — the same `anthropic` wire with `api_key:` declared, which is
+#     the other direction of the same rule and the only place the suite asserts
+#     that the Messages surface sends its credential when the spec has one.
+#
+# One flow per case rather than one flow with three nodes: what is being decided
+# is a single request's headers, and a flow whose second agent replayed the
+# first one's exchange would put the conversation channel between the assertion
+# and its subject.
+version: "0.1"
+
+state:
+  verdict:
+    enum: [approve, revise]
+    default: approve
+  feedback:
+    type: string
+    default: ""
+  summary:
+    type: string
+    default: ""
+
+# No `api_key:`. Legal because `base_url:` is declared, and the whole point of
+# the fixture: `${MOCK_BASE_URL}` is the gateway stand-in every fixture here
+# points at, and this one reaches it holding nothing.
+provider.claude_gateway:
+  kind: anthropic
+  base_url: ${MOCK_BASE_URL}
+
+provider.openai_gateway:
+  kind: openai
+  base_url: ${MOCK_BASE_URL}
+
+# The control: the same kind and the same endpoint, with the credential the
+# other two decline to hold.
+provider.claude_direct:
+  kind: anthropic
+  base_url: ${MOCK_BASE_URL}
+  api_key: ${MOCK_API_KEY}
+
+model.gateway_messages:
+  provider: provider.claude_gateway
+  id: claude-sonnet-4-6
+
+model.gateway_chat:
+  provider: provider.openai_gateway
+  id: gpt-4o
+
+model.keyed_messages:
+  provider: provider.claude_direct
+  id: claude-haiku-4-5
+
+agent.gateway_reviewer:
+  description: Reviews a goal through a keyless Messages connection.
+  model: model.gateway_messages
+  prompt: |
+    You are a meticulous technical reviewer.
+  input:
+    goal:
+      type: string
+  output:
+    verdict:
+      enum: [approve, revise]
+    feedback:
+      type: string
+
+agent.gateway_summarizer:
+  description: Summarizes a review through a keyless Chat Completions connection.
+  model: model.gateway_chat
+  prompt: |
+    You summarize reviews in one line.
+  input:
+    notes:
+      type: string
+  output:
+    summary:
+      type: string
+
+agent.keyed_reviewer:
+  description: Reviews a goal through a Messages connection that holds a key.
+  model: model.keyed_messages
+  prompt: |
+    You are a meticulous technical reviewer.
+  input:
+    goal:
+      type: string
+  output:
+    verdict:
+      enum: [approve, revise]
+    feedback:
+      type: string
+
+flow.messages:
+  description: "One agent node whose `anthropic` provider declares no `api_key:`."
+  inputs:
+    goal:
+      type: string
+      min_length: 1
+  outputs:
+    verdict:
+      enum: [approve, revise]
+    feedback:
+      type: string
+  nodes:
+    review:
+      agent: agent.gateway_reviewer
+      input:
+        goal: "input.goal"
+  edges:
+    - { from: start, to: review }
+    - { from: review, to: end }
+
+flow.chat:
+  description: "One agent node whose `openai` provider declares no `api_key:`."
+  inputs:
+    notes:
+      type: string
+      min_length: 1
+  outputs:
+    summary:
+      type: string
+  nodes:
+    summarize:
+      agent: agent.gateway_summarizer
+      input:
+        notes: "input.notes"
+  edges:
+    - { from: start, to: summarize }
+    - { from: summarize, to: end }
+
+flow.keyed:
+  description: "The same wire with `api_key:` declared: the header is still sent."
+  inputs:
+    goal:
+      type: string
+      min_length: 1
+  outputs:
+    verdict:
+      enum: [approve, revise]
+    feedback:
+      type: string
+  nodes:
+    review:
+      agent: agent.keyed_reviewer
+      input:
+        goal: "input.goal"
+  edges:
+    - { from: start, to: review }
+    - { from: review, to: end }
