@@ -194,26 +194,47 @@ pub(crate) fn parse(
 
 /// The headers the surface requires, per route.
 ///
-/// The **direct** route carries no credential check, and that is a decision
-/// rather than an omission: see WIRE-NOTES (12). Grammar 12.1 lets an `openai`
-/// provider that names a `base_url:` declare no `api_key:` (Decision D120), and
-/// `openai_compatible` — which reaches this same route — has always made the key
-/// optional, so a compiled graph legitimately sends no `Authorization` at all
-/// and this server stands in for the gateway as much as for the vendor.
+/// The **direct** route no longer requires a credential to be *there*, and that
+/// is a decision rather than an omission: see WIRE-NOTES (12). Grammar 12.1 lets
+/// an `openai` provider that names a `base_url:` declare no `api_key:` (Decision
+/// D120), and `openai_compatible` — which reaches this same route — has always
+/// made the key optional, so a compiled graph legitimately sends no
+/// `Authorization` at all and this server stands in for the gateway as much as
+/// for the vendor.
 ///
-/// The **Azure** routes keep theirs. `azure_openai` requires `api_key:` outright
-/// (grammar 12.1), so a request reaching a deployment route with neither
-/// spelling of the credential is the codegen bug this check was written for.
+/// **Only the presence requirement was dropped.** An `authorization` that *is*
+/// on the wire is still held to the spelling the service accepts —
+/// `Bearer <token>`, with a token — because the keyless posture the runtime
+/// promises is a header that is *absent*, not one that is malformed:
+/// `authorization: Bearer ` and a raw key under `authorization:` are requests
+/// that claim to authenticate and fail, and `api.openai.com` answers both 401.
+/// That is the codegen bug this check is now for, and it is the check the direct
+/// route always had, minus the part a keyless composition legitimately trips.
+///
+/// The **Azure** routes keep the presence check too. `azure_openai` requires
+/// `api_key:` outright (grammar 12.1), so a request reaching a deployment route
+/// with neither spelling of the credential is a codegen bug there as well — and
+/// a malformed `authorization` with no `api-key` beside it lands on the same
+/// refusal, since a bearer token that is not one leaves the route with nothing.
 fn check_headers(checker: &mut Checker, route: Route, headers: &BTreeMap<String, String>) {
     let value = |name: &str| headers.get(name).filter(|value| !value.is_empty());
-    let bearer = value("authorization").is_some_and(|value| value.starts_with("Bearer "));
+    let bearer = value("authorization")
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .is_some_and(|token| !token.trim().is_empty());
     // A credential, not a field: answered 401 rather than 400 (see `rejected`),
     // because that is the status the `openai` SDK's `AuthenticationError` comes
     // from and generated code may well classify the two apart.
-    if route.is_azure() && !bearer && value("api-key").is_none() {
+    if route.is_azure() {
+        if !bearer && value("api-key").is_none() {
+            checker.credential(
+                "headers.api-key",
+                "Access denied due to missing subscription key. Make sure to include subscription key when making requests to an API.",
+            );
+        }
+    } else if headers.contains_key("authorization") && !bearer {
         checker.credential(
-            "headers.api-key",
-            "Access denied due to missing subscription key. Make sure to include subscription key when making requests to an API.",
+            "headers.authorization",
+            "You didn't provide an API key. You need to provide your API key in an Authorization header using Bearer auth (i.e. Authorization: Bearer YOUR_KEY).",
         );
     }
     let json = headers
@@ -2131,6 +2152,29 @@ mod tests {
             "a keyless request is a legal shape on the direct route: {:?}",
             parsed.failures
         );
+
+        // A *malformed* one is not. Only the presence requirement was dropped:
+        // an `authorization` that is on the wire is still held to the spelling
+        // the service accepts, so a raw key and a bearer prefix with nothing
+        // after it are both the 401 they draw live.
+        for malformed in ["mock-provider-key", "Bearer ", "Bearer   ", ""] {
+            let mut wrong = headers();
+            wrong.insert("authorization".to_string(), malformed.to_string());
+            let parsed = parse(
+                Route::Direct,
+                &wrong,
+                "",
+                None,
+                Some(&request(
+                    json!({ "messages": [{ "role": "user", "content": "go" }] }),
+                )),
+            );
+            assert_eq!(
+                parsed.failures[0].pointer, "headers.authorization",
+                "`authorization: {malformed}` is a malformed credential"
+            );
+            assert!(parsed.failures[0].authentication);
+        }
 
         // Azure's is still required, and is still a credential: the refusal is
         // a 401 rather than the 400 a bad body draws — the distinction

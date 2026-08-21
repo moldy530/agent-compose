@@ -711,6 +711,81 @@ fn a_request_without_credentials_is_served_on_the_direct_route() {
     );
 }
 
+/// A call that *does* carry a credential is still held to its shape: only the
+/// presence requirement was dropped on the direct route, not the check.
+///
+/// This is the half of WIRE-NOTES (12) the keyless relaxation must not take with
+/// it. A graph that declares `api_key:` and puts it on the wire raw — no `Bearer`
+/// prefix — or that renders `Bearer ` around a key that resolved to nothing, is
+/// a codegen bug `api.openai.com` answers 401; a harness that served it would
+/// pass the bug through to the first live call, which is the failure this whole
+/// file exists to prevent. The refusal names the credential and nothing else,
+/// and consumes no script.
+#[test]
+fn a_request_whose_credential_is_malformed_is_refused_on_the_direct_route() {
+    let provider = MockProvider::start().expect("a port");
+    provider.enqueue(Script::new(MODEL, Outcome::text("never served")));
+
+    for malformed in ["mock-provider-key", "Basic bW9jaw==", "Bearer "] {
+        let response = provider
+            .client()
+            .send(
+                Request::post("/v1/chat/completions")
+                    .header("authorization", malformed)
+                    .json(&json!({
+                        "model": MODEL,
+                        "messages": [{ "role": "user", "content": "go" }],
+                    })),
+            )
+            .expect("the route answers");
+        assert_eq!(response.status, 401, "`authorization: {malformed}`");
+        let body = response.json();
+        assert_eq!(body["error"]["code"], "invalid_api_key");
+        assert_eq!(
+            body["error"]["param"],
+            Value::Null,
+            "a header is not a request parameter"
+        );
+        assert_eq!(response.header(HARNESS_HEADER), Some(REFUSED_INVALID));
+    }
+
+    let recorded = provider.requests();
+    assert_eq!(recorded.len(), 3);
+    for request in &recorded {
+        assert!(!request.is_valid());
+        assert_eq!(
+            request
+                .failures()
+                .iter()
+                .map(|failure| failure.pointer.as_str())
+                .collect::<Vec<_>>(),
+            ["headers.authorization"],
+            "the body was well formed: only the credential is wrong"
+        );
+    }
+    assert_eq!(
+        provider.snapshot().queues[MODEL],
+        1,
+        "a request refused for its credential consumes nothing"
+    );
+
+    // …and the well-formed spelling of the same key is served, so what the three
+    // refusals measure is the shape and not the route.
+    let response = send(
+        &provider.client(),
+        "/v1/chat/completions",
+        &json!({
+            "model": MODEL,
+            "messages": [{ "role": "user", "content": "go" }],
+        }),
+    );
+    assert_eq!(response.status, 200);
+    assert!(
+        provider.snapshot().queues.is_empty(),
+        "the well-formed call is the one that consumed the script"
+    );
+}
+
 /// Azure's missing subscription key is still a **401**, and it is the last
 /// credential this server requires.
 ///

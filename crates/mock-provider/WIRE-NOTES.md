@@ -144,22 +144,26 @@ These are load-bearing and pinned by tests in `src/` and `tests/`:
   `stop_reason` / `finish_reason` is the one field a compiled agent's tool loop
   branches on, so a `reply` may override it only with a value the surface really
   sends *and* one the body can carry — see (16). Everything else, `raw`.
-* **A missing credential is a 401** — where a credential is required at all.
-  The status is not the 400 a malformed body draws, because 401 is what both
-  SDKs raise `AuthenticationError` from; authentication is settled before the
-  body is, so the refusal names the credential and nothing else, while the
-  transcript still records every failure the request had. (11) is why 401 is
-  safe: neither the failover set nor the SDK retry set claims it.
+* **A missing or malformed credential is a 401** — where a credential is
+  required at all, and a malformed one is required to be well formed
+  everywhere. The status is not the 400 a malformed body draws, because 401 is
+  what both SDKs raise `AuthenticationError` from; authentication is settled
+  before the body is, so the refusal names the credential and nothing else,
+  while the transcript still records every failure the request had. (11) is why
+  401 is safe: neither the failover set nor the SDK retry set claims it.
 
-  **This server asks for one on the Azure routes only** (`api-key`, or a bearer
-  token), and (12) is the whole argument. The short form: `azure_openai` is the
-  one kind whose `api_key:` grammar 12.1 still requires outright, so a
-  deployment route reached without a credential is a codegen bug. On the
-  Messages API and the direct Chat Completions route the credential is
-  *conditional* — an `anthropic` or `openai` provider that names a `base_url:`
-  may declare none, and `openai_compatible` always could — so a request with no
-  `x-api-key` and no `Authorization` is a legal wire shape rather than a
-  mistake, and refusing it would make this harness stricter than the grammar.
+  **This server asks for a credential to be *there* on the Azure routes only**
+  (`api-key`, or a bearer token), and (12) is the whole argument. The short
+  form: `azure_openai` is the one kind whose `api_key:` grammar 12.1 still
+  requires outright, so a deployment route reached without a credential is a
+  codegen bug. On the Messages API and the direct Chat Completions route the
+  credential is *conditional* — an `anthropic` or `openai` provider that names a
+  `base_url:` may declare none, and `openai_compatible` always could — so a
+  request with no `x-api-key` and no `Authorization` is a legal wire shape
+  rather than a mistake, and refusing it would make this harness stricter than
+  the grammar. **A credential that is there is still checked for shape on every
+  route**: `x-api-key: ""` and an `authorization` that is not `Bearer <token>`
+  are refused, because absent is the keyless posture and empty is not.
 * **`tool_choice` requires `tools`**, on both surfaces, and **OpenAI refuses an
   empty `tools` array** (`Invalid 'tools': empty array. Expected an array with
   minimum length 1.`) — which is what a compiled graph sends for an agent with
@@ -351,36 +355,54 @@ the Azure routes. Values are never compared: the harness needs **no API keys**
 generated code sends the header at all, which a live call would otherwise be the
 first to discover.
 
-**A credential is checked only where a composition must carry one.** Grammar
-12.1's row is what decides that, and since Decision D120 it is not the same
-answer on every route:
+**A credential's *presence* is required only where a composition must carry one;
+its *shape* is required everywhere.** Grammar 12.1's row is what decides the
+first half, and since Decision D120 it is not the same answer on every route:
 
-| route | credential | why |
+| route | credential must be there | credential must be well formed |
 |---|---|---|
-| `POST /v1/messages` | not checked | an `anthropic` provider naming a `base_url:` may declare no `api_key:`, and then a compiled graph sends no `x-api-key` at all |
-| `POST /v1/chat/completions` | not checked | the same for `openai`, and `openai_compatible` — which reaches this route — always made `api_key:` optional |
-| the Azure routes | **required** | `azure_openai` requires `api_key:` outright, so a request without one is a codegen bug |
+| `POST /v1/messages` | no — an `anthropic` provider naming a `base_url:` may declare no `api_key:`, and then a compiled graph sends no `x-api-key` at all | yes — a present `x-api-key` must be non-empty |
+| `POST /v1/chat/completions` | no — the same for `openai`, and `openai_compatible`, which reaches this route, always made `api_key:` optional | yes — a present `authorization` must be `Bearer <token>`, with a token |
+| the Azure routes | **yes** — `azure_openai` requires `api_key:` outright, so a request without one is a codegen bug | yes — the same bearer rule, and `api-key` non-empty |
 
-The two relaxed rows are a **deliberate leniency**, and the only one in this
+The two relaxed cells are a **deliberate leniency**, and the only one in this
 file: a live `api.anthropic.com` answers an unauthenticated request 401, and
 this server does not. It is the right leniency because the server is not
 standing in for the vendor's host — it is standing in for whatever a
 composition's `base_url:` names, which is now routinely a gateway that injects
 the vendor credential server-side. Enforcing presence there would refuse the one
 deployment shape D120 exists to admit, and would do it in CI, where the mock is
-the *only* endpoint a compiled graph reaches. What is lost is the mock catching
-a codegen bug that drops a credential the composition *did* declare; that is
-covered instead where it is decidable — `compiled_graph_acceptance.rs` asserts on
-the recorded request's headers in both directions, present when the spec
-declares a key and absent when it does not.
+the *only* endpoint a compiled graph reaches.
 
-Where a credential *is* checked, a missing one is 401 and a missing or wrong
-`content-type` is 400 — the split the Certain list states, and the one both SDKs
-classify on (`AuthenticationError` is raised from the status alone). *Assumed*:
-that a **present but placeholder** key would also pass a live call, which is the
-whole basis of a keyless harness, and the exact error `code` on the Chat
-Completions 401 (`invalid_api_key`; a live missing-key 401 may carry
-`code: null`). *If wrong*: only a test asserting the string breaks —
+**Nothing else was relaxed with it.** A credential that *is* on the wire is held
+to the spelling the service accepts, because the keyless posture the runtime
+promises is a header that is absent, not one that is empty or malformed:
+`x-api-key: ""`, `authorization: Bearer ` and a raw key under `authorization:`
+are all requests that claim to authenticate and fail, and a live vendor answers
+each 401. Those are codegen bugs, they are decidable from one request, and the
+harness refuses them — `tests/anthropic_wire.rs`'s
+`an_empty_api_key_is_refused_while_a_gateway_token_is_served` and
+`tests/openai_wire.rs`'s
+`a_request_whose_credential_is_malformed_is_refused_on_the_direct_route` are
+where that is pinned.
+
+What the leniency does cost is the one case that is *not* decidable from a
+request: a credential sent under the wrong header for its wire. On the Messages
+route `authorization: Bearer …` with no `x-api-key` beside it is the documented
+gateway composition (`docs/topics/models.md`, "Keyless providers behind a
+gateway", writes exactly that under `headers:`), so this server cannot tell it
+apart from codegen having put the vendor key in the wrong place. That is covered
+where it *is* decidable — `compiled_graph_acceptance.rs` reads the recorded
+request against the spec that produced it, asserting the credential header is
+present when the spec declares a key and absent when it does not.
+
+A missing or malformed credential is 401 and a missing or wrong `content-type`
+is 400 — the split the Certain list states, and the one both SDKs classify on
+(`AuthenticationError` is raised from the status alone). *Assumed*: that a
+**present but placeholder** key would also pass a live call, which is the whole
+basis of a keyless harness, and the exact error `code` on the Chat Completions
+401 (`invalid_api_key`; a live missing-key 401 may carry `code: null`). *If
+wrong*: only a test asserting the string breaks —
 `tests/openai_wire.rs`'s `an_azure_request_without_a_subscription_key_is_refused`
 is where it lives.
 

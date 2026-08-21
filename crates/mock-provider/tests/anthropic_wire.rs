@@ -365,6 +365,79 @@ fn a_request_without_an_api_key_is_served() {
     );
 }
 
+/// An **empty** `x-api-key` is refused 401, because it is neither posture the
+/// grammar admits.
+///
+/// This is the half of WIRE-NOTES (12) the keyless relaxation must not take with
+/// it: only the *presence* requirement was dropped, not the check. A keyless
+/// provider sends no header at all — the emitted runtime's `credential` drops it
+/// rather than emptying it, precisely so a gateway is never handed a request
+/// that claims to authenticate with nothing. `x-api-key: ""` is therefore a
+/// codegen bug on the way to a live 401, and the harness has to be the one to
+/// find it.
+///
+/// A **gateway token under `authorization`** is the other direction and is
+/// served: `docs/topics/models.md` documents exactly that composition
+/// (`headers: { authorization: "Bearer ${PROXY_TOKEN}" }` on a keyless
+/// `kind: anthropic`), so this surface cannot treat the header as a misplaced
+/// vendor credential without refusing the shape D120 exists to admit.
+#[test]
+fn an_empty_api_key_is_refused_while_a_gateway_token_is_served() {
+    let provider = MockProvider::start().expect("a port");
+    provider.enqueue(Script::new(MODEL, Outcome::text("served for the gateway")));
+
+    let body = json!({
+        "model": MODEL,
+        "max_tokens": 1024,
+        "messages": [{ "role": "user", "content": "go" }],
+    });
+    let response = provider
+        .client()
+        .send(
+            Request::post("/v1/messages")
+                .header("x-api-key", "")
+                .header("anthropic-version", "2023-06-01")
+                .json(&body),
+        )
+        .expect("the route answers");
+    assert_eq!(response.status, 401);
+    assert_eq!(response.json()["error"]["type"], "authentication_error");
+    assert_eq!(response.header(HARNESS_HEADER), Some(REFUSED_INVALID));
+    assert_eq!(
+        provider.requests()[0]
+            .failures()
+            .iter()
+            .map(|failure| failure.pointer.as_str())
+            .collect::<Vec<_>>(),
+        ["headers.x-api-key"],
+        "the body was well formed: only the credential is wrong"
+    );
+    assert_eq!(
+        provider.snapshot().queues[MODEL],
+        1,
+        "a request refused for its credential consumes nothing"
+    );
+
+    let response = provider
+        .client()
+        .send(
+            Request::post("/v1/messages")
+                .header("authorization", "Bearer proxy-token")
+                .header("anthropic-version", "2023-06-01")
+                .json(&body),
+        )
+        .expect("the route answers");
+    assert_eq!(response.status, 200);
+    assert_eq!(
+        response.json()["content"][0]["text"],
+        "served for the gateway"
+    );
+    assert!(
+        provider.snapshot().queues.is_empty(),
+        "the gateway call is the one that consumed the script"
+    );
+}
+
 /// Every failover condition PRD 5.9 names, on the wire, with the status and body
 /// the SDK classifies from.
 #[test]
