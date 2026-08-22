@@ -235,8 +235,6 @@ export interface Journal {
   lookup(execution: string, key: string): JournalRecord | undefined;
   /** Append one effect. */
   append(record: JournalRecord): void;
-  /** Release the handle. */
-  close(): void;
 }
 
 // ---------------------------------------------------------------------------
@@ -390,9 +388,6 @@ class SqliteJournal implements Journal {
     );
   }
 
-  close(): void {
-    this.#database.close();
-  }
 }
 
 /** One error outcome, read back off its stored payload. */
@@ -507,11 +502,6 @@ export function journalExists(): boolean {
   return fs.existsSync(journalPath());
 }
 
-/** Forget the cached handle — for a caller that has closed the journal. */
-export function releaseJournal(): void {
-  opening = undefined;
-}
-
 // ---------------------------------------------------------------------------
 // Canonical values
 // ---------------------------------------------------------------------------
@@ -620,8 +610,6 @@ export interface JournalSession {
   readonly resuming: boolean;
   /** Next ordinal per `<site>#<kind>`. */
   readonly ordinals: Map<string, number>;
-  /** Whether any effect has yet gone past the frontier — for the report. */
-  frontier: boolean;
 }
 
 /** Every execution this process is journaling, by id. */
@@ -640,20 +628,9 @@ export function openSession(
   journal: Journal,
   resuming: boolean,
 ): JournalSession {
-  const session: JournalSession = {
-    execution,
-    journal,
-    resuming,
-    ordinals: new Map(),
-    frontier: !resuming,
-  };
+  const session: JournalSession = { execution, journal, resuming, ordinals: new Map() };
   sessions.set(execution, session);
   return session;
-}
-
-/** Whether anything past the journal's record has run in this session. */
-export function reachedFrontier(execution: string): boolean {
-  return sessions.get(execution)?.frontier ?? false;
 }
 
 /** Close one execution's session. The journal handle is the project's. */
@@ -763,11 +740,13 @@ export class EffectRecorder {
           );
         }
         held = found.outcome;
-      } else {
-        // The first key the journal does not hold is the frontier, and past it
-        // this execution is live again (resolved q29).
-        session.frontier = true;
       }
+      // The first key the journal does not hold is the frontier, and past it
+      // this execution is live again (resolved q29): `held` stays undefined and
+      // the caller performs the effect. Nothing is recorded about *reaching* it,
+      // because a frontier is per key rather than a state the execution enters —
+      // a `map` whose third item had run and whose fourth had not resumes with
+      // three replayed branches and one live one.
     }
 
     const write = (outcome: JournalOutcome): void => {

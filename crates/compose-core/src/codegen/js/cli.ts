@@ -312,7 +312,9 @@ async function resumeVerb(argv: readonly string[]): Promise<number> {
     throw new UsageError(
       `\`${execution}\` has already ${row.status}${
         row.endedAt === undefined ? "" : ` (${row.endedAt})`
-      }, so there is nothing to resume: the journal keeps the record of an execution that ended, and re-running it would re-issue effects that record says already happened`,
+      }, so there is nothing to resume: the journal keeps the record of an execution that ended, and re-running it would re-issue effects that record says already happened${
+        row.error === undefined ? "" : ` — it ended with ${row.error}`
+      }`,
     );
   }
   const flow = flows[row.flow];
