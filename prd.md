@@ -402,13 +402,25 @@ Exit criterion: a user can download a released binary, hand their coding agent t
 - Installable agent skill: `agent-compose skill`, a packaged skill definition teaching the CLI and the discovery loop rather than the grammar, installable into a user's agent (Claude Code, Codex, …) (resolved q23).
 - Release distribution: tagged releases publish prebuilt binaries for Linux and macOS (x86_64 + arm64) on GitHub Releases, with a checksum-verified install script and a dry run of the pipeline on every pull request (resolved q24).
 
-**M3 — Distribution (design-gated)**
-- `--target distributed` via `RemoteGraph`; execute `placements`.
-- Postgres checkpointer wiring; isolation/credential story per placement.
+**M3 — Distribution (design-gated; durability first — owner call)**
+
+Sequenced by owner priority: durable execution leads, and ships on its own
+before any distributed-placement work.
+
+- **Durable execution**: executions survive a process restart — open `human`
+  waits included — and resume across process generations. The mechanism is
+  gated on §10's open durability questions; note that "Postgres checkpointer
+  wiring" (this milestone's original spelling) predates resolved q17's in-task
+  instance shaping and resolved q4's wait board, both of which put most of a
+  run's live state where a LangGraph checkpointer cannot see it.
+- `--target distributed` via `RemoteGraph`; execute `placements`; isolation/credential story per placement.
 - Execute `schedule` and `event` triggers; declarative auth for `http` triggers.
 - Production `storage_backends` (Redis, pgvector, S3) behind the store plugin interface.
 - Least-privilege env distribution: isolated deployments receive only statically-referenced secrets.
-- `eject` command (deferred from M2 — owner call: not needed until the deploy story firms up).
+
+Deferred out of the milestone sequence entirely (owner call, 2026-08-21): the
+`eject` command. The eject *path* (PRD 5.12 — copy the directory, stop
+regenerating) remains the documented escape hatch.
 
 ## 8. Risks
 
@@ -462,7 +474,13 @@ Formerly open, now settled — rationale lives in the referenced sections:
 
 _New questions raised during grammar/spec work land here and must be resolved (moved to §9) before implementation of the affected area begins._
 
-_None currently open._
+26. **What mechanism makes an execution durable?** Two shapes are on the table. **(a) LangGraph's checkpointer interface** (Postgres/SQLite savers), the milestone's original spelling — but resolved q17 shapes subflow and map instances *inside* a task, and resolved q4 parks `human` waits on an in-process wait board, so the majority of a mid-run execution's live state is in places a graph-level checkpointer never sees; adopting it would mean restructuring both to be checkpointer-visible. **(b) A journal + replay of the trace this runtime already keeps**: every effect carries an idempotency key (resolved q10), store reads are recorded so "a replay has something to consume" (`docs/trace.md` §6, normative), every model call's attempts are recorded, and traversal ordinals are deterministic — i.e., the trace format was designed as a replay log, and durability is making the runtime *write it as one and read it back*. Lead recommendation: **(b)** — it fits the architecture as built, adds no LangGraph-version coupling to the durability story, and turns `docs/trace.md`'s existing replay discipline from documentation into the tested contract.
+
+27. **Where does the journal live, and how is that chosen?** Recommendation: the journal backend is a **deploy-target slot**, exactly as `storage_backends` are — the composition says nothing, the target binds it. `--target local` binds a SQLite journal file beside the project (durable by default, zero configuration, one file to delete), and a distributed target binds Postgres; both sit behind one journal interface so the runtime cannot tell which it got. The rejected alternative is a grammar-level knob (`durability: on|off` in the spec), which would make the same composition durable on one machine and not another *by author declaration* — placement facts belong in deploy files (5.10), and whether an execution survives a restart is a placement fact.
+
+28. **What does v1 durability scope cover?** Recommendation, three clauses: **`serve` auto-recovers** — on process start it replays every execution the journal holds open, including executions parked on `human` waits, which re-park with their wait ids intact (the wait id is deterministic — node path + ordinal — so a resume request that arrives after the restart still finds its wait); **`run` journals but does not auto-resume** — a crashed one-shot run is resumed explicitly by a new verb (`agent-compose resume <execution>`), because a CLI invocation ending is not evidence the user wants it re-run; and **triggers fire once** — recovery replays executions that exist, it does not re-fire the trigger that created them. Out of v1 scope, stated: cross-process migration (a journal written by one host resumed on another is M3-distribution's problem), and journal compaction.
+
+29. **What does replay execute, and what does it not?** Recommendation: **replay is read-only up to the frontier**. A replayed execution consumes recorded model answers, recorded store reads, and recorded tool results by idempotency key — byte-for-byte, no re-issue — and only the frontier (the first effect the journal does not hold) reaches the network. Consequence worth stating now: this makes determinism of everything *between* effects (routing, CEL evaluation, ordinal assignment) a durability-correctness requirement rather than a trace-niceness, so the conformance corpus and the ordinal rules become part of the recovery contract, and a divergence found at replay time (recorded answer fails the current contract) fails the resume with a diagnostic naming the divergent step rather than silently re-executing.
 
 ## 11. References
 
