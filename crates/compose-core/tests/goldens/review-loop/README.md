@@ -103,6 +103,7 @@ run` and `agent-compose serve` launch:
 
 ```sh
 bun src/index.ts run flow.<name> --input goal=... [--session <key>] [--format json]
+bun src/index.ts resume <execution-id> [--format json]
 bun src/index.ts serve --port 8787
 ```
 
@@ -119,17 +120,29 @@ a payload whose one member is this argument, and what that expression answers is
 the partition the run addresses (grammar 13.2). Declared on no trigger, the
 argument is the identity.
 
+`resume` carries on an execution this project's journal holds open — a run the
+machine lost, or one that stopped at a `human` pause with nobody to ask. Every
+run is journaled as it goes, and the first line `run` writes to stderr is the id
+this verb takes (`execution: exec_…`); under `--format json` the same value is
+`execution_id`. The graph is re-executed from its entry with every recorded
+effect **consumed** — the model answers it got, the results its tools produced,
+what its stores read, what a person answered — and only the frontier, the first
+effect the journal does not hold, reaches the network. It takes no `--input` and
+no `--session`: the invocation it replays is the one the journal recorded.
+
 `serve` starts the app over the composition's declared `http` triggers and
 announces where it is listening as one JSON line on stdout. Beside them it
 mounts two routes of its own — `GET /executions/:id` for an execution's status
 and `POST /executions/:id/resume` — so those two are the app's and a trigger
-cannot declare either: the compiler refuses one that does. Executions are
-tracked in that process: durable execution and checkpointers are a later
-milestone, so a status route answers `404` for an id the process did not start —
-and every execution it *did* start, with its outputs and its trace, is held for
-the life of the process, so a long-running `serve` grows with the number of
-requests it has answered. Restarting it is the only way to reclaim that until
-the checkpointer arrives and an execution stops living in memory.
+cannot declare either: the compiler refuses one that does. On start it
+**recovers** every execution the journal holds open, before it accepts a
+connection, so a pause comes back under the same wait id and a resume URL
+prepared against the process that died still finds it; triggers are not
+re-fired. What is still tracked in the process alone is the *report*: a status
+route answers `404` for an id neither this process nor the journal knows, and
+every execution it has finished, with its outputs and its trace, is held for the
+life of the process — so a long-running `serve` grows with the number of
+requests it has answered, and restarting it is what reclaims that.
 
 Stopping it stops the graph: `agent-compose serve` passes `SIGINT` and `SIGTERM`
 on to this project, which closes the app and exits, so a supervisor that signals

@@ -142,6 +142,15 @@ instantiation's own instance path — which is exactly how they trace
 (`docs/trace.md` §8) — so their effects are journaled without a record for the
 boundary itself.
 
+That inventory is held **mechanically**, in both directions:
+`crates/compose-core/src/codegen/journal.rs`'s
+`every_effect_site_reaches_the_journal_and_the_document_names_them_all` reads
+each of the six functions above out of the emitted modules and fails when one
+does not reach the journal, when this table does not name it, or when a seventh
+site exists that this table does not. A surface added to `src/runtime.ts` that
+calls the world and is not journaled is a replay that issues it twice — and the
+run would succeed, so nothing else in the repository would notice.
+
 ### 3.1 A model call
 
 One record per call `callModel` made, whichever way it ended. It holds the

@@ -62,15 +62,22 @@
 // Store ops are effects, and both halves of that are here:
 //
 // * **reads are recorded** — every op that answers with stored data writes a
-//   `StoreRecord` onto the node's trace entry, carrying what it answered. That
-//   record is the history a replay is meant to consume instead of the live store;
-//   this release has no checkpointer to replay *from* (M3 owns durable
-//   execution), so the record is what a trace holds and what a later replay will
-//   read.
+//   `StoreRecord` onto the node's trace entry, carrying what it answered, and
+//   the op itself is written to this project's journal (`./journal.ts`). The
+//   second of those is what a replay consumes: a resumed execution answers a
+//   read out of the record instead of asking the live store, and does not apply
+//   a **write** a second time — the row the journal holds is the row the first
+//   generation wrote, `deduped` included (PRD resolved q29,
+//   `docs/durability.md` §3.3).
 // * **writes are at-least-once, keyed** — a store-op node's write carries the
 //   idempotency key of grammar 9.4, and this backend dedupes on it: a retry of
 //   the same effect site answers what the first attempt answered instead of
 //   writing twice.
+//
+//   The key is what a *receiver* dedupes on, and it stays load-bearing under
+//   durability for the one window a journal cannot close: an effect that
+//   happened and whose journal row did not land is re-executed on replay, and
+//   carries the key its first attempt carried.
 //
 //   In the SQLite-backed kinds the key and the op's own answer are written in
 //   the **same transaction** as the effect, so an attempt that failed half way
@@ -113,10 +120,12 @@
 // serving an at-least-once guarantee, and which therefore grows with the number
 // of keyed writes a store has ever taken. It cannot be trimmed by age here: a
 // key's row is what makes a retry of that effect site answer instead of writing
-// twice, and this release has no checkpointer that could say when an execution
-// is past replaying (M3 owns durable execution). So the ledger's lifetime is the
-// store file's, retention is deleting the directory, and the emitted `README.md`
-// says that where it says where the data lives.
+// twice, and an execution is past replaying only when its journal says so —
+// which is a question about a different file, and one journal compaction would
+// have to answer (out of durability v1's scope, `docs/durability.md` §12). So
+// the ledger's lifetime is the store file's, retention is deleting the
+// directory, and the emitted `README.md` says that where it says where the data
+// lives.
 
 import crypto from "node:crypto";
 import fs from "node:fs";

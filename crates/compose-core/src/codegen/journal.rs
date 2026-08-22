@@ -105,4 +105,87 @@ mod tests {
             "an append that opened a transaction of its own would have a window a crash could land in"
         );
     }
+
+    /// **Every effect site is journaled, and there are no others.**
+    ///
+    /// `docs/durability.md` §3 makes completeness the invariant — "an effect
+    /// that is not journaled is one a replay re-executes" — and tells a reader
+    /// to verify it by finding the call sites. This is that reading, held
+    /// mechanically, in both directions.
+    ///
+    /// The **first** direction is the one a new effect kind breaks: a surface
+    /// added to `src/runtime.ts` that calls the world and does not reach the
+    /// journal is a replay that re-issues it, and no other test in this
+    /// repository would notice — the run would succeed, twice.
+    ///
+    /// The **second** is the one a documentation drift breaks: a site that is
+    /// journaled and is not in the table above. Both are counted rather than
+    /// merely searched for, because a search satisfied by any occurrence would
+    /// be satisfied by the one this comment mentions.
+    #[test]
+    fn every_effect_site_reaches_the_journal_and_the_document_names_them_all() {
+        let runtime = include_str!("js/runtime.ts");
+        let stores = include_str!("js/stores.ts");
+        let document = include_str!("../../../../docs/durability.md");
+
+        // Each site, the module it lives in, and how it reaches the journal —
+        // `journaled(…)` for a call whose whole answer is the record, and
+        // `claim(…)` for the two whose record is assembled first (a model
+        // call's ladder, a wait's settlement).
+        for (site, source, module) in [
+            ("callModel", runtime, "src/runtime.ts"),
+            ("runExec", runtime, "src/runtime.ts"),
+            ("runHttp", runtime, "src/runtime.ts"),
+            ("callFunction", runtime, "src/runtime.ts"),
+            ("runHuman", runtime, "src/runtime.ts"),
+            ("runStoreOp", stores, "src/stores.ts"),
+        ] {
+            let body = function_body(source, site);
+            assert!(
+                body.contains("journaled(") || body.contains(".claim("),
+                "`{site}` performs an effect and does not reach the journal, so a replay                  would issue it a second time (`docs/durability.md` §3)"
+            );
+            assert!(
+                document.contains(&format!("`{site}`")) && document.contains(module),
+                "`docs/durability.md` §3's inventory does not name `{site}` in `{module}`"
+            );
+        }
+
+        // …and no seventh. The count is over both emitted modules, because the
+        // document's table is.
+        let reached = runtime.matches("journaled(").count()
+            + runtime.matches(".claim(").count()
+            + stores.matches("journaled(").count()
+            + stores.matches(".claim(").count();
+        assert_eq!(
+            reached, 6,
+            "`docs/durability.md` §3 says there are exactly six effect sites and this build              has {reached}: a new one belongs in that table, and a lost one is a replay that              re-issues an effect"
+        );
+    }
+
+    /// The body of one exported function of an emitted module.
+    ///
+    /// The same reader `compose-core`'s `tests/trace_format_inventory.rs` uses,
+    /// and for its reason: a rule about what one function does is only a rule if
+    /// it is read off that function rather than off the file around it. Both
+    /// emitted modules are formatted, so a top-level declaration opens at column
+    /// zero and closes on a line that is exactly `}` — which is what makes a
+    /// line scan enough, and a brace count wrong: a signature's own inline
+    /// object type (`request: { … }`) opens a brace before the body does.
+    fn function_body(source: &str, name: &str) -> String {
+        let header = format!("export async function {name}(");
+        let mut lines = source.lines().skip_while(|line| !line.starts_with(&header));
+        let opened = lines
+            .next()
+            .unwrap_or_else(|| panic!("the emitted module declares `{header}…`"));
+        let mut held = String::from(opened);
+        for line in lines {
+            held.push('\n');
+            held.push_str(line);
+            if line == "}" {
+                return held;
+            }
+        }
+        panic!("`{name}` has no closing brace in the first column")
+    }
 }
