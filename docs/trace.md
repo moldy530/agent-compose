@@ -1117,6 +1117,19 @@ The version number alone is a promise; two tests make it a checkable one:
   stay under the rule: a `tool.*`'s answer is an external system's, and a store
   tool's is already in `StoreRecord.answer`, so recording it twice would buy
   nothing.
+* **The execution journal.** A compiled project keeps a second record beside
+  this one, and the two are not the same artifact: the journal holds every
+  effect's full payload — model completions, tool results, what a store
+  answered, what a person answered — because a replay has to hand those back
+  rather than re-issue them (`docs/durability.md`). It shares this format's
+  keying (§8) and nothing else, it is private recovery data with the same
+  sensitivity as the project's stores, and no field of this format is derived
+  from it or carries any part of it. Everything §11 keeps out stays out; the
+  journal is where it goes instead. A **resumed** execution writes a fresh trace
+  document of its own, carrying the same `execution_id` and the same
+  deterministic identities, in which replayed and live work are deliberately
+  not distinguished — this format answers what the *execution* did, and that is
+  the same answer whichever process did it (`docs/durability.md` §9).
 * **What a human answered.** A `human` node's pause is recorded — that it began,
   how long it had, and how it ended (§3.4) — and the answer itself is not. It is
   the same rule as the one below for a model's completion and is stated

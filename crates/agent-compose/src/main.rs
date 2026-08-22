@@ -1,6 +1,6 @@
 //! `agent-compose` — the compiler's command line.
 //!
-//! The verbs fall into two groups. Five act on a composition; the rest teach
+//! The verbs fall into two groups. Six act on a composition; the rest teach
 //! the reader about compositions in general and are described at the bottom of
 //! this header. The first is the product's core loop (PRD §7 M0):
 //!
@@ -42,24 +42,35 @@
 //! ([`compose_core::plan`]); what lives here is the two entrypoints, the choice
 //! of format, and the exit code.
 //!
-//! The last two are invocation (PRD 5.11):
+//! The last three are invocation (PRD 5.11):
 //!
 //! ```text
 //! agent-compose run <path> <flow> [--input k=v]... [--session <key>]
 //!                                 [--target <name>] [--out <dir>]
 //!                                 [--format human|json]
+//! agent-compose resume <path> <execution> [--target <name>] [--out <dir>]
+//!                                         [--format human|json]
 //! agent-compose serve <path> [--host <host>] [--port <port>]
 //!                            [--target <name>] [--out <dir>]
 //!                            [--format human|json]
 //! ```
 //!
-//! Both **build first**, exactly as `build` would and into the same directory,
-//! and then launch the emitted project's own command line (`bun src/index.ts …`,
-//! or `node` under the fallback). Nothing about invoking a compiled graph lives
-//! in this binary — see [`launch`], which is also where the two preconditions of
-//! *starting* something are checked: every `${ENV}` reference has a value
-//! (PRD §9.15) and the pinned dependency set is installed where the project can
-//! resolve it.
+//! All three **build first**, exactly as `build` would and into the same
+//! directory, and then launch the emitted project's own command line
+//! (`bun src/index.ts …`, or `node` under the fallback). Nothing about invoking a
+//! compiled graph lives in this binary — see [`launch`], which is also where the
+//! two preconditions of *starting* something are checked: every `${ENV}`
+//! reference has a value (PRD §9.15) and the pinned dependency set is installed
+//! where the project can resolve it.
+//!
+//! `resume` is the durable half (PRD resolved q26–q29, `docs/durability.md`).
+//! Every invocation journals its effects as it makes them, and a `run` that
+//! crashed leaves an execution the journal holds open; `resume` re-runs that
+//! execution's graph consuming the record read-only up to the frontier — the
+//! first effect the journal does not hold — so nothing already done is issued a
+//! second time. It takes no `--input` and no `--session`: the invocation it
+//! replays is the one the journal recorded. `serve` needs no verb of its own,
+//! because it recovers every open execution on start.
 //!
 //! `run`'s **stdout is the run's answer** — the flow's outputs as one JSON
 //! object, or the whole record under `--format json` — so this side writes
@@ -281,6 +292,23 @@ enum Command {
         #[arg(long, value_enum, default_value_t = Format::Human)]
         format: Format,
     },
+    /// Replay a journaled execution to completion, re-issuing nothing it already did
+    Resume {
+        /// Path to the spec entrypoint (conventionally `main.yml`)
+        path: PathBuf,
+        /// The execution to resume, as `run` printed it (`execution: exec_…`)
+        #[arg(value_name = "EXECUTION")]
+        execution: String,
+        /// Deploy target to resolve and emit for
+        #[arg(long, value_name = "NAME", default_value = DEFAULT_TARGET)]
+        target: String,
+        /// Where to write the generated project [default: <project>/build/<target>]
+        #[arg(long, value_name = "DIR")]
+        out: Option<PathBuf>,
+        /// How to report what was found, and how the run answers
+        #[arg(long, value_enum, default_value_t = Format::Human)]
+        format: Format,
+    },
     /// Serve the project's `http` triggers (validates, builds, then launches the app)
     Serve {
         /// Path to the spec entrypoint (conventionally `main.yml`)
@@ -405,6 +433,31 @@ fn main() -> ExitCode {
             );
             launch(&path, "run", &target, &out, format, &arguments)
         }
+        Command::Resume {
+            path,
+            execution,
+            target,
+            out,
+            format,
+        } => {
+            let out = out.unwrap_or_else(|| build::default_out(&path, &target));
+            // No `--input` and no `--session`: the invocation a resume replays is
+            // the one the journal recorded, and a second set of inputs would be
+            // one execution's record replayed into another execution's run
+            // (PRD resolved q29). The emitted CLI reads both off the lifecycle
+            // row.
+            let arguments = vec![
+                "resume".to_string(),
+                execution,
+                "--format".to_string(),
+                match format {
+                    Format::Human => "human",
+                    Format::Json => "json",
+                }
+                .to_string(),
+            ];
+            launch(&path, "resume", &target, &out, format, &arguments)
+        }
         Command::Serve {
             path,
             host,
@@ -431,7 +484,8 @@ fn main() -> ExitCode {
     }
 }
 
-/// `agent-compose run` and `agent-compose serve`: build, then start.
+/// `agent-compose run`, `agent-compose resume` and `agent-compose serve`: build,
+/// then start.
 ///
 /// The build half is [`build_project`]'s, run in the same order and refusing on
 /// the same report — a composition the compiler has something to say about is
@@ -453,9 +507,9 @@ fn launch(
     format: Format,
     arguments: &[String],
 ) -> ExitCode {
-    // The verb is the caller's, not this function's: both commands come through
-    // here, and a `serve` told that "`run` takes a spec entrypoint" names a
-    // command the caller did not type.
+    // The verb is the caller's, not this function's: all three commands come
+    // through here, and a `serve` told that "`run` takes a spec entrypoint" names
+    // a command the caller did not type.
     if let Err(reason) = usable(entrypoint, command) {
         return fail(&reason);
     }

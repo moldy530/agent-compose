@@ -401,6 +401,8 @@ fn an_unreadable_entrypoint_exits_two() {
         // `run` takes a flow beside the entrypoint; nothing gets as far as
         // reading it, but clap still requires it to be there.
         ("run", vec!["flow.nothing"]),
+        // …and `resume` an execution id, for the same reason.
+        ("resume", vec!["exec_nothing"]),
         ("serve", vec![]),
         ("build", vec![]),
     ] {
@@ -440,6 +442,83 @@ fn a_usage_error_exits_two() {
         .output()
         .expect("the command runs");
     assert_eq!(code(&output), 2, "a missing path is a usage error");
+}
+
+/// `resume`'s own command-line surface: two required positionals, and neither
+/// of `run`'s two invocation flags.
+///
+/// The last half is the one worth a test rather than a comment. A resume replays
+/// the invocation the journal recorded (`docs/durability.md` §6.2), so
+/// `--input` and `--session` are not flags it happens not to need — accepting
+/// either would be accepting an instruction to replay one execution's record
+/// into a different execution's run, and clap refusing them is where that is
+/// enforced.
+#[test]
+fn resume_takes_an_execution_and_neither_of_runs_invocation_flags() {
+    let help = Command::cargo_bin("agent-compose")
+        .expect("the binary under test is built")
+        .env("NO_COLOR", "1")
+        .args(["resume", "--help"])
+        .output()
+        .expect("the command runs");
+    assert_eq!(code(&help), 0);
+    let usage = stdout(&help)
+        .lines()
+        .find(|line| line.starts_with("Usage:"))
+        .expect("`resume --help` prints a usage line")
+        .to_string();
+    assert!(
+        usage.contains("<PATH> <EXECUTION>"),
+        "both positionals are required, in that order: {usage}"
+    );
+    assert!(
+        stdout(&help).contains("--target") && stdout(&help).contains("--out"),
+        "it resolves and builds a composition like `run` does:\n{}",
+        stdout(&help)
+    );
+
+    // A missing execution id is a usage error, not a run that produced no
+    // answer: there is nothing to resume until the caller names one.
+    let bare = Command::cargo_bin("agent-compose")
+        .expect("the binary under test is built")
+        .env("NO_COLOR", "1")
+        .current_dir(repo_root())
+        .args(["resume", "examples/review-loop/main.yml"])
+        .output()
+        .expect("the command runs");
+    assert_eq!(code(&bare), 2);
+    assert!(
+        stderr(&bare).contains("<EXECUTION>"),
+        "clap names what is missing:\n{}",
+        stderr(&bare)
+    );
+
+    for flag in ["--input", "--session"] {
+        let refused = Command::cargo_bin("agent-compose")
+            .expect("the binary under test is built")
+            .env("NO_COLOR", "1")
+            .current_dir(repo_root())
+            .args([
+                "resume",
+                "examples/review-loop/main.yml",
+                "exec_nothing",
+                flag,
+                "x",
+            ])
+            .output()
+            .expect("the command runs");
+        assert_eq!(
+            code(&refused),
+            2,
+            "`{flag}` is not a flag a resume takes:\n{}",
+            stderr(&refused)
+        );
+        assert!(
+            stderr(&refused).contains(flag),
+            "…and the refusal names it:\n{}",
+            stderr(&refused)
+        );
+    }
 }
 
 /// A project whose report is far larger than a pipe can hold: `definitions`

@@ -89,7 +89,7 @@ import Fastify from "fastify";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import { type CompiledFlow, flows, runFlow } from "./graph.ts";
-import { TRACE_VERSION, deliverHumanAnswer, humanWaits } from "./runtime.ts";
+import { TRACE_VERSION, deliverHumanAnswer, humanWaits, openExecutions } from "./runtime.ts";
 import type * as runtime from "./runtime.ts";
 import { type HttpTrigger, httpTriggers } from "./triggers.ts";
 
@@ -164,6 +164,17 @@ export function createApp(): FastifyInstance {
       handler: (request, reply) => start(executions, trigger, request, reply),
     });
   }
+
+  // Recovery, on the hook Fastify runs **before** the server accepts a
+  // connection: `onReady` is awaited by `listen`, so every execution the
+  // journal holds open has been put back on the board before the first request
+  // arrives (PRD resolved q28). A resume request that lands the instant after
+  // `listen` resolves therefore finds its wait, which is the whole promise —
+  // the wait id is deterministic (node path + ordinal), so it is the same id the
+  // caller was given by the process that died.
+  app.addHook("onReady", async () => {
+    await recover(executions);
+  });
 
   app.get("/executions/:id", (request, reply) => {
     const id = (request.params as { id: string }).id;
@@ -396,6 +407,93 @@ async function start(
 /** The `60s` grammar 13.3 defaults a sync trigger's response budget to. */
 const DEFAULT_SYNC_TIMEOUT_MS = 60_000;
 
+/**
+ * Put every execution this project's journal holds open back on the board
+ * (PRD resolved q28, `docs/durability.md` §5).
+ *
+ * "**`serve` auto-recovers**: on process start it replays every execution the
+ * journal holds open, including executions parked on `human` waits, which
+ * re-park with their wait ids intact." That is the whole of what happens here:
+ * each open execution is re-run under `resume: true`, so its recorded effects
+ * are consumed rather than re-issued and the run arrives back at the pause it
+ * was holding — under the same wait id, because a wait id is the node's
+ * instance path (grammar 9.4) and nothing about it depends on the process.
+ *
+ * Two things it deliberately does not do. It does not **re-fire triggers**: the
+ * lifecycle row records which trigger started an execution and nothing here
+ * reads it as an instruction, so a recovered `http` execution is the one that
+ * existed and never a second one (resolved q28). And it does not **wait** for
+ * the replays to finish — the executions it recovers are, by definition, ones
+ * that were still running, and the commonest of them is parked on a question
+ * nobody has answered yet. Registering them is what has to happen before the
+ * first request; finishing them is what the resume route is for.
+ *
+ * A replay that **diverges** (`runtime.ReplayDivergence`) is recorded on the
+ * execution like any other failure and reported by the status route: recovery
+ * of one execution never stops the process from serving the others.
+ */
+async function recover(executions: Map<string, Execution>): Promise<void> {
+  let open: readonly runtime.ExecutionRow[];
+  try {
+    open = await openExecutions();
+  } catch (error) {
+    // A journal that cannot be opened is a project that cannot recover, and it
+    // is not a reason to refuse to serve: the app starts, new executions
+    // journal (or fail loudly when they cannot), and this says what happened.
+    process.stderr.write(`this project's journal could not be read: ${message(error)}\n`);
+    return;
+  }
+  for (const row of open) {
+    const flow = flows[row.flow];
+    if (flow === undefined) {
+      // The composition moved under a journal that still holds an execution of
+      // a flow it no longer declares. Said rather than crashed, and left open:
+      // a reader who puts the flow back can still resume it.
+      process.stderr.write(
+        `\`${row.id}\` was running \`${row.flow}\`, which this build does not declare: it stays open in the journal\n`,
+      );
+      continue;
+    }
+    resumeInto(executions, flow, row);
+    process.stderr.write(`recovered ${row.id} (${row.flow})\n`);
+  }
+}
+
+/** Re-run one journaled execution in this process, and track it like any other. */
+function resumeInto(
+  executions: Map<string, Execution>,
+  flow: CompiledFlow,
+  row: runtime.ExecutionRow,
+): Execution {
+  const execution: Execution = {
+    id: row.id,
+    flow: flow.address,
+    trigger: row.trigger,
+    status: "running",
+    settled: Promise.resolve(),
+  };
+  execution.settled = runFlow(flow.address, row.inputs, {
+    executionId: row.id,
+    sessionKey: row.sessionKey,
+    resumable: true,
+    trigger: row.trigger,
+    resume: true,
+  })
+    .then((run) => {
+      execution.status = "completed";
+      execution.outputs = run.outputs;
+      execution.trace = run.trace;
+    })
+    .catch((error: unknown) => {
+      execution.status = "failed";
+      execution.error = message(error);
+      const trace = (error as { trace?: readonly runtime.TraceEntry[] }).trace;
+      if (trace !== undefined) execution.trace = trace;
+    });
+  executions.set(row.id, execution);
+  return execution;
+}
+
 /** Start the run, and record what it does when it stops. */
 function register(
   executions: Map<string, Execution>,
@@ -422,6 +520,10 @@ function register(
     executionId: id,
     sessionKey,
     resumable: true,
+    // Which trigger started it, for the journal's lifecycle row. Recorded so a
+    // reader of the journal can tell an `http` execution from a `run`; never
+    // re-fired on recovery (PRD resolved q28).
+    trigger: trigger.name,
   })
     .then((run) => {
       execution.status = "completed";

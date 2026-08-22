@@ -15,6 +15,7 @@ The LangGraph TypeScript project `agent-compose build` produced from `main.yml`,
 |---|---|
 | `src/cel.ts` | the CEL evaluator the routers embed (PRD 5.5) |
 | `src/env.ts` | every `${ENV}` reference the composition makes, and `readEnvironment()`, the presence check over them |
+| `src/journal.ts` | the execution journal: every effect a run issues, written as it happens, and what a resumed execution consumes instead of re-issuing it (`docs/durability.md`) |
 | `src/runtime.ts` | what every node does when it runs: the retry/timeout/error policy of grammar 9, the provider surfaces, the model failover ladder, the `exec`/`http` wrappers, and the router |
 | `src/stores.ts` | the local store backends: SQLite for `kv` and `vector`, a directory of files for `blob` (PRD 5.8) |
 | `src/schemas.ts` | every schema the composition declares, as Zod |
@@ -22,7 +23,7 @@ The LangGraph TypeScript project `agent-compose build` produced from `main.yml`,
 | `src/graph.ts` | the compiled graph: one node per flow node, the `flows` registry, and `runFlow` |
 | `src/triggers.ts` | the composition's declared `http` triggers: their routes, their response modes, and the CEL that reads a request payload |
 | `src/serve.ts` | the app over those triggers: start, status and resume (PRD 5.11) |
-| `src/cli.ts` | this project's own command line, which `agent-compose run` and `agent-compose serve` launch |
+| `src/cli.ts` | this project's own command line, which `agent-compose run`, `agent-compose resume` and `agent-compose serve` launch |
 | `src/index.ts` | the project's public surface, the one caller of `readEnvironment()`, and the entry point the command line hangs off |
 
 ## Running a flow
