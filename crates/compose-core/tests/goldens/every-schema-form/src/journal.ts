@@ -59,9 +59,12 @@
 // its own: a process that dies mid-write leaves the row absent, never half
 // present, so nothing in this file can parse as a complete record that is not
 // one. `synchronous = FULL` is what makes "committed" mean "on the disk"
-// rather than "in the page cache", and the write-ahead log is asked for and
-// tolerated if the build declines it — the rollback journal is equally atomic
-// per statement and differs only in concurrency.
+// rather than "in the page cache". SQLite's **rollback journal** is what backs
+// that, and a write-ahead log is deliberately not asked for: this driver's
+// virtual file system does not implement one — the pragma is accepted and
+// leaves the mode at `delete` — so asking would be a line that reads like a
+// guarantee and is not one. Atomicity per statement, which is the property
+// this file needs, is the same either way.
 //
 // What a crash *can* leave is an effect that happened with no row for it: the
 // row is written when the effect answers, and the window between the two is
@@ -75,11 +78,18 @@
 // A `serve` process runs many executions at once, and every statement here is
 // synchronous: `node-sqlite3-wasm` blocks the event loop for the duration of a
 // call, so two executions can never interleave inside one statement and no
-// intra-process locking is needed. Across *processes* this release keeps the
-// boundary `./stores.ts` keeps and PRD 5.10 draws — `--target local` is one
-// process — with `busy_timeout` set so a second process reading the journal
-// (an `agent-compose resume` run beside a live `serve`) waits rather than
-// failing outright.
+// intra-process locking is needed.
+//
+// Across *processes* this release keeps the boundary `./stores.ts` keeps and
+// PRD 5.10 draws — `--target local` is one process — but the journal is the one
+// artifact a second process legitimately arrives at: `agent-compose resume`
+// beside a live `serve` is the shape durability is *for*. So opening waits on a
+// lock rather than failing on one, twice over: `busy_timeout` is set before any
+// contended statement, and the open is retried under a deadline for the builds
+// whose file system implements no sleep for that pragma to use. What is still
+// outside the promise is two processes **writing** one project's journal at
+// once, which is two runs of one project — the case `./stores.ts` already
+// refuses.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -434,25 +444,61 @@ export function openJournal(): Promise<Journal> {
   opening ??= (async () => {
     const { Database } = await sqlite();
     fs.mkdirSync(dataRoot(), { recursive: true });
-    const database = new Database(journalPath());
-    // A write-ahead log where the build supports one, and the rollback journal
-    // where it does not: both are atomic per statement, which is the property
-    // this file needs, and they differ only in how a second process reading the
-    // file behaves while one is writing.
-    try {
-      database.exec("PRAGMA journal_mode = WAL;");
-    } catch {
-      // The rollback journal it is.
-    }
-    database.exec("PRAGMA synchronous = FULL;");
-    database.exec("PRAGMA busy_timeout = 5000;");
-    database.exec(SCHEMA);
-    return new SqliteJournal(database);
+    return new SqliteJournal(await migrated(Database));
   })();
   void opening.catch(() => {
     opening = undefined;
   });
   return opening;
+}
+
+/**
+ * How long the journal waits for a lock another process is holding, and how
+ * long the retry below keeps trying for.
+ *
+ * Two mechanisms rather than one, because only the first is SQLite's: a build
+ * whose virtual file system implements a sleep honours `busy_timeout`, and one
+ * that does not answers `SQLITE_BUSY` at once whatever it is set to. The retry
+ * is what covers the second, and it costs a run that meets no contention
+ * nothing at all.
+ */
+const LOCK_WAIT_MS = 5_000;
+
+/** The open handle, with the schema applied. */
+async function migrated(
+  Database: SqliteModule["Database"],
+): Promise<InstanceType<SqliteModule["Database"]>> {
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  let delay = 10;
+  for (;;) {
+    const database = new Database(journalPath());
+    try {
+      // **First**, so every statement after it waits for a lock rather than
+      // failing on one. A `PRAGMA` that arrives after the contended statement
+      // is a setting nobody read.
+      database.exec(`PRAGMA busy_timeout = ${LOCK_WAIT_MS};`);
+      // What makes "committed" mean "on the disk" rather than "in the page
+      // cache", which is the whole of what a journal is for.
+      database.exec("PRAGMA synchronous = FULL;");
+      database.exec(SCHEMA);
+      return database;
+      // A write-ahead log is deliberately **not** asked for. This driver's
+      // virtual file system does not implement one — `PRAGMA journal_mode =
+      // WAL` is accepted and leaves the mode at `delete` — so asking would be a
+      // line that reads like a guarantee and is not one. The rollback journal
+      // it uses instead is atomic per statement, which is the property this
+      // file needs (see the module header).
+    } catch (error) {
+      database.close();
+      if (Date.now() >= deadline) throw error;
+      // A lock another process is holding: the schema statements are the widest
+      // window a journal has, and `--target local` is one process (PRD 5.10) —
+      // so this is a *second* one arriving, and the honest thing is to let it
+      // in rather than to fail its run over a table that already exists.
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      delay = Math.min(delay * 2, 200);
+    }
+  }
 }
 
 /**

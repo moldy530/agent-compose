@@ -90,17 +90,27 @@ behind. Retention is deleting the file (resolved q27: "one file to delete").
 implicit transaction of its own, so a process that dies mid-write leaves the row
 absent and never half present: nothing in the file can parse as a complete
 record that is not one. `PRAGMA synchronous = FULL` is what makes "committed"
-mean "on the disk". A write-ahead log is requested and tolerated where the
-driver declines it — the rollback journal is equally atomic per statement and
-differs only in how a concurrent reader behaves.
+mean "on the disk". SQLite's **rollback journal** is what backs that; a
+write-ahead log is deliberately not asked for, because this driver's virtual
+file system does not implement one — the pragma is accepted and leaves the mode
+at `delete`, so asking would be a line that reads like a guarantee and is not
+one. Atomicity per statement is the same either way.
 
 **Concurrency.** A `serve` process runs many executions at once, and every
 statement here is synchronous: the driver blocks the event loop for the duration
 of a call, so two executions can never interleave inside one statement and no
-intra-process locking is needed. Across *processes* this release keeps the
-boundary PRD 5.10 draws and `src/stores.ts` already keeps — `--target local` is
-one process — with `busy_timeout` set so a second process reading the journal
-waits rather than failing outright.
+intra-process locking is needed.
+
+Across *processes* this release keeps the boundary PRD 5.10 draws and
+`src/stores.ts` already keeps — `--target local` is one process — with one
+exception the journal has to make, because it is the artifact a second process
+legitimately arrives at: `agent-compose resume` beside a live `serve` is the
+shape durability is *for*. So **opening waits on a lock rather than failing on
+one**, twice over — `busy_timeout` is set before any statement that can contend,
+and the open is retried under a deadline for the builds whose file system
+implements no sleep for that pragma to use. What is still outside the promise is
+two processes **writing** one project's journal at once, which is two runs of
+one project: the case `src/stores.ts` already refuses.
 
 **What a crash can still leave** is an effect that happened with no row for it:
 the row is written when the effect answers, and the window between the two is
