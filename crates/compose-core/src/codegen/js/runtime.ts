@@ -77,7 +77,6 @@ import {
   journaled,
   openJournal,
   openSession,
-  reachedFrontier,
   recorderFor,
   replayedFailure,
 } from "./journal.ts";
@@ -1010,7 +1009,13 @@ export async function runActivity<T>(
         // three would walk three recorded effects forward and report the last
         // disagreement rather than the first. Thrown bare, past the policy and
         // past `on_error:`, for the reason [`ReplayDivergence`] gives.
-        if (error instanceof ReplayDivergence) throw error;
+        //
+        // Read off the **cause chain** rather than by class, because it travels:
+        // a divergence inside a `flow:` node's instance arrives here restated as
+        // a `SubflowFailure`, and one inside a dispatched item as an
+        // `ItemFailure`. A check on the class alone would let exactly those two
+        // be retried.
+        if (divergenceOf(error) !== undefined) throw error;
         if (expired) break;
         if (attempt === attempts) break;
         // This attempt is over, so every pause it left open below it is one
@@ -5163,6 +5168,11 @@ export async function runMap(
           // never happened — and would carry the fan-out past a human for the
           // reason above (see [`abandonedOf`]).
           if (abandonedOf(cause) !== undefined) throw error;
+          // Nor is a journal that does not describe this run. `skip` would carry
+          // the fan-out past an effect the record claims to hold, which is the
+          // one thing resolved q29 refuses outright — and it would do so while
+          // recording the item as absorbed, so nothing downstream would know.
+          if (divergenceOf(cause) !== undefined) throw error;
           failed.push({ index, target: route.target, attempts, error: cause });
           // A dispatched `flow.*` that failed still made a trace, exactly as one
           // that completed did, and under `on_item_error: skip` the run carries
@@ -5285,6 +5295,10 @@ async function attemptItem(
       // on for: re-executing it would re-open the pause under a node that has
       // stopped waiting, on top of repeating every effect the instance issued.
       if (abandonedOf(error) !== undefined) throw new ItemAttempts(made, error);
+      // And a journal that does not describe this run, for [`runActivity`]'s
+      // reason: a second attempt would walk the next recorded effect forward and
+      // report a disagreement one step past the one that really happened.
+      if (divergenceOf(error) !== undefined) throw new ItemAttempts(made, error);
       if (attempt === allowed) break;
       // And the rule [`runActivity`]'s ladder follows between its attempts, for
       // the same reason and at the same seam: this attempt is over, the next one
@@ -6437,11 +6451,6 @@ export function closeExecution(execution: string): void {
   closeSession(execution);
 }
 
-/** Whether this generation has run anything past what the journal held. */
-export function pastFrontier(execution: string): boolean {
-  return reachedFrontier(execution);
-}
-
 /**
  * The [`ReplayDivergence`] on this error's `cause` chain, if it came out of one.
  *
@@ -6943,7 +6952,9 @@ export async function runNode(
     // claims to hold, and a `fallback:` would route on a disagreement rather
     // than on anything the composition declared. It carries the entry the
     // aborting path builds, so a reader still sees which node it stopped at.
-    if (error instanceof ReplayDivergence) throw carryEntry(error, aborted(error, 1));
+    if (divergenceOf(error) !== undefined) {
+      throw carryEntry(error, aborted(error, failure?.attempts ?? 1));
+    }
     // An expiry never travels, which is what makes `expiry.route` safe to route
     // on here: this is where one is answered, by the very node that raised it,
     // and the answer is a `Command` rather than a throw, so — unlike an
