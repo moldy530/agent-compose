@@ -523,6 +523,15 @@ export function sessionRefusal(address: string, stores: readonly string[]): stri
  * surface (PRD §9.21): `src/serve.ts`, whose `POST /executions/:id/resume`
  * delivers the answer, and `src/cli.ts`, when the `run` it is serving may ask
  * at the terminal it was launched from.
+ *
+ * # Every invocation is journaled
+ *
+ * PRD resolved q26–q29: the run's effects are written to this project's journal
+ * as they happen, and `resume: true` re-runs the graph consuming that record
+ * read-only up to the frontier. Journaling is unconditional — every target this
+ * compiler builds is process-local and binds the SQLite journal beside the
+ * project (resolved q27) — so a caller that says nothing about durability still
+ * gets it. `docs/durability.md` is normative.
  */
 export async function runFlow(
   address: string,
@@ -542,6 +551,28 @@ export async function runFlow(
      * route.
      */
     readonly resumable?: boolean;
+    /**
+     * What started this execution, for the journal's lifecycle row.
+     *
+     * `manual` where nothing says otherwise, which is every `agent-compose run`
+     * and every `manual` trigger; `src/serve.ts` passes the `http` trigger's own
+     * name. Recorded and never dispatched on — recovery replays executions, it
+     * does not re-fire triggers (PRD resolved q28).
+     */
+    readonly trigger?: string;
+    /**
+     * Whether this is a **resumed** generation of an execution the journal
+     * already holds (PRD resolved q29).
+     *
+     * `true` makes every effect site consult the journal before it calls the
+     * world: a recorded answer is returned byte for byte and nothing is
+     * re-issued, until the frontier — the first effect the journal does not
+     * hold — where the execution goes live again. `executionId` names which
+     * execution, and `inputs`/`sessionKey` must be the ones the journal
+     * recorded, which is why the two callers that resume read them back off the
+     * lifecycle row rather than composing them again.
+     */
+    readonly resume?: boolean;
   } = {},
 ): Promise<FlowRun> {
   const flow = flows[address];
@@ -565,6 +596,42 @@ export async function runFlow(
     throw new Error(sessionRefusal(address, flow.sessionStores));
   }
   const executionId = options.executionId ?? `exec_${globalThis.crypto.randomUUID()}`;
+  // Before the graph is streamed, so an execution the process dies in the middle
+  // of already has a row saying it was open (PRD resolved q28).
+  await runtime.openExecution({
+    execution: executionId,
+    flow: address,
+    trigger: options.trigger ?? "manual",
+    inputs: parsed,
+    sessionKey,
+    ...(options.resume === true ? { resuming: true } : {}),
+  });
+  try {
+    const produced = await quiesceFlow(address, flow, parsed, ceiling, sessionKey, executionId, options);
+    runtime.settleExecution(executionId);
+    return produced;
+  } catch (error) {
+    // Which of the three closing rows this is — `failed`, or none at all
+    // because the run is parked at a `human` pause and is exactly what a resume
+    // exists for — is `runtime.settleExecution`'s to decide, off the same
+    // `runtime.interruptOf` this function's own callers read.
+    runtime.settleExecution(executionId, error);
+    throw error;
+  } finally {
+    runtime.closeExecution(executionId);
+  }
+}
+
+/** [`runFlow`]'s body, with the journal's lifecycle row already open. */
+async function quiesceFlow(
+  address: string,
+  flow: CompiledFlow,
+  parsed: Record<string, unknown>,
+  ceiling: number,
+  sessionKey: string,
+  executionId: string,
+  options: { readonly resumable?: boolean },
+): Promise<FlowRun> {
   // Opened before the graph is streamed, so a status route asked the instant
   // after `start` answered already has somewhere to read this run's pauses from
   // (grammar 8.7, PRD 5.11). Every instance nested inside the run registers

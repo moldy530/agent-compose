@@ -1,0 +1,209 @@
+# Acceptance fixture: executions that outlive the process that started them
+# (PRD 5.11, resolved q26–q29, `docs/durability.md`).
+#
+# Every other fixture is about what a graph does in one process. This one is
+# about what survives when there is a second, and each flow is one claim a
+# journal has to be able to make:
+#
+#   * `flow.relay` — **two model calls in a row**, which is the smallest shape a
+#     frontier is observable in: kill the run while the second is in flight and
+#     the journal holds one recorded answer, so a resumed generation asks the
+#     provider for the second call and only the second. The mock's own request
+#     log is what decides it — replay is read-only or the count says so.
+#   * `flow.staged` — a **store write** and a **subprocess** ahead of a model
+#     call, so a crash lands the frontier past two effects of kinds a repeat
+#     would be visible in: the shim appends a line per run and the store's
+#     idempotency ledger reports a second application as `deduped: true`. A
+#     resumed generation that re-issued either would say so in both places.
+#   * `flow.gate` — an agent node and then a `human` pause, which is the
+#     execution `serve` is required to bring back (resolved q28) and the one
+#     `run` leaves open on purpose: a wait nobody answered is journaled as
+#     nothing at all, so a resumed generation re-parks under the very wait id
+#     the first one published — the node's instance path, which no process
+#     generation is part of.
+#
+# `flow.gate` carries an `http` trigger as well as its manual invocation,
+# because the `serve` half of recovery needs an execution a request started.
+#
+# `store.ledger` is `scope: global` deliberately. The idempotency ledger of a
+# keyed write lives with the store's data (grammar 9.4, `src/stores.ts`), so a
+# store that died with the run could not report a re-application at all — the
+# assertion needs a partition that outlives the process.
+version: "0.1"
+
+state:
+  relayed:
+    description: What the first agent node answered, and what the second is asked about.
+    type: string
+    default: nothing yet
+  final:
+    description: What the second agent node answered.
+    type: string
+    default: nothing yet
+  note:
+    description: What the single agent node of the staged and gated flows answered.
+    type: string
+    default: nothing yet
+  tally:
+    description: What the counting subprocess printed, so the node's write is observable.
+    type: string
+    default: nothing yet
+  decision:
+    description: What the human answered.
+    enum: [approve, reject]
+    default: reject
+
+provider.mock:
+  kind: anthropic
+  api_key: ${MOCK_API_KEY}
+  base_url: ${MOCK_BASE_URL}
+
+model.smart:
+  provider: provider.mock
+  id: claude-sonnet-4-6
+  settings:
+    max_tokens: 4096
+
+store.ledger:
+  kind: kv
+  scope: global
+  description: What a run wrote down before it was interrupted.
+  value_schema:
+    entry:
+      type: string
+
+agent.noter:
+  description: Answers with one note about whatever it is given.
+  model: model.smart
+  prompt: |
+    You write one short note about the topic you are given, and nothing else.
+  input:
+    topic:
+      description: What to write a note about.
+      type: string
+  output:
+    note:
+      description: The note.
+      type: string
+
+flow.relay:
+  description: Two model calls in a row, the second asking about the first's answer.
+  inputs:
+    topic:
+      type: string
+      min_length: 1
+  outputs:
+    relayed:
+      type: string
+    final:
+      type: string
+  nodes:
+    first:
+      agent: agent.noter
+      input:
+        topic: "input.topic"
+      writes:
+        note: relayed
+
+    second:
+      agent: agent.noter
+      input:
+        topic: "state.relayed"
+      writes:
+        note: final
+
+  edges:
+    - { from: start, to: first }
+    - { from: first, to: second }
+    - { from: second, to: end }
+
+flow.staged:
+  description: Write to a store, count a subprocess run, then call a model.
+  inputs:
+    topic:
+      type: string
+      min_length: 1
+  outputs:
+    tally:
+      type: string
+    note:
+      type: string
+  nodes:
+    # A keyed write (grammar 9.4): the store's own ledger is what would report a
+    # second application, and a replayed generation must not produce one.
+    save:
+      store: store.ledger
+      op: set
+      key: "'entry'"
+      value:
+        entry: "input.topic"
+
+    # A subprocess that counts its own executions. `${TALLY_BIN}` is supplied by
+    # the harness and the shim appends one line per run to `$TALLY_LOG`, so
+    # "this effect ran once" is a line count rather than an inference.
+    count:
+      exec:
+        command: "${TALLY_BIN}/tally"
+        output:
+          stdout: { type: string }
+      writes:
+        stdout: tally
+
+    ask:
+      agent: agent.noter
+      input:
+        topic: "input.topic"
+      writes:
+        note: note
+
+  edges:
+    - { from: start, to: save }
+    - { from: save, to: count }
+    - { from: count, to: ask }
+    - { from: ask, to: end }
+
+flow.gate:
+  description: Answer, then wait for a person — the execution a restart has to bring back.
+  inputs:
+    topic:
+      type: string
+      min_length: 1
+  outputs:
+    note:
+      type: string
+    decision:
+      enum: [approve, reject]
+  nodes:
+    ask:
+      agent: agent.noter
+      input:
+        topic: "input.topic"
+      writes:
+        note: note
+
+    # No `timeout:`, so the wait is open until somebody answers it: a budget
+    # would make "the process was restarted" a race against the clock rather
+    # than the thing under test.
+    sign_off:
+      human:
+        input:
+          note: { type: string }
+        output:
+          decision: { enum: [approve, reject] }
+      input:
+        note: "state.note"
+
+  edges:
+    - { from: start, to: ask }
+    - { from: ask, to: sign_off }
+    - { from: sign_off, to: end }
+
+triggers:
+  gate:
+    type: http
+    flow: flow.gate
+    method: POST
+    path: /gate
+    respond: async
+    input:
+      topic: "payload.body.topic"

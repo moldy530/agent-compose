@@ -1,5 +1,11 @@
-//! The M1 completion inventory: every criterion PRD §7 M1 promises, mapped to
-//! the acceptance test that decides it and to whether that test runs yet.
+//! The completion inventory: every criterion PRD §7 promises of a *running*
+//! compiled graph, mapped to the acceptance test that decides it and to whether
+//! that test runs yet.
+//!
+//! M1 is the bulk of it and is what the shape below is built around. M3's first
+//! bullet — durable execution — is here too, for the reason the file exists at
+//! all: it is a promise about what a compiled graph does when it runs, and the
+//! tests that decide it live in the same suite.
 //!
 //! `crates/compose-core/tests/static_check_inventory.rs` is the companion for M0, and this
 //! file is the same idea one milestone on: the PRD's own sentences, transcribed
@@ -52,6 +58,8 @@ enum Bullet {
     Harness,
     /// Not PRD §7 M1's own enumeration: CLAUDE.md's *Validation strategy*.
     Strategy,
+    /// PRD §7 M3's first bullet: "**Durable execution**: …".
+    Durability,
 }
 
 /// Whether a criterion's tests run today.
@@ -994,12 +1002,79 @@ const STRATEGY: &[Criterion] = &[
     },
 ];
 
+/// PRD §7 M3's first bullet, whose four clauses are the four claims durability
+/// makes: the record, what a resume does with it, the two recovery surfaces, and
+/// the failure that is not a re-execution.
+///
+/// The bullet is one sentence rather than an enumeration, so — like `HARNESS` —
+/// its phrases are held to it by containment rather than by splitting on `, `.
+/// The resolved questions behind it (q26–q29) are quoted in each test.
+const DURABILITY: &[Criterion] = &[
+    Criterion {
+        bullet: Bullet::Durability,
+        phrase: "a deploy-target-bound journal (SQLite locally, Postgres when distributed) records every effect",
+        tests: &[
+            // The two effect kinds a repeat is *visible* in, which is what makes
+            // "records every effect" a claim a test can decide rather than an
+            // inventory of call sites.
+            (
+                "a_replayed_prefix_re_issues_neither_its_store_write_nor_its_subprocess",
+                Status::Live,
+            ),
+        ],
+    },
+    Criterion {
+        bullet: Bullet::Durability,
+        phrase: "a resumed execution replays that record read-only up to the frontier",
+        tests: &[
+            // The core assertion of resolved q29, decided by the provider's own
+            // request log: the recorded calls do not reach it a second time.
+            (
+                "a_resumed_run_consumes_its_recorded_model_answers_instead_of_asking_again",
+                Status::Live,
+            ),
+            // …and the failure that is *not* a re-execution: a journal that no
+            // longer describes this composition stops the resume naming the step
+            // it disagrees at.
+            (
+                "a_resume_whose_journal_no_longer_describes_the_run_names_the_divergent_step",
+                Status::Live,
+            ),
+            // …and the two refusals that come *before* a replay: an id the
+            // journal does not hold, and a project with no journal at all.
+            (
+                "a_resume_that_cannot_find_its_execution_says_what_the_journal_holds",
+                Status::Live,
+            ),
+        ],
+    },
+    Criterion {
+        bullet: Bullet::Durability,
+        phrase: "executions survive a process restart",
+        tests: &[
+            // The `run` half (resolved q28: "`run` journals but does not
+            // auto-resume"), including the wait id a second generation re-parks
+            // under.
+            (
+                "a_pause_killed_with_its_process_is_asked_again_under_the_same_wait_id",
+                Status::Live,
+            ),
+            // …and the `serve` half, which recovers on its own.
+            (
+                "a_restarted_serve_recovers_its_open_executions_and_their_waits",
+                Status::Live,
+            ),
+        ],
+    },
+];
+
 fn rows() -> impl Iterator<Item = &'static Criterion> {
     CODEGEN
         .iter()
         .chain(COMMANDS)
         .chain(HARNESS)
         .chain(STRATEGY)
+        .chain(DURABILITY)
 }
 
 fn repository() -> PathBuf {
@@ -1026,6 +1101,38 @@ fn bullet(opening: &str) -> String {
         .into_iter()
         .find(|line| line.starts_with(&format!("- {opening}")))
         .unwrap_or_else(|| panic!("PRD §7 M1 has a bullet opening `{opening}`"))
+}
+
+/// The text of PRD §7 M3 — everything between its heading and the next section.
+fn distribution() -> Vec<String> {
+    let prd = fs::read_to_string(repository().join("prd.md")).expect("the PRD is readable");
+    prd.lines()
+        .skip_while(|line| !line.starts_with("**M3 —"))
+        .take_while(|line| !line.starts_with("## "))
+        .map(str::to_string)
+        .collect()
+}
+
+/// One bullet of PRD §7 M3, **whole**.
+///
+/// M1's bullets each fit on a line; M3's do not, and a reader of this file
+/// should not have to know which. So a bullet is the line that opens it plus
+/// every wrapped continuation under it — the lines up to the next one that
+/// starts a bullet of its own — joined back into the sentence the PRD wrote.
+fn distribution_bullet(opening: &str) -> String {
+    let lines = distribution();
+    let at = lines
+        .iter()
+        .position(|line| line.starts_with(&format!("- {opening}")))
+        .unwrap_or_else(|| panic!("PRD §7 M3 has a bullet opening `{opening}`"));
+    let mut held = vec![lines[at].clone()];
+    for line in &lines[at + 1..] {
+        if line.starts_with("- ") || line.trim().is_empty() {
+            break;
+        }
+        held.push(line.clone());
+    }
+    held.join(" ")
 }
 
 /// A bullet's list of items: everything after the first `: ` (where the bullet
@@ -1166,6 +1273,25 @@ fn the_inventory_transcribes_the_prd_m1_bullets() {
         HARNESS[0].phrase,
         "the harness bullet and the inventory's transcription of it have diverged"
     );
+}
+
+/// M3's durability rows are the PRD's own phrases too.
+///
+/// Containment rather than a split, for `HARNESS`'s reason: the bullet is one
+/// sentence and not a list. It is normalized first because the PRD wraps its
+/// prose, so a phrase that reads as one clause spans two lines in the file —
+/// which is a fact about the margin rather than about the promise.
+#[test]
+fn the_durability_rows_transcribe_the_prd_m3_bullet() {
+    let bullet = distribution_bullet("**Durable execution**");
+    let flattened = bullet.split_whitespace().collect::<Vec<_>>().join(" ");
+    for criterion in DURABILITY {
+        assert!(
+            flattened.contains(criterion.phrase),
+            "`{}` is not a phrase of PRD §7 M3's durable-execution bullet: {flattened}",
+            criterion.phrase
+        );
+    }
 }
 
 /// The rows CLAUDE.md contributes are its own phrases too.
@@ -1329,6 +1455,11 @@ fn every_bullet_contributes_criteria() {
         (Bullet::Commands, 4, "the commands bullet's four items"),
         (Bullet::Harness, 1, "the harness bullet's single claim"),
         (Bullet::Strategy, 2, "CLAUDE.md's two generated-code gates"),
+        (
+            Bullet::Durability,
+            3,
+            "the durable-execution bullet's three claims",
+        ),
     ] {
         let count = rows()
             .filter(|criterion| criterion.bullet == bullet)

@@ -120,6 +120,7 @@ pub mod cel;
 pub mod cli;
 pub mod env;
 pub mod graph;
+pub mod journal;
 pub mod names;
 pub mod pattern;
 pub mod policy;
@@ -222,6 +223,7 @@ pub fn emit(ir: &Ir) -> GeneratedProject {
         project::gitignore(ir),
         cel::module(ir),
         env::module(ir, &environment),
+        journal::module(ir),
         runtime::module(ir),
         stores::module(ir),
         schema::module(ir, &names),
@@ -953,6 +955,7 @@ flow.f:
                 "src/env.ts",
                 "src/graph.ts",
                 "src/index.ts",
+                "src/journal.ts",
                 "src/runtime.ts",
                 "src/schemas.ts",
                 "src/serve.ts",

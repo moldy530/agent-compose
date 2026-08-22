@@ -124,8 +124,15 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
+import { dataRoot, journaled } from "./journal.ts";
 import * as runtime from "./runtime.ts";
 import type { EmbedBinding, RunContext, StoreRecord } from "./runtime.ts";
+
+// Where a project's data lives is `./journal.ts`'s to say, because that module
+// is the leaf of the emitted import graph — this one imports `./runtime.ts` and
+// `./runtime.ts` imports it — and re-exported here because `./cli.ts` and every
+// ejected reader learned the name from this module.
+export { DATA_DIRECTORY, dataRoot } from "./journal.ts";
 
 // ---------------------------------------------------------------------------
 // What a binding says (grammar 11.1)
@@ -248,27 +255,14 @@ function writes(op: StoreOp): boolean {
 // ---------------------------------------------------------------------------
 // Where the data lives
 // ---------------------------------------------------------------------------
-
-/** The variable that moves a project's whole data directory. */
-export const DATA_DIRECTORY = "AGENT_COMPOSE_DATA_DIR";
-
-/**
- * The emitted project's root: the directory `src/` sits in.
- *
- * Derived from this module's own URL rather than from `process.cwd()`, because a
- * store's data must not depend on where a process happened to be started: `bun
- * src/index.ts run …` from the project directory and the same command from a
- * repository root have to address one store.
- */
-const PROJECT_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
-
-/** Where this project keeps what its stores hold. */
-export function dataRoot(): string {
-  const override = process.env[DATA_DIRECTORY];
-  return override === undefined || override === ""
-    ? path.join(PROJECT_ROOT, ".agent-compose")
-    : path.resolve(override);
-}
+//
+// `DATA_DIRECTORY` and `dataRoot` are declared in `./journal.ts` and re-exported
+// at the head of this file. They moved there when the journal arrived, because
+// that module is the leaf of the emitted import graph and the two artifacts —
+// a project's stores and a project's journal — share one directory. Nothing
+// about the layout changed: `<project>/.agent-compose/`, moved whole by
+// `AGENT_COMPOSE_DATA_DIR`, derived from this project's own location rather
+// than from where a process happened to be started.
 
 /** One key, as a file name: reversible, and unable to climb out. */
 export function encodeKey(key: string): string {
@@ -522,14 +516,18 @@ export async function runStoreOp(
   // leaves nothing for the next one to trip over.
   const idempotencyKey = writes(op) ? site.idempotencyKey : undefined;
 
-  const answer = await perform(
-    store,
-    op,
-    params,
-    scopeKey,
-    execution,
-    idempotencyKey,
-    context.signal,
+  // Both halves of PRD 5.8's replay discipline go through the journal, and this
+  // is where "replay consumes history, not the live store" stops being a
+  // description of the trace and becomes the mechanism: a replayed **read**
+  // answers what it answered, and a replayed **write** is not applied a second
+  // time — the row the journal holds is the row the first generation wrote,
+  // `deduped` included, so the trace entry a resumed run files is the entry the
+  // crashed one would have filed (`docs/durability.md` §3.3).
+  const answer = await journaled(
+    context.effects,
+    "store",
+    { store: store.address, op, scope: store.scope, partition: scopeKey, via: site.via, params },
+    () => perform(store, op, params, scopeKey, execution, idempotencyKey, context.signal),
   );
   record(context, {
     store: store.address,

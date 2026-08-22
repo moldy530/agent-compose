@@ -69,6 +69,29 @@ import { Command, GraphRecursionError, isInterrupted } from "@langchain/langgrap
 
 import { CelError, bind, evaluate, evaluateGuard, toJson } from "./cel.ts";
 import type { CelValue, Roots, Shape } from "./cel.ts";
+import {
+  JOURNAL_VERSION,
+  ReplayDivergence,
+  closeSession,
+  journalExists,
+  journaled,
+  openJournal,
+  openSession,
+  reachedFrontier,
+  recorderFor,
+  replayedFailure,
+} from "./journal.ts";
+import type { EffectRecorder, ExecutionRow, Journal } from "./journal.ts";
+
+export {
+  JOURNAL_VERSION,
+  ReplayDivergence,
+  canonical,
+  journalExists,
+  journalPath,
+  openJournal,
+} from "./journal.ts";
+export type { EffectKind, ExecutionRow, Journal, JournalRecord } from "./journal.ts";
 
 // ---------------------------------------------------------------------------
 // Failures
@@ -691,6 +714,23 @@ export interface RunContext {
    * node's entry or not depending on when the sink answered.
    */
   readonly toolDispatches?: DispatchRecord[];
+  /**
+   * Where every effect this site issues is journaled, and where a replay reads
+   * one back from (PRD resolved q26–q29, `docs/durability.md`).
+   *
+   * Rooted at the effect **site** — the instance path of grammar 9.4 this
+   * context belongs to — so the key an effect derives is the address
+   * `docs/trace.md` §8 already gives it plus the effect's kind and its ordinal
+   * at that site. [`runActivity`] creates one per node execution; [`runMap`]
+   * hands each dispatch a child rooted at the dispatch's own path, which is what
+   * keeps two items of one fan-out off each other's keys.
+   *
+   * Absent when nothing is journaling this execution — an ejected caller
+   * driving a compiled graph directly, or a unit test — and every effect site
+   * is written to work without one, which is what makes durability a property
+   * of the *invocation* rather than a dependency of the graph.
+   */
+  readonly effects?: EffectRecorder;
 }
 
 /**
@@ -891,6 +931,11 @@ export async function runActivity<T>(
   // to it on every attempt, so a rejection nobody is waiting on is still a
   // handled one.
   const expiry = budget === undefined ? undefined : untilAborted(controller.signal);
+  // One recorder per node **execution**, not per attempt: the ordinals a key
+  // carries count every effect this site ever issues in this execution, so a
+  // second attempt's model call is a second record rather than a collision with
+  // the first attempt's (`docs/durability.md` §4).
+  const effects = recorderFor(execution.id, site);
 
   try {
     let last: unknown;
@@ -911,6 +956,7 @@ export async function runActivity<T>(
           ...(storeRecords === undefined ? {} : { storeRecords }),
           ...(modelCalls === undefined ? {} : { modelCalls }),
           ...(toolDispatches === undefined ? {} : { toolDispatches }),
+          ...(effects === undefined ? {} : { effects }),
         });
         // The loser of the race rejects with nobody awaiting it — an activity
         // that observes the abort, after the deadline has already answered for
@@ -958,6 +1004,13 @@ export async function runActivity<T>(
         // on bare rather than wrapped in a [`NodeFailure`]: by construction
         // there is nothing to report it to, which is what the class means.
         if (abandonedOf(error) !== undefined) throw error;
+        // A journal that does not describe this run is not an activity outcome
+        // either, and it is the one failure a `retry:` could make *worse*: every
+        // attempt would consume the next ordinal at this site, so a ladder of
+        // three would walk three recorded effects forward and report the last
+        // disagreement rather than the first. Thrown bare, past the policy and
+        // past `on_error:`, for the reason [`ReplayDivergence`] gives.
+        if (error instanceof ReplayDivergence) throw error;
         if (expired) break;
         if (attempt === attempts) break;
         // This attempt is over, so every pause it left open below it is one
@@ -1581,6 +1634,95 @@ export async function callModel(
   },
   site: ModelSite,
 ): Promise<ModelResult> {
+  const recorder = site.effects;
+  if (recorder === undefined) return await callModelLive(selection, request, site);
+
+  // The identity of *this* call, which a recorded answer has to match: which
+  // `model.*` was asked, what it was asked, and which tools it was offered.
+  // The conversation is in it because it is what a ladder answered — a replay
+  // whose second call carries a different history is a different call, and
+  // handing it the first generation's answer would be exactly the silent
+  // re-keying resolved q29 refuses.
+  const slot = recorder.claim("model", {
+    model: selection.address,
+    system: request.system,
+    turns: request.turns,
+    tools: request.tools.map((tool) => tool.name),
+    ...(request.pinned === undefined ? {} : { pinned: request.pinned.name }),
+  });
+
+  if (slot.held !== undefined) {
+    // A recorded model call is replayed **whole**: the answer the loop accepted,
+    // and every `ModelCall` record the ladder filed on the way to it — the
+    // failovers a route spent, and the refusal that ended a call that answered
+    // nothing. Without the records the resumed generation's trace would say a
+    // node called no model at all (`docs/trace.md` §7.2). A call is always kept
+    // as a *value*, whichever way it went, so the error arm is unreachable and
+    // is answered rather than assumed away.
+    if (slot.held.kind === "error") throw replayedFailure(slot.held);
+    const held = slot.held.value as JournaledCall;
+    for (const call of held.calls) site.modelCalls?.push(call);
+    if (!held.ok) throw replayedFailure({ kind: "error", ...held.error });
+    const served = held.calls[held.calls.length - 1];
+    if (served === undefined) {
+      throw new ReplayDivergence(
+        { key: slot.key, site: recorder.site, kind: "model", ordinal: 0 },
+        "the journal recorded an answer with no model-call record behind it",
+      );
+    }
+    return { answer: held.answer, served };
+  }
+
+  const before = site.modelCalls?.length ?? 0;
+  const filed = (): ModelCall[] => (site.modelCalls ?? []).slice(before);
+  try {
+    const result = await callModelLive(selection, request, site);
+    slot.keep({ ok: true, answer: result.answer, calls: filed() } satisfies JournaledCall);
+    return result;
+  } catch (error) {
+    // Kept as a **value** rather than through the slot's error path, because a
+    // spent ladder is more than its message: the records it filed are what a
+    // reader of the failed node's entry reads, and they have to survive into
+    // the resumed generation's trace with it.
+    slot.keep({
+      ok: false,
+      error: { name: nameOf(error), message: messageOf(error) },
+      calls: filed(),
+    } satisfies JournaledCall);
+    throw error;
+  }
+}
+
+/** One model call as the journal keeps it (see [`callModel`]). */
+type JournaledCall =
+  | { readonly ok: true; readonly answer: ModelAnswer; readonly calls: ModelCall[] }
+  | {
+      readonly ok: false;
+      readonly error: { readonly name: string; readonly message: string };
+      readonly calls: ModelCall[];
+    };
+
+/** An error's class name, as `describe` reads it. */
+function nameOf(error: unknown): string {
+  return error instanceof Error ? error.name : "Error";
+}
+
+/** An error's message, as `describe` reads it. */
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** [`callModel`] with nothing between it and the provider. */
+async function callModelLive(
+  selection: ModelSelection,
+  request: {
+    readonly system: string;
+    readonly turns: readonly Turn[];
+    readonly tools: readonly ToolSpec[];
+    readonly pinned?: ToolSpec;
+  },
+  site: ModelSite,
+): Promise<ModelResult> {
   const members = ladder(selection);
   const routeOn: readonly RouteCondition[] = isRoute(selection) ? selection.routeOn : [];
   const failovers: Failover[] = [];
@@ -1649,6 +1791,14 @@ export interface ModelSite {
   readonly deadline?: number;
   /** Where this call is recorded, when the caller is collecting. */
   readonly modelCalls?: ModelCall[];
+  /**
+   * Where this call is **journaled**, when the execution is durable.
+   *
+   * [`RunContext.effects`], read through the same structural equivalence the
+   * three fields above are read through: a model call is an effect of the node
+   * that made it, and its site is that node's.
+   */
+  readonly effects?: EffectRecorder;
 }
 
 /**
@@ -2748,6 +2898,30 @@ export async function runExec(
   input: unknown,
   context: RunContext,
 ): Promise<unknown> {
+  // The identity is the command **as the composition wrote it** rather than as
+  // it resolved, which is `docs/trace.md` §11.1's discipline read where the
+  // reader is a replay: one composition derives one identity whatever
+  // environment it runs in, so an execution journaled on one machine is not
+  // reported as divergent on another for having a different `${TOOLBIN}`.
+  return await journaled(
+    context.effects,
+    "tool",
+    {
+      surface: "exec",
+      command: asWritten(binding.command),
+      args: binding.args.map((argument) => asWritten(argument)),
+      input,
+    },
+    () => runExecLive(binding, input, context),
+  );
+}
+
+/** [`runExec`] with nothing between it and the child process. */
+async function runExecLive(
+  binding: ExecBinding,
+  input: unknown,
+  context: RunContext,
+): Promise<unknown> {
   const environment: Record<string, string> = { ...(process.env as Record<string, string>) };
   // The delivery slot starts empty, whatever the process was started with. The
   // name grammar 9.4 fixes is a plain one, and a variable that happened to be in
@@ -2902,6 +3076,26 @@ export interface HttpBinding {
 
 /** Run one `http:` binding (grammar 6.1, 8.3). */
 export async function runHttp(
+  binding: HttpBinding,
+  request: { readonly query?: Record<string, unknown>; readonly body?: unknown },
+  context: RunContext,
+): Promise<unknown> {
+  return await journaled(
+    context.effects,
+    "tool",
+    {
+      surface: "http",
+      method: binding.method,
+      // As written, for [`runExec`]'s reason.
+      url: asWritten(binding.url),
+      request,
+    },
+    () => runHttpLive(binding, request, context),
+  );
+}
+
+/** [`runHttp`] with nothing between it and the network. */
+async function runHttpLive(
   binding: HttpBinding,
   request: { readonly query?: Record<string, unknown>; readonly body?: unknown },
   context: RunContext,
@@ -3066,7 +3260,18 @@ export async function callFunction(
       `no host function is registered as \`${name}\`: call \`registerFunction(${JSON.stringify(name)}, …)\` before running the graph`,
     );
   }
-  return await implementation(args, context);
+  // Journaled like the other two surfaces, and it is the one where the promise
+  // is worth stating outright: a host function is arbitrary caller code, so
+  // "replay does not re-run it" is what keeps a resumed execution from mailing
+  // a second invoice. What it answered has to be JSON, which grammar 6.1
+  // already requires of it — the answer is parsed against the binding's
+  // declared `output:`.
+  return await journaled(
+    context.effects,
+    "tool",
+    { surface: "function", name, args },
+    async () => await implementation(args, context),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -4811,6 +5016,16 @@ export async function runMap(
       get deadline(): number | undefined {
         return context.deadline;
       },
+      // And the instance's own effect site, which is what keeps two items of one
+      // fan-out off each other's journal keys: the dispatch's path is the
+      // frame `docs/trace.md` §8 gives it, `<node>/<traversal>/<index>`, and an
+      // effect under it derives its key from that rather than from the map
+      // node's. The counters stay the execution's, so a node `retry:` that
+      // re-runs the whole fan-out records a second set of effects instead of
+      // colliding with the first attempt's (`docs/durability.md` §4).
+      ...(context.effects === undefined
+        ? {}
+        : { effects: context.effects.child(site.path.join("/")) }),
     };
 
     if (route.detach) {
@@ -5894,10 +6109,37 @@ export async function runHuman(
   };
   const opened: HumanPause = { pausedAt, ...(expiresAt === undefined ? {} : { expiresAt }) };
 
+  // A settled wait is an effect like any other, and the one whose payload
+  // `docs/trace.md` §11 most firmly keeps out of the trace: what a person
+  // answered. The journal is where it goes, because a replay that re-asked a
+  // question somebody has already answered would be a durability story that
+  // asks the human to do the work twice (`docs/durability.md` §3.4).
+  const slot = context.effects?.claim("human", { wait: id, node: descriptor.node, shown });
+  if (slot?.held !== undefined) {
+    if (slot.held.kind === "error") throw replayedFailure(slot.held);
+    const held = slot.held.value as JournaledWait;
+    if (held.settled === "resumed") {
+      return { output: held.output, human: { ...opened, settledAt: held.settledAt, settled: "resumed" } };
+    }
+    // A wait that ran out its budget replays as one: the route is the
+    // composition's, so it is read off the descriptor rather than off the
+    // record, and what the record supplies is the two instants the entry shows.
+    throw new HumanExpiry(
+      descriptor.flow,
+      descriptor.node,
+      id,
+      descriptor.timeoutMs ?? 0,
+      descriptor.onTimeout ?? END_NODE,
+      { ...opened, settledAt: held.settledAt, settled: "expired" },
+    );
+  }
+
   const board = humanBoards.get(context.execution.id);
   if (board === undefined || !board.resumable) {
     // The pause happened — it is on the trace entry either way — and there is
-    // nothing that could ever answer it.
+    // nothing that could ever answer it. **Nothing is journaled**: an
+    // unanswered wait is exactly what a resumed generation has to re-park, and
+    // a record here would settle it with an outcome nobody gave (resolved q28).
     throw new HumanInterrupt(descriptor.flow, descriptor.node, id, opened);
   }
 
@@ -5925,8 +6167,16 @@ export async function runHuman(
       // the node below it goes back to work (see [`humanWatchers`]).
       announce(wait.execution);
       if (outcome === "resumed") {
-        resolve({ output: value, human: { ...opened, ...stopped(outcome) } });
+        const ended = stopped(outcome);
+        slot?.keep({
+          settled: "resumed",
+          output: value,
+          settledAt: ended.settledAt,
+        } satisfies JournaledWait);
+        resolve({ output: value, human: { ...opened, ...ended } });
       } else if (outcome === "expired") {
+        const ended = stopped(outcome);
+        slot?.keep({ settled: "expired", settledAt: ended.settledAt } satisfies JournaledWait);
         reject(
           new HumanExpiry(
             descriptor.flow,
@@ -5934,7 +6184,7 @@ export async function runHuman(
             id,
             descriptor.timeoutMs ?? 0,
             descriptor.onTimeout ?? END_NODE,
-            { ...opened, ...stopped(outcome) },
+            { ...opened, ...ended },
           ),
         );
       } else if (outcome === "interrupted") {
@@ -5973,9 +6223,24 @@ export async function runHuman(
 }
 
 /** How a pause that reached the trace stopped waiting, as the entry spells it. */
-function stopped(outcome: "resumed" | "expired"): Pick<HumanPause, "settledAt" | "settled"> {
+function stopped(outcome: "resumed" | "expired"): {
+  readonly settledAt: string;
+  readonly settled: "resumed" | "expired";
+} {
   return { settledAt: new Date().toISOString(), settled: outcome };
 }
+
+/**
+ * One settled wait as the journal keeps it (see [`runHuman`]).
+ *
+ * The answer itself is in it, which is the one payload `docs/trace.md` §11 is
+ * most explicit about keeping out of the trace — and the clearest statement of
+ * why the journal is a second artifact rather than the trace read twice
+ * (`docs/durability.md` §7).
+ */
+type JournaledWait =
+  | { readonly settled: "resumed"; readonly output: unknown; readonly settledAt: string }
+  | { readonly settled: "expired"; readonly settledAt: string };
 
 /** LangGraph's terminal pseudo-node, as a `goto` target spells it. */
 const END_NODE = "__end__";
@@ -6060,6 +6325,156 @@ function pauseOf(error: unknown, site: string): HumanPause | undefined {
 // ---------------------------------------------------------------------------
 // One node execution, end to end
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Durable executions (PRD 5.11, resolved q26–q29, `docs/durability.md`)
+// ---------------------------------------------------------------------------
+
+/**
+ * What a caller says about the execution it is starting or resuming.
+ *
+ * `runFlow` in `./graph.ts` is the one caller, and it passes what an invocation
+ * already knows: nothing here has to be re-derived from the composition.
+ */
+export interface ExecutionOpening {
+  readonly execution: string;
+  readonly flow: string;
+  /**
+   * What started it. `manual` for `agent-compose run` and for a `manual`
+   * trigger; an `http` trigger's own name where one did.
+   *
+   * Recorded and never dispatched on: resolved q28 makes recovery replay the
+   * executions that exist rather than re-fire the trigger that created them.
+   */
+  readonly trigger: string;
+  readonly inputs: Record<string, unknown>;
+  readonly sessionKey: string;
+  /**
+   * Whether this generation is **resuming** an execution the journal already
+   * holds, rather than starting one.
+   *
+   * The only thing it changes is whether a recorded effect may be consumed: a
+   * generation that started the execution writes and never reads (there is
+   * nothing yet to read), and a resuming one consumes what the journal holds up
+   * to the frontier and then writes past it (resolved q29).
+   */
+  readonly resuming?: boolean;
+}
+
+/**
+ * Begin journaling one execution, and answer with the journal it will use.
+ *
+ * Called before the graph is streamed, so a record exists for an execution the
+ * process may die in the middle of — which is the whole point: a lifecycle row
+ * with `status: "open"` is what `serve`'s recovery and `agent-compose resume`
+ * enumerate.
+ *
+ * Every instance nested inside the run — a `flow:` node's, a `map`'s dispatch,
+ * a subflow a model called — finds this session by execution id rather than by
+ * being handed it, exactly as the wait board is found ([`openHumanWaits`]).
+ */
+export async function openExecution(opening: ExecutionOpening): Promise<void> {
+  const journal = await openJournal();
+  const resuming = opening.resuming === true;
+  if (resuming) {
+    const row = journal.execution(opening.execution);
+    if (row !== undefined && row.journalVersion !== JOURNAL_VERSION) {
+      throw new Error(
+        `\`${opening.execution}\` was journaled at version ${row.journalVersion} and this build reads version ${JOURNAL_VERSION}: a journal is read by the compiler release that wrote it (\`docs/durability.md\` §9)`,
+      );
+    }
+  } else {
+    journal.begin({
+      id: opening.execution,
+      flow: opening.flow,
+      trigger: opening.trigger,
+      inputs: opening.inputs,
+      sessionKey: opening.sessionKey,
+      status: "open",
+      journalVersion: JOURNAL_VERSION,
+      startedAt: new Date().toISOString(),
+    });
+  }
+  openSession(opening.execution, journal, resuming);
+  settledJournals.set(opening.execution, journal);
+}
+
+/**
+ * Record how one execution ended — or that it has not ended at all.
+ *
+ * Three outcomes and only two of them close the row, which is resolved q28's
+ * scope read at the one place it is decided:
+ *
+ *  * **no error** — `completed`. Nothing left to replay.
+ *  * **an interrupt** — the run reached a `human` pause with nobody to answer
+ *    it (grammar 8.7). The row stays **open**, because that is precisely the
+ *    execution `agent-compose resume` and `serve`'s recovery exist for: the
+ *    wait id is deterministic, so a resumed generation re-parks under it.
+ *  * **anything else** — `failed`. A composition's own error policy has already
+ *    decided this run; replaying it would re-derive the same failure from the
+ *    same record.
+ */
+export function settleExecution(execution: string, error?: unknown): void {
+  const journal = settledJournals.get(execution);
+  if (journal === undefined) return;
+  if (error === undefined) {
+    journal.end(execution, "completed");
+    return;
+  }
+  if (interruptOf(error) !== undefined) return;
+  journal.end(execution, "failed", describe(error));
+}
+
+/**
+ * Every execution one process is journaling, so [`settleExecution`] can reach
+ * the handle without the caller carrying it through a `finally`.
+ */
+const settledJournals = new Map<string, Journal>();
+
+/** Release one execution's journaling state. The file stays the project's. */
+export function closeExecution(execution: string): void {
+  settledJournals.delete(execution);
+  closeSession(execution);
+}
+
+/** Whether this generation has run anything past what the journal held. */
+export function pastFrontier(execution: string): boolean {
+  return reachedFrontier(execution);
+}
+
+/**
+ * The [`ReplayDivergence`] on this error's `cause` chain, if it came out of one.
+ *
+ * [`interruptOf`]'s counterpart for the other outcome a run has that is not a
+ * failure of the composition: a resume whose journal does not describe this
+ * graph. It is read for the same reason — a reporting surface should say *what
+ * happened* rather than the class of wrapper the failure arrived in — and the
+ * two are the whole of why `src/cli.ts` looks past a `FlowFailure` at all.
+ */
+export function divergenceOf(error: unknown): ReplayDivergence | undefined {
+  for (let held: unknown = error; held !== undefined && held !== null; ) {
+    if (held instanceof ReplayDivergence) return held;
+    held = (held as { cause?: unknown }).cause;
+  }
+  return undefined;
+}
+
+/** One execution's lifecycle row, or `undefined` where the journal has none. */
+export async function journaledExecution(id: string): Promise<ExecutionRow | undefined> {
+  if (!journalExists()) return undefined;
+  return (await openJournal()).execution(id);
+}
+
+/**
+ * Every execution the journal holds open, oldest first.
+ *
+ * What `serve` replays on start (resolved q28), and what a reader is pointed at
+ * by an unknown-execution diagnostic.
+ */
+export async function openExecutions(): Promise<readonly ExecutionRow[]> {
+  if (!journalExists()) return [];
+  return (await openJournal()).openExecutions();
+}
 
 /** The graph state a node reads: the composition's channels, plus `$run`. */
 export type GraphStateLike = Readonly<Record<string, unknown>> & { readonly $run: RunChannel };
@@ -6522,6 +6937,13 @@ export async function runNode(
     // entry would belong to a task nothing is left to read (see
     // [`abandonPausesUnder`], [`HumanAbandoned`]).
     if (abandonedOf(error) !== undefined) throw error;
+    // A fourth is not an outcome either, and is the one an `on_error:` must not
+    // be allowed to absorb: a journal that does not describe this run
+    // (resolved q29). `skip` would carry this graph past an effect the record
+    // claims to hold, and a `fallback:` would route on a disagreement rather
+    // than on anything the composition declared. It carries the entry the
+    // aborting path builds, so a reader still sees which node it stopped at.
+    if (error instanceof ReplayDivergence) throw carryEntry(error, aborted(error, 1));
     // An expiry never travels, which is what makes `expiry.route` safe to route
     // on here: this is where one is answered, by the very node that raised it,
     // and the answer is a `Command` rather than a throw, so — unlike an

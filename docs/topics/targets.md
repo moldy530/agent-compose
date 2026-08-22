@@ -116,6 +116,55 @@ composition is legal under `--target local` and rejected under
 `--target staging`, and `validate --target staging` is how you find that out
 before deploying.
 
+Checkpointing is **not** durability, and the two are easy to run together.
+That rule is about a LangGraph checkpointer; what makes an execution survive a
+restart here is a journal the runtime writes itself (below). `local` is still
+the un-checkpointed target, and it is also a durable one.
+
+## Durability is bound by the target too, and `local` binds SQLite
+
+Every invocation of every flow is journaled — no key turns it on, and none turns
+it off. Under `--target local` the journal is one SQLite file beside the
+project:
+
+```text
+<project>/.agent-compose/journal.sqlite
+```
+
+beside the stores, moved whole by `AGENT_COMPOSE_DATA_DIR`, and deleted by
+deleting it. The path is the same for `run`, `serve` and `resume` of one project
+and one target, which is what lets one command finish what another started.
+
+What is in it is every **effect** a run issued as it issued it: the model answers
+it got, the results its tools produced, what its stores read and wrote, and what
+a person answered a `human` node. A resumed execution re-runs the same graph and
+**consumes** that record instead of re-issuing it, up to the frontier — the
+first effect the journal does not hold — where it goes live again.
+
+```sh
+agent-compose run main.yml flow.review --input goal=ship
+# execution: exec_9f1c8a3e-1b7d-4a20-9d61-1f0e8a2c4d55
+# … the machine reboots …
+
+agent-compose resume main.yml exec_9f1c8a3e-1b7d-4a20-9d61-1f0e8a2c4d55
+# the two model calls it had already made are not made again
+```
+
+`serve` needs no such command: on start it recovers every execution the journal
+holds open, before it accepts a connection, and one parked on a `human` pause
+re-parks under the same wait id — so a resume request prepared against the
+process that died still finds its wait. Triggers are not re-fired.
+
+Because the journal holds what a trace deliberately does not — completions, tool
+results, a person's answer — it is **private recovery data with the same
+sensitivity as this project's stores**, never an observability artifact. Nothing
+uploads it and no command prints it.
+
+A distributed target will bind Postgres behind the same interface; every target
+this release can build is process-local, so every one of them binds SQLite and
+there is nothing for a deploy file to say. `docs/durability.md` is normative,
+and `docs/grammar.md` Decision D121 records why there is no grammar for it.
+
 ## `storage_backends`
 
 | Key | Shape |
@@ -164,7 +213,9 @@ on its runtime effect is a documented no-op.
 | `network:` on a placement | parsed, no-op |
 
 `human` nodes were on this list and have left it: the runtime landed, so a
-compiled project really pauses and resumes. What is still deferred is not the
-construct but its **durability**.
+compiled project really pauses and resumes — and their durability has left it
+too: a wait that a restart interrupted comes back with its id intact, because
+the wait id is the node's instance path and the journal is what a resumed
+execution reads its answers out of.
 
-Normative source: `docs/grammar.md` §14, §14.1, §14.2, §14.3, §15
+Normative source: `docs/durability.md`, `docs/grammar.md` §14, §14.1, §14.2, §14.3, §15
