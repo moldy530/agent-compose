@@ -36,21 +36,24 @@
 // # What an execution is here, and what it is not
 //
 // Executions are tracked **in this process**: a `Map` from id to the run's state
-// and the promise it settles. That is what this milestone can honestly offer —
-// durable execution and checkpointers are M3 (PRD §7) — and it is why a status
-// route answers `404` for an id this process never started, including one it
-// started before it was restarted. The sync-timeout upgrade continues the same
-// in-process execution rather than resuming a checkpointed one.
+// and the promise it settles. The *record* is this process's; the **run** is
+// not — every execution is journaled as it goes (`./journal.ts`, PRD resolved
+// q26-q29), and [`recover`] puts every one the journal holds open back on this
+// map before the app accepts a connection. So a restart loses the reports of
+// executions that had already finished and keeps the ones that had not, which is
+// the half that matters: a status route answers `404` for an id neither this
+// process nor the journal knows, and the sync-timeout upgrade continues the same
+// in-process execution it started.
 //
 // **Nothing is evicted**, and that is a decision rather than an omission. The
-// map holds every execution this process started, with its outputs and its
-// trace, so a long-running `serve` grows with the number of requests it has
-// answered. The alternative is an eviction policy, and every policy this
+// map holds every execution this process started or recovered, with its outputs
+// and its trace, so a long-running `serve` grows with the number of requests it
+// has answered. The alternative is an eviction policy, and every policy this
 // milestone could write is a `404` for an execution that really ran — a caller
 // polling a status URL it was handed, told the run never existed. A retention
-// story needs somewhere for an evicted execution to *be*, which is the
-// checkpointer, so it is M3's to write; until then the boundary is stated here
-// and in the emitted `README.md` rather than approximated with a bound.
+// story needs somewhere for an evicted execution's *report* to be, which the
+// journal is not (it records effects, not reports), so the boundary is stated
+// here and in the emitted `README.md` rather than approximated with a bound.
 //
 // # Resume (grammar 8.7, PRD 5.11)
 //
@@ -79,9 +82,14 @@
 // refused as such, rather than joined into an id nothing is holding.
 //
 // **What durability there is.** The wait is a promise parked in this process,
-// like the execution table below: a `serve` restarted while a human was thinking
-// has lost it, and the emitted `README.md` says so. Checkpointed waits arrive
-// with durable execution (PRD §7, M3).
+// and a restarted `serve` does not *hold* it — it **replays** the execution out
+// of the journal and parks again, under the same `wait_id`, because that id is
+// the node's instance path (grammar 9.4) and no process generation is part of
+// it. So a `resume_url` handed out by the process that died answers in the one
+// that replaced it. What the journal holds no record of is a wait nobody
+// answered — there is nothing to record about one — which is exactly what makes
+// re-parking the right thing to do with it (PRD resolved q28,
+// `docs/durability.md` §3.4, §6.1).
 
 import process from "node:process";
 

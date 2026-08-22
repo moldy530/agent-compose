@@ -359,6 +359,7 @@ run` and `agent-compose serve` launch:
 
 ```sh
 bun src/index.ts run flow.<name> --input goal=... [--session <key>] [--format json]
+bun src/index.ts resume <execution-id> [--format json]
 bun src/index.ts serve --port 8787
 ```
 
@@ -375,17 +376,29 @@ a payload whose one member is this argument, and what that expression answers is
 the partition the run addresses (grammar 13.2). Declared on no trigger, the
 argument is the identity.
 
+`resume` carries on an execution this project's journal holds open — a run the
+machine lost, or one that stopped at a `human` pause with nobody to ask. Every
+run is journaled as it goes, and the first line `run` writes to stderr is the id
+this verb takes (`execution: exec_…`); under `--format json` the same value is
+`execution_id`. The graph is re-executed from its entry with every recorded
+effect **consumed** — the model answers it got, the results its tools produced,
+what its stores read, what a person answered — and only the frontier, the first
+effect the journal does not hold, reaches the network. It takes no `--input` and
+no `--session`: the invocation it replays is the one the journal recorded.
+
 `serve` starts the app over the composition's declared `http` triggers and
 announces where it is listening as one JSON line on stdout. Beside them it
 mounts two routes of its own — `GET /executions/:id` for an execution's status
 and `POST /executions/:id/resume` — so those two are the app's and a trigger
-cannot declare either: the compiler refuses one that does. Executions are
-tracked in that process: durable execution and checkpointers are a later
-milestone, so a status route answers `404` for an id the process did not start —
-and every execution it *did* start, with its outputs and its trace, is held for
-the life of the process, so a long-running `serve` grows with the number of
-requests it has answered. Restarting it is the only way to reclaim that until
-the checkpointer arrives and an execution stops living in memory.
+cannot declare either: the compiler refuses one that does. On start it
+**recovers** every execution the journal holds open, before it accepts a
+connection, so a pause comes back under the same wait id and a resume URL
+prepared against the process that died still finds it; triggers are not
+re-fired. What is still tracked in the process alone is the *report*: a status
+route answers `404` for an id neither this process nor the journal knows, and
+every execution it has finished, with its outputs and its trace, is held for the
+life of the process — so a long-running `serve` grows with the number of
+requests it has answered, and restarting it is what reclaims that.
 
 Stopping it stops the graph: `agent-compose serve` passes `SIGINT` and `SIGTERM`
 on to this project, which closes the app and exits, so a supervisor that signals
@@ -518,10 +531,18 @@ longer held, and the next attempt asks again at the same `wait_id`. Poll the
 status route for the question rather than holding on to an `interrupts` entry
 from an earlier poll.
 
-**A wait lives in this process.** It is a parked promise, not a checkpoint, so a
-`serve` restarted while a human was thinking has lost it and the execution is
-gone with every other one that process was tracking. Durable waits arrive with
-durable execution.
+**A wait survives the process that opened it.** It is a parked promise rather
+than a checkpoint, so a restarted `serve` does not *hold* it — it **replays** the
+execution out of this project's journal and parks again, under the same
+`wait_id`, because the id is the node's instance path and no process generation
+is part of it. So a resume URL handed out by the process that died answers in
+the one that replaced it. What the journal does not hold is a wait nobody
+answered — there is nothing to record about it — which is exactly what makes
+re-parking the right thing to do with one.
+
+The same is true of a `run`: a pause it could not ask leaves its execution open
+in the journal, and `bun src/index.ts resume <execution-id>` picks it up,
+prompting at the terminal exactly as an interactive `run` does.
 
 ## Answering a pause at the terminal
 
@@ -630,6 +651,7 @@ installed (PRD 5.8). What it writes lives under this directory:
 ```text
 .agent-compose/stores/<name>.sqlite                      a `kv` or `vector` store
 .agent-compose/blobs/<name>/<partition>/values/<key>     a `blob` store
+.agent-compose/journal.sqlite                            every effect every execution issued
 .agent-compose/traces/<flow>-<execution id>.json         what `run` wrote out
 ```
 
@@ -641,12 +663,22 @@ memory and released when the run ends, which is what "dies with the run" means.
 same. It is derived from this project's own location rather than from the
 working directory, so a graph reads the same store wherever it was launched from.
 
-One thing under the directory is not a store's: the traces above, which
-`agent-compose run` writes and names on stderr. Each is one JSON object — the
+Two things under the directory are not a store's. The **traces** above, which
+`agent-compose run` writes and names on stderr: each is one JSON object — the
 trace envelope, carrying `trace_version`, the flow, the execution id, how the run
 ended, and the run's `entries` — rather than a bare list, so a file found on its
 own says which format it is in. The whole directory is listed in `.gitignore` —
 what a run produced is not what a build emitted.
+
+And the **journal**, which is what makes an execution survive the process that
+started it: every effect a run issued, written as it happened, so a `resume` (or
+a restarted `serve`) can hand the graph back what it already got instead of
+asking for it again. Read it as **private recovery data with the same
+sensitivity as your stores** rather than as a log: unlike a trace, which
+deliberately carries no completion, no tool result and no human's answer, the
+journal carries all three in full, because a replay cannot work without them.
+Nothing sends it anywhere and no command prints it. Deleting it costs exactly
+the ability to resume the executions it holds open.
 
 ### One process at a time
 
@@ -661,14 +693,20 @@ arrives with the production `storage_backends:` of a later milestone; until then
 `--target local` means one process, which is the same boundary the target draws
 everywhere else.
 
+The journal makes one concession to that, because it is the artifact a second
+process legitimately arrives at: **opening** it waits for a lock rather than
+failing on one, so an `agent-compose resume` typed beside a live `serve` gets in.
+Two processes *running* against one project is still the case above.
+
 **Nothing here is pruned.** A store keeps what was written to it until you
 delete the file, and that includes the idempotency ledger a keyed write leaves
 beside its effect (the `applied` table of a SQLite store, the `applied`
 directory of a blob one — one entry per key) — so a long-lived
 `global` store's ledger grows with the number of writes ever made to it, and so
-does the traces directory. Retention is yours: everything under
+do the journal and the traces directory. Retention is yours: everything under
 `.agent-compose/` is safe to remove between runs, and removing it is what "start
-clean" means.
+clean" means — at the cost, for the journal, of the executions it was holding
+open.
 "#;
 
 /// The section a composition with a `route_on: [timeout]` route gets.
