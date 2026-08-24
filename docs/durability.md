@@ -102,15 +102,30 @@ of a call, so two executions can never interleave inside one statement and no
 intra-process locking is needed.
 
 Across *processes* this release keeps the boundary PRD 5.10 draws and
-`src/stores.ts` already keeps — `--target local` is one process — with one
-exception the journal has to make, because it is the artifact a second process
-legitimately arrives at: `agent-compose resume` beside a live `serve` is the
-shape durability is *for*. So **opening waits on a lock rather than failing on
-one**, twice over — `busy_timeout` is set before any statement that can contend,
-and the open is retried under a deadline for the builds whose file system
-implements no sleep for that pragma to use. What is still outside the promise is
-two processes **writing** one project's journal at once, which is two runs of
-one project: the case `src/stores.ts` already refuses.
+`src/stores.ts` already keeps — `--target local` is one process. **One process
+at a time writes a project's journal**, and that is a rule rather than a
+mechanism: `node-sqlite3-wasm` runs SQLite over a virtual file system that
+implements no cross-process locking, so two processes on one file do not queue
+behind each other — they interleave, and each can read pages the other has not
+committed. `PRAGMA busy_timeout` is still set before any statement that can
+contend, and the open is still retried under a deadline, because both cost an
+uncontended run nothing and both are what a backend that *does* lock would need
+(resolved q27's Postgres slot is the one on the roadmap). Neither is a
+guarantee, and nothing in this document should be read as one. The
+per-statement atomicity above is likewise a statement about one process's
+writes.
+
+The two live surfaces are therefore kept **apart** rather than serialized:
+
+* an execution a live `serve` is holding is one `serve` has already recovered
+  (§6.1 — it recovers *every* open execution at start), and it is finished
+  through `POST /executions/:id/resume`;
+* `agent-compose resume` is for an execution **no live process is running** —
+  the one a crashed `run` left behind, which is the case resolved q28 gives it.
+
+Running `agent-compose resume` against an execution a live `serve` is replaying
+is outside the promise. Both generations would run past the frontier at once,
+issuing live effects into one record.
 
 **What a crash can still leave** is an effect that happened with no row for it:
 the row is written when the effect answers, and the window between the two is
@@ -185,10 +200,24 @@ composition derives one identity whatever environment it runs in, so an
 execution journaled on one machine is not reported as divergent on another for
 having a different `${TOOLBIN}`.
 
+The binding **whole**, field for field: an `exec:`'s `command:`, `args:`,
+`cwd:`, `env:` and `expect_exit:`, an `http:`'s `method:`, `url:`, `headers:`
+and `expect_status:`, and on both the shape the declared `output:` decodes into.
+Each of them changes what the call is or what its answer means, so a binding
+that moved in any one of them is a call this run does not make and a recorded
+answer is not its.
+
 A **detached** `map` delivery (`docs/grammar.md` §8.6 rule 7) is journaled like
 any other effect under the dispatch's own instance path. Its outcome is never
 observed by the join (Decision D94) and nothing about the trace changes; what
-the record buys is that a replay does not deliver it twice.
+the record buys is that a replay does not deliver it twice. A divergence raised
+inside one is the exception to rule 7's "nothing it does can delay the enclosing
+flow instance" — §7 makes a divergence un-absorbable by any policy, and
+`detach:` is a policy — so it is held against the execution and fails it: at the
+next effect any branch of the run reaches, or on the way out of `runFlow` for a
+run with none left. What the run does not do is *wait* for a detached delivery,
+which rule 7 forbids: a divergence raised after the run has already quiesced has
+no run left to fail, and is written to stderr instead.
 
 ### 3.3 A store op
 
@@ -246,7 +275,7 @@ be resumed:
 * **`failed`** — the run produced no answer and was not holding a question: a
   node failed and the composition's own `on_error:` decided the run. Replaying
   it would re-derive the same failure from the same record, so `resume` refuses
-  it by name.
+  it by name. A **divergence** is not one of these and never closes a row (§7).
 * **`open`** — the run has not ended. Two ways to be open, and both are exactly
   what recovery is for: the process died, or the run reached a `human` pause
   with nobody to answer it (`docs/grammar.md` §8.7) and ended `3`. The second is
@@ -344,10 +373,15 @@ on:
   has to happen before the first request; finishing them is what the resume
   route is for.
 
-A replay that fails — including a divergence (§7) — is recorded on that
-execution and reported by the status route. Recovery of one execution never
-stops the process from serving the others. An open execution of a flow the
-current build no longer declares is reported on stderr and left open.
+A replay that fails is recorded on that execution and reported by the status
+route, and recovery of one execution never stops the process from serving the
+others. A **divergence** (§7) is reported the same way and leaves the journal
+row **open**: what this process reports is what this build saw, while the row
+records the execution. An open execution of a flow the current build no longer
+declares is reported on stderr and left open for the same reason.
+
+Because recovery takes every open execution, an execution worth resuming by hand
+is one no `serve` is running — see §2 on what is outside the promise.
 
 ### 6.2 `run` journals; `resume` replays
 
@@ -402,14 +436,29 @@ resolved q29: "a divergence discovered at replay time […] fails the resume wit
 a diagnostic naming the divergent step, rather than silently re-executing an
 effect the journal claimed to hold."
 
-**What is compared** is the effect's *request identity* — §3's per-kind
-descriptions say what goes into each — canonicalized as JSON with object keys in
-sorted order, so two identical requests cannot compare unequal for having been
-built by different branches of one function.
+**Two things** can be that. The first is the effect's *request identity* — §3's
+per-kind descriptions say what goes into each — canonicalized as JSON with
+object keys in sorted order, so two identical requests cannot compare unequal
+for having been built by different branches of one function. It is compared at
+the effect seam, before anything is answered.
+
+The second is q29's other clause: **a recorded answer that fails the current
+contract.** A composition may keep a binding exactly as it was and tighten what
+it will accept back — a `min_length:` added to a field, an `enum:` narrowed —
+and the recorded answer then satisfies the request check and fails the node's
+declared `output:`. That is decided where the answer is parsed rather than at
+the seam, because the contract belongs to the node, and it is a divergence
+rather than the ordinary "this answered off-contract" failure for the reason
+below: an ordinary one is a node failure, a `retry:` absorbs it, and the second
+attempt claims an ordinal past the frontier and **re-issues the effect live** —
+the double side effect this whole document exists to prevent, reported as a bad
+answer.
 
 **What the failure names** is the divergent step: the effect site's instance
-path, the effect kind, the ordinal at that site, the whole key, and both sides
-of the disagreement truncated to 200 characters each.
+path, the effect kind, the ordinal at that site, the whole key, and — for a
+request identity — both sides of the disagreement truncated to 200 characters
+each. A recorded answer that failed the current contract names what the contract
+said instead.
 
 ```text
 ReplayDivergence: this execution's journal does not describe this run at
@@ -424,9 +473,26 @@ does not describe this graph is not the world misbehaving — `skip` would carry
 the run past an effect the record claims to hold, and a `fallback:` would route
 on a disagreement rather than on anything the composition declared. Retrying it
 would be worse still: each attempt would consume the next ordinal at that site
-and report the last disagreement rather than the first. The resume exits
-nonzero, the trace entry of the node it stopped at is written, and the execution
-stays open.
+and report the last disagreement rather than the first.
+
+**No policy at any nesting depth absorbs it**, which is q29's own phrasing.
+There are four ladders and policies a failure can be absorbed by, and each lets
+this one through: a node's `retry:`, a node's `on_error:` (`skip` and
+`fallback:` alike), a `map`'s `on_item_error:`, and the item retry the `retry`
+form of that key gives each item. The two boundaries a failure is *restated* at
+— a `flow:` node's instance and a dispatched item — are looked through rather
+than tested for, so a divergence inside a subflow, inside a `map` item, or
+inside a flow-as-tool child is the same divergence when it arrives. `detach:` is
+the fifth and is §3.2's.
+
+The resume exits nonzero, the trace entry of the node it stopped at is written,
+and **the execution stays open**. That last is not a detail: a divergence says
+this build's composition and this execution's record disagree, which is not a
+statement about the execution. Recording it as the execution's own failure would
+make it unresumable for ever — `resume` refuses a `failed` row by name — even
+after the composition is put back, and since `serve` replays *every* open
+execution at start (§6.1), one deploy that moved a prompt would close every open
+execution of that project in a single restart.
 
 The commonest cause is a composition that moved under a journal — a changed
 prompt, a renamed tool, a different `url:`. That is the diagnosis the message is
@@ -545,7 +611,12 @@ At a given `JOURNAL_VERSION`:
 * the key derivation of §4, and the vocabulary of `EffectKind`;
 * the `status` vocabulary of §3.6;
 * that a record's payload round-trips: a value written by one generation is the
-  value the next one is handed;
+  value the next one is handed. Both ends of that: a payload is stored as
+  canonical JSON, so the generation that *recorded* it goes on with the round
+  trip rather than with the value it happened to build — otherwise the two
+  generations would carry differently ordered copies of one value, and the
+  difference would surface as a divergence the composition never made the moment
+  either was folded into a later request identity;
 * that replay is read-only up to the frontier (§5), and that a divergence fails
   the resume rather than re-executing (§7).
 

@@ -75,15 +75,21 @@
 // intra-process locking is needed.
 //
 // Across *processes* this release keeps the boundary `./stores.ts` keeps and
-// PRD 5.10 draws — `--target local` is one process — but the journal is the one
-// artifact a second process legitimately arrives at: `agent-compose resume`
-// beside a live `serve` is the shape durability is *for*. So opening waits on a
-// lock rather than failing on one, twice over: `busy_timeout` is set before any
-// contended statement, and the open is retried under a deadline for the builds
-// whose file system implements no sleep for that pragma to use. What is still
-// outside the promise is two processes **writing** one project's journal at
-// once, which is two runs of one project — the case `./stores.ts` already
-// refuses.
+// PRD 5.10 draws — `--target local` is one process, and **one process at a time
+// writes a project's journal**. That is a rule rather than a mechanism, and it
+// is stated as one because this driver cannot enforce it: `node-sqlite3-wasm`
+// runs SQLite over a virtual file system that implements no cross-process
+// locking at all, so two processes on one file do not queue behind each other —
+// they interleave, and each can read pages the other has not committed.
+// `busy_timeout` is still set, and the open is still retried under a deadline,
+// because both are free and both are what a build whose file system *does* lock
+// would need. Neither is a guarantee, and nothing here should be read as one.
+//
+// So the two live surfaces are kept apart rather than serialized. `serve`
+// recovers every open execution at start, which means an execution a live
+// `serve` holds is already being replayed by it and is finished through
+// `POST /executions/:id/resume`; `agent-compose resume` is for an execution
+// **no live process is running** — the one a crashed `run` left behind.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -442,14 +448,17 @@ export function openJournal(): Promise<Journal> {
 }
 
 /**
- * How long the journal waits for a lock another process is holding, and how
- * long the retry below keeps trying for.
+ * How long the journal waits on a busy file, and how long the retry below keeps
+ * trying for.
  *
- * Two mechanisms rather than one, because only the first is SQLite's: a build
- * whose virtual file system implements a sleep honours `busy_timeout`, and one
- * that does not answers `SQLITE_BUSY` at once whatever it is set to. The retry
- * is what covers the second, and it costs a run that meets no contention
- * nothing at all.
+ * Both are **best effort**, and the module header says why: this driver's
+ * virtual file system implements no cross-process locking, so on the builds this
+ * compiler release ships there is no lock for `busy_timeout` to wait on and no
+ * `SQLITE_BUSY` for the retry to catch. They are here because they cost a run
+ * that meets no contention nothing, and because a driver that grows real locking
+ * — or a backend that has it, which is what resolved q27's Postgres slot is —
+ * finds them already asked for. One process at a time writes a project's
+ * journal, and that stays a rule rather than a mechanism.
  */
 const LOCK_WAIT_MS = 5_000;
 
@@ -462,9 +471,11 @@ async function migrated(
   for (;;) {
     const database = new Database(journalPath());
     try {
-      // **First**, so every statement after it waits for a lock rather than
-      // failing on one. A `PRAGMA` that arrives after the contended statement
-      // is a setting nobody read.
+      // **First**, so that on a build whose file system does lock, every
+      // statement after it waits rather than failing. A `PRAGMA` that arrives
+      // after the contended statement is a setting nobody read — and on this
+      // driver it is a setting with nothing to wait on either way
+      // ([`LOCK_WAIT_MS`]).
       database.exec(`PRAGMA busy_timeout = ${LOCK_WAIT_MS};`);
       // What makes "committed" mean "on the disk" rather than "in the page
       // cache", which is the whole of what a journal is for.
@@ -480,10 +491,11 @@ async function migrated(
     } catch (error) {
       database.close();
       if (Date.now() >= deadline) throw error;
-      // A lock another process is holding: the schema statements are the widest
-      // window a journal has, and `--target local` is one process (PRD 5.10) —
-      // so this is a *second* one arriving, and the honest thing is to let it
-      // in rather than to fail its run over a table that already exists.
+      // Whatever refused the open, tried again under a deadline rather than
+      // failed on at once: the schema statements are the widest window a journal
+      // has, and the honest thing to do about a file that is momentarily busy is
+      // to let this process in rather than to fail its run over a table that
+      // already exists. Best effort, for [`LOCK_WAIT_MS`]'s reason.
       await new Promise((resolve) => setTimeout(resolve, delay));
       delay = Math.min(delay * 2, 200);
     }
@@ -515,11 +527,38 @@ export function journalExists(): boolean {
  * follows insertion would make two identical requests compare unequal because
  * one was built by a different branch of the same code.
  *
- * `undefined` is dropped exactly as `JSON.stringify` drops it, so a value that
- * round-trips through this function is the value a replay hands back.
+ * A member whose value is `undefined` is dropped exactly as `JSON.stringify`
+ * drops it. A value that is `undefined` **whole** — a host function that
+ * answered nothing (grammar 6.1 requires JSON of one, and `undefined` is not
+ * JSON) — is written as `null` rather than as the JS `undefined` that
+ * `JSON.stringify` answers: the payload column is `NOT NULL` and the driver
+ * refuses to bind `undefined` at all, so leaving it would replace whatever the
+ * node's own `output:` had to say about an empty answer with a SQLite error
+ * raised *after* the effect had already happened.
  */
 export function canonical(value: unknown): string {
-  return JSON.stringify(sorted(value));
+  return JSON.stringify(sorted(value)) ?? "null";
+}
+
+/**
+ * A value as a **later generation** will be handed it: this journal's own round
+ * trip, applied to the generation that is recording it.
+ *
+ * `docs/durability.md` §11.1 promises that "a value written by one generation is
+ * the value the next one is handed", and that promise has two ends. A replay
+ * reads its value back through `JSON.parse` of [`canonical`], so its object keys
+ * arrive **sorted**; the generation that recorded it held whatever order the
+ * code that built the value happened to use. Handing the recording generation
+ * the raw value would make the two differ — invisibly, until the value is
+ * re-serialized into some later effect's request identity, where the difference
+ * is reported as a divergence the composition never made. (A `kv` `get` builds
+ * its row as `{value, found}` and reads back as `{found, value}`; an agent that
+ * called a store tool puts that row verbatim into its next model call's turns.)
+ *
+ * So both generations are handed the round trip, and the asymmetry is gone.
+ */
+function revived(value: unknown): unknown {
+  return JSON.parse(canonical(value)) as unknown;
 }
 
 function sorted(value: unknown): unknown {
@@ -636,6 +675,7 @@ export function openSession(
 /** Close one execution's session. The journal handle is the project's. */
 export function closeSession(execution: string): void {
   sessions.delete(execution);
+  latched.delete(execution);
 }
 
 /**
@@ -661,8 +701,13 @@ export function recorderFor(execution: string, site: string): EffectRecorder | u
 export interface EffectSlot {
   readonly key: string;
   readonly held: JournalOutcome | undefined;
-  /** Record what the live effect answered. */
-  keep(value: unknown): void;
+  /**
+   * Record what the live effect answered, and answer with the value the
+   * **journal** now holds — which is what the caller must go on with. See
+   * [`revived`]: the two generations are handed the same value or the promise
+   * `docs/durability.md` §11.1 makes is not one.
+   */
+  keep(value: unknown): unknown;
   /** Record what the live effect threw. */
   fail(error: unknown): void;
 }
@@ -719,6 +764,17 @@ export class EffectRecorder {
    * rather than a re-execution (resolved q29).
    */
   claim(kind: EffectKind, request: unknown): EffectSlot {
+    // A divergence raised where nothing could carry it out — a detached `map`
+    // delivery, whose whole point is that the flow instance does not wait for it
+    // (grammar 8.6 rule 7) — belongs to the **execution** rather than to that
+    // branch: resolved q29 makes a divergence un-absorbable "by `retry:`,
+    // `on_error:`, `on_item_error:`, or any policy at any nesting depth", and
+    // `detach: true` is a policy. Re-raised at the next effect any branch of this
+    // execution reaches, so a run with work left stops at once instead of
+    // finishing against a record that has stopped describing it. See
+    // [`latchDivergence`].
+    const poisoned = latched.get(this.#session.execution);
+    if (poisoned !== undefined) throw poisoned;
     const counter = `${this.#site}#${kind}`;
     const ordinal = this.#session.ordinals.get(counter) ?? 0;
     this.#session.ordinals.set(counter, ordinal + 1);
@@ -740,6 +796,12 @@ export class EffectRecorder {
           );
         }
         held = found.outcome;
+        // Request identity is only the **first** of resolved q29's two
+        // divergences. The second — "a recorded answer fails the current
+        // contract" — cannot be decided here, because the contract belongs to the
+        // node that asked: it is decided where the answer is parsed, off this
+        // note. See [`recordedAnswerOf`].
+        if (held.kind === "value") noteReplayed(held.value, { key, site, kind, ordinal });
       }
       // The first key the journal does not hold is the frontier, and past it
       // this execution is live again (resolved q29): `held` stays undefined and
@@ -765,10 +827,111 @@ export class EffectRecorder {
     return {
       key,
       held,
-      keep: (value) => write({ kind: "value", value }),
+      keep: (value) => {
+        // Recorded **and returned** as the journal now holds it, so this
+        // generation and the next are handed the same value ([`revived`]).
+        const kept = revived(value);
+        write({ kind: "value", value: kept });
+        return kept;
+      },
       fail: (error) => write({ kind: "error", ...named(error) }),
     };
   }
+}
+
+// ---------------------------------------------------------------------------
+// A recorded answer that fails the current contract (resolved q29's second half)
+// ---------------------------------------------------------------------------
+
+/**
+ * Which record each replayed value came out of.
+ *
+ * resolved q29 makes **two** things a divergence: a recorded request the run no
+ * longer makes, and "a recorded answer [that] fails the current contract". Only
+ * the first is decidable at the effect seam — the second is decided by the
+ * schema the *node* declares, which the seam has never seen and which sits one
+ * call away in the emitted node body. So the seam leaves a note, and the parse
+ * reads it ([`recordedAnswerOf`], `parseResult` in `./runtime.ts`).
+ *
+ * Weakly held, and by identity: the note lives exactly as long as the value the
+ * graph is carrying, and a value that is not a replayed one is not in it. Every
+ * object *inside* a replayed payload is noted too, because what a contract
+ * refuses is as often a field of the answer as the answer itself.
+ *
+ * The alternative — letting the parse raise its ordinary `ResultMismatch` — is
+ * the failure resolved q29 exists to prevent: that class is a node failure, a
+ * `retry:` absorbs it, and the retry's second attempt claims an ordinal past the
+ * frontier and re-issues the effect **live**.
+ */
+const replayed = new WeakMap<object, Pick<JournalRecord, "key" | "site" | "kind" | "ordinal">>();
+
+/** Note a replayed payload, and everything inside it. See [`replayed`]. */
+function noteReplayed(
+  value: unknown,
+  record: Pick<JournalRecord, "key" | "site" | "kind" | "ordinal">,
+): void {
+  if (value === null || typeof value !== "object") return;
+  replayed.set(value, record);
+  for (const held of Object.values(value as Record<string, unknown>)) {
+    noteReplayed(held, record);
+  }
+}
+
+/**
+ * The divergence a value that came out of the journal raises when the contract
+ * it is being held to refuses it — and `undefined` for a value this generation
+ * produced itself, which is an ordinary failure of the world.
+ */
+export function recordedAnswerOf(value: unknown, detail: string): ReplayDivergence | undefined {
+  if (value === null || typeof value !== "object") return undefined;
+  const record = replayed.get(value);
+  return record === undefined
+    ? undefined
+    : new ReplayDivergence(
+        record,
+        `the recorded answer no longer satisfies this run's contract: ${detail}`,
+      );
+}
+
+// ---------------------------------------------------------------------------
+// A divergence with nobody to throw it to
+// ---------------------------------------------------------------------------
+
+/** The divergence each execution is holding, where one was raised off-thread. */
+const latched = new Map<string, ReplayDivergence>();
+
+/**
+ * Hold a divergence raised on a branch **nothing awaits**.
+ *
+ * There is exactly one such branch: a detached `map` delivery, whose `.catch` is
+ * the one place in this runtime where a failure legitimately stops travelling
+ * (grammar 8.6 rule 7 — "nothing it does can delay the enclosing flow
+ * instance"). A [`ReplayDivergence`] is the one failure that may not stop there:
+ * resolved q29 makes it un-absorbable by any policy at any nesting depth, and
+ * swallowing it would report a resume as complete while a delivery the record
+ * claims to hold was never made.
+ *
+ * Held rather than thrown, because there is nobody to throw to. Two readers pick
+ * it up: [`EffectRecorder.claim`], so any branch still running fails at its next
+ * effect, and `runFlow` in `./graph.ts`, so an execution with no effects left
+ * fails on the way out. The **first** is kept, because the first is the one that
+ * describes where the record and the run parted company.
+ */
+export function latchDivergence(execution: string, divergence: ReplayDivergence): void {
+  if (sessions.has(execution)) {
+    if (!latched.has(execution)) latched.set(execution, divergence);
+    return;
+  }
+  // The run this delivery belonged to has already ended — rule 7 is why nothing
+  // waited for it — so there is no run left to fail. Said on stderr rather than
+  // dropped: a divergence nobody can be told about is still one a reader has to
+  // be able to find.
+  process.stderr.write(`${divergence.name}: ${divergence.message}\n`);
+}
+
+/** The divergence latched on this execution, if one was. */
+export function latchedDivergence(execution: string): ReplayDivergence | undefined {
+  return latched.get(execution);
 }
 
 /** An error as the journal keeps it: the two halves `describe` reads. */
@@ -820,6 +983,8 @@ export async function journaled<T>(
     slot.fail(error);
     throw error;
   }
-  slot.keep(value);
-  return value;
+  // The **kept** value rather than the live one: what the journal now holds is
+  // what a resumed generation will be handed, so it is what this one goes on
+  // with too (`docs/durability.md` §11.1, and see [`revived`]).
+  return slot.keep(value) as T;
 }

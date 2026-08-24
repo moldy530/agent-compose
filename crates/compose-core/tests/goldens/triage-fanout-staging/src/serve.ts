@@ -442,9 +442,14 @@ const DEFAULT_SYNC_TIMEOUT_MS = 60_000;
  * nobody has answered yet. Registering them is what has to happen before the
  * first request; finishing them is what the resume route is for.
  *
- * A replay that **diverges** (`runtime.ReplayDivergence`) is recorded on the
- * execution like any other failure and reported by the status route: recovery
- * of one execution never stops the process from serving the others.
+ * A replay that **diverges** (`runtime.ReplayDivergence`) is reported by the
+ * status route like any other failed replay, and recovery of one execution never
+ * stops the process from serving the others — but the execution's **journal row
+ * stays open** (`docs/durability.md` §7). The distinction is the point: what
+ * this process reports is what this build saw, while the row records the
+ * execution, and a build whose composition has moved under a journal has not
+ * decided anything about the executions that journal holds. Put the composition
+ * back and the next start recovers them.
  */
 async function recover(executions: Map<string, Execution>): Promise<void> {
   let open: readonly runtime.ExecutionRow[];
@@ -458,6 +463,11 @@ async function recover(executions: Map<string, Execution>): Promise<void> {
     return;
   }
   for (const row of open) {
+    // One generation of one execution per process. Nothing can be running yet —
+    // this hook is what runs before the first connection — so the guard is a
+    // statement rather than a fix: an execution this process is already replaying
+    // is never replayed a second time beside itself.
+    if (executions.has(row.id)) continue;
     const flow = flows[row.flow];
     if (flow === undefined) {
       // The composition moved under a journal that still holds an execution of
