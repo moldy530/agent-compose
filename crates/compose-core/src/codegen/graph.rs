@@ -3452,6 +3452,14 @@ export async function runFlow(
   });
   try {
     const produced = await quiesceFlow(address, flow, parsed, ceiling, sessionKey, executionId, options);
+    // A run that reached quiescence may still be holding a divergence raised
+    // where nothing could throw it — a detached `map` delivery, which grammar 8.6
+    // rule 7 says the flow instance does not wait for. PRD resolved q29 makes a
+    // divergence un-absorbable by any policy at any nesting depth, and `detach:`
+    // is one, so it fails the resume here rather than being reported as a
+    // completion the record does not support.
+    const diverged = runtime.latchedDivergence(executionId);
+    if (diverged !== undefined) throw diverged;
     runtime.settleExecution(executionId);
     return produced;
   } catch (error) {
