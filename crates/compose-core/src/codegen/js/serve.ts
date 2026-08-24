@@ -96,7 +96,7 @@ import process from "node:process";
 import Fastify from "fastify";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
-import { type CompiledFlow, flows, runFlow } from "./graph.ts";
+import { type CompiledFlow, type FlowRun, flows, runFlow } from "./graph.ts";
 import { TRACE_VERSION, deliverHumanAnswer, humanWaits, openExecutions } from "./runtime.ts";
 import type * as runtime from "./runtime.ts";
 import { type HttpTrigger, httpTriggers } from "./triggers.ts";
@@ -490,24 +490,23 @@ function resumeInto(
     status: "running",
     settled: Promise.resolve(),
   };
-  execution.settled = runFlow(flow.address, row.inputs, {
-    executionId: row.id,
-    sessionKey: row.sessionKey,
-    resumable: true,
-    trigger: row.trigger,
-    resume: true,
-  })
-    .then((run) => {
-      execution.status = "completed";
-      execution.outputs = run.outputs;
-      execution.trace = run.trace;
-    })
-    .catch((error: unknown) => {
-      execution.status = "failed";
-      execution.error = message(error);
-      const trace = (error as { trace?: readonly runtime.TraceEntry[] }).trace;
-      if (trace !== undefined) execution.trace = trace;
-    });
+  execution.settled = settling(
+    execution,
+    runFlow(flow.address, row.inputs, {
+      executionId: row.id,
+      sessionKey: row.sessionKey,
+      resumable: true,
+      trigger: row.trigger,
+      resume: true,
+    }),
+    // The webhook the caller who started this execution is still waiting for.
+    // It is on the lifecycle row because *this* process is the one that will
+    // finish the run, and the request that named the URL reached the one that
+    // did not (`docs/durability.md` §6.1). A recovered execution that fired no
+    // webhook would leave a caller who was handed a `202` with no signal at all
+    // — the contract was push, so nobody is polling the status route.
+    row.callback,
+  );
   executions.set(row.id, execution);
   return execution;
 }
@@ -531,22 +530,74 @@ function register(
     // because the run's own handlers write into it.
     settled: Promise.resolve(),
   };
+  const callback = callbackOf(trigger, payload);
   // `resumable: true` is what makes a `human` node a *pause* rather than the end
   // of the run: this app mounts the route that answers one (grammar 8.7,
   // PRD 5.11), which `agent-compose run` does not.
-  execution.settled = runFlow(flow.address, inputs, {
-    executionId: id,
-    sessionKey,
-    resumable: true,
-    // Which trigger started it, for the journal's lifecycle row. Recorded so a
-    // reader of the journal can tell an `http` execution from a `run`; never
-    // re-fired on recovery (PRD resolved q28).
-    trigger: trigger.name,
-  })
-    .then((run) => {
+  execution.settled = settling(
+    execution,
+    runFlow(flow.address, inputs, {
+      executionId: id,
+      sessionKey,
+      resumable: true,
+      // Which trigger started it, for the journal's lifecycle row. Recorded so a
+      // reader of the journal can tell an `http` execution from a `run`; never
+      // re-fired on recovery (PRD resolved q28).
+      trigger: trigger.name,
+      // And where its completion webhook goes, on the same row and for the
+      // reason [`resumeInto`] reads it back: the process that finishes this
+      // execution may not be this one.
+      ...(callback === undefined ? {} : { callback }),
+    }),
+    callback,
+  );
+  executions.set(id, execution);
+  return execution;
+}
+
+/**
+ * The completion webhook this request asked for, where it asked for one
+ * (grammar 13.3's `callback:`).
+ *
+ * A URL the payload does not yield is **no webhook** rather than a bad request:
+ * a completion webhook is optional, and `callback: "payload.body.callback_url"`
+ * — the natural spelling, and the one the grammar's own example uses — reads a
+ * key most callers will not have sent (grammar 4.1, Decision D110). So a
+ * refusal here is an absence.
+ *
+ * Read when the request arrives rather than when the run ends, which is what
+ * lets it be **recorded**. `payload` is fixed the moment the route is entered,
+ * so the URL is the same either way; what differs is that a run finishing in
+ * another process can still deliver it (`docs/durability.md` §6.1).
+ */
+function callbackOf(trigger: HttpTrigger, payload: Payload): string | undefined {
+  if (trigger.callback === undefined) return undefined;
+  try {
+    return trigger.callback(payload);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Record what a run did on its execution, and deliver its completion webhook.
+ *
+ * One tail for both ways a run reaches this process — a request that started it
+ * and a recovery that picked it up — because the two differ in how a run
+ * *begins* and in nothing after it. An execution recovered at start finishes
+ * like any other, and a caller holding a `202` is owed the same push whichever
+ * process got there.
+ */
+function settling(
+  execution: Execution,
+  run: Promise<FlowRun>,
+  callback: string | undefined,
+): Promise<void> {
+  return run
+    .then((answer) => {
       execution.status = "completed";
-      execution.outputs = run.outputs;
-      execution.trace = run.trace;
+      execution.outputs = answer.outputs;
+      execution.trace = answer.trace;
     })
     .catch((error: unknown) => {
       execution.status = "failed";
@@ -555,24 +606,9 @@ function register(
       if (trace !== undefined) execution.trace = trace;
     })
     .then(async () => {
-      // `callback:` is read **here** rather than at the start, and the
-      // difference is grammar 13.3's: a completion webhook is optional, and a
-      // request that carried no URL for one is a request with no webhook rather
-      // than a bad request. Evaluating it at the start would make
-      // `callback: "payload.body.callback_url"` — the natural spelling, and the
-      // one the grammar's own example uses — refuse every caller who did not
-      // want a callback (grammar 4.1, Decision D110).
-      if (trigger.callback === undefined) return;
-      let url: string;
-      try {
-        url = trigger.callback(payload);
-      } catch {
-        return;
-      }
-      await notify(url, execution);
+      if (callback === undefined) return;
+      await notify(callback, execution);
     });
-  executions.set(id, execution);
-  return execution;
 }
 
 /** The completion webhook of an `async` trigger (grammar 13.3). */

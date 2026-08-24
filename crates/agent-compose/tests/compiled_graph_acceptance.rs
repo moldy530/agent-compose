@@ -12422,6 +12422,367 @@ fn a_diverged_resume_leaves_the_execution_open_for_the_composition_that_fits_it(
     );
 }
 
+/// A run that **parked** keeps what it owns on disk (`docs/durability.md` §5).
+///
+/// `scope: execution` means "dies with the run" (grammar 11.1), and a run that
+/// reached a `human` pause with nobody to answer it has not ended: it exits `3`
+/// with its journal row open, which is the execution `resume` exists for. So the
+/// one store whose contents really can outlive the process — a `blob` store,
+/// which is a directory whatever its scope — has to still be there.
+///
+/// `flow.papered` writes a draft, parks, and reads the draft back on the far
+/// side of the pause. Getting this wrong is silent: a replayed `put` is never
+/// applied a second time, so a partition removed on the way out leaves the
+/// live `get` past the frontier answering `found: false` about something the
+/// record says the execution wrote. Nothing compares unequal, §7's divergences
+/// never fire, and the resume reports `completed` carrying a wrong answer —
+/// which is why the assertion is on the value read back rather than on an error.
+#[test]
+fn a_parked_runs_own_blob_store_is_there_for_the_generation_that_resumes() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let Some(project) = harness::scratch_project("resume-papered") else {
+        return;
+    };
+    let environment = harness::environment(&provider);
+
+    // Nobody can answer this one: no `AGENT_COMPOSE_INTERACTIVE`, so the pause
+    // ends the run rather than parking on a promise (grammar 8.7).
+    let parked = harness::run_formatted(
+        &project,
+        "durability",
+        "flow.papered",
+        &[("topic", "durability")],
+        None,
+        Some("json"),
+        &environment,
+    );
+    let said_on_stderr = parked.failed();
+    let report = parked.outputs();
+    assert_eq!(
+        report["status"], "interrupted",
+        "{report}\n{said_on_stderr}"
+    );
+    let execution = report["execution_id"]
+        .as_str()
+        .expect("a run names the execution it opened")
+        .to_string();
+
+    // The partition itself, where `src/stores.ts` puts it. Asserted directly
+    // because the read below is what a *user* sees and this is what makes it
+    // true: a directory the parked generation deleted is not something a later
+    // assertion could tell from a store that was never written.
+    let partition = project
+        .join(".agent-compose")
+        .join("blobs")
+        .join("papers")
+        .join("execution")
+        .join(&execution);
+    assert!(
+        partition.is_dir(),
+        "a parked run leaves its own `blob` partition where the resume can read \
+         it: `{}` is not there",
+        partition.display()
+    );
+
+    let resumed = harness::resume_answering(
+        &project,
+        "durability",
+        &execution,
+        &environment,
+        &["{\"decision\": \"approve\"}"],
+        harness::Answers::Closed,
+    );
+    resumed.succeeded();
+    assert_eq!(
+        resumed.outputs(),
+        json!({ "decision": "approve", "recalled": true, "paper": "durability" }),
+        "the live `get` past the frontier reads the world the parked generation \
+         left behind: {}",
+        resumed.stderr()
+    );
+
+    // …and the generation that *ended* the execution took the partition with it,
+    // which is the lifetime grammar 11.1 declares.
+    assert!(
+        !partition.is_dir(),
+        "the resumed generation ends the execution, so it removes what the \
+         execution owned: `{}` is still there",
+        partition.display()
+    );
+}
+
+/// A detached delivery still in flight when the run stops is **recorded before
+/// the run lets go** (`docs/durability.md` §3.2).
+///
+/// Grammar 8.6 rule 7 says nothing a detached delivery does may delay the
+/// enclosing flow instance, and nothing does: the join returns at dispatch. But
+/// a delivery is journaled when it *answers*, so a process that walked away from
+/// one in flight would leave an effect with no row — and `flow.posted` parks at
+/// a pause nobody can answer, which is `agent-compose run`'s own documented way
+/// to stop rather than a crash. The resume would then deliver each receipt a
+/// second time, systematically.
+///
+/// The shim writes its line **before** it answers, so the effect is made while
+/// the run is still parking and the record can only be there if the run waited
+/// for it. Two lines after the resume is the whole assertion: two deliveries,
+/// two receipts, across two generations.
+#[test]
+fn a_detached_delivery_in_flight_when_a_run_parks_is_not_delivered_twice() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let Some(project) = harness::scratch_project("resume-posted") else {
+        return;
+    };
+
+    let shims = harness::Scratch::new("posted");
+    let log = shims.path().join("receipt.log");
+    // The line first, then a delay, then the answer: the effect has happened and
+    // the record has not, which is the window the run has to close.
+    harness::shim(
+        shims.path(),
+        "receipt",
+        "printf 'filed\\n' >> \"$RECEIPT_LOG\"\nsleep 0.4\nprintf 'filed'\n",
+    );
+    let mut environment = harness::environment(&provider);
+    environment.push((
+        harness::RECEIPT_BIN.to_string(),
+        shims.path().display().to_string(),
+    ));
+    environment.push((harness::RECEIPT_LOG.to_string(), log.display().to_string()));
+
+    let parked = harness::run_formatted(
+        &project,
+        "durability",
+        "flow.posted",
+        &[("topic", "durability"), ("topics", "[\"one\",\"two\"]")],
+        None,
+        Some("json"),
+        &environment,
+    );
+    let said_on_stderr = parked.failed();
+    let report = parked.outputs();
+    assert_eq!(
+        report["status"], "interrupted",
+        "{report}\n{said_on_stderr}"
+    );
+    let execution = report["execution_id"]
+        .as_str()
+        .expect("a run names the execution it opened")
+        .to_string();
+    assert_eq!(
+        harness::lines_in(&log),
+        2,
+        "the first generation made both deliveries"
+    );
+    assert!(
+        harness::journal_holds(&project, &["receipt/0/0#tool/0", "receipt/0/1#tool/0"]),
+        "…and did not stop until both were recorded, because it is going to be \
+         resumed: {}",
+        said_on_stderr
+    );
+
+    let resumed = harness::resume_answering(
+        &project,
+        "durability",
+        &execution,
+        &environment,
+        &["{\"decision\": \"approve\"}"],
+        harness::Answers::Closed,
+    );
+    resumed.succeeded();
+    assert_eq!(
+        resumed.outputs(),
+        json!({ "decision": "approve" }),
+        "{}",
+        resumed.stderr()
+    );
+    assert_eq!(
+        harness::lines_in(&log),
+        2,
+        "the resumed generation consumed both records instead of delivering \
+         again (`docs/durability.md` §3.2)"
+    );
+}
+
+/// A **human** answer is held to the contract this build declares, and an
+/// answer it no longer admits is resolved q29's second divergence.
+///
+/// The other record kinds reach a result parse, which is where a recorded answer
+/// that fails the current contract is caught. A `human` answer reaches none: it
+/// is returned straight out of the journal, so a composition that narrowed the
+/// node's `output:` under a journal would otherwise resume `completed` carrying
+/// a value its own `outputs:` refuses — and, because the enum is narrower, would
+/// report a flow output no reader of the composition could have expected.
+///
+/// `flow.signed` is answered `approve` and killed past the pause, and the resumed
+/// copy of the composition admits only `reject`.
+#[test]
+fn a_recorded_human_answer_the_composition_no_longer_admits_is_a_divergence() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "note": "worth signing off" })),
+    ));
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "note": "signed and relayed" }))
+            .after(Duration::from_secs(120)),
+    ));
+
+    let Some((project, built)) = harness::build_under_toolchain("durability", "resume-narrowed")
+    else {
+        return;
+    };
+    assert!(
+        built.status.success(),
+        "the durability fixture did not build"
+    );
+
+    let mut answering = harness::environment(&provider);
+    answering.push((harness::INTERACTIVE.to_string(), "1".to_string()));
+    let killed = harness::crash_run_answering(
+        &project,
+        &["run", "flow.signed", "--input", "topic=durability"],
+        &answering,
+        &["{\"decision\": \"approve\"}"],
+        |_| provider.snapshot().requests >= 2,
+    );
+
+    // The composition narrows what a person may answer, and nothing else.
+    let moved = harness::Scratch::new("narrowed");
+    let source = std::fs::read_to_string(harness::fixture("durability")).expect("the fixture");
+    let edited = source.replace(
+        "          decision: { enum: [approve, reject] }",
+        "          decision: { enum: [reject] }",
+    );
+    assert_ne!(
+        edited, source,
+        "the `output:` line is the one being changed"
+    );
+    let entrypoint = moved.path().join("main.yml");
+    std::fs::write(&entrypoint, edited).expect("the scratch area is writable");
+
+    provider.reset();
+    let resumed = harness::resume_entrypoint(
+        &project,
+        &entrypoint,
+        &killed.execution,
+        Some("json"),
+        &harness::environment(&provider),
+    );
+    let said_on_stderr = resumed.failed();
+    let answered = resumed.outputs();
+    assert_eq!(answered["status"], "failed", "{answered}\n{said_on_stderr}");
+    let said = answered["error"].as_str().expect("an error");
+    assert!(
+        said.starts_with("ReplayDivergence: "),
+        "an answer this composition no longer admits is a divergence rather than \
+         a value the run goes on with: {said}"
+    );
+    assert!(
+        said.contains("sign_off/0#human/0"),
+        "…naming the step whose recorded answer it is: {said}"
+    );
+    assert!(
+        said.contains("no longer satisfies this run's contract"),
+        "…and saying which of the two divergences it is: {said}"
+    );
+    assert_eq!(
+        provider.snapshot().requests,
+        0,
+        "nothing past the pause was issued"
+    );
+}
+
+/// A recovered execution delivers the `callback:` webhook its caller is waiting
+/// for (`docs/durability.md` §6.1).
+///
+/// The `async` contract of grammar 13.3 is push: the route answers `202` and the
+/// caller waits to be told. The process that finishes an execution need not be
+/// the one that answered `202` — `serve` recovers every open execution at start
+/// — so the URL is on the lifecycle row, and a recovered run that completes has
+/// to fire it. A caller of a run recovered by the second process is not polling
+/// the status route, so a lost webhook is a caller with no signal at all.
+#[test]
+fn a_recovered_execution_delivers_the_completion_webhook_its_caller_waits_for() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "note": "worth signing off" })),
+    ));
+
+    let receiver = harness::Receiver::start().expect("a loopback receiver");
+    let Some(project) = harness::scratch_project("serve-recovered-callback") else {
+        return;
+    };
+    let environment = harness::environment(&provider);
+
+    let execution;
+    let resume_url;
+    {
+        let Some(first) = harness::serve_into(&project, "durability", &environment) else {
+            return;
+        };
+        let app = Client::new(&first.base_url).expect("a client for the generated app");
+        let started = app
+            .post_json(
+                "/gate-pushed",
+                &json!({
+                    "topic": "durability",
+                    "callback_url": format!("{}/done", receiver.base_url),
+                }),
+            )
+            .expect("the trigger's route answers");
+        assert_eq!(started.status, 202, "{}", started.text());
+        execution = started.json()["execution_id"]
+            .as_str()
+            .expect("an execution id")
+            .to_string();
+        let status = harness::settled(&app, &execution);
+        assert_eq!(status["status"], "interrupted", "{status}");
+        resume_url = status["interrupts"].as_array().expect("the pauses")[0]["resume_url"]
+            .as_str()
+            .expect("a resume url")
+            .to_string();
+        // Dropped holding the pause: the run never finished, so no webhook has
+        // fired and the caller is still waiting.
+    }
+    assert!(
+        receiver.delivered().is_empty(),
+        "a run that never finished fired no webhook: {:?}",
+        receiver.delivered()
+    );
+
+    let Some(second) = harness::serve_into(&project, "durability", &environment) else {
+        return;
+    };
+    let app = Client::new(&second.base_url).expect("a client for the generated app");
+    let recovered = harness::settled(&app, &execution);
+    assert_eq!(recovered["status"], "interrupted", "{recovered}");
+    let answered = app
+        .post_json(&resume_url, &json!({ "decision": "approve" }))
+        .expect("the resume route answers");
+    assert!(
+        answered.status == 200 || answered.status == 202,
+        "{}",
+        answered.text()
+    );
+
+    let delivered = receiver.wait_for(1, Duration::from_secs(30));
+    let report = &delivered[0];
+    assert_eq!(report["execution_id"], execution, "{report}");
+    assert_eq!(report["status"], "completed", "{report}");
+    assert_eq!(
+        report["outputs"],
+        json!({ "note": "worth signing off", "decision": "approve" }),
+        "the webhook carries the report of the run this process finished: {report}"
+    );
+    assert_eq!(
+        provider.snapshot().requests,
+        1,
+        "recovery replayed the model call rather than re-issuing it"
+    );
+}
+
 /// `flow.parceled`, run and killed while `wrap`'s model call is in flight.
 ///
 /// Shared by the three tests above because setting it up is the expensive half:

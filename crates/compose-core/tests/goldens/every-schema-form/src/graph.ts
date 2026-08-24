@@ -1104,6 +1104,17 @@ export async function runFlow(
      */
     readonly trigger?: string;
     /**
+     * The completion webhook of an `async` `http` trigger, resolved against the
+     * request that started this execution (grammar 13.3).
+     *
+     * `src/serve.ts` passes it and nothing else does. It goes on the journal's
+     * lifecycle row because the process that finishes an execution need not be
+     * the one that started it: a `serve` that restarts mid-run recovers the
+     * execution and has to be able to call the caller back
+     * (`docs/durability.md` §6.1).
+     */
+    readonly callback?: string;
+    /**
      * Whether this is a **resumed** generation of an execution the journal
      * already holds (PRD resolved q29).
      *
@@ -1147,6 +1158,7 @@ export async function runFlow(
     trigger: options.trigger ?? "manual",
     inputs: parsed,
     sessionKey,
+    ...(options.callback === undefined ? {} : { callback: options.callback }),
     ...(options.resume === true ? { resuming: true } : {}),
   });
   try {
@@ -1188,9 +1200,41 @@ async function quiesceFlow(
   // (grammar 8.7, PRD 5.11). Every instance nested inside the run registers
   // against the same execution id and is told apart by its instance path.
   runtime.openHumanWaits(executionId, options.resumable === true);
+  // `scope: execution` means what it says: whatever this run's own stores held
+  // is released when the run ends, however it ended (PRD 5.8, grammar 11.1).
+  // A `serve` process runs many executions, so a store that stayed open would
+  // be both a leak and a lifetime the composition did not declare. A pause the
+  // run was holding goes the same way and for the same reason: a wait that
+  // outlived its run would be one a resume could still be delivered to, with
+  // no graph left to receive it (grammar 8.7).
+  //
+  // **Unless the run has not ended.** An execution whose journal row stays open
+  // — parked at a `human` pause with nobody to answer it, or stopped by a
+  // divergence — is one a resume replays, and `runtime.staysOpen` is the very
+  // predicate `runtime.settleExecution` decides that by. What such a run owns
+  // *on disk* has to still be there when the resumed generation reads past the
+  // frontier: a replayed write is never applied a second time, so a partition
+  // this generation deleted would answer an empty `get` about something the
+  // execution wrote, with nothing comparing unequal to catch it
+  // (`docs/durability.md` §5).
+  const release = async (outcome: unknown): Promise<void> => {
+    const parked = runtime.staysOpen(executionId, outcome);
+    runtime.releaseHumanWaits(executionId);
+    // And the deliveries nothing joined. A detached `map` delivery is journaled
+    // when it answers, so a generation that walks out from under one in flight
+    // leaves an effect with no record — which the generation that resumes this
+    // execution issues a second time (`docs/durability.md` §3.2). Only where
+    // there *is* going to be one: a run that ended waits for nothing, which is
+    // grammar 8.6 rule 7 read where it applies.
+    if (parked) await runtime.settleDetached(executionId);
+    stores.releaseExecution(executionId, parked);
+  };
   // `runtime.quiesce` keeps the last state each superstep produced, which is
   // what makes a failure's trace survive; the one failure it restates on the way
-  // out is LangGraph stopping the run at the ceiling.
+  // out is LangGraph stopping the run at the ceiling. Its answer carries the
+  // run's own failure rather than throwing it, so the release reads that error
+  // on the settled path and the thrown one on the other — the same outcome
+  // either way, which is what a `finally` could not have been told.
   const { state, error } = await runtime
     .quiesce(
       flow,
@@ -1203,17 +1247,16 @@ async function quiesceFlow(
       },
       ceiling,
     )
-    // `scope: execution` means what it says: whatever this run's own stores held
-    // is released when the run ends, however it ended (PRD 5.8, grammar 11.1).
-    // A `serve` process runs many executions, so a store that stayed open would
-    // be both a leak and a lifetime the composition did not declare. A pause the
-    // run was holding goes the same way and for the same reason: a wait that
-    // outlived its run would be one a resume could still be delivered to, with
-    // no graph left to receive it (grammar 8.7).
-    .finally(() => {
-      stores.releaseExecution(executionId);
-      runtime.releaseHumanWaits(executionId);
-    });
+    .then(
+      async (reached) => {
+        await release(reached.error);
+        return reached;
+      },
+      async (thrown: unknown) => {
+        await release(thrown);
+        throw thrown;
+      },
+    );
   if (error !== undefined) {
     throw new runtime.FlowFailure(
       address,

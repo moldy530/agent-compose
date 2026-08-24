@@ -212,6 +212,20 @@ export interface ExecutionRow {
   readonly inputs: Record<string, unknown>;
   /** The session identity `scope: session` stores key off (grammar 11.3). */
   readonly sessionKey: string;
+  /**
+   * Where this execution's completion webhook goes, for an `async` `http`
+   * trigger that asked for one (grammar 13.3's `callback:`) — and absent for
+   * every other invocation.
+   *
+   * Recorded because the process that **finishes** an execution need not be the
+   * one that started it: `serve` recovers every open execution at start
+   * (`docs/durability.md` §6.1), and a caller who was handed a `202` and is
+   * waiting for a push has no other way to be told. The URL rather than the
+   * request it came out of: it is what the webhook needs, and a whole HTTP
+   * request kept for one field of it would be the largest private payload in
+   * the journal and the least of it used (§8).
+   */
+  readonly callback?: string;
   readonly status: ExecutionStatus;
   readonly journalVersion: number;
   readonly startedAt: string;
@@ -283,6 +297,7 @@ CREATE TABLE IF NOT EXISTS executions (
   trigger_kind    TEXT NOT NULL,
   inputs          TEXT NOT NULL,
   session_key     TEXT NOT NULL,
+  callback        TEXT,
   status          TEXT NOT NULL,
   journal_version INTEGER NOT NULL,
   started_at      TEXT NOT NULL,
@@ -316,8 +331,8 @@ class SqliteJournal implements Journal {
   begin(row: ExecutionRow): void {
     this.#database.run(
       `INSERT INTO executions
-         (id, flow, trigger_kind, inputs, session_key, status, journal_version, started_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         (id, flow, trigger_kind, inputs, session_key, callback, status, journal_version, started_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT (id) DO NOTHING`,
       [
         row.id,
@@ -325,6 +340,7 @@ class SqliteJournal implements Journal {
         row.trigger,
         JSON.stringify(row.inputs),
         row.sessionKey,
+        row.callback ?? null,
         row.status,
         row.journalVersion,
         row.startedAt,
@@ -418,12 +434,14 @@ function executionOf(row: Row): ExecutionRow {
   const held = row;
   const endedAt = held["ended_at"];
   const error = held["error"];
+  const callback = held["callback"];
   return {
     id: String(held["id"]),
     flow: String(held["flow"]),
     trigger: String(held["trigger_kind"]),
     inputs: JSON.parse(String(held["inputs"])) as Record<string, unknown>,
     sessionKey: String(held["session_key"]),
+    ...(callback === null || callback === undefined ? {} : { callback: String(callback) }),
     status: String(held["status"]) as ExecutionStatus,
     journalVersion: Number(held["journal_version"]),
     startedAt: String(held["started_at"]),
@@ -526,6 +544,16 @@ async function migrated(
       // cache", which is the whole of what a journal is for.
       database.exec("PRAGMA synchronous = FULL;");
       database.exec(SCHEMA);
+      // `CREATE TABLE IF NOT EXISTS` leaves a table that exists exactly as it
+      // is, so a column the schema grew after a file was created is a column
+      // that file does not have. §11.2 makes a physical schema change
+      // compatible only where it still reads older files, and a column added to
+      // the lifecycle row has to be writable in one too — an `INSERT` naming a
+      // column the file lacks would fail every new execution in it.
+      const columns = database.all("PRAGMA table_info(executions)") as Row[];
+      if (!columns.some((column) => column["name"] === "callback")) {
+        database.exec("ALTER TABLE executions ADD COLUMN callback TEXT;");
+      }
       return database;
       // A write-ahead log is deliberately **not** asked for. This driver's
       // virtual file system does not implement one — `PRAGMA journal_mode =

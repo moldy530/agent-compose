@@ -59,6 +59,15 @@
 #     **detached**, so one execution carries effects two instance frames down
 #     and one delivery nothing waits for. Between them they are every nesting
 #     depth q29 says a divergence may not be absorbed at.
+#   * `flow.papered` — a `scope: execution` **`blob`** store written before a
+#     pause and read after it. A blob store is a directory on disk whatever its
+#     scope, so this is the one store whose contents a resumed generation really
+#     can read across the frontier — and the one a parked run must therefore
+#     leave where it is (`docs/durability.md` §5).
+#   * `flow.posted` — the detached deliveries of `flow.parceled` with a **pause**
+#     after them rather than a model call, which is the shape a delivery still in
+#     flight when the run stops is observable in: the run parks, the process
+#     ends, and a delivery with no record is one the resume makes again (§3.2).
 #   * `flow.fanned` — a **detached** `map` whose sink calls a *model*, which
 #     `flow.parceled`'s subprocess sink cannot decide. A delivery runs with the
 #     node execution's collectors detached (Decision D94), so its record holds
@@ -66,8 +75,9 @@
 #     read the answering route member off that empty list would fail a resume
 #     whose composition nobody had touched.
 #
-# `flow.gate` carries an `http` trigger as well as its manual invocation,
-# because the `serve` half of recovery needs an execution a request started.
+# `flow.gate` carries two `http` triggers as well as its manual invocation,
+# because the `serve` half of recovery needs an execution a request started —
+# and, on the second of them, one whose caller asked to be called back.
 #
 # `store.ledger` is `scope: global` deliberately. The idempotency ledger of a
 # keyed write lives with the store's data (grammar 9.4, `src/stores.ts`), so a
@@ -110,6 +120,10 @@ state:
     description: Whether `flow.scratched` found what it wrote down for itself.
     type: boolean
     default: false
+  paper:
+    description: What `flow.papered` read back out of its own blob store.
+    type: string
+    default: nothing yet
 
 provider.mock:
   kind: anthropic
@@ -141,6 +155,15 @@ store.scratch:
   value_schema:
     entry:
       type: string
+
+# The third lifetime, and the one `store.scratch` cannot stand in for: a `blob`
+# store is a **directory on disk** whatever its scope, so a `scope: execution`
+# one really does outlive the process that filled it — which is what makes it
+# the store a parked run has to leave alone (`docs/durability.md` §5).
+store.papers:
+  kind: blob
+  scope: execution
+  description: The draft this run is keeping beside itself while a person reads it.
 
 # The sink of the **detached** map below. It never reports back, so the only
 # account of a delivery is the line the shim appends to `$RECEIPT_LOG` — which
@@ -488,6 +511,100 @@ flow.scratched:
     - { from: think, to: recall }
     - { from: recall, to: end }
 
+flow.papered:
+  description: Write a draft to disk, park at a pause, then read the draft back.
+  inputs:
+    topic:
+      type: string
+      min_length: 1
+  outputs:
+    decision:
+      enum: [approve, reject]
+    paper:
+      type: string
+    recalled:
+      type: boolean
+  nodes:
+    stage:
+      store: store.papers
+      op: put
+      key: "'draft.txt'"
+      value: "input.topic"
+
+    # Nobody answers this on the first generation, so the run ends `3` with its
+    # row open — which is the moment `flow.scratched` cannot reach: a crash takes
+    # a process out mid-effect, while this is the documented way a `run` stops.
+    # What the run holds on disk has to survive it.
+    sign_off:
+      human:
+        input:
+          note: { type: string }
+        output:
+          decision: { enum: [approve, reject] }
+      input:
+        note: "input.topic"
+
+    # Past the frontier on the resume, and reading the partition the parked
+    # generation owned. A `put` is replayed rather than re-applied, so a
+    # generation that had removed the directory on its way out would answer
+    # `found: false` about something the record says this execution wrote.
+    reread:
+      store: store.papers
+      op: get
+      key: "'draft.txt'"
+      writes:
+        found: recalled
+        value: paper
+
+  edges:
+    - { from: start, to: stage }
+    - { from: stage, to: sign_off }
+    - { from: sign_off, to: reread }
+    - { from: reread, to: end }
+
+flow.posted:
+  description: Deliver detached receipts, then park at a pause nobody can answer.
+  inputs:
+    topic:
+      type: string
+      min_length: 1
+    topics:
+      type: array
+      max_items: 4
+      items: { type: string }
+  outputs:
+    decision:
+      enum: [approve, reject]
+  nodes:
+    # `flow.parceled`'s deliveries with a **pause** after them instead of a model
+    # call. The run does not wait for a delivery (grammar 8.6 rule 7), so it
+    # arrives at the pause with both still in flight and stops there — and a
+    # delivery whose record had not landed by then is one the resume makes a
+    # second time (`docs/durability.md` §3.2).
+    receipt:
+      map:
+        over: input.topics
+        as: topic
+        node: tool.receipt
+        max_concurrency: 2
+        detach: true
+        input:
+          line: "topic"
+
+    sign_off:
+      human:
+        input:
+          note: { type: string }
+        output:
+          decision: { enum: [approve, reject] }
+      input:
+        note: "input.topic"
+
+  edges:
+    - { from: start, to: receipt }
+    - { from: receipt, to: sign_off }
+    - { from: sign_off, to: end }
+
 flow.consulted:
   description: Write something down, then answer about it having read it back.
   inputs:
@@ -743,3 +860,19 @@ triggers:
     respond: async
     input:
       topic: "payload.body.topic"
+
+  # The same flow behind a trigger that asks to be **called back** (grammar
+  # 13.3). A second trigger rather than a `callback:` on the first, because the
+  # two make different promises to a caller and one of them has to be tested
+  # across a restart: the process that answers `202` need not be the one that
+  # finishes the run, and a caller waiting for a push is not polling the status
+  # route (`docs/durability.md` §6.1).
+  pushed:
+    type: http
+    flow: flow.gate
+    method: POST
+    path: /gate-pushed
+    respond: async
+    input:
+      topic: "payload.body.topic"
+    callback: "payload.body.callback_url"

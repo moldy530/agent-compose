@@ -485,8 +485,20 @@ function remember(
  * the generated `serve` app — runs many executions, so an execution-scoped store
  * that stayed open would be a leak *and* a lie: "dies with the run" is the
  * lifetime grammar 11.1 declares.
+ *
+ * `parked` says the run has **not** ended — its journal row is still open and a
+ * resume will replay it (`runtime.staysOpen`). What lives in this process goes
+ * either way, because this process is not what the resumed generation will read
+ * from; what lives **on disk** stays, because it is. A `scope: execution` `blob`
+ * store is a directory (see [`inProcessOnly`]), so removing it here would delete
+ * the very world a live `get` past the frontier is promised to find — a replayed
+ * `put` is never applied a second time, and nothing would compare unequal
+ * (`docs/durability.md` §5). The generation that *ends* the execution removes
+ * it, and reaches the same op site to re-register it on the way ([`remember`]).
+ * An execution nobody ever resumes leaves its partition behind, exactly as it
+ * leaves its row open.
  */
-export function releaseExecution(id: string): void {
+export function releaseExecution(id: string, parked = false): void {
   IN_PROCESS_ONLY.delete(id);
   const held = PER_EXECUTION.get(id);
   if (held === undefined) return;
@@ -513,6 +525,7 @@ export function releaseExecution(id: string): void {
       () => {},
     );
   }
+  if (parked) return;
   for (const directory of held.directories) {
     try {
       fs.rmSync(directory, { recursive: true, force: true });
@@ -614,8 +627,11 @@ export async function runStoreOp(
  * Exactly [`open`]'s `:memory:` arm: a `scope: execution` `kv`/`vector` store,
  * and any store a target bound to `provider: memory`. A `blob` store is a
  * directory either way, so its data outlives the process that wrote it even at
- * `scope: execution` — which is what [`releaseExecution`] removes, and what a
- * resumed generation now removes on its way out ([`remember`]).
+ * `scope: execution` — which is what [`releaseExecution`] removes when the
+ * execution **ends**, and what a resumed generation removes on its way out
+ * ([`remember`]). A generation that only *parked* removes nothing, which is what
+ * leaves that directory there to be read across the resume
+ * (`docs/durability.md` §5).
  */
 function inProcessOnly(store: StoreBinding): boolean {
   if (store.kind === "blob") return false;
