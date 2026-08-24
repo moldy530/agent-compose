@@ -494,8 +494,18 @@ Because it does not wait, a resume can arrive while the replay is still on its
 way back to the wait. That request is refused with a refusal **of its own** — a
 `409` carrying `recovering: true` and a sentence that says to send it again —
 rather than with the one that means there is no pause here, which is what a
-*settled* wait is refused with and reads as final. The window closes the moment
-the execution holds a pause again, or its run ends without one.
+*settled* wait is refused with and reads as final.
+
+The window is per **pause**, not per execution. One execution can hold several
+(grammar 8.6) and its branches reach them independently — a branch whose
+recorded prefix the crash left an effect of has to run that effect live before
+it re-parks, while a branch whose prefix is whole is back at once — so the first
+pause published says nothing about the second. A request that **names** a wait
+the board does not know is inside the window for as long as the replay runs,
+because a pause stays on the board once it opens: an id the board has never held
+is one this generation has not reached. A request that names no wait is inside
+it only while the board has held nothing at all. Either way the window closes
+when the run ends.
 
 A replay that fails is recorded on that execution and reported by the status
 route, and recovery of one execution never stops the process from serving the
