@@ -194,6 +194,24 @@ export interface JournalRecord {
   /** The canonical JSON of what identified the request. See [`canonical`]. */
   readonly request: string;
   readonly outcome: JournalOutcome;
+  /**
+   * Whether the generation that recorded this effect went on to **refuse its
+   * own answer** against the contract the node declared.
+   *
+   * Written after the fact, by the parse that refused it ([`refuseRecorded`]),
+   * and read by the resume that meets the same answer again
+   * ([`recordedAnswerOf`]). It is the one thing a record cannot say at the
+   * moment it is written — the seam has not seen the schema, and the schema has
+   * not seen the answer — and the one thing that tells resolved q29's second
+   * divergence from an ordinary mismatch a composition already had: a recorded
+   * answer this build refuses is a divergence *unless the generation that
+   * recorded it refused it too*, in which case the ladder that absorbed it then
+   * absorbs it now and its next attempt is a replay.
+   *
+   * `false` on every record until something refuses it, which is every record of
+   * a run that went as its composition expected.
+   */
+  readonly refused: boolean;
   /** When it was recorded, as an ISO 8601 instant. */
   readonly recordedAt: string;
 }
@@ -268,6 +286,11 @@ export interface Journal {
   lookup(execution: string, key: string): JournalRecord | undefined;
   /** Append one effect. */
   append(record: JournalRecord): void;
+  /**
+   * Record that the generation which wrote `key` refused its own answer — see
+   * [`JournalRecord.refused`]. Idempotent, and a no-op for a key nothing wrote.
+   */
+  refuse(execution: string, key: string): void;
 }
 
 // ---------------------------------------------------------------------------
@@ -319,6 +342,7 @@ CREATE TABLE IF NOT EXISTS effects (
   request     TEXT NOT NULL,
   outcome     TEXT NOT NULL,
   payload     TEXT NOT NULL,
+  refused     INTEGER NOT NULL DEFAULT 0,
   recorded_at TEXT NOT NULL,
   PRIMARY KEY (execution, key)
 );
@@ -393,6 +417,7 @@ class SqliteJournal implements Journal {
       ordinal: Number(row["ordinal"]),
       request: String(row["request"]),
       outcome,
+      refused: Number(row["refused"] ?? 0) !== 0,
       recordedAt: String(row["recorded_at"]),
     };
   }
@@ -423,6 +448,15 @@ class SqliteJournal implements Journal {
     );
   }
 
+  refuse(execution: string, key: string): void {
+    // One statement again, and one that says the same thing however many times
+    // it runs: a ladder that met this answer on two generations marks it twice
+    // and the row is the same row (see [`JournalRecord.refused`]).
+    this.#database.run("UPDATE effects SET refused = 1 WHERE execution = ? AND key = ?", [
+      execution,
+      key,
+    ]);
+  }
 }
 
 /** One error outcome, read back off its stored payload. */
@@ -559,6 +593,10 @@ async function migrated(
       const columns = database.all("PRAGMA table_info(executions)") as Row[];
       if (!columns.some((column) => column["name"] === "callback")) {
         database.exec("ALTER TABLE executions ADD COLUMN callback TEXT;");
+      }
+      const effects = database.all("PRAGMA table_info(effects)") as Row[];
+      if (!effects.some((column) => column["name"] === "refused")) {
+        database.exec("ALTER TABLE effects ADD COLUMN refused INTEGER NOT NULL DEFAULT 0;");
       }
       return database;
       // A write-ahead log is deliberately **not** asked for. This driver's
@@ -908,13 +946,14 @@ export class EffectRecorder {
         // node that asked: it is decided where the answer is parsed, off this
         // note. See [`recordedAnswerOf`].
         if (held.kind === "value") {
-          noteReplayed(held.value, {
+          note(replayed, held.value, {
             execution: session.execution,
             key,
             site,
             kind,
             ordinal,
             request: found.request,
+            refused: found.refused,
           });
         }
       }
@@ -926,17 +965,18 @@ export class EffectRecorder {
       // three replayed branches and one live one.
     }
 
+    const from: ReplayedFrom = {
+      execution: session.execution,
+      key,
+      site,
+      kind,
+      ordinal,
+      request: identity,
+      refused: false,
+    };
+
     const write = (outcome: JournalOutcome): void => {
-      session.journal.append({
-        execution: session.execution,
-        key,
-        site,
-        kind,
-        ordinal,
-        request: identity,
-        outcome,
-        recordedAt: new Date().toISOString(),
-      });
+      session.journal.append({ ...from, outcome, recordedAt: new Date().toISOString() });
     };
 
     return {
@@ -950,6 +990,10 @@ export class EffectRecorder {
         // generation and the next are handed the same value ([`revived`]).
         const kept = revived(value);
         write({ kind: "value", value: kept });
+        // And noted as this record's, so that a contract which refuses it says
+        // so **on the record** rather than leaving the next generation to infer
+        // it (see [`produced`], [`refuseRecorded`]).
+        note(produced, kept, from);
         return kept;
       },
       fail: (error) => write({ kind: "error", ...named(error) }),
@@ -962,38 +1006,55 @@ export class EffectRecorder {
 // ---------------------------------------------------------------------------
 
 /**
- * Which record each replayed value came out of.
+ * Which record a value in the graph's hands came out of.
  *
  * resolved q29 makes **two** things a divergence: a recorded request the run no
  * longer makes, and "a recorded answer [that] fails the current contract". Only
  * the first is decidable at the effect seam — the second is decided by the
  * schema the *node* declares, which the seam has never seen and which sits one
  * call away in the emitted node body. So the seam leaves a note, and the parse
- * reads it ([`recordedAnswerOf`], `parseResult` in `./runtime.ts`).
+ * reads it ([`recordedAnswerOf`], [`refuseRecorded`], `parseResult` in
+ * `./runtime.ts`).
  *
  * Weakly held, and by identity: the note lives exactly as long as the value the
- * graph is carrying, and a value that is not a replayed one is not in it. Every
- * object *inside* a replayed payload is noted too, because what a contract
- * refuses is as often a field of the answer as the answer itself.
+ * graph is carrying. Every object *inside* a payload is noted too, because what
+ * a contract refuses is as often a field of the answer as the answer itself.
+ */
+type ReplayedFrom = Pick<
+  JournalRecord,
+  "execution" | "key" | "site" | "kind" | "ordinal" | "request" | "refused"
+>;
+
+/**
+ * Values a **replay** handed back, which are the ones a refusal may be a
+ * divergence about.
  *
  * The alternative — letting the parse raise its ordinary `ResultMismatch` — is
  * the failure resolved q29 exists to prevent: that class is a node failure, a
  * `retry:` absorbs it, and the retry's second attempt claims an ordinal past the
  * frontier and re-issues the effect **live**.
  */
-type ReplayedFrom = Pick<
-  JournalRecord,
-  "execution" | "key" | "site" | "kind" | "ordinal" | "request"
->;
-
 const replayed = new WeakMap<object, ReplayedFrom>();
 
-/** Note a replayed payload, and everything inside it. See [`replayed`]. */
-function noteReplayed(value: unknown, record: ReplayedFrom): void {
+/**
+ * Values a **live** effect answered on this generation, which are the ones a
+ * refusal has to be written down about.
+ *
+ * The two halves of one fact. A contract that refuses an answer refuses it on
+ * whichever generation meets it, and the only generation that can *say so on the
+ * record* is the one that recorded it: by the time a resume meets the same
+ * answer the effect is long over. So the recording generation marks its own
+ * record ([`refuseRecorded`]) and the resumed one reads the mark
+ * ([`recordedAnswerOf`]), and neither has to guess.
+ */
+const produced = new WeakMap<object, ReplayedFrom>();
+
+/** Note a payload, and everything inside it. See [`replayed`], [`produced`]. */
+function note(into: WeakMap<object, ReplayedFrom>, value: unknown, record: ReplayedFrom): void {
   if (value === null || typeof value !== "object") return;
-  replayed.set(value, record);
+  into.set(value, record);
   for (const held of Object.values(value as Record<string, unknown>)) {
-    noteReplayed(held, record);
+    note(into, held, record);
   }
 }
 
@@ -1006,41 +1067,65 @@ function noteReplayed(value: unknown, record: ReplayedFrom): void {
  * breaking compositions nobody touched: a recorded answer may fail a contract
  * that has not moved, because it failed it on the generation that recorded it
  * too — a flaky `exec:` under a `retry:` whose first attempt answered
- * off-contract and whose second did not. The journal says which happened. The
- * ordinal counts every effect of a kind ever issued at a site (§4), so if that
- * ladder went round again the **next** record at this site is its second
- * attempt — and what makes it that attempt rather than merely the next thing
- * the site did is that a retry repeats the *identical request*. So the next
- * record is compared by request identity, not merely counted: where it repeats
- * this one, the mismatch is one the composition already had and already decided,
- * the ladder does now what it did then, and its next attempt is a replay rather
- * than a live call. Where the journal holds nothing there — or holds a
- * *different* request, which is the site going on to its next effect rather than
- * retrying this one — the original never went round again, so this contract is
- * one this build brought, and re-running the effect under it is the
- * re-execution q29 refuses.
+ * off-contract and whose second did not. That generation's own ladder decided
+ * it, and a resume has to do what it did rather than call the disagreement new.
  *
- * Counting alone was the earlier reading and it is wrong at every site that
- * issues two or more effects of one kind: an agent whose loop calls `tool.alpha`
- * and then `tool.beta` records `…#tool/0` and `…#tool/1`, and a tightened
- * contract on *alpha* would find beta's record sitting where a second attempt
- * would have been and report an ordinary mismatch — which a `retry:` absorbs,
- * and whose second attempt walks past the frontier and issues both effects live.
+ * The record says which happened, because the generation that refused the answer
+ * **wrote it down** ([`refuseRecorded`], [`JournalRecord.refused`]). Nothing is
+ * inferred from the records around it. Two readings were tried and both are
+ * wrong, for one reason: what the ordinals hold is the *sequence* of effects at
+ * a site, and "the site retried this call" and "the site made this call again"
+ * are the same sequence.
+ *
+ *  * **Counting** — treating the next record as the retried attempt — is wrong
+ *    at every site that issues two or more effects of one kind: an agent whose
+ *    loop calls `tool.alpha` and then `tool.beta` records `…#tool/0` and
+ *    `…#tool/1`, and a tightened contract on *alpha* would find beta's record
+ *    sitting where a second attempt would have been.
+ *  * **Counting plus request identity** — requiring the next record to repeat
+ *    this one's request — is wrong at every site that legitimately issues the
+ *    same request twice, which a model's loop does whenever it looks something
+ *    up a second time. The divergence would be downgraded to a mismatch, and an
+ *    `on_error:` or a `retry:` would absorb the very failure q29 says no policy
+ *    may absorb — the second attempt walking past the frontier and issuing both
+ *    effects live.
  */
 export function recordedAnswerOf(value: unknown, detail: string): ReplayDivergence | undefined {
   if (value === null || typeof value !== "object") return undefined;
   const record = replayed.get(value);
   if (record === undefined) return undefined;
-  const session = sessions.get(record.execution);
-  if (session !== undefined) {
-    const key = `${record.site}#${record.kind}/${record.ordinal + 1}`;
-    const next = session.journal.lookup(record.execution, key);
-    if (next !== undefined && next.request === record.request) return undefined;
-  }
+  // The mismatch this composition already had, and already decided: the ladder
+  // does now what it did then, and the attempt it spends is a replay rather than
+  // a call.
+  if (record.refused) return undefined;
   return new ReplayDivergence(
     record,
     `the recorded answer no longer satisfies this run's contract: ${detail}`,
   );
+}
+
+/**
+ * Say on the record that this generation's own contract refused what a live
+ * effect answered. See [`JournalRecord.refused`].
+ *
+ * Called from the parse rather than from the seam, because the contract is the
+ * node's: `parseResult` is where a schema and an answer first meet. A value no
+ * journaled effect produced — a CEL result, a flow's inputs, an answer this
+ * generation *replayed* rather than performed — is not on any record and this
+ * does nothing about it.
+ *
+ * Written **before** the mismatch is thrown, so the retry the mismatch sets off
+ * appends its own record after the mark rather than before it. A process killed
+ * between the effect's row and this one leaves the record unmarked, which is the
+ * conservative half: a later resume reports a divergence naming the step instead
+ * of replaying silently past it (§2's window, decided the safe way).
+ */
+export function refuseRecorded(value: unknown): void {
+  if (value === null || typeof value !== "object") return;
+  const record = produced.get(value);
+  if (record === undefined) return;
+  const session = sessions.get(record.execution);
+  session?.journal.refuse(record.execution, record.key);
 }
 
 // ---------------------------------------------------------------------------

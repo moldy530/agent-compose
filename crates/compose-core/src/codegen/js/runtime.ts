@@ -81,6 +81,7 @@ import {
   openSession,
   recordedAnswerOf,
   recorderFor,
+  refuseRecorded,
   replayedFailure,
 } from "./journal.ts";
 import type { EffectRecorder, ExecutionRow, Journal } from "./journal.ts";
@@ -389,6 +390,15 @@ function describeIssues(value: unknown, issues: readonly ResultIssue[]): string 
  * durability exists to prevent, reported as an ordinary bad answer. So the
  * provenance of the value decides the class, and a [`ReplayDivergence`] travels
  * past every policy (see [`runActivity`], [`runNode`], [`attemptItem`]).
+ *
+ * And this is where the *other* half of that decision is written down. A live
+ * answer this contract refuses is one a later generation will meet again, and
+ * whether it was refused **then** is the whole of what tells resolved q29's
+ * divergence from a mismatch the composition already had and already retried
+ * past. Only this generation can say so, so it says so on the record
+ * (`refuseRecorded` in `./journal.ts`) instead of leaving the next one to infer
+ * it from the records around it — which cannot be done, because a retried call
+ * and a repeated call leave the same sequence behind.
  */
 export function parseResult<T>(schema: ResultSchema<T>, value: unknown, subject: string): T {
   const parsed = schema.safeParse(value);
@@ -396,6 +406,7 @@ export function parseResult<T>(schema: ResultSchema<T>, value: unknown, subject:
   const refused = new ResultMismatch(subject, value, parsed.error?.issues ?? []);
   const recorded = recordedAnswerOf(value, refused.message);
   if (recorded !== undefined) throw recorded;
+  refuseRecorded(value);
   throw refused;
 }
 
