@@ -11532,6 +11532,92 @@ fn a_recorded_answer_that_fails_the_current_contract_is_a_divergence_not_a_retry
     );
 }
 
+/// The other side of the same rule: a recorded answer that fails a contract
+/// which has **not** moved is not a divergence, because it failed it on the
+/// generation that recorded it too.
+///
+/// `flow.flaky`'s subprocess answers off-contract the first time it is run and
+/// on-contract the second, and its `retry:` absorbed that on the generation that
+/// crashed — so the journal holds two records at that site. A resumed generation
+/// meets the first one, and has to do exactly what the first generation did:
+/// spend an attempt and replay the second record. Reading it as a divergence
+/// would break a composition nobody touched; reading it as a mismatch and then
+/// re-running the command would be the double side effect. The journal is what
+/// tells the two apart, and the log is what says which one happened.
+#[test]
+fn a_recorded_answer_the_original_retried_past_is_retried_past_again() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "note": "a flaky note" })).after(Duration::from_secs(120)),
+    ));
+
+    let Some((project, built)) = harness::build_under_toolchain("durability", "resume-flaky")
+    else {
+        return;
+    };
+    assert!(
+        built.status.success(),
+        "the durability fixture did not build"
+    );
+
+    let shims = harness::Scratch::new("flaky");
+    let log = shims.path().join("tally.log");
+    // Empty the first time, which the node's `min_length: 3` refuses; the
+    // ladder's second attempt is answered.
+    harness::shim(
+        shims.path(),
+        "tally",
+        "printf 'ran\\n' >> \"$TALLY_LOG\"\n\
+         if [ \"$(wc -l < \"$TALLY_LOG\")\" -le 1 ]; then printf ''; else printf 'tallied'; fi\n",
+    );
+    let mut environment = harness::environment(&provider);
+    environment.push((
+        harness::TALLY_BIN.to_string(),
+        shims.path().display().to_string(),
+    ));
+    environment.push((harness::TALLY_LOG.to_string(), log.display().to_string()));
+
+    let killed = harness::crash_run(
+        &project,
+        &["run", "flow.flaky", "--input", "topic=durability"],
+        &environment,
+        |_| provider.snapshot().requests >= 1,
+    );
+    assert_eq!(
+        harness::lines_in(&log),
+        2,
+        "the first generation spent an attempt on the off-contract answer"
+    );
+
+    provider.reset();
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "note": "a flaky note" })),
+    ));
+
+    let resumed = harness::resume(
+        &project,
+        "durability",
+        &killed.execution,
+        Some("json"),
+        &environment,
+    );
+    let answered = resumed.outputs();
+    assert_eq!(
+        answered["status"], "completed",
+        "a mismatch the recording generation's own ladder absorbed is not a \
+         divergence — the composition never moved: {answered}"
+    );
+    resumed.succeeded();
+    assert_eq!(answered["outputs"]["tally"], "tallied", "{answered}");
+    assert_eq!(
+        harness::lines_in(&log),
+        2,
+        "…and the attempt it spent was a replay: the command did not run again"
+    );
+}
+
 /// A divergence **two instance frames down** — inside a subflow a `map`
 /// dispatched — arrives whole, keyed by the instance that made it
 /// (`docs/durability.md` §4), and is not absorbed by `on_item_error: skip`.

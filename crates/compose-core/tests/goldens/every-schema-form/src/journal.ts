@@ -807,7 +807,9 @@ export class EffectRecorder {
         // contract" — cannot be decided here, because the contract belongs to the
         // node that asked: it is decided where the answer is parsed, off this
         // note. See [`recordedAnswerOf`].
-        if (held.kind === "value") noteReplayed(held.value, { key, site, kind, ordinal });
+        if (held.kind === "value") {
+          noteReplayed(held.value, { execution: session.execution, key, site, kind, ordinal });
+        }
       }
       // The first key the journal does not hold is the frontier, and past it
       // this execution is live again (resolved q29): `held` stays undefined and
@@ -869,13 +871,12 @@ export class EffectRecorder {
  * `retry:` absorbs it, and the retry's second attempt claims an ordinal past the
  * frontier and re-issues the effect **live**.
  */
-const replayed = new WeakMap<object, Pick<JournalRecord, "key" | "site" | "kind" | "ordinal">>();
+type ReplayedFrom = Pick<JournalRecord, "execution" | "key" | "site" | "kind" | "ordinal">;
+
+const replayed = new WeakMap<object, ReplayedFrom>();
 
 /** Note a replayed payload, and everything inside it. See [`replayed`]. */
-function noteReplayed(
-  value: unknown,
-  record: Pick<JournalRecord, "key" | "site" | "kind" | "ordinal">,
-): void {
+function noteReplayed(value: unknown, record: ReplayedFrom): void {
   if (value === null || typeof value !== "object") return;
   replayed.set(value, record);
   for (const held of Object.values(value as Record<string, unknown>)) {
@@ -887,16 +888,33 @@ function noteReplayed(
  * The divergence a value that came out of the journal raises when the contract
  * it is being held to refuses it — and `undefined` for a value this generation
  * produced itself, which is an ordinary failure of the world.
+ *
+ * There is a third answer folded into the second, and it is what keeps this from
+ * breaking compositions nobody touched: a recorded answer may fail a contract
+ * that has not moved, because it failed it on the generation that recorded it
+ * too — a flaky `exec:` under a `retry:` whose first attempt answered
+ * off-contract and whose second did not. The journal says which happened. The
+ * ordinal counts every effect of a kind ever issued at a site (§4), so the
+ * record of the **next** one is exactly the attempt that ladder made: where the
+ * journal holds it, this mismatch is one the composition already had and already
+ * decided, the ladder does now what it did then, and its next attempt is a
+ * replay rather than a live call. Where the journal holds nothing there, the
+ * original never went round again — so this contract is one this build brought,
+ * and re-running the effect under it is the re-execution q29 refuses.
  */
 export function recordedAnswerOf(value: unknown, detail: string): ReplayDivergence | undefined {
   if (value === null || typeof value !== "object") return undefined;
   const record = replayed.get(value);
-  return record === undefined
-    ? undefined
-    : new ReplayDivergence(
-        record,
-        `the recorded answer no longer satisfies this run's contract: ${detail}`,
-      );
+  if (record === undefined) return undefined;
+  const session = sessions.get(record.execution);
+  if (session !== undefined) {
+    const next = `${record.site}#${record.kind}/${record.ordinal + 1}`;
+    if (session.journal.lookup(record.execution, next) !== undefined) return undefined;
+  }
+  return new ReplayDivergence(
+    record,
+    `the recorded answer no longer satisfies this run's contract: ${detail}`,
+  );
 }
 
 // ---------------------------------------------------------------------------

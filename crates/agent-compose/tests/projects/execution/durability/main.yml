@@ -32,6 +32,12 @@
 #     composition tightens, which is resolved q29's second divergence — a
 #     recorded answer that fails the current contract — and the two policies are
 #     the two that must not absorb it.
+#   * `flow.flaky` — the same subprocess whose **first** attempt answers
+#     off-contract and whose second does not, under a `retry:` that absorbs it.
+#     A resumed generation meets that recorded answer and its unmoved contract,
+#     and must do what the first one did rather than call the disagreement a
+#     divergence: the journal holds the next attempt's record, which is the whole
+#     of how the two are told apart.
 #   * `flow.parceled` — a `map` into a **subflow** and a second `map` that is
 #     **detached**, so one execution carries effects two instance frames down
 #     and one delivery nothing waits for. Between them they are every nesting
@@ -322,6 +328,44 @@ flow.guarded:
           stdout: { type: string }
       retry: { max: 2, backoff: 1ms }
       on_error: skip
+      writes:
+        stdout: tally
+
+    ask:
+      agent: agent.noter
+      input:
+        topic: "input.topic"
+      writes:
+        note: note
+
+  edges:
+    - { from: start, to: count }
+    - { from: count, to: ask }
+    - { from: ask, to: end }
+
+flow.flaky:
+  description: A subprocess whose first attempt answers off-contract and whose second does not.
+  inputs:
+    topic:
+      type: string
+      min_length: 1
+  outputs:
+    tally:
+      type: string
+    note:
+      type: string
+  nodes:
+    # The other side of the rule `flow.guarded` tests. A recorded answer can fail
+    # a contract that has **not** moved — because it failed it on the generation
+    # that recorded it too, and the ladder went round again. The journal is what
+    # tells the two apart: the next attempt's record is there, so this mismatch
+    # is one the composition already had and already decided.
+    count:
+      exec:
+        command: "${TALLY_BIN}/tally"
+        output:
+          stdout: { type: string, min_length: 3 }
+      retry: { max: 2, backoff: 1ms }
       writes:
         stdout: tally
 
