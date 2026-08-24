@@ -13696,15 +13696,17 @@ fn wait_for_lines(log: &Path, lines: usize) {
 /// sleeping would be a race this suite loses on a loaded runner, and would lose
 /// it as "the delivery ran three times" rather than as "the kill was early".
 /// [`harness::journal_holds`] is the same condition read off the journal.
-fn crash_a_parceled_run(
-    provider: &MockProvider,
-    purpose: &str,
-) -> Option<(
+/// What [`crash_a_parceled_run`] hands the tests that share it: the project
+/// directory, the killed run, the environment its resume must be started with,
+/// and the shim scratch whose lifetime keeps those paths alive.
+type CrashedParceledRun = (
     std::path::PathBuf,
     harness::Killed,
     Vec<(String, String)>,
     harness::Scratch,
-)> {
+);
+
+fn crash_a_parceled_run(provider: &MockProvider, purpose: &str) -> Option<CrashedParceledRun> {
     let (project, built) = harness::build_under_toolchain("durability", purpose)?;
     assert!(
         built.status.success(),
