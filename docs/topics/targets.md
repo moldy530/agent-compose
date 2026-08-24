@@ -155,6 +155,11 @@ holds open, before it accepts a connection, and one parked on a `human` pause
 re-parks under the same wait id — so a resume request prepared against the
 process that died still finds its wait. Triggers are not re-fired.
 
+Which is also why `resume` is the verb for an execution **nothing is running**:
+one process at a time writes a project's journal, and a `serve` that is up has
+already taken every open execution it holds. Finish those through its
+`POST /executions/:id/resume` route.
+
 Because the journal holds what a trace deliberately does not — completions, tool
 results, a person's answer — it is **private recovery data with the same
 sensitivity as this project's stores**, never an observability artifact. Nothing
