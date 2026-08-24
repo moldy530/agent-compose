@@ -195,6 +195,19 @@ outcomes that close a lifecycle row (§6.1); `writeTrace`, which is the command'
 document rather than the graph's effect (§9); and the journal's own storage,
 which is the record a replay reads.
 
+Whatever its kind, one effect's record carries the same five things: its **key**
+(§4), the **request identity** the key's effect was issued under (§7), the
+**outcome** — the answer or the failure, in full — the instant it was recorded
+at, and one flag.
+
+The flag is `refused`, and it is the one thing a record cannot say at the moment
+it is written: whether the generation that recorded this effect went on to
+**refuse its own answer** against the contract the node declared. The seam has
+not seen the schema and the schema has not seen the answer, so the parse that
+refuses a live answer marks its record before raising, and a resume that meets
+that answer again reads the mark. §7 is what it decides. It is `false` on every
+record of a run that went as its composition expected.
+
 ### 3.1 A model call
 
 One record per call `callModel` made, whichever way it ended. It holds the
@@ -593,23 +606,32 @@ answer.
 One case sits inside that and is **not** a divergence: a recorded answer can
 fail a contract that has not moved at all, because it failed it on the
 generation that recorded it too — a flaky `exec:` under a `retry:` whose first
-attempt answered off-contract and whose second did not. The journal says which
-happened. The ordinal counts every effect of a kind ever issued at a site (§4),
-so if that ladder went round again the **next** record at the site is its second
-attempt — and what identifies it as that attempt rather than as whatever the
-site did next is that a retry repeats the *identical request*. So the next
-record is compared by request identity, not merely counted: where it repeats
-this one, the mismatch is one this composition already had and already decided,
-the ladder does now what it did then, and the attempt it spends is a replay
-rather than a call. Where the journal holds nothing there — or holds a different
-request, which is the site going on to its next effect rather than retrying this
-one — the original never went round again, so the contract is one this build
-brought.
+attempt answered off-contract and whose second did not. That generation's own
+ladder decided it, and a resume has to do what it did rather than call the
+disagreement new.
 
-Counting alone would be wrong at every site that issues two or more effects of
-one kind: an agent whose loop calls `tool.alpha` and then `tool.beta` records
-`…#tool/0` and `…#tool/1`, and a tightened contract on *alpha* would find beta's
-record sitting where a second attempt would have been.
+**The record says which happened, because the generation that refused the answer
+wrote it down.** A parse that refuses a live answer marks that answer's record
+`refused` (§3) before it raises its mismatch, and a resume that meets a refused
+record raises the ordinary mismatch too: the ladder does now what it did then,
+and the attempt it spends is a replay rather than a call. A record with no mark
+is one this build is the first to refuse, which is the divergence.
+
+Nothing is inferred from the records *around* it, and two readings that tried to
+be are both wrong for one reason — what the ordinals hold is the **sequence** of
+effects at a site, and "the site retried this call" and "the site made this call
+again" are the same sequence:
+
+* **counting** — treating the next record at the site as the retried attempt —
+  is wrong wherever a site issues two or more effects of one kind: an agent
+  whose loop calls `tool.alpha` and then `tool.beta` records `…#tool/0` and
+  `…#tool/1`, and a tightened contract on *alpha* would find beta's record
+  sitting where a second attempt would have been;
+* **counting plus request identity** — requiring that next record to repeat this
+  one's request — is wrong wherever a site legitimately issues the same request
+  twice, which a model's loop does whenever it looks something up again. The
+  divergence would be downgraded to a mismatch, and an `on_error:` or a `retry:`
+  would absorb what q29 says no policy may absorb.
 
 **What the failure names** is the divergent step: the effect site's instance
 path, the effect kind, the ordinal at that site, the whole key, and — for a
