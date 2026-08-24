@@ -6188,7 +6188,15 @@ export async function runHuman(
     pausedAt,
     ...(expiresAt === undefined ? {} : { expiresAt }),
   };
-  const opened: HumanPause = { pausedAt, ...(expiresAt === undefined ? {} : { expiresAt }) };
+  // The two instants that describe the pause itself rather than its end. Kept
+  // apart from [`HumanPause`] because they are also what the **journal** holds:
+  // a replayed wait is dated by the generation that opened it, not by the one
+  // that read the record back (see [`JournaledWait`]).
+  const instants: Omit<JournaledInstants, "settledAt"> = {
+    pausedAt,
+    ...(expiresAt === undefined ? {} : { expiresAt }),
+  };
+  const opened: HumanPause = instants;
 
   // A settled wait is an effect like any other, and the one whose payload
   // `docs/trace.md` §11 most firmly keeps out of the trace: what a person
@@ -6199,19 +6207,28 @@ export async function runHuman(
   if (slot?.held !== undefined) {
     if (slot.held.kind === "error") throw replayedFailure(slot.held);
     const held = slot.held.value as JournaledWait;
+    // Every instant of the entry is the record's, `pausedAt` included: this
+    // process opened no wait, and dating one by its own clock would put the
+    // answer before the question (see [`JournaledWait`]).
+    const replayedPause: HumanPause = {
+      pausedAt: held.pausedAt,
+      ...(held.expiresAt === undefined ? {} : { expiresAt: held.expiresAt }),
+      settledAt: held.settledAt,
+      settled: held.settled,
+    };
     if (held.settled === "resumed") {
-      return { output: held.output, human: { ...opened, settledAt: held.settledAt, settled: "resumed" } };
+      return { output: held.output, human: replayedPause };
     }
     // A wait that ran out its budget replays as one: the route is the
     // composition's, so it is read off the descriptor rather than off the
-    // record, and what the record supplies is the two instants the entry shows.
+    // record, and what the record supplies is the instants the entry shows.
     throw new HumanExpiry(
       descriptor.flow,
       descriptor.node,
       id,
       descriptor.timeoutMs ?? 0,
       descriptor.onTimeout ?? END_NODE,
-      { ...opened, settledAt: held.settledAt, settled: "expired" },
+      replayedPause,
     );
   }
 
@@ -6250,6 +6267,7 @@ export async function runHuman(
       if (outcome === "resumed") {
         const ended = stopped(outcome);
         const kept = slot?.keep({
+          ...instants,
           settled: "resumed",
           output: value,
           settledAt: ended.settledAt,
@@ -6264,7 +6282,11 @@ export async function runHuman(
         });
       } else if (outcome === "expired") {
         const ended = stopped(outcome);
-        slot?.keep({ settled: "expired", settledAt: ended.settledAt } satisfies JournaledWait);
+        slot?.keep({
+          ...instants,
+          settled: "expired",
+          settledAt: ended.settledAt,
+        } satisfies JournaledWait);
         reject(
           new HumanExpiry(
             descriptor.flow,
@@ -6325,10 +6347,27 @@ function stopped(outcome: "resumed" | "expired"): {
  * most explicit about keeping out of the trace — and the clearest statement of
  * why the journal is a second artifact rather than the trace read twice
  * (`docs/durability.md` §7).
+ *
+ * **All three instants** are in it, not only the settlement. A pause that a
+ * person answered at 10:05 is replayed by a process that started at 11:00, and
+ * an entry that took `pausedAt` from *this* process's clock and `settledAt` from
+ * the record would say the wait was answered five and fifty-five minutes before
+ * it began. `docs/durability.md` §9 promises the opposite — "a reader of the
+ * resumed document sees what the execution did, not what this process did" — so
+ * the whole `HumanPause` is the record's, and the resumed generation's clock
+ * reaches the entry nowhere.
  */
-type JournaledWait =
-  | { readonly settled: "resumed"; readonly output: unknown; readonly settledAt: string }
-  | { readonly settled: "expired"; readonly settledAt: string };
+interface JournaledInstants {
+  /** When the wait began — the `pausedAt` of the entry the record replays as. */
+  readonly pausedAt: string;
+  /** When it would have expired, on the generation that opened it. */
+  readonly expiresAt?: string;
+  /** When it stopped waiting. */
+  readonly settledAt: string;
+}
+
+type JournaledWait = JournaledInstants &
+  ({ readonly settled: "resumed"; readonly output: unknown } | { readonly settled: "expired" });
 
 /** LangGraph's terminal pseudo-node, as a `goto` target spells it. */
 const END_NODE = "__end__";
