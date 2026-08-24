@@ -48,6 +48,8 @@ pub fn module(ir: &Ir) -> super::GeneratedFile {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
     use crate::codegen::test_support::ir_of;
 
@@ -161,6 +163,207 @@ mod tests {
             reached, 6,
             "`docs/durability.md` §3 says there are exactly six effect sites and this build              has {reached}: a new one belongs in that table, and a lost one is a replay that              re-issues an effect"
         );
+    }
+
+    /// The six journaled seams, by the name each is declared under.
+    const SEAMS: [&str; 6] = [
+        "callModel",
+        "runExec",
+        "runHttp",
+        "callFunction",
+        "runHuman",
+        "runStoreOp",
+    ];
+
+    /// **Nothing calls the world except through one of the six.**
+    ///
+    /// The sibling above reads the inventory from the top down: the six
+    /// functions `docs/durability.md` §3 names reach the journal, and no
+    /// seventh does. That direction cannot see the failure its own docstring
+    /// calls load-bearing — a *new* surface, `runGrpc` say, that spawns a
+    /// process or opens a socket and never reaches the journal at all. It is
+    /// not one of the six, so no per-site assertion applies to it; it contains
+    /// no `journaled(` and no `.claim(`, so the count still answers six; the
+    /// table is untouched, so the documentation assertions pass. `cargo test`
+    /// is green and every replay past that node issues its call again.
+    ///
+    /// So this reads it from the bottom up instead, off the **primitives**
+    /// rather than off the seams: every `fetch`, every `spawn`, every
+    /// filesystem call and every SQLite statement in the two emitted modules
+    /// has to sit in a function the six can reach. `runGrpc` fails here on the
+    /// first line of its body.
+    ///
+    /// Reachability is transitive because the seams are thin: `runExec` calls
+    /// `runExecLive`, which calls `spawn`; `runStoreOp` calls `perform`, which
+    /// calls `open`, `transact`, `tabular`, `blobOp` and — through
+    /// `runtime.callEmbeddings` — `send`, which is where a `vector` store's
+    /// network call lives. Following the calls is what keeps the rule honest
+    /// without pinning the shape of the code beneath each seam.
+    #[test]
+    fn nothing_in_the_emitted_runtime_calls_the_world_except_under_a_journaled_seam() {
+        // The primitives. Each one *is* the effect — the moment a process
+        // leaves itself — so a replay that reaches one has re-executed
+        // something whatever the code around it is called.
+        const PRIMITIVES: [&str; 13] = [
+            "fetch(",
+            "spawn(",
+            "fs.writeFileSync",
+            "fs.readFileSync",
+            "fs.renameSync",
+            "fs.rmSync",
+            "fs.mkdirSync",
+            "fs.existsSync",
+            "fs.readdirSync",
+            "database.run(",
+            "database.get(",
+            "database.all(",
+            "database.exec(",
+        ];
+
+        // The one site that is not an effect the graph issues, and so is not
+        // one a replay may perform twice: `releaseExecution` is grammar 11.1's
+        // `scope: execution` lifetime, run by `runFlow` when a run ends. It
+        // removes what the run owned; running it twice removes it twice.
+        const NOT_AN_EFFECT: [&str; 1] = ["releaseExecution"];
+
+        let modules = [
+            ("src/runtime.ts", include_str!("js/runtime.ts")),
+            ("src/stores.ts", include_str!("js/stores.ts")),
+        ];
+        let declared: Vec<(&str, String, String)> = modules
+            .iter()
+            .flat_map(|(module, source)| {
+                declarations(source)
+                    .into_iter()
+                    .map(move |(name, body)| (*module, name, body))
+            })
+            .collect();
+
+        for seam in SEAMS {
+            assert!(
+                declared.iter().any(|(_, name, _)| name == seam),
+                "`{seam}` is not declared in either emitted module, so this test is reading \
+                 an inventory that has moved"
+            );
+        }
+
+        // Everything the six reach, followed until it stops growing.
+        let mut reached: BTreeSet<&str> = SEAMS.into_iter().collect();
+        loop {
+            let mut grew = false;
+            for (_, name, body) in &declared {
+                if !reached.contains(name.as_str()) {
+                    continue;
+                }
+                for (_, called, _) in &declared {
+                    if reached.contains(called.as_str()) || !calls(body, called) {
+                        continue;
+                    }
+                    reached.insert(called.as_str());
+                    grew = true;
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+
+        let mut exempted: BTreeSet<&str> = BTreeSet::new();
+        for (module, name, body) in &declared {
+            for primitive in PRIMITIVES {
+                if !body.contains(primitive) {
+                    continue;
+                }
+                if NOT_AN_EFFECT.contains(&name.as_str()) {
+                    exempted.insert(name.as_str());
+                    continue;
+                }
+                assert!(
+                    reached.contains(name.as_str()),
+                    "`{name}` in `{module}` calls `{primitive}` and nothing journaled reaches \
+                     it, so a replay past it issues that call a second time \
+                     (`docs/durability.md` §3). Either route it through one of {SEAMS:?}, or — \
+                     if it is not an effect the graph issues — say so in this test's \
+                     `NOT_AN_EFFECT`."
+                );
+            }
+        }
+        assert_eq!(
+            exempted,
+            NOT_AN_EFFECT.into_iter().collect::<BTreeSet<&str>>(),
+            "an exemption nothing uses is one nobody is checking: drop it"
+        );
+    }
+
+    /// Whether `body` calls `name`, as a call rather than as a longer word.
+    ///
+    /// `runtime.` is looked through, because `src/stores.ts` reaches
+    /// `src/runtime.ts` through a namespace import and `runtime.callEmbeddings`
+    /// is one of the edges this walk depends on.
+    fn calls(body: &str, name: &str) -> bool {
+        let wanted = format!("{name}(");
+        let mut rest = body;
+        while let Some(at) = rest.find(&wanted) {
+            let before = rest[..at].chars().next_back();
+            let boundary = match before {
+                None => true,
+                Some('.') => rest[..at].ends_with("runtime."),
+                Some(character) => {
+                    !character.is_alphanumeric() && character != '_' && character != '$'
+                }
+            };
+            if boundary {
+                return true;
+            }
+            rest = &rest[at + wanted.len()..];
+        }
+        false
+    }
+
+    /// Every top-level function of an emitted module, by name and body.
+    ///
+    /// The same line scan [`function_body`] does, widened to every declaration
+    /// form the two modules use and to all of them at once. Both are formatted,
+    /// so a top-level declaration opens at column zero and closes on a line that
+    /// is exactly `}`.
+    fn declarations(source: &str) -> Vec<(String, String)> {
+        let mut found = Vec::new();
+        let mut lines = source.lines().peekable();
+        while let Some(line) = lines.next() {
+            let Some(name) = declared_name(line) else {
+                continue;
+            };
+            let mut body = String::from(line);
+            for line in lines.by_ref() {
+                body.push('\n');
+                body.push_str(line);
+                if line == "}" {
+                    break;
+                }
+            }
+            found.push((name, body));
+        }
+        found
+    }
+
+    /// The name a top-level `function` declaration line opens, if it is one.
+    fn declared_name(line: &str) -> Option<String> {
+        let rest = line
+            .strip_prefix("export async function ")
+            .or_else(|| line.strip_prefix("export function "))
+            .or_else(|| line.strip_prefix("async function "))
+            .or_else(|| line.strip_prefix("function "))?;
+        let name: String = rest
+            .chars()
+            .take_while(|character| character.is_alphanumeric() || *character == '_')
+            .collect();
+        // A generic (`transact<T>(`) and a plain one (`open(`) both count; a
+        // line that only *mentions* the word does not.
+        let after = &rest[name.len()..];
+        if name.is_empty() || !(after.starts_with('(') || after.starts_with('<')) {
+            return None;
+        }
+        Some(name)
     }
 
     /// The body of one exported function of an emitted module.
