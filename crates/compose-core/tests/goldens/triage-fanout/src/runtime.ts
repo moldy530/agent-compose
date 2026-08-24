@@ -1694,11 +1694,19 @@ export async function callModel(
     const held = slot.held.value as JournaledCall;
     for (const call of held.calls) site.modelCalls?.push(call);
     if (!held.ok) throw replayedFailure({ kind: "error", ...held.error });
-    const served = held.calls[held.calls.length - 1];
+    // Which member answered, off the record's own field — and off the tail of
+    // `calls` where there is one, because those are the objects just pushed into
+    // the node's channel and the trace reconciles the two lists by **identity**
+    // ([`merged`]). The field is what makes the empty case answerable: `calls`
+    // is the *node execution's* collector, and a detached `map` delivery has
+    // none by construction (D94, and see [`runMap`]) — so its record holds an
+    // empty list, and a `served` inferred from that tail would fail a resume of
+    // a composition nobody had touched.
+    const served = held.calls[held.calls.length - 1] ?? held.served;
     if (served === undefined) {
       throw new ReplayDivergence(
-        { key: slot.key, site: recorder.site, kind: "model", ordinal: 0 },
-        "the journal recorded an answer with no model-call record behind it",
+        slot,
+        "the journal recorded an answer with no record of which model served it",
       );
     }
     return { answer: held.answer, served };
@@ -1717,6 +1725,7 @@ export async function callModel(
     const kept = slot.keep({
       ok: true,
       answer: result.answer,
+      served: result.served,
       calls: filed(),
     } satisfies JournaledCall) as Extract<JournaledCall, { ok: true }>;
     return { answer: kept.answer, served: result.served };
@@ -1734,9 +1743,25 @@ export async function callModel(
   }
 }
 
-/** One model call as the journal keeps it (see [`callModel`]). */
+/**
+ * One model call as the journal keeps it (see [`callModel`]).
+ *
+ * `served` is the member of the route that answered, and `calls` is what the
+ * ladder filed on the node's own trace channel on the way there. They overlap
+ * wherever there *is* such a channel — the last of `calls` is this same call —
+ * and the reason both are here is the case where there is not: a detached `map`
+ * delivery runs with the node's collectors detached (D94), so `calls` is empty
+ * and `served` is the only account of who answered. It is optional because a
+ * record written before this field existed has none, which
+ * `docs/durability.md` §11.2 makes a compatible reading rather than a bump.
+ */
 type JournaledCall =
-  | { readonly ok: true; readonly answer: ModelAnswer; readonly calls: ModelCall[] }
+  | {
+      readonly ok: true;
+      readonly answer: ModelAnswer;
+      readonly served?: ModelCall;
+      readonly calls: ModelCall[];
+    }
   | {
       readonly ok: false;
       readonly error: { readonly name: string; readonly message: string };
