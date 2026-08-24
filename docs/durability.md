@@ -103,17 +103,24 @@ intra-process locking is needed.
 
 Across *processes* this release keeps the boundary PRD 5.10 draws and
 `src/stores.ts` already keeps — `--target local` is one process. **One process
-at a time writes a project's journal**, and that is a rule rather than a
-mechanism: `node-sqlite3-wasm` runs SQLite over a virtual file system that
-implements no cross-process locking, so two processes on one file do not queue
-behind each other — they interleave, and each can read pages the other has not
-committed. `PRAGMA busy_timeout` is still set before any statement that can
-contend, and the open is still retried under a deadline, because both cost an
-uncontended run nothing and both are what a backend that *does* lock would need
-(resolved q27's Postgres slot is the one on the roadmap). Neither is a
-guarantee, and nothing in this document should be read as one. The
-per-statement atomicity above is likewise a statement about one process's
-writes.
+at a time writes a project's journal**, and that stays a rule rather than a
+promise; what the driver adds beneath it is a real lock. `node-sqlite3-wasm`
+takes SQLite's exclusive lock by creating `<file>.lock` as a directory and gives
+it back by removing it, so a second process on one journal meets `SQLITE_BUSY`
+rather than interleaving into pages the first has not committed. `PRAGMA
+busy_timeout` is set before any statement that can contend, and the open is
+retried under a deadline for the statements the pragma does not cover.
+
+**A lock does not die with its owner**, and that matters here more than
+anywhere: a process killed *inside* a write never reaches the `rmdir`, and the
+directory it leaves would refuse every later open of that journal — the resume
+of the very execution the crash interrupted, and every future run of the
+project. So a lock still held after a deadline has been waited out is removed
+and the open retried once. Under the rule above that is a lock whose owner is
+gone, and every write here is a single statement, so a live owner never holds
+one for anything like that long. The **rollback journal** the same crash leaves
+is not touched: SQLite recovers it on the next open, which is what makes the
+interrupted write leave no half-written row.
 
 The two live surfaces are therefore kept **apart** rather than serialized:
 
@@ -157,14 +164,24 @@ instantiation's own instance path — which is exactly how they trace
 (`docs/trace.md` §8) — so their effects are journaled without a record for the
 boundary itself.
 
-That inventory is held **mechanically**, in both directions:
-`crates/compose-core/src/codegen/journal.rs`'s
-`every_effect_site_reaches_the_journal_and_the_document_names_them_all` reads
-each of the six functions above out of the emitted modules and fails when one
-does not reach the journal, when this table does not name it, or when a seventh
-site exists that this table does not. A surface added to `src/runtime.ts` that
-calls the world and is not journaled is a replay that issues it twice — and the
-run would succeed, so nothing else in the repository would notice.
+That inventory is held **mechanically**, and by two tests in
+`crates/compose-core/src/codegen/journal.rs` that read it from opposite ends.
+
+`every_effect_site_reaches_the_journal_and_the_document_names_them_all` reads it
+from the seams: each of the six functions above is read out of the emitted
+modules, and the test fails when one does not reach the journal, when this table
+does not name it, or when a seventh site exists that this table does not.
+
+`nothing_in_the_emitted_runtime_calls_the_world_except_under_a_journaled_seam`
+reads it from the **primitives**, which is the direction the first cannot see.
+A surface added to `src/runtime.ts` that calls the world and is not journaled is
+a replay that issues it twice — and it is not one of the six, contains no
+`journaled(` and no `.claim(`, and is in no table, so nothing else in the
+repository would notice. So every `fetch`, every `spawn`, every filesystem call
+and every SQLite statement in the two emitted modules is required to sit in a
+function the six transitively reach. One site is exempt and is named in the test:
+`releaseExecution`, which is grammar 11.1's `scope: execution` lifetime rather
+than an effect the graph issues.
 
 ### 3.1 A model call
 
@@ -238,9 +255,16 @@ it addressed, which surface ran it, and the op's evaluated parameters.
 ### 3.4 A human wait
 
 One record per **settled** wait, holding how it settled and — where somebody
-answered — the answer itself. A wait that expired records that it expired and
-the instant it did; the route it takes is the composition's `on_timeout:` and is
-read off the node rather than off the record.
+answered — the answer itself. A wait that expired records that it expired; the
+route it takes is the composition's `on_timeout:` and is read off the node
+rather than off the record.
+
+It holds **all three of the wait's instants** — when it began, when it would
+have expired, and when it stopped waiting — because all three describe the
+generation that held the pause and none of them describes the one that reads the
+record back. A resumed generation that dated `pausedAt` by its own clock and
+took `settledAt` from the record would file an entry whose answer arrives before
+its question, which is the opposite of what §9 promises a reader.
 
 An **unsettled** wait records nothing, and that is the whole of re-parking: a
 resumed execution reaching a wait the journal does not hold parks under the same
@@ -343,9 +367,32 @@ again, and traversal ordinals are assigned again. They must answer what they
 answered — see §4's second property — and the failure mode when they do not is
 §7.
 
+**A live effect past the frontier acts on the world the recorded prefix left
+behind**, and that is a real premise rather than a restatement. It holds for
+every world an effect can reach *except one*: a store whose data lives in the
+process. A `scope: execution` `kv`/`vector` store — and any store a target bound
+to `provider: memory` — is an in-memory database opened per execution
+(`src/stores.ts`), so its rows died with the crash; and because the prefix's
+writes are answered out of the journal they are never re-applied. A live read
+past the frontier would find an empty store, answer `found: false` about
+something the execution wrote, route down a branch the original would never have
+taken, and report `completed`. Nothing compares unequal, so neither divergence
+in §7 sees it.
+
+So it is **refused**: a live op on an in-process store whose recorded prefix
+wrote to it fails the resume with a diagnostic naming the store and the effect
+site, raised and travelling exactly as §7's divergences do — past every policy,
+without closing the execution's row. The repair is the composition's: a store a
+resumed execution reads across the frontier has to be `scope: session` or
+`scope: global`. A `scope: execution` **`blob`** store is not affected; it is a
+directory on disk, so its contents are still there, and the resumed run removes
+the partition when it ends exactly as the crashed one would have.
+
 **Time is not replayed.** A `timeout:` budget runs against the resumed
 generation's clock, and a `human` node's own budget restarts when the wait
-re-parks. A backoff's jitter is re-rolled. None of it changes what an effect
+re-parks — a wait the journal *holds* is not re-parked at all, and replays with
+the instants the recording generation measured (§3.4). A backoff's jitter is
+re-rolled. None of it changes what an effect
 answers; it can change *whether* a deadline fires, and a resumed execution whose
 budgets fire differently is a resumed execution whose effect sequence diverges —
 reported as §7 rather than silently accepted.
@@ -459,11 +506,21 @@ fail a contract that has not moved at all, because it failed it on the
 generation that recorded it too — a flaky `exec:` under a `retry:` whose first
 attempt answered off-contract and whose second did not. The journal says which
 happened. The ordinal counts every effect of a kind ever issued at a site (§4),
-so the record of the **next** one is exactly the attempt that ladder made:
-where the journal holds it, the mismatch is one this composition already had
-and already decided, the ladder does now what it did then, and the attempt it
-spends is a replay rather than a call. Where the journal holds nothing there,
-the original never went round again, so the contract is one this build brought.
+so if that ladder went round again the **next** record at the site is its second
+attempt — and what identifies it as that attempt rather than as whatever the
+site did next is that a retry repeats the *identical request*. So the next
+record is compared by request identity, not merely counted: where it repeats
+this one, the mismatch is one this composition already had and already decided,
+the ladder does now what it did then, and the attempt it spends is a replay
+rather than a call. Where the journal holds nothing there — or holds a different
+request, which is the site going on to its next effect rather than retrying this
+one — the original never went round again, so the contract is one this build
+brought.
+
+Counting alone would be wrong at every site that issues two or more effects of
+one kind: an agent whose loop calls `tool.alpha` and then `tool.beta` records
+`…#tool/0` and `…#tool/1`, and a tightened contract on *alpha* would find beta's
+record sitting where a second attempt would have been.
 
 **What the failure names** is the divergent step: the effect site's instance
 path, the effect kind, the ordinal at that site, the whole key, and — for a
@@ -550,9 +607,9 @@ execution had run in one process:
   because all of them are deterministic (§4);
 * a replayed model call carries the `ModelCall` records the original ladder
   filed (§3.1), a replayed store op carries the `StoreRecord` the original op
-  filed (§3.3), and a replayed wait carries its original `settledAt` (§3.4). A
-  reader of the resumed document sees what the execution did, not what this
-  process did.
+  filed (§3.3), and a replayed wait carries the original `pausedAt`,
+  `expiresAt` and `settledAt` (§3.4). A reader of the resumed document sees what
+  the execution did, not what this process did.
 
 **Replayed and live entries are not distinguishable** in the trace, and that is
 a decision rather than an omission. `docs/trace.md` §10.3 requires a version
@@ -676,16 +733,24 @@ Stated by resolved q28, and restated here so a reader is not left to infer it:
 And one this document states rather than defers, because it is a property of the
 backend v1 binds rather than a feature left out:
 
-* **two processes on one project's journal at once.** The driver's virtual file
-  system implements no cross-process locking (§2), so one process at a time
-  writes a project's journal — `agent-compose resume` beside a live `serve`
-  included.
+* **two processes on one project's journal at once.** The driver's lock keeps
+  them out of each other's pages (§2), but it is a lock rather than a plan:
+  neither process can see what the other's replay is doing past the frontier, so
+  one process at a time writes a project's journal — `agent-compose resume`
+  beside a live `serve` included. Because a held lock is broken after a deadline
+  (§2), a second process does not merely queue: it eventually goes in.
 
-Two more, both consequences of §5 rather than deferrals:
+Three more, all consequences of §5 rather than deferrals:
 
 * an effect that happened with **no row** for it (§2) is re-executed on replay;
 * a resumed execution whose deadlines fire differently from the original's
-  diverges (§5) and is reported as §7, rather than silently re-executing.
+  diverges (§5) and is reported as §7, rather than silently re-executing;
+* an execution that reads a **store whose data lives in the process** across the
+  frontier cannot be resumed (§5). Nothing reconstructs the rows a
+  `scope: execution` `kv`/`vector` store held, so the resume is refused rather
+  than answered out of an empty one. Making such a store durable is the same
+  problem as journal compaction — it needs a lifetime that outlives the run — and
+  the composition-level answer is `scope: session`.
 
 ---
 
