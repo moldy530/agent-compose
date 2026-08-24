@@ -933,6 +933,42 @@ fn answered(mut command: Command, answers: &[&str], afterwards: Answers) -> Run 
 // Durable executions (PRD resolved q26-q29, `docs/durability.md`)
 // ---------------------------------------------------------------------------
 
+/// Whether a project's journal **committed** a record under each of these keys.
+///
+/// The one way a test can wait for an effect nothing reports. A detached `map`
+/// delivery (grammar 8.6 rule 7) is journaled when it answers and the run waits
+/// for neither — so a kill predicate that watched the delivery's own shim and
+/// then slept would be racing the append that follows it, and on a loaded runner
+/// would sometimes kill the run first. Waiting for the record itself is the
+/// same condition without the clock.
+///
+/// Read off the file's bytes rather than through a driver, and deliberately: the
+/// journal's SQLite lives under a virtual file system with no cross-process
+/// locking (`docs/durability.md` §2), so a second process *opening* it while the
+/// run writes could roll back a transaction the run had in flight. A key is
+/// stored as plain text in a page, so a scan is enough to see one.
+///
+/// **Committed** is the load-bearing word. In rollback-journal mode SQLite
+/// writes the new page into the main file and only then removes the journal, so
+/// bytes alone would answer `true` for a row a crash would still roll back. A
+/// missing (or empty) `-journal` beside the file means no transaction is in
+/// flight, and everything the main file holds has been committed — a later
+/// transaction rolling back restores its own pages, never these.
+pub fn journal_holds(project: &Path, keys: &[&str]) -> bool {
+    let path = project.join(".agent-compose").join("journal.sqlite");
+    let hot = path.with_file_name("journal.sqlite-journal");
+    if std::fs::metadata(&hot).is_ok_and(|held| held.len() > 0) {
+        return false;
+    }
+    let Ok(bytes) = std::fs::read(&path) else {
+        return false;
+    };
+    keys.iter().all(|key| {
+        let wanted = key.as_bytes();
+        bytes.windows(wanted.len()).any(|window| window == wanted)
+    })
+}
+
 /// What a run that was **killed** left behind.
 pub struct Killed {
     /// The execution id it printed before it died — what `resume` takes.
@@ -977,6 +1013,28 @@ pub fn crash_run(
     environment: &[(String, String)],
     ready: impl Fn(&[String]) -> bool,
 ) -> Killed {
+    crash_run_answering(project, arguments, environment, &[], ready)
+}
+
+/// [`crash_run`] with the pauses it reaches answered at standard input first.
+///
+/// The one shape a **journaled answer** can be set up in: a person answers, the
+/// run carries on, and the process dies past the pause rather than at it. The
+/// answers are written before the wait for `ready` starts, so the prompt loop
+/// has them the moment it asks; standard input stays open until after the kill,
+/// exactly as it does for a run with no answers at all, so a pause the script
+/// does not cover parks instead of losing its answer surface.
+///
+/// # Panics
+///
+/// Panics for [`crash_run`]'s two reasons.
+pub fn crash_run_answering(
+    project: &Path,
+    arguments: &[&str],
+    environment: &[(String, String)],
+    answers: &[&str],
+    ready: impl Fn(&[String]) -> bool,
+) -> Killed {
     let mut command = bun();
     command.arg(project.join("src/index.ts")).args(arguments);
     seal(&mut command, environment);
@@ -985,7 +1043,11 @@ pub fn crash_run(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = command.spawn().expect("bun runs");
-    let held_stdin = child.stdin.take().expect("stdin is piped");
+    let mut held_stdin = child.stdin.take().expect("stdin is piped");
+    for answer in answers {
+        let _ = writeln!(held_stdin, "{answer}");
+        let _ = held_stdin.flush();
+    }
     let stdout = child.stdout.take().expect("stdout is piped");
     let stderr = child.stderr.take().expect("stderr is piped");
     let lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
