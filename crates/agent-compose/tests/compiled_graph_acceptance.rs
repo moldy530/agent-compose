@@ -12749,6 +12749,129 @@ fn a_detached_delivery_in_flight_when_a_run_parks_is_not_delivered_twice() {
     );
 }
 
+/// A **resumed** generation does not end with a detached delivery still in
+/// flight, whether or not it is parked (`docs/durability.md` §3.2, §7).
+///
+/// The sibling test above is the **parked** half: a run that stops at a pause
+/// waits, because a delivery with no record is one the resume makes again. This
+/// is the half that decides the *outcome*, and it is not about the record at
+/// all.
+///
+/// A delivery is the one place a `ReplayDivergence` has nothing to be thrown to
+/// — nothing joins it (grammar 8.6 rule 7) — so it is latched against the
+/// execution instead, and a latch is exactly what makes `runtime.staysOpen`
+/// true: it keeps the row **open**, keeps the `scope: execution` blob partition
+/// on disk, and fails the resume. A generation that read that predicate at the
+/// instant the graph quiesced and then walked away would be reading it while the
+/// answer was still being decided: a delivery that latches a moment later leaves
+/// the row closed `completed` over a delivery the record describes and nobody
+/// made, or the partition removed under the very resume §5 promises it to. Both
+/// are unrecoverable, and neither compares unequal to anything.
+///
+/// So the observable claim is the one that holds the predicate still: **a
+/// resumed run that has quiesced is not over until its deliveries are**. The
+/// shim writes its line and then holds, so the effect has happened and its
+/// record has not; `wrap`'s call is replayed in milliseconds while both
+/// deliveries are still in the shim. A generation that let go there exits before
+/// either append — the run's own report is written and `process.exit` is
+/// immediate — and the records are simply absent.
+#[test]
+fn a_resumed_generation_does_not_end_with_a_detached_delivery_still_in_flight() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(SONNET, Outcome::structured(json!({ "note": "one note" }))),
+        Script::new(SONNET, Outcome::structured(json!({ "note": "two note" }))),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "note": "wrapped" })).after(Duration::from_secs(120)),
+        ),
+    ]);
+
+    let Some((project, built)) = harness::build_under_toolchain("durability", "resume-inflight")
+    else {
+        return;
+    };
+    assert!(
+        built.status.success(),
+        "the durability fixture did not build:\n{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+
+    let shims = harness::Scratch::new("inflight");
+    let log = shims.path().join("receipt.log");
+    // The line first, then a hold, then the answer: the delivery has happened
+    // and its record has not, for as long as this test needs both to be true.
+    harness::shim(
+        shims.path(),
+        "receipt",
+        "printf 'filed\\n' >> \"$RECEIPT_LOG\"\nsleep 3\nprintf 'filed'\n",
+    );
+    let mut environment = harness::environment(&provider);
+    environment.push((
+        harness::RECEIPT_BIN.to_string(),
+        shims.path().display().to_string(),
+    ));
+    environment.push((harness::RECEIPT_LOG.to_string(), log.display().to_string()));
+
+    // Killed **inside** both deliveries rather than after them: the two subflow
+    // instances have answered, `wrap`'s call is in flight, and each shim has
+    // written its line and is holding. So neither delivery reaches the journal,
+    // and the resume has to make them live — which is what puts one in flight
+    // while the resumed graph quiesces.
+    let killed = harness::crash_run(
+        &project,
+        &[
+            "run",
+            "flow.parceled",
+            "--input",
+            "topic=durability",
+            "--input",
+            "topics=[\"one\",\"two\"]",
+        ],
+        &environment,
+        |_| provider.snapshot().requests >= 3 && harness::lines_in(&log) == 2,
+    );
+
+    // The one call a correct replay still owes the provider: `wrap`'s, which the
+    // crash interrupted. The two subflow instances are in the record.
+    provider.reset();
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "note": "wrapped" })),
+    ));
+
+    let resumed = harness::resume(
+        &project,
+        "durability",
+        &killed.execution,
+        Some("json"),
+        &environment,
+    );
+    resumed.succeeded();
+    let answered = resumed.outputs();
+    assert_eq!(answered["status"], "completed", "{answered}");
+    assert_eq!(
+        answered["outputs"]["note"], "wrapped",
+        "the run reached its own answer: {answered}"
+    );
+    assert_eq!(
+        harness::lines_in(&log),
+        4,
+        "the crash left no record of either delivery, so the resume made both \
+         live — which is what puts one in flight at quiescence (§3.2's \
+         at-least-once): {}",
+        resumed.stderr()
+    );
+    assert!(
+        harness::journal_holds(&project, &["receipt/0/0#tool/0", "receipt/0/1#tool/0"]),
+        "a resumed run that quiesced with deliveries still in flight ended \
+         anyway: their records are not in the journal, so the reading that \
+         decided this execution's outcome was taken before the execution had \
+         one: {}",
+        resumed.stderr()
+    );
+}
+
 /// A **human** answer is held to the contract this build declares, and an
 /// answer it no longer admits is resolved q29's second divergence.
 ///
@@ -13053,6 +13176,146 @@ fn a_diverged_recovery_delivers_no_webhook_and_the_repair_delivers_one() {
         1,
         "neither recovery re-issued the recorded call"
     );
+}
+
+/// A recovery that fails **before the execution is opened** delivers no webhook
+/// either, and the start that finishes the execution delivers exactly one
+/// (`docs/durability.md` §6.1).
+///
+/// The sibling test above moves a *prompt*, which fails the replay at an effect
+/// — inside the run, with the journal's session open and a `ReplayDivergence` to
+/// read. This one moves the flow's own `inputs:`, and that is the sharper case
+/// for the same rule: `runFlow` parses the recorded invocation before it opens
+/// anything, so the failure is an ordinary `Error` raised with the lifecycle row
+/// untouched. It is the shape a whole class of them takes — a `session_key:` the
+/// composition has since started requiring, a journal written by another
+/// compiler release — and every one of them leaves the row **open** while
+/// carrying nothing a predicate over the error could recognise.
+///
+/// So a build that asked "is this error one that keeps the row open?" instead of
+/// "did this generation close the row?" pushes `failed` about an execution that
+/// has not finished, and the start that puts the composition back and completes
+/// it pushes again: two webhooks for one execution, the first of them wrong, to
+/// a caller who was handed a `202` and is polling nothing.
+#[test]
+fn a_recovery_that_cannot_take_the_recorded_inputs_delivers_no_webhook() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "note": "worth signing off" })),
+    ));
+
+    let receiver = harness::Receiver::start().expect("a loopback receiver");
+    let Some(project) = harness::scratch_project("serve-unparseable-callback") else {
+        return;
+    };
+    let environment = harness::environment(&provider);
+
+    let execution;
+    let resume_url;
+    {
+        let Some(first) = harness::serve_into(&project, "durability", &environment) else {
+            return;
+        };
+        let app = Client::new(&first.base_url).expect("a client for the generated app");
+        let started = app
+            .post_json(
+                "/gate-pushed",
+                &json!({
+                    "topic": "durability",
+                    "callback_url": format!("{}/done", receiver.base_url),
+                }),
+            )
+            .expect("the trigger's route answers");
+        assert_eq!(started.status, 202, "{}", started.text());
+        execution = started.json()["execution_id"]
+            .as_str()
+            .expect("an execution id")
+            .to_string();
+        let status = harness::settled(&app, &execution);
+        assert_eq!(status["status"], "interrupted", "{status}");
+        resume_url = status["interrupts"].as_array().expect("the pauses")[0]["resume_url"]
+            .as_str()
+            .expect("a resume url")
+            .to_string();
+        // Dropped holding the pause, with the row open and nothing pushed.
+    }
+
+    // The flow's `inputs:` narrow under the journal, so the recorded invocation
+    // is one this build refuses to start at all.
+    let moved = harness::Scratch::new("unparseable-callback");
+    let entrypoint = moved.path().join("main.yml");
+    std::fs::write(&entrypoint, narrowed_gate_inputs()).expect("the scratch area is writable");
+
+    {
+        let Some(second) = harness::serve_entrypoint_into(&project, &entrypoint, &environment)
+        else {
+            return;
+        };
+        let app = Client::new(&second.base_url).expect("a client for the generated app");
+        let refused = harness::settled(&app, &execution);
+        assert_eq!(refused["status"], "failed", "{refused}");
+        assert!(
+            !refused["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("ReplayDivergence"),
+            "this build refused the invocation before the replay began, which is what \
+             makes the error one no predicate over its class could catch: {refused}"
+        );
+        // Given time to be sent, and then said not to have been.
+        nothing_delivered(&receiver, Duration::from_secs(3));
+    }
+
+    // The composition comes back, and so does the execution.
+    let Some(third) = harness::serve_into(&project, "durability", &environment) else {
+        return;
+    };
+    let app = Client::new(&third.base_url).expect("a client for the generated app");
+    let recovered = harness::settled(&app, &execution);
+    assert_eq!(
+        recovered["status"], "interrupted",
+        "a start that never opened the execution closed nothing: {recovered}"
+    );
+    let answered = app
+        .post_json(&resume_url, &json!({ "decision": "approve" }))
+        .expect("the resume route answers");
+    assert!(
+        answered.status == 200 || answered.status == 202,
+        "{}",
+        answered.text()
+    );
+
+    let delivered = receiver.wait_for(1, Duration::from_secs(30));
+    assert_eq!(
+        delivered.len(),
+        1,
+        "one execution, one completion webhook: {delivered:?}"
+    );
+    let report = &delivered[0];
+    assert_eq!(report["execution_id"], execution, "{report}");
+    assert_eq!(
+        report["status"], "completed",
+        "…and it is the report of the run that finished rather than the opinion of \
+         the build that would not start it: {report}"
+    );
+}
+
+/// The `durability` fixture with `flow.gate`'s own `inputs:` narrowed past the
+/// invocation the journal recorded, which fails `runFlow`'s parse **before**
+/// `runtime.openExecution` — the one place a recovery can fail with the
+/// lifecycle row untouched.
+fn narrowed_gate_inputs() -> String {
+    let source = std::fs::read_to_string(harness::fixture("durability")).expect("the fixture");
+    let edited = source.replace(
+        "  description: Answer, then wait for a person — the execution a restart has to bring back.\n  inputs:\n    topic:\n      type: string\n      min_length: 1\n",
+        "  description: Answer, then wait for a person — the execution a restart has to bring back.\n  inputs:\n    topic:\n      type: string\n      min_length: 200\n",
+    );
+    assert_ne!(
+        edited, source,
+        "`flow.gate`'s own `inputs:` is what this copy narrows"
+    );
+    edited
 }
 
 /// Give a webhook that must not be sent the time to be sent, and then say it was

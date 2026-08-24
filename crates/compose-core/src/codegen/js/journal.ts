@@ -1155,6 +1155,13 @@ export function latchDivergence(execution: string, divergence: ReplayDivergence)
   // waited for it — so there is no run left to fail. Said on stderr rather than
   // dropped: a divergence nobody can be told about is still one a reader has to
   // be able to find.
+  //
+  // A **backstop** rather than a path a resume takes. Only a generation
+  // consuming a record can raise a divergence at all, and `runFlow` waits for
+  // every delivery such a generation dispatched before it closes the session
+  // (`./graph.ts`, `docs/durability.md` §3.2) — so what reaches here is a
+  // delivery that outlived the session by some other route, and the honest
+  // thing to do with it is to say so rather than to assume it cannot happen.
   process.stderr.write(`${divergence.name}: ${divergence.message}\n`);
 }
 

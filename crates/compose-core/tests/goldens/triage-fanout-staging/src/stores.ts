@@ -117,14 +117,25 @@
 // # One process
 //
 // These backends are the local, zero-infra ones, and they assume the project is
-// one process: SQLite here is a WebAssembly build over `node:fs` with no
-// cross-process locking, so two `agent-compose run`s sharing a session-scoped
-// store are outside what this release promises — the second one's op fails the
-// node with `SQLite3Error: database is locked` rather than corrupting anything.
-// That is the same boundary PRD 5.10 draws — `--target local` is one process —
-// and production backends are M3. The emitted `README.md` says so where a reader
-// meets the data directory, because `agent-compose run` is the surface where
-// running two at once is the obvious thing to try.
+// one process: SQLite here is a WebAssembly build over `node:fs`, whose virtual
+// file system takes a lock by creating `<file>.lock` as a directory, so two
+// `agent-compose run`s sharing a session-scoped store are outside what this
+// release promises — the second one's op waits out `PRAGMA busy_timeout` and
+// then fails the node with `SQLite3Error: database is locked` rather than
+// corrupting anything. That is the same boundary PRD 5.10 draws — `--target
+// local` is one process — and production backends are M3. The emitted
+// `README.md` says so where a reader meets the data directory, because
+// `agent-compose run` is the surface where running two at once is the obvious
+// thing to try.
+//
+// **A lock does not die with its owner**, which is the same fact `./journal.ts`
+// is written around and matters here for the same reason: a `run` killed inside
+// a store write never reaches the `rmdir`, and the directory it leaves would
+// refuse every later open of that store — the resume of the very execution the
+// crash interrupted included, whose live ops past the frontier are promised the
+// world the recorded prefix left behind (`docs/durability.md` §5). So [`open`]
+// waits [`LOCK_WAIT_MS`] and then treats a lock still standing as a corpse,
+// exactly as the journal does and under the same rule that makes it sound.
 //
 // # Retention
 //
@@ -415,6 +426,76 @@ CREATE TABLE IF NOT EXISTS applied (
 );
 `;
 
+/**
+ * How long an op waits on a locked store file, and how long the retry inside
+ * [`migrated`] keeps trying for.
+ *
+ * `./journal.ts`'s own deadline to the millisecond, and deliberately so: the two
+ * files sit in one directory, are locked by one driver's virtual file system,
+ * and are left behind by one crash, so two different deadlines would be two
+ * different answers to one question.
+ */
+const LOCK_WAIT_MS = 5_000;
+
+/** How this driver's virtual file system spells a held lock. See the header. */
+const LOCK_DIRECTORY = ".lock";
+
+/** Remove a lock no live process is giving back. See the module header. */
+function breakStaleLock(file: string): boolean {
+  const lock = `${file}${LOCK_DIRECTORY}`;
+  if (!fs.existsSync(lock)) return false;
+  try {
+    fs.rmSync(lock, { recursive: true, force: true });
+    return true;
+  } catch {
+    // A lock this process cannot remove is one it cannot get past either; the
+    // open below fails with the driver's own message rather than with this.
+    return false;
+  }
+}
+
+/**
+ * One store file, open with its schema applied — waiting out a lock and, past
+ * the deadline, breaking the one a killed writer left behind.
+ *
+ * `./journal.ts`'s `migrated` for the other file in the same directory, and the
+ * duplication is the honest shaping: the modules are separate compiler
+ * constants with separate schemas, and the shared thing is a fact about the
+ * driver rather than a function either of them owns.
+ */
+async function migrated(
+  Database: SqliteModule["Database"],
+  file: string,
+): Promise<InstanceType<SqliteModule["Database"]>> {
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  let broke = false;
+  let delay = 10;
+  for (;;) {
+    const database = new Database(file);
+    try {
+      // **First**, so that every statement after it waits on a locked file
+      // rather than failing at once. A `PRAGMA` that arrives after the
+      // contended statement is a setting nobody read.
+      database.exec(`PRAGMA busy_timeout = ${LOCK_WAIT_MS};`);
+      database.exec(SCHEMA);
+      return database;
+    } catch (error) {
+      database.close();
+      if (Date.now() >= deadline) {
+        // The deadline is up. Either a lock is still there — in which case its
+        // owner is gone under the one-process rule the header states, and it
+        // goes, once — or this is a failure waiting cannot fix, and it is the
+        // caller's.
+        if (broke || !breakStaleLock(file)) throw error;
+        broke = true;
+        continue;
+      }
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      delay = Math.min(delay * 2, 200);
+    }
+  }
+}
+
 /** The database a store's op runs against, opened and migrated on first use. */
 function open(store: StoreBinding, execution: runtime.ExecutionIdentity): Promise<Database> {
   const cacheKey = handleKey(store, execution);
@@ -423,18 +504,18 @@ function open(store: StoreBinding, execution: runtime.ExecutionIdentity): Promis
 
   const opening = (async () => {
     const { Database } = await sqlite();
-    let opened: Database;
     if (store.scope === "execution" || store.backend.provider === "memory") {
       // Nothing on disk: an execution-scoped store dies with the run, and
-      // `provider: memory` says so outright.
-      opened = new Database(":memory:");
-    } else {
-      const directory = path.join(dataRoot(), "stores");
-      fs.mkdirSync(directory, { recursive: true });
-      opened = new Database(path.join(directory, `${encodeKey(store.name)}.sqlite`));
+      // `provider: memory` says so outright. Nothing to contend over either —
+      // an in-memory database is this process's alone — so it is opened
+      // directly rather than through the deadline [`migrated`] keeps.
+      const opened = new Database(":memory:");
+      opened.exec(SCHEMA);
+      return opened;
     }
-    opened.exec(SCHEMA);
-    return opened;
+    const directory = path.join(dataRoot(), "stores");
+    fs.mkdirSync(directory, { recursive: true });
+    return await migrated(Database, path.join(directory, `${encodeKey(store.name)}.sqlite`));
   })();
   // Registered before the first `await` inside it, so a concurrent caller finds
   // this promise rather than opening a second handle. A failed open is dropped

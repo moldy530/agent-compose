@@ -117,8 +117,8 @@ import {
   TRACE_VERSION,
   deliverHumanAnswer,
   humanWaits,
+  journaledExecution,
   openExecutions,
-  staysOpen,
   watchHumanPauses,
 } from "./runtime.ts";
 import type * as runtime from "./runtime.ts";
@@ -730,9 +730,20 @@ function callbackOf(trigger: HttpTrigger, payload: Payload): string | undefined 
  * start replays it again. Reporting `failed` to the caller would be this
  * process's opinion delivered as the execution's outcome — and then the recovery
  * that completes it would deliver a *second* webhook for one execution, the
- * first of them wrong. So the guard is the same predicate the row is closed by:
- * what stays open sends nothing, and the process that finally closes the row is
- * the one that pushes, once.
+ * first of them wrong. So the guard is the lifecycle row: what stays open sends
+ * nothing, and the process that finally closes the row is the one that pushes,
+ * once.
+ *
+ * **Which is read off the row itself**, rather than inferred from the error.
+ * "This error is not one that keeps the row open" is a different question from
+ * "this generation closed the row", and the two part company on every failure
+ * raised *before* [`runtime.openExecution`] — a recovered execution whose
+ * recorded inputs this build's `inputs:` no longer accept, a `session_key:` the
+ * composition has since started requiring, a journal written by another compiler
+ * release. Every one of those leaves the lifecycle row untouched and **open**,
+ * and every one of them is an ordinary `Error` that [`runtime.staysOpen`] says
+ * nothing about — so the inference pushes `failed`, and the start that finally
+ * replays the execution pushes again. The row is the fact; this asks it.
  */
 function settling(
   execution: Execution,
@@ -746,7 +757,7 @@ function settling(
       execution.trace = answer.trace;
       return true;
     })
-    .catch((error: unknown) => {
+    .catch(async (error: unknown) => {
       execution.status = "failed";
       execution.error = message(error);
       const trace = (error as { trace?: readonly runtime.TraceEntry[] }).trace;
@@ -754,12 +765,35 @@ function settling(
       // The status route still reports what *this* process saw — a reader
       // polling it is asking about this build — and that is the whole of the
       // difference: the report is this process's, the push is the execution's.
-      return !staysOpen(execution.id, error);
+      return !(await stillOpen(execution.id));
     })
     .then(async (finished) => {
       if (!finished || callback === undefined) return;
       await notify(callback, execution);
     });
+}
+
+/**
+ * Whether the journal still holds this execution **open** — the one question
+ * [`settling`] has to answer before it pushes.
+ *
+ * An id the journal holds no row for is **not** open, and that is the right
+ * answer rather than a missing case: it is a request whose run failed before it
+ * could be journaled at all, so no start will ever recover it and the caller who
+ * was handed a `202` is owed the failure now. What has a row and is still open
+ * is the execution somebody else will finish.
+ *
+ * A journal this process cannot read answers `true`, because the honest reading
+ * of "I cannot tell" here is the conservative one: a push that should not have
+ * gone cannot be taken back, while a push that was owed is still delivered by
+ * whichever process does close the row.
+ */
+async function stillOpen(execution: string): Promise<boolean> {
+  try {
+    return (await journaledExecution(execution))?.status === "open";
+  } catch {
+    return true;
+  }
 }
 
 /** The completion webhook of an `async` trigger (grammar 13.3). */

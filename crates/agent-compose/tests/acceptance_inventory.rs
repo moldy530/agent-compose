@@ -1178,11 +1178,27 @@ const DURABILITY: &[Criterion] = &[
                 "a_diverged_recovery_delivers_no_webhook_and_the_repair_delivers_one",
                 Status::Live,
             ),
+            // …and the same promise where the failure is not a divergence at
+            // all: a recovery refused before the execution is opened leaves the
+            // row open while carrying nothing the class of the error could say
+            // so, so the push is decided by reading the row.
+            (
+                "a_recovery_that_cannot_take_the_recorded_inputs_delivers_no_webhook",
+                Status::Live,
+            ),
             // …and what a run that stops on its own must not leave behind: a
             // detached delivery made with no record is one the resume makes
             // again.
             (
                 "a_detached_delivery_in_flight_when_a_run_parks_is_not_delivered_twice",
+                Status::Live,
+            ),
+            // …and what a **resumed** run must not decide while one is still in
+            // flight: a delivery is the one place a divergence has nothing to be
+            // thrown to, so the predicate that keeps the row open is still being
+            // decided until the deliveries are done.
+            (
+                "a_resumed_generation_does_not_end_with_a_detached_delivery_still_in_flight",
                 Status::Live,
             ),
             // …and what "survives" has to mean when a build disagrees with the

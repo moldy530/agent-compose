@@ -6121,6 +6121,12 @@ export function humanWaits(execution: string): readonly HumanWait[] {
  * **A settled pause is settled.** Whichever of the two sides got there first —
  * an answer, or the budget running out — wins exactly once, so a resume racing
  * an expiry is decided rather than applied twice.
+ *
+ * **An answer this accepts can still fail the run.** The pause is journaled as
+ * it settles, and a journal that refuses the record leaves the answer accepted
+ * and the *node* failing with the write's own error (see [`runHuman`]): the turn
+ * was spent, so it is not offered again here, and the run stops rather than
+ * going on from a wait its own record does not hold.
  */
 export function deliverHumanAnswer(
   execution: string,
@@ -6381,12 +6387,34 @@ export async function runHuman(
       announce(wait.execution);
       if (outcome === "resumed") {
         const ended = stopped(outcome);
-        const kept = slot?.keep({
-          ...instants,
-          settled: "resumed",
-          output: value,
-          settledAt: ended.settledAt,
-        } satisfies JournaledWait) as Extract<JournaledWait, { settled: "resumed" }> | undefined;
+        let kept: Extract<JournaledWait, { settled: "resumed" }> | undefined;
+        try {
+          kept = slot?.keep({
+            ...instants,
+            settled: "resumed",
+            output: value,
+            settledAt: ended.settledAt,
+          } satisfies JournaledWait) as Extract<JournaledWait, { settled: "resumed" }> | undefined;
+        } catch (error) {
+          // **The parked promise is what a write failure leaves through**, and
+          // that is the whole of why the record is written inside a `try` here
+          // rather than beside every other `keep` in this file. The wait is
+          // already marked settled above — it has to be, or the answer and the
+          // expiry could both land — so a throw that escaped `settle`
+          // would leave a wait nothing may settle again holding a promise
+          // nothing ever settles: [`closeHumanWaits`] and [`releaseHumanWaits`]
+          // both skip a settled entry, a later [`deliverHumanAnswer`] refuses
+          // it, and the `human` node's `await` never returns. The run does not
+          // fail, does not park and does not end — it hangs, which is the one
+          // outcome a durable execution has no way back from.
+          //
+          // So the failure travels as the node's: the journal could not record
+          // what the person said, and a run that went on from a wait its own
+          // record does not hold is a run whose resume would ask them again
+          // (`docs/durability.md` §3.4).
+          reject(error);
+          return true;
+        }
         // What the journal now holds, where it holds anything, for [`callModel`]'s
         // reason: the answer a person gave is a value the rest of the graph reads
         // and a later effect's identity may be built out of, so both generations
@@ -6397,11 +6425,22 @@ export async function runHuman(
         });
       } else if (outcome === "expired") {
         const ended = stopped(outcome);
-        slot?.keep({
-          ...instants,
-          settled: "expired",
-          settledAt: ended.settledAt,
-        } satisfies JournaledWait);
+        try {
+          slot?.keep({
+            ...instants,
+            settled: "expired",
+            settledAt: ended.settledAt,
+          } satisfies JournaledWait);
+        } catch (error) {
+          // The same rule on the other settlement, and the arm where escaping
+          // would cost more: this one is reached from a `setTimeout` callback,
+          // where a throw is an uncaught exception rather than something a
+          // caller could report. The expiry is not routed either — a run that
+          // took `on_timeout:` past a wait whose expiry the journal does not
+          // hold would re-park on the resume and spend the budget again.
+          reject(error);
+          return true;
+        }
         reject(
           new HumanExpiry(
             descriptor.flow,

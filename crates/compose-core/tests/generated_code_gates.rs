@@ -1328,12 +1328,12 @@ fn the_fan_out_runtime_bounds_orders_and_resolves_every_dispatch() {
 /// (grammar 8.7, 9.2, PRD 5.11).
 ///
 /// The acceptance suite answers, expires and addresses pauses through a served
-/// app, which is where the composition's behaviour is decided. Eleven claims are
+/// app, which is where the composition's behaviour is decided. Twelve claims are
 /// not decidable there — eight because the case that breaks them is a task
 /// **nobody is awaiting**, one because the case that breaks it is a bug in the
-/// runtime rather than anything a composition can ask for, and two because every
+/// runtime rather than anything a composition can ask for, two because every
 /// composition that can reach one declares an `on_error:` the orderings agree
-/// on:
+/// on, and one because it needs the journal's write to fail on command:
 ///
 ///   * **a pause is addressed by, and belongs to, an instance path.** A node
 ///     holds the pauses its own path is a prefix of, which is the whole of what
@@ -1377,6 +1377,13 @@ fn the_fan_out_runtime_bounds_orders_and_resolves_every_dispatch() {
 ///     absorbs an ordinary delivery failure at that same node. A served app
 ///     cannot tell the orderings apart: every fixture that reaches an expiry
 ///     resolves `on_error: fail`, where they agree;
+///   * **a settlement the journal cannot record fails the node.** The wait is
+///     marked settled before its record is written, so a write that threw out
+///     of the settlement would leave a wait nothing may settle again holding a
+///     promise nothing ever settles — a run that hangs rather than one that
+///     fails, on both settlements that are journaled. Deciding it needs the
+///     write to refuse on command, which is a stub recorder rather than a
+///     composition;
 ///   * **a released wait's expiry timer is cleared.** An `unref`ed timer keeps
 ///     nothing alive, so it is invisible to `process.getActiveResourcesInfo()`
 ///     and to the process exiting: the runner counts the global
@@ -1698,6 +1705,39 @@ fn the_wait_board_behaved(observed: &Value) {
         json!({ "ok": false, "reason": "settled" })
     );
     assert_eq!(observed["answering"]["still_published"], json!([]));
+
+    // …and a journal that refuses the settled wait's record fails the **node**
+    // rather than leaving the pause parked for ever. The wait is marked settled
+    // before the record is written, so a write that threw out of the settlement
+    // would leave a wait nothing may settle again holding a promise nothing ever
+    // settles — the `human` node's `await` never returns, and the run neither
+    // fails nor parks nor ends. Without the guard `settled` reads `"pending"`
+    // and the delivery reports the write's error as its own.
+    assert_eq!(
+        observed["unwritable_answer"],
+        json!({
+            "delivery": { "ok": true, "threw": null },
+            "settled": "Error",
+            "reported": "the journal refused this record",
+            "still_published": [],
+            "again": "settled",
+        }),
+        "a pause whose record could not be written left its node parked: {observed}"
+    );
+
+    // The same on the arm a `setTimeout` fires, where a throw is an uncaught
+    // exception rather than something a caller could report — and where the
+    // expiry must not route either, since `on_timeout:` taken past a wait whose
+    // expiry the journal does not hold is a budget the resume spends again.
+    assert_eq!(
+        observed["unwritable_expiry"],
+        json!({
+            "settled": "Error",
+            "reported": "the journal refused this record",
+            "still_published": [],
+        }),
+        "an expiry whose record could not be written did not fail its node: {observed}"
+    );
 
     // A run with no answer surface never registers a pause: an `agent-compose
     // run` whose standard input is not a terminal has no way to answer one, so
@@ -2458,6 +2498,14 @@ fn the_bound_object_arrived_as_parameters(answer: &Value) {
 /// here is the backend underneath it. Gate 13 runs the same runner under Node,
 /// because a WebAssembly SQLite over `node:fs` is exactly the kind of dependency
 /// that could behave differently on the fallback runtime.
+///
+/// One claim here is durability's rather than the catalogue's: **a lock a killed
+/// writer left behind does not seal the store**. The driver's virtual file
+/// system takes SQLite's lock as a directory beside the file, and a `run` killed
+/// inside a write never removes it — so the store a resume has to read past its
+/// frontier (`docs/durability.md` §5) is one a crash could otherwise render
+/// permanently unopenable. The lock is planted rather than raced for, because
+/// the window a real crash lands in is one statement wide.
 #[test]
 fn the_local_store_backends_partition_dedupe_and_encode_what_they_are_given() {
     let Some(root) = installed() else {
@@ -2695,6 +2743,31 @@ fn the_local_backends_behaved(answer: &Value) {
     assert_eq!(
         answer["blobEncoded"], "%2E%2E%2Fescape%20me",
         "`.` and `/` are both encoded, so no key becomes a path that climbs out"
+    );
+
+    // The lock a killed writer never gave back does not take the store with it.
+    // This driver takes SQLite's lock by creating `<file>.lock` as a directory
+    // and gives it back by removing it, so a `run` killed inside a write leaves
+    // one nothing else will ever remove — and left standing it refuses every
+    // later open of that store, the resume of the very execution the crash
+    // interrupted included (`docs/durability.md` §2, §5). Without the deadline
+    // and the break beneath it the write below fails `SQLITE_BUSY` at once and
+    // every later run of the project fails with it.
+    assert_eq!(
+        answer["sealedWrite"],
+        Value::Null,
+        "a store a crashed writer left locked refused the write that came next: {}",
+        answer["sealedWrite"]
+    );
+    assert_eq!(
+        answer["sealedRead"],
+        json!({ "value": { "theme": "dark" }, "found": true }),
+        "…and the write it took is the one a later read answers with"
+    );
+    assert_eq!(
+        answer["sealedLockGone"],
+        json!(true),
+        "…and the corpse is gone rather than waited out once per op"
     );
 
     // A backend grammar 14.2 names and this release does not implement.
