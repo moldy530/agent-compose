@@ -1054,6 +1054,13 @@ const DURABILITY: &[Criterion] = &[
                 "a_recorded_answer_that_fails_the_current_contract_is_a_divergence_not_a_retry",
                 Status::Live,
             ),
+            // …and its other side, which is what keeps that from breaking a
+            // composition nobody touched: a mismatch the recording generation's
+            // own ladder already absorbed is replayed, not re-decided.
+            (
+                "a_recorded_answer_the_original_retried_past_is_retried_past_again",
+                Status::Live,
+            ),
             // …and the three nesting depths a divergence may not be absorbed at:
             // a dispatched subflow under `on_item_error: skip`, the item retry
             // the other form of that key gives, and a delivery nothing waits for.

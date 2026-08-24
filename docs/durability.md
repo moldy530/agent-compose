@@ -454,6 +454,17 @@ attempt claims an ordinal past the frontier and **re-issues the effect live** �
 the double side effect this whole document exists to prevent, reported as a bad
 answer.
 
+One case sits inside that and is **not** a divergence: a recorded answer can
+fail a contract that has not moved at all, because it failed it on the
+generation that recorded it too — a flaky `exec:` under a `retry:` whose first
+attempt answered off-contract and whose second did not. The journal says which
+happened. The ordinal counts every effect of a kind ever issued at a site (§4),
+so the record of the **next** one is exactly the attempt that ladder made:
+where the journal holds it, the mismatch is one this composition already had
+and already decided, the ladder does now what it did then, and the attempt it
+spends is a replay rather than a call. Where the journal holds nothing there,
+the original never went round again, so the contract is one this build brought.
+
 **What the failure names** is the divergent step: the effect site's instance
 path, the effect kind, the ordinal at that site, the whole key, and — for a
 request identity — both sides of the disagreement truncated to 200 characters
