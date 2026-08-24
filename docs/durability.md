@@ -479,7 +479,11 @@ on:
   one this process started, and a recovered execution that finishes **delivers
   the `callback:` webhook** its request asked for — the URL is on the lifecycle
   row (§3.5), because a caller who was handed a `202` and is waiting for a push
-  is not polling the status route;
+  is not polling the status route. *Finishes* is the word: the webhook fires on
+  exactly the outcomes that **close the row**, so a replay that leaves the
+  execution open — a divergence (§7), a pause nobody can answer — pushes nothing
+  and the process that eventually closes the row is the one that delivers, once.
+  A caller is told an execution failed only where the run really ended;
 * recovery **does not wait** for the replays to finish. The executions it
   recovers are by definition ones that were still running, and the commonest of
   them is parked on a question nobody has answered yet. Registering them is what
