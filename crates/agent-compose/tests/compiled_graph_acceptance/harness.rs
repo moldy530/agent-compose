@@ -168,6 +168,12 @@ pub const TALLY_BIN: &str = "TALLY_BIN";
 /// The file that shim appends one line to per run, so an effect that happened
 /// twice is a line count rather than an inference.
 pub const TALLY_LOG: &str = "TALLY_LOG";
+/// The directory of shims the `durability` fixture's **detached** sink is in,
+/// supplied to every run for [`TALLY_BIN`]'s reason.
+pub const RECEIPT_BIN: &str = "RECEIPT_BIN";
+/// The file that sink appends one line to per delivery — the only account there
+/// is of a dispatch nothing waits for (grammar 8.6 rule 7).
+pub const RECEIPT_LOG: &str = "RECEIPT_LOG";
 
 /// The compiler under test.
 fn agent_compose() -> Command {
@@ -216,7 +222,19 @@ pub fn environment(provider: &MockProvider) -> Vec<(String, String)> {
         (OPS_BIN.to_string(), "/bin".to_string()),
         (OPS_URL.to_string(), provider.base_url()),
         (TALLY_BIN.to_string(), "/bin".to_string()),
+        (RECEIPT_BIN.to_string(), "/bin".to_string()),
     ]
+}
+
+/// How many lines a shim's log holds, and `0` where it has written none.
+///
+/// The one way this suite can see an effect that nothing reports: a subprocess
+/// that ran twice, or a detached delivery that was made twice, is a line count.
+pub fn lines_in(log: &Path) -> usize {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .count()
 }
 
 /// An executable script on `PATH`, for a composition that names a command.

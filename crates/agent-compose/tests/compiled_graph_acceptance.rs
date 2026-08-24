@@ -11329,6 +11329,579 @@ fn a_resume_that_cannot_find_its_execution_says_what_the_journal_holds() {
     );
 }
 
+/// A replayed value is the value the recording generation went on with
+/// (`docs/durability.md` §11.1) — decided where it is observable: inside a
+/// request identity built out of it.
+///
+/// `flow.consulted`'s agent reads `store.ledger` and then answers, so the row
+/// the read produced is put into the *next* model call's turns verbatim. The
+/// backend builds a `kv` `get` row as `{value, found}` and the journal holds it
+/// as `{found, value}`, which is the same value and not the same bytes. A
+/// generation that kept the first order and a generation that reads back the
+/// second therefore compose two different requests out of one composition — and
+/// because the crash lands in the node *after* the agent, every one of the
+/// agent's calls is recorded, so the resume compares that request against the
+/// record rather than treating it as the frontier.
+///
+/// The failure this pins is a resume that dies with a `ReplayDivergence` naming
+/// `ask/0#model/1` against a composition nobody touched.
+#[test]
+fn a_replayed_store_read_is_the_row_the_recording_generation_went_on_with() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        // The agent's own loop: read the ledger, stop asking, answer.
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new("ledger_get", json!({ "key": "entry" }))]),
+        ),
+        Script::new(SONNET, Outcome::text("I have what I need.")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "note": "read it back" })),
+        ),
+        // …and the node the crash lands in.
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "note": "relayed" })).after(Duration::from_secs(120)),
+        ),
+    ]);
+
+    let Some((project, built)) = harness::build_under_toolchain("durability", "resume-consulted")
+    else {
+        return;
+    };
+    assert!(
+        built.status.success(),
+        "the durability fixture did not build:\n{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+
+    let environment = harness::environment(&provider);
+    let killed = harness::crash_run(
+        &project,
+        &["run", "flow.consulted", "--input", "topic=durability"],
+        &environment,
+        |_| provider.snapshot().requests >= 4,
+    );
+
+    provider.reset();
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "note": "relayed" })),
+    ));
+
+    let resumed = harness::resume(
+        &project,
+        "durability",
+        &killed.execution,
+        Some("json"),
+        &environment,
+    );
+    let answered = resumed.outputs();
+    assert_eq!(
+        answered["status"], "completed",
+        "the composition never moved, so nothing about this resume is a divergence — \
+         a recorded value that reads back in a different order than it was written in \
+         is the journal disagreeing with itself: {answered}"
+    );
+    resumed.succeeded();
+    assert_eq!(answered["outputs"]["note"], "read it back", "{answered}");
+    assert_eq!(answered["outputs"]["final"], "relayed", "{answered}");
+    assert_eq!(
+        provider.snapshot().requests,
+        1,
+        "the three recorded calls were replayed and only the killed one was made again"
+    );
+
+    // …and the row really did travel through a request: the replayed store read
+    // is what the agent's second call was told, so a replay that answered it
+    // from the live store rather than from the record would have had to open one.
+    let asked = provider.requests();
+    assert!(
+        asked[0].body_text.contains("read it back"),
+        "the live call is the second node's, asked about what the agent answered: {}",
+        asked[0].body_text
+    );
+}
+
+/// resolved q29's **second** divergence: "a recorded answer [that] fails the
+/// current contract".
+///
+/// `flow.guarded` runs a subprocess whose `output:` the resumed copy of the
+/// composition tightens — the binding is untouched, so the recorded *request*
+/// still matches and only the recorded *answer* is now refused. Two things must
+/// happen and neither is the obvious one: the resume fails naming the step, and
+/// the subprocess does **not** run again. The node carries `retry: { max: 2 }`
+/// and `on_error: skip`, which are exactly the two policies that would otherwise
+/// absorb it — the ladder by claiming an ordinal past the frontier and running
+/// the command live, `skip` by carrying the run on past an effect the record
+/// claims to hold.
+#[test]
+fn a_recorded_answer_that_fails_the_current_contract_is_a_divergence_not_a_retry() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "note": "a guarded note" })).after(Duration::from_secs(120)),
+    ));
+
+    let Some((project, built)) = harness::build_under_toolchain("durability", "resume-contract")
+    else {
+        return;
+    };
+    assert!(
+        built.status.success(),
+        "the durability fixture did not build"
+    );
+
+    let shims = harness::Scratch::new("guarded");
+    let log = shims.path().join("tally.log");
+    harness::shim(
+        shims.path(),
+        "tally",
+        "printf 'ran\\n' >> \"$TALLY_LOG\"\nprintf 'tallied'\n",
+    );
+    let mut environment = harness::environment(&provider);
+    environment.push((
+        harness::TALLY_BIN.to_string(),
+        shims.path().display().to_string(),
+    ));
+    environment.push((harness::TALLY_LOG.to_string(), log.display().to_string()));
+
+    let killed = harness::crash_run(
+        &project,
+        &["run", "flow.guarded", "--input", "topic=durability"],
+        &environment,
+        |_| provider.snapshot().requests >= 1,
+    );
+    assert_eq!(
+        harness::lines_in(&log),
+        1,
+        "the first generation ran the subprocess once"
+    );
+
+    // The composition keeps the binding and tightens what it will accept back.
+    let moved = harness::Scratch::new("contract");
+    let source = std::fs::read_to_string(harness::fixture("durability")).expect("the fixture");
+    let edited = source.replace(
+        "          stdout: { type: string }",
+        "          stdout: { type: string, min_length: 500 }",
+    );
+    assert_ne!(
+        edited, source,
+        "the `output:` line is the one being changed"
+    );
+    let entrypoint = moved.path().join("main.yml");
+    std::fs::write(&entrypoint, edited).expect("the scratch area is writable");
+
+    provider.reset();
+    let resumed = harness::resume_entrypoint(
+        &project,
+        &entrypoint,
+        &killed.execution,
+        Some("json"),
+        &environment,
+    );
+    let said_on_stderr = resumed.failed();
+    let answered = resumed.outputs();
+    assert_eq!(answered["status"], "failed", "{answered}\n{said_on_stderr}");
+    let said = answered["error"].as_str().expect("an error");
+    assert!(
+        said.starts_with("ReplayDivergence: "),
+        "a recorded answer this composition no longer accepts is a divergence, not a \
+         node failure a `retry:` may re-run: {said}"
+    );
+    assert!(
+        said.contains("count/0#tool/0"),
+        "…naming the step whose recorded answer it is: {said}"
+    );
+    assert!(
+        said.contains("no longer satisfies this run's contract"),
+        "…and saying which of the two divergences it is: {said}"
+    );
+
+    assert_eq!(
+        harness::lines_in(&log),
+        1,
+        "the retry ladder did not walk past the frontier and run the command again \
+         (PRD resolved q29)"
+    );
+    assert_eq!(
+        provider.snapshot().requests,
+        0,
+        "`on_error: skip` did not carry the run past the effect either"
+    );
+}
+
+/// A divergence **two instance frames down** — inside a subflow a `map`
+/// dispatched — arrives whole, keyed by the instance that made it
+/// (`docs/durability.md` §4), and is not absorbed by `on_item_error: skip`.
+///
+/// `flow.parceled` dispatches `flow.child` per item, so the model call that
+/// disagrees is at `parcel/0/<index>/write/0` rather than at any node the top
+/// level declares. `skip` is the reading that would be worst: the fan-out would
+/// record the item as absorbed and the run would carry on and **complete**, so a
+/// resume that succeeds here is the whole failure.
+#[test]
+fn a_divergence_inside_a_dispatched_subflow_is_not_absorbed_by_on_item_error() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(SONNET, Outcome::structured(json!({ "note": "one note" }))),
+        Script::new(SONNET, Outcome::structured(json!({ "note": "two note" }))),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "note": "wrapped" })).after(Duration::from_secs(120)),
+        ),
+    ]);
+
+    let Some((project, killed, environment, _shims)) =
+        crash_a_parceled_run(&provider, "resume-parceled")
+    else {
+        return;
+    };
+
+    let moved = harness::Scratch::new("parceled-prompt");
+    let entrypoint = moved.path().join("main.yml");
+    std::fs::write(&entrypoint, moved_prompt()).expect("the scratch area is writable");
+
+    provider.reset();
+    let resumed = harness::resume_entrypoint(
+        &project,
+        &entrypoint,
+        &killed.execution,
+        Some("json"),
+        &environment,
+    );
+    let said_on_stderr = resumed.failed();
+    let answered = resumed.outputs();
+    assert_eq!(answered["status"], "failed", "{answered}\n{said_on_stderr}");
+    let said = answered["error"].as_str().expect("an error");
+    assert!(
+        said.starts_with("ReplayDivergence: "),
+        "`on_item_error: skip` absorbs what an item did, not a journal that has \
+         stopped describing this run: {said}"
+    );
+    assert!(
+        said.contains("parcel/0/0/write/0"),
+        "…keyed by the dispatched instance's own path, two frames down \
+         (`docs/durability.md` §4): {said}"
+    );
+    assert_eq!(
+        provider.snapshot().requests,
+        0,
+        "a divergence re-executes nothing, at any depth"
+    );
+}
+
+/// The same divergence under the *other* item policy: `on_item_error: retry`.
+///
+/// The composition the resume is pointed at moves the prompt **and** the policy,
+/// which is legitimate — a resume replays a record against whatever composition
+/// it is given, and that is what makes a divergence a divergence. What the item
+/// retry must not do is retry: each attempt would claim the next ordinal at the
+/// item's site, so a ladder of three would walk three recorded effects forward
+/// and report a disagreement one step past the one that really happened — and
+/// the attempt that ran out of records would issue its model call **live**.
+#[test]
+fn a_divergence_inside_a_dispatched_item_is_not_retried_by_its_item_policy() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(SONNET, Outcome::structured(json!({ "note": "one note" }))),
+        Script::new(SONNET, Outcome::structured(json!({ "note": "two note" }))),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "note": "wrapped" })).after(Duration::from_secs(120)),
+        ),
+    ]);
+
+    let Some((project, killed, environment, _shims)) =
+        crash_a_parceled_run(&provider, "resume-parceled-retry")
+    else {
+        return;
+    };
+
+    let moved = harness::Scratch::new("parceled-retry");
+    let retried = moved_prompt().replace(
+        "        on_item_error: skip",
+        "        on_item_error:\n          retry: { max: 2, backoff: 1ms }",
+    );
+    assert!(
+        retried.contains("retry: { max: 2, backoff: 1ms }"),
+        "the item policy is the second thing this copy moves"
+    );
+    let entrypoint = moved.path().join("main.yml");
+    std::fs::write(&entrypoint, retried).expect("the scratch area is writable");
+
+    provider.reset();
+    let resumed = harness::resume_entrypoint(
+        &project,
+        &entrypoint,
+        &killed.execution,
+        Some("json"),
+        &environment,
+    );
+    let said_on_stderr = resumed.failed();
+    let answered = resumed.outputs();
+    assert_eq!(answered["status"], "failed", "{answered}\n{said_on_stderr}");
+    let said = answered["error"].as_str().expect("an error");
+    assert!(
+        said.contains("model effect #0"),
+        "the **first** disagreement is what is reported: a retried item would have \
+         walked the record forward and named a later one: {said}"
+    );
+    assert_eq!(
+        provider.snapshot().requests,
+        0,
+        "…and no attempt of that item ran out of records and asked the provider"
+    );
+}
+
+/// A divergence raised inside a **detached** delivery fails the resume, which is
+/// the one nesting depth with nobody to throw to.
+///
+/// `detach: true` is a `map`-route policy (grammar 8.6 rule 7) and resolved q29
+/// admits no policy at any depth, so the fire-and-forget `catch` that keeps a
+/// delivery from failing the flow instance may not keep this from failing the
+/// **execution**.
+///
+/// What the moved composition changes is the sink's `expect_exit:`, which is
+/// deliberate on a second count: a request identity is the binding **whole**
+/// (`docs/durability.md` §3.2), so a widened `expect_exit:` — which changes what
+/// an answer means without changing the command that produced it — has to be a
+/// divergence. An identity built from the command and its arguments alone would
+/// hand this run the answer recorded under the old binding and complete.
+#[test]
+fn a_divergence_in_a_detached_delivery_fails_the_resume_it_cannot_be_thrown_out_of() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(SONNET, Outcome::structured(json!({ "note": "one note" }))),
+        Script::new(SONNET, Outcome::structured(json!({ "note": "two note" }))),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "note": "wrapped" })).after(Duration::from_secs(120)),
+        ),
+    ]);
+
+    let Some((project, killed, environment, shims)) =
+        crash_a_parceled_run(&provider, "resume-detached")
+    else {
+        return;
+    };
+    let log = shims.path().join("receipt.log");
+    assert_eq!(
+        harness::lines_in(&log),
+        2,
+        "the first generation made both deliveries, so both are in the journal"
+    );
+
+    let moved = harness::Scratch::new("detached-binding");
+    let source = std::fs::read_to_string(harness::fixture("durability")).expect("the fixture");
+    let edited = source.replace("    expect_exit: [0]", "    expect_exit: [0, 1]");
+    assert_ne!(
+        edited, source,
+        "the sink's `expect_exit:` is what this copy moves"
+    );
+    let entrypoint = moved.path().join("main.yml");
+    std::fs::write(&entrypoint, edited).expect("the scratch area is writable");
+
+    provider.reset();
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "note": "wrapped" })),
+    ));
+    let resumed = harness::resume_entrypoint(
+        &project,
+        &entrypoint,
+        &killed.execution,
+        Some("json"),
+        &environment,
+    );
+    let said_on_stderr = resumed.failed();
+    let answered = resumed.outputs();
+    assert_eq!(answered["status"], "failed", "{answered}\n{said_on_stderr}");
+    let said = answered["error"].as_str().expect("an error");
+    assert!(
+        said.starts_with("ReplayDivergence: "),
+        "a delivery nothing waits for is still an effect the record describes: {said}"
+    );
+    assert!(
+        said.contains("receipt/0/"),
+        "…named by the dispatch that made it: {said}"
+    );
+    assert_eq!(
+        harness::lines_in(&log),
+        2,
+        "…and it delivered nothing: a divergence is raised before the effect"
+    );
+}
+
+/// A diverged resume leaves the execution **open** (`docs/durability.md` §7).
+///
+/// The composition is what disagreed, so putting it back is the whole repair —
+/// and it can only be a repair if the failed resume did not close the row. A
+/// `failed` row is refused by name, so recording a divergence as the execution's
+/// own outcome would make one moved prompt an unresumable execution for ever,
+/// and `serve` — which replays *every* open execution at start — would burn a
+/// project's whole backlog on a single deploy.
+#[test]
+fn a_diverged_resume_leaves_the_execution_open_for_the_composition_that_fits_it() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "note": "the first note" })),
+    ));
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "note": "the second note" })).after(Duration::from_secs(120)),
+    ));
+
+    let Some((project, built)) = harness::build_under_toolchain("durability", "resume-reopened")
+    else {
+        return;
+    };
+    assert!(
+        built.status.success(),
+        "the durability fixture did not build"
+    );
+
+    let environment = harness::environment(&provider);
+    let killed = harness::crash_run(
+        &project,
+        &["run", "flow.relay", "--input", "topic=durability"],
+        &environment,
+        |_| provider.snapshot().requests >= 2,
+    );
+
+    let moved = harness::Scratch::new("reopened");
+    let source = std::fs::read_to_string(harness::fixture("durability")).expect("the fixture");
+    let edited = source.replace(
+        "    You write one short note about the topic you are given, and nothing else.",
+        "    You write one long essay about the topic you are given, and nothing else.",
+    );
+    assert_ne!(edited, source, "the prompt line is the one being changed");
+    let entrypoint = moved.path().join("main.yml");
+    std::fs::write(&entrypoint, edited).expect("the scratch area is writable");
+
+    provider.reset();
+    harness::resume_entrypoint(
+        &project,
+        &entrypoint,
+        &killed.execution,
+        Some("json"),
+        &environment,
+    )
+    .failed();
+
+    // The composition comes back, and so does the execution: the record is
+    // untouched and the frontier is where it always was.
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "note": "the second note" })),
+    ));
+    let again = harness::resume(
+        &project,
+        "durability",
+        &killed.execution,
+        Some("json"),
+        &environment,
+    );
+    let said = again.stderr();
+    assert!(
+        !said.contains("has already failed"),
+        "a divergence is this build disagreeing with a record, not the execution \
+         failing — the row it closed is one nothing can reopen: {said}"
+    );
+    again.succeeded();
+    let answered = again.outputs();
+    assert_eq!(answered["status"], "completed", "{answered}");
+    assert_eq!(
+        answered["outputs"]["relayed"], "the first note",
+        "…and it replayed from the same record: {answered}"
+    );
+    assert_eq!(
+        provider.snapshot().requests,
+        1,
+        "the diverged resume issued nothing and the repaired one issued only the \
+         call the crash interrupted"
+    );
+}
+
+/// `flow.parceled`, run and killed while `wrap`'s model call is in flight.
+///
+/// Shared by the three tests above because setting it up is the expensive half:
+/// two dispatched subflow instances and two detached deliveries have to be
+/// **recorded** before the crash, or the resume would meet a frontier where the
+/// tests want a comparison. The predicate waits for both, and then for the
+/// journal to have caught up with the delivery whose line the shim has already
+/// written — a detached delivery is journaled when it answers, and nothing in
+/// the run is waiting for that moment.
+fn crash_a_parceled_run(
+    provider: &MockProvider,
+    purpose: &str,
+) -> Option<(
+    std::path::PathBuf,
+    harness::Killed,
+    Vec<(String, String)>,
+    harness::Scratch,
+)> {
+    let (project, built) = harness::build_under_toolchain("durability", purpose)?;
+    assert!(
+        built.status.success(),
+        "the durability fixture did not build:\n{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+
+    let shims = harness::Scratch::new(purpose);
+    let log = shims.path().join("receipt.log");
+    harness::shim(
+        shims.path(),
+        "receipt",
+        "printf 'filed\\n' >> \"$RECEIPT_LOG\"\nprintf 'filed'\n",
+    );
+    let mut environment = harness::environment(provider);
+    environment.push((
+        harness::RECEIPT_BIN.to_string(),
+        shims.path().display().to_string(),
+    ));
+    environment.push((harness::RECEIPT_LOG.to_string(), log.display().to_string()));
+
+    let settled = std::cell::Cell::new(0_u32);
+    let killed = harness::crash_run(
+        &project,
+        &[
+            "run",
+            "flow.parceled",
+            "--input",
+            "topic=durability",
+            "--input",
+            "topics=[\"one\",\"two\"]",
+        ],
+        &environment,
+        |_| {
+            let there = provider.snapshot().requests >= 3 && harness::lines_in(&log) >= 2;
+            settled.set(if there { settled.get() + 1 } else { 0 });
+            // Five consecutive polls, which is a tenth of a second after the last
+            // delivery wrote its line: long enough for the append that follows it,
+            // and bounded by `crash_run`'s own deadline either way.
+            settled.get() >= 5
+        },
+    );
+    Some((project, killed, environment, shims))
+}
+
+/// The `durability` fixture with the note-writing agent's prompt changed, which
+/// is how a composition moves under a journal in practice: one line of a prompt
+/// is part of every request the agent makes and so part of every recorded
+/// request identity.
+fn moved_prompt() -> String {
+    let source = std::fs::read_to_string(harness::fixture("durability")).expect("the fixture");
+    let edited = source.replace(
+        "    You write one short note about the topic you are given, and nothing else.",
+        "    You write one long essay about the topic you are given, and nothing else.",
+    );
+    assert_ne!(edited, source, "the prompt line is the one being changed");
+    edited
+}
+
 /// A structured-output request for one model, under one output-schema name.
 fn structured_request(model: &str, output: &str) -> Value {
     json!({

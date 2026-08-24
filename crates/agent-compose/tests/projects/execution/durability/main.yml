@@ -21,6 +21,21 @@
 #     nothing at all, so a resumed generation re-parks under the very wait id
 #     the first one published — the node's instance path, which no process
 #     generation is part of.
+#   * `flow.consulted` — an agent that reaches a **store read** and then answers
+#     from what it read. The read's row is `{value, found}` as `src/stores.ts`
+#     builds it and `{found, value}` as a journal holds it, and the loop puts
+#     that row verbatim into the next model call's turns — so this is the flow
+#     that decides whether a value a replay hands back is the value the
+#     recording generation went on with (`docs/durability.md` §11.1).
+#   * `flow.guarded` — a subprocess under **both** a `retry:` and an
+#     `on_error: skip`, ahead of a model call. Its `output:` is what a resumed
+#     composition tightens, which is resolved q29's second divergence — a
+#     recorded answer that fails the current contract — and the two policies are
+#     the two that must not absorb it.
+#   * `flow.parceled` — a `map` into a **subflow** and a second `map` that is
+#     **detached**, so one execution carries effects two instance frames down
+#     and one delivery nothing waits for. Between them they are every nesting
+#     depth q29 says a divergence may not be absorbed at.
 #
 # `flow.gate` carries an `http` trigger as well as its manual invocation,
 # because the `serve` half of recovery needs an execution a request started.
@@ -52,6 +67,12 @@ state:
     description: What the human answered.
     enum: [approve, reject]
     default: reject
+  notes:
+    description: One element per dispatched subflow instance, in source-item order.
+    type: array
+    max_items: 8
+    items: { type: string }
+    reduce: append
 
 provider.mock:
   kind: anthropic
@@ -70,6 +91,39 @@ store.ledger:
   description: What a run wrote down before it was interrupted.
   value_schema:
     entry:
+      type: string
+
+# The sink of the **detached** map below. It never reports back, so the only
+# account of a delivery is the line the shim appends to `$RECEIPT_LOG` — which
+# is what makes "a replay does not deliver it twice" an assertion.
+tool.receipt:
+  description: File one receipt for a topic that has been noted.
+  input:
+    line: { type: string }
+  output:
+    filed: { type: string }
+  # `expect_exit:` is spelled out rather than left at its default because it is
+  # one of the fields a request identity has to carry: it changes what an answer
+  # *means*, so a resume against a composition that widened it is a resume of a
+  # call this composition does not make (`docs/durability.md` §3.2).
+  exec:
+    command: "${RECEIPT_BIN}/receipt"
+    args: ["filed"]
+    expect_exit: [0]
+
+agent.consulting:
+  description: Answers about a topic after reading what a previous run wrote down.
+  model: model.smart
+  prompt: |
+    Read what was written down before you answer, and answer in one short note.
+  stores: [store.ledger]
+  input:
+    topic:
+      description: What to write a note about.
+      type: string
+  output:
+    note:
+      description: The note.
       type: string
 
 agent.noter:
@@ -197,6 +251,171 @@ flow.gate:
     - { from: start, to: ask }
     - { from: ask, to: sign_off }
     - { from: sign_off, to: end }
+
+flow.consulted:
+  description: Write something down, then answer about it having read it back.
+  inputs:
+    topic:
+      type: string
+      min_length: 1
+  outputs:
+    note:
+      type: string
+    final:
+      type: string
+  nodes:
+    remember:
+      store: store.ledger
+      op: set
+      key: "'entry'"
+      value:
+        entry: "input.topic"
+
+    # A model call, a **store read**, and two more model calls — which is the
+    # shape the ordering of a recorded value is observable in: the row the read
+    # answered goes into the next call's turns verbatim, so a generation that
+    # went on with a differently ordered copy of it makes a call its own journal
+    # does not hold (`docs/durability.md` §11.1).
+    ask:
+      agent: agent.consulting
+      input:
+        topic: "input.topic"
+      writes:
+        note: note
+
+    # The node the crash lands in, so that every one of `ask`'s calls is
+    # **recorded** rather than at the frontier: a request identity is only
+    # compared where the journal holds one.
+    relay:
+      agent: agent.noter
+      input:
+        topic: "state.note"
+      writes:
+        note: final
+
+  edges:
+    - { from: start, to: remember }
+    - { from: remember, to: ask }
+    - { from: ask, to: relay }
+    - { from: relay, to: end }
+
+flow.guarded:
+  description: A subprocess under a retry ladder and an error policy, then a model call.
+  inputs:
+    topic:
+      type: string
+      min_length: 1
+  outputs:
+    tally:
+      type: string
+    note:
+      type: string
+  nodes:
+    # The two policies resolved q29 says a divergence travels past. Either would
+    # otherwise turn "the recorded answer no longer fits this composition" into
+    # an ordinary node failure: the ladder would re-run the subprocess, and
+    # `skip` would carry the run past an effect the record claims to hold.
+    count:
+      exec:
+        command: "${TALLY_BIN}/tally"
+        output:
+          stdout: { type: string }
+      retry: { max: 2, backoff: 1ms }
+      on_error: skip
+      writes:
+        stdout: tally
+
+    ask:
+      agent: agent.noter
+      input:
+        topic: "input.topic"
+      writes:
+        note: note
+
+  edges:
+    - { from: start, to: count }
+    - { from: count, to: ask }
+    - { from: ask, to: end }
+
+flow.child:
+  description: One dispatched instance — the frame a nested effect key carries.
+  inputs:
+    topic:
+      type: string
+      min_length: 1
+  outputs:
+    note:
+      type: string
+  nodes:
+    write:
+      agent: agent.noter
+      input:
+        topic: "input.topic"
+      writes:
+        note: note
+  edges:
+    - { from: start, to: write }
+    - { from: write, to: end }
+
+flow.parceled:
+  description: Fan out into a subflow, deliver a detached receipt, then answer.
+  inputs:
+    topic:
+      type: string
+      min_length: 1
+    topics:
+      type: array
+      max_items: 4
+      items: { type: string }
+  outputs:
+    notes:
+      type: array
+      max_items: 8
+      items: { type: string }
+    note:
+      type: string
+  nodes:
+    # An effect two instance frames down: the dispatch's own path
+    # (`parcel/0/<index>`) and then the child instance's node inside it, which is
+    # the addressing `docs/durability.md` §4 makes normative and the only place a
+    # second scheme would show up.
+    parcel:
+      map:
+        over: input.topics
+        as: topic
+        node: flow.child
+        max_concurrency: 2
+        on_item_error: skip
+        input:
+          topic: "topic"
+        writes:
+          note: notes
+
+    # Fire and forget (grammar 8.6 rule 7): nothing waits for these, so the only
+    # account of a delivery is the shim's log — and the only thing that can carry
+    # a divergence out of one is the execution it belongs to.
+    receipt:
+      map:
+        over: input.topics
+        as: topic
+        node: tool.receipt
+        max_concurrency: 2
+        detach: true
+        input:
+          line: "topic"
+
+    wrap:
+      agent: agent.noter
+      input:
+        topic: "input.topic"
+      writes:
+        note: note
+
+  edges:
+    - { from: start, to: parcel }
+    - { from: parcel, to: receipt }
+    - { from: receipt, to: wrap }
+    - { from: wrap, to: end }
 
 triggers:
   gate:
