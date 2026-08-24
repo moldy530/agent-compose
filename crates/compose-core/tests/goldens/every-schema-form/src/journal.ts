@@ -82,14 +82,21 @@
 //
 // Across *processes* this release keeps the boundary `./stores.ts` keeps and
 // PRD 5.10 draws — `--target local` is one process, and **one process at a time
-// writes a project's journal**. That is a rule rather than a mechanism, and it
-// is stated as one because this driver cannot enforce it: `node-sqlite3-wasm`
-// runs SQLite over a virtual file system that implements no cross-process
-// locking at all, so two processes on one file do not queue behind each other —
-// they interleave, and each can read pages the other has not committed.
-// `busy_timeout` is still set, and the open is still retried under a deadline,
-// because both are free and both are what a build whose file system *does* lock
-// would need. Neither is a guarantee, and nothing here should be read as one.
+// writes a project's journal**. That stays a rule rather than a promise, but it
+// is not an unenforced one: `node-sqlite3-wasm` takes SQLite's exclusive lock by
+// creating `<file>.lock` as a directory and gives it back by removing it, so a
+// second process meets `SQLITE_BUSY` rather than interleaving into pages the
+// first has not committed. `busy_timeout` is set before any statement that can
+// contend, and the open is retried under a deadline for the statements the
+// pragma does not cover.
+//
+// What that lock does not do is die with its owner. A process killed **inside**
+// a write never reaches the `rmdir`, and the directory it leaves would refuse
+// every later open of that journal — the resume of the interrupted execution
+// and every future run of the project alike. So a lock still held after this
+// process has waited the deadline out is treated as the corpse it is under the
+// rule above, and removed ([`LOCK_DIRECTORY`]). The rollback journal the same
+// crash leaves is untouched: SQLite recovers it on the next open.
 //
 // So the two live surfaces are kept apart rather than serialized. `serve`
 // recovers every open execution at start, which means an execution a live
@@ -454,34 +461,72 @@ export function openJournal(): Promise<Journal> {
 }
 
 /**
- * How long the journal waits on a busy file, and how long the retry below keeps
- * trying for.
+ * How long the journal waits on a locked file, and how long the retry below
+ * keeps trying for.
  *
- * Both are **best effort**, and the module header says why: this driver's
- * virtual file system implements no cross-process locking, so on the builds this
- * compiler release ships there is no lock for `busy_timeout` to wait on and no
- * `SQLITE_BUSY` for the retry to catch. They are here because they cost a run
- * that meets no contention nothing, and because a driver that grows real locking
- * — or a backend that has it, which is what resolved q27's Postgres slot is —
- * finds them already asked for. One process at a time writes a project's
- * journal, and that stays a rule rather than a mechanism.
+ * There *is* something to wait on: this driver's virtual file system takes
+ * SQLite's exclusive lock by creating `<file>.lock` as a directory and gives it
+ * back by removing it, so a second process on one journal meets `SQLITE_BUSY`
+ * rather than interleaving into the same pages. `busy_timeout` is set first for
+ * that reason, and the retry beneath it covers the schema statements the pragma
+ * cannot.
+ *
+ * What that lock does **not** do is die with the process holding it — see
+ * [`LOCK_DIRECTORY`].
  */
 const LOCK_WAIT_MS = 5_000;
+
+/**
+ * The lock a killed writer leaves behind, and why breaking it is right.
+ *
+ * A `mkdir` lock is released by an `rmdir` that a process which dies inside its
+ * write never reaches. Nothing else ever removes it, so one interrupted write
+ * would leave a directory that refuses **every** later open of that journal:
+ * not just the resume of the execution the crash interrupted, but every future
+ * run of the project. A durability story whose one artifact a crash can render
+ * permanently unopenable is not one.
+ *
+ * So a lock that is still there after this process has waited [`LOCK_WAIT_MS`]
+ * for it is treated as a corpse and removed, and the open is tried once more.
+ * That is sound under exactly the rule this file already keeps (the module
+ * header, `docs/durability.md` §2): **one process at a time writes a project's
+ * journal**. A lock nobody gave back inside five seconds is, under that rule,
+ * a lock whose owner is gone — and every write here is a single statement, so a
+ * live owner never holds one for anything like that long.
+ *
+ * The hot rollback journal the same crash leaves is *not* touched: SQLite
+ * recovers it on the next open, which is what makes the interrupted write leave
+ * no half-written row (§2).
+ */
+const LOCK_DIRECTORY = ".lock";
+
+/** Remove a lock no live process is giving back. See [`LOCK_DIRECTORY`]. */
+function breakStaleLock(): boolean {
+  const lock = `${journalPath()}${LOCK_DIRECTORY}`;
+  if (!fs.existsSync(lock)) return false;
+  try {
+    fs.rmSync(lock, { recursive: true, force: true });
+    return true;
+  } catch {
+    // A lock this process cannot remove is one it cannot get past either; the
+    // open below fails with the driver's own message rather than with this.
+    return false;
+  }
+}
 
 /** The open handle, with the schema applied. */
 async function migrated(
   Database: SqliteModule["Database"],
 ): Promise<InstanceType<SqliteModule["Database"]>> {
   const deadline = Date.now() + LOCK_WAIT_MS;
+  let broke = false;
   let delay = 10;
   for (;;) {
     const database = new Database(journalPath());
     try {
-      // **First**, so that on a build whose file system does lock, every
-      // statement after it waits rather than failing. A `PRAGMA` that arrives
-      // after the contended statement is a setting nobody read — and on this
-      // driver it is a setting with nothing to wait on either way
-      // ([`LOCK_WAIT_MS`]).
+      // **First**, so that every statement after it waits on a locked file
+      // rather than failing at once. A `PRAGMA` that arrives after the contended
+      // statement is a setting nobody read.
       database.exec(`PRAGMA busy_timeout = ${LOCK_WAIT_MS};`);
       // What makes "committed" mean "on the disk" rather than "in the page
       // cache", which is the whole of what a journal is for.
@@ -496,12 +541,19 @@ async function migrated(
       // file needs (see the module header).
     } catch (error) {
       database.close();
-      if (Date.now() >= deadline) throw error;
+      if (Date.now() >= deadline) {
+        // The deadline is up. Either a lock is still held — in which case its
+        // owner is gone and it goes, once ([`LOCK_DIRECTORY`]) — or this is a
+        // failure waiting cannot fix, and it is the caller's.
+        if (broke || !breakStaleLock()) throw error;
+        broke = true;
+        continue;
+      }
       // Whatever refused the open, tried again under a deadline rather than
       // failed on at once: the schema statements are the widest window a journal
       // has, and the honest thing to do about a file that is momentarily busy is
       // to let this process in rather than to fail its run over a table that
-      // already exists. Best effort, for [`LOCK_WAIT_MS`]'s reason.
+      // already exists.
       await new Promise((resolve) => setTimeout(resolve, delay));
       delay = Math.min(delay * 2, 200);
     }
@@ -604,9 +656,20 @@ export class ReplayDivergence extends Error {
   readonly kind: EffectKind;
   readonly ordinal: number;
 
-  constructor(record: Pick<JournalRecord, "key" | "site" | "kind" | "ordinal">, detail: string) {
+  /**
+   * `lead` names *which* of the two the failure is, and defaults to the common
+   * one: the record and this build's composition disagree. The other reading —
+   * the record is this run's and the world it was recorded against is gone —
+   * passes its own, because a sentence saying the journal does not describe the
+   * run would send a reader to a composition that never moved.
+   */
+  constructor(
+    record: Pick<JournalRecord, "key" | "site" | "kind" | "ordinal">,
+    detail: string,
+    lead = "this execution's journal does not describe this run",
+  ) {
     super(
-      `this execution's journal does not describe this run at \`${record.site}\` ` +
+      `${lead} at \`${record.site}\` ` +
         `(${record.kind} effect #${record.ordinal}, key \`${record.key}\`): ${detail}`,
     );
     this.name = "ReplayDivergence";
@@ -706,6 +769,15 @@ export function recorderFor(execution: string, site: string): EffectRecorder | u
  */
 export interface EffectSlot {
   readonly key: string;
+  /**
+   * The three halves of [`key`], carried apart so a caller that has to *raise*
+   * something about this effect names it the way a record does. Together with
+   * `key` they are a `Pick<JournalRecord, …>`, which is what
+   * [`ReplayDivergence`] takes.
+   */
+  readonly site: string;
+  readonly kind: EffectKind;
+  readonly ordinal: number;
   readonly held: JournalOutcome | undefined;
   /**
    * Record what the live effect answered, and answer with the value the
@@ -808,7 +880,14 @@ export class EffectRecorder {
         // node that asked: it is decided where the answer is parsed, off this
         // note. See [`recordedAnswerOf`].
         if (held.kind === "value") {
-          noteReplayed(held.value, { execution: session.execution, key, site, kind, ordinal });
+          noteReplayed(held.value, {
+            execution: session.execution,
+            key,
+            site,
+            kind,
+            ordinal,
+            request: found.request,
+          });
         }
       }
       // The first key the journal does not hold is the frontier, and past it
@@ -834,6 +913,9 @@ export class EffectRecorder {
 
     return {
       key,
+      site,
+      kind,
+      ordinal,
       held,
       keep: (value) => {
         // Recorded **and returned** as the journal now holds it, so this
@@ -871,7 +953,10 @@ export class EffectRecorder {
  * `retry:` absorbs it, and the retry's second attempt claims an ordinal past the
  * frontier and re-issues the effect **live**.
  */
-type ReplayedFrom = Pick<JournalRecord, "execution" | "key" | "site" | "kind" | "ordinal">;
+type ReplayedFrom = Pick<
+  JournalRecord,
+  "execution" | "key" | "site" | "kind" | "ordinal" | "request"
+>;
 
 const replayed = new WeakMap<object, ReplayedFrom>();
 
@@ -894,13 +979,25 @@ function noteReplayed(value: unknown, record: ReplayedFrom): void {
  * that has not moved, because it failed it on the generation that recorded it
  * too — a flaky `exec:` under a `retry:` whose first attempt answered
  * off-contract and whose second did not. The journal says which happened. The
- * ordinal counts every effect of a kind ever issued at a site (§4), so the
- * record of the **next** one is exactly the attempt that ladder made: where the
- * journal holds it, this mismatch is one the composition already had and already
- * decided, the ladder does now what it did then, and its next attempt is a
- * replay rather than a live call. Where the journal holds nothing there, the
- * original never went round again — so this contract is one this build brought,
- * and re-running the effect under it is the re-execution q29 refuses.
+ * ordinal counts every effect of a kind ever issued at a site (§4), so if that
+ * ladder went round again the **next** record at this site is its second
+ * attempt — and what makes it that attempt rather than merely the next thing
+ * the site did is that a retry repeats the *identical request*. So the next
+ * record is compared by request identity, not merely counted: where it repeats
+ * this one, the mismatch is one the composition already had and already decided,
+ * the ladder does now what it did then, and its next attempt is a replay rather
+ * than a live call. Where the journal holds nothing there — or holds a
+ * *different* request, which is the site going on to its next effect rather than
+ * retrying this one — the original never went round again, so this contract is
+ * one this build brought, and re-running the effect under it is the
+ * re-execution q29 refuses.
+ *
+ * Counting alone was the earlier reading and it is wrong at every site that
+ * issues two or more effects of one kind: an agent whose loop calls `tool.alpha`
+ * and then `tool.beta` records `…#tool/0` and `…#tool/1`, and a tightened
+ * contract on *alpha* would find beta's record sitting where a second attempt
+ * would have been and report an ordinary mismatch — which a `retry:` absorbs,
+ * and whose second attempt walks past the frontier and issues both effects live.
  */
 export function recordedAnswerOf(value: unknown, detail: string): ReplayDivergence | undefined {
   if (value === null || typeof value !== "object") return undefined;
@@ -908,8 +1005,9 @@ export function recordedAnswerOf(value: unknown, detail: string): ReplayDivergen
   if (record === undefined) return undefined;
   const session = sessions.get(record.execution);
   if (session !== undefined) {
-    const next = `${record.site}#${record.kind}/${record.ordinal + 1}`;
-    if (session.journal.lookup(record.execution, next) !== undefined) return undefined;
+    const key = `${record.site}#${record.kind}/${record.ordinal + 1}`;
+    const next = session.journal.lookup(record.execution, key);
+    if (next !== undefined && next.request === record.request) return undefined;
   }
   return new ReplayDivergence(
     record,
@@ -993,9 +1091,23 @@ export async function journaled<T>(
   kind: EffectKind,
   request: unknown,
   perform: () => Promise<T>,
+  /**
+   * Called with the slot the moment it is claimed, before anything is answered
+   * and before the effect could be performed.
+   *
+   * For a caller that has to decide something from *whether the journal holds
+   * this effect* — `./stores.ts` is the one, and what it decides is whether a
+   * live op is about to read a store the recorded prefix filled in a process
+   * that is gone. It runs in the same synchronous step the ordinal was
+   * allocated in, so two branches of one execution cannot interleave between
+   * the claim and the decision. It may throw, and a throw here reaches the
+   * caller with the effect not performed and nothing written.
+   */
+  inspect?: (slot: EffectSlot) => void,
 ): Promise<T> {
   if (recorder === undefined) return await perform();
   const slot = recorder.claim(kind, request);
+  inspect?.(slot);
   if (slot.held !== undefined) {
     if (slot.held.kind === "error") throw replayedFailure(slot.held);
     return slot.held.value as T;
@@ -1004,6 +1116,13 @@ export async function journaled<T>(
   try {
     value = await perform();
   } catch (error) {
+    // A divergence is not an outcome: it is this build refusing to go on
+    // against a record it cannot honour, raised from *inside* an effect it did
+    // not perform — a nested one, in a flow-as-tool child or a subflow whose
+    // own seam is under this one. Recording it would put an error at a key the
+    // effect never reached, and a later resume would replay that error as the
+    // world's, absorbable by the very policies resolved q29 keeps it away from.
+    if (error instanceof ReplayDivergence) throw error;
     slot.fail(error);
     throw error;
   }
