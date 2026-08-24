@@ -12783,6 +12783,194 @@ fn a_recovered_execution_delivers_the_completion_webhook_its_caller_waits_for() 
     );
 }
 
+/// An answer that arrives **while a recovered execution is still on its way back
+/// to its pause** is told to send it again — not that there is nothing waiting.
+///
+/// Recovery does not wait for the replays it starts (`docs/durability.md` §6.1):
+/// the port is open while they are still catching up. So the `resume_url` a
+/// caller holds — the one the dead process published, and the one this one will
+/// publish again, because a wait id is the node's instance path and no process
+/// generation is part of it (resolved q28) — can be POSTed into that window. The
+/// board is empty at that instant, and both refusals that describes are
+/// sentences about a pause being **over**: "this execution is not waiting for a
+/// human answer" is what a settled one is refused with. A caller that reads
+/// either as final drops an answer nothing was wrong with, and the execution
+/// waits for ever.
+///
+/// `flow.held` makes the window a fact rather than a race. Its subprocess is
+/// killed with the first generation, so no record of it lands and the generation
+/// that recovers the execution has to run it **live** before it can re-park —
+/// and the shim runs until this test releases it. Nothing here is timed.
+#[test]
+fn a_recovered_execution_still_catching_up_tells_a_resume_to_send_it_again() {
+    let provider = MockProvider::start().expect("a loopback port");
+
+    let Some(project) = harness::scratch_project("serve-recovery-catchup") else {
+        return;
+    };
+    let shims = harness::Scratch::new("held");
+    let log = shims.path().join("tally.log");
+    // Released by the test, out of the same directory the log is in, so the two
+    // halves of the shim's behaviour need one env var between them.
+    let release = shims.path().join("tally.log.released");
+    harness::shim(
+        shims.path(),
+        "tally",
+        "printf 'ran\\n' >> \"$TALLY_LOG\"\n\
+         until [ -e \"$TALLY_LOG.released\" ]; do sleep 0.05; done\n\
+         printf 'tallied'\n",
+    );
+    let mut environment = harness::environment(&provider);
+    environment.push((
+        harness::TALLY_BIN.to_string(),
+        shims.path().display().to_string(),
+    ));
+    environment.push((harness::TALLY_LOG.to_string(), log.display().to_string()));
+
+    let execution;
+    {
+        let Some(first) = harness::serve_into(&project, "durability", &environment) else {
+            return;
+        };
+        let app = Client::new(&first.base_url).expect("a client for the generated app");
+        let started = app
+            .post_json("/held", &json!({ "topic": "durability" }))
+            .expect("the trigger's route answers");
+        assert_eq!(started.status, 202, "{}", started.text());
+        execution = started.json()["execution_id"]
+            .as_str()
+            .expect("an execution id")
+            .to_string();
+        // Waiting for the shim's own line is what makes "killed inside the
+        // effect" a fact rather than a sleep: the line is written before it
+        // starts waiting to be released.
+        wait_for_lines(&log, 1);
+        // Dropping it signals the whole process group, so the blocked subprocess
+        // goes with the app that spawned it and its record never lands.
+    }
+
+    let Some(second) = harness::serve_into(&project, "durability", &environment) else {
+        return;
+    };
+    let app = Client::new(&second.base_url).expect("a client for the generated app");
+    // Recovery ran in `onReady`, so this execution was on the board before the
+    // port opened — and its subprocess is running again, past the frontier,
+    // because the killed generation left no record of it (§2).
+    wait_for_lines(&log, 2);
+    let running: Value = app
+        .get(&format!("/executions/{execution}"))
+        .expect("the status route answers")
+        .json();
+    assert_eq!(
+        running["status"], "running",
+        "the recovered execution has not come back to its pause yet: {running}"
+    );
+
+    // The URL the process that died published for this pause, which is the one
+    // this process will publish for it — asserted below, rather than assumed.
+    let resume_url = format!("/executions/{execution}/resume?wait=sign_off%2F0");
+    let early = app
+        .post_json(&resume_url, &json!({ "decision": "approve" }))
+        .expect("the resume route answers");
+    assert_eq!(early.status, 409, "{}", early.text());
+    let refused = early.json();
+    assert_eq!(
+        refused["recovering"], true,
+        "a refusal of its own, which a client can decide on without reading a sentence: {refused}"
+    );
+    let sentence = refused["error"].as_str().expect("a refusal says why");
+    assert!(
+        sentence.contains("send it again"),
+        "…telling the caller the answer was not refused: {sentence}"
+    );
+    assert!(
+        !sentence.contains("holding no pause"),
+        "…rather than the sentence a pause that is over is refused with: {sentence}"
+    );
+
+    // The same window, addressed the other way. An execution holding one pause
+    // may be answered without naming it, and that is the refusal whose sentence
+    // says there is nothing waiting at all.
+    let unnamed = app
+        .post_json(
+            &format!("/executions/{execution}/resume"),
+            &json!({ "decision": "approve" }),
+        )
+        .expect("the resume route answers");
+    assert_eq!(unnamed.status, 409, "{}", unnamed.text());
+    let refused = unnamed.json();
+    assert_eq!(refused["recovering"], true, "{refused}");
+    assert!(
+        !refused["error"]
+            .as_str()
+            .expect("a refusal says why")
+            .contains("is not waiting for a human answer"),
+        "{refused}"
+    );
+
+    // Released: the live effect answers, and the execution re-parks under the
+    // wait id its composition fixes.
+    std::fs::write(&release, "").expect("the scratch area is writable");
+    let parked = harness::settled(&app, &execution);
+    assert_eq!(parked["status"], "interrupted", "{parked}");
+    let waiting = &parked["interrupts"].as_array().expect("the pauses")[0];
+    assert_eq!(waiting["wait_id"], "sign_off/0", "{waiting}");
+    assert_eq!(
+        waiting["resume_url"].as_str().expect("a resume url"),
+        resume_url,
+        "…which is the URL the refused answer was addressed to all along: {waiting}"
+    );
+
+    // …and the answer the caller was told to send again is taken.
+    let answered = app
+        .post_json(&resume_url, &json!({ "decision": "approve" }))
+        .expect("the resume route answers");
+    assert!(
+        answered.status == 200 || answered.status == 202,
+        "{}",
+        answered.text()
+    );
+    let finished = harness::settled(&app, &execution);
+    assert_eq!(finished["status"], "completed", "{finished}");
+    assert_eq!(
+        finished["outputs"],
+        json!({ "tally": "tallied", "decision": "approve" }),
+        "{finished}"
+    );
+    assert_eq!(
+        harness::lines_in(&log),
+        2,
+        "the subprocess ran once per generation: the killed one left no record of \
+         it, which is the one window a journal cannot close (§2)"
+    );
+}
+
+/// Poll until a shim's log holds `lines`, and say what it holds if it never
+/// does.
+///
+/// What a test **waits on** rather than what it counts afterwards: the shim of
+/// `flow.held` writes its line and then waits to be released, so one line is
+/// "the first generation is inside the effect" and two is "so is the generation
+/// that recovered it".
+fn wait_for_lines(log: &Path, lines: usize) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let held = harness::lines_in(log);
+        if held >= lines {
+            assert_eq!(
+                held, lines,
+                "the shim ran more times than this test expects"
+            );
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the shim's log never reached {lines} lines; it holds {held}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// `flow.parceled`, run and killed while `wrap`'s model call is in flight.
 ///
 /// Shared by the three tests above because setting it up is the expensive half:

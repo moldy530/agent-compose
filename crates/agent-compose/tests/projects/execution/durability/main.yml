@@ -68,6 +68,12 @@
 #     after them rather than a model call, which is the shape a delivery still in
 #     flight when the run stops is observable in: the run parks, the process
 #     ends, and a delivery with no record is one the resume makes again (§3.2).
+#   * `flow.held` — a **subprocess that has not been released** ahead of a
+#     pause. A generation killed inside it leaves an effect with no record, so
+#     the generation that recovers the execution has to run it live *before* it
+#     can re-park — which is the window a resume prepared against the dead
+#     process can arrive in, and the one `serve` does not hold the port for
+#     (`docs/durability.md` §6.1).
 #   * `flow.fanned` — a **detached** `map` whose sink calls a *model*, which
 #     `flow.parceled`'s subprocess sink cannot decide. A delivery runs with the
 #     node execution's collectors detached (Decision D94), so its record holds
@@ -562,6 +568,45 @@ flow.papered:
     - { from: sign_off, to: reread }
     - { from: reread, to: end }
 
+flow.held:
+  description: Run a subprocess nobody has released yet, then wait for a person.
+  inputs:
+    topic:
+      type: string
+      min_length: 1
+  outputs:
+    tally:
+      type: string
+    decision:
+      enum: [approve, reject]
+  nodes:
+    # The effect a generation is killed **inside**, so its record never lands and
+    # the generation that recovers the execution runs it again — §2's window,
+    # here on purpose. What it buys is time: the shim waits to be released, so
+    # the recovered execution is demonstrably not back at its pause while a
+    # resume for that pause is answered.
+    hold:
+      exec:
+        command: "${TALLY_BIN}/tally"
+        output:
+          stdout: { type: string }
+      writes:
+        stdout: tally
+
+    sign_off:
+      human:
+        input:
+          note: { type: string }
+        output:
+          decision: { enum: [approve, reject] }
+      input:
+        note: "input.topic"
+
+  edges:
+    - { from: start, to: hold }
+    - { from: hold, to: sign_off }
+    - { from: sign_off, to: end }
+
 flow.posted:
   description: Deliver detached receipts, then park at a pause nobody can answer.
   inputs:
@@ -857,6 +902,21 @@ triggers:
     flow: flow.gate
     method: POST
     path: /gate
+    respond: async
+    input:
+      topic: "payload.body.topic"
+
+  # The execution a restart has to bring back that cannot be back **at once**:
+  # its subprocess has no record, so the recovered generation runs it live before
+  # it reaches the pause. A trigger of its own because the window is only
+  # observable through `serve` — a `resume` is a caller who is already waiting
+  # for the run, while this is a caller who was handed a URL by a process that no
+  # longer exists.
+  held:
+    type: http
+    flow: flow.held
+    method: POST
+    path: /held
     respond: async
     input:
       topic: "payload.body.topic"

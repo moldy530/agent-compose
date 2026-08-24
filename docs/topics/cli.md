@@ -135,6 +135,10 @@ same wait id, so a `POST /executions/:id/resume` prepared against the process
 that died still finds its wait. Triggers are not re-fired — recovery replays the
 executions that exist.
 
+It does not wait for those replays, so an answer can arrive while one is still on
+its way back to its pause: that request is refused with `recovering: true` and
+told to send it again, rather than told there is nothing waiting for it.
+
 ## `docs`
 
 Bare, a topic index. With a topic, that topic's document — the curriculum an

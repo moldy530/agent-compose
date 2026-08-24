@@ -474,6 +474,13 @@ on:
   has to happen before the first request; finishing them is what the resume
   route is for.
 
+Because it does not wait, a resume can arrive while the replay is still on its
+way back to the wait. That request is refused with a refusal **of its own** — a
+`409` carrying `recovering: true` and a sentence that says to send it again —
+rather than with the one that means there is no pause here, which is what a
+*settled* wait is refused with and reads as final. The window closes the moment
+the execution holds a pause again, or its run ends without one.
+
 A replay that fails is recorded on that execution and reported by the status
 route, and recovery of one execution never stops the process from serving the
 others. A **divergence** (§7) is reported the same way and leaves the journal

@@ -96,6 +96,13 @@
 // answered — there is nothing to record about one — which is exactly what makes
 // re-parking the right thing to do with it (PRD resolved q28,
 // `docs/durability.md` §3.4, §6.1).
+//
+// **Replaying back to it takes as long as it takes**, and recovery does not wait
+// for that (§6.1). So a resume can arrive while the wait is still ahead of the
+// replay, and that request is refused with a refusal of its own — `recovering:
+// true`, and a sentence that says to send it again — rather than with the
+// sentence that means the pause is over. It is the one refusal on this route
+// about *when* a request arrived rather than about what it addressed.
 
 import process from "node:process";
 
@@ -103,7 +110,13 @@ import Fastify from "fastify";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import { type CompiledFlow, type FlowRun, flows, runFlow } from "./graph.ts";
-import { TRACE_VERSION, deliverHumanAnswer, humanWaits, openExecutions } from "./runtime.ts";
+import {
+  TRACE_VERSION,
+  deliverHumanAnswer,
+  humanWaits,
+  openExecutions,
+  watchHumanPauses,
+} from "./runtime.ts";
 import type * as runtime from "./runtime.ts";
 import { type HttpTrigger, httpTriggers } from "./triggers.ts";
 
@@ -126,6 +139,23 @@ interface Execution {
    * disagree, which a stored flag updated from two sides eventually would.
    */
   status: Exclude<ExecutionStatus, "interrupted">;
+  /**
+   * Whether this is an execution [`recover`] picked up that has **not yet come
+   * back to where its predecessor stopped**.
+   *
+   * `false` for every execution a request started, and for a recovered one from
+   * the moment it holds a pause again or its run ends — which is exactly as long
+   * as it is true that "the answer you are sending may still find its wait".
+   *
+   * What it is for is one sentence on the resume route. Recovery does not wait
+   * for the replays it starts (`docs/durability.md` §6.1), so an execution is on
+   * this map as `running` while it is still consuming its recorded prefix — and
+   * a `POST /executions/:id/resume` prepared against the process that died can
+   * land in that window. Held to the pauses the runtime publishes rather than
+   * asserted from the replay, for [`statusOf`]'s reason: the board is where a
+   * wait *is*, so a flag cleared from anywhere else could disagree with it.
+   */
+  recovering: boolean;
   outputs?: Record<string, unknown>;
   trace?: readonly runtime.TraceEntry[];
   error?: string;
@@ -245,6 +275,29 @@ export function createApp(): FastifyInstance {
         wait: outcome.wait.id,
         status: statusOf(execution),
         status_url: `/executions/${id}`,
+      });
+    }
+    // **A recovered execution that has not re-parked yet has refused nothing.**
+    // The two refusals below that mean "no such pause here" — there is none at
+    // all, or none under the id you named — are true of the board and false of
+    // the execution while a replay is still on its way back to the wait
+    // ([`Execution.recovering`], `docs/durability.md` §6.1). Both sentences read
+    // as final, and one of them is the very sentence a *settled* pause is
+    // refused with, so a client holding a `resume_url` the dead process handed
+    // out would drop an answer nothing was wrong with. It is told to send it
+    // again instead, and given a key to decide that on rather than a sentence to
+    // match: this is the one refusal on this route that is about *when* the
+    // request arrived.
+    if (
+      execution.recovering &&
+      (outcome.reason === "not-waiting" || outcome.reason === "no-such-wait")
+    ) {
+      return reply.code(409).send({
+        execution_id: id,
+        status: statusOf(execution),
+        ...(named === undefined ? {} : { wait: named }),
+        recovering: true,
+        error: `this execution is being recovered from the journal and has not come back to its pause yet, so this answer has not been refused: send it again`,
       });
     }
     return reply.code(outcome.reason === "mismatch" ? 400 : 409).send({
@@ -494,8 +547,29 @@ function resumeInto(
     flow: flow.address,
     trigger: row.trigger,
     status: "running",
+    // Until it is back where its predecessor stopped. See
+    // [`Execution.recovering`] for what turns on the window, and [`caughtUp`]
+    // for the two ways out of it.
+    recovering: true,
     settled: Promise.resolve(),
   };
+  // The replay has arrived: this execution is holding a pause again, or its run
+  // has ended without one. Either way an answer that misses now misses for a
+  // reason of its own, and the resume route stops saying "send it again".
+  //
+  // Watched rather than awaited, because recovery must not wait for the replays
+  // it starts (`docs/durability.md` §6.1) — the commonest execution it recovers
+  // is parked on a question nobody has answered, so awaiting one would be
+  // awaiting the person. The subscription is dropped at the same moment for the
+  // reason [`watchHumanPauses`] gives: a `serve` that has recovered many
+  // executions holds no listener per finished one.
+  function caughtUp(): void {
+    execution.recovering = false;
+    unwatch();
+  }
+  const unwatch = watchHumanPauses(row.id, () => {
+    if (humanWaits(row.id).length > 0) caughtUp();
+  });
   execution.settled = settling(
     execution,
     runFlow(flow.address, row.inputs, {
@@ -512,7 +586,7 @@ function resumeInto(
     // webhook would leave a caller who was handed a `202` with no signal at all
     // — the contract was push, so nobody is polling the status route.
     row.callback,
-  );
+  ).then(caughtUp);
   executions.set(row.id, execution);
   return execution;
 }
@@ -532,6 +606,10 @@ function register(
     flow: flow.address,
     trigger: trigger.name,
     status: "running",
+    // This request is the execution's first generation, so there is nothing for
+    // it to catch up to: a pause it has not reached yet is one nobody has been
+    // handed a `resume_url` for.
+    recovering: false,
     // Replaced immediately below. The record has to exist before the run does,
     // because the run's own handlers write into it.
     settled: Promise.resolve(),

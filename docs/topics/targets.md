@@ -153,7 +153,9 @@ agent-compose resume main.yml exec_9f1c8a3e-1b7d-4a20-9d61-1f0e8a2c4d55
 `serve` needs no such command: on start it recovers every execution the journal
 holds open, before it accepts a connection, and one parked on a `human` pause
 re-parks under the same wait id — so a resume request prepared against the
-process that died still finds its wait. Triggers are not re-fired.
+process that died still finds its wait. Triggers are not re-fired. It does not
+wait for the replays, so a request that arrives before one is back at its pause
+is refused with `recovering: true` and told to send it again.
 
 Which is also why `resume` is the verb for an execution **nothing is running**:
 one process at a time writes a project's journal, and a `serve` that is up has
