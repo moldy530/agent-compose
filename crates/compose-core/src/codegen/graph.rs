@@ -3494,7 +3494,7 @@ async function quiesceFlow(
   ceiling: number,
   sessionKey: string,
   executionId: string,
-  options: { readonly resumable?: boolean },
+  options: { readonly resumable?: boolean; readonly resume?: boolean },
 ): Promise<FlowRun> {
   // Opened before the graph is streamed, so a status route asked the instant
   // after `start` answered already has somewhere to read this run's pauses from
@@ -3519,15 +3519,38 @@ async function quiesceFlow(
   // execution wrote, with nothing comparing unequal to catch it
   // (`docs/durability.md` §5).
   const release = async (outcome: unknown): Promise<void> => {
-    const parked = runtime.staysOpen(executionId, outcome);
     runtime.releaseHumanWaits(executionId);
-    // And the deliveries nothing joined. A detached `map` delivery is journaled
-    // when it answers, so a generation that walks out from under one in flight
-    // leaves an effect with no record — which the generation that resumes this
-    // execution issues a second time (`docs/durability.md` §3.2). Only where
-    // there *is* going to be one: a run that ended waits for nothing, which is
-    // grammar 8.6 rule 7 read where it applies.
-    if (parked) await runtime.settleDetached(executionId);
+    // And the deliveries nothing joined, on the two ways out where one still in
+    // flight can change what this function has to decide.
+    //
+    // A detached `map` delivery is journaled when it answers, so a generation
+    // that walks out from under one in flight leaves an effect with no record —
+    // which the generation that resumes this execution issues a second time
+    // (`docs/durability.md` §3.2). That is the **parked** half, and for a run
+    // that ended it costs nothing, because nothing will resume it.
+    //
+    // The **resuming** half is about the answer itself. A delivery is the one
+    // place a `runtime.ReplayDivergence` has nothing to be thrown to, so it is
+    // latched against the execution (PRD resolved q29) — and a latch is exactly
+    // what makes `runtime.staysOpen` true. A delivery still working through its
+    // permits when the graph quiesced can latch one *after* a reading taken
+    // here, and a reading taken before that is a run closed `completed` over a
+    // delivery the record describes and nobody made, or a `scope: execution`
+    // blob partition removed under the very resume §5 promises it to. So a
+    // generation that is consuming a record waits for them: a divergence can
+    // arise on no other kind (a first generation has no record to disagree
+    // with), which is why this is not a wait every run pays.
+    //
+    // Grammar 8.6 rule 7 is untouched either way: the join returned at
+    // dispatch, the trace entry was written without it, and this is `runFlow`
+    // on its way out of a run that has already stopped advancing.
+    if (runtime.staysOpen(executionId, outcome) || options.resume === true) {
+      await runtime.settleDetached(executionId);
+    }
+    // Read **after** the deliveries have settled, so it is the answer the whole
+    // execution gives rather than the one it gave at the instant the graph
+    // quiesced.
+    const parked = runtime.staysOpen(executionId, outcome);
     stores.releaseExecution(executionId, parked);
   };
   // `runtime.quiesce` keeps the last state each superstep produced, which is

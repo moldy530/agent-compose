@@ -122,6 +122,13 @@ one for anything like that long. The **rollback journal** the same crash leaves
 is not touched: SQLite recovers it on the next open, which is what makes the
 interrupted write leave no half-written row.
 
+The project's **stores** are opened the same way, and for the same reason
+(`src/stores.ts`). They sit in the same directory, under the same driver and the
+same one-process rule, and one crash leaves locks on both — so a store that did
+not break a stale one would be a second artifact a single interrupted write can
+render permanently unopenable, and the first thing it would refuse is the live
+op a resume makes past its frontier (§5).
+
 The two live surfaces are therefore kept **apart** rather than serialized:
 
 * an execution a live `serve` is holding is one `serve` has already recovered
@@ -268,16 +275,28 @@ next effect any branch of the run reaches, or on the way out of `runFlow` for a
 run with none left.
 
 What no *flow instance* waits for is the delivery itself, which is rule 7. The
-**execution** waits once, and only where waiting buys the sentence above: on the
-way out of a run whose lifecycle row stays **open** (§3.6) — parked at a `human`
-pause, or stopped by a divergence — `runFlow` waits for the deliveries it
-dispatched to be recorded before it lets the run go. Such a run is one a resume
-replays, and a delivery still in flight when the process walks away is an effect
-with no row, which the resumed generation issues a second time. That is not §2's
-window and not a crash: `agent-compose run`'s exit `3` is a documented way to
-stop, so the repeat would be systematic rather than a race. A run that **ended**
-waits for nothing, because nothing will replay it — and a divergence raised in a
-delivery after that has no run left to fail, so it is written to stderr instead.
+**execution** waits on the way out, on the two occasions where a delivery still
+in flight changes what the run has to decide.
+
+The first is a run whose lifecycle row stays **open** (§3.6) — parked at a
+`human` pause, or stopped by a divergence. Such a run is one a resume replays,
+and a delivery still in flight when the process walks away is an effect with no
+row, which the resumed generation issues a second time. That is not §2's window
+and not a crash: `agent-compose run`'s exit `3` is a documented way to stop, so
+the repeat would be systematic rather than a race.
+
+The second is a **resumed** generation, whatever it ended as, and there the wait
+is about the outcome rather than the record. Whether the row stays open is
+decided by whether a divergence was raised, a delivery is the one place one can
+be raised with nothing to throw it to, and only a generation consuming a record
+can raise one at all — a first generation has nothing to disagree with. A
+reading taken while a delivery was still working would be a reading taken before
+the execution had an answer: the row closed `completed` over a delivery the
+record describes and nobody made, or the `scope: execution` partition of §5
+removed under the resume it was being kept for.
+
+A **first** generation that ended waits for nothing, because nothing will replay
+it — and a divergence cannot arise in one.
 
 ### 3.3 A store op
 
@@ -314,6 +333,12 @@ schema the delivery that recorded it was held to. An answer a narrowed `output:`
 no longer admits is §7's second divergence and is raised as one: no other reader
 would catch it — a human answer reaches no result parse — and the resume would
 otherwise end reporting a value the composition refuses.
+
+A settlement the journal **cannot record** fails the `human` node with the
+write's own error. The answer is not offered back to whoever gave it — the turn
+was spent, and a pause may not settle twice — and the run stops there rather
+than going on from a wait its own record does not hold, which is a wait the
+resume would put to the person a second time.
 
 An **unsettled** wait records nothing, and that is the whole of re-parking: a
 resumed execution reaching a wait the journal does not hold parks under the same
@@ -494,9 +519,15 @@ on:
   row (§3.5), because a caller who was handed a `202` and is waiting for a push
   is not polling the status route. *Finishes* is the word: the webhook fires on
   exactly the outcomes that **close the row**, so a replay that leaves the
-  execution open — a divergence (§7), a pause nobody can answer — pushes nothing
-  and the process that eventually closes the row is the one that delivers, once.
-  A caller is told an execution failed only where the run really ended;
+  execution open — a divergence (§7), a pause nobody can answer, a start that
+  refused the recorded invocation before it opened anything — pushes nothing and
+  the process that eventually closes the row is the one that delivers, once. It
+  is decided by **reading the row**, not by classifying the error: a recovery
+  can fail before the execution is opened at all — inputs this build's `inputs:`
+  no longer accepts, a `session_key:` it has since started requiring, a journal
+  written by another compiler release (§11) — and every one of those leaves the
+  row open while looking like an ordinary failure. A caller is told an execution
+  failed only where the run really ended;
 * recovery **does not wait** for the replays to finish. The executions it
   recovers are by definition ones that were still running, and the commonest of
   them is parked on a question nobody has answered yet. Registering them is what

@@ -17,6 +17,7 @@
 // Usage: node store-backends.mjs <generated project directory> <data directory>
 // Output: one JSON object of everything the gate asserts about.
 
+import fs from "node:fs";
 import { pathToFileURL } from "node:url";
 import path from "node:path";
 import process from "node:process";
@@ -282,6 +283,35 @@ const answer = {};
   );
   // A key that percent-encodes to nothing a path can climb out of.
   answer.blobEncoded = stores.encodeKey("../escape me");
+}
+
+// --- The lock a killed writer left behind ------------------------------------
+
+// This driver's virtual file system takes SQLite's lock by creating
+// `<file>.lock` as a **directory** and gives it back by removing it, so a `run`
+// killed inside a store write never gives it back and nothing else ever will.
+// Left standing it refuses every later open of that store — not only the resume
+// of the execution the crash interrupted, whose live ops past the frontier are
+// promised the world the recorded prefix left behind (`docs/durability.md` §5),
+// but every future run of the project. `./journal.ts` breaks such a lock for the
+// other file in this directory; a store that did not would be a second artifact
+// one crash can permanently seal.
+//
+// The lock is planted rather than raced for, for the reason the journal's own
+// test plants one: the window a real crash has to land in is one statement wide.
+
+{
+  const store = binding("sealed", "kv", "global");
+  const run = context("exec_sealed");
+  const file = path.join(data, "stores", `${stores.encodeKey("sealed")}.sqlite`);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.mkdirSync(`${file}.lock`, { recursive: true });
+
+  answer.sealedWrite = await refusal(() =>
+    stores.runStoreOp(store, "set", { key: "a", value: { theme: "dark" } }, run, node("s/1")),
+  );
+  answer.sealedRead = await stores.runStoreOp(store, "get", { key: "a" }, run, node());
+  answer.sealedLockGone = !fs.existsSync(`${file}.lock`);
 }
 
 // --- A backend this compiler release does not implement ----------------------

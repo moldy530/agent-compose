@@ -392,19 +392,23 @@ the ability to resume the executions it holds open.
 
 **Run one of these at a time against one project.** The local backends are the
 zero-infra ones: `kv` and `vector` are a SQLite database opened through a
-WebAssembly build over `node:fs`, which has no cross-process locking, so two
-`agent-compose run`s sharing a `session` or `global` store race for it and the
-loser fails the node with `SQLite3Error: database is locked`. It fails loudly
-rather than corrupting anything, and a `serve` process — which runs its
-executions in **one** process — is not affected. Concurrency across processes
-arrives with the production `storage_backends:` of a later milestone; until then
-`--target local` means one process, which is the same boundary the target draws
-everywhere else.
+WebAssembly build over `node:fs`, whose locking is a directory beside the file
+rather than the operating system's — so two `agent-compose run`s sharing a
+`session` or `global` store contend for it, and the loser waits and then fails
+the node with `SQLite3Error: database is locked`. It fails loudly rather than
+corrupting anything, and a `serve` process — which runs its executions in **one**
+process — is not affected. Concurrency across processes arrives with the
+production `storage_backends:` of a later milestone; until then `--target local`
+means one process, which is the same boundary the target draws everywhere else.
 
-The journal makes one concession to that, because it is the artifact a second
-process legitimately arrives at: **opening** it waits for a lock rather than
-failing on one, so an `agent-compose resume` typed beside a live `serve` gets in.
-Two processes *running* against one project is still the case above.
+**Opening** is the concession to that, and both artifacts make it: the journal
+and the stores wait for a lock rather than failing on one, so an
+`agent-compose resume` typed beside a live `serve` gets in. Waiting is also what
+makes a **crash** survivable here. That lock directory does not die with the
+process holding it, so a run killed mid-write leaves one nothing else would ever
+remove — and left standing it would refuse every later open of that file, for
+ever. So a lock still there after the wait is treated as its dead owner's and
+removed. Two processes *running* against one project is still the case above.
 
 **Nothing here is pruned.** A store keeps what was written to it until you
 delete the file, and that includes the idempotency ledger a keyed write leaves
