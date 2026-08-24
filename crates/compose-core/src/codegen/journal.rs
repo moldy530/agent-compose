@@ -189,9 +189,10 @@ mod tests {
     ///
     /// So this reads it from the bottom up instead, off the **primitives**
     /// rather than off the seams: every `fetch`, every `spawn`, every
-    /// filesystem call and every SQLite statement in the two emitted modules
-    /// has to sit in a function the six can reach. `runGrpc` fails here on the
-    /// first line of its body.
+    /// filesystem call and every SQLite statement in **every** emitted constant
+    /// module has to sit somewhere the six can reach, or be named below as
+    /// something that is not an effect the graph issues. `runGrpc` fails here on
+    /// the first line of its body.
     ///
     /// Reachability is transitive because the seams are thin: `runExec` calls
     /// `runExecLive`, which calls `spawn`; `runStoreOp` calls `perform`, which
@@ -199,6 +200,17 @@ mod tests {
     /// `runtime.callEmbeddings` — `send`, which is where a `vector` store's
     /// network call lives. Following the calls is what keeps the rule honest
     /// without pinning the shape of the code beneath each seam.
+    ///
+    /// **Every module and every declaration form**, because a blind spot in
+    /// either is a place an unjournaled call can sit while this test answers
+    /// green. `src/serve.ts` really holds one — the completion webhook — and a
+    /// reading that took only `src/runtime.ts` and `src/stores.ts` could not see
+    /// it; a reading that took only top-level `function` declarations could not
+    /// see a `class HttpPool { async send() { await fetch(…) } }` or a
+    /// `const runGrpc = async () => …` in the two modules it did read. So the
+    /// file is **partitioned** by its column-zero declarations, whatever their
+    /// keyword, and every primitive is attributed to the declaration it sits
+    /// under.
     #[test]
     fn nothing_in_the_emitted_runtime_calls_the_world_except_under_a_journaled_seam() {
         // The primitives. Each one *is* the effect — the moment a process
@@ -220,15 +232,44 @@ mod tests {
             "database.exec(",
         ];
 
-        // The one site that is not an effect the graph issues, and so is not
-        // one a replay may perform twice: `releaseExecution` is grammar 11.1's
-        // `scope: execution` lifetime, run by `runFlow` when a run ends. It
-        // removes what the run owned; running it twice removes it twice.
-        const NOT_AN_EFFECT: [&str; 1] = ["releaseExecution"];
+        // What calls the world and is **not** an effect the graph issues, so is
+        // not one a replay may perform twice. Each is named with its module,
+        // because the same name in another module would be a different decision:
+        //
+        //  * `releaseExecution` — grammar 11.1's `scope: execution` lifetime,
+        //    run by `runFlow` when a run ends. It removes what the run owned;
+        //    running it twice removes it twice.
+        //  * `notify` — the completion webhook of an `async` `http` trigger
+        //    (grammar 13.3). It reports an execution that has already ended, and
+        //    a row is closed before it fires, so no replay ever reaches it: the
+        //    process that finishes a run is the one that calls it, once
+        //    (`docs/durability.md` §6.1).
+        //  * `writeTrace` — the run's own trace document, written by the command
+        //    after the run (`docs/trace.md`). A resumed generation writes a fresh
+        //    whole one, which is §9's promise rather than a repeat.
+        //  * the journal's **own** storage: `SqliteJournal`, the open path that
+        //    creates and migrates the file, the lock a killed writer leaves
+        //    behind (§2), and `journalExists`. These are the record itself. A
+        //    replay that "re-executed" them would be a replay reading its own
+        //    journal, which is what a replay *is*.
+        const NOT_AN_EFFECT: [(&str, &str); 8] = [
+            ("src/stores.ts", "releaseExecution"),
+            ("src/serve.ts", "notify"),
+            ("src/cli.ts", "writeTrace"),
+            ("src/journal.ts", "SqliteJournal"),
+            ("src/journal.ts", "openJournal"),
+            ("src/journal.ts", "breakStaleLock"),
+            ("src/journal.ts", "migrated"),
+            ("src/journal.ts", "journalExists"),
+        ];
 
         let modules = [
             ("src/runtime.ts", include_str!("js/runtime.ts")),
             ("src/stores.ts", include_str!("js/stores.ts")),
+            ("src/journal.ts", include_str!("js/journal.ts")),
+            ("src/serve.ts", include_str!("js/serve.ts")),
+            ("src/cli.ts", include_str!("js/cli.ts")),
+            ("src/cel.ts", include_str!("js/cel.ts")),
         ];
         let declared: Vec<(&str, String, String)> = modules
             .iter()
@@ -242,7 +283,7 @@ mod tests {
         for seam in SEAMS {
             assert!(
                 declared.iter().any(|(_, name, _)| name == seam),
-                "`{seam}` is not declared in either emitted module, so this test is reading \
+                "`{seam}` is declared in none of the emitted modules, so this test is reading \
                  an inventory that has moved"
             );
         }
@@ -268,14 +309,14 @@ mod tests {
             }
         }
 
-        let mut exempted: BTreeSet<&str> = BTreeSet::new();
+        let mut exempted: BTreeSet<(&str, &str)> = BTreeSet::new();
         for (module, name, body) in &declared {
             for primitive in PRIMITIVES {
                 if !body.contains(primitive) {
                     continue;
                 }
-                if NOT_AN_EFFECT.contains(&name.as_str()) {
-                    exempted.insert(name.as_str());
+                if NOT_AN_EFFECT.contains(&(module, name.as_str())) {
+                    exempted.insert((module, name.as_str()));
                     continue;
                 }
                 assert!(
@@ -290,7 +331,9 @@ mod tests {
         }
         assert_eq!(
             exempted,
-            NOT_AN_EFFECT.into_iter().collect::<BTreeSet<&str>>(),
+            NOT_AN_EFFECT
+                .into_iter()
+                .collect::<BTreeSet<(&str, &str)>>(),
             "an exemption nothing uses is one nobody is checking: drop it"
         );
     }
@@ -320,47 +363,72 @@ mod tests {
         false
     }
 
-    /// Every top-level function of an emitted module, by name and body.
+    /// What the lines before an emitted module's first declaration are called.
     ///
-    /// The same line scan [`function_body`] does, widened to every declaration
-    /// form the two modules use and to all of them at once. Both are formatted,
-    /// so a top-level declaration opens at column zero and closes on a line that
-    /// is exactly `}`.
+    /// A primitive there is a module that calls the world **as it loads**, which
+    /// no seam could reach and no exemption should quietly cover, so it is named
+    /// rather than skipped.
+    const MODULE_SCOPE: &str = "<module scope>";
+
+    /// Every top-level declaration of an emitted module, by name and body.
+    ///
+    /// A **partition** rather than a brace match, and that is the point: each
+    /// line at column zero that declares a name opens a region and the region
+    /// runs to the next one, so a `class`, a `const … = async () =>` and a
+    /// `function` are all read the same way and none of them can hide a call to
+    /// the world by being the wrong shape. Matching a closing brace would have to
+    /// know each form's, which is the reading that missed a class method.
+    ///
+    /// **Comment lines are dropped**, because both things this body is read for
+    /// are about code: a primitive named in prose is not a call, and a function
+    /// named in prose is not an edge in the reachability walk.
     fn declarations(source: &str) -> Vec<(String, String)> {
-        let mut found = Vec::new();
-        let mut lines = source.lines().peekable();
-        while let Some(line) = lines.next() {
-            let Some(name) = declared_name(line) else {
-                continue;
-            };
-            let mut body = String::from(line);
-            for line in lines.by_ref() {
-                body.push('\n');
-                body.push_str(line);
-                if line == "}" {
-                    break;
-                }
+        let mut found: Vec<(String, String)> = Vec::new();
+        let mut name = String::from(MODULE_SCOPE);
+        let mut body = String::new();
+        for line in source.lines() {
+            if let Some(opened) = declared_name(line) {
+                found.push((
+                    std::mem::replace(&mut name, opened),
+                    std::mem::take(&mut body),
+                ));
             }
-            found.push((name, body));
+            if is_comment(line) {
+                continue;
+            }
+            body.push_str(line);
+            body.push('\n');
         }
+        found.push((name, body));
         found
     }
 
-    /// The name a top-level `function` declaration line opens, if it is one.
+    /// Whether this line is comment or documentation rather than code.
+    fn is_comment(line: &str) -> bool {
+        let trimmed = line.trim_start();
+        trimmed.starts_with("//") || trimmed.starts_with('*') || trimmed.starts_with("/*")
+    }
+
+    /// The name a column-zero declaration line opens, if it is one.
+    ///
+    /// Every keyword an emitted module declares something callable under, which
+    /// is what makes the partition above cover a `class` and an arrow-function
+    /// `const` as well as a `function`. A `type`, an `interface` and an `import`
+    /// declare nothing that can call the world, so they open no region and their
+    /// lines stay with the declaration above them.
     fn declared_name(line: &str) -> Option<String> {
-        let rest = line
-            .strip_prefix("export async function ")
-            .or_else(|| line.strip_prefix("export function "))
-            .or_else(|| line.strip_prefix("async function "))
-            .or_else(|| line.strip_prefix("function "))?;
+        let rest = line.strip_prefix("export ").unwrap_or(line);
+        let rest = rest.strip_prefix("async ").unwrap_or(rest);
+        let rest = ["function ", "class ", "const ", "let ", "var "]
+            .into_iter()
+            .find_map(|keyword| rest.strip_prefix(keyword))?;
         let name: String = rest
             .chars()
-            .take_while(|character| character.is_alphanumeric() || *character == '_')
+            .take_while(|character| {
+                character.is_alphanumeric() || *character == '_' || *character == '$'
+            })
             .collect();
-        // A generic (`transact<T>(`) and a plain one (`open(`) both count; a
-        // line that only *mentions* the word does not.
-        let after = &rest[name.len()..];
-        if name.is_empty() || !(after.starts_with('(') || after.starts_with('<')) {
+        if name.is_empty() {
             return None;
         }
         Some(name)
