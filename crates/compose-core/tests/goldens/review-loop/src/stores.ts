@@ -98,6 +98,15 @@
 //   the difference between a transactional store and a filesystem, and it is
 //   written down here rather than promised away.
 //
+// A store a **resumed** execution reads across the frontier therefore has to be
+// one that outlives the run. `scope: session` and `scope: global` are files on
+// disk and are exactly the world the recorded prefix left behind; a
+// `scope: execution` `kv`/`vector` store and anything a target bound to
+// `provider: memory` are not — their rows died with the process, and a replayed
+// write is not applied a second time, so a live read past the frontier would
+// answer out of an empty database. That is refused rather than answered, by
+// [`inProcessState`], and `docs/durability.md` §5 is normative for it.
+//
 // A store write an **agent** made through a synthesized tool (grammar 11.5)
 // carries no key and is not deduped. Grammar 9.4 names exactly two carriers — "a
 // detached `map` dispatch (§8.6 rule 7) and a store write (§11.4)" — and §11.4 is
@@ -139,7 +148,8 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
-import { dataRoot, journaled } from "./journal.ts";
+import { ReplayDivergence, dataRoot, journaled } from "./journal.ts";
+import type { EffectSlot } from "./journal.ts";
 import * as runtime from "./runtime.ts";
 import type { EmbedBinding, RunContext, StoreRecord } from "./runtime.ts";
 
@@ -367,8 +377,18 @@ function sqlite(): Promise<SqliteModule> {
  */
 const DATABASES = new Map<string, Promise<Database>>();
 
-/** What an execution has opened, so [`releaseExecution`] can let it go. */
-const PER_EXECUTION = new Map<string, Set<string>>();
+/**
+ * What an execution owns, so [`releaseExecution`] can let it go.
+ *
+ * Two sets rather than one, because the two are released differently — a
+ * database handle is closed, a directory of blobs is removed — and a single set
+ * would have to guess which a string was. `databases` holds [`handleKey`]s,
+ * `directories` holds absolute paths.
+ */
+const PER_EXECUTION = new Map<
+  string,
+  { readonly databases: Set<string>; readonly directories: Set<string> }
+>();
 
 /** Which database a store's op addresses. */
 function handleKey(store: StoreBinding, execution: runtime.ExecutionIdentity): string {
@@ -424,18 +444,38 @@ function open(store: StoreBinding, execution: runtime.ExecutionIdentity): Promis
   void opening.catch(() => {
     if (DATABASES.get(cacheKey) === opening) DATABASES.delete(cacheKey);
   });
-  if (store.scope === "execution") remember(execution.id, cacheKey);
   return opening;
 }
 
-/** Note a resource this execution owns, so its end can release it. */
-function remember(execution: string, resource: string): void {
-  let held = PER_EXECUTION.get(execution);
+/**
+ * Note the resources one op's store makes this execution the owner of, so its
+ * end can release them (grammar 11.1's `scope: execution` — "dies with the
+ * run").
+ *
+ * Called from [`runStoreOp`] and **outside** the journaled seam, off
+ * `store.scope` alone, because inside it this is a registration a replay never
+ * performs: a resumed generation whose `put` is answered out of the journal
+ * never enters [`blobOp`], so an ownership noted there would be noted by the
+ * crashed generation and by nothing afterwards — and the run that *did* end
+ * would leave the partition on disk for ever. It costs an op that owns nothing
+ * two comparisons, and an op that does two set insertions.
+ */
+function remember(
+  store: StoreBinding,
+  execution: runtime.ExecutionIdentity,
+  scopeKey: string,
+): void {
+  if (store.scope !== "execution") return;
+  let held = PER_EXECUTION.get(execution.id);
   if (held === undefined) {
-    held = new Set();
-    PER_EXECUTION.set(execution, held);
+    held = { databases: new Set(), directories: new Set() };
+    PER_EXECUTION.set(execution.id, held);
   }
-  held.add(resource);
+  if (store.kind === "blob") {
+    held.directories.add(blobRoot(store, scopeKey));
+    return;
+  }
+  held.databases.add(handleKey(store, execution));
 }
 
 /**
@@ -447,33 +487,35 @@ function remember(execution: string, resource: string): void {
  * lifetime grammar 11.1 declares.
  */
 export function releaseExecution(id: string): void {
+  IN_PROCESS_ONLY.delete(id);
   const held = PER_EXECUTION.get(id);
   if (held === undefined) return;
   PER_EXECUTION.delete(id);
-  for (const resource of held) {
+  for (const resource of held.databases) {
     const database = DATABASES.get(resource);
-    if (database !== undefined) {
-      DATABASES.delete(resource);
-      // The handle is behind a promise (see [`DATABASES`]), so the close is
-      // scheduled rather than performed: an op still in flight when the run
-      // ended is the one case, and letting it finish beats closing the file
-      // underneath it. Both rejections are swallowed — an open that failed has
-      // nothing to close, and a close that failed released it anyway.
-      void database.then(
-        (held) => {
-          try {
-            held.close();
-          } catch {
-            // A database that is already closed is one that is already released.
-          }
-        },
-        () => {},
-      );
-      continue;
-    }
-    // Anything else this execution owned is a directory of blobs.
+    // Absent where the ownership was noted at an op the journal answered, so
+    // nothing was ever opened ([`remember`]): there is no handle to close.
+    if (database === undefined) continue;
+    DATABASES.delete(resource);
+    // The handle is behind a promise (see [`DATABASES`]), so the close is
+    // scheduled rather than performed: an op still in flight when the run
+    // ended is the one case, and letting it finish beats closing the file
+    // underneath it. Both rejections are swallowed — an open that failed has
+    // nothing to close, and a close that failed released it anyway.
+    void database.then(
+      (open) => {
+        try {
+          open.close();
+        } catch {
+          // A database that is already closed is one that is already released.
+        }
+      },
+      () => {},
+    );
+  }
+  for (const directory of held.directories) {
     try {
-      fs.rmSync(resource, { recursive: true, force: true });
+      fs.rmSync(directory, { recursive: true, force: true });
     } catch {
       // Best effort: a temporary directory that outlives the process is a
       // nuisance, and failing a completed run over one would be worse.
@@ -531,6 +573,10 @@ export async function runStoreOp(
   // leaves nothing for the next one to trip over.
   const idempotencyKey = writes(op) ? site.idempotencyKey : undefined;
 
+  // What `scope: execution` makes this run the owner of, noted **outside** the
+  // seam below because a replayed op never enters it (see [`remember`]).
+  remember(store, execution, scopeKey);
+
   // Both halves of PRD 5.8's replay discipline go through the journal, and this
   // is where "replay consumes history, not the live store" stops being a
   // description of the trace and becomes the mechanism: a replayed **read**
@@ -543,6 +589,7 @@ export async function runStoreOp(
     "store",
     { store: store.address, op, scope: store.scope, partition: scopeKey, via: site.via, params },
     () => perform(store, op, params, scopeKey, execution, idempotencyKey, context.signal),
+    (slot) => inProcessState(store, op, execution, slot),
   );
   record(context, {
     store: store.address,
@@ -555,6 +602,84 @@ export async function runStoreOp(
     ...(idempotencyKey === undefined ? {} : { idempotencyKey, deduped: answer.deduped }),
   });
   return answer.row;
+}
+
+// ---------------------------------------------------------------------------
+// A store the frontier cannot reach back into
+// ---------------------------------------------------------------------------
+
+/**
+ * Whether this store's data lives **only in the process that opened it**.
+ *
+ * Exactly [`open`]'s `:memory:` arm: a `scope: execution` `kv`/`vector` store,
+ * and any store a target bound to `provider: memory`. A `blob` store is a
+ * directory either way, so its data outlives the process that wrote it even at
+ * `scope: execution` — which is what [`releaseExecution`] removes, and what a
+ * resumed generation now removes on its way out ([`remember`]).
+ */
+function inProcessOnly(store: StoreBinding): boolean {
+  if (store.kind === "blob") return false;
+  return store.scope === "execution" || store.backend.provider === "memory";
+}
+
+/**
+ * Per execution, the in-process stores whose recorded prefix **wrote** to them.
+ *
+ * Emptied by [`releaseExecution`] with everything else the execution owned.
+ */
+const IN_PROCESS_ONLY = new Map<string, Set<string>>();
+
+/**
+ * Refuse a live op on a store whose contents died with the generation that
+ * filled it (`docs/durability.md` §5).
+ *
+ * The frontier model says a live effect past it acts on the same world the
+ * recorded prefix left behind, and for a network, a filesystem or a store on
+ * disk it does. For a store that lives in the process it does not: the prefix's
+ * writes are answered out of the journal and so are **never re-applied**, and
+ * the resumed process holds a database that was created empty a moment ago. The
+ * first live read then answers `found: false` about something the execution
+ * wrote, routes down a branch the original would never have taken, and reports
+ * `completed`. Nothing compares unequal, so §7's two divergences see nothing.
+ *
+ * So this is the third, and it is decided here because here is the only place
+ * both facts are known: that the prefix wrote to this store (a replayed write,
+ * noted below), and that this op is past the frontier (`slot.held` is
+ * `undefined`). It is a [`ReplayDivergence`] because it has to travel exactly
+ * where one travels — past `retry:`, `on_error:`, `on_item_error:` and
+ * `detach:`, and without closing the execution's row — and it carries its own
+ * opening clause, because the composition is not what disagreed.
+ */
+function inProcessState(
+  store: StoreBinding,
+  op: StoreOp,
+  execution: runtime.ExecutionIdentity,
+  slot: EffectSlot,
+): void {
+  if (!inProcessOnly(store)) return;
+  if (slot.held !== undefined) {
+    // Replayed. A write in the prefix is what makes the store's contents
+    // unreconstructable; a read is not — it answered out of a store this
+    // generation's copy matches, empty for empty.
+    if (!writes(op)) return;
+    let held = IN_PROCESS_ONLY.get(execution.id);
+    if (held === undefined) {
+      held = new Set();
+      IN_PROCESS_ONLY.set(execution.id, held);
+    }
+    held.add(store.address);
+    return;
+  }
+  if (IN_PROCESS_ONLY.get(execution.id)?.has(store.address) !== true) return;
+  const lifetime =
+    store.backend.provider === "memory"
+      ? `\`provider: memory\` (${store.backend.from})`
+      : `\`scope: execution\``;
+  throw new ReplayDivergence(
+    slot,
+    `this execution's record holds a write to \`${store.address}\`, which is ${lifetime} — its rows live only in the process that opened it. That process is gone, and a replayed write is not applied a second time, so this op would answer out of an empty store rather than out of the world the record left behind. A store a resumed execution reads past the frontier has to outlive the run: \`scope: session\` or \`scope: global\` (\`docs/durability.md\` §5)`,
+    "this execution's record cannot be replayed",
+  );
 }
 
 /** One op's answer, and whether the backend had already applied its key. */
@@ -581,7 +706,7 @@ async function perform(
   signal: AbortSignal,
 ): Promise<Applied> {
   if (store.kind === "blob") {
-    return blobOp(store, op, params, scopeKey, execution, idempotencyKey);
+    return blobOp(store, op, params, scopeKey, idempotencyKey);
   }
   const database = await open(store, execution);
   // A `vector` write and a `vector` search both need a vector, and computing one
@@ -786,21 +911,30 @@ function byUtf8Bytes(left: string, right: string): number {
   return a.length - b.length;
 }
 
+/**
+ * A `blob` store's partition on disk: everything one scope of it holds.
+ *
+ * Named rather than joined at its two call sites, because the two have to agree
+ * exactly: [`blobOp`] writes under it and [`remember`] registers it for removal
+ * when an execution-scoped run ends, and a directory removed by one path and
+ * written by another is a lifetime that only looks kept.
+ */
+function blobRoot(store: StoreBinding, scopeKey: string): string {
+  return path.join(dataRoot(), "blobs", encodeKey(store.name), scopeKey);
+}
+
 /** The `blob` rows of grammar 11.4's catalog, over a directory of files. */
 function blobOp(
   store: StoreBinding,
   op: StoreOp,
   params: StoreParams,
   scopeKey: string,
-  execution: runtime.ExecutionIdentity,
   idempotencyKey: string | undefined,
 ): Applied {
-  const root = path.join(dataRoot(), "blobs", encodeKey(store.name), scopeKey);
+  const root = blobRoot(store, scopeKey);
   const values = path.join(root, "values");
   const types = path.join(root, "types");
   const ledger = path.join(root, "applied");
-  // An execution-scoped blob store's whole partition goes when the run does.
-  if (store.scope === "execution") remember(execution.id, root);
 
   if (idempotencyKey !== undefined) {
     const marker = path.join(ledger, markerName(idempotencyKey));
