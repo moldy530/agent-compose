@@ -47,9 +47,12 @@
 #   * `flow.sourced` — an agent whose **one loop calls two different tools**, so
 #     one effect site holds two `tool` effects (`ask/0#tool/0` and
 #     `ask/0#tool/1`). Tightening the *first* tool's `output:` is a contract
-#     divergence whose next record is the second tool's call rather than a
-#     retried attempt of the first, which is the case a rule that merely counted
-#     records would get wrong.
+#     divergence, and what sits at the next ordinal is what a rule inferring
+#     "the original already retried past this" would read. Two scripts drive it,
+#     because the two wrong readings fail on different ones: two **different**
+#     tools defeat counting alone, and the same tool called twice with the same
+#     arguments — which a model's loop does whenever it looks something up
+#     again — defeat counting plus request identity.
 #   * `flow.scratched` — a `scope: execution` store written before a model call
 #     and read after it. Its rows die with the process, and a replayed write is
 #     never re-applied, so a resumed generation would read an **empty** store
@@ -74,6 +77,11 @@
 #     can re-park — which is the window a resume prepared against the dead
 #     process can arrive in, and the one `serve` does not hold the port for
 #     (`docs/durability.md` §6.1).
+#   * `flow.twinned` — **two** pauses in one execution whose branches are not
+#     back at the same moment: one has nothing before it and the other has the
+#     unreleased subprocess of `flow.held`. It is the shape that decides whether
+#     the catching-up window is per pause or per execution — with one pause, a
+#     window closed on the first pause the board sees looks right.
 #   * `flow.fanned` — a **detached** `map` whose sink calls a *model*, which
 #     `flow.parceled`'s subprocess sink cannot decide. A delivery runs with the
 #     node execution's collectors detached (Decision D94), so its record holds
@@ -607,6 +615,67 @@ flow.held:
     - { from: hold, to: sign_off }
     - { from: sign_off, to: end }
 
+flow.twinned:
+  description: Two pauses in one execution, one of them behind an effect that has to run live.
+  inputs:
+    topic:
+      type: string
+      min_length: 1
+  outputs:
+    notes:
+      type: array
+      max_items: 8
+      items: { type: string }
+    tally:
+      type: string
+    decision:
+      enum: [approve, reject]
+  nodes:
+    # A fork rather than two `start` edges, and one with a journaled effect in
+    # it: replaying `open` is what proves the second generation is consuming the
+    # record rather than starting over.
+    open:
+      exec:
+        command: printf
+        args: ["%s", "opened"]
+        output:
+          stdout: { type: string }
+
+    # The branch whose prefix is **whole**: nothing precedes it, so the
+    # generation that recovers this execution is back at this pause at once.
+    sign_now:
+      human:
+        input:
+          note: { type: string }
+        output:
+          note: { type: string }
+      input:
+        note: "input.topic"
+      writes:
+        note: notes
+
+    # The branch whose prefix the crash left an effect of: `flow.held` is the
+    # unreleased subprocess and the pause behind it, whole. It is an **instance**
+    # rather than two more nodes here because a superstep does not end while one
+    # of its tasks is parked — two pauses reached one after the other in this
+    # graph would be two pauses one after the other in time, which is not the
+    # shape under test. A `flow:` node runs its own graph inside one task of this
+    # one, so `sign_now` and the pause inside this instance are open together.
+    later:
+      flow: flow.held
+      input:
+        topic: "input.topic"
+      writes:
+        tally: tally
+        decision: decision
+
+  edges:
+    - { from: start, to: open }
+    - { from: open, to: sign_now }
+    - { from: open, to: later }
+    - { from: sign_now, to: end }
+    - { from: later, to: end }
+
 flow.posted:
   description: Deliver detached receipts, then park at a pause nobody can answer.
   inputs:
@@ -917,6 +986,19 @@ triggers:
     flow: flow.held
     method: POST
     path: /held
+    respond: async
+    input:
+      topic: "payload.body.topic"
+
+  # The execution that holds **two** pauses whose branches are not back at the
+  # same moment. `held` cannot decide that: with one pause, the first pause the
+  # board sees is the only pause there is, and a window closed on it looks
+  # right.
+  twinned:
+    type: http
+    flow: flow.twinned
+    method: POST
+    path: /twinned
     respond: async
     input:
       topic: "payload.body.topic"

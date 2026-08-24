@@ -102,7 +102,10 @@
 // replay, and that request is refused with a refusal of its own — `recovering:
 // true`, and a sentence that says to send it again — rather than with the
 // sentence that means the pause is over. It is the one refusal on this route
-// about *when* a request arrived rather than about what it addressed.
+// about *when* a request arrived rather than about what it addressed, and it is
+// decided per **pause** rather than per execution: two branches of one execution
+// reach their pauses independently, so one being back says nothing about the
+// other (see [`stillReplayingTo`]).
 
 import process from "node:process";
 
@@ -141,22 +144,37 @@ interface Execution {
    */
   status: Exclude<ExecutionStatus, "interrupted">;
   /**
-   * Whether this is an execution [`recover`] picked up that has **not yet come
-   * back to where its predecessor stopped**.
+   * Whether this is an execution [`recover`] picked up whose replay is **still
+   * running**.
    *
    * `false` for every execution a request started, and for a recovered one from
-   * the moment it holds a pause again or its run ends — which is exactly as long
-   * as it is true that "the answer you are sending may still find its wait".
+   * the moment its run ends.
    *
    * What it is for is one sentence on the resume route. Recovery does not wait
    * for the replays it starts (`docs/durability.md` §6.1), so an execution is on
    * this map as `running` while it is still consuming its recorded prefix — and
    * a `POST /executions/:id/resume` prepared against the process that died can
-   * land in that window. Held to the pauses the runtime publishes rather than
-   * asserted from the replay, for [`statusOf`]'s reason: the board is where a
-   * wait *is*, so a flag cleared from anywhere else could disagree with it.
+   * land in that window.
+   *
+   * It is deliberately **not** cleared when the execution re-parks. One
+   * execution can hold more than one pause (grammar 8.6), the branches reach
+   * them independently, and a branch whose prefix the crash left an effect of
+   * has to run that effect live before it re-parks at all — so the first pause
+   * back says nothing about the second. What decides whether a *particular*
+   * answer arrived early is [`stillReplayingTo`], off the pause it named.
    */
   recovering: boolean;
+  /**
+   * Whether this execution has held a pause since this process picked it up.
+   *
+   * The other half of [`stillReplayingTo`], and the half a wait id cannot
+   * supply: a resume that names **no** pause is not about any particular one, so
+   * the only thing that makes "there is nothing waiting" premature is a board
+   * that has held nothing at all. Read off the pauses the runtime publishes
+   * rather than asserted from the replay, for [`statusOf`]'s reason: the board
+   * is where a wait *is*.
+   */
+  parked: boolean;
   outputs?: Record<string, unknown>;
   trace?: readonly runtime.TraceEntry[];
   error?: string;
@@ -174,6 +192,39 @@ interface Execution {
 function statusOf(execution: Execution): ExecutionStatus {
   if (execution.status !== "running") return execution.status;
   return humanWaits(execution.id).length > 0 ? "interrupted" : "running";
+}
+
+/**
+ * Whether a resume this recovered execution could not deliver arrived **before
+ * the replay got to the pause it named** — the window `docs/durability.md` §6.1
+ * describes, decided per request rather than per execution.
+ *
+ * Per request because one execution can hold more than one pause and its
+ * branches reach them independently (grammar 8.6): a branch whose recorded
+ * prefix the crash left an effect of has to run that effect live before it
+ * re-parks, while a branch whose prefix is whole is back at once. A window that
+ * closed on the first pause the board saw would hand the second branch's client
+ * the final refusal this one exists to prevent.
+ *
+ * The two refusals it decides are decided differently, because only one of them
+ * names a pause.
+ *
+ *  * `no-such-wait` **is** the proof: a pause stays on the board once it opens,
+ *    answered or expired or still waiting (see `runtime.deliverHumanAnswer`,
+ *    which finds a settled one and says so). So an id the board does not know is
+ *    an id this generation has not reached, and while the replay runs it may
+ *    still reach it.
+ *  * `not-waiting` names nothing, so there is no pause to ask about. What makes
+ *    it premature is a board that has held **none at all**: once this generation
+ *    has published a pause, an unaddressed answer arriving to an empty board is
+ *    being told the truth about the board it was sent to.
+ */
+function stillReplayingTo(
+  execution: Execution,
+  reason: Extract<runtime.ResumeOutcome, { ok: false }>["reason"],
+): boolean {
+  if (reason === "no-such-wait") return true;
+  return reason === "not-waiting" && !execution.parked;
 }
 
 /** The payload shape grammar 13.3 fixes, as one request presents it. */
@@ -278,21 +329,18 @@ export function createApp(): FastifyInstance {
         status_url: `/executions/${id}`,
       });
     }
-    // **A recovered execution that has not re-parked yet has refused nothing.**
-    // The two refusals below that mean "no such pause here" — there is none at
-    // all, or none under the id you named — are true of the board and false of
-    // the execution while a replay is still on its way back to the wait
-    // ([`Execution.recovering`], `docs/durability.md` §6.1). Both sentences read
-    // as final, and one of them is the very sentence a *settled* pause is
-    // refused with, so a client holding a `resume_url` the dead process handed
-    // out would drop an answer nothing was wrong with. It is told to send it
-    // again instead, and given a key to decide that on rather than a sentence to
-    // match: this is the one refusal on this route that is about *when* the
+    // **A recovered execution the replay has not brought back to this pause has
+    // refused nothing.** The two refusals below that mean "no such pause here" —
+    // there is none at all, or none under the id you named — are true of the
+    // board and false of the execution while a replay is still on its way to
+    // that wait ([`Execution.recovering`], `docs/durability.md` §6.1). Both
+    // sentences read as final, and one of them is the very sentence a *settled*
+    // pause is refused with, so a client holding a `resume_url` the dead process
+    // handed out would drop an answer nothing was wrong with. It is told to send
+    // it again instead, and given a key to decide that on rather than a sentence
+    // to match: this is the one refusal on this route that is about *when* the
     // request arrived.
-    if (
-      execution.recovering &&
-      (outcome.reason === "not-waiting" || outcome.reason === "no-such-wait")
-    ) {
+    if (execution.recovering && stillReplayingTo(execution, outcome.reason)) {
       return reply.code(409).send({
         execution_id: id,
         status: statusOf(execution),
@@ -548,20 +596,20 @@ function resumeInto(
     flow: flow.address,
     trigger: row.trigger,
     status: "running",
-    // Until it is back where its predecessor stopped. See
-    // [`Execution.recovering`] for what turns on the window, and [`caughtUp`]
-    // for the two ways out of it.
+    // Until the replay stops. See [`Execution.recovering`] for what turns on the
+    // window and [`stillReplayingTo`] for what it decides.
     recovering: true,
+    parked: false,
     settled: Promise.resolve(),
   };
-  // The replay has arrived: this execution is holding a pause again, or its run
-  // has ended without one. Either way an answer that misses now misses for a
-  // reason of its own, and the resume route stops saying "send it again".
+  // The replay has stopped: whatever it did or did not reach, nothing more is
+  // coming, so an answer that misses now misses for a reason of its own and the
+  // resume route stops saying "send it again".
   //
   // Watched rather than awaited, because recovery must not wait for the replays
   // it starts (`docs/durability.md` §6.1) — the commonest execution it recovers
   // is parked on a question nobody has answered, so awaiting one would be
-  // awaiting the person. The subscription is dropped at the same moment for the
+  // awaiting the person. The subscription is dropped when the run ends for the
   // reason [`watchHumanPauses`] gives: a `serve` that has recovered many
   // executions holds no listener per finished one.
   function caughtUp(): void {
@@ -569,7 +617,7 @@ function resumeInto(
     unwatch();
   }
   const unwatch = watchHumanPauses(row.id, () => {
-    if (humanWaits(row.id).length > 0) caughtUp();
+    if (humanWaits(row.id).length > 0) execution.parked = true;
   });
   execution.settled = settling(
     execution,
@@ -609,8 +657,10 @@ function register(
     status: "running",
     // This request is the execution's first generation, so there is nothing for
     // it to catch up to: a pause it has not reached yet is one nobody has been
-    // handed a `resume_url` for.
+    // handed a `resume_url` for. `parked` is what [`stillReplayingTo`] would
+    // read, and it is never asked about an execution that is not recovering.
     recovering: false,
+    parked: false,
     // Replaced immediately below. The record has to exist before the run does,
     // because the run's own handlers write into it.
     settled: Promise.resolve(),
