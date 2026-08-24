@@ -6526,7 +6526,7 @@ export async function openExecution(opening: ExecutionOpening): Promise<void> {
     const row = journal.execution(opening.execution);
     if (row !== undefined && row.journalVersion !== JOURNAL_VERSION) {
       throw new Error(
-        `\`${opening.execution}\` was journaled at version ${row.journalVersion} and this build reads version ${JOURNAL_VERSION}: a journal is read by the compiler release that wrote it (\`docs/durability.md\` §9)`,
+        `\`${opening.execution}\` was journaled at version ${row.journalVersion} and this build reads version ${JOURNAL_VERSION}: a journal is read by the compiler release that wrote it (\`docs/durability.md\` §11)`,
       );
     }
   } else {

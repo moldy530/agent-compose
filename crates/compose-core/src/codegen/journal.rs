@@ -7,7 +7,7 @@
 //! `storage_backends` are, with `--target local` binding a SQLite file beside
 //! the project. Every target this compiler release can build is process-local,
 //! so SQLite is what every project gets and the composition says nothing about
-//! it (`docs/durability.md` §8).
+//! it (`docs/durability.md` §10).
 //!
 //! It is a **constant**, like [`super::runtime`], [`super::cel`] and
 //! [`super::stores`]: byte-identical in every project this compiler release

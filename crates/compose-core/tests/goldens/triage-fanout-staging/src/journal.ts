@@ -25,7 +25,7 @@
 // effect without re-issuing it. So the journal is a second artifact with the
 // same sensitivity as this project's stores: private recovery data, never
 // uploaded, never rendered, deleted by deleting the file. `docs/durability.md`
-// §7 is normative for that posture; nothing here weakens `docs/trace.md` §11.
+// §8 is normative for that posture; nothing here weakens `docs/trace.md` §11.
 //
 // What the two *do* share is identity. An effect is addressed by the instance
 // path of grammar 9.4 — the frames `docs/trace.md` §8 describes — so a key read
@@ -114,11 +114,11 @@ import { fileURLToPath } from "node:url";
 // ---------------------------------------------------------------------------
 
 /**
- * The journal format's version, as `docs/durability.md` §9 pins it.
+ * The journal format's version, as `docs/durability.md` §11 pins it.
  *
  * Written on every execution row, and read back when one is replayed: a journal
  * written by an older compiler release is refused by version rather than
- * misread. It moves under `docs/durability.md` §9's rules, which are
+ * misread. It moves under `docs/durability.md` §11's rules, which are
  * `docs/trace.md` §10's applied to this artifact.
  */
 export const JOURNAL_VERSION = 1;
