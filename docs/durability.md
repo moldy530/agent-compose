@@ -177,11 +177,23 @@ reads it from the **primitives**, which is the direction the first cannot see.
 A surface added to `src/runtime.ts` that calls the world and is not journaled is
 a replay that issues it twice — and it is not one of the six, contains no
 `journaled(` and no `.claim(`, and is in no table, so nothing else in the
-repository would notice. So every `fetch`, every `spawn`, every filesystem call
-and every SQLite statement in the two emitted modules is required to sit in a
-function the six transitively reach. One site is exempt and is named in the test:
-`releaseExecution`, which is grammar 11.1's `scope: execution` lifetime rather
-than an effect the graph issues.
+repository would notice. So every call to the world in every emitted constant
+module is required to sit in a declaration the six transitively reach.
+
+What counts as a call to the world is **derived rather than listed**, because a
+list of spellings is only as complete as the last person to extend it: `spawn(`
+is not `spawnSync(`, and `fs.writeFileSync` is not `fs.appendFileSync`. Each
+module's imports are read instead, and every specifier has to be classified as
+one whose surface *is* the world — in which case every binding it introduces is
+a primitive, whatever member of it is called — or one that reaches nothing
+outside the process. A specifier in neither class fails the test until somebody
+says which it is, and the platform globals that arrive with no import (`fetch`
+and the transports beside it) are named in the test. A handful of sites are
+exempt and each is named there with its reason: `releaseExecution`, which is
+grammar 11.1's `scope: execution` lifetime; `notify`, which fires only on the
+outcomes that close a lifecycle row (§6.1); `writeTrace`, which is the command's
+document rather than the graph's effect (§9); and the journal's own storage,
+which is the record a replay reads.
 
 ### 3.1 A model call
 
