@@ -109,6 +109,7 @@ import {
   deliverHumanAnswer,
   humanWaits,
   openExecutions,
+  staysOpen,
   watchHumanPauses,
 } from "./runtime.ts";
 import type * as runtime from "./runtime.ts";
@@ -665,6 +666,17 @@ function callbackOf(trigger: HttpTrigger, payload: Payload): string | undefined 
  * *begins* and in nothing after it. An execution recovered at start finishes
  * like any other, and a caller holding a `202` is owed the same push whichever
  * process got there.
+ *
+ * **The webhook is owed to a run that finished**, which is not every run that
+ * stopped. A resume that meets a [`runtime.ReplayDivergence`] leaves the journal
+ * row **open** on purpose (`docs/durability.md` §7): the disagreement is this
+ * build's, not the execution's, so the composition can be put back and the next
+ * start replays it again. Reporting `failed` to the caller would be this
+ * process's opinion delivered as the execution's outcome — and then the recovery
+ * that completes it would deliver a *second* webhook for one execution, the
+ * first of them wrong. So the guard is the same predicate the row is closed by:
+ * what stays open sends nothing, and the process that finally closes the row is
+ * the one that pushes, once.
  */
 function settling(
   execution: Execution,
@@ -676,15 +688,20 @@ function settling(
       execution.status = "completed";
       execution.outputs = answer.outputs;
       execution.trace = answer.trace;
+      return true;
     })
     .catch((error: unknown) => {
       execution.status = "failed";
       execution.error = message(error);
       const trace = (error as { trace?: readonly runtime.TraceEntry[] }).trace;
       if (trace !== undefined) execution.trace = trace;
+      // The status route still reports what *this* process saw — a reader
+      // polling it is asking about this build — and that is the whole of the
+      // difference: the report is this process's, the push is the execution's.
+      return !staysOpen(execution.id, error);
     })
-    .then(async () => {
-      if (callback === undefined) return;
+    .then(async (finished) => {
+      if (!finished || callback === undefined) return;
       await notify(callback, execution);
     });
 }
