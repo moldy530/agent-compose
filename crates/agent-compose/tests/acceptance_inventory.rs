@@ -1062,10 +1062,16 @@ const DURABILITY: &[Criterion] = &[
                 Status::Live,
             ),
             // …and what tells those two apart, at the site that has more than
-            // one effect of a kind: the next record is a retried attempt only
-            // when it repeats the request, never merely by being next.
+            // one effect of a kind. Nothing about the records *around* the
+            // answer can: two different tools at one site defeat counting, and
+            // one tool called twice with the same arguments defeats counting
+            // plus request identity, so the record says which it was.
             (
                 "a_contract_that_moved_on_one_of_two_tools_at_a_site_is_not_read_as_a_retry",
+                Status::Live,
+            ),
+            (
+                "a_contract_that_moved_on_a_repeated_call_at_a_site_is_not_read_as_a_retry",
                 Status::Live,
             ),
             // …and the one world a live effect past the frontier cannot assume
@@ -1151,11 +1157,25 @@ const DURABILITY: &[Criterion] = &[
                 "a_recovered_execution_still_catching_up_tells_a_resume_to_send_it_again",
                 Status::Live,
             ),
+            // …and that the window is per **pause**: an execution holding two
+            // whose branches are not back at the same moment must not hand the
+            // second one's client the refusal the first one's arrival cleared.
+            (
+                "a_second_pause_still_being_replayed_to_is_told_to_send_its_answer_again",
+                Status::Live,
+            ),
             // …including what an `async` caller was promised: the completion
             // webhook is fired by the process that *finishes* the run, which is
             // not the one that answered its `202`.
             (
                 "a_recovered_execution_delivers_the_completion_webhook_its_caller_waits_for",
+                Status::Live,
+            ),
+            // …and the half of that promise a divergence would break twice
+            // over: a recovery that leaves the row open pushes nothing, so one
+            // execution is one completion whatever it took to reach it.
+            (
+                "a_diverged_recovery_delivers_no_webhook_and_the_repair_delivers_one",
                 Status::Live,
             ),
             // …and what a run that stops on its own must not leave behind: a

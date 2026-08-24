@@ -11256,6 +11256,152 @@ fn a_contract_that_moved_on_one_of_two_tools_at_a_site_is_not_read_as_a_retry() 
     );
 }
 
+/// The same site, the same tightened contract, and the next record repeating
+/// this one's **request**: still a divergence, because a repeated call is not a
+/// retried one (`docs/durability.md` §7).
+///
+/// A recorded answer this build refuses is not a divergence when the generation
+/// that recorded it refused it too — its own ladder decided that, and a resume
+/// has to do what it did. What tells the two apart cannot be read off the
+/// records *around* the answer: the ordinals hold the sequence of effects at a
+/// site, and "the site retried this call" and "the site made this call again"
+/// are the same sequence. Here `agent.reading`'s loop calls `tool.alpha` twice
+/// with identical arguments — the ordinary shape of a model looking something up
+/// again — so `ask/0#tool/1` is byte-for-byte the request `ask/0#tool/0` was,
+/// which is exactly what an inference would read as "the ladder already went
+/// round".
+///
+/// Reading it that way is not a smaller mistake than missing the divergence: the
+/// node carries `retry: { max: 2 }`, so the ordinary mismatch is absorbed and the
+/// second attempt claims ordinals **past the frontier** — a live provider call
+/// and a live re-run of the subprocess, which is the double side effect resolved
+/// q29 exists to prevent. So the record says which it was, because the generation
+/// that refused the answer wrote it down.
+#[test]
+fn a_contract_that_moved_on_a_repeated_call_at_a_site_is_not_read_as_a_retry() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let looked_up = json!({ "line": "the first source" });
+    provider.enqueue_all([
+        // Two turns, one call each, with the **same** arguments: two `tool`
+        // effects at one site whose recorded requests are identical.
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new("alpha", looked_up.clone())]),
+        ),
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new("alpha", looked_up.clone())]),
+        ),
+        // The loop stops when the model answers without calling anything, and
+        // the declared `output:` is asked for in a call of its own.
+        Script::new(SONNET, Outcome::text("the source agrees with itself")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "note": "the source agrees with itself" })),
+        ),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "note": "relayed" })).after(Duration::from_secs(120)),
+        ),
+    ]);
+
+    let Some((project, built)) = harness::build_under_toolchain("durability", "resume-twice-asked")
+    else {
+        return;
+    };
+    assert!(
+        built.status.success(),
+        "the durability fixture did not build"
+    );
+
+    let shims = harness::Scratch::new("twice-asked");
+    let log = shims.path().join("tally.log");
+    harness::shim(
+        shims.path(),
+        "alpha",
+        "printf 'alpha\\n' >> \"$TALLY_LOG\"\nprintf 'alpha said so'\n",
+    );
+    harness::shim(
+        shims.path(),
+        "beta",
+        "printf 'beta\\n' >> \"$TALLY_LOG\"\nprintf 'beta said so'\n",
+    );
+    let mut environment = harness::environment(&provider);
+    environment.push((
+        harness::TALLY_BIN.to_string(),
+        shims.path().display().to_string(),
+    ));
+    environment.push((harness::TALLY_LOG.to_string(), log.display().to_string()));
+
+    let killed = harness::crash_run(
+        &project,
+        &["run", "flow.sourced", "--input", "topic=durability"],
+        &environment,
+        |_| {
+            provider.snapshot().requests >= 5
+                && harness::journal_holds(&project, &["ask/0#tool/0", "ask/0#tool/1"])
+        },
+    );
+    assert_eq!(
+        harness::lines_in(&log),
+        2,
+        "the first generation read the one source twice: {}",
+        killed.stderr
+    );
+
+    // The same one line as the two-tools case: `tool.alpha`'s contract, and
+    // nothing about the binding, so the request identity still matches.
+    let moved = harness::Scratch::new("twice-asked-contract");
+    let source = std::fs::read_to_string(harness::fixture("durability")).expect("the fixture");
+    let edited = source.replace(
+        "    first: { type: string }",
+        "    first: { type: string, min_length: 500 }",
+    );
+    assert_ne!(
+        edited, source,
+        "`tool.alpha`'s output is what this copy moves"
+    );
+    let entrypoint = moved.path().join("main.yml");
+    std::fs::write(&entrypoint, edited).expect("the scratch area is writable");
+
+    provider.reset();
+    let resumed = harness::resume_entrypoint(
+        &project,
+        &entrypoint,
+        &killed.execution,
+        Some("json"),
+        &environment,
+    );
+    let said_on_stderr = resumed.failed();
+    let answered = resumed.outputs();
+    assert_eq!(answered["status"], "failed", "{answered}\n{said_on_stderr}");
+    let said = answered["error"].as_str().expect("an error");
+    assert!(
+        said.starts_with("ReplayDivergence: "),
+        "a record that repeats this one's request is the site calling again, not the \
+         ladder going round: {said}"
+    );
+    assert!(
+        said.contains("`ask/0#tool/0`"),
+        "…named at the first of the two, which is the one this build refused: {said}"
+    );
+    assert!(
+        said.contains("no longer satisfies this run's contract"),
+        "…and said to be the contract divergence rather than a moved request: {said}"
+    );
+    assert_eq!(
+        provider.snapshot().requests,
+        0,
+        "an absorbed mismatch would have spent the node's second attempt on a live \
+         model call"
+    );
+    assert_eq!(
+        harness::lines_in(&log),
+        2,
+        "…and re-read the source a third time"
+    );
+}
+
 /// A store whose data **died with the process** is refused rather than answered
 /// out of an empty database (`docs/durability.md` §5).
 ///
@@ -12783,6 +12929,152 @@ fn a_recovered_execution_delivers_the_completion_webhook_its_caller_waits_for() 
     );
 }
 
+/// A recovery that **diverges** delivers no webhook, and the start that
+/// finishes the execution delivers exactly one (`docs/durability.md` §6.1, §7).
+///
+/// A divergence leaves the journal row **open** on purpose: the disagreement
+/// belongs to this build's composition rather than to the execution, so putting
+/// the composition back is the repair and the next start replays the execution
+/// again. A push fired on that outcome would report `failed` about a run that
+/// has not finished — and the start that does finish it would then fire a
+/// *second* one. Two completions for one execution, the first of them wrong, to
+/// a caller who was handed a `202` and is not polling anything.
+///
+/// So the webhook is owed to a run that **finished**, which is the same
+/// predicate the lifecycle row is closed by. What the status route reports is
+/// still what this process saw: the report is this build's, the push is the
+/// execution's.
+#[test]
+fn a_diverged_recovery_delivers_no_webhook_and_the_repair_delivers_one() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "note": "worth signing off" })),
+    ));
+
+    let receiver = harness::Receiver::start().expect("a loopback receiver");
+    let Some(project) = harness::scratch_project("serve-diverged-callback") else {
+        return;
+    };
+    let environment = harness::environment(&provider);
+
+    let execution;
+    let resume_url;
+    {
+        let Some(first) = harness::serve_into(&project, "durability", &environment) else {
+            return;
+        };
+        let app = Client::new(&first.base_url).expect("a client for the generated app");
+        let started = app
+            .post_json(
+                "/gate-pushed",
+                &json!({
+                    "topic": "durability",
+                    "callback_url": format!("{}/done", receiver.base_url),
+                }),
+            )
+            .expect("the trigger's route answers");
+        assert_eq!(started.status, 202, "{}", started.text());
+        execution = started.json()["execution_id"]
+            .as_str()
+            .expect("an execution id")
+            .to_string();
+        let status = harness::settled(&app, &execution);
+        assert_eq!(status["status"], "interrupted", "{status}");
+        resume_url = status["interrupts"].as_array().expect("the pauses")[0]["resume_url"]
+            .as_str()
+            .expect("a resume url")
+            .to_string();
+        // Dropped holding the pause, with the row open and nothing pushed.
+    }
+
+    // The composition moves under the journal, which is how one does in
+    // practice: the prompt this build asks with is not the one the record holds.
+    let moved = harness::Scratch::new("diverged-callback");
+    let entrypoint = moved.path().join("main.yml");
+    std::fs::write(&entrypoint, moved_prompt()).expect("the scratch area is writable");
+
+    {
+        let Some(second) = harness::serve_entrypoint_into(&project, &entrypoint, &environment)
+        else {
+            return;
+        };
+        let app = Client::new(&second.base_url).expect("a client for the generated app");
+        let diverged = harness::settled(&app, &execution);
+        assert_eq!(diverged["status"], "failed", "{diverged}");
+        assert!(
+            diverged["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("ReplayDivergence: "),
+            "this build could not replay the record, which is what the status route \
+             reports: {diverged}"
+        );
+        // Given time to be sent, and then said not to have been: the push would
+        // follow the status this process just published, so a read taken at once
+        // would be a read taken too early.
+        nothing_delivered(&receiver, Duration::from_secs(3));
+    }
+
+    // The composition comes back, and so does the execution.
+    let Some(third) = harness::serve_into(&project, "durability", &environment) else {
+        return;
+    };
+    let app = Client::new(&third.base_url).expect("a client for the generated app");
+    let recovered = harness::settled(&app, &execution);
+    assert_eq!(
+        recovered["status"], "interrupted",
+        "a diverged resume closed nothing: {recovered}"
+    );
+    let answered = app
+        .post_json(&resume_url, &json!({ "decision": "approve" }))
+        .expect("the resume route answers");
+    assert!(
+        answered.status == 200 || answered.status == 202,
+        "{}",
+        answered.text()
+    );
+
+    let delivered = receiver.wait_for(1, Duration::from_secs(30));
+    assert_eq!(
+        delivered.len(),
+        1,
+        "one execution, one completion webhook: {delivered:?}"
+    );
+    let report = &delivered[0];
+    assert_eq!(report["execution_id"], execution, "{report}");
+    assert_eq!(
+        report["status"], "completed",
+        "…and it is the report of the run that finished rather than the opinion of \
+         the build that could not replay it: {report}"
+    );
+    assert_eq!(
+        provider.snapshot().requests,
+        1,
+        "neither recovery re-issued the recorded call"
+    );
+}
+
+/// Give a webhook that must not be sent the time to be sent, and then say it was
+/// not.
+///
+/// A `assert!(delivered().is_empty())` taken the instant a status is published
+/// would pass for a build that fires the push a moment later, which is the
+/// failure it exists to catch. Polling for a budget cannot flake the other way:
+/// a build that fires nothing has nothing to arrive however long this waits.
+fn nothing_delivered(receiver: &harness::Receiver, budget: Duration) {
+    let deadline = std::time::Instant::now() + budget;
+    while std::time::Instant::now() < deadline {
+        let held = receiver.delivered();
+        assert!(
+            held.is_empty(),
+            "an execution the journal keeps open has not finished, so its caller is \
+             owed nothing yet: {held:?}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
 /// An answer that arrives **while a recovered execution is still on its way back
 /// to its pause** is told to send it again — not that there is nothing waiting.
 ///
@@ -12936,6 +13228,161 @@ fn a_recovered_execution_still_catching_up_tells_a_resume_to_send_it_again() {
         finished["outputs"],
         json!({ "tally": "tallied", "decision": "approve" }),
         "{finished}"
+    );
+    assert_eq!(
+        harness::lines_in(&log),
+        2,
+        "the subprocess ran once per generation: the killed one left no record of \
+         it, which is the one window a journal cannot close (§2)"
+    );
+}
+
+/// The same window, for an execution holding **two** pauses whose branches are
+/// not back at the same moment (`docs/durability.md` §6.1).
+///
+/// One execution can hold more than one pause and its branches reach them
+/// independently (grammar 8.6). `flow.twinned` is that shape with the two
+/// halves deliberately unequal: `sign_now` has nothing before it, so the
+/// generation that recovers this execution re-parks it at once, while the pause
+/// inside its `flow.held` instance sits behind that flow's unreleased
+/// subprocess — an effect the crash left no record of, which this generation
+/// therefore has to run **live** before it can reach that pause at all.
+///
+/// So the first pause back says nothing about the second, and a window closed on
+/// the first pause the board sees hands the instance's client the very refusal
+/// the window exists to prevent: `this execution is holding no pause`, listing
+/// the *other* branch's wait as what is pending. That sentence is what a settled
+/// pause is refused with, and a client that reads it as final drops an answer
+/// nothing was wrong with — leaving the execution parked for ever.
+#[test]
+fn a_second_pause_still_being_replayed_to_is_told_to_send_its_answer_again() {
+    let provider = MockProvider::start().expect("a loopback port");
+
+    let Some(project) = harness::scratch_project("serve-recovery-two-pauses") else {
+        return;
+    };
+    let shims = harness::Scratch::new("twinned");
+    let log = shims.path().join("tally.log");
+    let release = shims.path().join("tally.log.released");
+    harness::shim(
+        shims.path(),
+        "tally",
+        "printf 'ran\\n' >> \"$TALLY_LOG\"\n\
+         until [ -e \"$TALLY_LOG.released\" ]; do sleep 0.05; done\n\
+         printf 'tallied'\n",
+    );
+    let mut environment = harness::environment(&provider);
+    environment.push((
+        harness::TALLY_BIN.to_string(),
+        shims.path().display().to_string(),
+    ));
+    environment.push((harness::TALLY_LOG.to_string(), log.display().to_string()));
+
+    let execution;
+    {
+        let Some(first) = harness::serve_into(&project, "durability", &environment) else {
+            return;
+        };
+        let app = Client::new(&first.base_url).expect("a client for the generated app");
+        let started = app
+            .post_json("/twinned", &json!({ "topic": "durability" }))
+            .expect("the trigger's route answers");
+        assert_eq!(started.status, 202, "{}", started.text());
+        execution = started.json()["execution_id"]
+            .as_str()
+            .expect("an execution id")
+            .to_string();
+        // Both halves reached: one pause published, and the other branch inside
+        // the effect it will be killed in.
+        let waiting = wait_for_pauses(&app, &execution, 1);
+        assert_eq!(
+            waiting["interrupts"][0]["wait_id"], "sign_now/0",
+            "the branch with nothing before it is the one that parks: {waiting}"
+        );
+        wait_for_lines(&log, 1);
+    }
+
+    let Some(second) = harness::serve_into(&project, "durability", &environment) else {
+        return;
+    };
+    let app = Client::new(&second.base_url).expect("a client for the generated app");
+    // Recovery ran in `onReady`. One branch is back at its pause; the other is
+    // inside the subprocess the killed generation left no record of.
+    wait_for_lines(&log, 2);
+    let half = wait_for_pauses(&app, &execution, 1);
+    assert_eq!(
+        half["interrupts"][0]["wait_id"], "sign_now/0",
+        "one of the two is back, and it is the one whose prefix is whole: {half}"
+    );
+
+    // The URL the dead process published for the *other* pause. Its wait id is
+    // grammar 9.4's instance path — the `flow:` node's frame and then the node
+    // inside it — so it is the URL this process will publish for it too,
+    // asserted below rather than assumed.
+    let later = format!("/executions/{execution}/resume?wait=later%2F0%2Fsign_off%2F0");
+    let early = app
+        .post_json(&later, &json!({ "decision": "approve" }))
+        .expect("the resume route answers");
+    assert_eq!(early.status, 409, "{}", early.text());
+    let refused = early.json();
+    assert_eq!(
+        refused["recovering"], true,
+        "the pause this answer names is still ahead of the replay, whatever the pause \
+         beside it is doing: {refused}"
+    );
+    let sentence = refused["error"].as_str().expect("a refusal says why");
+    assert!(
+        sentence.contains("send it again"),
+        "…so the caller is told the answer was not refused: {sentence}"
+    );
+    assert!(
+        !sentence.contains("holding no pause"),
+        "…rather than the sentence a pause that is over is refused with: {sentence}"
+    );
+
+    // Released: the live effect answers and the second branch parks under the id
+    // its composition fixes.
+    std::fs::write(&release, "").expect("the scratch area is writable");
+    let both = wait_for_pauses(&app, &execution, 2);
+    let ids: Vec<String> = both["interrupts"]
+        .as_array()
+        .expect("the pauses")
+        .iter()
+        .map(|one| one["wait_id"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["later/0/sign_off/0".to_string(), "sign_now/0".to_string()],
+        "{both}"
+    );
+    assert_eq!(
+        both["interrupts"][0]["resume_url"].as_str().expect("a url"),
+        later,
+        "…and the second is at the URL the refused answer was addressed to all \
+         along: {both}"
+    );
+
+    // …and the answer the caller was told to send again is taken, as is the one
+    // beside it.
+    let now = format!("/executions/{execution}/resume?wait=sign_now%2F0");
+    for (url, body) in [
+        (&later, json!({ "decision": "approve" })),
+        (&now, json!({ "note": "signed now" })),
+    ] {
+        let answered = app.post_json(url, &body).expect("the resume route answers");
+        assert!(
+            answered.status == 200 || answered.status == 202,
+            "{}",
+            answered.text()
+        );
+    }
+    let finished = harness::settled(&app, &execution);
+    assert_eq!(finished["status"], "completed", "{finished}");
+    assert_eq!(
+        finished["outputs"],
+        json!({ "notes": ["signed now"], "tally": "tallied", "decision": "approve" }),
+        "both pauses were answered exactly once, and the live effect answered \
+         between them: {finished}"
     );
     assert_eq!(
         harness::lines_in(&log),
