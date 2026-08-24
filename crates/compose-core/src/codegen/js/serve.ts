@@ -417,7 +417,7 @@ const DEFAULT_SYNC_TIMEOUT_MS = 60_000;
 
 /**
  * Put every execution this project's journal holds open back on the board
- * (PRD resolved q28, `docs/durability.md` §5).
+ * (PRD resolved q28, `docs/durability.md` §6.1).
  *
  * "**`serve` auto-recovers**: on process start it replays every execution the
  * journal holds open, including executions parked on `human` waits, which
