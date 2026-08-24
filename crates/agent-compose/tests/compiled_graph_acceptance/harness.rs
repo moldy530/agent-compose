@@ -1312,6 +1312,21 @@ pub fn serve(name: &str, provider: &MockProvider) -> Option<Served> {
 /// restarted against the same journal" is two `serve` commands over one
 /// directory. Everything else takes a fresh one.
 pub fn serve_into(out: &Path, name: &str, environment: &[(String, String)]) -> Option<Served> {
+    serve_entrypoint_into(out, &fixture(name), environment)
+}
+
+/// The same again, for a composition that is **not** a fixture.
+///
+/// Which is what a restart across a *moved* composition needs: the whole point
+/// of a divergence is that the second `serve` is built from a source the first
+/// one was not, and a fixture edited in place would be edited for every other
+/// test in this suite. The journal is the directory's, so a scratch entrypoint
+/// served into the same `--out` meets the same executions.
+pub fn serve_entrypoint_into(
+    out: &Path,
+    entrypoint: &Path,
+    environment: &[(String, String)],
+) -> Option<Served> {
     // The toolchain check `scratch_project` makes on the caller's behalf, made
     // here too: this entry point is handed a directory rather than asking for
     // one, and a run with no Bun has nothing to serve.
@@ -1319,7 +1334,7 @@ pub fn serve_into(out: &Path, name: &str, environment: &[(String, String)]) -> O
     let mut command = agent_compose();
     command
         .arg("serve")
-        .arg(fixture(name))
+        .arg(entrypoint)
         .args(["--port", "0"])
         .arg("--out")
         .arg(out)
