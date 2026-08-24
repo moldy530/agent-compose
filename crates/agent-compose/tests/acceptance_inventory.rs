@@ -1061,6 +1061,19 @@ const DURABILITY: &[Criterion] = &[
                 "a_recorded_answer_the_original_retried_past_is_retried_past_again",
                 Status::Live,
             ),
+            // …and what tells those two apart, at the site that has more than
+            // one effect of a kind: the next record is a retried attempt only
+            // when it repeats the request, never merely by being next.
+            (
+                "a_contract_that_moved_on_one_of_two_tools_at_a_site_is_not_read_as_a_retry",
+                Status::Live,
+            ),
+            // …and the one world a live effect past the frontier cannot assume
+            // the record left behind: a store whose rows died with the process.
+            (
+                "a_store_that_died_with_the_process_refuses_the_resume_it_cannot_answer",
+                Status::Live,
+            ),
             // …and the three nesting depths a divergence may not be absorbed at:
             // a dispatched subflow under `on_item_error: skip`, the item retry
             // the other form of that key gives, and a delivery nothing waits for.
@@ -1095,6 +1108,13 @@ const DURABILITY: &[Criterion] = &[
                 "a_pause_killed_with_its_process_is_asked_again_under_the_same_wait_id",
                 Status::Live,
             ),
+            // …and its other half, which is the promise a person can see: a
+            // pause somebody **answered** is replayed rather than put to them
+            // twice, dated by the generation that held it.
+            (
+                "an_answered_pause_is_replayed_rather_than_put_to_the_person_twice",
+                Status::Live,
+            ),
             // …and the `serve` half, which recovers on its own.
             (
                 "a_restarted_serve_recovers_its_open_executions_and_their_waits",
@@ -1106,6 +1126,13 @@ const DURABILITY: &[Criterion] = &[
             // replays every open execution at every start.
             (
                 "a_diverged_resume_leaves_the_execution_open_for_the_composition_that_fits_it",
+                Status::Live,
+            ),
+            // …and what a crash must not be able to do to the one artifact
+            // recovery reads: seal it. A writer killed inside a write leaves the
+            // driver's lock directory behind, and nothing else removes it.
+            (
+                "a_lock_a_killed_writer_left_behind_does_not_seal_the_journal",
                 Status::Live,
             ),
         ],

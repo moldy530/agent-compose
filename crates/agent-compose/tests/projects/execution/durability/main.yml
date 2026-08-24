@@ -38,6 +38,23 @@
 #     and must do what the first one did rather than call the disagreement a
 #     divergence: the journal holds the next attempt's record, which is the whole
 #     of how the two are told apart.
+#   * `flow.signed` — the same pause with a **node after it**, which is the only
+#     shape a journaled *answer* is observable in: answer the question, kill the
+#     process while the next node's model call is in flight, and a resumed
+#     generation has to hand the graph what the person said instead of asking
+#     them again. `flow.gate` cannot decide it — nothing follows its pause, so
+#     the answer and the end of the run are the same moment.
+#   * `flow.sourced` — an agent whose **one loop calls two different tools**, so
+#     one effect site holds two `tool` effects (`ask/0#tool/0` and
+#     `ask/0#tool/1`). Tightening the *first* tool's `output:` is a contract
+#     divergence whose next record is the second tool's call rather than a
+#     retried attempt of the first, which is the case a rule that merely counted
+#     records would get wrong.
+#   * `flow.scratched` — a `scope: execution` store written before a model call
+#     and read after it. Its rows die with the process, and a replayed write is
+#     never re-applied, so a resumed generation would read an **empty** store
+#     past the frontier: the one world a live effect cannot assume the record
+#     left behind (`docs/durability.md` §5).
 #   * `flow.parceled` — a `map` into a **subflow** and a second `map` that is
 #     **detached**, so one execution carries effects two instance frames down
 #     and one delivery nothing waits for. Between them they are every nesting
@@ -79,6 +96,14 @@ state:
     max_items: 8
     items: { type: string }
     reduce: append
+  readings:
+    description: What the two tools of `flow.sourced` were read as, joined by the agent.
+    type: string
+    default: nothing yet
+  recalled:
+    description: Whether `flow.scratched` found what it wrote down for itself.
+    type: boolean
+    default: false
 
 provider.mock:
   kind: anthropic
@@ -95,6 +120,18 @@ store.ledger:
   kind: kv
   scope: global
   description: What a run wrote down before it was interrupted.
+  value_schema:
+    entry:
+      type: string
+
+# The other lifetime, and the one a resume cannot reconstruct: `scope: execution`
+# rows live in an in-memory database opened per execution (`src/stores.ts`), so
+# they die with the process that opened them and a replayed write is never
+# applied again (`docs/durability.md` §5).
+store.scratch:
+  kind: kv
+  scope: execution
+  description: What this run is keeping for itself while it works.
   value_schema:
     entry:
       type: string
@@ -116,6 +153,48 @@ tool.receipt:
     command: "${RECEIPT_BIN}/receipt"
     args: ["filed"]
     expect_exit: [0]
+
+# The two readers `agent.reading` calls in one loop. They are separate `tool.*`
+# declarations rather than one called twice because that is what puts two
+# **different** requests at one effect site: a rule that decided "the next record
+# is this one's retry" by counting would find `beta`'s record where a second
+# attempt of `alpha` would have been.
+tool.alpha:
+  description: Read the first source.
+  input:
+    line: { type: string }
+  # `first:` and `second:` rather than one name on both, so a test can tighten
+  # exactly one of the two contracts by editing a line that appears once.
+  output:
+    first: { type: string }
+  exec:
+    command: "${TALLY_BIN}/alpha"
+    args: ["read"]
+
+tool.beta:
+  description: Read the second source.
+  input:
+    line: { type: string }
+  output:
+    second: { type: string }
+  exec:
+    command: "${TALLY_BIN}/beta"
+    args: ["read"]
+
+agent.reading:
+  description: Reads both sources before it answers.
+  model: model.smart
+  prompt: |
+    Read both sources, then say in one line what they said.
+  tools: [tool.alpha, tool.beta]
+  input:
+    topic:
+      description: What to read about.
+      type: string
+  output:
+    note:
+      description: What the two sources said.
+      type: string
 
 agent.consulting:
   description: Answers about a topic after reading what a previous run wrote down.
@@ -257,6 +336,131 @@ flow.gate:
     - { from: start, to: ask }
     - { from: ask, to: sign_off }
     - { from: sign_off, to: end }
+
+flow.signed:
+  description: Answer, wait for a person, then answer again — a pause with a node after it.
+  inputs:
+    topic:
+      type: string
+      min_length: 1
+  outputs:
+    note:
+      type: string
+    decision:
+      enum: [approve, reject]
+    final:
+      type: string
+  nodes:
+    ask:
+      agent: agent.noter
+      input:
+        topic: "input.topic"
+      writes:
+        note: note
+
+    sign_off:
+      human:
+        input:
+          note: { type: string }
+        output:
+          decision: { enum: [approve, reject] }
+      input:
+        note: "state.note"
+
+    # The node the crash lands in, so that the **settled** wait is behind the
+    # frontier rather than at it: an answered pause is journaled the moment it is
+    # answered, and a run that ended there would have nothing after it to
+    # interrupt.
+    relay:
+      agent: agent.noter
+      input:
+        topic: "state.note"
+      writes:
+        note: final
+
+  edges:
+    - { from: start, to: ask }
+    - { from: ask, to: sign_off }
+    - { from: sign_off, to: relay }
+    - { from: relay, to: end }
+
+flow.sourced:
+  description: An agent whose one loop calls two tools, then a second model call.
+  inputs:
+    topic:
+      type: string
+      min_length: 1
+  outputs:
+    readings:
+      type: string
+    note:
+      type: string
+  nodes:
+    # `retry:` is the policy that makes the failure visible: a contract
+    # divergence reported as an ordinary mismatch would be absorbed here, and the
+    # second attempt would walk the ordinals past the frontier and issue both
+    # tools **and** the model call live.
+    ask:
+      agent: agent.reading
+      input:
+        topic: "input.topic"
+      retry: { max: 2, backoff: 1ms }
+      writes:
+        note: readings
+
+    relay:
+      agent: agent.noter
+      input:
+        topic: "state.readings"
+      writes:
+        note: note
+
+  edges:
+    - { from: start, to: ask }
+    - { from: ask, to: relay }
+    - { from: relay, to: end }
+
+flow.scratched:
+  description: Write to a store that dies with the run, call a model, then read it back.
+  inputs:
+    topic:
+      type: string
+      min_length: 1
+  outputs:
+    note:
+      type: string
+    recalled:
+      type: boolean
+  nodes:
+    stash:
+      store: store.scratch
+      op: set
+      key: "'entry'"
+      value:
+        entry: "input.topic"
+
+    think:
+      agent: agent.noter
+      input:
+        topic: "input.topic"
+      writes:
+        note: note
+
+    # Past the frontier on a resume, and reading a store whose rows went with the
+    # process that wrote them. Answering it out of an empty database would route
+    # this flow on a `found: false` the original execution never saw.
+    recall:
+      store: store.scratch
+      op: get
+      key: "'entry'"
+      writes:
+        found: recalled
+
+  edges:
+    - { from: start, to: stash }
+    - { from: stash, to: think }
+    - { from: think, to: recall }
+    - { from: recall, to: end }
 
 flow.consulted:
   description: Write something down, then answer about it having read it back.

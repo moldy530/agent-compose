@@ -10935,6 +10935,405 @@ fn a_pause_killed_with_its_process_is_asked_again_under_the_same_wait_id() {
     );
 }
 
+/// A lock the killed writer never gave back does not take the journal with it
+/// (`docs/durability.md` §2).
+///
+/// The driver takes SQLite's exclusive lock by creating `<file>.lock` as a
+/// directory and gives it back by removing it, so a process that dies **inside**
+/// a write leaves one nothing else will ever remove. Left standing it refuses
+/// every later open of that journal — not only the resume of the execution the
+/// crash interrupted, but every future run of the project, for ever. A
+/// durability story with a file a crash can permanently seal is not one.
+///
+/// The stale lock is planted rather than raced for, which is the only way to
+/// decide this: the window a real crash has to land in is one statement wide, so
+/// a test that tried to hit it would be a test that usually did not.
+#[test]
+fn a_lock_a_killed_writer_left_behind_does_not_seal_the_journal() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "note": "the first note" })),
+        ),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "note": "the second note" })),
+        ),
+    ]);
+
+    let Some((project, built)) = harness::build_under_toolchain("durability", "stale-lock") else {
+        return;
+    };
+    assert!(
+        built.status.success(),
+        "the durability fixture did not build"
+    );
+
+    let environment = harness::environment(&provider);
+    let lock = project.join(".agent-compose").join("journal.sqlite.lock");
+    std::fs::create_dir_all(&lock).expect("the project's data directory is writable");
+
+    let ran = harness::run_into(
+        &project,
+        "durability",
+        "flow.relay",
+        &[("topic", "durability")],
+        None,
+        &environment,
+    );
+    ran.succeeded();
+    assert!(
+        !lock.exists(),
+        "the lock its owner never gave back is gone: {}",
+        lock.display()
+    );
+    assert_eq!(
+        provider.snapshot().requests,
+        2,
+        "…and the run it was blocking did everything it was going to do"
+    );
+}
+
+/// A pause somebody **answered** is not asked again, and the entry it replays as
+/// is dated by the generation that held it.
+///
+/// The other half of the test above, and the promise durability makes that a
+/// person can see: `flow.gate` cannot decide it, because nothing follows its
+/// pause — the answer and the end of the run are the same moment there, so the
+/// journalled answer is never read back. `flow.signed` puts a node after the
+/// wait, the run is answered and then killed while *that* node's model call is
+/// in flight, and the resumed generation has to hand the graph what the person
+/// said.
+///
+/// The resume is **not** interactive, which is the sharpest form of the
+/// assertion available: a resumed execution that re-parked would have no answer
+/// surface at all and would end `3` holding the question (grammar 8.7).
+///
+/// It also decides the entry's two instants. A replayed wait takes `settledAt`
+/// from the record; if it took `pausedAt` from *this* process's clock, the trace
+/// of a resumed execution would say the answer arrived before the question — a
+/// negative duration for any reader that subtracts them, and the opposite of
+/// what `docs/durability.md` §9 promises.
+#[test]
+fn an_answered_pause_is_replayed_rather_than_put_to_the_person_twice() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "note": "worth signing off" })),
+    ));
+    // Held, so the kill lands while the node **after** the pause is calling: the
+    // answer is journaled and the run has not finished with it.
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "note": "signed and relayed" }))
+            .after(Duration::from_secs(120)),
+    ));
+
+    let Some((project, built)) = harness::build_under_toolchain("durability", "resume-answered")
+    else {
+        return;
+    };
+    assert!(
+        built.status.success(),
+        "the durability fixture did not build"
+    );
+
+    let mut answering = harness::environment(&provider);
+    answering.push((harness::INTERACTIVE.to_string(), "1".to_string()));
+
+    let killed = harness::crash_run_answering(
+        &project,
+        &["run", "flow.signed", "--input", "topic=durability"],
+        &answering,
+        &["{\"decision\": \"approve\"}"],
+        |_| provider.snapshot().requests >= 2,
+    );
+    assert!(
+        killed
+            .stderr
+            .contains("answer `sign_off/0` with one line of JSON"),
+        "the first generation asked the question: {}",
+        killed.stderr
+    );
+
+    // Everything ahead of the frontier is behind the crash: the model call, and
+    // the answer a person gave.
+    provider.reset();
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "note": "signed and relayed" })),
+    ));
+
+    let resumed = harness::resume(
+        &project,
+        "durability",
+        &killed.execution,
+        Some("json"),
+        &harness::environment(&provider),
+    );
+    resumed.succeeded();
+    let answered = resumed.outputs();
+    assert_eq!(answered["status"], "completed", "{answered}");
+    assert_eq!(
+        answered["outputs"]["decision"], "approve",
+        "the resumed run goes on with what the person answered, not with the \
+         channel's default: {answered}"
+    );
+    assert_eq!(
+        answered["outputs"]["final"], "signed and relayed",
+        "…and reached the node past the pause: {answered}"
+    );
+    assert!(
+        !resumed.stderr().contains("answer `sign_off/0`"),
+        "a resumed execution does not put an answered question to a person a \
+         second time: {}",
+        resumed.stderr()
+    );
+    assert_eq!(
+        provider.snapshot().requests,
+        1,
+        "…and asked the provider only for the call the crash interrupted"
+    );
+
+    // The trace `--format json` carries, which is the resumed generation's own
+    // whole document (`docs/durability.md` §9).
+    let entries: Vec<&Value> = answered["trace"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the report carries the run's trace: {answered}"))
+        .iter()
+        .filter(|entry| entry["node"] == "sign_off")
+        .collect();
+    let [signed] = entries.as_slice() else {
+        panic!("the resumed generation filed one entry for the pause: {entries:?}");
+    };
+    let pause = &signed["human"];
+    assert_eq!(pause["settled"], "resumed", "{signed}");
+    let paused = pause["pausedAt"].as_str().expect("when the wait began");
+    let settled = pause["settledAt"].as_str().expect("when it was answered");
+    assert!(
+        paused <= settled,
+        "a replayed wait is dated by the generation that held it: this one was \
+         answered at {settled} and says it began at {paused}"
+    );
+}
+
+/// A contract that moved on the **first** of two tools at one effect site is a
+/// divergence, not an ordinary mismatch a `retry:` absorbs.
+///
+/// `docs/durability.md` §7 lets one recorded mismatch through: the one the
+/// recording generation's own ladder already retried past. What tells the two
+/// apart is the next record at the site — and *next* has to mean "the same
+/// request again", not merely "the next one". `agent.reading` calls `tool.alpha`
+/// and then `tool.beta` in one loop, so the site holds `ask/0#tool/0` and
+/// `ask/0#tool/1`; tightening only alpha's `output:` puts beta's record exactly
+/// where a second attempt of alpha would have been.
+///
+/// The composition's own `retry: { max: 2 }` on the node is what makes getting
+/// this wrong catastrophic rather than merely wrong: an ordinary `ResultMismatch`
+/// is absorbed, and the second attempt claims ordinals past the frontier — a live
+/// provider call and a live re-run of **both** subprocesses, which is the double
+/// side effect resolved q29 exists to prevent.
+#[test]
+fn a_contract_that_moved_on_one_of_two_tools_at_a_site_is_not_read_as_a_retry() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        // One answer, two calls: two `tool` effects at one site.
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![
+                ToolCall::new("alpha", json!({ "line": "the first source" })),
+                ToolCall::new("beta", json!({ "line": "the second source" })),
+            ]),
+        ),
+        // The loop offers the agent's tools while the model is calling them and
+        // asks for the declared `output:` once it stops, so the turn after the
+        // two results is a plain answer and the structured one is its own call.
+        Script::new(SONNET, Outcome::text("both sources agree")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "note": "both sources agree" })),
+        ),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "note": "relayed" })).after(Duration::from_secs(120)),
+        ),
+    ]);
+
+    let Some((project, built)) = harness::build_under_toolchain("durability", "resume-two-tools")
+    else {
+        return;
+    };
+    assert!(
+        built.status.success(),
+        "the durability fixture did not build"
+    );
+
+    let shims = harness::Scratch::new("two-tools");
+    let log = shims.path().join("tally.log");
+    harness::shim(
+        shims.path(),
+        "alpha",
+        "printf 'alpha\\n' >> \"$TALLY_LOG\"\nprintf 'alpha said so'\n",
+    );
+    harness::shim(
+        shims.path(),
+        "beta",
+        "printf 'beta\\n' >> \"$TALLY_LOG\"\nprintf 'beta said so'\n",
+    );
+    let mut environment = harness::environment(&provider);
+    environment.push((
+        harness::TALLY_BIN.to_string(),
+        shims.path().display().to_string(),
+    ));
+    environment.push((harness::TALLY_LOG.to_string(), log.display().to_string()));
+
+    let killed = harness::crash_run(
+        &project,
+        &["run", "flow.sourced", "--input", "topic=durability"],
+        &environment,
+        |_| {
+            // `relay`'s call is the one in flight, and both of `ask`'s tool
+            // effects are in the record rather than merely in the shim's log.
+            provider.snapshot().requests >= 4
+                && harness::journal_holds(&project, &["ask/0#tool/0", "ask/0#tool/1"])
+        },
+    );
+    assert_eq!(
+        harness::lines_in(&log),
+        2,
+        "the first generation read both sources once: {}",
+        killed.stderr
+    );
+
+    // Exactly one line moves, and it is the **first** tool's contract. The
+    // binding itself is untouched, so the request identity still matches and the
+    // divergence is the one decided at the parse (`docs/durability.md` §7).
+    let moved = harness::Scratch::new("two-tools-contract");
+    let source = std::fs::read_to_string(harness::fixture("durability")).expect("the fixture");
+    let edited = source.replace(
+        "    first: { type: string }",
+        "    first: { type: string, min_length: 500 }",
+    );
+    assert_ne!(
+        edited, source,
+        "`tool.alpha`'s output is what this copy moves"
+    );
+    let entrypoint = moved.path().join("main.yml");
+    std::fs::write(&entrypoint, edited).expect("the scratch area is writable");
+
+    provider.reset();
+    let resumed = harness::resume_entrypoint(
+        &project,
+        &entrypoint,
+        &killed.execution,
+        Some("json"),
+        &environment,
+    );
+    let said_on_stderr = resumed.failed();
+    let answered = resumed.outputs();
+    assert_eq!(answered["status"], "failed", "{answered}\n{said_on_stderr}");
+    let said = answered["error"].as_str().expect("an error");
+    assert!(
+        said.starts_with("ReplayDivergence: "),
+        "a recorded answer this build no longer accepts is a divergence whatever \
+         else the site went on to do: {said}"
+    );
+    assert!(
+        said.contains("`ask/0#tool/0`"),
+        "…named at the effect whose contract moved, not at the one after it: {said}"
+    );
+    assert_eq!(
+        provider.snapshot().requests,
+        0,
+        "a divergence re-executes nothing: an absorbed mismatch would have spent \
+         the node's second attempt on a live model call"
+    );
+    assert_eq!(
+        harness::lines_in(&log),
+        2,
+        "…and neither source was read a second time"
+    );
+}
+
+/// A store whose data **died with the process** is refused rather than answered
+/// out of an empty database (`docs/durability.md` §5).
+///
+/// `flow.scratched` writes to a `scope: execution` store, calls a model, and then
+/// reads the store back. The crash lands in the model call, so the write is in
+/// the record and the read is past the frontier — and a replayed write is never
+/// applied a second time, so the resumed process holds a scratch database that
+/// was created empty a moment ago.
+///
+/// Nothing about that compares unequal: the read's request identity has not
+/// moved and there is no record to compare it against. So without the refusal the
+/// resume answers `found: false` about something the execution wrote, routes on
+/// it, and reports `completed` — a wrong answer with no diagnostic, which is
+/// worse than a failed resume.
+#[test]
+fn a_store_that_died_with_the_process_refuses_the_resume_it_cannot_answer() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "note": "a scratched note" })).after(Duration::from_secs(120)),
+    ));
+
+    let Some((project, built)) = harness::build_under_toolchain("durability", "resume-scratch")
+    else {
+        return;
+    };
+    assert!(
+        built.status.success(),
+        "the durability fixture did not build"
+    );
+
+    let environment = harness::environment(&provider);
+    let killed = harness::crash_run(
+        &project,
+        &["run", "flow.scratched", "--input", "topic=durability"],
+        &environment,
+        |_| {
+            provider.snapshot().requests >= 1
+                && harness::journal_holds(&project, &["stash/0#store/0"])
+        },
+    );
+
+    provider.reset();
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "note": "a scratched note" })),
+    ));
+    let resumed = harness::resume(
+        &project,
+        "durability",
+        &killed.execution,
+        Some("json"),
+        &environment,
+    );
+    let said_on_stderr = resumed.failed();
+    let answered = resumed.outputs();
+    assert_eq!(answered["status"], "failed", "{answered}\n{said_on_stderr}");
+    let said = answered["error"].as_str().expect("an error");
+    assert!(
+        said.starts_with("ReplayDivergence: "),
+        "a live read of a store the record filled in a process that is gone is \
+         not an answer this build can give: {said}"
+    );
+    assert!(
+        said.contains("`recall/0`") && said.contains("`store.scratch`"),
+        "…naming the op it stopped at and the store it cannot reconstruct: {said}"
+    );
+    assert!(
+        said.contains("scope: session"),
+        "…and what the composition would have to say instead: {said}"
+    );
+    assert_eq!(
+        provider.snapshot().requests,
+        1,
+        "the frontier's own call is live and nothing past it ran"
+    );
+}
+
 /// `serve` auto-recovers (resolved q28): "on process start it replays every
 /// execution the journal holds open, including executions parked on `human`
 /// waits, which re-park with their wait ids intact — the wait id is
@@ -11916,10 +12315,16 @@ fn a_diverged_resume_leaves_the_execution_open_for_the_composition_that_fits_it(
 /// Shared by the three tests above because setting it up is the expensive half:
 /// two dispatched subflow instances and two detached deliveries have to be
 /// **recorded** before the crash, or the resume would meet a frontier where the
-/// tests want a comparison. The predicate waits for both, and then for the
-/// journal to have caught up with the delivery whose line the shim has already
-/// written — a detached delivery is journaled when it answers, and nothing in
-/// the run is waiting for that moment.
+/// tests want a comparison.
+///
+/// So the predicate waits for the **records**, not for the effects. A detached
+/// delivery is journaled when it answers and nothing in the run waits for that
+/// moment (grammar 8.6 rule 7), so the shim's own log line is written some way
+/// ahead of the append that follows it — the child has still to exit, its
+/// streams to close and the promise to resolve. Watching the log and then
+/// sleeping would be a race this suite loses on a loaded runner, and would lose
+/// it as "the delivery ran three times" rather than as "the kill was early".
+/// [`harness::journal_holds`] is the same condition read off the journal.
 fn crash_a_parceled_run(
     provider: &MockProvider,
     purpose: &str,
@@ -11950,7 +12355,6 @@ fn crash_a_parceled_run(
     ));
     environment.push((harness::RECEIPT_LOG.to_string(), log.display().to_string()));
 
-    let settled = std::cell::Cell::new(0_u32);
     let killed = harness::crash_run(
         &project,
         &[
@@ -11963,13 +12367,17 @@ fn crash_a_parceled_run(
         ],
         &environment,
         |_| {
-            let there = provider.snapshot().requests >= 3 && harness::lines_in(&log) >= 2;
-            settled.set(if there { settled.get() + 1 } else { 0 });
-            // Five consecutive polls, which is a tenth of a second after the last
-            // delivery wrote its line: long enough for the append that follows it,
-            // and bounded by `crash_run`'s own deadline either way.
-            settled.get() >= 5
+            // Both subflow instances answered and `wrap`'s call is the one in
+            // flight, and both deliveries are in the record under the dispatch's
+            // own instance path (`docs/durability.md` §4).
+            provider.snapshot().requests >= 3
+                && harness::journal_holds(&project, &["receipt/0/0#tool/0", "receipt/0/1#tool/0"])
         },
+    );
+    assert_eq!(
+        harness::lines_in(&log),
+        2,
+        "the two deliveries the journal holds are the two the shim made"
     );
     Some((project, killed, environment, shims))
 }
