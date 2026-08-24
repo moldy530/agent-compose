@@ -400,10 +400,27 @@ the partition when it ends exactly as the crashed one would have.
 generation's clock, and a `human` node's own budget restarts when the wait
 re-parks — a wait the journal *holds* is not re-parked at all, and replays with
 the instants the recording generation measured (§3.4). A backoff's jitter is
-re-rolled. None of it changes what an effect
-answers; it can change *whether* a deadline fires, and a resumed execution whose
-budgets fire differently is a resumed execution whose effect sequence diverges —
-reported as §7 rather than silently accepted.
+re-rolled. None of it changes what an effect answers, and a recorded effect is
+answered out of the record whatever the clock says.
+
+What it can change is *whether* a deadline fires, and that is a change in the
+**shape** of the run rather than in the identity of any effect. Replaying an
+attempt costs no wall clock, so a node whose `timeout:` ended its `retry:`
+ladder on the recording generation can have budget left to go round again on the
+resumed one. That next attempt claims a key the journal does not hold — which is
+the frontier, exactly as §5 defines it — so the effect is issued **live** and
+recorded, and the resumed execution has done something the recording one did
+not.
+
+That is not a divergence and is not reported as one: nothing compares unequal,
+and neither does the reverse case, where a resumed generation's deadline fires
+*earlier* and leaves records at that site unconsumed. It is the same
+at-least-once compromise §2 states for an effect that answered with no row for
+it, reached through a policy instead of through a crash, and it is bounded the
+same way — a repeat carries `docs/grammar.md` §9.4's idempotency key wherever the
+effect has one, which a store write and a detached dispatch do and an `exec:`
+does not. A composition that cannot afford the repeat is one whose node should
+not carry both a `timeout:` and a `retry:` over a non-idempotent effect.
 
 ## 6. Recovery: `serve` and `resume`
 
@@ -751,8 +768,13 @@ backend v1 binds rather than a feature left out:
 Three more, all consequences of §5 rather than deferrals:
 
 * an effect that happened with **no row** for it (§2) is re-executed on replay;
-* a resumed execution whose deadlines fire differently from the original's
-  diverges (§5) and is reported as §7, rather than silently re-executing;
+* a resumed execution's deadlines are the **resumed generation's** (§5). A node
+  budget that ended a `retry:` ladder on the recording generation may not end it
+  on the replayed one, where the recorded attempts cost no wall clock, so a
+  resume can spend an attempt the original never spent. What that attempt issues
+  is a live effect past the frontier rather than a re-issue of a recorded one,
+  and nothing about it compares unequal — so it is not §7's divergence and is
+  not reported as one;
 * an execution that reads a **store whose data lives in the process** across the
   frontier cannot be resumed (§5). Nothing reconstructs the rows a
   `scope: execution` `kv`/`vector` store held, so the resume is refused rather
