@@ -673,7 +673,15 @@ Stated by resolved q28, and restated here so a reader is not left to infer it:
   project has ever issued, exactly as the stores' idempotency ledger does, and
   retention is deleting it.
 
-Two more this document adds, both consequences of §5 rather than deferrals:
+And one this document states rather than defers, because it is a property of the
+backend v1 binds rather than a feature left out:
+
+* **two processes on one project's journal at once.** The driver's virtual file
+  system implements no cross-process locking (§2), so one process at a time
+  writes a project's journal — `agent-compose resume` beside a live `serve`
+  included.
+
+Two more, both consequences of §5 rather than deferrals:
 
 * an effect that happened with **no row** for it (§2) is re-executed on replay;
 * a resumed execution whose deadlines fire differently from the original's
