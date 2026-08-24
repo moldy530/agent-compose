@@ -188,11 +188,24 @@ mod tests {
     /// is green and every replay past that node issues its call again.
     ///
     /// So this reads it from the bottom up instead, off the **primitives**
-    /// rather than off the seams: every `fetch`, every `spawn`, every
-    /// filesystem call and every SQLite statement in **every** emitted constant
-    /// module has to sit somewhere the six can reach, or be named below as
-    /// something that is not an effect the graph issues. `runGrpc` fails here on
-    /// the first line of its body.
+    /// rather than off the seams: every call to the world in **every** emitted
+    /// constant module has to sit somewhere the six can reach, or be named below
+    /// as something that is not an effect the graph issues. `runGrpc` fails here
+    /// on the first line of its body.
+    ///
+    /// **What counts as a primitive is derived rather than listed**, which is
+    /// the difference between a rule and a spot check. A hand-written list of
+    /// spellings is only as complete as the last person to extend it: `spawn(`
+    /// does not match `spawnSync(`, `fs.writeFileSync` does not match
+    /// `fs.appendFileSync` or `fs.promises.writeFile`, and a surface written
+    /// with any call the list happens not to hold passes both directions of the
+    /// inventory while replaying into a second side effect. So the primitives
+    /// are read off each module's **imports**: a module specifier is either one
+    /// whose surface is the world ([`WORLD_MODULES`]) — in which case *every*
+    /// binding it introduces is a primitive, whatever member of it is called —
+    /// or one that reaches nothing outside the process ([`INERT_MODULES`]), and
+    /// a specifier in neither list fails this test until somebody says which it
+    /// is. What arrives with no import to derive it from is [`UNIMPORTED`].
     ///
     /// Reachability is transitive because the seams are thin: `runExec` calls
     /// `runExecLive`, which calls `spawn`; `runStoreOp` calls `perform`, which
@@ -211,27 +224,76 @@ mod tests {
     /// file is **partitioned** by its column-zero declarations, whatever their
     /// keyword, and every primitive is attributed to the declaration it sits
     /// under.
+    /// Module specifiers whose surface **is** the world.
+    ///
+    /// Every binding one of these introduces is a primitive: the whole of
+    /// `node:fs` rather than the six calls of it this repository happens to
+    /// make today, the whole of `node:child_process` rather than `spawn` alone.
+    /// A module listed here is a decision that anything reached through it
+    /// leaves the process.
+    const WORLD_MODULES: [&str; 13] = [
+        "node:fs",
+        "node:fs/promises",
+        "node:child_process",
+        "node:net",
+        "node:tls",
+        "node:dgram",
+        "node:dns",
+        "node:http",
+        "node:https",
+        "node:http2",
+        "node:cluster",
+        "node:worker_threads",
+        "node-sqlite3-wasm",
+    ];
+
+    /// Module specifiers that reach nothing outside the process, each with the
+    /// reason it does not.
+    ///
+    ///  * `node:path`, `node:url`, `node:crypto` — string and byte arithmetic.
+    ///  * `node:process` — `env`, `argv`, `exit` and the two standard streams.
+    ///    Writing a diagnostic to `stderr` is not an effect a composition
+    ///    issues, and no replay is "of" one.
+    ///  * `@langchain/langgraph` — the graph engine the emitted nodes run
+    ///    under. It calls the world only through the node bodies this compiler
+    ///    emits, which are what the rest of this test reads.
+    ///  * `fastify` — the app `serve` mounts. Its socket belongs to the
+    ///    *command*, like `writeTrace`'s file: a recovered execution is replayed
+    ///    into a server that is already listening, so nothing here is ever
+    ///    reached a second time by a replay.
+    const INERT_MODULES: [&str; 6] = [
+        "node:path",
+        "node:process",
+        "node:url",
+        "node:crypto",
+        "@langchain/langgraph",
+        "fastify",
+    ];
+
+    /// What calls the world with no import to derive it from.
+    ///
+    /// Two families. The **platform globals** — `fetch` and the transports a
+    /// future surface would most plausibly reach for — are in the runtime rather
+    /// than in a module, so no specifier introduces them. And the SQLite
+    /// **handle**: its driver arrives by dynamic `import()` (classified with the
+    /// rest, see [`WORLD_MODULES`]) and its binding is destructured out of the
+    /// promise, so the names to watch are the constructor and the handle every
+    /// statement goes through — `#database.run(…)` included, which is why the
+    /// entry is the member prefix rather than a call.
+    const UNIMPORTED: [&str; 9] = [
+        "fetch(",
+        "WebSocket(",
+        "EventSource(",
+        "XMLHttpRequest(",
+        "navigator.sendBeacon(",
+        "Bun.",
+        "Deno.",
+        "Database(",
+        "database.",
+    ];
+
     #[test]
     fn nothing_in_the_emitted_runtime_calls_the_world_except_under_a_journaled_seam() {
-        // The primitives. Each one *is* the effect — the moment a process
-        // leaves itself — so a replay that reaches one has re-executed
-        // something whatever the code around it is called.
-        const PRIMITIVES: [&str; 13] = [
-            "fetch(",
-            "spawn(",
-            "fs.writeFileSync",
-            "fs.readFileSync",
-            "fs.renameSync",
-            "fs.rmSync",
-            "fs.mkdirSync",
-            "fs.existsSync",
-            "fs.readdirSync",
-            "database.run(",
-            "database.get(",
-            "database.all(",
-            "database.exec(",
-        ];
-
         // What calls the world and is **not** an effect the graph issues, so is
         // not one a replay may perform twice. Each is named with its module,
         // because the same name in another module would be a different decision:
@@ -240,9 +302,12 @@ mod tests {
         //    run by `runFlow` when a run ends. It removes what the run owned;
         //    running it twice removes it twice.
         //  * `notify` — the completion webhook of an `async` `http` trigger
-        //    (grammar 13.3). It reports an execution that has already ended, and
-        //    a row is closed before it fires, so no replay ever reaches it: the
-        //    process that finishes a run is the one that calls it, once
+        //    (grammar 13.3). It reports an execution that has **ended**, and
+        //    `settling` fires it on exactly the outcomes that close the
+        //    lifecycle row — it is skipped under `runtime.staysOpen`, which is
+        //    the same predicate the row itself is closed by. So the execution a
+        //    later process replays is one no webhook has been sent for, and the
+        //    process that finishes a run is the one that calls this, once
         //    (`docs/durability.md` §6.1).
         //  * `writeTrace` — the run's own trace document, written by the command
         //    after the run (`docs/trace.md`). A resumed generation writes a fresh
@@ -271,6 +336,41 @@ mod tests {
             ("src/cli.ts", include_str!("js/cli.ts")),
             ("src/cel.ts", include_str!("js/cel.ts")),
         ];
+        // The primitives, derived. Each one *is* the effect — the moment a
+        // process leaves itself — so a replay that reaches one has re-executed
+        // something whatever the code around it is called.
+        let mut primitives: BTreeSet<String> = UNIMPORTED.into_iter().map(str::to_string).collect();
+        for (module, source) in modules {
+            for statement in imports(source) {
+                for specifier in specifiers(&statement) {
+                    // Another emitted module, read in its own right by the loop
+                    // this one is inside.
+                    if specifier.starts_with('.') {
+                        continue;
+                    }
+                    if INERT_MODULES.contains(&specifier.as_str()) {
+                        continue;
+                    }
+                    assert!(
+                        WORLD_MODULES.contains(&specifier.as_str()),
+                        "`{module}` imports `{specifier}`, which this test cannot classify. Say \
+                         which it is: `WORLD_MODULES` if anything reached through it leaves the \
+                         process — every binding it introduces then has to sit under one of \
+                         {SEAMS:?} — or `INERT_MODULES`, with the reason it reaches nothing \
+                         outside this process."
+                    );
+                    // A type-only import introduces no value, so it calls
+                    // nothing; the specifier is still classified above, because
+                    // a module that arrives as a type today is one somebody
+                    // imports for its functions tomorrow.
+                    if statement.starts_with("import type ") {
+                        continue;
+                    }
+                    primitives.extend(bindings(&statement));
+                }
+            }
+        }
+
         let declared: Vec<(&str, String, String)> = modules
             .iter()
             .flat_map(|(module, source)| {
@@ -311,8 +411,8 @@ mod tests {
 
         let mut exempted: BTreeSet<(&str, &str)> = BTreeSet::new();
         for (module, name, body) in &declared {
-            for primitive in PRIMITIVES {
-                if !body.contains(primitive) {
+            for primitive in &primitives {
+                if !body.contains(primitive.as_str()) {
                     continue;
                 }
                 if NOT_AN_EFFECT.contains(&(module, name.as_str())) {
@@ -336,6 +436,96 @@ mod tests {
                 .collect::<BTreeSet<(&str, &str)>>(),
             "an exemption nothing uses is one nobody is checking: drop it"
         );
+    }
+
+    /// Every `import` of an emitted module, each flattened onto one line.
+    ///
+    /// Flattened because an import list is formatted across lines as soon as it
+    /// is long enough, and a reading that took lines would see the specifier and
+    /// the names it introduces as different statements. The **dynamic** ones are
+    /// here too, as bare `import("…")` fragments: the SQLite driver arrives that
+    /// way, and a module loaded at a call site is as much a module this project
+    /// imports as one loaded at the top.
+    fn imports(source: &str) -> Vec<String> {
+        let mut found: Vec<String> = Vec::new();
+        let mut held: Option<String> = None;
+        for line in source.lines() {
+            if let Some(at) = line.find("import(") {
+                found.push(line[at..].trim().to_string());
+            }
+            if held.is_none() && !line.starts_with("import ") {
+                continue;
+            }
+            let mut statement = held.take().unwrap_or_default();
+            if !statement.is_empty() {
+                statement.push(' ');
+            }
+            statement.push_str(line.trim());
+            if statement.contains("from \"") {
+                found.push(statement);
+            } else {
+                held = Some(statement);
+            }
+        }
+        found
+    }
+
+    /// The module specifiers one import statement names.
+    fn specifiers(statement: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        let mut rest = statement;
+        for opener in ["from \"", "import(\""] {
+            while let Some(at) = rest.find(opener) {
+                let after = &rest[at + opener.len()..];
+                let Some(end) = after.find('"') else { break };
+                found.push(after[..end].to_string());
+                rest = &after[end..];
+            }
+            rest = statement;
+        }
+        found
+    }
+
+    /// The primitives one import of a [`WORLD_MODULES`] specifier introduces.
+    ///
+    /// A **named** import is a call under its local name — `spawn` from
+    /// `node:child_process` is `spawn(`, and `{ spawn as launch }` is `launch(`.
+    /// A default or namespace import is the whole surface under its own name, so
+    /// it is the member prefix `fs.` rather than any list of calls: that is what
+    /// makes `fs.appendFileSync` and `fs.promises.writeFile` primitives without
+    /// anybody having thought of them.
+    fn bindings(statement: &str) -> Vec<String> {
+        let body = statement
+            .strip_prefix("import ")
+            .unwrap_or(statement)
+            .split(" from \"")
+            .next()
+            .unwrap_or_default()
+            .trim();
+        let (before, named) = match (body.find('{'), body.find('}')) {
+            (Some(open), Some(close)) if open < close => (&body[..open], &body[open + 1..close]),
+            _ => (body, ""),
+        };
+        let mut found: Vec<String> = named
+            .split(',')
+            .filter_map(|entry| entry.rsplit(" as ").next())
+            .map(str::trim)
+            .filter(|name| !name.is_empty() && *name != "type")
+            .map(|name| format!("{name}("))
+            .collect();
+        // Whatever is left of the braces: `fs`, `* as fs`, or `fs,`.
+        let whole = before
+            .trim()
+            .trim_end_matches(',')
+            .trim()
+            .trim_start_matches('*')
+            .trim()
+            .trim_start_matches("as ")
+            .trim();
+        if !whole.is_empty() {
+            found.push(format!("{whole}."));
+        }
+        found
     }
 
     /// Whether `body` calls `name`, as a call rather than as a longer word.
