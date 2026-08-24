@@ -240,9 +240,19 @@ inside one is the exception to rule 7's "nothing it does can delay the enclosing
 flow instance" — §7 makes a divergence un-absorbable by any policy, and
 `detach:` is a policy — so it is held against the execution and fails it: at the
 next effect any branch of the run reaches, or on the way out of `runFlow` for a
-run with none left. What the run does not do is *wait* for a detached delivery,
-which rule 7 forbids: a divergence raised after the run has already quiesced has
-no run left to fail, and is written to stderr instead.
+run with none left.
+
+What no *flow instance* waits for is the delivery itself, which is rule 7. The
+**execution** waits once, and only where waiting buys the sentence above: on the
+way out of a run whose lifecycle row stays **open** (§3.6) — parked at a `human`
+pause, or stopped by a divergence — `runFlow` waits for the deliveries it
+dispatched to be recorded before it lets the run go. Such a run is one a resume
+replays, and a delivery still in flight when the process walks away is an effect
+with no row, which the resumed generation issues a second time. That is not §2's
+window and not a crash: `agent-compose run`'s exit `3` is a documented way to
+stop, so the repeat would be systematic rather than a race. A run that **ended**
+waits for nothing, because nothing will replay it — and a divergence raised in a
+delivery after that has no run left to fail, so it is written to stderr instead.
 
 ### 3.3 A store op
 
@@ -274,6 +284,12 @@ record back. A resumed generation that dated `pausedAt` by its own clock and
 took `settledAt` from the record would file an entry whose answer arrives before
 its question, which is the opposite of what §9 promises a reader.
 
+A replayed answer is **parsed against the node's `output:` again**, by the same
+schema the delivery that recorded it was held to. An answer a narrowed `output:`
+no longer admits is §7's second divergence and is raised as one: no other reader
+would catch it — a human answer reaches no result parse — and the resume would
+otherwise end reporting a value the composition refuses.
+
 An **unsettled** wait records nothing, and that is the whole of re-parking: a
 resumed execution reaching a wait the journal does not hold parks under the same
 wait id — the id is the node's instance path (`docs/grammar.md` §9.4), so it is
@@ -294,6 +310,7 @@ One row per execution, written before the graph is streamed:
 | `trigger` | what started it: `manual` for `agent-compose run` and for a `manual` trigger, an `http` trigger's own name where one did. **Recorded and never dispatched on** — resolved q28: recovery replays executions that exist, it does not re-fire the trigger that created them |
 | `inputs` | the invocation's inputs, as the flow's `inputs:` parsed them |
 | `sessionKey` | the session identity `scope: session` stores key off (`docs/grammar.md` §11.3) |
+| `callback` | where this execution's completion webhook goes, for an `async` `http` trigger that asked for one (`docs/grammar.md` §13.3) — absent for every other invocation. Recorded because the process that *finishes* an execution need not be the one that started it (§6.1), and resolved when the request arrives rather than when the run ends, which is what makes that possible. The URL only: the request it came out of is not kept |
 | `status` | `open`, `completed` or `failed` — §3.6 |
 | `journalVersion` | the version at the head of this document |
 | `startedAt`, `endedAt`, `error` | when, and why it failed |
@@ -396,6 +413,15 @@ resumed execution reads across the frontier has to be `scope: session` or
 directory on disk, so its contents are still there, and the resumed run removes
 the partition when it ends exactly as the crashed one would have.
 
+A generation that only **parked** removes nothing. `agent-compose run` reaching
+a `human` pause with nobody to answer it is not a crash — it exits `3` and
+leaves the row open (§3.6) — so it lets go of what it holds *in this process*
+and leaves what is on disk for the generation that finishes the execution. The
+alternative is the failure above with nothing to catch it: a partition deleted
+on the way out, a replayed `put` that is never applied again, and a live `get`
+past the frontier answering `found: false` about something the record says the
+execution wrote.
+
 **Time is not replayed.** A `timeout:` budget runs against the resumed
 generation's clock, and a `human` node's own budget restarts when the wait
 re-parks — a wait the journal *holds* is not re-parked at all, and replays with
@@ -438,7 +464,10 @@ on:
   a `POST /executions/:id/resume` prepared against the process that died still
   finds its wait;
 * the status route answers for a recovered execution exactly as it answers for
-  one this process started;
+  one this process started, and a recovered execution that finishes **delivers
+  the `callback:` webhook** its request asked for — the URL is on the lifecycle
+  row (§3.5), because a caller who was handed a `202` and is waiting for a push
+  is not polling the status route;
 * recovery **does not wait** for the replays to finish. The executions it
   recovers are by definition ones that were still running, and the commonest of
   them is parked on a question nobody has answered yet. Registering them is what
@@ -519,7 +548,9 @@ contract.** A composition may keep a binding exactly as it was and tighten what
 it will accept back — a `min_length:` added to a field, an `enum:` narrowed —
 and the recorded answer then satisfies the request check and fails the node's
 declared `output:`. That is decided where the answer is parsed rather than at
-the seam, because the contract belongs to the node, and it is a divergence
+the seam, because the contract belongs to the node: at the node's result parse
+for a model or tool answer, and at the replayed wait itself for a `human` one
+(§3.4), which is the single kind that reaches no result parse. It is a divergence
 rather than the ordinary "this answered off-contract" failure for the reason
 below: an ordinary one is a node failure, a `retry:` absorbs it, and the second
 attempt claims an ordinal past the frontier and **re-issues the effect live** —

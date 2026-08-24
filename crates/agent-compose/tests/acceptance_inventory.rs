@@ -1074,6 +1074,20 @@ const DURABILITY: &[Criterion] = &[
                 "a_store_that_died_with_the_process_refuses_the_resume_it_cannot_answer",
                 Status::Live,
             ),
+            // …and its opposite, which is the premise the refusal is carved out
+            // of: a store that *does* outlive the process has to be there, so a
+            // run that only parked leaves its own `blob` partition alone.
+            (
+                "a_parked_runs_own_blob_store_is_there_for_the_generation_that_resumes",
+                Status::Live,
+            ),
+            // …and the second divergence at the one record kind that reaches no
+            // result parse: an answer a person gave, under an `output:` the
+            // composition has since narrowed.
+            (
+                "a_recorded_human_answer_the_composition_no_longer_admits_is_a_divergence",
+                Status::Live,
+            ),
             // …and the three nesting depths a divergence may not be absorbed at:
             // a dispatched subflow under `on_item_error: skip`, the item retry
             // the other form of that key gives, and a delivery nothing waits for.
@@ -1128,6 +1142,20 @@ const DURABILITY: &[Criterion] = &[
             // …and the `serve` half, which recovers on its own.
             (
                 "a_restarted_serve_recovers_its_open_executions_and_their_waits",
+                Status::Live,
+            ),
+            // …including what an `async` caller was promised: the completion
+            // webhook is fired by the process that *finishes* the run, which is
+            // not the one that answered its `202`.
+            (
+                "a_recovered_execution_delivers_the_completion_webhook_its_caller_waits_for",
+                Status::Live,
+            ),
+            // …and what a run that stops on its own must not leave behind: a
+            // detached delivery made with no record is one the resume makes
+            // again.
+            (
+                "a_detached_delivery_in_flight_when_a_run_parks_is_not_delivered_twice",
                 Status::Live,
             ),
             // …and what "survives" has to mean when a build disagrees with the

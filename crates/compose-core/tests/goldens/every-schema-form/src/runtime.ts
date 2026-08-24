@@ -5155,7 +5155,7 @@ export async function runMap(
         modelCalls: undefined,
         toolDispatches: undefined,
       };
-      void (async () => {
+      const delivering = (async () => {
         // `max_concurrency` is an **admission** bound over every in-flight
         // dispatch, detached included (grammar 8.6's key table, D28): a detached
         // delivery waits for a node permit to *start*, exactly as a joined
@@ -5192,6 +5192,12 @@ export async function runMap(
         const diverged = divergenceOf(error);
         if (diverged !== undefined) latchDivergence(scoped.execution.id, diverged);
       });
+      // Held against the execution rather than let go of entirely. Rule 7 is
+      // about what the flow instance waits for, and it still waits for nothing:
+      // this promise is read by [`settleDetached`] alone, on the one way out
+      // where a delivery with no record is a delivery that happens **twice**
+      // (see there, and `docs/durability.md` §3.2).
+      holdDelivery(scoped.execution.id, delivering);
       continue;
     }
 
@@ -5335,6 +5341,65 @@ export async function runMap(
     ...(models.length === 0 ? {} : { models }),
     ...(toolDispatches.length === 0 ? {} : { toolDispatches }),
   };
+}
+
+/**
+ * Every detached `map` delivery still in flight, by execution.
+ *
+ * A `Set` per execution because a fan-out dispatches many and each settles on
+ * its own, and keyed by execution because that is the scope the one reader cares
+ * about: [`settleDetached`] is asked about a run that has stopped, and a
+ * delivery under a `flow:` node or inside a flow a model called belongs to the
+ * same execution as the run that started it (see [`openSession`]).
+ */
+const detachedDeliveries = new Map<string, Set<Promise<void>>>();
+
+/** Note one delivery for as long as it is in flight. See [`settleDetached`]. */
+function holdDelivery(execution: string, delivery: Promise<void>): void {
+  let held = detachedDeliveries.get(execution);
+  if (held === undefined) {
+    held = new Set();
+    detachedDeliveries.set(execution, held);
+  }
+  held.add(delivery);
+  void delivery.finally(() => {
+    const still = detachedDeliveries.get(execution);
+    if (still === undefined) return;
+    still.delete(delivery);
+    if (still.size === 0) detachedDeliveries.delete(execution);
+  });
+}
+
+/**
+ * Wait for the detached deliveries of an execution whose row **stays open**
+ * (`docs/durability.md` §3.2).
+ *
+ * Grammar 8.6 rule 7 says nothing a detached delivery does may delay the
+ * enclosing flow instance, and nothing here does: the join returned long ago,
+ * the trace entry was written without it, and this is `runFlow` on its way out
+ * of a run that has already stopped advancing.
+ *
+ * What it buys is the sentence §3.2 makes about a delivery's record — "a replay
+ * does not deliver it twice". A delivery's row is written when the delivery
+ * answers, so a process that walks out from under one leaves an effect with no
+ * record, and the generation that resumes this execution issues it again. For a
+ * run that **ended** that costs nothing, because nothing will resume it. For a
+ * run that parked at a `human` pause — `agent-compose run`'s own exit-3 path,
+ * which is not a crash and not §2's one-statement window — it is a second
+ * delivery every time.
+ *
+ * Called after the wait board is released, so a delivery holding a pause of its
+ * own is already abandoned rather than something this could wait on for ever.
+ * The loop re-reads the map because a delivery may dispatch a fan-out of its
+ * own, and every promise here has its rejection already swallowed by the
+ * `.catch` rule 7 requires, so nothing this awaits can throw.
+ */
+export async function settleDetached(execution: string): Promise<void> {
+  for (;;) {
+    const held = detachedDeliveries.get(execution);
+    if (held === undefined || held.size === 0) return;
+    await Promise.all([...held]);
+  }
 }
 
 /** A failed item, carrying how many attempts its policy made. */
@@ -6242,7 +6307,27 @@ export async function runHuman(
       settled: held.settled,
     };
     if (held.settled === "resumed") {
-      return { output: held.output, human: replayedPause };
+      // Held to the contract this build declares, exactly as the delivery that
+      // recorded it was ([`deliverHumanAnswer`] parses before it settles). This
+      // is resolved q29's **second** divergence at the one record kind whose
+      // answer a person gave: an `output:` the composition has since narrowed
+      // makes the recorded answer one this run may not go on with, and no other
+      // reader would catch it — a `human` answer reaches no `parseResult`, so
+      // the note [`recordedAnswerOf`] reads is never consulted, and the run
+      // would end reporting an output its own schema refuses.
+      //
+      // Raised as a [`ReplayDivergence`] rather than as the mismatch the parse
+      // threw, and off this slot rather than off the note, for that class's
+      // reason: it has to travel past every policy and name the step
+      // (`docs/durability.md` §7), and here the step is known outright.
+      try {
+        return { output: descriptor.parse(held.output), human: replayedPause };
+      } catch (error) {
+        throw new ReplayDivergence(
+          slot,
+          `the recorded answer no longer satisfies this run's contract: ${describe(error)}`,
+        );
+      }
     }
     // A wait that ran out its budget replays as one: the route is the
     // composition's, so it is read off the descriptor rather than off the
@@ -6502,6 +6587,16 @@ export interface ExecutionOpening {
   readonly inputs: Record<string, unknown>;
   readonly sessionKey: string;
   /**
+   * The completion webhook this invocation asked for, where it asked for one
+   * (grammar 13.3's `callback:`).
+   *
+   * `src/serve.ts` is the only caller that passes it, and it resolves the URL
+   * when the request arrives rather than when the run ends — because the run may
+   * end in a *different process* (`docs/durability.md` §6.1), and a URL nobody
+   * recorded is a caller nobody can call back.
+   */
+  readonly callback?: string;
+  /**
    * Whether this generation is **resuming** an execution the journal already
    * holds, rather than starting one.
    *
@@ -6542,6 +6637,7 @@ export async function openExecution(opening: ExecutionOpening): Promise<void> {
       trigger: opening.trigger,
       inputs: opening.inputs,
       sessionKey: opening.sessionKey,
+      ...(opening.callback === undefined ? {} : { callback: opening.callback }),
       status: "open",
       journalVersion: JOURNAL_VERSION,
       startedAt: new Date().toISOString(),
@@ -6578,17 +6674,33 @@ export async function openExecution(opening: ExecutionOpening): Promise<void> {
 export function settleExecution(execution: string, error?: unknown): void {
   const journal = settledJournals.get(execution);
   if (journal === undefined) return;
-  // Read off the **latch** as well as off the error, because the one divergence
-  // that has no error to travel on is a detached delivery's (see
-  // [`latchDivergence`]): a run whose only divergence was raised there must not
-  // be closed `completed` either.
-  if (divergenceOf(error) !== undefined || latchedDivergence(execution) !== undefined) return;
+  if (staysOpen(execution, error)) return;
   if (error === undefined) {
     journal.end(execution, "completed");
     return;
   }
-  if (interruptOf(error) !== undefined) return;
   journal.end(execution, "failed", describe(error));
+}
+
+/**
+ * Whether an execution that stopped this way is one the journal keeps **open**
+ * — and so one a resume will replay.
+ *
+ * [`settleExecution`]'s first question, exported because it is also `runFlow`'s:
+ * a run whose row stays open has not finished with the world, so what it owns
+ * has to outlive it (`src/graph.ts`, `docs/durability.md` §5). Two functions
+ * deciding it separately would eventually decide it differently, and the way
+ * that failure shows up — a partition removed under an execution somebody
+ * resumes tomorrow — is one no test of either function alone would catch.
+ *
+ * Read off the **latch** as well as off the error, because the one divergence
+ * that has no error to travel on is a detached delivery's (see
+ * [`latchDivergence`]): a run whose only divergence was raised there is not one
+ * to be closed `completed` either.
+ */
+export function staysOpen(execution: string, error?: unknown): boolean {
+  if (divergenceOf(error) !== undefined || latchedDivergence(execution) !== undefined) return true;
+  return error !== undefined && interruptOf(error) !== undefined;
 }
 
 /**

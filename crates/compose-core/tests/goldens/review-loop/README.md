@@ -138,7 +138,10 @@ cannot declare either: the compiler refuses one that does. On start it
 **recovers** every execution the journal holds open, before it accepts a
 connection, so a pause comes back under the same wait id and a resume URL
 prepared against the process that died still finds it; triggers are not
-re-fired. What is still tracked in the process alone is the *report*: a status
+re-fired, and a recovered execution that finishes delivers the `callback:`
+webhook its request asked for, because the caller who was handed a `202` is
+waiting to be told rather than polling. What is still tracked in the process
+alone is the *report*: a status
 route answers `404` for an id neither this process nor the journal knows, and
 every execution it has finished, with its outputs and its trace, is held for the
 life of the process — so a long-running `serve` grows with the number of

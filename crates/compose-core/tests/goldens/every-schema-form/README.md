@@ -138,7 +138,10 @@ cannot declare either: the compiler refuses one that does. On start it
 **recovers** every execution the journal holds open, before it accepts a
 connection, so a pause comes back under the same wait id and a resume URL
 prepared against the process that died still finds it; triggers are not
-re-fired. What is still tracked in the process alone is the *report*: a status
+re-fired, and a recovered execution that finishes delivers the `callback:`
+webhook its request asked for, because the caller who was handed a `202` is
+waiting to be told rather than polling. What is still tracked in the process
+alone is the *report*: a status
 route answers `404` for an id neither this process nor the journal knows, and
 every execution it has finished, with its outputs and its trace, is held for the
 life of the process — so a long-running `serve` grows with the number of
@@ -351,8 +354,12 @@ installed (PRD 5.8). What it writes lives under this directory:
 
 `<partition>` is the store's declared `scope:` made concrete — `global`,
 `session/<session key>`, or `execution/<execution id>` — so one file holds every
-session and a read never sees another's. A `scope: execution` store is held in
-memory and released when the run ends, which is what "dies with the run" means.
+session and a read never sees another's. A `scope: execution` `kv` or `vector`
+store is held in memory and a `blob` one is a partition beside the others, and
+both go when the run **ends**, which is what "dies with the run" means. A run
+that stopped at a `human` pause nobody answered has not ended — its journal row
+is open and `resume` picks it up — so what it wrote is still there for the
+generation that finishes it.
 `AGENT_COMPOSE_DATA_DIR` moves the whole directory; the paths under it stay the
 same. It is derived from this project's own location rather than from the
 working directory, so a graph reads the same store wherever it was launched from.
