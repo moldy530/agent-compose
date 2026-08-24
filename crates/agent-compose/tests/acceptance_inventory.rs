@@ -1089,6 +1089,16 @@ const DURABILITY: &[Criterion] = &[
                 "a_divergence_in_a_detached_delivery_fails_the_resume_it_cannot_be_thrown_out_of",
                 Status::Live,
             ),
+            // …and the other half of that depth, which is the one a delivery's
+            // *own* record has to carry: nothing joins it, so none of the
+            // `ModelCall` entries a joined call files are filed at all, and a
+            // replay that inferred the answering member from them would report a
+            // composition nobody touched as divergent — permanently, because a
+            // divergence never closes the row.
+            (
+                "a_detached_delivery_that_called_a_model_is_replayed_rather_than_reported_as_divergent",
+                Status::Live,
+            ),
             // …and the two refusals that come *before* a replay: an id the
             // journal does not hold, and a project with no journal at all.
             (

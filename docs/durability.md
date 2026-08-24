@@ -192,6 +192,14 @@ refusal that ended a call no member answered. Both halves are needed: without
 the answer a replay cannot continue, and without the records the resumed
 generation's trace would say the node called no model at all.
 
+It also holds `served`, the route member that answered, in its own right rather
+than as the last of those records. Where the node is collecting them the two are
+the same call and the field is redundant; where it is **not**, it is the only
+account of who answered — a detached `map` delivery runs with the node's
+collectors detached (Decision D94, §3.2), so its record's list of filed calls is
+empty by construction and a replay that read the answerer off the tail of that
+list would fail a resume whose composition nobody had touched.
+
 A call that **failed** is recorded as a failure and replays as one: the resumed
 generation re-raises an error with the recorded class name and message, so the
 node's own `retry:` ladder and `on_error:` decide exactly what they decided

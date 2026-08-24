@@ -59,6 +59,12 @@
 #     **detached**, so one execution carries effects two instance frames down
 #     and one delivery nothing waits for. Between them they are every nesting
 #     depth q29 says a divergence may not be absorbed at.
+#   * `flow.fanned` — a **detached** `map` whose sink calls a *model*, which
+#     `flow.parceled`'s subprocess sink cannot decide. A delivery runs with the
+#     node execution's collectors detached (Decision D94), so its record holds
+#     none of the `ModelCall` entries a joined call files — and a replay that
+#     read the answering route member off that empty list would fail a resume
+#     whose composition nobody had touched.
 #
 # `flow.gate` carries an `http` trigger as well as its manual invocation,
 # because the `serve` half of recovery needs an execution a request started.
@@ -209,6 +215,26 @@ agent.consulting:
   output:
     note:
       description: The note.
+      type: string
+
+# The detached sink of `flow.fanned`. An agent of its own rather than
+# `agent.noter` because a detached dispatch may write no state at all (grammar
+# 8.6 rule 7): `note` is a channel, so a delivery whose output field carried that
+# name would be writing by name. Its prompt is its own for the same kind of
+# reason — the tests that move a prompt under a journal move `agent.noter`'s by
+# its text, and two agents sharing a line would be moved together.
+agent.filing:
+  description: Files one note about whatever it is given, and reports to nobody.
+  model: model.smart
+  prompt: |
+    You file one short note about the topic you are given, and nothing else.
+  input:
+    topic:
+      description: What to write a note about.
+      type: string
+  output:
+    filed:
+      description: The note, as filed.
       type: string
 
 agent.noter:
@@ -663,6 +689,49 @@ flow.parceled:
     - { from: start, to: parcel }
     - { from: parcel, to: receipt }
     - { from: receipt, to: wrap }
+    - { from: wrap, to: end }
+
+flow.fanned:
+  description: Deliver detached notes that call a model, then answer.
+  inputs:
+    topic:
+      type: string
+      min_length: 1
+    topics:
+      type: array
+      max_items: 4
+      items: { type: string }
+  outputs:
+    note:
+      type: string
+  nodes:
+    # `flow.parceled`'s detached sink is a subprocess; this one calls a
+    # **model**, which is the other kind of effect a delivery can make and the
+    # one whose record has a second half. A detached delivery runs with the node
+    # execution's collectors detached (Decision D94), so the `ModelCall` records
+    # a joined call files on the way to its answer are not filed at all here —
+    # and the record has to say who served the call anyway, or a resume of a
+    # composition nobody touched would fail (`docs/durability.md` §3.1).
+    notify:
+      map:
+        over: input.topics
+        as: topic
+        node: agent.filing
+        max_concurrency: 2
+        detach: true
+        input:
+          topic: "topic"
+
+    wrap:
+      agent: agent.noter
+      input:
+        topic: "input.topic"
+      writes:
+        note: note
+
+  edges:
+    - { from: start, to: notify }
+    - { from: notify, to: wrap }
     - { from: wrap, to: end }
 
 triggers:

@@ -12219,6 +12219,118 @@ fn a_divergence_in_a_detached_delivery_fails_the_resume_it_cannot_be_thrown_out_
     );
 }
 
+/// A **detached** delivery that called a model is *replayed*, and a resume of
+/// the composition that recorded it is not a divergence.
+///
+/// A delivery runs with the node execution's collectors detached (Decision D94):
+/// nothing joins it, so nothing may reach the node's trace entry through it, and
+/// `RunContext.modelCalls` is `undefined` for the whole branch. The `ModelCall`
+/// records a joined call files on its way to an answer are therefore not filed
+/// at all here, and the record's list of them is empty **by construction** — so
+/// a replay that read the answering route member off the tail of that list would
+/// find nothing there and raise a `ReplayDivergence` about a composition nobody
+/// had touched. Which member served the call is recorded in its own right for
+/// exactly this shape (`docs/durability.md` §3.1).
+///
+/// `flow.parceled`'s detached sink is a subprocess, so the whole corpus around
+/// it cannot decide this: `flow.fanned`'s is `agent.filing`. And the failure it
+/// guards against is unrecoverable rather than merely wrong — a divergence
+/// deliberately never closes the execution's row (§7), so every later `resume`,
+/// and every `serve` start, would re-derive it for ever.
+#[test]
+fn a_detached_delivery_that_called_a_model_is_replayed_rather_than_reported_as_divergent() {
+    let provider = MockProvider::start().expect("a loopback port");
+    // Matched by item text rather than left to arrive in order: a detached
+    // delivery and the node after it are dispatched together (rule 7), so which
+    // of the three calls reaches the provider first is not this test's to say.
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "filed": "noted first" })),
+        )
+        .matching("alpha-item"),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "filed": "noted second" })),
+        )
+        .matching("beta-item"),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "note": "wrapped" })).after(Duration::from_secs(120)),
+        )
+        .matching("durability"),
+    ]);
+
+    let Some((project, built)) = harness::build_under_toolchain("durability", "resume-fanned")
+    else {
+        return;
+    };
+    assert!(
+        built.status.success(),
+        "the durability fixture did not build:\n{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+
+    let environment = harness::environment(&provider);
+    let killed = harness::crash_run(
+        &project,
+        &[
+            "run",
+            "flow.fanned",
+            "--input",
+            "topic=durability",
+            "--input",
+            "topics=[\"alpha-item\",\"beta-item\"]",
+        ],
+        &environment,
+        |_| {
+            // Both deliveries are in the **record** — not merely answered by the
+            // provider — and `wrap`'s call is the one still in flight.
+            provider.snapshot().requests >= 3
+                && harness::journal_holds(&project, &["notify/0/0#model/0", "notify/0/1#model/0"])
+        },
+    );
+
+    // The one call a correct replay still owes the provider, and nothing else.
+    provider.reset();
+    provider.enqueue(
+        Script::new(SONNET, Outcome::structured(json!({ "note": "wrapped" })))
+            .matching("durability"),
+    );
+
+    let resumed = harness::resume(
+        &project,
+        "durability",
+        &killed.execution,
+        Some("json"),
+        &environment,
+    );
+    let said = resumed.stderr();
+    assert!(
+        !said.contains("ReplayDivergence"),
+        "the composition did not move: a delivery whose record holds no filed \
+         call is still a delivery this run made:\n{said}"
+    );
+    resumed.succeeded();
+    let answered = resumed.outputs();
+    assert_eq!(answered["status"], "completed", "{answered}\n{said}");
+    assert_eq!(answered["outputs"]["note"], "wrapped", "{answered}");
+
+    let asked = provider.requests();
+    assert_eq!(
+        asked.len(),
+        1,
+        "both deliveries were answered out of the journal: only the call the \
+         crash interrupted reaches the provider, and {} did",
+        asked.len()
+    );
+    assert!(
+        asked[0].body_text.contains("durability"),
+        "…and the one live call is `wrap`'s: {}",
+        asked[0].body_text
+    );
+}
+
 /// A diverged resume leaves the execution **open** (`docs/durability.md` §7).
 ///
 /// The composition is what disagreed, so putting it back is the whole repair —
