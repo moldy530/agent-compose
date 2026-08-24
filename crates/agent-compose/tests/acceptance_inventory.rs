@@ -1021,6 +1021,14 @@ const DURABILITY: &[Criterion] = &[
                 "a_replayed_prefix_re_issues_neither_its_store_write_nor_its_subprocess",
                 Status::Live,
             ),
+            // …and the half a write cannot decide: a **read** is recorded too,
+            // and what it answers has to be what the generation that recorded it
+            // went on with, or the two generations compose different requests
+            // out of one composition (`docs/durability.md` §11.1).
+            (
+                "a_replayed_store_read_is_the_row_the_recording_generation_went_on_with",
+                Status::Live,
+            ),
         ],
     },
     Criterion {
@@ -1038,6 +1046,27 @@ const DURABILITY: &[Criterion] = &[
             // it disagrees at.
             (
                 "a_resume_whose_journal_no_longer_describes_the_run_names_the_divergent_step",
+                Status::Live,
+            ),
+            // …the other divergence resolved q29 names, which is not a request
+            // that moved but an answer this composition no longer accepts.
+            (
+                "a_recorded_answer_that_fails_the_current_contract_is_a_divergence_not_a_retry",
+                Status::Live,
+            ),
+            // …and the three nesting depths a divergence may not be absorbed at:
+            // a dispatched subflow under `on_item_error: skip`, the item retry
+            // the other form of that key gives, and a delivery nothing waits for.
+            (
+                "a_divergence_inside_a_dispatched_subflow_is_not_absorbed_by_on_item_error",
+                Status::Live,
+            ),
+            (
+                "a_divergence_inside_a_dispatched_item_is_not_retried_by_its_item_policy",
+                Status::Live,
+            ),
+            (
+                "a_divergence_in_a_detached_delivery_fails_the_resume_it_cannot_be_thrown_out_of",
                 Status::Live,
             ),
             // …and the two refusals that come *before* a replay: an id the
@@ -1062,6 +1091,14 @@ const DURABILITY: &[Criterion] = &[
             // …and the `serve` half, which recovers on its own.
             (
                 "a_restarted_serve_recovers_its_open_executions_and_their_waits",
+                Status::Live,
+            ),
+            // …and what "survives" has to mean when a build disagrees with the
+            // record: an execution a divergence stopped is still open, because a
+            // resume against a `failed` row is refused by name and `serve`
+            // replays every open execution at every start.
+            (
+                "a_diverged_resume_leaves_the_execution_open_for_the_composition_that_fits_it",
                 Status::Live,
             ),
         ],
