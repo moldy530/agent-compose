@@ -1144,6 +1144,13 @@ const DURABILITY: &[Criterion] = &[
                 "a_restarted_serve_recovers_its_open_executions_and_their_waits",
                 Status::Live,
             ),
+            // …including the window recovering without waiting opens: an answer
+            // that arrives before the replay is back at its pause is told to
+            // send it again, rather than that there is nothing waiting for it.
+            (
+                "a_recovered_execution_still_catching_up_tells_a_resume_to_send_it_again",
+                Status::Live,
+            ),
             // …including what an `async` caller was promised: the completion
             // webhook is fired by the process that *finishes* the run, which is
             // not the one that answered its `202`.

@@ -543,6 +543,13 @@ the one that replaced it. What the journal does not hold is a wait nobody
 answered — there is nothing to record about it — which is exactly what makes
 re-parking the right thing to do with one.
 
+**Replaying back to that pause takes as long as it takes**, and the app serves
+its other executions meanwhile rather than holding the port until every replay
+has landed. So an answer can arrive before the wait is back on the board, and
+that request is refused with a refusal of its own: a `409` carrying `recovering:
+true` and saying to send it again, rather than one of the ones above that mean
+the pause is over.
+
 The same is true of a `run`: a pause it could not ask leaves its execution open
 in the journal, and `bun src/index.ts resume <execution-id>` picks it up,
 prompting at the terminal exactly as an interactive `run` does.
