@@ -288,6 +288,14 @@ export const toolReviewQueueOutput = z.object({
 }).strict();
 export type ToolReviewQueueOutput = z.infer<typeof toolReviewQueueOutput>;
 
+/**
+ * `builtin.read_file` — the arguments of the runtime built-in of that name, which every attachment of it offers (grammar 5.5).
+ */
+export const builtinReadFileInput = z.object({
+  path: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }).describe("The file to read, relative to the tool's root directory."),
+}).strict();
+export type BuiltinReadFileInput = z.infer<typeof builtinReadFileInput>;
+
 /** State channel `human_decision` — its declared type (grammar 10.1). */
 export const stateHumanDecision = z.enum(["approve", "reject"]).describe("What the reviewer decided about the run as a whole.").default("approve");
 export type StateHumanDecision = z.infer<typeof stateHumanDecision>;
