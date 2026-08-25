@@ -198,8 +198,8 @@
       "required": ["root"],
       "properties": {
         "root": {
-          "description": "REQUIRED. The directory this tool is bounded to. Every path the model supplies resolves inside it - resolution, not string prefix, so symlinks and .. count - and one that lands outside is refused. Interpolable (grammar 4.3 class 2).",
-          "$ref": "#/$defs/interpolatedString"
+          "description": "REQUIRED, and non-empty. The directory this tool is bounded to. Every path the model supplies resolves inside it - resolution, not string prefix, so symlinks and .. count - and one that lands outside is refused. An empty root would bound the tool to whatever directory the runtime was started in, which is the ambient capability the per-entry bounds exist to refuse. Interpolable (grammar 4.3 class 2).",
+          "allOf": [{ "$ref": "#/$defs/interpolatedString" }, { "minLength": 1 }]
         }
       },
       "additionalProperties": false
@@ -216,8 +216,8 @@
           "required": ["root", "timeout"],
           "properties": {
             "root": {
-              "description": "REQUIRED. The working directory the command runs in. Interpolable (grammar 4.3 class 2).",
-              "$ref": "#/$defs/interpolatedString"
+              "description": "REQUIRED, and non-empty. The working directory the command runs in. An empty root would hand the shell whatever directory the runtime was started in, which is the ambient capability every bound here is written out to refuse. Interpolable (grammar 4.3 class 2).",
+              "allOf": [{ "$ref": "#/$defs/interpolatedString" }, { "minLength": 1 }]
             },
             "timeout": {
               "description": "REQUIRED. How long the command may run before it is killed and the call fails. This bounds one command; a node-level timeout: bounds the whole agent node (grammar 9.2).",

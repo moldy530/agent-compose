@@ -1403,6 +1403,13 @@ const BUILTINS: &[Criterion] = &[
                 "a_symlink_that_points_out_of_the_root_is_refused",
                 Status::Live,
             ),
+            // …and the bound the environment can answer with nothing, which
+            // would leave the tool bounded to wherever the runtime was started —
+            // the ambient capability D123 refuses.
+            (
+                "a_root_that_resolves_to_nothing_fails_the_call",
+                Status::Live,
+            ),
         ],
     },
     Criterion {
@@ -1419,6 +1426,13 @@ const BUILTINS: &[Criterion] = &[
             // node's own `on_error:` gets to decide the run.
             (
                 "a_command_that_exits_nonzero_fails_the_node_under_its_on_error",
+                Status::Live,
+            ),
+            // …and what the deadline has to end besides the shell: the pipes a
+            // surviving grandchild holds, which a runtime that kept them would
+            // go on reading — and be held open by — long after the call failed.
+            (
+                "a_killed_commands_grandchild_does_not_hold_the_runtime_open",
                 Status::Live,
             ),
         ],

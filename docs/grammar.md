@@ -990,18 +990,30 @@ written as a bare address is a compile error naming the mapping form, because th
 bounds are not optional.
 
 **`root:` is required on every built-in**, on `builtin.bash` as much as on the
-file tools. It is interpolable (§4.3 class 2), resolved at process start, and
-resolved again as a real directory at each call — a `root:` naming a directory
-that does not exist fails the call. Every path argument is taken relative to it,
-and a path that **resolves** outside it is refused: resolution, not string
-comparison, so a `..` that climbs out and a symlink that points out are both
-refused, and a write to a file that does not exist yet resolves through its
-parent. `builtin.bash` runs with the resolved root as its working directory.
+file tools, and it must be **non-empty**: `root: ""` is a compile error, and a
+`root:` whose `${VAR}` resolves to the empty string fails the call, because an
+empty path is the directory the runtime happened to be started in and a bound
+nobody wrote is not a bound. It is interpolable (§4.3 class 2), resolved at
+process start, and resolved again as a real directory at each call — a `root:`
+naming a directory that does not exist fails the call. Every path argument is
+taken relative to it, and a path that **resolves** outside it is refused:
+resolution, not string comparison, so a `..` that climbs out and a symlink that
+points out are both refused, and a write to a file that does not exist yet
+resolves through its parent. `builtin.bash` runs with the resolved root as its
+working directory.
 
 **`timeout:` is required on `builtin.bash`** and is a §4.4 duration. It bounds
 one command; §9.2's node-level `timeout:` bounds the whole agent node, deadline
 included, and the two compose rather than replace one another. `timeout:` on a
 file tool is an unknown key — there is no command there to bound.
+
+What the deadline kills is the **shell**, and what it ends is the **call**. A
+command that put work in the background — `some-server &` — leaves that work
+running as an orphan, exactly as it would have from a hand-rolled `exec:` tool;
+the runtime stops reading what it left behind rather than waiting on it, so the
+bound is the composition's however long the orphan lives. Cleaning up after such
+a command is the command's own business, and containing it is the distribution
+work's (below).
 
 **A built-in's name on the wire is its local name** — `bash`, `read_file`,
 `write_file`, `list` — exactly as an attached `tool.*`'s is, so a `tool.bash` on
@@ -6557,7 +6569,18 @@ name's own bounds are checked against its own row (Appendix B).
 file tools'. The headline is "bounded by a mandatory root and a timeout", and a
 shell whose working directory defaulted to wherever the runtime happened to be
 started would be the ambient capability the whole decision refuses — read off no
-entry, different on a developer's machine and a deployment's. `timeout:` is
+entry, different on a developer's machine and a deployment's.
+
+**Required means non-empty**, on all four, for exactly that reason and in two
+places. `root: ""` is a compile error, because it is a key present and a bound
+absent — `""` resolves to the process's own working directory, so an entry
+spelling it would grant precisely the ambient capability the paragraph above
+refuses, while *looking* bounded to a reader. And because the value is
+interpolable, the same hole is reachable through an environment variable that is
+set and empty: `${WORKSPACE}` satisfying the presence check of PRD 5.9 with
+nothing in it. The parser cannot see that one, so the runtime refuses an empty
+*resolved* root as an execution failure, under §9 like every other bound the
+call could not honour. One rule, checked wherever it can be broken. `timeout:` is
 required rather than defaulted for the same reason and with the same words: "a
 model holding bash is arbitrary code execution on the host running the graph,
 which is why every bound here is explicit". A default is a bound nobody wrote and

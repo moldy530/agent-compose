@@ -6,7 +6,8 @@ The value is well-typed and still not legal here. Shape rules the type system
 cannot state live behind this code: an `http` trigger's `path:` must start with
 `/`, a cron expression must have five fields, `else:` takes the literal `true`,
 a `pattern:` must be a valid RE2 expression, an `expect_exit` list must be
-non-empty and distinct.
+non-empty and distinct, a built-in's `root:` must name a directory rather than
+the empty string.
 
 Most of these refuse an **inert** value — one that changes nothing about what
 runs. `else: false` says nothing, because an unguarded edge is already

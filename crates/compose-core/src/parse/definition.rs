@@ -293,9 +293,39 @@ fn builtin_attachment(
     let context = format!("`{}` in {subject}", tool.address());
     let mapping = expect_mapping(&entry.value, &context, cx)?;
     let mut fields = Fields::new(mapping, entry.value.span.clone(), &context);
+    // Required **and** non-empty. `root: ""` would satisfy the key check and
+    // then resolve, at the call, to whatever directory the runtime happened to
+    // be started in — the ambient capability D123 refuses in its own words, read
+    // off no entry and different on a developer's machine and a deployment's. A
+    // `${VAR}` that comes back empty is the same hole reached through the
+    // environment, and the runtime closes that half where it resolves the root.
     let root = fields
         .require("root", cx)
-        .and_then(|node| lexical::interpolated(node, "`root`", cx));
+        .and_then(|node| lexical::interpolated(node, "`root`", cx))
+        .filter(|root| {
+            if !root.value.as_str().is_empty() {
+                return true;
+            }
+            cx.push(
+                Diagnostic::error(
+                    DiagnosticCode::InvalidValue,
+                    root.span.clone(),
+                    format!("`root` in {context} must not be empty"),
+                )
+                .with_help(format!(
+                    "name the directory this tool is bounded to — `- {}: {{ root: ./workspace{} }}`; \
+                     an empty root would bound it to wherever the runtime was started instead \
+                     (grammar 5.5)",
+                    tool.address(),
+                    if tool.runs_a_command() {
+                        ", timeout: 30s"
+                    } else {
+                        ""
+                    }
+                )),
+            );
+            false
+        });
     let timeout = if tool.runs_a_command() {
         fields
             .require("timeout", cx)

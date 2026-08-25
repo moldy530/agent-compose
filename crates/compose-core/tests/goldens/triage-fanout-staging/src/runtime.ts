@@ -3696,10 +3696,23 @@ async function runBuiltinLive(
  * node's `retry:`/`on_error:` decides it (Decision D119). The message quotes the
  * root **as written**, which is what keeps a resolved `${WORKSPACE}` out of a
  * field the trace carries (`docs/trace.md` §11.1).
+ *
+ * A root that resolves to **nothing** fails the same way, and is checked before
+ * anything else because it is the one empty answer the file system would accept:
+ * `path.resolve("")` is this process's working directory, so an attachment whose
+ * `${WORKSPACE}` came back empty would silently bound the tool to wherever the
+ * runtime happened to be started — the ambient capability grammar 5.5 and D123
+ * refuse in their own words. The parser refuses an empty `root:` as written; this
+ * is the same rule where only the environment can break it.
  */
 async function builtinRoot(binding: BuiltinBinding): Promise<string> {
   const written = asWritten(binding.root);
   const declared = interpolate(binding.root);
+  if (declared.trim() === "") {
+    throw new Error(
+      `\`builtin.${binding.tool}\`'s \`root:\` \`${written}\` resolved to nothing, and a tool bounded to nothing would be bounded to whatever directory this process was started in`,
+    );
+  }
   const resolved = await realpathOrAbsent(path.resolve(declared));
   const directory =
     resolved === undefined ? false : await fs.promises.stat(resolved).then(
@@ -3831,12 +3844,32 @@ async function runBuiltinBash(
       // the command's to honour rather than the composition's. Resolving twice
       // is harmless: the first settlement is the promise's, and the `close`
       // that may still arrive finds it settled.
+      //
+      // Settling early is only half of ending a call, though, and [`abandon`]
+      // is the other half: the *promise* is settled but the grandchild still
+      // holds the pipes this runtime is still reading, so the `data` handlers
+      // below would go on appending to a buffer nobody will ever read, and the
+      // open handles would go on holding the event loop. In a long-lived host —
+      // `serve`, or anything embedding a compiled graph — that is unbounded
+      // memory growth and a process that will not exit, both of them minutes
+      // after the call they belong to was reported as failed. So the streams are
+      // dropped rather than merely ignored: what the deadline ends is the call
+      // *and* this runtime's hold on what outlived it.
+      const abandon = (): void => {
+        for (const stream of [child.stdout, child.stderr]) {
+          if (stream === null || stream === undefined) continue;
+          stream.removeAllListeners("data");
+          stream.destroy();
+        }
+        child.unref();
+      };
       const timer =
         bound === undefined
           ? undefined
           : setTimeout(() => {
               expired = true;
               child.kill("SIGKILL");
+              abandon();
               resolve({ code: -1, stdout, stderr, expired: true });
             }, bound.millis);
       const settle = (): void => {
@@ -3850,6 +3883,12 @@ async function runBuiltinBash(
       });
       child.on("error", (error) => {
         settle();
+        // The same early settlement, reached the other way: a node deadline or a
+        // cancelled run aborts the spawn's signal, which kills the shell and
+        // rejects here while a grandchild may still hold the pipes. A spawn that
+        // never started (no `bash` on `PATH`) has nothing to drop, which is what
+        // the guards in `abandon` are for.
+        abandon();
         reject(error);
       });
       child.on("close", (code) => {

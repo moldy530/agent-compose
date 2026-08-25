@@ -12490,6 +12490,118 @@ fn a_resumed_run_consumes_a_recorded_builtin_instead_of_running_it_again() {
     );
 }
 
+/// A killed command's **grandchild** does not keep this runtime alive, and the
+/// output it goes on writing is not still being read (grammar 5.5, resolved
+/// q31).
+///
+/// `builtin.bash` settles its call at the deadline rather than at the child's
+/// `close`, because a killed shell can leave a background grandchild holding the
+/// output pipes. Settling is only half of ending the call: the pipes and their
+/// `data` handlers are still this runtime's, and a call that has already failed
+/// must not keep them. Kept, they are an event-loop handle that holds the
+/// process open for as long as the grandchild lives and a buffer that goes on
+/// growing for a result nobody will ever read — in `serve`, or any host
+/// embedding a compiled graph, unbounded memory minutes after the node failed.
+///
+/// The two are one defect and this is the observable half: the command leaves a
+/// grandchild holding the pipes for a minute, the node fails at its one-second
+/// deadline, `on_error: skip` absorbs it — and the **process** is asked when it
+/// is done. A run that ended at the failure would exit on its own and prove
+/// nothing, which is why this flow completes instead.
+#[test]
+fn a_killed_commands_grandchild_does_not_hold_the_runtime_open() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_scratch, environment) = bounded_root(&provider, "builtins-outlived");
+
+    // The grandchild writes once and then holds both pipes open for a minute,
+    // long after the shell above it is killed at one second.
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::tool_calls(vec![ToolCall::new(
+            "bash",
+            json!({ "command": "{ printf 'still here'; sleep 60; } & wait" }),
+        )]),
+    ));
+
+    let started = std::time::Instant::now();
+    let Some(run) = harness::invoke_with(
+        "builtin-tools",
+        "flow.outlived",
+        &json!({ "goal": "leave something behind" }),
+        &environment,
+    ) else {
+        return;
+    };
+    let elapsed = started.elapsed();
+
+    // The node failed at its own bound, and the run went on without it.
+    run.succeeded();
+    assert_eq!(run.outputs()["summary"], "the node was skipped");
+    let entries = run.entries("attempt");
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0]["outcome"], "skipped");
+    let said = entries[0]["error"].as_str().unwrap_or_default();
+    assert!(
+        said.contains("ran longer than `1s`"),
+        "the node's error names the bound the attachment wrote: {said}"
+    );
+
+    // …and the process was done when the graph was. Everything here — the build,
+    // the run, the deadline — is seconds; the grandchild is a minute. A runtime
+    // still holding its pipes would be sitting in the event loop for the rest of
+    // that minute with the flow long since finished.
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "the run exited when the graph finished rather than when the grandchild \
+         let go of the pipes (took {elapsed:?})"
+    );
+}
+
+/// A `root:` that resolves to **nothing** fails the call, rather than quietly
+/// bounding the tool to whatever directory the process was started in
+/// (grammar 5.5, D123).
+///
+/// The parser refuses an empty `root:` as written, so the only way to reach this
+/// is the environment: `${BUILTIN_ROOT}` is present — the presence check of PRD
+/// 5.9 is satisfied — and empty. `path.resolve("")` is the process's working
+/// directory, so a runtime that skipped this check would answer the call from
+/// wherever it happened to be started, which is the ambient capability every
+/// bound in q31 is written out to refuse. The file the model asks for is one
+/// that really exists beside the running test, so a runtime with the hole
+/// **succeeds** at reading it and this test fails on the missing failure.
+#[test]
+fn a_root_that_resolves_to_nothing_fails_the_call() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_scratch, mut environment) = bounded_root(&provider, "builtins-empty-root");
+    environment.push(("BUILTIN_ROOT".to_string(), String::new()));
+
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::tool_calls(vec![ToolCall::new(
+            "read_file",
+            json!({ "path": "Cargo.toml" }),
+        )]),
+    ));
+
+    let Some(run) = harness::invoke_with(
+        "builtin-tools",
+        "flow.work",
+        &json!({ "goal": "read whatever is around" }),
+        &environment,
+    ) else {
+        return;
+    };
+    let said = run.failed();
+    assert!(
+        said.contains("resolved to nothing") && said.contains("${BUILTIN_ROOT}"),
+        "the failure names the bound that came back empty: {said}"
+    );
+    assert!(
+        !said.contains("could not read"),
+        "the call failed on the root rather than reaching the file system at all: {said}"
+    );
+}
+
 /// Every `ToolCallRecord` one agent node's model calls filed, in call order
 /// (`docs/trace.md` §7.3).
 fn tool_calls_of(run: &harness::Invocation, node: &str) -> Vec<Value> {
