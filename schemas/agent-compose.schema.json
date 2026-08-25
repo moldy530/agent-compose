@@ -225,6 +225,11 @@
       "description": "A string on one of grammar 4.3's class 2 surfaces, where ${ENV_NAME} references may be embedded in text, e.g. \"https://${API_HOST}/v1\": http urls and headers, the whole exec block (command, args, cwd, env values), non-secret provider keys, and non-secret deploy config. Substitution happens at process start. Use $${ for a literal ${.",
       "type": "string"
     },
+    "envRefString": {
+      "description": "A class 2 string that reaches for the environment: it carries at least one unescaped ${ENV_NAME} reference, so what it says is decided at process start rather than here. It is the second arm of every closed-set provider value the compiler leaves undecided for that reason - `search_context_size: ${SEARCH_DEPTH}` is a deployment knob, not a typo - and the pattern spells \"unescaped\" exactly as `noEnvRefString` does (Decision D108). A closed set the curated table pins to a single value has no such arm: that value is decided by the entry's own `type`, and an ${ENV_NAME} there is `unexpected-env-ref` (grammar 12.1, 4.3 / Decision D122).",
+      "type": "string",
+      "pattern": "(^|[^$])\\$\\{[A-Z_][A-Z0-9_]*\\}"
+    },
     "noEnvRefString": {
       "description": "A string on one of the surfaces where environment references are illegal (grammar 4.3 class 3: prompts, descriptions, schemas, CEL, model and embedding model ids, trigger path/cron/timezone, content types, identifiers and references - anything the classification does not place in class 1 or 2). Nothing is interpolated here, so an unescaped ${ENV_NAME} token is an error rather than text that silently survives. Write $${ENV_NAME} for a literal ${ENV_NAME}. The pattern spells \"unescaped\" as an explicit alternation - at the start of the string, or after one character that is not the `$` of the `$${` escape - rather than as a lookbehind, which is outside the interoperable regex subset this schema keeps to (Decision D108).",
       "type": "string",
@@ -1881,10 +1886,17 @@
                   }
                 },
                 "search_context_size": {
-                  "enum": [
-                    "low",
-                    "medium",
-                    "high"
+                  "anyOf": [
+                    {
+                      "enum": [
+                        "low",
+                        "medium",
+                        "high"
+                      ]
+                    },
+                    {
+                      "$ref": "#/$defs/envRefString"
+                    }
                   ]
                 },
                 "user_location": {
@@ -2049,26 +2061,47 @@
                   ]
                 },
                 "background": {
-                  "enum": [
-                    "transparent",
-                    "opaque",
-                    "auto"
+                  "anyOf": [
+                    {
+                      "enum": [
+                        "transparent",
+                        "opaque",
+                        "auto"
+                      ]
+                    },
+                    {
+                      "$ref": "#/$defs/envRefString"
+                    }
                   ]
                 },
                 "input_fidelity": {
                   "description": "How much of an input image the edit preserves.",
-                  "enum": [
-                    "high",
-                    "low"
+                  "anyOf": [
+                    {
+                      "enum": [
+                        "high",
+                        "low"
+                      ]
+                    },
+                    {
+                      "$ref": "#/$defs/envRefString"
+                    }
                   ]
                 },
                 "model": {
                   "$ref": "#/$defs/interpolatedString"
                 },
                 "moderation": {
-                  "enum": [
-                    "auto",
-                    "low"
+                  "anyOf": [
+                    {
+                      "enum": [
+                        "auto",
+                        "low"
+                      ]
+                    },
+                    {
+                      "$ref": "#/$defs/envRefString"
+                    }
                   ]
                 },
                 "output_compression": {
@@ -2077,10 +2110,17 @@
                   "maximum": 100
                 },
                 "output_format": {
-                  "enum": [
-                    "png",
-                    "webp",
-                    "jpeg"
+                  "anyOf": [
+                    {
+                      "enum": [
+                        "png",
+                        "webp",
+                        "jpeg"
+                      ]
+                    },
+                    {
+                      "$ref": "#/$defs/envRefString"
+                    }
                   ]
                 },
                 "partial_images": {
@@ -2089,11 +2129,18 @@
                   "maximum": 3
                 },
                 "quality": {
-                  "enum": [
-                    "low",
-                    "medium",
-                    "high",
-                    "auto"
+                  "anyOf": [
+                    {
+                      "enum": [
+                        "low",
+                        "medium",
+                        "high",
+                        "auto"
+                      ]
+                    },
+                    {
+                      "$ref": "#/$defs/envRefString"
+                    }
                   ]
                 },
                 "size": {

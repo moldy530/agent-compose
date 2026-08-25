@@ -311,6 +311,15 @@ const GRAMMAR: &[Check] = &[
             "type-mismatch",
             "unknown-variant",
             "value-out-of-range",
+            // The two spellings of "this key is read at compile time, and an
+            // `${ENV}` reaches the wire as the string it expands to". A field
+            // the table types as a **non-string** cannot carry one at all
+            // (`type-mismatch`); a field it pins to a **single** string may
+            // only carry that string, since the value is decided by the
+            // entry's own `type:` and the service refuses any other
+            // (`unexpected-env-ref`). A closed set of more than one is a knob a
+            // deployment turns and interpolates like any class 2 value.
+            "unexpected-env-ref",
         ],
         evidence: Evidence::Fixture,
     },

@@ -65,6 +65,12 @@ pub enum FieldShape {
     /// (grammar 4.3 class 2).
     Text,
     /// One of a closed set of strings.
+    ///
+    /// A set of **more than one** is a knob the author turns, and interpolates
+    /// like any other class 2 string: a `${SEARCH_DEPTH}` naming the value a
+    /// deployment wants is not decided at compile time, exactly as a
+    /// `base_url:` is not. A set of **exactly one** is not a knob at all — see
+    /// [`FieldShape::pinned`].
     Choice(&'static [&'static str]),
     /// An array of strings.
     Strings,
@@ -88,6 +94,30 @@ pub enum FieldShape {
 }
 
 impl FieldShape {
+    /// The single value this shape admits, where it admits exactly one.
+    ///
+    /// A [`Self::Choice`] of one string is a **pin** rather than a knob. The
+    /// value is the table's, decided by the entry's own `type:`, and the only
+    /// reason it is written in the config at all is that the wire requires the
+    /// key: `web_search_20250305` is `web_search`, a `user_location:` is an
+    /// `approximate` one, a `cache_control:` is `ephemeral`, and the service
+    /// answers 400 — or ignores the block — when it is spelled otherwise.
+    ///
+    /// Which is why a pinned field takes a **literal**, and is the one place a
+    /// class 2 provider value does not interpolate (grammar 12.1, 4.3). The
+    /// only legal value is a constant this table already holds, so an `${ENV}`
+    /// there is redundant when the process happens to hold that constant and a
+    /// guaranteed refusal when it does not — precisely the failure the strict
+    /// tier exists to move to compile time, let through by the one shape whose
+    /// whole purpose is to catch it.
+    #[must_use]
+    pub const fn pinned(self) -> Option<&'static str> {
+        match self {
+            Self::Choice([only]) => Some(only),
+            _ => None,
+        }
+    }
+
     /// How a diagnostic names this shape, with its article.
     #[must_use]
     pub const fn description(self) -> &'static str {
@@ -558,7 +588,7 @@ pub fn type_names(kind: ProviderKind) -> Vec<&'static str> {
 
 /// The one `name:` the wire pairs with this `type:`, where the row pins one.
 ///
-/// The pinning is [`FieldShape::Choice`] of exactly one string — see
+/// The pinning is [`FieldShape::pinned`] — a `Choice` of exactly one string, see
 /// [`WEB_SEARCH_NAME`] — so a row that has a `name:` at all *decides* it, and
 /// the name a Messages-wire entry reaches the request under is knowable without
 /// reading the config the author wrote. That is what lets the compiler see two
@@ -571,10 +601,7 @@ pub fn type_names(kind: ProviderKind) -> Vec<&'static str> {
 /// no row for.
 #[must_use]
 pub fn canonical_name(kind: ProviderKind, type_name: &str) -> Option<&'static str> {
-    match lookup(kind, type_name)?.shape.field("name")? {
-        FieldShape::Choice([only]) => Some(only),
-        _ => None,
-    }
+    lookup(kind, type_name)?.shape.field("name")?.pinned()
 }
 
 #[cfg(test)]
