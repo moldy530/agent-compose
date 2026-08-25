@@ -1125,6 +1125,24 @@ const DURABILITY: &[Criterion] = &[
                 "a_resumed_run_replays_a_responses_wire_answer_without_asking_again",
                 Status::Live,
             ),
+            // …and the promise `docs/durability.md` §7 makes about the other
+            // direction, which the two above cannot decide because a matching
+            // suite replays whether or not the identity keys on it: a resume
+            // whose provider *lost* a server tool diverges at the first model
+            // call rather than replaying an answer produced under another tool
+            // surface (Decision D122, resolved q29).
+            (
+                "a_resume_whose_provider_lost_its_server_tools_diverges_at_the_first_model_call",
+                Status::Live,
+            ),
+            // …and the arm that buys, which is why `JOURNAL_VERSION` did not
+            // move for any of it: a composition declaring no suite omits the key
+            // entirely and derives the identity it always derived, so a journal
+            // written before the key existed still replays.
+            (
+                "a_composition_with_no_server_tools_keeps_the_identity_it_always_derived",
+                Status::Live,
+            ),
             // …the other divergence resolved q29 names, which is not a request
             // that moved but an answer this composition no longer accepts.
             (

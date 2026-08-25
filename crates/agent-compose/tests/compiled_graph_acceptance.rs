@@ -12023,6 +12023,189 @@ fn a_resumed_run_replays_a_responses_wire_answer_without_asking_again() {
     );
 }
 
+/// The other side of the two above, and the one `docs/durability.md` §7 promises
+/// outright: **a resume whose provider lost a server tool diverges at the first
+/// model call.**
+///
+/// The suite is in the request identity because it is part of what the model was
+/// offered (Decision D122), and the consequence is the one resolved q29 intends:
+/// the recorded answer was produced by a model with a different tool surface, so
+/// handing it to a graph that would now ask differently is the silent re-keying
+/// q29 refuses. The resume fails, naming the step.
+///
+/// Both halves of the conditionality that makes that true are decided here, and
+/// only a run can decide either:
+///
+/// * the key is **present** when a member declares a suite — asserted off the
+///   journal's own bytes before the composition moves, since a `serverTools`
+///   that never reached the identity would make the divergence below happen for
+///   some other reason and this test pass on a build that had stopped keying on
+///   the suite at all;
+/// * and the identity really **turns on it** — the composition that moves under
+///   the journal moves in exactly one respect, the `server_tools:` array of the
+///   provider `flow.relay`'s two calls resolve to. Every other input to the
+///   identity (the `model.*` addressed, the system prompt, the conversation, the
+///   tool names, the pinned tool) is byte-for-byte what the killed generation
+///   recorded.
+///
+/// A regression that stopped emitting the key would pass every other test in
+/// this file — the two above included, since a suite that matches replays either
+/// way — and would replay an answer produced under a tool surface this build no
+/// longer offers.
+#[test]
+fn a_resume_whose_provider_lost_its_server_tools_diverges_at_the_first_model_call() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "answer": "the first finding" })).with_server_tools(vec![
+            ServerToolUse::new(
+                "web_search_20250305",
+                json!({ "query": "the question" }),
+                json!([{ "type": "web_search_result", "url": "https://docs.example.com/a" }]),
+            ),
+        ]),
+    ));
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "answer": "the second finding" }))
+            .after(Duration::from_secs(120)),
+    ));
+
+    let Some((project, built)) =
+        harness::build_under_toolchain("server-tools", "resume-suite-moved")
+    else {
+        return;
+    };
+    assert!(
+        built.status.success(),
+        "the server-tools fixture did not build:\n{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+
+    let environment = harness::environment(&provider);
+    let killed = harness::crash_run(
+        &project,
+        &["run", "flow.relay", "--input", "question=does it?"],
+        &environment,
+        |_| provider.snapshot().requests >= 2,
+    );
+
+    // The first half: the recorded identity carries the suite. Read off the
+    // journal's committed bytes, the way this harness reads every key.
+    assert!(
+        harness::journal_holds(&project, &["first/0#model/0"]),
+        "the killed generation committed the first node's model record"
+    );
+    assert!(
+        harness::journal_holds(&project, &["serverTools"]),
+        "a connection that declares a suite puts it in the request identity \
+         (`docs/durability.md` §7)"
+    );
+
+    // The composition moves, in the one respect this test is about: the
+    // provider behind `flow.relay` stops declaring a suite.
+    let moved = harness::Scratch::new("suite-moved");
+    let source = std::fs::read_to_string(harness::fixture("server-tools")).expect("the fixture");
+    let edited = source.replace(
+        "  base_url: ${MOCK_BASE_URL}\n  server_tools:\n    - type: web_search_20250305\n      \
+         name: web_search\n      max_uses: 5\n      allowed_domains: [\"docs.example.com\"]\n",
+        "  base_url: ${MOCK_BASE_URL}\n",
+    );
+    assert_ne!(
+        edited, source,
+        "the Messages provider's suite is the block being removed"
+    );
+    let entrypoint = moved.path().join("main.yml");
+    std::fs::write(&entrypoint, edited).expect("the scratch area is writable");
+
+    provider.reset();
+    let resumed = harness::resume_entrypoint(
+        &project,
+        &entrypoint,
+        &killed.execution,
+        Some("json"),
+        &environment,
+    );
+    let said_on_stderr = resumed.failed();
+    let answered = resumed.outputs();
+    assert_eq!(answered["status"], "failed", "{answered}\n{said_on_stderr}");
+    let said = answered["error"].as_str().expect("an error");
+    assert!(
+        said.starts_with("ReplayDivergence: "),
+        "a resume of an answer produced under another tool surface is a divergence: {said}"
+    );
+    assert!(
+        said.contains("first/0#model/0"),
+        "…naming the step that disagreed, which is the *first* model call: {said}"
+    );
+
+    assert_eq!(
+        provider.snapshot().requests,
+        0,
+        "a divergence re-executes nothing (PRD resolved q29)"
+    );
+}
+
+/// The arm the conditionality above buys, and the reason `JOURNAL_VERSION` did
+/// not move for any of it: a composition that declares **no** suite derives the
+/// identity it already derived.
+///
+/// `callModel` omits the `serverTools` key entirely where no ladder member
+/// declares one, rather than writing an empty array — and the difference is
+/// every journal written before the key existed. `canonical()` sorts keys and
+/// hashes the whole object, so an extra `"serverTools":[[]]` would be a
+/// different string and every pre-existing record would fail to match its own
+/// replay (`docs/durability.md` §11.2, §11.3).
+///
+/// This holds it off the journal's committed bytes, on the fixture whose
+/// providers declare nothing: the run above is the same shape and the same
+/// two-call frontier, so what differs between the two assertions is only the
+/// suite.
+#[test]
+fn a_composition_with_no_server_tools_keeps_the_identity_it_always_derived() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "note": "the first note" })),
+    ));
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "note": "the second note" })),
+    ));
+
+    let Some((project, built)) = harness::build_under_toolchain("durability", "identity-no-suite")
+    else {
+        return;
+    };
+    assert!(
+        built.status.success(),
+        "the durability fixture did not build:\n{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+
+    let environment = harness::environment(&provider);
+    let ran = harness::run_into(
+        &project,
+        "durability",
+        "flow.relay",
+        &[("topic", "durability")],
+        None,
+        &environment,
+    );
+    ran.succeeded();
+
+    assert!(
+        harness::journal_holds(&project, &["first/0#model/0", "second/0#model/0"]),
+        "both model records are committed, so the journal really is being read"
+    );
+    assert!(
+        !harness::journal_holds(&project, &["serverTools"]),
+        "no ladder member declares a suite, so the key is omitted from the request \
+         identity rather than written empty — which is what keeps a journal from \
+         before the key existed replaying, and `JOURNAL_VERSION` where it is"
+    );
+}
+
 /// A pause survives the process that opened it, and comes back under the **same
 /// wait id** (resolved q28).
 ///
