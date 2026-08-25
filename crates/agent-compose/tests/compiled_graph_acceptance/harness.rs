@@ -128,6 +128,7 @@ pub const FIXTURES: &[&str] = &[
     "agent-anthropic",
     "agent-openai",
     "bounded-cycle",
+    "builtin-tools",
     "durability",
     "fanout",
     "flow-as-tool",
