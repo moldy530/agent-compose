@@ -3816,12 +3816,22 @@ async function runBuiltinBash(
       // `timeout` option, which the two supported runtimes do not implement
       // alike. `SIGKILL` rather than `SIGTERM`: the bound is what an author was
       // promised, and a command that traps the polite signal would outlive it.
+      //
+      // And the call is settled **here**, rather than left to the `close` event
+      // the ordinary path resolves on. `close` waits for the child's output
+      // pipes to close as well as for the child to exit, and a killed shell can
+      // leave a background grandchild holding them — `bash -c 'sleep 30 &
+      // wait'` is the shape — so a deadline that waited for `close` would be
+      // the command's to honour rather than the composition's. Resolving twice
+      // is harmless: the first settlement is the promise's, and the `close`
+      // that may still arrive finds it settled.
       const timer =
         bound === undefined
           ? undefined
           : setTimeout(() => {
               expired = true;
               child.kill("SIGKILL");
+              resolve({ code: -1, stdout, stderr, expired: true });
             }, bound.millis);
       const settle = (): void => {
         if (timer !== undefined) clearTimeout(timer);
