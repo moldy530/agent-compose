@@ -1018,6 +1018,13 @@ const HARNESS: &[Criterion] = &[Criterion {
             "a_failover_off_the_messages_wire_rewrites_the_turn_for_the_responses_one",
             Status::Live,
         ),
+        // …and the turn that rewriting has *nothing* to write: a Responses
+        // answer that is all server-tool items, which the rebuild must drop
+        // rather than send as the empty message the Messages API refuses.
+        (
+            "a_responses_turn_with_nothing_the_messages_wire_can_spell_is_not_replayed_empty",
+            Status::Live,
+        ),
         (
             "server_tools_on_a_kind_whose_wire_has_none_is_refused_by_name",
             Status::Live,

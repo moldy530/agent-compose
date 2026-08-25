@@ -1169,6 +1169,91 @@ fn a_failover_off_the_responses_wire_rewrites_the_turn_for_the_messages_one() {
     assert!(provider.snapshot().is_drained());
 }
 
+/// A Responses turn whose **whole** content is items the Messages wire cannot
+/// spell is dropped from the replay rather than sent as an empty message
+/// (Decision D122).
+///
+/// The turn above carried a `tool_use` the rebuild had something to render. This
+/// one carries nothing: the provider ran its search and the model said no words,
+/// which is also the shape an answer cut short by `max_output_tokens` takes. The
+/// turn survives `replayed` — it has items, so the model did answer — and then
+/// reaches a member on the other wire, where `text` is `""` and there are no
+/// tool calls, so the rebuild has no block to emit.
+///
+/// `{"role": "assistant", "content": []}` is what a rebuild that emitted the
+/// turn anyway would send, and the Messages API refuses it (`content: List
+/// should have at least 1 item`) — so the node would die on a 400 about the
+/// *request*, one call after the model's empty answer, and `rate_limit` is not a
+/// status a `route_on:` catches. Dropping the turn keeps the conversation legal
+/// and leaves it opening on the user turn it already opened on.
+#[test]
+fn a_responses_turn_with_nothing_the_messages_wire_can_spell_is_not_replayed_empty() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        // Turn one, on the Responses wire: a search the provider ran, and not one
+        // word of prose beside it. No tool call, so the loop ends here.
+        Script::new(
+            GPT5,
+            Outcome::text("").with_server_tools(vec![ServerToolUse::new(
+                "web_search",
+                json!({ "type": "search", "query": "what" }),
+                json!([{ "url": "https://docs.example.com/a" }]),
+            )]),
+        ),
+        // The pinned call that answers the node falls to the Anthropic member,
+        // replaying a history whose only assistant turn is that one.
+        Script::new(GPT5, Outcome::rate_limit()),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "answer": "the fallback answered anyway" })),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke(
+        "server-tools",
+        "flow.cross_from_responses",
+        &[("question", "what?")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(run.outputs()["answer"], "the fallback answered anyway");
+
+    let asked = provider.requests();
+    assert_eq!(
+        asked
+            .iter()
+            .map(|request| (request.surface, request.path.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (Surface::Responses, "/v1/responses"),
+            (Surface::Responses, "/v1/responses"),
+            (Surface::Anthropic, "/v1/messages"),
+        ],
+        "the loop ended on the first answer, and the pinned call fell to the other wire"
+    );
+
+    let replayed = &asked[2];
+    assert!(
+        replayed.is_valid(),
+        "an empty assistant message would be refused here: {:?}\n{}",
+        replayed.failures(),
+        replayed.body_text
+    );
+    assert_eq!(
+        block_types(
+            replayed.body()["messages"]
+                .as_array()
+                .expect("a message list")
+        ),
+        [vec!["<user>".to_string()]],
+        "the unspellable turn was dropped, not padded and not emptied: {}",
+        replayed.body_text
+    );
+    assert!(provider.snapshot().is_drained());
+}
+
 /// The same seam, crossed the other way: a Messages answer replayed to the
 /// Responses wire (Decision D122).
 ///
