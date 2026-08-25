@@ -254,10 +254,18 @@ empty path is the runtime's own working directory, so a bound that accepted one
 would be the ambient capability these entries exist to refuse — read off no
 entry, and different on a developer's machine and a deployment's.
 
+`builtin.list`'s `glob` matches `*` and `?` inside one path segment and `**`
+across them — `docs/*.md` is the files directly under `docs/`, `**/*.md` is every
+one of them at any depth. `**` matches zero segments as readily as several, so
+writing several of them says what one says.
+
 **`timeout:` is required on `builtin.bash`** and illegal on the file tools, which
-run no command. It bounds one command; the node's own `timeout:` bounds the whole
-agent node, tool loop included, and the two compose. The deadline kills the
-command's whole **process group** and ends the call — the shell is almost never
+run no command. What bounds a file tool is the node's own `timeout:`: a listing
+over a large tree stops where it is when the node's deadline runs out or the run
+is cancelled, rather than finishing a walk nothing is waiting for. `bash`'s own
+`timeout:` bounds one command; the node's bounds the whole agent node, tool loop
+included, and the two compose. The deadline kills the command's whole **process
+group** and ends the call — the shell is almost never
 where the work is, and a `npm run build` that outlived its own deadline would go
 on writing inside `root:` after the node had already failed. What survives is
 what left the group on purpose (`setsid`, `set -m`, a daemon that double-forks),
