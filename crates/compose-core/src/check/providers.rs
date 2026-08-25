@@ -153,8 +153,9 @@ pub(crate) fn check(ctx: &mut Ctx) {
                     continue;
                 };
                 let kind = provider.kind;
+                let wire = wire_of(provider);
                 for (key, value) in &model.settings {
-                    setting(ctx, key, value, kind, address, &model.provider);
+                    setting(ctx, key, value, kind, wire, address, &model.provider);
                 }
             }
             DefinitionBody::Model(Model::Route(route)) => {
@@ -413,18 +414,21 @@ const fn describe_value(value: &PluginValue) -> &'static str {
 /// depends on which member answered. That is a real thing to know and a legal
 /// thing to want (a fallback vendor that has no web search is still a fallback),
 /// so q30 makes it visible rather than refused.
+///
+/// **Whole entries, not `type:` strings.** Two members that both declare
+/// `web_search_20250305` and give it `max_uses: 1` and `max_uses: 99` offered
+/// the model materially different tools, which is the subject of this warning;
+/// and the runtime already treats the two ladders as different calls, since a
+/// journaled model call's request identity carries the whole config object
+/// (`docs/durability.md` §3.1). A copy-then-edit of one provider is exactly how
+/// that shape arrives, so it is the shape the check has to see.
 fn server_tool_suites(ctx: &mut Ctx, address: &str, route: &crate::ir::definition::RouteModel) {
-    let mut baseline: Option<(String, Vec<String>, Span)> = None;
+    let mut baseline: Option<(String, Vec<Entry>, Span)> = None;
     for member in &route.route {
         let Some((provider, definition)) = provider_of(ctx, &member.value) else {
             continue;
         };
-        let suite: Vec<String> = definition
-            .config
-            .server_tools
-            .iter()
-            .map(|tool| tool.type_name.value.clone())
-            .collect();
+        let suite: Vec<Entry> = definition.config.server_tools.iter().map(entry).collect();
         match &baseline {
             None => baseline = Some((provider, suite, member.span.clone())),
             Some((first, want, at)) => {
@@ -448,8 +452,9 @@ fn server_tool_suites(ctx: &mut Ctx, address: &str, route: &crate::ir::definitio
                     .with_help(
                         "a server tool runs on the provider's side, so each member of a route \
                          offers its own suite and which tools the model had depends on which \
-                         member served the call: declare the same suite on both providers, or \
-                         keep this one knowing the difference (grammar 12.2, Decision D122)",
+                         member served the call: declare the same suite, field for field, on \
+                         both providers, or keep this one knowing the difference (grammar 12.2, \
+                         Decision D122)",
                     ),
                 );
             }
@@ -457,10 +462,94 @@ fn server_tool_suites(ctx: &mut Ctx, address: &str, route: &crate::ir::definitio
     }
 }
 
+/// One `server_tools:` entry as the comparison reads it: the `type:` the two
+/// suites are matched up by, and a canonical rendering of everything beside it.
+///
+/// A rendering rather than the values themselves because the values are spanned,
+/// and two members that wrote the same config in two files wrote it at two
+/// positions — the wire cannot see that and neither may this check.
+#[derive(PartialEq, Eq)]
+struct Entry {
+    type_name: String,
+    config: String,
+}
+
+/// [`Entry`] for one declared tool.
+fn entry(tool: &ServerTool) -> Entry {
+    Entry {
+        type_name: tool.type_name.value.clone(),
+        config: tool
+            .config
+            .iter()
+            .map(|(key, value)| format!("{key}={}", rendered(&value.value)))
+            .collect::<Vec<_>>()
+            .join(","),
+    }
+}
+
+/// One config value, canonically: same value, same string.
+///
+/// A wire object is a **set** of fields, so a nested mapping's keys are sorted
+/// here — the top level already is, since the IR keeps it in a `BTreeMap`. An
+/// interpolated string renders as what it says rather than as what it resolves
+/// to, which is the only reading available at compile time and the right one:
+/// two providers naming `${SEARCH_DOMAINS}` declared the same offer.
+fn rendered(value: &PluginValue) -> String {
+    match value {
+        PluginValue::Null => "null".to_string(),
+        PluginValue::Bool(flag) => flag.to_string(),
+        PluginValue::Int(number) => number.to_string(),
+        PluginValue::Float(number) => number.to_string(),
+        PluginValue::Text(text) => format!("{:?}", text.as_str()),
+        PluginValue::Sequence(items) => format!(
+            "[{}]",
+            items
+                .iter()
+                .map(|item| rendered(&item.value))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        PluginValue::Mapping(entries) => {
+            let mut fields: Vec<String> = entries
+                .iter()
+                .map(|entry| format!("{}={}", entry.key.value, rendered(&entry.value.value)))
+                .collect();
+            fields.sort();
+            format!("{{{}}}", fields.join(","))
+        }
+    }
+}
+
 /// What two suites disagree about, as one clause a reader can act on.
-fn difference(first: &[String], second: &[String]) -> String {
-    let missing: Vec<&String> = first.iter().filter(|tool| !second.contains(tool)).collect();
-    let extra: Vec<&String> = second.iter().filter(|tool| !first.contains(tool)).collect();
+fn difference(first: &[Entry], second: &[Entry]) -> String {
+    let named = |suite: &[Entry], other: &[Entry]| -> Vec<String> {
+        suite
+            .iter()
+            .filter(|entry| !other.iter().any(|tool| tool.type_name == entry.type_name))
+            .map(|entry| entry.type_name.clone())
+            .collect()
+    };
+    let missing = named(first, second);
+    let extra = named(second, first);
+    // A tool both members declare and configure differently, which is the half a
+    // `type:`-only comparison cannot see.
+    let mut reconfigured: Vec<String> = Vec::new();
+    for entry in first {
+        if reconfigured.contains(&entry.type_name) {
+            continue;
+        }
+        let configs = |suite: &[Entry]| -> Vec<String> {
+            suite
+                .iter()
+                .filter(|tool| tool.type_name == entry.type_name)
+                .map(|tool| tool.config.clone())
+                .collect()
+        };
+        let theirs = configs(second);
+        if !theirs.is_empty() && configs(first) != theirs {
+            reconfigured.push(entry.type_name.clone());
+        }
+    }
     let mut clauses = Vec::new();
     if !missing.is_empty() {
         clauses.push(format!(
@@ -474,9 +563,15 @@ fn difference(first: &[String], second: &[String]) -> String {
             crate::parse::reader::list(&extra)
         ));
     }
+    if !reconfigured.is_empty() {
+        clauses.push(format!(
+            "it configures {} differently",
+            crate::parse::reader::list(&reconfigured)
+        ));
+    }
     if clauses.is_empty() {
-        // Same tools, different order — which is a difference the wire can see,
-        // since the array reaches the request as written.
+        // Same tools, same configs, different order — which is a difference the
+        // wire can see, since the array reaches the request as written.
         return "the same tools in a different order".to_string();
     }
     clauses.join(", and ")
@@ -491,15 +586,85 @@ fn provider_of<'a>(ctx: &Ctx<'a>, model: &Address) -> Option<(String, &'a Provid
         .map(|provider| (direct.provider.value.to_string(), provider))
 }
 
+/// Which HTTP surface a connection speaks, where its kind alone does not say.
+///
+/// One kind forks: an `openai` provider that declares `server_tools:` issues
+/// **every** one of its calls to the Responses API, because that is the only
+/// OpenAI surface the built-in tool suite exists on (Decision D122). The fork is
+/// the compiler's own — one key beside another in one mapping decides it — which
+/// is what makes the settings that surface has no equivalent of a compile-time
+/// question rather than a 400 on the first model call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Wire {
+    /// Whatever the kind's row says: Messages, Chat Completions, or the Azure
+    /// spelling of the latter.
+    OfItsKind,
+    /// OpenAI's Responses API.
+    Responses,
+}
+
+/// [`Wire`] for one resolved provider.
+fn wire_of(provider: &Provider) -> Wire {
+    if provider.kind == ProviderKind::OpenAi && !provider.config.server_tools.is_empty() {
+        Wire::Responses
+    } else {
+        Wire::OfItsKind
+    }
+}
+
+/// The published `settings:` keys the **Responses** wire has no equivalent of.
+///
+/// Two of grammar 12.2's keys are Chat Completions' and are not carried over:
+/// there is no `stop` and no `seed` on `POST /v1/responses`. The `openai` plugin
+/// publishes both — a provider without a suite still takes them — so the row
+/// they are refused on is the connection's wire rather than its kind
+/// (`WIRE-NOTES` (19), Decision D122).
+const RESPONSES_HAS_NO: &[&str] = &["stop", "seed"];
+
 /// One `settings:` entry against the provider kind's published schema.
 fn setting(
     ctx: &mut Ctx,
     key: &str,
     value: &Spanned<Literal>,
     kind: ProviderKind,
+    wire: Wire,
     model: &str,
     provider: &Spanned<Address>,
 ) {
+    // A knob this connection's **wire** does not have, on a kind that publishes
+    // it. Refused here rather than left to the request, for the reason the
+    // strict server-tool tier exists: a setting the service will not read is
+    // otherwise a run that dies on its first model call with a 400 and no span,
+    // and the alternative failure — a `stop` sequence quietly never applying —
+    // is worse. The kind's own key row is untouched: move the suite off this
+    // provider and both keys come back.
+    if wire == Wire::Responses && RESPONSES_HAS_NO.contains(&key) {
+        ctx.push(
+            Diagnostic::error(
+                DiagnosticCode::UnknownKey,
+                value.span.clone(),
+                format!(
+                    "`{key}` is not a setting the `{}` provider plugin publishes on the \
+                     Responses wire",
+                    kind.as_str()
+                ),
+            )
+            .with_label(
+                provider.span.clone(),
+                format!(
+                    "`{}` declares `server_tools:`, which moves every call it serves onto \
+                     `POST /v1/responses`",
+                    provider.value
+                ),
+            )
+            .with_help(format!(
+                "the Responses API has no `{key}`, and refuses a request carrying one: drop it \
+                 from `{model}`, or declare the suite on a second provider and leave this \
+                 connection on Chat Completions (grammar 12.1, Decision D122)"
+            )),
+        );
+        return;
+    }
     let schema = published(kind);
     let Some((_, shape)) = schema.iter().find(|(name, _)| *name == key) else {
         let known: Vec<&str> = schema.iter().map(|(name, _)| *name).collect();

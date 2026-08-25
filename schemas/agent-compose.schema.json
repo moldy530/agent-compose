@@ -1632,7 +1632,8 @@
                   ]
                 },
                 "name": {
-                  "$ref": "#/$defs/interpolatedString"
+                  "description": "The canonical name the Messages API pairs with this `type`. Required, and fixed: the service refuses a request whose two disagree.",
+                  "const": "web_search"
                 },
                 "cache_control": {
                   "type": "object",
@@ -1730,7 +1731,8 @@
                   ]
                 },
                 "name": {
-                  "$ref": "#/$defs/interpolatedString"
+                  "description": "The canonical name the Messages API pairs with this `type`. Required, and fixed: the service refuses a request whose two disagree.",
+                  "const": "web_fetch"
                 },
                 "cache_control": {
                   "type": "object",
@@ -1821,7 +1823,8 @@
                   ]
                 },
                 "name": {
-                  "$ref": "#/$defs/interpolatedString"
+                  "description": "The canonical name the Messages API pairs with this `type`. Required, and fixed: the service refuses a request whose two disagree.",
+                  "const": "code_execution"
                 },
                 "cache_control": {
                   "type": "object",

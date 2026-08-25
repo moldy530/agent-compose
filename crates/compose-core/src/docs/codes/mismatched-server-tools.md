@@ -16,6 +16,13 @@ between failover and server tools. So the difference is made **visible** rather
 than refused: the warning names both providers and what they disagree about, and
 a reader who meant it carries on.
 
+**Different means field for field.** Two members that both declare
+`web_search_20250305` and give it `max_uses: 1` and `max_uses: 99` offered the
+model materially different tools, so the warning names that too — a
+copy-then-edit of a provider is exactly how the half-changed suite arrives, and
+the runtime already treats the two ladders as different calls, since a journaled
+model call's request identity carries the whole config object.
+
 Capability equivalence (`missing-capability`) is the neighbouring rule and is an
 error, because structured output is what an agent's contract is *made of* — a
 route that lost it produces a parse failure two nodes later. A missing search
@@ -51,8 +58,9 @@ model.resilient:
 
 ## The fix
 
-Declare the same suite on both providers, if both vendors serve it — providers
-are cheap, and two connections carrying one array is the ordinary shape.
+Declare the same suite, field for field, on both providers, if both vendors
+serve it — providers are cheap, and two connections carrying one array is the
+ordinary shape.
 
 Or keep the route as it is. The warning is the record that a failover changes
 what the model can do, not an instruction to remove one.
