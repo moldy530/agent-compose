@@ -190,10 +190,22 @@ provider.anthropic:
 ```
 
 Both dated revisions are `code_execution` — that is what the Messages wire pairs
-with either `type:` — so one of the two goes. The other way is an attachment: an
-`agent.*` holding `tool.web_search` whose model reaches a provider declaring
-`web_search_20250305` offers `web_search` twice, and the fix is to rename the
-attachment or to move the suite onto a provider that agent does not use.
+with either `type:` — so one of the two goes. That half holds on every kind: two
+entries of one array under one name are one tool twice by your own reckoning,
+whatever the wire keys on.
+
+The other way is an attachment, and that half is the **Messages wire's alone**:
+an `agent.*` holding `tool.web_search` whose model reaches an `anthropic`
+provider declaring `web_search_20250305` offers `web_search` twice, and the fix
+is to rename the attachment or to move the suite onto a provider that agent does
+not use. It is the one wire where a server tool and a client tool sit under the
+same key. On the Responses wire a built-in is addressed by its `type:` while a
+function tool carries a `name:`; on Chat Completions a function tool's name is
+nested inside its own object; and no table could say what a gateway keys its
+vocabulary on. So `tool.search_docs` beside an `openai_compatible` connection
+whose suite declares `name: search_docs` compiles — the entry's
+`unknown-server-tool` warning is the whole of what this release has to say about
+it.
 
 ### Two tiers of checking, and why
 

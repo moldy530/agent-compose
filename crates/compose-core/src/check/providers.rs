@@ -320,11 +320,20 @@ fn unverified_field(type_name: &str, names: &[&str], key: &str) -> String {
 /// between two *client* tools (`check::bindings`'s `tool-name-collision`). Which
 /// key the slot is keyed on is the wire's:
 ///
-/// * a wire that addresses a tool by **name** — the Messages one, and a
-///   gateway's, where a server tool sits in the same array under the same key as
-///   the agent's own tools — is keyed on that name;
+/// * a wire that addresses a tool by **name** — the Messages one, where the
+///   table pins the name each dated `type:` reaches the request under, and a
+///   gateway's, where the `name:` an entry declares is the author's own claim
+///   about the vocabulary it is writing for — is keyed on that name;
 /// * the **Responses** wire's built-ins carry no `name:` at all, so the `type:`
 ///   *is* the slot: one connection offers `web_search` once.
+///
+/// This is a comparison **within one suite**, and that is what makes the
+/// gateway arm answerable at all: two entries of one array declaring one
+/// `name:` are one tool twice by the author's own reckoning, whichever key the
+/// gateway ends up reading. The other half of §11.5's rule — a suite entry
+/// against the *agent's* attached tools — needs to know what the wire keys both
+/// sides on and so is stated over the Messages wire alone
+/// (`check::bindings`'s `server_tool_collisions`, grammar 12.1, D122).
 #[derive(PartialEq, Eq)]
 enum Slot {
     /// The `name:` the entry reaches the wire under.

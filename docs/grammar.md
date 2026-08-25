@@ -3507,9 +3507,14 @@ attached or synthesized tool already takes, are a compile error
 (`tool-name-collision`) — §11.5's rule and §11.5's reason, reached from the
 connection's side. On the Messages wire the name is the one the table pairs with
 each dated `type`, which is what makes `code_execution_20250522` beside
-`code_execution_20250825` two types with one name; the agent-side half is stated
-over that wire alone, since a Responses built-in is addressed by its `type` and a
-function tool by its `name`, two keys that cannot collide.
+`code_execution_20250825` two types with one name; the within-a-suite half holds
+on every kind, since two entries of one array under one name are one tool twice
+by the author's own reckoning. The agent-side half is stated over the Messages
+wire **alone**: a Responses built-in is addressed by its `type` and a function
+tool by its `name`, Chat Completions nests a function tool's name inside its own
+object, and no table could say what a gateway keys its vocabulary on — so a
+`tool.*` whose name an `openai` or `openai_compatible` connection's suite also
+spells is not refused.
 
 The checking is **two-tier**, and the constraint behind it is that a server tool
 a vendor ships tomorrow must be usable the day it ships:
