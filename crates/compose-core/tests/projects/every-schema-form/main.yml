@@ -276,10 +276,19 @@ agent.shaper:
   description: Produces one of everything.
   model: model.m
   prompt: Produce a shape.
-  # A flow attached as a tool, which is the other half of the shape above: the
-  # agent's tool list carries it beside nothing else, so the emitted binding is
-  # readable as exactly what grammar 5.4 gives a `flow.*` on the wire.
-  tools: [flow.condense]
+  # A flow attached as a tool, which is the other half of the shape above, and
+  # all four runtime built-ins beside it (grammar 5.5, D123). The list is the one
+  # place two entry *shapes* meet — a bare address and a single-key mapping —
+  # and each built-in's emitted binding carries a schema and a bound this
+  # composition is the only golden to spell, so `tsc` and the pinned parse see
+  # every one of them.
+  tools:
+    - flow.condense
+    - builtin.read_file: { root: "${WORKSPACE}" }
+    - builtin.write_file: { root: "${WORKSPACE}" }
+    - builtin.list: { root: "${WORKSPACE}" }
+    # The bounded one: a working directory and a deadline, both required.
+    - builtin.bash: { root: "${WORKSPACE}/build", timeout: 30s }
   input:
     goal: { type: string, description: What to shape. }
   output:

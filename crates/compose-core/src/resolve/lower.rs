@@ -140,9 +140,34 @@ fn agent(source: &ast_def::AgentDef) -> Option<ir::definition::Agent> {
         output: field_map(source.output.as_ref()?)?,
         input: optional(source.input.as_ref(), field_map)?,
         tools: source.tools.clone(),
+        builtins: source
+            .builtins
+            .iter()
+            .map(builtin)
+            .collect::<Option<Vec<_>>>()?,
         stores: source.stores.clone(),
         description: source.description.clone(),
         max_tool_iterations: source.max_tool_iterations.as_ref().map(|value| value.value),
+    })
+}
+
+/// One `builtin.*` attachment, with its bounds required (grammar 5.5,
+/// Decision D123).
+///
+/// `root:` is required of every built-in and `timeout:` of `builtin.bash`, so an
+/// attachment missing either is dropped exactly as an agent missing its `model:`
+/// is: the parser has already reported it, and the artifact only ever holds a
+/// composition that declared everything it needs.
+fn builtin(source: &ast_def::BuiltinAttachment) -> Option<ir::definition::BuiltinTool> {
+    let timeout = source.timeout.clone();
+    if source.tool.value.runs_a_command() && timeout.is_none() {
+        return None;
+    }
+    Some(ir::definition::BuiltinTool {
+        tool: source.tool.clone(),
+        root: source.root.clone()?,
+        timeout,
+        span: source.span.clone(),
     })
 }
 

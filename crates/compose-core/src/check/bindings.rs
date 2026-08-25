@@ -361,8 +361,48 @@ pub(crate) fn agent_tools(ctx: &mut Ctx, address: &str, agent: &Agent) {
         );
     }
     attached_tool_collisions(ctx, address, agent);
+    builtin_tool_collisions(ctx, address, agent);
     store_tool_collisions(ctx, address, agent);
     server_tool_collisions(ctx, address, agent);
+}
+
+/// A built-in's name is on the wire beside the agent's other tools, so a
+/// `tool.*` or `flow.*` whose local name is `bash`, `read_file`, `write_file` or
+/// `list` collides with the built-in of that name (grammar 5.5, 11.5,
+/// Decision D123).
+///
+/// The same rule as [`attached_tool_collisions`], reached from the entry that
+/// carries no address to compare: a built-in's name is fixed by this compiler
+/// rather than by an author's definition key, so the repair is on the *other*
+/// side — rename the definition, or drop one of the two attachments. Which entry
+/// the report underlines is the built-in's, because that is the entry a reader
+/// can see the name in without opening another file.
+fn builtin_tool_collisions(ctx: &mut Ctx, address: &str, agent: &Agent) {
+    for builtin in &agent.builtins {
+        let local = builtin.tool.value.as_str();
+        let Some(attached) = agent
+            .tools
+            .iter()
+            .find(|tool| tool.value.name.as_str() == local)
+        else {
+            continue;
+        };
+        ctx.push(
+            Diagnostic::error(
+                DiagnosticCode::ToolNameCollision,
+                builtin.tool.span.clone(),
+                format!(
+                    "`{address}` attaches `{}` and `{}`, which are one `{local}` tool on the model's side",
+                    builtin.tool.value.address(),
+                    attached.value
+                ),
+            )
+            .with_label(attached.span.clone(), "the other is attached here")
+            .with_help(
+                "an attached tool's name is its address's local name and a built-in's is fixed by the compiler (grammar 5.4, 5.5): rename the definition, or drop one of the two attachments",
+            ),
+        );
+    }
 }
 
 /// Two entries of one `tools:` list whose **local names** are equal are one tool
@@ -415,6 +455,13 @@ fn attached_tool_collisions(ctx: &mut Ctx, address: &str, agent: &Agent) {
 /// An attached tool's name is its address's local name — the only name it has
 /// on the model's side — so `tool.prefs_get` and the `prefs_get` a `kv`
 /// `store.prefs` synthesizes are two tools with one name.
+///
+/// The **built-ins** are deliberately not compared here, and that is a fact
+/// about the two name shapes rather than an omission: a synthesized name is
+/// `<store's local name>_<op>` over grammar 11.4's closed op list, and none of
+/// `bash`, `read_file`, `write_file` or `list` has that shape for a non-empty
+/// local name. `the_builtin_names_are_not_shapes_a_store_can_synthesize` is that
+/// premise, held where it can fail if either list moves (grammar 5.5, 11.5).
 fn store_tool_collisions(ctx: &mut Ctx, address: &str, agent: &Agent) {
     if agent.tools.is_empty() || agent.stores.is_empty() {
         return;
@@ -502,6 +549,19 @@ fn server_tool_collisions(ctx: &mut Ctx, address: &str, agent: &Agent) {
             )
         })
         .collect();
+    // A built-in reaches the same `tools` array under the same key, so a suite
+    // declaring `bash` and an agent holding `builtin.bash` is the same 400 as
+    // any other pair (grammar 5.5, Decision D123).
+    for builtin in &agent.builtins {
+        offered.push((
+            builtin.tool.value.as_str().to_string(),
+            builtin.tool.span.clone(),
+            format!(
+                "attaches `{}`, whose name collides with",
+                builtin.tool.value.address()
+            ),
+        ));
+    }
     for attached in &agent.stores {
         let Some(store) = ctx.store(&attached.value) else {
             continue;
@@ -800,5 +860,32 @@ flow.f:
             ),
             ["unknown-server-tool"]
         );
+    }
+
+    /// No store can synthesize a tool called `bash`, `read_file`, `write_file`
+    /// or `list`, which is why [`super::store_tool_collisions`] does not compare
+    /// the built-ins.
+    ///
+    /// The premise is about two closed lists — the built-in names and grammar
+    /// 11.4's ops — so it is held here rather than asserted in a comment: a
+    /// built-in whose name were `notes_get`, or an op called `file`, would make
+    /// the collision writable, and this test is what would say so.
+    #[test]
+    fn the_builtin_names_are_not_shapes_a_store_can_synthesize() {
+        use crate::ast::definition::{Builtin, StoreKind};
+        for builtin in Builtin::ALL {
+            for kind in StoreKind::ALL {
+                for op in kind.operations() {
+                    let suffix = format!("_{op}");
+                    assert!(
+                        !builtin.as_str().ends_with(&suffix)
+                            || builtin.as_str().len() == suffix.len(),
+                        "`{}` is `<local>_{op}` for a non-empty local name, so a store could \
+                         synthesize it",
+                        builtin.as_str()
+                    );
+                }
+            }
+        }
     }
 }
