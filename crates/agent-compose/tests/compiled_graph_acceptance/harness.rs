@@ -135,6 +135,7 @@ pub const FIXTURES: &[&str] = &[
     "keyless-gateway",
     "model-failover",
     "provider-kinds",
+    "server-tools",
     "stores",
 ];
 

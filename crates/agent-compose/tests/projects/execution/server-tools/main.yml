@@ -1,0 +1,259 @@
+# M3 acceptance fixture: server tools on both launch wires (grammar 12.1,
+# Decision D122, resolved q30).
+#
+# A **server tool** runs on the provider's side, inside the model call. The
+# runtime dispatches nothing: it appends the provider's `server_tools:` array to
+# the `tools` of every request that provider serves, and the results arrive
+# woven into the assistant's turn. So what this fixture is written to make
+# assertable is three things a transcript can see:
+#
+#   * the config reaches the wire **verbatim** — the whole of what q30's
+#     pass-through promises;
+#   * a scripted `server_tool_use` (Messages) or `web_search_call` (Responses)
+#     flows through the loop **without being dispatched**, and the agent still
+#     answers;
+#   * an `openai` provider carrying a suite issues its calls to `/v1/responses`
+#     rather than `/v1/chat/completions`, and everything else about the call —
+#     function tools, structured output — still works there.
+#
+# The two providers are the two wires, and `provider.searching_openai` is
+# deliberately the *only* difference from an ordinary `openai` provider: one key
+# moves the connection to another API (Decision D122's all-or-nothing seam).
+#
+# `tool.lookup` is an `exec` binding over `printf` for the reason every fixture's
+# is: the tool loop has to be runnable in CI with no infrastructure, and its
+# output is one string property, so the raw stdout binds to it (grammar 6.1).
+version: "0.1"
+
+# One channel, written by name from each agent's `answer` output field, so a
+# flow's `outputs:` has something to materialize from (grammar 7.5, D53).
+state:
+  answer:
+    description: What the agent answered, written by name from its output.
+    type: string
+    default: nothing yet
+  relayed:
+    description: What the first node of `flow.relay` answered.
+    type: string
+    default: nothing yet
+  final:
+    description: What its second node answered.
+    type: string
+    default: nothing yet
+
+provider.searching_anthropic:
+  kind: anthropic
+  api_key: ${MOCK_API_KEY}
+  base_url: ${MOCK_BASE_URL}
+  server_tools:
+    - type: web_search_20250305
+      name: web_search
+      max_uses: 5
+      allowed_domains: ["docs.example.com"]
+
+provider.searching_openai:
+  kind: openai
+  api_key: ${MOCK_API_KEY}
+  base_url: ${MOCK_BASE_URL}
+  server_tools:
+    - type: web_search
+      search_context_size: medium
+
+# The failover pair: one member searches, the other does not, and the two are on
+# different wires. `validate` warns about the differing suites (q30 makes that
+# visible rather than refused) and the run has to compose across the seam
+# anyway — each attempt speaks its own provider's wire.
+provider.plain_openai:
+  kind: openai
+  api_key: ${MOCK_API_KEY}
+  base_url: ${MOCK_BASE_URL}
+
+model.searching_claude:
+  provider: provider.searching_anthropic
+  id: claude-sonnet-4-6
+  settings:
+    max_tokens: 4096
+
+model.searching_gpt:
+  provider: provider.searching_openai
+  id: gpt-5
+  settings:
+    max_tokens: 4096
+
+model.plain_gpt:
+  provider: provider.plain_openai
+  id: gpt-4o-mini
+
+model.crossing_wires:
+  description: A route whose members answer on two different wires.
+  route: [model.searching_gpt, model.plain_gpt]
+  route_on: [rate_limit]
+
+tool.lookup:
+  description: Look up one fact the answer depends on.
+  input:
+    query:
+      description: What to look up.
+      type: string
+      min_length: 1
+  output:
+    snippet:
+      description: The one fact found, as text.
+      type: string
+  exec:
+    command: printf
+    args: ["a looked-up snippet"]
+
+agent.searcher:
+  description: Answers with the web search its provider runs for it.
+  model: model.searching_claude
+  prompt: |
+    You are a researcher.
+
+    Search the web for whatever the question depends on, then answer it.
+  input:
+    question:
+      description: What to answer.
+      type: string
+  output:
+    answer:
+      description: The answer, as text.
+      type: string
+
+agent.responder:
+  description: The same, on the Responses wire, and with a client tool as well.
+  model: model.searching_gpt
+  prompt: |
+    You are a researcher.
+
+    Look up whatever the question depends on — with your own tool or with the
+    search your provider runs — then answer it.
+  tools: [tool.lookup]
+  max_tool_iterations: 3
+  input:
+    question:
+      description: What to answer.
+      type: string
+  output:
+    answer:
+      description: The answer, as text.
+      type: string
+
+agent.crosser:
+  description: Answers through a route whose members are on two wires.
+  model: model.crossing_wires
+  prompt: |
+    You are a researcher. Answer the question.
+  input:
+    question:
+      description: What to answer.
+      type: string
+  output:
+    answer:
+      description: The answer, as text.
+      type: string
+
+flow.search:
+  description: One agent whose provider searches the web for it.
+  inputs:
+    question:
+      type: string
+      min_length: 1
+  outputs:
+    answer:
+      type: string
+  nodes:
+    ask:
+      agent: agent.searcher
+      input:
+        question: "input.question"
+  edges:
+    - { from: start, to: ask }
+    - { from: ask, to: end }
+
+flow.respond:
+  description: The same on the Responses wire, with a client tool in the loop.
+  inputs:
+    question:
+      type: string
+      min_length: 1
+  outputs:
+    answer:
+      type: string
+  nodes:
+    ask:
+      agent: agent.responder
+      input:
+        question: "input.question"
+  edges:
+    - { from: start, to: ask }
+    - { from: ask, to: end }
+
+flow.cross:
+  description: One agent whose route crosses from the Responses wire to Chat Completions.
+  inputs:
+    question:
+      type: string
+      min_length: 1
+  outputs:
+    answer:
+      type: string
+  nodes:
+    ask:
+      agent: agent.crosser
+      input:
+        question: "input.question"
+  edges:
+    - { from: start, to: ask }
+    - { from: ask, to: end }
+
+flow.relay:
+  # Two model calls in a row on a provider that carries a server-tool suite —
+  # the smallest shape a *frontier* is observable in. Kill the run while the
+  # second call is in flight and the journal holds one recorded answer, so a
+  # resumed generation replays it instead of asking again: q30 leaves replay
+  # untouched, because the tool use happened inside the recorded model call
+  # (`docs/durability.md` §3.1).
+  description: Two searching calls in a row, the second asking about the first's answer.
+  inputs:
+    question:
+      type: string
+      min_length: 1
+  outputs:
+    relayed:
+      type: string
+    final:
+      type: string
+  nodes:
+    first:
+      agent: agent.searcher
+      input:
+        question: "input.question"
+      writes:
+        answer: relayed
+
+    second:
+      agent: agent.searcher
+      input:
+        question: "state.relayed"
+      writes:
+        answer: final
+
+  edges:
+    - { from: start, to: first }
+    - { from: first, to: second }
+    - { from: second, to: end }
+
+triggers:
+  search:
+    type: manual
+    flow: flow.search
+  relay:
+    type: manual
+    flow: flow.relay
+  respond:
+    type: manual
+    flow: flow.respond
+  cross:
+    type: manual
+    flow: flow.cross

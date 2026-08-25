@@ -1,0 +1,24 @@
+# A single-file project whose only report is a **warning**: a server tool this
+# compiler release does not know, which travels to the wire unchecked
+# (grammar 12.1, Decision D122, resolved q30). Pinned by `cli.rs` — it is the
+# one composition that exercises what a warning does to a report and to an exit
+# code.
+version: "0.1"
+
+provider.p:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+  server_tools:
+    - type: web_search_20260101
+      name: web_search
+
+model.m:
+  provider: provider.p
+  id: some-model
+
+agent.reviewer:
+  description: Reviews a draft.
+  model: model.m
+  prompt: Review the draft.
+  output:
+    verdict: { enum: [approve, revise] }
