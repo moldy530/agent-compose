@@ -13,6 +13,20 @@ Neither half of the rule is decidable in one place: the synthesized names come
 from the store's definition, and the name they collide with is in the agent's
 own `tools:` list.
 
+The same rule reaches two more pairs, because the request's `tools` array is one
+namespace whoever fills it. A provider's `server_tools:` suite is appended to
+that array on every request the connection serves (grammar 12.1), so:
+
+* two entries of one suite that reach the wire as one tool collide — the Messages
+  wire pairs each dated `type:` with one fixed `name:`, which is what makes
+  `code_execution_20250522` beside `code_execution_20250825` two types with one
+  name;
+* a server tool collides with an attached `tool.*`/`flow.*` or a synthesized
+  store tool of any agent whose model reaches that provider — including through
+  a failover route, whose members each declare their own suite.
+
+Both are reported against the entry written second, with the first labelled.
+
 ## A spec that triggers it
 
 ```yaml triggers
@@ -60,5 +74,12 @@ is worth considering first: a hand-written tool that duplicates a synthesized
 one is usually the older of the two, and `agent_access: read` already narrows
 the surface without a wrapper.
 
-Grammar: `docs/grammar.md` §11.5. Topics:
-`agent-compose docs stores`, `agent-compose docs agents`.
+Where the other name is a **server tool**, the same three repairs read
+differently: keep one of two dated revisions, rename the attachment the suite
+collides with, or — since a suite belongs to the connection rather than to one
+agent — declare it on a second provider that this agent's model does not reach.
+Providers are cheap.
+
+Grammar: `docs/grammar.md` §11.5, §12.1. Topics:
+`agent-compose docs stores`, `agent-compose docs agents`,
+`agent-compose docs models`.

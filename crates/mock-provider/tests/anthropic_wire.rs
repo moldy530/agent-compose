@@ -733,6 +733,61 @@ fn a_declared_server_tool_arrives_verbatim_and_is_recorded_as_one() {
     assert_eq!(recorded[0].body()["tools"][1], web_search);
 }
 
+/// The `tools` array is one namespace, and a name in it twice is a 400 whichever
+/// side runs the tool (`WIRE-NOTES` (22)).
+///
+/// Both shapes the compiler's `tool-name-collision` rule now refuses are refused
+/// here too, which is what lets the acceptance harness witness that rule rather
+/// than take the compiler's word for it: two dated revisions of one server tool
+/// carry one canonical `name:`, and a client tool may take a name the
+/// connection's suite already spends.
+#[test]
+fn a_name_the_tools_array_already_carries_is_refused_whichever_side_runs_it() {
+    let provider = MockProvider::start().expect("a port");
+    let client = provider.client();
+
+    let mut both_revisions = output_schema_tool();
+    let array = both_revisions.as_array_mut().expect("a tool list");
+    array.push(json!({ "type": "code_execution_20250522", "name": "code_execution" }));
+    array.push(json!({ "type": "code_execution_20250825", "name": "code_execution" }));
+    let response = send(
+        &client,
+        &structured_request(both_revisions, "reviewer_output"),
+    );
+    assert_eq!(response.status, 400);
+    assert_eq!(response.header(HARNESS_HEADER), Some(REFUSED_INVALID));
+    assert!(
+        response.json()["error"]["message"]
+            .as_str()
+            .expect("a message")
+            .contains("Duplicate tool name `code_execution`"),
+        "{}",
+        response.json()
+    );
+
+    let mut against_a_client_tool = output_schema_tool();
+    let array = against_a_client_tool.as_array_mut().expect("a tool list");
+    array.push(json!({
+        "name": "web_search",
+        "description": "Search the web the long way round.",
+        "input_schema": { "type": "object" },
+    }));
+    array.push(json!({ "type": "web_search_20250305", "name": "web_search" }));
+    let response = send(
+        &client,
+        &structured_request(against_a_client_tool, "reviewer_output"),
+    );
+    assert_eq!(response.status, 400);
+    assert_eq!(response.header(HARNESS_HEADER), Some(REFUSED_INVALID));
+
+    let recorded = provider.requests();
+    assert_eq!(recorded.len(), 2);
+    assert_eq!(recorded[0].failures().len(), 1);
+    assert_eq!(recorded[0].failures()[0].pointer, "tools.2.name");
+    assert_eq!(recorded[1].failures().len(), 1);
+    assert_eq!(recorded[1].failures()[0].pointer, "tools.2.name");
+}
+
 /// A scripted server-tool use comes back as the pair of blocks the Messages wire
 /// answers with — the use, and the result the service produced for it — ahead of
 /// whatever the model then said. Nothing here is for the graph to run.

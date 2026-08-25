@@ -556,6 +556,27 @@ pub fn type_names(kind: ProviderKind) -> Vec<&'static str> {
     known(kind).iter().map(|tool| tool.type_name).collect()
 }
 
+/// The one `name:` the wire pairs with this `type:`, where the row pins one.
+///
+/// The pinning is [`FieldShape::Choice`] of exactly one string — see
+/// [`WEB_SEARCH_NAME`] — so a row that has a `name:` at all *decides* it, and
+/// the name a Messages-wire entry reaches the request under is knowable without
+/// reading the config the author wrote. That is what lets the compiler see two
+/// entries landing in one slot of the `tools` array: `code_execution_20250522`
+/// and `code_execution_20250825` are two types with one name, and the API
+/// refuses a `tools` array carrying a name twice.
+///
+/// `None` for a row whose wire addresses its tools some other way — the
+/// Responses built-ins carry no `name:` at all — and for a `type:` the table has
+/// no row for.
+#[must_use]
+pub fn canonical_name(kind: ProviderKind, type_name: &str) -> Option<&'static str> {
+    match lookup(kind, type_name)?.shape.field("name")? {
+        FieldShape::Choice([only]) => Some(only),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -714,6 +735,33 @@ mod tests {
                 .field("name"),
             Some(FieldShape::Choice(&["code_execution"])),
             "both dated revisions carry the same canonical name"
+        );
+    }
+
+    /// [`canonical_name`] reads the pinning above rather than a second list, so
+    /// the two dated code-execution revisions answer one name — which is what
+    /// makes a suite declaring both a collision the compiler can see.
+    #[test]
+    fn the_canonical_name_is_the_one_the_row_pins() {
+        assert_eq!(
+            canonical_name(ProviderKind::Anthropic, "web_search_20250305"),
+            Some("web_search")
+        );
+        assert_eq!(
+            canonical_name(ProviderKind::Anthropic, "code_execution_20250522"),
+            canonical_name(ProviderKind::Anthropic, "code_execution_20250825"),
+            "two dated revisions of one tool occupy one slot of the `tools` array"
+        );
+        assert_eq!(
+            canonical_name(ProviderKind::Anthropic, "code_execution_20250825"),
+            Some("code_execution")
+        );
+        // A Responses built-in is addressed by its `type:`: no row pins a name,
+        // because the wire has no key to pin.
+        assert_eq!(canonical_name(ProviderKind::OpenAi, "web_search"), None);
+        assert_eq!(
+            canonical_name(ProviderKind::Anthropic, "a_tool_this_release_predates"),
+            None
         );
     }
 

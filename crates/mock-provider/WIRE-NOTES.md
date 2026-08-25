@@ -744,6 +744,16 @@ in its curated table, and does — `web_search_20250305` must be named
 `agent-compose validate` error rather than something this route catches, which
 is the right place for it: the run never happens.
 
+**Uniqueness is the exception, and it is checked.** A name this server cannot
+evaluate against a vocabulary it may predate is still a name it can compare with
+the *other* names in the same array, and the Messages API answers a request
+offering two tools under one name with a 400 whichever side runs them. So a
+server tool's `name:` goes into the same `seen` set a client tool's does: a suite
+declaring both dated `code_execution_*` revisions, or a `tool.web_search` beside
+`web_search_20250305`, is refused here exactly as the compiler refuses it
+(`tool-name-collision`) — which is what keeps the acceptance harness able to
+witness that rule rather than merely trusting it.
+
 The answer side is the mirror. A scripted `server_tools` entry becomes, on the
 Messages wire, a `server_tool_use` block and the `<name>_tool_result` that
 answers it; on Responses, one `<type>_call` item carrying `status` and — where

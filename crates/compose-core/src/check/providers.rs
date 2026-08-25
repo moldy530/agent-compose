@@ -169,6 +169,7 @@ pub(crate) fn check(ctx: &mut Ctx) {
                 for tool in &provider.config.server_tools {
                     server_tool(ctx, address, provider.kind, tool);
                 }
+                suite_collisions(ctx, address, provider);
             }
             _ => {}
         }
@@ -309,6 +310,135 @@ fn unverified_field(type_name: &str, names: &[&str], key: &str) -> String {
          (grammar 12.1, Decision D122)",
         crate::parse::reader::list(names)
     )
+}
+
+/// The slot of the request's `tools` array one `server_tools:` entry occupies.
+///
+/// The array a request carries is one namespace, and two entries landing in one
+/// slot of it are two tools the model is offered under one identity — which the
+/// provider surfaces refuse outright, exactly as they refuse the same shape
+/// between two *client* tools (`check::bindings`'s `tool-name-collision`). Which
+/// key the slot is keyed on is the wire's:
+///
+/// * a wire that addresses a tool by **name** — the Messages one, and a
+///   gateway's, where a server tool sits in the same array under the same key as
+///   the agent's own tools — is keyed on that name;
+/// * the **Responses** wire's built-ins carry no `name:` at all, so the `type:`
+///   *is* the slot: one connection offers `web_search` once.
+#[derive(PartialEq, Eq)]
+enum Slot {
+    /// The `name:` the entry reaches the wire under.
+    Named(String),
+    /// The `type:`, for an entry that takes no name.
+    Typed(String),
+}
+
+/// The `name:` one entry reaches a name-addressed wire under, where that is
+/// knowable: the canonical one the table pins for a `type:` it has a row for,
+/// and otherwise the literal the entry declares.
+///
+/// `None` for a name that is not decidable here — an interpolated one, whose
+/// value is whatever the process is started with (grammar 4.3 class 2), or one
+/// the strict tier has already refused for its shape — and `None` on the
+/// Responses wire, whose built-ins have no name.
+pub(crate) fn wire_name(kind: ProviderKind, tool: &ServerTool) -> Option<String> {
+    if kind == ProviderKind::OpenAi {
+        return None;
+    }
+    if let Some(canonical) = server_tools::canonical_name(kind, tool.type_name.value.as_str()) {
+        return Some(canonical.to_string());
+    }
+    match &tool.config.get("name")?.value {
+        PluginValue::Text(text) if text.references.is_empty() => Some(text.as_str().to_string()),
+        _ => None,
+    }
+}
+
+/// [`Slot`] for one entry, or `None` where the wire's key for it is not
+/// decidable at compile time.
+///
+/// **The `type:` is a slot only for a tool the table has a row for**, and that
+/// is the whole of what keeps this rule out of the second tier's way. Every
+/// tabled tool is a singleton on its wire — one connection offers `web_search`
+/// once — but nothing here could claim that of a `type:` this release has never
+/// seen, and a vendor whose next built-in is declared once *per instance*, told
+/// apart by a label rather than by a name, would meet a compiler refusing the
+/// composition the vendor documents. So an unknown-tier entry is compared on the
+/// literal `name:` it declares, which is the author's own claim about the wire's
+/// name space, and on nothing else.
+fn slot(kind: ProviderKind, tool: &ServerTool) -> Option<Slot> {
+    let type_name = tool.type_name.value.as_str();
+    if server_tools::lookup(kind, type_name).is_some() {
+        return Some(match server_tools::canonical_name(kind, type_name) {
+            Some(name) => Slot::Named(name.to_string()),
+            None => Slot::Typed(type_name.to_string()),
+        });
+    }
+    wire_name(kind, tool).map(Slot::Named)
+}
+
+/// Two entries of one suite that reach the wire as one tool (grammar 12.1,
+/// 11.5, Decision D122).
+///
+/// The strict tier checks each entry against its own row and would not see this:
+/// `code_execution_20250522` and `code_execution_20250825` are two valid
+/// configs of two real tools, and the table pins **one** `name:` across both, so
+/// a request carrying them both carries `code_execution` twice and is answered
+/// 400. That is the failure the canonical-name pinning exists to move to compile
+/// time (`ast/server_tools.rs`'s `WEB_SEARCH_NAME`), and pinning the name alone
+/// only moves half of it: the other half is a comparison between entries.
+///
+/// The code is [`DiagnosticCode::ToolNameCollision`] rather than one of this
+/// module's own, because the rule is the same rule — the model is offered two
+/// different things under one name — reached from the provider's side.
+fn suite_collisions(ctx: &mut Ctx, address: &str, provider: &Provider) {
+    let tools = &provider.config.server_tools;
+    for (position, tool) in tools.iter().enumerate() {
+        let Some(here) = slot(provider.kind, tool) else {
+            continue;
+        };
+        let Some(first) = tools[..position]
+            .iter()
+            .find(|earlier| slot(provider.kind, earlier).as_ref() == Some(&here))
+        else {
+            continue;
+        };
+        let type_name = tool.type_name.value.as_str();
+        let (message, help) = if first.type_name.value == tool.type_name.value {
+            (
+                format!("`{address}` declares the server tool `{type_name}` twice"),
+                "the suite reaches the request's `tools` array as written, so one `type:` \
+                 declared twice offers the model one tool twice: drop one of the two entries \
+                 (grammar 12.1, Decision D122)"
+                    .to_string(),
+            )
+        } else {
+            let Slot::Named(name) = &here else {
+                continue;
+            };
+            (
+                format!(
+                    "`{address}` declares `{}` and `{type_name}`, which are one `{name}` tool on \
+                     the model's side",
+                    first.type_name.value
+                ),
+                format!(
+                    "the wire pairs each dated `type:` with one fixed `name:` — both of these are \
+                     `{name}` — and refuses a `tools` array carrying one name twice: keep one of \
+                     the two revisions (grammar 12.1, Decision D122)"
+                ),
+            )
+        };
+        ctx.push(
+            Diagnostic::error(
+                DiagnosticCode::ToolNameCollision,
+                tool.span.clone(),
+                message,
+            )
+            .with_label(first.span.clone(), "the first is declared here")
+            .with_help(help),
+        );
+    }
 }
 
 /// One config value against its documented shape.
@@ -869,8 +999,8 @@ const fn describe(shape: Shape) -> &'static str {
 /// An agent's model resolves to providers that can serve structured output
 /// (grammar 12.2, PRD 5.2).
 fn structured_output(ctx: &mut Ctx, model: &Spanned<Address>, agent: &str) {
-    for (address, kind) in providers_of(ctx, &model.value) {
-        if capabilities(kind).structured_output {
+    for (address, provider) in providers_of(ctx, &model.value) {
+        if capabilities(provider.kind).structured_output {
             continue;
         }
         ctx.push(
@@ -893,10 +1023,11 @@ fn structured_output(ctx: &mut Ctx, model: &Spanned<Address>, agent: &str) {
 fn equivalence(ctx: &mut Ctx, address: &str, route: &crate::ir::definition::RouteModel) {
     let mut baseline: Option<(String, Capabilities)> = None;
     for member in &route.route {
-        let Some((provider, kind)) = providers_of(ctx, &member.value).into_iter().next() else {
+        let Some((provider, definition)) = providers_of(ctx, &member.value).into_iter().next()
+        else {
             continue;
         };
-        let capabilities = capabilities(kind);
+        let capabilities = capabilities(definition.kind);
         match &baseline {
             None => baseline = Some((provider, capabilities)),
             Some((first, want)) => {
@@ -953,22 +1084,18 @@ pub(crate) fn require_embeddings(ctx: &mut Ctx, provider: &Spanned<Address>, sto
 
 /// The providers a `model.*` reference resolves to: one for a direct model,
 /// one per member for a route.
-fn providers_of(ctx: &Ctx, model: &Address) -> Vec<(String, ProviderKind)> {
+///
+/// The whole width of the ladder, because that is the granularity a route's
+/// per-member declarations have: any member may serve the call, so a rule about
+/// what the connection publishes — a capability, or a server-tool suite — has
+/// to hold of each.
+pub(crate) fn providers_of<'a>(ctx: &Ctx<'a>, model: &Address) -> Vec<(String, &'a Provider)> {
     match ctx.model(model) {
-        Some(Model::Direct(direct)) => ctx
-            .provider(&direct.provider.value)
-            .map(|provider| (direct.provider.value.to_string(), provider.kind))
-            .into_iter()
-            .collect(),
+        Some(Model::Direct(_)) => provider_of(ctx, model).into_iter().collect(),
         Some(Model::Route(route)) => route
             .route
             .iter()
-            .filter_map(|member| match ctx.model(&member.value) {
-                Some(Model::Direct(direct)) => ctx
-                    .provider(&direct.provider.value)
-                    .map(|provider| (direct.provider.value.to_string(), provider.kind)),
-                _ => None,
-            })
+            .filter_map(|member| provider_of(ctx, &member.value))
             .collect(),
         None => Vec::new(),
     }
@@ -1051,6 +1178,105 @@ mod tests {
             );
         }
         assert_eq!(RESPONSES_HAS_NO, ["stop", "seed"]);
+    }
+
+    /// Every code one composition reports, in the order the report is sorted
+    /// into. The `version:` line is prepended so a case is only its providers.
+    fn codes(body: &str) -> Vec<String> {
+        let ir = crate::codegen::test_support::ir_of(&format!("version: \"0.1\"\n{body}"));
+        crate::check::check(&ir)
+            .iter()
+            .map(|diagnostic| diagnostic.code.to_string())
+            .collect()
+    }
+
+    /// The suite-collision rule keys a `type:` only where the curated table has
+    /// a row for it, and the second tier is where that matters.
+    ///
+    /// A tabled tool is a singleton on its wire — one connection offers
+    /// `web_search` once — and the row is what says so. Nothing could say it of
+    /// a `type:` this release has never seen, and a vendor whose next built-in
+    /// is declared once *per instance*, told apart by a label rather than a
+    /// name, must not meet a compiler refusing the shape that vendor documents.
+    /// So an unknown-tier entry is compared on the literal `name:` it declares
+    /// and on nothing else, which is also the one thing a gateway's vocabulary
+    /// cannot make the compiler wrong about: two entries the author named the
+    /// same are two entries the author named the same.
+    #[test]
+    fn the_second_tier_collides_on_a_name_it_was_given_and_never_on_a_type() {
+        // Tabled, and its wire gives it no `name:`: the `type:` is the slot.
+        assert!(
+            codes(
+                r#"
+provider.o:
+  kind: openai
+  api_key: ${K}
+  server_tools:
+    - type: web_search
+    - type: web_search
+"#
+            )
+            .contains(&"tool-name-collision".to_string())
+        );
+        // The same shape one tier down — a vendor's next built-in, declared
+        // twice because that is how it is used — is carried, warned about, and
+        // not refused.
+        assert_eq!(
+            codes(
+                r#"
+provider.o:
+  kind: openai
+  api_key: ${K}
+  server_tools:
+    - type: remote_toolset
+      server_label: docs
+    - type: remote_toolset
+      server_label: tickets
+"#
+            ),
+            ["unknown-server-tool", "unknown-server-tool"],
+            "an unknown `type:` is not a slot this release can claim is single"
+        );
+        // A gateway serves no table at all, so the same holds there — until the
+        // author names two entries alike, which is their own claim rather than
+        // the compiler's.
+        assert_eq!(
+            codes(
+                r#"
+provider.g:
+  kind: openai_compatible
+  base_url: ${GATEWAY_URL}
+  server_tools:
+    - type: retrieval
+      name: search_docs
+    - type: retrieval
+      name: search_tickets
+"#
+            ),
+            ["unknown-server-tool", "unknown-server-tool"]
+        );
+        assert_eq!(
+            codes(
+                r#"
+provider.g:
+  kind: openai_compatible
+  base_url: ${GATEWAY_URL}
+  server_tools:
+    - type: retrieval
+      name: search
+    - type: lookup
+      name: search
+"#
+            ),
+            // Source order: the collision is reported against the entry written
+            // second, whose own `unknown-server-tool` warning sits one line
+            // further down.
+            [
+                "unknown-server-tool",
+                "tool-name-collision",
+                "unknown-server-tool"
+            ]
+        );
     }
 
     #[test]
