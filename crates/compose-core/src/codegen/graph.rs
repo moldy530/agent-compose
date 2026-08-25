@@ -429,8 +429,13 @@ fn providers(ir: &Ir, names: &Names) -> String {
             text.push_str("    return [\n");
             for (index, tool) in config.server_tools.iter().enumerate() {
                 let site = format!("{address}.server_tools[{index}]");
+                // Every key quoted, `type` included: a server tool's config keys
+                // are the provider's vocabulary rather than this grammar's, so
+                // they are arbitrary text — the same rule `names::literal`
+                // follows for a `settings:` mapping.
                 text.push_str(&format!(
-                    "      {{ type: {}",
+                    "      {{ {}: {}",
+                    names::string("type"),
                     names::string(&tool.type_name.value)
                 ));
                 for (key, value) in &tool.config {

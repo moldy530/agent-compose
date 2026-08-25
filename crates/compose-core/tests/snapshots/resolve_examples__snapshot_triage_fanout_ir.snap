@@ -2059,7 +2059,7 @@ expression: "resolve_clean(\"examples/triage-fanout\", \"local\")"
         "value": "provider.anthropic",
         "span": "providers.yml:1:1..1:19"
       },
-      "span": "providers.yml:1:1..3:32",
+      "span": "providers.yml:1:1..13:44",
       "namespace": "provider",
       "kind": "anthropic",
       "api_key": {
@@ -2067,27 +2067,56 @@ expression: "resolve_clean(\"examples/triage-fanout\", \"local\")"
           "env_ref": "ANTHROPIC_API_KEY"
         },
         "span": "providers.yml:3:12..3:32"
-      }
+      },
+      "server_tools": [
+        {
+          "type": {
+            "value": "web_search_20250305",
+            "span": "providers.yml:10:13..10:32"
+          },
+          "config": {
+            "allowed_domains": {
+              "value": [
+                {
+                  "text": "docs.example.com"
+                }
+              ],
+              "span": "providers.yml:13:24..13:44"
+            },
+            "max_uses": {
+              "value": 3,
+              "span": "providers.yml:12:17..12:18"
+            },
+            "name": {
+              "value": {
+                "text": "web_search"
+              },
+              "span": "providers.yml:11:13..11:23"
+            }
+          },
+          "span": "providers.yml:10:7..13:44"
+        }
+      ]
     },
     "provider.local": {
       "address": {
         "value": "provider.local",
-        "span": "providers.yml:6:1..6:15"
+        "span": "providers.yml:16:1..16:15"
       },
-      "span": "providers.yml:6:1..9:28",
+      "span": "providers.yml:16:1..19:28",
       "namespace": "provider",
       "kind": "openai_compatible",
       "api_key": {
         "value": {
           "env_ref": "LOCAL_LLM_KEY"
         },
-        "span": "providers.yml:9:12..9:28"
+        "span": "providers.yml:19:12..19:28"
       },
       "base_url": {
         "value": {
           "env_ref": "LOCAL_LLM_URL"
         },
-        "span": "providers.yml:8:13..8:29"
+        "span": "providers.yml:18:13..18:29"
       }
     },
     "store.docs": {
