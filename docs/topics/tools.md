@@ -256,10 +256,13 @@ entry, and different on a developer's machine and a deployment's.
 
 **`timeout:` is required on `builtin.bash`** and illegal on the file tools, which
 run no command. It bounds one command; the node's own `timeout:` bounds the whole
-agent node, tool loop included, and the two compose. The deadline kills the shell
-and ends the call: a command that backgrounded something leaves it running, as it
-would have from a hand-rolled `exec:` tool, and the runtime stops reading after
-it rather than waiting for it.
+agent node, tool loop included, and the two compose. The deadline kills the
+command's whole **process group** and ends the call — the shell is almost never
+where the work is, and a `npm run build` that outlived its own deadline would go
+on writing inside `root:` after the node had already failed. What survives is
+what left the group on purpose (`setsid`, `set -m`, a daemon that double-forks),
+exactly as it would have from a hand-rolled `exec:` tool; the runtime stops
+reading after such a process rather than waiting for it.
 
 **What fails and what bounces.** Arguments the tool's schema refuses go back to
 the model, which can call again — a missing `path`, an empty `command`.

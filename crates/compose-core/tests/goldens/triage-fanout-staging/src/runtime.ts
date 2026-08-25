@@ -69,6 +69,7 @@
 // `fetch` is global from Node 18 and the project's floor is 22.18.
 
 import { spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
@@ -3798,6 +3799,102 @@ async function realpathOrAbsent(target: string): Promise<string | undefined> {
 }
 
 /**
+ * Kill a `builtin.bash` shell **and every process it started**.
+ *
+ * The shell is spawned `detached`, which on a POSIX host makes it the leader of
+ * a process group of its own; a signal sent to the negated pid goes to the whole
+ * group, which is where the command's real work lives. That distinction is the
+ * whole point of this function: `bash -c 'npm run build'` is a shell that forks,
+ * and a `SIGKILL` aimed at the shell's own pid ends the shell while the build
+ * keeps compiling — inside the very `root:` the attachment bounded it to, for as
+ * long after the node failed as it likes.
+ *
+ * What still escapes is what **left the group deliberately**: a command that
+ * calls `setsid`, a shell that turned job control on (`set -m`), a daemon that
+ * double-forks away. Those are the same processes a hand-rolled `exec:` tool
+ * would have left behind, and containing them is the distribution work's, not
+ * this bound's (grammar 5.5, Decision D124).
+ *
+ * The fallback is for the host where the group kill is not a thing —
+ * `process.kill` with a negative pid is a POSIX call, and Windows is a posture
+ * q31 defers — where killing the shell alone is still better than killing
+ * nothing. Both are guarded: a group that has already gone answers `ESRCH`, and
+ * a spawn that never started has no pid to aim at.
+ */
+function killCommandGroup(child: ChildProcess): void {
+  const pid = child.pid;
+  if (pid !== undefined) {
+    try {
+      process.kill(-pid, "SIGKILL");
+      return;
+    } catch {
+      // Already gone, or a host without process groups: fall through.
+    }
+  }
+  try {
+    child.kill("SIGKILL");
+  } catch {
+    // Already gone. The deadline's job is that nothing is left running, and
+    // nothing is.
+  }
+}
+
+/** The `builtin.bash` shells this process has running right now. */
+const runningCommands = new Set<ChildProcess>();
+
+/** The stop signals swept for, and the handlers installed for them. */
+const SWEPT_SIGNALS = ["SIGINT", "SIGTERM"] as const;
+const commandSweeps: (() => void)[] = [];
+
+/**
+ * Register a running command, and — while any is running — arrange for a stop
+ * signal to take its process group with it.
+ *
+ * A detached command is a command the **terminal** can no longer reach: its
+ * group is not the foreground one any more, so the `SIGINT` a person types
+ * reaches this process and nothing below it. Left there, `Ctrl-C` on a `run`
+ * would end the graph and leave the build it was in the middle of still writing
+ * into `root:` — a regression against a hand-rolled `exec:` tool, whose child
+ * *is* in that group and does die. So the group this call detached is swept
+ * here instead, and what the terminal used to do the runtime now does.
+ *
+ * Two properties keep this from being a runtime that seizes an embedder's
+ * signals. The handlers exist **only while a command does** — installed with the
+ * first, removed with the last, so a process that is not running one has exactly
+ * the disposition it had before this module was imported. And the sweep
+ * **re-raises**: it kills the groups, stands down, and delivers the same signal
+ * again, so whatever would have happened — `serve`'s own handler closing the app
+ * (`src/serve.ts`), or the default disposition ending the process — happens,
+ * unchanged and with the same exit status (grammar 5.5, Decision D124).
+ */
+function holdCommand(child: ChildProcess): void {
+  if (runningCommands.size === 0) {
+    for (const signal of SWEPT_SIGNALS) {
+      const sweep = (): void => {
+        for (const running of runningCommands) killCommandGroup(running);
+        runningCommands.clear();
+        standDown();
+        process.kill(process.pid, signal);
+      };
+      commandSweeps.push(() => process.removeListener(signal, sweep));
+      process.on(signal, sweep);
+    }
+  }
+  runningCommands.add(child);
+}
+
+/** Drop a command that has ended, and the sweep with the last of them. */
+function releaseCommand(child: ChildProcess): void {
+  runningCommands.delete(child);
+  if (runningCommands.size === 0) standDown();
+}
+
+/** Remove the sweep handlers, giving the process back the disposition it had. */
+function standDown(): void {
+  for (const remove of commandSweeps.splice(0)) remove();
+}
+
+/**
  * Run one `builtin.bash` command (grammar 5.5, PRD resolved q31).
  *
  * `bash` is resolved from `PATH` at the call, which is the posture q31 fixes: a
@@ -3823,11 +3920,26 @@ async function runBuiltinBash(
   const bound = binding.timeout;
   const spawned = new Promise<{ code: number; stdout: string; stderr: string; expired: boolean }>(
     (resolve, reject) => {
+      // `detached` is what makes the deadline below bound the **command** rather
+      // than the shell that happens to be typing it. On a POSIX host it puts the
+      // shell in a process group of its own, and the group is what gets killed:
+      // a shell alone is almost never where the work is — `npm run build`,
+      // `a | b`, `(cd sub && make)` are all bash *forking*, and a kill aimed at
+      // the shell's pid leaves every one of those children running, still
+      // writing inside `root:`, for as long as they like after the node they
+      // belonged to has already failed. Under `retry:` that is two generations
+      // of the same command in one root with the graph believing one is live.
+      // See [`killCommandGroup`] for what the kill is and what still escapes it.
       const child = spawn("bash", ["-c", command], {
         cwd: root,
         stdio: ["ignore", "pipe", "pipe"],
+        detached: true,
         signal: context.signal,
       });
+      // …and detaching is also what puts the command out of the terminal's
+      // reach, which [`holdCommand`] is the answer to: while one is running,
+      // a stop signal this process is sent takes its group with it.
+      holdCommand(child);
       let stdout = "";
       let stderr = "";
       let expired = false;
@@ -3838,15 +3950,16 @@ async function runBuiltinBash(
       //
       // And the call is settled **here**, rather than left to the `close` event
       // the ordinary path resolves on. `close` waits for the child's output
-      // pipes to close as well as for the child to exit, and a killed shell can
-      // leave a background grandchild holding them — `bash -c 'sleep 30 &
-      // wait'` is the shape — so a deadline that waited for `close` would be
-      // the command's to honour rather than the composition's. Resolving twice
-      // is harmless: the first settlement is the promise's, and the `close`
-      // that may still arrive finds it settled.
+      // pipes to close as well as for the child to exit, and a process that put
+      // itself in a process group of its own — `bash -c 'set -m; sleep 30 &
+      // wait'` is the shape, and a double-forking daemon is the other — is out
+      // of reach of the group kill and can still be holding them, so a deadline
+      // that waited for `close` would be the command's to honour rather than the
+      // composition's. Resolving twice is harmless: the first settlement is the
+      // promise's, and the `close` that may still arrive finds it settled.
       //
       // Settling early is only half of ending a call, though, and [`abandon`]
-      // is the other half: the *promise* is settled but the grandchild still
+      // is the other half: the *promise* is settled but such an escapee still
       // holds the pipes this runtime is still reading, so the `data` handlers
       // below would go on appending to a buffer nobody will ever read, and the
       // open handles would go on holding the event loop. In a long-lived host —
@@ -3868,12 +3981,25 @@ async function runBuiltinBash(
           ? undefined
           : setTimeout(() => {
               expired = true;
-              child.kill("SIGKILL");
+              killCommandGroup(child);
               abandon();
+              settle();
               resolve({ code: -1, stdout, stderr, expired: true });
             }, bound.millis);
+      // A node deadline (grammar 9.2) or a cancelled run aborts the spawn's
+      // signal, and the platform answers that by killing the **shell** — the
+      // one pid it knows about. The command's own children are this call's to
+      // end for the same reason the timeout's are: a run somebody cancelled
+      // must not leave a build still writing into `root:`. Registered after the
+      // spawn, so the platform's kill lands first and this one sweeps the group
+      // it left behind; `abandon` stays the `error` handler's, which is where
+      // the abort arrives.
+      const swept = (): void => killCommandGroup(child);
+      context.signal.addEventListener("abort", swept, { once: true });
       const settle = (): void => {
         if (timer !== undefined) clearTimeout(timer);
+        context.signal.removeEventListener("abort", swept);
+        releaseCommand(child);
       };
       child.stdout.on("data", (chunk: Buffer) => {
         stdout += chunk.toString();
@@ -3883,11 +4009,10 @@ async function runBuiltinBash(
       });
       child.on("error", (error) => {
         settle();
-        // The same early settlement, reached the other way: a node deadline or a
-        // cancelled run aborts the spawn's signal, which kills the shell and
-        // rejects here while a grandchild may still hold the pipes. A spawn that
-        // never started (no `bash` on `PATH`) has nothing to drop, which is what
-        // the guards in `abandon` are for.
+        // The same early settlement, reached the other way: the abort above
+        // rejects here while a process that left the group may still hold the
+        // pipes. A spawn that never started (no `bash` on `PATH`) has nothing to
+        // drop, which is what the guards in `abandon` are for.
         abandon();
         reject(error);
       });

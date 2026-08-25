@@ -1013,13 +1013,22 @@ one command; §9.2's node-level `timeout:` bounds the whole agent node, deadline
 included, and the two compose rather than replace one another. `timeout:` on a
 file tool is an unknown key — there is no command there to bound.
 
-What the deadline kills is the **shell**, and what it ends is the **call**. A
-command that put work in the background — `some-server &` — leaves that work
-running as an orphan, exactly as it would have from a hand-rolled `exec:` tool;
-the runtime stops reading what it left behind rather than waiting on it, so the
-bound is the composition's however long the orphan lives. Cleaning up after such
-a command is the command's own business, and containing it is the distribution
-work's (below).
+What the deadline kills is the shell **and every process it started**, and what
+it ends is the **call**. The command runs in a process group of its own and the
+deadline kills the *group*, because the shell is almost never where the work is:
+`npm run build`, `a | b`, `(cd sub && make)` and a plain `some-server &` are all
+`bash` forking, and a kill aimed at the shell alone would leave every one of them
+running — still writing inside `root:` — after the node they belonged to had
+already failed. Under `retry:` that would be two generations of one command in
+one root ([D124](#d124-a-built-ins-deadline-kills-the-commands-process-group-not-just-the-shell)).
+
+What outlives the deadline is what **left the group deliberately**: a command
+that calls `setsid`, a shell that turned job control on (`set -m`), a daemon that
+double-forks away. Those are exactly the processes a hand-rolled `exec:` tool
+would have left behind too; the runtime stops reading what such a process holds
+rather than waiting on it, so the bound is the composition's however long the
+escapee lives. Cleaning up after one is the command's own business, and
+containing it is the distribution work's (below).
 
 **A built-in's name on the wire is its local name** — `bash`, `read_file`,
 `write_file`, `list` — exactly as an attached `tool.*`'s is, so a `tool.bash` on
@@ -6620,6 +6629,43 @@ resumed execution consumes a recorded `bash` instead of running it a second time
 (`docs/durability.md` §3.2). That last one is the property that makes a built-in
 worth having over a hand-rolled `exec:` tool at all — it is the same property,
 reached with none of the boilerplate. *PRD 5.5, 5.12, resolved q31, G3.*
+
+### D124. A built-in's deadline kills the command's process group, not just the shell
+
+`builtin.bash` runs its command in a **process group of its own**, and the
+`timeout:` kills the group. So does an abort — a §9.2 node deadline, or a
+cancelled run — and so does a stop signal delivered to the process running the
+graph while a command is in flight.
+
+**Rationale**. §5.5 promises that a command which outruns its `timeout:` "is
+killed", and the bound is one of the two things q31 says a built-in *has*: "a
+model holding bash is arbitrary code execution on the host running the graph,
+which is why every bound here is explicit". A kill aimed at the shell's own pid
+does not keep that promise, because the shell is almost never where the work is.
+`bash -c 'npm run build'` forks; so does a pipeline, a subshell, a command list.
+Kill the shell and every one of those children keeps running — and keeps writing
+inside the `root:` the attachment bounded it to — while the graph has already
+reported the call as failed and moved on. With `retry: 2` that is two generations
+of one command writing one root with the composition believing exactly one is
+live; with `on_error: skip` it is a downstream node reading files a "killed"
+command is still producing. The bound would be a message rather than a fact.
+
+**What this costs and why it is worth it.** A detached command is out of the
+**terminal's** reach as well as the shell's: its group is no longer the
+foreground one, so the `SIGINT` a person types no longer reaches it the way it
+reaches an `exec:` tool's child. That would have traded one orphan for another,
+so the runtime closes it directly — while a command is running, `SIGINT` and
+`SIGTERM` sweep the live groups and are then re-raised, leaving the exit
+behaviour, the exit status and `serve`'s own shutdown exactly as they were. The
+handlers exist only for as long as a command does.
+
+**What is still out of reach**, and is said rather than implied: a process that
+*left* the group on purpose — `setsid`, a shell that turned job control on
+(`set -m`), a daemon that double-forks. Those escape a hand-rolled `exec:` tool
+identically, and containing them is the distribution work's, beside the container
+and syscall isolation §5.5 defers there. The runtime stops **reading** what such a
+process holds rather than waiting on it, so the call is still bounded even when
+the process is not. *PRD resolved q31, §5.5, §9.2.*
 
 ---
 

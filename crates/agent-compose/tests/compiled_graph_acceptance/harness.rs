@@ -1105,6 +1105,86 @@ pub fn crash_run_answering(
     }
 }
 
+/// What a run that was asked to stop did about it.
+pub struct Stopped {
+    /// How it ended, or `None` where it had to be killed to end at all.
+    pub status: Option<std::process::ExitStatus>,
+    /// How long it took from the signal to that end.
+    pub took: Duration,
+}
+
+/// Start a compiled project's own `run`, wait for `ready`, and ask it to
+/// **stop** — the signal a person types, not the one a crash is.
+///
+/// [`crash_run`]'s counterpart, and the difference is the whole point: `SIGKILL`
+/// is the event durability is for, and this is the event a `Ctrl-C` is. A run
+/// that is asked to stop has to *end*, and end promptly — a runtime that installs
+/// a handler and then fails to hand the signal back would leave a person's
+/// terminal wedged — and it has to take what it started with it.
+///
+/// Launched directly rather than through `agent-compose run` for
+/// [`crash_run`]'s reason: the signal has to reach the process running the
+/// graph. `ready` takes no arguments and is polled, because what the caller is
+/// usually waiting for here is a fact on disk — a command has really started —
+/// rather than a line on stderr.
+///
+/// # Panics
+///
+/// Panics when `ready` never answers `true`, which is a broken test rather than
+/// a finding.
+#[cfg(unix)]
+pub fn stop_run(
+    project: &Path,
+    arguments: &[&str],
+    environment: &[(String, String)],
+    signal: libc::c_int,
+    ready: impl Fn() -> bool,
+) -> Stopped {
+    let mut command = bun();
+    command.arg(project.join("src/index.ts")).args(arguments);
+    seal(&mut command, environment);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = command.spawn().expect("bun runs");
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !ready() {
+        assert!(
+            Instant::now() < deadline,
+            "the run never reached the point this test stops it at"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let pid = i32::try_from(child.id()).expect("a pid fits in an i32");
+    // SAFETY: `pid` is a child this process spawned and has not yet reaped.
+    unsafe { libc::kill(pid, signal) };
+
+    let signalled = Instant::now();
+    let stop = signalled + Duration::from_secs(20);
+    let mut status = None;
+    while Instant::now() < stop {
+        match child.try_wait().expect("the child can be waited on") {
+            Some(ended) => {
+                status = Some(ended);
+                break;
+            }
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+    let took = signalled.elapsed();
+    if status.is_none() {
+        let _ = child.kill();
+    }
+    // Reaped on both paths, so a run that ignored the signal leaves no zombie
+    // behind for the rest of the suite: `wait` after a `try_wait` that already
+    // answered hands back the status it saw.
+    let _ = child.wait();
+    Stopped { status, took }
+}
+
 /// `agent-compose resume <fixture> <execution> --out <dir>`, pointed at a
 /// project a previous generation already built.
 pub fn resume(
