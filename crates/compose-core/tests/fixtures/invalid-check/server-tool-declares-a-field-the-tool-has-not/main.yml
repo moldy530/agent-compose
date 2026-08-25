@@ -1,0 +1,18 @@
+# rule: a known `server_tools:` entry declares only the fields its tool has (grammar 12.1, Decision D122)
+# code: unknown-key
+# message: `max_usages` is not a field of server tool `web_search_20250305` of `provider.main`
+# at: main.yml:18:19
+# help: did you mean `max_uses`?
+#
+# The strict tier of resolved q30's two: a `type:` in the curated table is
+# checked field by field, because a config the provider will refuse is a run
+# that dies on its first model call with a 400 and no span to point at.
+version: "0.1"
+
+provider.main:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+  server_tools:
+    - type: web_search_20250305
+      name: web_search
+      max_usages: 5

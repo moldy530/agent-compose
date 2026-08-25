@@ -24,6 +24,7 @@ pub mod document;
 pub mod flow;
 pub mod policy;
 pub mod schema;
+pub mod server_tools;
 pub mod trigger;
 
 pub use binding::{
@@ -37,8 +38,8 @@ pub use common::{
 };
 pub use definition::{
     AgentAccess, AgentDef, Definition, DefinitionBody, DirectModel, EmbedBlock, ModelDef,
-    ProviderDef, ProviderKind, RouteCondition, RouteModel, Settings, StoreDef, StoreKind,
-    StoreScope, ToolDef, ToolImplementation,
+    ProviderDef, ProviderKind, RouteCondition, RouteModel, ServerToolDef, Settings, StoreDef,
+    StoreKind, StoreScope, ToolDef, ToolImplementation,
 };
 pub use deploy::{
     BackendAlias, BackendConfig, BackendDefault, BackendProvider, ConnectionField, EventSource,

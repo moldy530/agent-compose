@@ -3418,15 +3418,16 @@ that name it.
 | `api_key` | env-ref value | per kind (below) | never a literal (§4.3) |
 | `base_url` | env-ref value | per kind (below) | never a literal (§4.3) |
 | `headers` | map name→string (interpolable) | optional on the kinds that take it | extra request headers |
+| `server_tools` | array of wire config objects | optional on the kinds that take it | tools the **provider** runs, appended to every request it serves (below) |
 | kind-specific keys | per plugin | per kind (below) | validated against the plugin's published schema |
 
 v0 provider kinds and the keys each one takes, `kind:` and `description:` aside:
 
 | `kind` | Required | Optional |
 |---|---|---|
-| `anthropic` | `api_key` — **or** a `base_url` naming the gateway that holds one (below) | `api_key` (beside a `base_url`), `base_url`, `headers` |
-| `openai` | `api_key` — **or** a `base_url` naming the gateway that holds one (below) | `api_key` (beside a `base_url`), `base_url`, `headers`, `organization` |
-| `openai_compatible` | `base_url` | `api_key`, `headers` |
+| `anthropic` | `api_key` — **or** a `base_url` naming the gateway that holds one (below) | `api_key` (beside a `base_url`), `base_url`, `headers`, `server_tools` |
+| `openai` | `api_key` — **or** a `base_url` naming the gateway that holds one (below) | `api_key` (beside a `base_url`), `base_url`, `headers`, `organization`, `server_tools` |
+| `openai_compatible` | `base_url` | `api_key`, `headers`, `server_tools` |
 | `azure_openai` | `base_url`, `api_key`, `api_version` | `headers` |
 | `bedrock` | `region` | `access_key_id`, `secret_access_key`, `session_token`, `profile` |
 | `vertex` | `project`, `location` | `credentials_json` |
@@ -3472,6 +3473,51 @@ The two SDK-reached kinds are where the rows differ most visibly from the rest:
 connection made through a cloud SDK has no bare endpoint to point at and no
 request the spec composes headers onto. A deployment that genuinely needs either
 is reaching a compatible HTTP endpoint, which is what `openai_compatible` is for.
+
+**`server_tools` is a provider-side tool suite.** A *server tool* runs on the
+provider's side, inside the model call: the compiled runtime dispatches nothing,
+and the results arrive woven into the assistant's turn. The key holds an array
+of config objects written in **that provider's own wire vocabulary**, and the
+runtime appends them to the `tools` of every request that provider serves, after
+the agent's own tools.
+
+```yaml
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+  server_tools:
+    - type: web_search_20250305
+      name: web_search
+      max_uses: 5
+```
+
+Each entry MUST carry a string `type`, which is the key the provider's
+vocabulary is looked up under and is never interpolated. Every other key is the
+provider's, travels verbatim, and is grammar 4.3 class 2 — non-secret provider
+config, so its string values MAY interpolate.
+
+The checking is **two-tier**, and the constraint behind it is that a server tool
+a vendor ships tomorrow must be usable the day it ships:
+
+- a `type` in the compiler's **curated table** for that kind is validated
+  strictly — a field the tool does not have, a mistyped one, or a constraint
+  violation is an error naming the repair;
+- a `type` outside it is a **warning** (`unknown-server-tool`) naming exactly
+  what could not be verified, and the entry then travels to the wire as written.
+  The composition still builds and still runs.
+
+The key is legal on the three kinds whose rows name it and is an error
+(`unsupported-server-tools`) on `azure_openai`, `bedrock` and `vertex`, whose
+wires this release has not been taught to carry it on. On `openai_compatible`
+every entry is second-tier: a gateway may honour any vocabulary at all.
+
+**A suite belongs to a connection**, so every agent whose model resolves to that
+provider holds it; scoping a suite to one agent is done by defining a second
+provider. And because a failover route's members each name their own provider,
+which tools were on offer depends on which member answered — a route whose
+members declare different suites is a warning (`mismatched-server-tools`), not a
+refusal. Decision
+[D122](#d122-server-tools-are-provider-side-config-checked-in-two-tiers).
 
 ### 12.2 Model definitions
 
@@ -6246,6 +6292,53 @@ about a LangGraph **checkpointer**, which PRD resolved q26 rules out as this
 project's durability mechanism in favour of journal + replay. `--target local` is
 still the un-checkpointed target, `detach: true` is still legal only there, and
 it is now also a durable one. *PRD 5.11, resolved q26–q29.*
+
+### D122. Server tools are provider-side config, checked in two tiers
+
+A provider MAY declare `server_tools:`, an array of config objects in that
+provider's own wire vocabulary, and the runtime appends them to the `tools` of
+every request that provider serves. Each entry requires a string `type:`;
+everything else is the provider's and travels verbatim, as grammar 4.3 class 2
+values. The compiler keeps a **curated table** of the server tools each kind is
+known to serve: an entry naming one is checked strictly against it, and an entry
+naming anything else is a **warning** that says so and is carried to the wire
+unchanged. **Rationale**: PRD resolved q30. The governing constraint is *no
+manual support treadmill* — a server tool the vendor ships tomorrow must be
+usable the day it ships, without waiting for a compiler release — and the two
+tiers are how that coexists with G3 diagnostics: the table buys a real error
+message for the tools it knows, and buys nothing at the cost of a warning for
+the tools it does not. A table that *gated* would be the treadmill; no table at
+all would make a misspelled `max_uses` a 400 on the first live call, with no
+span.
+
+**The runtime dispatches nothing.** A server tool executes on the provider's
+side, inside the model call, and its results arrive woven into the assistant's
+turn — which is why the array is a wire object rather than a construct of this
+grammar, and why a `server_tool_use` block is *not* a tool call the agent's loop
+answers. It is also why replay is untouched: the use happens inside the recorded
+model call (`docs/durability.md` §3.1).
+
+**Launch scope is `anthropic` and `openai`, plus `openai_compatible`
+unverified.** For Anthropic's Messages wire the table holds web search, web
+fetch and code execution; for OpenAI it holds the built-in suite of the
+**Responses** API — web search, file search, code interpreter, image generation
+— which Chat Completions does not carry. So an `openai` provider that declares
+`server_tools:` speaks the Responses API for **all** of its calls, and one that
+declares none keeps Chat Completions: one provider, one wire, because a
+connection that switched per request would make "what did this model see" depend
+on which agent asked. `openai_compatible` takes the key with every entry
+second-tier — a gateway may honour any vocabulary, and refusing would recreate
+the treadmill — and rides its Chat Completions `tools` array. `azure_openai`,
+`bedrock` and `vertex` refuse it outright rather than dropping it silently
+(D50).
+
+**A suite belongs to a connection.** Every agent whose model resolves to that
+provider holds it, and scoping a suite to one agent is done by defining a second
+provider — providers are cheap. Failover capability is therefore per-chain-member
+by construction, so `validate` **warns** when a route's members declare differing
+suites: which tools were on offer depends on which member answered, and that is
+a legal thing to want (a fallback vendor that has no web search is still a
+fallback) as well as a real thing to know. *PRD 5.9, resolved q30.*
 
 ---
 

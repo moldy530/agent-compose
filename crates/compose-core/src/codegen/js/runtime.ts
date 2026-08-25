@@ -1120,6 +1120,21 @@ export type ProviderKind =
   | "bedrock"
   | "vertex";
 
+/**
+ * One entry of a provider's `server_tools:` — a tool the **provider** runs, on
+ * its own side, inside the model call (grammar 12.1, Decision D122).
+ *
+ * Written in that provider's own wire vocabulary and appended verbatim to the
+ * `tools` of every request the provider serves. Nothing here is dispatched by
+ * this runtime: a server tool's results arrive woven into the assistant's turn,
+ * which is why the type is an open record rather than anything with an
+ * `invoke`. `type` is the only key the compiler reads.
+ */
+export interface ServerToolConfig {
+  readonly type: string;
+  readonly [key: string]: unknown;
+}
+
 /** A resolved `provider.*` (grammar 12.1). Values are read when a node runs. */
 export interface ProviderBinding {
   readonly address: string;
@@ -1135,6 +1150,39 @@ export interface ProviderBinding {
   readonly apiVersion?: string;
   readonly organization?: string;
   readonly headers?: Readonly<Record<string, string>>;
+  /**
+   * `server_tools:`, where the composition declared any (Decision D122).
+   *
+   * **Absent** and **empty** are the same thing on the wire and are kept apart
+   * anyway: the emitter omits the key entirely for a provider that declares no
+   * suite, so a binding carrying `[]` is one whose array was emptied rather than
+   * one that never had it — and on an `openai` provider that distinction is
+   * load-bearing, since declaring a suite is what moves the connection onto the
+   * Responses wire ([`speaksResponses`]).
+   */
+  readonly serverTools?: readonly ServerToolConfig[];
+}
+
+/**
+ * Whether this connection speaks OpenAI's **Responses** API rather than Chat
+ * Completions (Decision D122).
+ *
+ * All-or-nothing per provider, and that is the seam an author meets: the
+ * built-in tool suite — web search, file search, code interpreter, image
+ * generation — is a Responses-API surface that Chat Completions does not carry,
+ * so an `openai` provider that declares `server_tools:` issues **every** one of
+ * its calls to `/v1/responses`, and one that declares none keeps Chat
+ * Completions exactly as before. One provider, one wire: a connection that
+ * switched per request would make "what did this model see" depend on which
+ * agent asked.
+ *
+ * `openai_compatible` is deliberately not here. A gateway's suite rides its
+ * Chat Completions `tools` array verbatim — many honour one — and moving a
+ * gateway onto a wire it may not implement at all would break the compositions
+ * that work today.
+ */
+function speaksResponses(provider: ProviderBinding): boolean {
+  return provider.kind === "openai" && (provider.serverTools ?? []).length > 0;
 }
 
 /** A resolved `model.*` in its direct form (grammar 12.2). */
@@ -1679,12 +1727,28 @@ export async function callModel(
   // whose second call carries a different history is a different call, and
   // handing it the first generation's answer would be exactly the silent
   // re-keying resolved q29 refuses.
+  //
+  // The **server** tools are in it for the same reason the client ones are: a
+  // provider's suite is part of what the model was offered, and a resume whose
+  // provider gained or lost one is a resume of a different call — so it
+  // diverges at the first model call rather than replaying an answer produced
+  // under another tool surface (`docs/durability.md` §3.1, §7, Decision D122).
+  //
+  // Per **ladder member**, because that is the granularity the suite has: each
+  // provider in a route declares its own array, so which tools were on offer
+  // depends on which member served the call. And the key is **omitted
+  // entirely** where no member declares one, which is what keeps every
+  // composition that predates the key deriving the identity it already derived
+  // — an older journal still replays, and `JOURNAL_VERSION` does not move
+  // (`docs/durability.md` §11.2, §11.3).
+  const suites = ladder(selection).map((member) => member.provider.serverTools ?? []);
   const slot = recorder.claim("model", {
     model: selection.address,
     system: request.system,
     turns: request.turns,
     tools: request.tools.map((tool) => tool.name),
     ...(request.pinned === undefined ? {} : { pinned: request.pinned.name }),
+    ...(suites.some((suite) => suite.length > 0) ? { serverTools: suites } : {}),
   });
 
   if (slot.held !== undefined) {
@@ -1971,9 +2035,12 @@ async function callDirect(
       `\`${model.provider.address}\` is \`kind: ${model.provider.kind}\`, which is reached through a cloud SDK rather than an HTTP endpoint (grammar 12.1) and which this compiler release does not call: bind \`${model.address}\` to an \`anthropic\`, \`openai\`, \`openai_compatible\` or \`azure_openai\` provider`,
     );
   }
-  return model.provider.kind === "anthropic"
-    ? await callMessages(model, request, signal)
-    : await callChatCompletions(model, request, signal);
+  if (model.provider.kind === "anthropic") return await callMessages(model, request, signal);
+  // The one wire choice that is not the kind's alone: an `openai` provider
+  // carrying a server-tool suite speaks Responses for **every** call it makes
+  // (Decision D122, [`speaksResponses`]).
+  if (speaksResponses(model.provider)) return await callResponses(model, request, signal);
+  return await callChatCompletions(model, request, signal);
 }
 
 async function callMessages(
@@ -2031,12 +2098,22 @@ async function callMessages(
     messages,
     ...settings,
   };
-  if (offered.length > 0) {
-    body["tools"] = offered.map((tool) => ({
-      name: tool.name,
-      description: tool.description,
-      input_schema: tool.schema,
-    }));
+  // The agent's own tools first, then the provider's server tools — the order
+  // is pinned by the goldens rather than left to chance, because the array
+  // reaches the wire as written and a reader comparing two builds should not
+  // have to work out whether a reordering meant anything. Client tools lead
+  // because they are the ones this composition declares; a server tool is a
+  // property of the connection every agent on it shares.
+  const server = model.provider.serverTools ?? [];
+  if (offered.length > 0 || server.length > 0) {
+    body["tools"] = [
+      ...offered.map((tool) => ({
+        name: tool.name,
+        description: tool.description,
+        input_schema: tool.schema,
+      })),
+      ...server,
+    ];
   }
   if (request.pinned !== undefined) {
     body["tool_choice"] = { type: "tool", name: request.pinned.name };
@@ -2055,6 +2132,14 @@ async function callMessages(
 
   const blocks = (answer["content"] ?? []) as { type: string; [key: string]: unknown }[];
   const texts = blocks.filter((block) => block.type === "text").map((block) => block["text"]);
+  // `tool_use` **exactly**, which is what keeps a server tool out of the tool
+  // loop (Decision D122). A provider that ran one answers with a
+  // `server_tool_use` block and its paired `*_tool_result` beside it: the call
+  // already happened, on the provider's side, and there is nothing for this
+  // runtime to dispatch. Reading them as calls would send the loop looking for a
+  // tool the agent never declared, which since Decision D119 is a *refusal*
+  // bounced back to the model — an answer that worked, reported as a mistake.
+  // They travel instead on `content`, which [`replayed`] sends back unaltered.
   const uses = blocks.filter((block) => block.type === "tool_use");
   const pinnedUse =
     request.pinned === undefined
@@ -2193,6 +2278,197 @@ async function callChatCompletions(
     // absence of content is what every other branch here sees; the reason is the
     // only thing that tells a refusal from a `max_tokens` cut.
     refusal: (message["refusal"] as string | null) ?? null,
+  };
+}
+
+/**
+ * OpenAI's **Responses** API: `POST /v1/responses` (Decision D122).
+ *
+ * The wire an `openai` provider moves to when it declares `server_tools:`, and
+ * the only one of OpenAI's two that carries the built-in tool suite at all —
+ * web search, file search, code interpreter, image generation. Everything else
+ * about the call is the same call: the same conversation, the same client
+ * function tools, the same structured-output posture, the same failover ladder
+ * around it.
+ *
+ * # What changes from Chat Completions
+ *
+ * * **The conversation is a list of items, not messages.** A user turn is a
+ *   `message` item; a function call is its own `function_call` item beside the
+ *   message rather than a field on it; a result is a `function_call_output`
+ *   item keyed by `call_id`. The system prompt is `instructions`, which is why
+ *   it is not the first item.
+ * * **An assistant turn goes back as the items it came as.** [`ModelAnswer`]
+ *   carries the raw `output` array, exactly as the Messages wire carries
+ *   content blocks, and a replay sends it unaltered — which is what keeps a
+ *   `web_search_call` item, a `reasoning` item, and the pairing between a
+ *   `function_call` and the output that answers it intact. A turn rebuilt from
+ *   `text` and `toolCalls` would drop every one of them.
+ * * **A tool is flat.** `{ type: "function", name, parameters }` rather than
+ *   `{ type: "function", function: { … } }`.
+ * * **Two settings are spelled differently**, and are translated here:
+ *   `max_tokens` is `max_output_tokens`, and `reasoning_effort` is
+ *   `reasoning: { effort }`. Everything else in `settings:` travels as written,
+ *   which means a knob this wire does not have (`stop`, `seed`) reaches the
+ *   service and is refused by it — visibly, in the run that declared it, rather
+ *   than dropped here into a request that quietly did something else.
+ *   `docs/topics/models.md` says so where an author meets the seam.
+ *
+ * # What does not change
+ *
+ * Structured output keeps the q16 posture exactly: what is **constrained** is
+ * what is **parsed**. `text.format` is the Responses spelling of Chat
+ * Completions' `response_format`, carrying the same schema under the same
+ * `strict` decision ([`strictable`]), and the object parsed back out is the
+ * assistant text that format shaped.
+ *
+ * And a function call is dispatched exactly as it is on the other two wires —
+ * the loop, the refusals of Decision D119, the ordinals of grammar 9.4 — because
+ * the loop is above this function and never learns which wire answered.
+ */
+async function callResponses(
+  model: ModelBinding,
+  request: {
+    readonly system: string;
+    readonly turns: readonly Turn[];
+    readonly tools: readonly ToolSpec[];
+    readonly pinned?: ToolSpec;
+  },
+  signal: AbortSignal,
+): Promise<ModelAnswer> {
+  const input: unknown[] = [];
+  for (const turn of request.turns) {
+    if (turn.role === "user") {
+      input.push({
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: turn.text }],
+      });
+      continue;
+    }
+    if (turn.role === "tool") {
+      for (const result of turn.results) {
+        // No error flag: a `function_call_output` is closed to its `call_id` and
+        // its `output`, so a refusal *is* the output text — the same concession
+        // Chat Completions makes, and for the same reason (Decision D119,
+        // `WIRE-NOTES` (18), (21)). Answering every call at all is the
+        // load-bearing half: an unanswered `call_id` is a request this surface
+        // refuses.
+        input.push({
+          type: "function_call_output",
+          call_id: result.id,
+          output: result.content,
+        });
+      }
+      continue;
+    }
+    // An answer this surface produced goes back as it came. Everything the
+    // reading below does not read — a `reasoning` item, a `web_search_call`,
+    // the annotations on an `output_text` — is in here and nowhere else.
+    if (turn.blocks !== undefined) {
+      input.push(...turn.blocks);
+      continue;
+    }
+    // The one turn this runtime composed rather than received: the shared
+    // history channel of grammar 10.4.
+    const text = turn.text ?? "";
+    if (text !== "") {
+      input.push({
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text }],
+      });
+    }
+    for (const call of turn.toolCalls ?? []) {
+      input.push({
+        type: "function_call",
+        call_id: call.id,
+        name: call.name,
+        arguments: JSON.stringify(call.args),
+      });
+    }
+  }
+
+  const settings = { ...model.settings };
+  if (settings["max_tokens"] !== undefined) {
+    settings["max_output_tokens"] = settings["max_tokens"];
+    delete settings["max_tokens"];
+  }
+  if (settings["reasoning_effort"] !== undefined) {
+    settings["reasoning"] = { effort: settings["reasoning_effort"] };
+    delete settings["reasoning_effort"];
+  }
+
+  const body: Record<string, unknown> = {
+    model: model.id,
+    instructions: request.system,
+    input,
+    ...settings,
+  };
+  // Client tools first, then the provider's suite — the same order the Messages
+  // wire uses, pinned by the goldens for the same reason.
+  const server = model.provider.serverTools ?? [];
+  const functions = request.tools.map((tool) => ({
+    type: "function",
+    name: tool.name,
+    description: tool.description,
+    parameters: tool.schema,
+    strict: strictable(tool.schema),
+  }));
+  if (functions.length > 0 || server.length > 0) {
+    body["tools"] = [...functions, ...server];
+  }
+  if (request.pinned !== undefined) {
+    body["text"] = {
+      format: {
+        type: "json_schema",
+        name: request.pinned.name,
+        strict: strictable(request.pinned.schema),
+        schema: request.pinned.schema,
+      },
+    };
+  }
+
+  const { headers } = openAiRequest(model.provider);
+  const answer = await send(model, `${baseUrl(model.provider)}/v1/responses`, headers, body, signal);
+
+  const output = (answer["output"] ?? []) as Record<string, unknown>[];
+  const texts: string[] = [];
+  let refusal: string | null = null;
+  for (const item of output) {
+    if (item["type"] !== "message") continue;
+    for (const part of (item["content"] ?? []) as Record<string, unknown>[]) {
+      if (part["type"] === "output_text") texts.push(String(part["text"] ?? ""));
+      // A stated decline, which is what tells a refusal from an answer cut
+      // short by `max_output_tokens` — both otherwise arrive as no structured
+      // output (`WIRE-NOTES` (3), (21)).
+      if (part["type"] === "refusal") refusal = String(part["refusal"] ?? "");
+    }
+  }
+  const calls = output
+    .filter((item) => item["type"] === "function_call")
+    .map((item) => ({
+      id: String(item["call_id"]),
+      name: String(item["name"]),
+      args: JSON.parse(String(item["arguments"] ?? "{}")) as unknown,
+    }));
+  const text = texts.length > 0 ? texts.join("") : null;
+  // `status` is the call's own outcome and `incomplete_details.reason` is why an
+  // incomplete one stopped; the narrower of the two is what a reader needs, so
+  // it wins where there is one.
+  const incomplete = (answer["incomplete_details"] ?? null) as Record<string, unknown> | null;
+  const stopReason =
+    incomplete !== null && incomplete["reason"] !== undefined
+      ? String(incomplete["reason"])
+      : ((answer["status"] as string | null) ?? null);
+  return {
+    text,
+    toolCalls: request.pinned === undefined ? calls : [],
+    structured:
+      request.pinned === undefined || text === null ? null : (JSON.parse(text) as unknown),
+    stopReason,
+    content: output,
+    refusal,
   };
 }
 

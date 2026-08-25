@@ -517,13 +517,13 @@ fn launch(
     let (validation, ir) = analyse(entrypoint, target);
     let mut report = Diagnostics::new();
     report.extend(validation);
-    let validated = report.is_empty();
+    let validated = !report.has_errors();
     if let (Some(ir), true) = (&ir, validated) {
         report.extend(compose_core::target_diagnostics(ir));
     }
     report.sort();
     let diagnostics = report.into_vec();
-    let Some(ir) = ir.filter(|_| diagnostics.is_empty()) else {
+    let Some(ir) = ir.filter(|_| !report::refuses(&diagnostics)) else {
         // The composition is the answer, so the report is what this command
         // writes — on the stream the format names, exactly as `validate` does.
         let written = match format {
@@ -550,6 +550,14 @@ fn launch(
         let _ = written;
         return ExitCode::from(REPORTED);
     };
+
+    // The composition was accepted **with** something to say. The warnings are
+    // printed and the launch goes ahead — that is what a warning is (see
+    // `compose_core::diag::Severity`) — and they go to **stderr in both
+    // formats**, because on this side the answer is the child's stdout: a JSON
+    // report written there would interleave with the flow's outputs, which is
+    // the one thing `--format json` promises never to do.
+    warned(entrypoint, target, &diagnostics);
 
     let project = compose_core::emit(&ir);
     match build::write(&project, out) {
@@ -586,6 +594,32 @@ fn launch(
     }
 }
 
+/// Print the warnings of a composition that was accepted, on the one stream a
+/// launched child never writes to.
+///
+/// A no-op for a clean report, which is nearly every run: nothing is printed,
+/// not even a verdict, because `run` and `serve` answer with what they produced
+/// and a line saying the spec was fine is noise in front of it. What is printed
+/// when there *is* something is the same block `validate` prints, through the
+/// same renderer, ending in the same pointer at `explain` — a reader who meets a
+/// code here is further from `validate` than one who typed it.
+fn warned(entrypoint: &Path, target: &str, diagnostics: &[compose_core::Diagnostic]) {
+    if diagnostics.is_empty() {
+        return;
+    }
+    let color = report::color_enabled();
+    let root = entrypoint.parent().unwrap_or_else(|| Path::new(""));
+    let mut stream = io::stderr().lock();
+    let _ = write(&mut stream, &report::human(root, diagnostics, color))
+        .and_then(|()| {
+            write(
+                &mut stream,
+                &report::verdict(entrypoint, target, diagnostics, color),
+            )
+        })
+        .and_then(|()| write(&mut stream, &report::explain_hint(true)));
+}
+
 /// Everything both commands do before they differ: resolve, check, and hand back
 /// the report alongside the artifact.
 ///
@@ -611,10 +645,15 @@ fn validate(entrypoint: &Path, target: &str, format: Format) -> ExitCode {
     }
 
     let (diagnostics, _) = analyse(entrypoint, target);
-    let verdict = if diagnostics.is_empty() {
-        CLEAN
-    } else {
+    // The exit code is the **verdict**, and a warning is not one: a composition
+    // reported with nothing but warnings is one this compiler accepts, builds
+    // and runs, so `validate` exits `0` and the report says what it noticed.
+    // A CI step that wants warnings to fail reads the `warnings` array of
+    // `--format json`, which is why that key is its own (see `report::json`).
+    let verdict = if report::refuses(&diagnostics) {
         REPORTED
+    } else {
+        CLEAN
     };
     let written = match format {
         Format::Json => match report::json(&diagnostics) {
@@ -796,10 +835,17 @@ fn entrypoint(path: &Path, side: SpecSide) -> Result<PathBuf, String> {
 
 /// `agent-compose build`, and `build --check`.
 ///
-/// Validation comes first and **any** diagnostic refuses the emission — a
-/// warning included. Generated code is a build artifact of a valid composition
-/// (PRD 5.12), and a project emitted from one the compiler had something to say
-/// about would report that thing again, later, as a `tsc` error with no span.
+/// Validation comes first and an **error** refuses the emission. Generated code
+/// is a build artifact of a valid composition (PRD 5.12), and a project emitted
+/// from one the compiler refused would report that refusal again, later, as a
+/// `tsc` error with no span.
+///
+/// A **warning** does not refuse it, which is the whole of what the severity
+/// means: the composition is one this compiler accepts, so the project is
+/// written, the exit code is `0`, and the warnings are printed above the verdict
+/// that says how many there were. `unknown-server-tool` is the case that makes
+/// this load-bearing — a server tool the vendor shipped after this release has
+/// to build (grammar 12.1, Decision D122).
 ///
 /// A clean validation is not on its own enough to emit: `validate` answers "is
 /// this composition well formed", which is target-independent, and codegen has
@@ -828,19 +874,21 @@ fn build_project(
     // first.
     let mut report = Diagnostics::new();
     report.extend(validation);
-    let validated = report.is_empty();
+    let validated = !report.has_errors();
     if let (Some(ir), true) = (&ir, validated) {
         report.extend(compose_core::target_diagnostics(ir));
     }
     report.sort();
     let diagnostics = report.into_vec();
-    // A composition that validated and still has something reported against it
-    // is one this target cannot express, which is a different sentence from
-    // "not valid" — see `report::build_verdict`.
-    let target_only = validated && !diagnostics.is_empty();
+    let refused = report::refuses(&diagnostics);
+    // A composition that validated and is still **refused** is one this target
+    // cannot express, which is a different sentence from "not valid" — see
+    // `report::build_verdict`. A warning does not put a build in that state, so
+    // this is asked of the errors rather than of the report.
+    let target_only = validated && refused;
 
-    let project = match (&ir, diagnostics.is_empty()) {
-        (Some(ir), true) => Some(compose_core::emit(ir)),
+    let project = match (&ir, refused) {
+        (Some(ir), false) => Some(compose_core::emit(ir)),
         _ => None,
     };
 
@@ -893,10 +941,10 @@ fn build_project(
         _ => None,
     };
 
-    let verdict = if diagnostics.is_empty() && drift.is_empty() {
-        CLEAN
-    } else {
+    let verdict = if refused || !drift.is_empty() {
         REPORTED
+    } else {
+        CLEAN
     };
     let built = report::Built {
         diagnostics: &diagnostics,

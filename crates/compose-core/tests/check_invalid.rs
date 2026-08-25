@@ -68,6 +68,8 @@ const CHECK_CODES: &[&str] = &[
     "tool-name-collision",
     "missing-session-key",
     "missing-capability",
+    "unknown-server-tool",
+    "mismatched-server-tools",
     "missing-key",
     "unknown-key",
     "unknown-variant",

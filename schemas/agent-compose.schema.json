@@ -1586,6 +1586,527 @@
       ]
     },
 
+      "serverToolConfig": {
+        "description": "One entry of a provider's `server_tools:` \u2014 a tool the provider runs on its own side, in that provider's wire vocabulary. `type` is required and is the key the vocabulary is looked up under; every other key is the provider's and is carried verbatim (grammar 12.1 / Decision D122).",
+        "type": "object",
+        "required": [
+          "type"
+        ],
+        "properties": {
+          "type": {
+            "description": "The tool's wire type, exactly as the provider takes it \u2014 versioned where the vendor versions it, e.g. `web_search_20250305`. Never an ${ENV} reference: it is what the curated table is looked up under.",
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "anthropicServerTool": {
+        "description": "A server tool on an `anthropic` provider: the Messages wire's suite. A `type` the curated table names is checked against its documented fields; anything else is carried unchecked (grammar 12.1 / Decision D122).",
+        "allOf": [
+          {
+            "$ref": "#/$defs/serverToolConfig"
+          },
+          {
+            "if": {
+              "properties": {
+                "type": {
+                  "enum": [
+                    "web_search_20250305"
+                  ]
+                }
+              },
+              "required": [
+                "type"
+              ]
+            },
+            "then": {
+              "type": "object",
+              "required": [
+                "type",
+                "name"
+              ],
+              "properties": {
+                "type": {
+                  "enum": [
+                    "web_search_20250305"
+                  ]
+                },
+                "name": {
+                  "$ref": "#/$defs/interpolatedString"
+                },
+                "cache_control": {
+                  "type": "object",
+                  "required": [
+                    "type"
+                  ],
+                  "properties": {
+                    "type": {
+                      "const": "ephemeral"
+                    }
+                  },
+                  "additionalProperties": false
+                },
+                "max_uses": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "allowed_domains": {
+                  "description": "Only these domains are searched.",
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/interpolatedString"
+                  }
+                },
+                "blocked_domains": {
+                  "description": "These domains are never searched.",
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/interpolatedString"
+                  }
+                },
+                "user_location": {
+                  "description": "An approximate location the search is biased towards.",
+                  "type": "object",
+                  "required": [
+                    "type"
+                  ],
+                  "properties": {
+                    "type": {
+                      "const": "approximate"
+                    },
+                    "city": {
+                      "$ref": "#/$defs/interpolatedString"
+                    },
+                    "region": {
+                      "$ref": "#/$defs/interpolatedString"
+                    },
+                    "country": {
+                      "$ref": "#/$defs/interpolatedString"
+                    },
+                    "timezone": {
+                      "$ref": "#/$defs/interpolatedString"
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              },
+              "additionalProperties": false,
+              "allOf": [
+                {
+                  "description": "One list is an allow-list and the other is a deny-list; a tool carrying both has no answer to which applies.",
+                  "not": {
+                    "required": [
+                      "allowed_domains",
+                      "blocked_domains"
+                    ]
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "type": {
+                  "enum": [
+                    "web_fetch_20250910"
+                  ]
+                }
+              },
+              "required": [
+                "type"
+              ]
+            },
+            "then": {
+              "type": "object",
+              "required": [
+                "type",
+                "name"
+              ],
+              "properties": {
+                "type": {
+                  "enum": [
+                    "web_fetch_20250910"
+                  ]
+                },
+                "name": {
+                  "$ref": "#/$defs/interpolatedString"
+                },
+                "cache_control": {
+                  "type": "object",
+                  "required": [
+                    "type"
+                  ],
+                  "properties": {
+                    "type": {
+                      "const": "ephemeral"
+                    }
+                  },
+                  "additionalProperties": false
+                },
+                "max_uses": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "allowed_domains": {
+                  "description": "Only these domains are fetched.",
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/interpolatedString"
+                  }
+                },
+                "blocked_domains": {
+                  "description": "These domains are never fetched.",
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/interpolatedString"
+                  }
+                },
+                "citations": {
+                  "type": "object",
+                  "required": [
+                    "enabled"
+                  ],
+                  "properties": {
+                    "enabled": {
+                      "type": "boolean"
+                    }
+                  },
+                  "additionalProperties": false
+                },
+                "max_content_tokens": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              },
+              "additionalProperties": false,
+              "allOf": [
+                {
+                  "description": "One list is an allow-list and the other is a deny-list; a tool carrying both has no answer to which applies.",
+                  "not": {
+                    "required": [
+                      "allowed_domains",
+                      "blocked_domains"
+                    ]
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "type": {
+                  "enum": [
+                    "code_execution_20250522",
+                    "code_execution_20250825"
+                  ]
+                }
+              },
+              "required": [
+                "type"
+              ]
+            },
+            "then": {
+              "type": "object",
+              "required": [
+                "type",
+                "name"
+              ],
+              "properties": {
+                "type": {
+                  "enum": [
+                    "code_execution_20250522",
+                    "code_execution_20250825"
+                  ]
+                },
+                "name": {
+                  "$ref": "#/$defs/interpolatedString"
+                },
+                "cache_control": {
+                  "type": "object",
+                  "required": [
+                    "type"
+                  ],
+                  "properties": {
+                    "type": {
+                      "const": "ephemeral"
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        ]
+      },
+      "openaiServerTool": {
+        "description": "A server tool on an `openai` provider: the Responses API's built-in suite. Declaring any moves the connection onto `POST /v1/responses` for all of its calls, which is the wire that carries them (grammar 12.1 / Decision D122).",
+        "allOf": [
+          {
+            "$ref": "#/$defs/serverToolConfig"
+          },
+          {
+            "if": {
+              "properties": {
+                "type": {
+                  "enum": [
+                    "web_search",
+                    "web_search_preview"
+                  ]
+                }
+              },
+              "required": [
+                "type"
+              ]
+            },
+            "then": {
+              "type": "object",
+              "required": [
+                "type"
+              ],
+              "properties": {
+                "type": {
+                  "enum": [
+                    "web_search",
+                    "web_search_preview"
+                  ]
+                },
+                "filters": {
+                  "type": "object",
+                  "properties": {
+                    "allowed_domains": {
+                      "description": "Only these domains are searched.",
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/$defs/interpolatedString"
+                      }
+                    }
+                  },
+                  "additionalProperties": false
+                },
+                "search_context_size": {
+                  "enum": [
+                    "low",
+                    "medium",
+                    "high"
+                  ]
+                },
+                "user_location": {
+                  "description": "An approximate location the search is biased towards.",
+                  "type": "object",
+                  "required": [
+                    "type"
+                  ],
+                  "properties": {
+                    "type": {
+                      "const": "approximate"
+                    },
+                    "city": {
+                      "$ref": "#/$defs/interpolatedString"
+                    },
+                    "region": {
+                      "$ref": "#/$defs/interpolatedString"
+                    },
+                    "country": {
+                      "$ref": "#/$defs/interpolatedString"
+                    },
+                    "timezone": {
+                      "$ref": "#/$defs/interpolatedString"
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "type": {
+                  "enum": [
+                    "file_search"
+                  ]
+                }
+              },
+              "required": [
+                "type"
+              ]
+            },
+            "then": {
+              "type": "object",
+              "required": [
+                "type",
+                "vector_store_ids"
+              ],
+              "properties": {
+                "type": {
+                  "enum": [
+                    "file_search"
+                  ]
+                },
+                "vector_store_ids": {
+                  "description": "The vector stores to search. Required: a file search with nothing to search is refused.",
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/interpolatedString"
+                  }
+                },
+                "max_num_results": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 50
+                },
+                "ranking_options": {
+                  "type": "object",
+                  "properties": {
+                    "ranker": {
+                      "$ref": "#/$defs/interpolatedString"
+                    },
+                    "score_threshold": {
+                      "type": "number",
+                      "minimum": 0,
+                      "maximum": 1
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "type": {
+                  "enum": [
+                    "code_interpreter"
+                  ]
+                }
+              },
+              "required": [
+                "type"
+              ]
+            },
+            "then": {
+              "type": "object",
+              "required": [
+                "type",
+                "container"
+              ],
+              "properties": {
+                "type": {
+                  "enum": [
+                    "code_interpreter"
+                  ]
+                },
+                "container": {
+                  "description": "A container id, or a request to make one.",
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/interpolatedString"
+                    },
+                    {
+                      "type": "object",
+                      "required": [
+                        "type"
+                      ],
+                      "properties": {
+                        "type": {
+                          "const": "auto"
+                        },
+                        "file_ids": {
+                          "description": "Files the new container is seeded with.",
+                          "type": "array",
+                          "items": {
+                            "$ref": "#/$defs/interpolatedString"
+                          }
+                        }
+                      },
+                      "additionalProperties": false
+                    }
+                  ]
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "type": {
+                  "enum": [
+                    "image_generation"
+                  ]
+                }
+              },
+              "required": [
+                "type"
+              ]
+            },
+            "then": {
+              "type": "object",
+              "required": [
+                "type"
+              ],
+              "properties": {
+                "type": {
+                  "enum": [
+                    "image_generation"
+                  ]
+                },
+                "background": {
+                  "enum": [
+                    "transparent",
+                    "opaque",
+                    "auto"
+                  ]
+                },
+                "model": {
+                  "$ref": "#/$defs/interpolatedString"
+                },
+                "moderation": {
+                  "enum": [
+                    "auto",
+                    "low"
+                  ]
+                },
+                "output_compression": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 100
+                },
+                "output_format": {
+                  "enum": [
+                    "png",
+                    "webp",
+                    "jpeg"
+                  ]
+                },
+                "partial_images": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 3
+                },
+                "quality": {
+                  "enum": [
+                    "low",
+                    "medium",
+                    "high",
+                    "auto"
+                  ]
+                },
+                "size": {
+                  "$ref": "#/$defs/interpolatedString"
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        ]
+      },
     "providerDef": {
       "description": "An inference connection: kind plus connection config. Credentials are ${ENV} references, never literals. A kind's row in grammar 12.1 is closed: beyond `kind:` and `description:`, a provider takes exactly the keys its own kind admits, and a key belonging to another kind is an error rather than ignored config (Decision D106). Grammar 12.1 / PRD 5.9.",
       "type": "object",
@@ -1613,6 +2134,11 @@
           "propertyNames": { "type": "string", "pattern": "^[a-zA-Z0-9_-]+$" },
           "additionalProperties": { "$ref": "#/$defs/interpolatedString" }
         },
+        "server_tools": {
+          "description": "Tools the provider runs on its own side, inside the model call, appended to the `tools` of every request this connection serves. Written in the provider's own wire vocabulary: `type` is the only key this compiler reads, everything else travels verbatim, and string values may embed ${ENV} references. A `type` in the compiler's curated table for the kind is checked strictly; anything else is a warning and is carried unchanged, so a server tool the vendor ships later is usable the day it ships (grammar 12.1 / Decision D122).",
+          "type": "array",
+          "items": { "$ref": "#/$defs/serverToolConfig" }
+        },
         "description": { "description": "Documentation.", "type": "string" }
       },
       "additionalProperties": false,
@@ -1631,6 +2157,7 @@
               }
             ],
             "properties": {
+              "server_tools": { "items": { "$ref": "#/$defs/anthropicServerTool" } },
               "api_version": false,
               "organization": false,
               "region": false,
@@ -1658,6 +2185,7 @@
               }
             ],
             "properties": {
+              "server_tools": { "items": { "$ref": "#/$defs/openaiServerTool" } },
               "api_version": false,
               "region": false,
               "location": false,
@@ -1695,6 +2223,7 @@
             "description": "An `azure_openai` provider takes `base_url`, `api_key`, and `api_version` (all required) plus `headers`. Grammar 12.1 / Decision D106.",
             "required": ["base_url", "api_key", "api_version"],
             "properties": {
+              "server_tools": false,
               "organization": false,
               "region": false,
               "location": false,
@@ -1713,6 +2242,7 @@
             "description": "A `bedrock` provider takes `region` (required) plus the AWS credential keys `access_key_id`, `secret_access_key`, `session_token`, and `profile`. It is reached through the AWS SDK rather than a bare endpoint, so `base_url`, `api_key`, and `headers` are not its keys. Grammar 12.1 / Decision D106.",
             "required": ["region"],
             "properties": {
+              "server_tools": false,
               "api_key": false,
               "base_url": false,
               "api_version": false,
@@ -1730,6 +2260,7 @@
             "description": "A `vertex` provider takes `project` and `location` (both required) plus `credentials_json`. It is reached through the Google SDK rather than a bare endpoint, so `base_url`, `headers`, and the `api_key` credential form are not its keys. Grammar 12.1 / Decision D106.",
             "required": ["project", "location"],
             "properties": {
+              "server_tools": false,
               "api_key": false,
               "base_url": false,
               "api_version": false,

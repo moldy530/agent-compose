@@ -348,7 +348,8 @@ fn the_json_report_is_one_object_of_diagnostics() {
       "severity": "error",
       "span": "models.yml:1:1..1:8"
     }
-  ]
+  ],
+  "warnings": []
 }
 "#
     );
@@ -358,15 +359,20 @@ fn the_json_report_is_one_object_of_diagnostics() {
 
 /// A clean run in the machine format is still one object, so a consumer parses
 /// one shape whatever the outcome.
+///
+/// **Two** arrays, both always present: `diagnostics` is what rejects the
+/// composition and `warnings` is what does not, so the question a machine reader
+/// asks first — "did this pass" — is answered by one array being empty rather
+/// than by filtering the other on `severity` (see `report::json`).
 #[test]
-fn a_clean_json_report_carries_an_empty_array() {
+fn a_clean_json_report_carries_empty_arrays() {
     let output = validate(
         &repo_root(),
         &["examples/review-loop/main.yml", "--format", "json"],
     );
     assert_eq!(
         stdout(&output),
-        "{\n  \"diagnostics\": []\n}\n",
+        "{\n  \"diagnostics\": [],\n  \"warnings\": []\n}\n",
         "a clean run still writes the enclosing object"
     );
     assert_eq!(stderr(&output), "");

@@ -202,6 +202,32 @@ pub struct ProviderConfig {
     /// `headers:` — extra request headers, interpolable values.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub headers: Vec<InterpolatedEntry>,
+    /// `server_tools:` — the provider-side tools appended to the `tools` of
+    /// every request this connection serves, in declaration order
+    /// (Decision D122).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub server_tools: Vec<ServerTool>,
+}
+
+/// One `server_tools:` entry, as the artifact carries it (grammar 12.1,
+/// Decision D122).
+///
+/// A wire object rather than a construct of this grammar: `type:` is the only
+/// key the compiler reads, and `config` is everything beside it — checked
+/// against the curated table when the type is in it, and carried untouched
+/// either way. The values are grammar 4.3 class 2, so each string reaches the
+/// artifact as an [`Interpolated`] node that records the references it embeds.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ServerTool {
+    /// `type:` — the key the provider's own vocabulary is looked up under.
+    #[serde(rename = "type")]
+    pub type_name: Spanned<String>,
+    /// Everything beside `type:`, sorted by key: a wire object is a set of
+    /// fields rather than a sequence, and the artifact is canonical.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub config: BTreeMap<String, Spanned<crate::ast::deploy::PluginValue>>,
+    /// The entry's own span.
+    pub span: Span,
 }
 
 /// A `model.*` definition: a direct binding or a route, never both

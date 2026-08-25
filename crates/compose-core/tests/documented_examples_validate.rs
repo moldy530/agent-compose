@@ -146,6 +146,12 @@ const TOPICS_WITHOUT_A_RUNNABLE_EXAMPLE: &[(&str, &str)] = &[
 /// the next one. That last is the shape a bare fragment cannot carry at all:
 /// the repair is two edits in two places, and a one-line `over:` is only ever
 /// the second of them.
+///
+/// The last two are a different case and are here for a different reason: they
+/// are **warnings**, so their triggering example builds. A reader who is told
+/// "correct the spelling" or "drop the key" has no diagnostic to confirm they
+/// did — the report simply goes quiet — so the repaired spec is the only thing
+/// that says which edit produces the quiet report.
 const EXPLANATIONS_WITH_A_CORRECTED_EXAMPLE: &[&str] = &[
     "invalid-path-expression",
     "missing-capability",
@@ -153,6 +159,8 @@ const EXPLANATIONS_WITH_A_CORRECTED_EXAMPLE: &[&str] = &[
     "unbalanced-convergence",
     "undefined-channel",
     "unkeyed-map-write",
+    "unknown-server-tool",
+    "unsupported-server-tools",
 ];
 
 /// The topics that teach a deploy file, and must keep one that resolves.

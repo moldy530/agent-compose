@@ -105,6 +105,13 @@ pub fn explanation(code: DiagnosticCode) -> &'static str {
         DiagnosticCode::ToolNameCollision => include_str!("codes/tool-name-collision.md"),
         DiagnosticCode::MissingSessionKey => include_str!("codes/missing-session-key.md"),
         DiagnosticCode::MissingCapability => include_str!("codes/missing-capability.md"),
+        DiagnosticCode::UnsupportedServerTools => {
+            include_str!("codes/unsupported-server-tools.md")
+        }
+        DiagnosticCode::UnknownServerTool => include_str!("codes/unknown-server-tool.md"),
+        DiagnosticCode::MismatchedServerTools => {
+            include_str!("codes/mismatched-server-tools.md")
+        }
         DiagnosticCode::DeadEnd => include_str!("codes/dead-end.md"),
         DiagnosticCode::UnboundedCycle => include_str!("codes/unbounded-cycle.md"),
         DiagnosticCode::UnbalancedConvergence => include_str!("codes/unbalanced-convergence.md"),

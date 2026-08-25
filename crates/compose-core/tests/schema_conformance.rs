@@ -557,3 +557,176 @@ fn the_published_schema_accepts_a_keyless_provider_that_names_its_endpoint() {
         }
     }
 }
+
+/// The published schema knows every server tool the compiler's table does, and
+/// checks each one's shape (grammar 12.1, Decision D122).
+///
+/// The two halves of resolved q30's first tier have to agree, and they are two
+/// hand-written documents: `ast::server_tools` is what `agent-compose validate`
+/// reads, and `schemas/agent-compose.schema.json` is what an editor reads. A
+/// tool in one and not the other is a red squiggle on correct YAML, or a green
+/// editor on a config the compiler refuses — and both look to an author like
+/// the tool being unsupported.
+///
+/// So the `type` strings are **derived** from the table rather than listed: a
+/// tool added to the table with no mirrored `if`/`then` in the schema fails
+/// here, on the row it was added for.
+#[test]
+fn the_published_schema_knows_every_server_tool_the_table_does() {
+    let schema = read_schema();
+    let defs = schema["$defs"]
+        .as_object()
+        .expect("the schema declares `$defs`");
+    for (kind, def) in [
+        (ProviderKind::Anthropic, "anthropicServerTool"),
+        (ProviderKind::OpenAi, "openaiServerTool"),
+    ] {
+        let published = serde_json::to_string(
+            defs.get(def)
+                .unwrap_or_else(|| panic!("the schema declares `{def}`")),
+        )
+        .expect("a printable subschema");
+        let known = compose_core::ast::server_tools::known(kind);
+        assert!(
+            !known.is_empty(),
+            "`{}` is one of the kinds with a curated table",
+            kind.as_str()
+        );
+        for tool in known {
+            assert!(
+                published.contains(&format!("\"{}\"", tool.type_name)),
+                "`{}`'s `{}` is in the compiler's table and not in the published schema's `{def}`",
+                kind.as_str(),
+                tool.type_name
+            );
+        }
+    }
+}
+
+/// Every kind the compiler admits `server_tools:` on accepts one in the
+/// published schema, and every kind it refuses the key on is refused there too
+/// (grammar 12.1, Decision D122).
+///
+/// Derived from `ProviderKind::serves_server_tools` for the reason
+/// [`the_published_schema_accepts_a_keyless_provider_that_names_its_endpoint`]
+/// derives its kinds: the gate is hand-duplicated per kind in the schema, so a
+/// seventh kind — or a fourth kind taught the shape — has to grow a branch
+/// there, and a hardcoded list would let that ship silently disagreeing.
+#[test]
+fn the_published_schema_gates_server_tools_by_kind() {
+    let validator = compile_schema();
+    for kind in ProviderKind::ALL {
+        let mut provider = serde_json::Map::new();
+        provider.insert("kind".to_string(), json!(kind.as_str()));
+        // Whatever else this kind requires, so the only thing under test is the
+        // one key.
+        for key in kind.required_keys() {
+            provider.insert((*key).to_string(), json!("${SOMETHING}"));
+        }
+        if kind.default_endpoint().is_some() {
+            provider.insert("api_key".to_string(), json!("${VENDOR_API_KEY}"));
+        }
+        provider.insert(
+            "server_tools".to_string(),
+            // A type outside every table: the second tier, which is exactly what
+            // an editor must not squiggle on a kind that takes the key.
+            json!([{ "type": "a_tool_shipped_after_this_release" }]),
+        );
+        let instance = json!({ "version": "0.1", "provider.p": Value::Object(provider) });
+        let errors = validation_errors(&validator, &instance);
+        assert_eq!(
+            errors.is_empty(),
+            kind.serves_server_tools(),
+            "the published schema and `{}`'s key row disagree about `server_tools:`:\n{}",
+            kind.as_str(),
+            errors.join("\n")
+        );
+    }
+}
+
+/// The strict tier really is strict in the schema too: a known tool's misspelled
+/// field is rejected, and the same object under an unknown `type` is not.
+///
+/// This is the property the two tiers are *made of*, and it is the one an editor
+/// shows: the config the provider will refuse is squiggled where it was written,
+/// and the config nobody can verify is left alone.
+#[test]
+fn the_published_schema_checks_a_known_server_tool_and_carries_an_unknown_one() {
+    let validator = compile_schema();
+    let strict = json!({
+        "version": "0.1",
+        "provider.p": {
+            "kind": "anthropic",
+            "api_key": "${ANTHROPIC_API_KEY}",
+            "server_tools": [{ "type": "web_search_20250305", "name": "web_search", "max_usages": 5 }],
+        },
+    });
+    assert!(
+        !validation_errors(&validator, &strict).is_empty(),
+        "a field `web_search_20250305` does not have is refused"
+    );
+
+    let both_lists = json!({
+        "version": "0.1",
+        "provider.p": {
+            "kind": "anthropic",
+            "api_key": "${ANTHROPIC_API_KEY}",
+            "server_tools": [{
+                "type": "web_search_20250305",
+                "name": "web_search",
+                "allowed_domains": ["docs.example.com"],
+                "blocked_domains": ["ads.example.com"],
+            }],
+        },
+    });
+    assert!(
+        !validation_errors(&validator, &both_lists).is_empty(),
+        "an allow-list beside a deny-list is refused"
+    );
+
+    let unverifiable = json!({
+        "version": "0.1",
+        "provider.p": {
+            "kind": "anthropic",
+            "api_key": "${ANTHROPIC_API_KEY}",
+            "server_tools": [{ "type": "web_search_20260101", "name": "web_search", "max_usages": 5 }],
+        },
+    });
+    let errors = validation_errors(&validator, &unverifiable);
+    assert!(
+        errors.is_empty(),
+        "a tool outside the table travels to the wire as written, squiggle-free:\n{}",
+        errors.join("\n")
+    );
+
+    let missing_store = json!({
+        "version": "0.1",
+        "provider.p": {
+            "kind": "openai",
+            "api_key": "${OPENAI_API_KEY}",
+            "server_tools": [{ "type": "file_search" }],
+        },
+    });
+    assert!(
+        !validation_errors(&validator, &missing_store).is_empty(),
+        "a `file_search` with no `vector_store_ids` is refused"
+    );
+
+    let legal = json!({
+        "version": "0.1",
+        "provider.p": {
+            "kind": "openai",
+            "api_key": "${OPENAI_API_KEY}",
+            "server_tools": [
+                { "type": "file_search", "vector_store_ids": ["${HANDBOOK_STORE}"], "max_num_results": 5 },
+                { "type": "code_interpreter", "container": { "type": "auto" } },
+            ],
+        },
+    });
+    let errors = validation_errors(&validator, &legal);
+    assert!(
+        errors.is_empty(),
+        "a well-formed Responses suite is accepted, `${{ENV}}` values and all:\n{}",
+        errors.join("\n")
+    );
+}

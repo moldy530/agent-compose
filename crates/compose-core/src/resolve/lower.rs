@@ -206,8 +206,26 @@ fn provider(source: &ast_def::ProviderDef) -> Option<ir::definition::Provider> {
             project: source.project.clone(),
             profile: source.profile.clone(),
             headers: source.headers.iter().map(interpolated_entry).collect(),
+            server_tools: source.server_tools.iter().filter_map(server_tool).collect(),
         },
         description: source.description.clone(),
+    })
+}
+
+/// One `server_tools:` entry (grammar 12.1, Decision D122).
+///
+/// An entry whose `type:` did not read is dropped, like every other required
+/// key this pass finds absent: the parser has already reported it, and a
+/// composition with a diagnostic produces no artifact.
+fn server_tool(source: &ast_def::ServerToolDef) -> Option<ir::definition::ServerTool> {
+    Some(ir::definition::ServerTool {
+        type_name: source.type_name.clone()?,
+        config: source
+            .config
+            .iter()
+            .map(|entry| (entry.key.value.clone(), entry.value.clone()))
+            .collect(),
+        span: source.span.clone(),
     })
 }
 
