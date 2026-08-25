@@ -160,11 +160,12 @@ fn agent_tools(
                             format!("`tools` lists `{}` twice", attachment.tool.value.address()),
                         )
                         .with_label(first.tool.span.clone(), "first listed here")
-                        .with_help(
+                        .with_help(format!(
                             "one entry attaches one built-in under one set of bounds; a second \
-                             entry for the same name would be a second `bash` on the wire \
-                             (grammar 5.5)",
-                        ),
+                             entry for the same name would offer the model two `{}` tools \
+                             (grammar 5.5, 11.5)",
+                            attachment.tool.value.as_str()
+                        )),
                     );
                     continue;
                 }
@@ -230,13 +231,7 @@ fn builtin_attachment(
     cx: &mut Cx,
 ) -> Option<crate::ast::definition::BuiltinAttachment> {
     let entries = expect_mapping(item, "each entry of `tools`", cx)?.entries();
-    let names = || {
-        list(
-            Builtin::ALL
-                .iter()
-                .map(|tool| format!("`{}`", tool.address())),
-        )
-    };
+    let names = || list(Builtin::ALL.iter().map(|tool| tool.address()));
     let [entry] = entries else {
         cx.push(
             Diagnostic::error(
@@ -269,14 +264,21 @@ fn builtin_attachment(
                 format!("`{}` is not a built-in tool", key.value),
             )
             .with_optional_help(
+                // Suggested on the **local** names, with the shared
+                // `builtin.` prefix taken off both sides. Left on, every pair
+                // of names is eight characters closer than it is, and the
+                // distance budget — a third of the length — is eight characters
+                // wider: `builtin.grep` comes back as "did you mean
+                // `builtin.bash`?", which is a nudge toward the one built-in
+                // nobody should be nudged toward by accident (PRD G3).
                 suggest(
-                    &key.value,
+                    key.value.strip_prefix("builtin.").unwrap_or(&key.value),
                     &Builtin::ALL
                         .iter()
-                        .map(|tool| tool.address())
+                        .map(|tool| tool.as_str())
                         .collect::<Vec<_>>(),
                 )
-                .map(|name| format!("did you mean `{name}`?"))
+                .map(|name| format!("did you mean `builtin.{name}`?"))
                 .or_else(|| {
                     Some(format!(
                         "the built-ins are {}; a `tool.*` or `flow.*` is attached as a bare \

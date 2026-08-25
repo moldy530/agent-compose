@@ -22,7 +22,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use compose_core::ast::definition::ProviderKind;
+use compose_core::ast::definition::{Builtin, ProviderKind};
 use jsonschema::Validator;
 use serde_json::{Value, json};
 
@@ -555,6 +555,53 @@ fn the_published_schema_accepts_a_keyless_provider_that_names_its_endpoint() {
                 errors.join("\n")
             );
         }
+    }
+}
+
+/// Every built-in the compiler admits is one the published schema admits, with
+/// the bounds that name requires and nothing else (grammar 5.5, Decision D123).
+///
+/// The negative half is five fixtures under `invalid-schema/`, and it cannot
+/// carry the positive one: `additionalProperties: false` over four named
+/// properties is a shape where the *accepting* direction is the one that breaks
+/// silently. A fifth built-in added to the compiler and forgotten here would
+/// leave an editor underlining a composition `validate` accepts — the failure
+/// mode Appendix B exists to prevent, and the one nothing in this workspace
+/// would otherwise see.
+///
+/// The names are derived from [`Builtin::ALL`] rather than listed, so the two
+/// tables cannot fall out of step, and the bounds are keyed on the same
+/// predicate the parser reads (`runs_a_command`).
+#[test]
+fn the_published_schema_accepts_every_builtin_with_its_own_bounds() {
+    let validator = compile_schema();
+    assert!(
+        !Builtin::ALL.is_empty(),
+        "the built-in set is what this test quantifies over"
+    );
+    for builtin in Builtin::ALL {
+        let bounds = if builtin.runs_a_command() {
+            json!({ "root": "${WORKSPACE}", "timeout": "30s" })
+        } else {
+            json!({ "root": "${WORKSPACE}" })
+        };
+        let instance = json!({
+            "version": "0.1",
+            "agent.fixer": {
+                "model": "model.smart",
+                "prompt": "Fix it.",
+                "tools": ["tool.repo_grep", { builtin.address(): bounds }],
+                "output": { "summary": { "type": "string" } },
+            },
+        });
+        let errors = validation_errors(&validator, &instance);
+        assert!(
+            errors.is_empty(),
+            "the published schema must accept `{}` with the bounds it requires:\n{}\n{}",
+            builtin.address(),
+            serde_json::to_string_pretty(&instance).expect("a printable instance"),
+            errors.join("\n")
+        );
     }
 }
 

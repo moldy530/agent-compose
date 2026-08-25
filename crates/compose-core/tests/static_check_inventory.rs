@@ -282,6 +282,39 @@ const GRAMMAR: &[Check] = &[
         codes: &["tool-name-collision"],
         evidence: Evidence::Fixture,
     },
+    // The built-ins of resolved q31, split across the two passes for the same
+    // reason the server-tool rows below are. Every **bound** is a key beside
+    // another key in one entry, so the whole of it is the parser's — which name,
+    // whether it takes a `root:`, whether it takes a `timeout:`, whether the
+    // entry attaches one tool or two. What the parser cannot decide is the only
+    // thing that needs another file: whether the *name* the built-in takes on
+    // the wire is one something else on this agent already takes.
+    Check {
+        rule: "a `builtin.*` entry names one of the four and carries the bounds that name requires (5.5, D123)",
+        pass: "parse/definition.rs",
+        codes: &[
+            "unknown-variant",
+            "missing-key",
+            "unknown-key",
+            "invalid-value",
+            "invalid-reference",
+            "invalid-duration",
+        ],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        // Two sites, as for a server tool and for the same reason: a built-in's
+        // name meets an attached `tool.*`/`flow.*` in the agent's own list, and
+        // meets a provider's suite only once the agent's model reaches that
+        // provider. A *store's* synthesized names cannot collide with a built-in
+        // at all — `<local>_<op>` is not a shape any of the four names has — and
+        // `check/bindings.rs` holds that premise as a test of its own rather
+        // than as a comment.
+        rule: "a built-in's name is one no other tool this agent offers takes (5.5, 11.5, D123)",
+        pass: "check/bindings.rs",
+        codes: &["tool-name-collision"],
+        evidence: Evidence::Fixture,
+    },
     Check {
         rule: "a provider with a default endpoint declares `api_key:` or a `base_url:` (12.1, D120)",
         pass: "parse/definition.rs",
