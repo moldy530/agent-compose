@@ -12390,6 +12390,143 @@ fn a_composition_with_no_server_tools_keeps_the_identity_it_always_derived() {
     );
 }
 
+/// The **second** key `JOURNAL_VERSION` did not move for, on the same terms as
+/// the one above: a conversation turn off the **Messages** wire is written
+/// untagged, so a tool loop on that wire derives the identity it always derived.
+///
+/// `docs/durability.md` §3.1: an assistant turn records which wire wrote its
+/// blocks, and the key "is written **only** for a Responses turn: the Messages
+/// wire was the only surface that ever produced blocks, so leaving its turns
+/// untagged keeps every identity an earlier build derived". One line of the
+/// emitted runtime makes that true — `replayed`'s `...(answer.wire === undefined
+/// ? {} : { wire: answer.wire })`, resting on `callMessages` returning no `wire`
+/// field — and losing it is invisible to every other test in this file. A
+/// `wire: "messages"` added to `callMessages` for symmetry would stamp the key
+/// onto every replayed Messages turn; `turns` is part of a model call's request
+/// identity, so every second-and-later call of every Messages tool loop would
+/// re-key, and `canonical()` hashes the whole object. Each resume test here
+/// resumes a journal its own build wrote, so both sides would carry the new key
+/// and agree — while an `agent-compose resume` of an execution begun under an
+/// earlier build would die with a `ReplayDivergence` at the loop's second model
+/// call, with no `JOURNAL_VERSION` bump to signal a migration.
+///
+/// Both halves of the conditionality are decided, for the reason the pair above
+/// decides both of its: a negative assertion on its own would also pass on a
+/// build whose identity had stopped carrying the conversation at all, or whose
+/// journal had stopped holding a request as text this scan can read.
+///
+/// * `flow.search_loop` is the Messages wire with a real loop — three model
+///   calls, the second and third of which replay an assistant turn — and its
+///   journal must hold no `wire` key anywhere;
+/// * `flow.respond` is the same shape on the wire that **does** tag its turns,
+///   and its journal must hold one, which is what makes the scan above a scan
+///   that can see the key at all.
+#[test]
+fn a_messages_wire_tool_loop_keeps_the_untagged_turns_it_always_derived() {
+    let provider = MockProvider::start().expect("a loopback port");
+    // The Messages loop: a server search and a client call in one turn, prose to
+    // end the loop, then the pinned answer.
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new("lookup", json!({ "query": "what" }))])
+                .with_server_tools(vec![ServerToolUse::new(
+                    "web_search_20250305",
+                    json!({ "query": "what" }),
+                    json!([{ "type": "web_search_result", "url": "https://docs.example.com/a" }]),
+                )]),
+        ),
+        Script::new(SONNET, Outcome::text("I have what I need.")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "answer": "a looked-up snippet" })),
+        ),
+    ]);
+
+    let Some((messages, built)) =
+        harness::build_under_toolchain("server-tools", "identity-messages-untagged")
+    else {
+        return;
+    };
+    assert!(
+        built.status.success(),
+        "the server-tools fixture did not build:\n{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+
+    let environment = harness::environment(&provider);
+    harness::run_into(
+        &messages,
+        "server-tools",
+        "flow.search_loop",
+        &[("question", "what?")],
+        None,
+        &environment,
+    )
+    .succeeded();
+
+    assert!(
+        harness::journal_holds(&messages, &["ask/0#model/0", "ask/0#model/2"]),
+        "the loop's model records are committed, so the journal really is being read"
+    );
+    assert!(
+        !harness::journal_holds(&messages, &["\"wire\""]),
+        "a Messages turn is replayed untagged, so the key reaches neither the \
+         recorded answer nor the request identity — which is what keeps a journal \
+         from before the second wire existed replaying, and `JOURNAL_VERSION` \
+         where it is (`docs/durability.md` §3.1, §11.2)"
+    );
+    assert!(provider.snapshot().is_drained());
+
+    // The positive half, on the wire whose turns *are* tagged: the same loop
+    // shape, three calls, replaying assistant turns the Responses wire wrote.
+    provider.reset();
+    provider.enqueue_all([
+        Script::new(
+            GPT5,
+            Outcome::tool_calls(vec![ToolCall::new("lookup", json!({ "query": "what" }))])
+                .with_server_tools(vec![ServerToolUse::new(
+                    "web_search",
+                    json!({ "type": "search", "query": "what" }),
+                    json!([{ "url": "https://docs.example.com/a" }]),
+                )]),
+        ),
+        Script::new(GPT5, Outcome::text("I have what I need.")),
+        Script::new(
+            GPT5,
+            Outcome::structured(json!({ "answer": "a looked-up snippet" })),
+        ),
+    ]);
+
+    let Some((responses, built)) =
+        harness::build_under_toolchain("server-tools", "identity-responses-tagged")
+    else {
+        return;
+    };
+    assert!(
+        built.status.success(),
+        "the server-tools fixture did not build:\n{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+
+    harness::run_into(
+        &responses,
+        "server-tools",
+        "flow.respond",
+        &[("question", "what?")],
+        None,
+        &environment,
+    )
+    .succeeded();
+
+    assert!(
+        harness::journal_holds(&responses, &["ask/0#model/0", "ask/0#model/2", "\"wire\""]),
+        "the same three-call loop on the Responses wire commits the key, so the \
+         assertion above is an absence this scan can tell from a presence"
+    );
+    assert!(provider.snapshot().is_drained());
+}
+
 /// A pause survives the process that opened it, and comes back under the **same
 /// wait id** (resolved q28).
 ///
