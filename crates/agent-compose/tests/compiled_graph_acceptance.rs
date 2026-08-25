@@ -12062,6 +12062,83 @@ fn every_builtin_runs_inside_its_root_and_answers_the_model() {
     assert!(provider.snapshot().is_drained());
 }
 
+/// What a `list` answers: the entries in order, a glob matched within and across
+/// path segments, and a flag when it stopped short (grammar 5.5).
+///
+/// The glob matcher is this runtime's own — one fewer pinned dependency, which
+/// is the posture the whole emitted runtime is written in — so its two rules
+/// need exercising rather than asserting: `*` and `?` stay inside one segment
+/// and `**` spans them. The cap is here for the same reason: a bound nothing
+/// reaches is a bound nobody knows the shape of, and `truncated` is what tells a
+/// model its listing is a prefix rather than an answer.
+#[test]
+fn a_listing_matches_globs_in_order_and_says_when_it_stopped_short() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (scratch, environment) = bounded_root(&provider, "builtins-glob");
+    let root = root_of(&scratch);
+    // A tree deep enough that `*` and `**` disagree about it.
+    std::fs::create_dir_all(root.join("docs/deep")).expect("the root is writable");
+    for path in [
+        "docs/one.md",
+        "docs/two.txt",
+        "docs/deep/three.md",
+        "top.md",
+    ] {
+        std::fs::write(root.join(path), "x").expect("the root is writable");
+    }
+    // …and a directory with more entries than one answer carries.
+    let crowd = root.join("crowd");
+    std::fs::create_dir_all(&crowd).expect("the root is writable");
+    for index in 0..1001 {
+        std::fs::write(crowd.join(format!("{index:04}.txt")), "x").expect("the root is writable");
+    }
+
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![
+                // `*` does not cross a `/`, so `docs/deep/three.md` is not a match.
+                ToolCall::new("list", json!({ "path": ".", "glob": "docs/*.md" })),
+                // `**` does, and reaches the file the one above cannot.
+                ToolCall::new("list", json!({ "path": ".", "glob": "**/*.md" })),
+                // …and the listing that has to stop.
+                ToolCall::new("list", json!({ "path": "crowd", "glob": "" })),
+            ]),
+        ),
+        Script::new(SONNET, Outcome::text("I have the listings.")),
+        Script::new(SONNET, Outcome::structured(json!({ "summary": "listed" }))),
+    ]);
+
+    let Some(run) = harness::invoke_with(
+        "builtin-tools",
+        "flow.work",
+        &json!({ "goal": "list the tree" }),
+        &environment,
+    ) else {
+        return;
+    };
+    run.succeeded();
+
+    let handed = provider.requests()[1].body().to_string();
+    // Segment-bounded: the two files directly under `docs/`, in order, and not
+    // the one a level down.
+    assert!(
+        handed.contains(r#"[\"docs/one.md\"]"#),
+        "`docs/*.md` matches inside one segment only: {handed}"
+    );
+    // Segment-spanning: everything with that suffix, wherever it sits.
+    assert!(
+        handed.contains(r#"[\"docs/deep/three.md\",\"docs/one.md\",\"top.md\"]"#),
+        "`**/*.md` crosses segments, and the entries are in order: {handed}"
+    );
+    // …and the listing that ran out says so rather than looking complete.
+    assert!(
+        handed.contains(r#"\"truncated\":true"#) && handed.contains(r#"\"0000.txt\""#),
+        "a listing past the cap answers a prefix and reports that it is one: {handed}"
+    );
+    assert!(provider.snapshot().is_drained());
+}
+
 /// A path that climbs out of the root with `..` is **refused**, and refusing it
 /// fails the node rather than going back to the model (PRD resolved q31).
 ///

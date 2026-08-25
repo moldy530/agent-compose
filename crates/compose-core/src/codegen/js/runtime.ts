@@ -3666,8 +3666,14 @@ async function runBuiltinLive(
       return await readWithinRoot(binding, root, String(args.path));
     case "write_file":
       return await writeWithinRoot(binding, root, String(args.path), String(args.content));
-    default:
+    case "list":
       return await listWithinRoot(binding, root, String(args.path), String(args.glob));
+    default:
+      // Unreachable over a project this compiler emitted: the set is closed in
+      // the grammar and the emitter writes one of the four. Said rather than
+      // defaulted to a branch, because a fifth name reaching here should stop
+      // rather than quietly list a directory.
+      throw new Error(`\`builtin.${binding.tool}\` is not a built-in this runtime implements`);
   }
 }
 
@@ -3739,7 +3745,7 @@ async function targetWithinRoot(
   binding: BuiltinBinding,
   root: string,
   requested: string,
-): Promise<{ path: string; exists: boolean }> {
+): Promise<string> {
   const absolute = path.resolve(root, requested);
   const resolved = await realpathOrAbsent(absolute);
   let target = resolved;
@@ -3761,7 +3767,7 @@ async function targetWithinRoot(
       `\`builtin.${binding.tool}\` refused \`${requested}\`: it resolves outside \`root:\` \`${asWritten(binding.root)}\`, which is the directory this tool is bounded to`,
     );
   }
-  return { path: target, exists: resolved !== undefined };
+  return target;
 }
 
 /** A path's real location, or `undefined` where nothing is there to resolve. */
@@ -3878,7 +3884,7 @@ async function readWithinRoot(
 ): Promise<unknown> {
   const target = await targetWithinRoot(binding, root, requested);
   try {
-    return { content: await fs.promises.readFile(target.path, "utf8") };
+    return { content: await fs.promises.readFile(target, "utf8") };
   } catch (error) {
     throw builtinFailure(binding, "read", requested, error);
   }
@@ -3893,7 +3899,7 @@ async function writeWithinRoot(
 ): Promise<unknown> {
   const target = await targetWithinRoot(binding, root, requested);
   try {
-    await fs.promises.writeFile(target.path, content, "utf8");
+    await fs.promises.writeFile(target, content, "utf8");
   } catch (error) {
     throw builtinFailure(binding, "write", requested, error);
   }
@@ -3923,7 +3929,7 @@ async function listWithinRoot(
   const target = await targetWithinRoot(binding, root, requested);
   const found: string[] = [];
   try {
-    await walkListing(target.path, "", glob === "", glob, found);
+    await walkListing(target, "", glob === "", glob, found);
   } catch (error) {
     throw builtinFailure(binding, "list", requested, error);
   }
