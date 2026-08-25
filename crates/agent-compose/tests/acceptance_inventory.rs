@@ -988,6 +988,17 @@ const HARNESS: &[Criterion] = &[Criterion {
             "an_openai_provider_with_server_tools_runs_its_loop_on_the_responses_wire",
             Status::Live,
         ),
+        // …and the turn shape only that wire can produce: a preamble `message`
+        // before the shaped one, which is what a server tool running mid-turn
+        // leaves behind.
+        (
+            "a_pinned_responses_turn_is_read_at_the_message_the_format_shaped",
+            Status::Live,
+        ),
+        (
+            "a_pinned_responses_turn_carrying_no_object_is_reported_as_no_structured_output",
+            Status::Live,
+        ),
         // …and the third route the key reaches, which is on neither of those
         // two wires: a gateway keeps Chat Completions and its suite rides that
         // request's own `tools` array.

@@ -770,6 +770,31 @@ carries these blocks through its loop opaquely, which is exactly the property th
 acceptance suite asserts. A wrong member name here would therefore fail nothing
 that is not already failing.
 
+### 23. One Responses turn may hold more than one `message`, and `text.format` shapes the last
+
+The other side of (19)'s "the conversation is a list of items": a `message` is an
+item like any other, so a turn may carry several — a preamble the model wrote
+before a server tool ran, then the shaped answer after it, with the
+`<type>_call` of (22) between them. Neither of the other two wires can produce
+that shape: the Messages API answers a pinned request with a `tool_use` block
+whose `input` **is** the object, and Chat Completions has exactly one
+`choices[0].message.content`.
+
+So a `text.format` of type `json_schema` constrains the turn's **final** message
+and says nothing about what precedes it, and a reader that concatenates every
+`output_text` and parses the join parses something the format never shaped. The
+runtime reads the last message-bearing item for its structured answer and keeps
+the join only as the turn's text (`callResponses`, `shapedOutput`);
+`compiled_graph_acceptance.rs`'s
+`a_pinned_responses_turn_is_read_at_the_message_the_format_shaped` is what
+decides it, served with a **raw** response because `reply_answer` writes at most
+one `message` item per scripted answer and so cannot compose the shape.
+
+*What is assumed* is that the service is willing to send a preamble beside a
+shaped answer at all. If it never does, nothing is lost — a single-message turn
+reads identically — and if it does, the alternative is a `JSON.parse` of prose
+thrown inside the journaled model call, which a resume then replays.
+
 ---
 
 ## Accepted-key lists are curated, not exhaustive

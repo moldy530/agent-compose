@@ -2535,17 +2535,28 @@ async function callResponses(
   const answer = await send(model, `${baseUrl(model.provider)}/v1/responses`, headers, body, signal);
 
   const output = (answer["output"] ?? []) as Record<string, unknown>[];
-  const texts: string[] = [];
+  // **Per message item**, not one flat list of parts. A turn on this wire can
+  // hold more than one `message` — a preamble the model wrote before a server
+  // tool ran, the shaped answer after it — and the two answer different
+  // questions. `text` is everything the assistant said, which is what a replay
+  // on another wire has to carry; the *structured* answer is the last message
+  // alone, because `text.format` shapes the turn's final message and says
+  // nothing about what precedes it. Flattening them and parsing the join is how
+  // `Let me look that up.{"answer":"…"}` reaches `JSON.parse`, and server tools
+  // are exactly what makes a multi-`message` turn reachable (Decision D122).
+  const said: string[] = [];
   let refusal: string | null = null;
   for (const item of output) {
     if (item["type"] !== "message") continue;
+    const parts: string[] = [];
     for (const part of (item["content"] ?? []) as Record<string, unknown>[]) {
-      if (part["type"] === "output_text") texts.push(String(part["text"] ?? ""));
+      if (part["type"] === "output_text") parts.push(String(part["text"] ?? ""));
       // A stated decline, which is what tells a refusal from an answer cut
       // short by `max_output_tokens` — both otherwise arrive as no structured
       // output (`WIRE-NOTES` (3), (21)).
       if (part["type"] === "refusal") refusal = String(part["refusal"] ?? "");
     }
+    if (parts.length > 0) said.push(parts.join(""));
   }
   const calls = output
     .filter((item) => item["type"] === "function_call")
@@ -2554,7 +2565,8 @@ async function callResponses(
       name: String(item["name"]),
       args: JSON.parse(String(item["arguments"] ?? "{}")) as unknown,
     }));
-  const text = texts.length > 0 ? texts.join("") : null;
+  const text = said.length > 0 ? said.join("") : null;
+  const shaped = said.length > 0 ? said[said.length - 1]! : null;
   // `status` is the call's own outcome and `incomplete_details.reason` is why an
   // incomplete one stopped; the narrower of the two is what a reader needs, so
   // it wins where there is one.
@@ -2566,8 +2578,7 @@ async function callResponses(
   return {
     text,
     toolCalls: request.pinned === undefined ? calls : [],
-    structured:
-      request.pinned === undefined || text === null ? null : (JSON.parse(text) as unknown),
+    structured: request.pinned === undefined ? null : shapedOutput(shaped),
     stopReason,
     content: output,
     // …and whose vocabulary those are, because a failover ladder may hand this
@@ -2575,6 +2586,29 @@ async function callResponses(
     wire: "responses",
     refusal,
   };
+}
+
+/**
+ * The structured answer a Responses turn's final message carries, or `null`.
+ *
+ * `text.format` shapes that message, so parsing it is parsing what the format
+ * constrained — but only the **service** guarantees the shape, and a turn that
+ * came back with prose where the schema was asked for is an answer this runtime
+ * cannot use rather than a call that failed. So the absence is reported as an
+ * absence, which is the same posture the Messages wire has when the pinned
+ * `tool_use` block is not in the turn: `callAgent` then names the agent, the
+ * output it asked for, and what the surface said about why — a stated refusal,
+ * or a `max_output_tokens` cut. A `SyntaxError` thrown from here would name
+ * none of those, and would be thrown *inside* the journaled model call, which
+ * would record a call that worked as a call that did not.
+ */
+function shapedOutput(text: string | null): unknown {
+  if (text === null) return null;
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return null;
+  }
 }
 
 /**
