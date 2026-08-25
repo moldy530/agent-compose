@@ -638,6 +638,99 @@ fn a_providers_server_tools_reach_the_messages_wire_verbatim() {
     assert!(provider.snapshot().is_drained());
 }
 
+/// A `server_tool_use` block in an answer the tool loop is reading is **not**
+/// dispatched, and is **not** refused (Decision D122, over Decision D119).
+///
+/// This is the negative half of the pass-through, and it needs a loop to be
+/// visible at all: the answer carries a `server_tool_use` block beside a
+/// `tool_use` one, and only the second may reach the runtime. A runtime that
+/// read the first as a call would find no tool of that name on the agent and
+/// bounce it back as a refusal — a `refused` record in the trace, and a wasted
+/// turn — so the trace is what decides it. The block still has to *travel*: the
+/// next request replays the assistant turn whole, which is where the Messages
+/// API requires it back beside the `tool_use` it preceded.
+#[test]
+fn a_server_tool_block_is_neither_dispatched_nor_refused_by_the_loop() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new("lookup", json!({ "query": "what" }))])
+                .with_server_tools(vec![ServerToolUse::new(
+                    "web_search_20250305",
+                    json!({ "query": "what" }),
+                    json!([{ "type": "web_search_result", "url": "https://docs.example.com/a" }]),
+                )]),
+        ),
+        Script::new(SONNET, Outcome::text("I have what I need.")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "answer": "a looked-up snippet" })),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke(
+        "server-tools",
+        "flow.search_loop",
+        &[("question", "what?")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(run.outputs()["answer"], "a looked-up snippet");
+
+    // What the loop ran, as the trace records it (`docs/trace.md` §7.3): the
+    // agent's own tool, once, and nothing else. A refusal here would be the
+    // server tool having been read as a call.
+    let asked: Vec<(String, String)> = run
+        .entries("ask")
+        .iter()
+        .flat_map(|entry| {
+            entry["models"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+        })
+        .flat_map(|call| {
+            call["toolCalls"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+        })
+        .map(|record| {
+            (
+                record["name"].as_str().unwrap_or_default().to_string(),
+                record["outcome"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        asked,
+        [("lookup".to_string(), "completed".to_string())],
+        "the loop ran the agent's tool and nothing else: {asked:?}"
+    );
+
+    // …and the block travelled: the next request replays the assistant turn
+    // whole, `server_tool_use` and its result included.
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 3);
+    let replayed = requests[1].body()["messages"][1]["content"]
+        .as_array()
+        .expect("the assistant turn is a block list")
+        .iter()
+        .map(|block| block["type"].as_str().unwrap_or_default().to_string())
+        .collect::<Vec<_>>();
+    assert!(
+        replayed.contains(&"server_tool_use".to_string())
+            && replayed.contains(&"web_search_tool_result".to_string()),
+        "the answer went back as it came: {replayed:?}"
+    );
+    assert!(provider.snapshot().is_drained());
+}
+
 /// An `openai` provider that declares a suite speaks the **Responses** API for
 /// every call it makes, and everything else about the call still works there
 /// (Decision D122).

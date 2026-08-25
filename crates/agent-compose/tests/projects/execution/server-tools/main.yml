@@ -139,6 +139,30 @@ agent.responder:
       description: The answer, as text.
       type: string
 
+agent.looping_searcher:
+  # The Messages-wire agent that has a **client** tool as well, so its loop
+  # really turns. That is what makes "a server tool is not dispatched" a claim a
+  # trace can decide: the answer carries a `server_tool_use` block beside a
+  # `tool_use` one, and only the second may reach the runtime. Reading the first
+  # as a call would bounce it back as a refusal (Decision D119) and show up in
+  # the trace as an outcome no correct run has.
+  description: Searches, calls its own tool, and answers.
+  model: model.searching_claude
+  prompt: |
+    You are a researcher.
+
+    Use the search your provider runs and your own lookup tool, then answer.
+  tools: [tool.lookup]
+  max_tool_iterations: 3
+  input:
+    question:
+      description: What to answer.
+      type: string
+  output:
+    answer:
+      description: The answer, as text.
+      type: string
+
 agent.crosser:
   description: Answers through a route whose members are on two wires.
   model: model.crossing_wires
@@ -165,6 +189,24 @@ flow.search:
   nodes:
     ask:
       agent: agent.searcher
+      input:
+        question: "input.question"
+  edges:
+    - { from: start, to: ask }
+    - { from: ask, to: end }
+
+flow.search_loop:
+  description: The Messages wire with a tool loop, so both kinds of tool are in one turn.
+  inputs:
+    question:
+      type: string
+      min_length: 1
+  outputs:
+    answer:
+      type: string
+  nodes:
+    ask:
+      agent: agent.looping_searcher
       input:
         question: "input.question"
   edges:
@@ -248,6 +290,9 @@ triggers:
   search:
     type: manual
     flow: flow.search
+  search_loop:
+    type: manual
+    flow: flow.search_loop
   relay:
     type: manual
     flow: flow.relay

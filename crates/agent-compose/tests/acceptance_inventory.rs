@@ -981,6 +981,10 @@ const HARNESS: &[Criterion] = &[Criterion {
             Status::Live,
         ),
         (
+            "a_server_tool_block_is_neither_dispatched_nor_refused_by_the_loop",
+            Status::Live,
+        ),
+        (
             "an_openai_provider_with_server_tools_runs_its_loop_on_the_responses_wire",
             Status::Live,
         ),
