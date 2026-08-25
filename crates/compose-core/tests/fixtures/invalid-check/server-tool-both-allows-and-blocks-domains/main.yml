@@ -1,0 +1,19 @@
+# rule: a web-search server tool allows domains or blocks them, never both (grammar 12.1, Decision D122)
+# code: conflicting-keys
+# message: server tool `web_search_20250305` of `provider.main` declares both `allowed_domains` and `blocked_domains`
+# at: main.yml:19:24
+# label: main.yml:18:24 `allowed_domains` is declared here
+# help: one is an allow-list and the other is a deny-list, and a tool carrying both has no answer to which applies: keep `allowed_domains` or `blocked_domains`, not both
+#
+# One list is an allow-list and the other is a deny-list; a tool carrying both
+# has no answer to which applies, and the service refuses it.
+version: "0.1"
+
+provider.main:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+  server_tools:
+    - type: web_search_20250305
+      name: web_search
+      allowed_domains: ["docs.example.com"]
+      blocked_domains: ["ads.example.com"]

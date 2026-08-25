@@ -380,6 +380,7 @@ fn provider(fields: &mut Fields<'_>, subject: &str, cx: &mut Cx) -> ProviderDef 
     let headers = provider_key(fields, "headers", kind_ref, subject, cx)
         .map(|node| binding::interpolated_map(node, "`headers`", binding::NameForm::HeaderLike, cx))
         .unwrap_or_default();
+    let server_tools = server_tools(fields, kind_ref, subject, cx);
     let description = description(fields, cx);
 
     if let Some(kind) = kind.as_ref() {
@@ -416,7 +417,125 @@ fn provider(fields: &mut Fields<'_>, subject: &str, cx: &mut Cx) -> ProviderDef 
         project,
         profile,
         headers,
+        server_tools,
         description,
+    }
+}
+
+/// Read `server_tools:` — the array of wire config objects a provider appends
+/// to every request it serves (grammar 12.1, Decision D122).
+///
+/// The kind gate is here rather than in [`provider_key`] because the refusal is
+/// a different sentence: a `region:` on an `anthropic` provider is a key from
+/// another kind's row, while a `server_tools:` on a `bedrock` one is a key this
+/// **release** has not taught that kind's wire, and the repair is not "move it"
+/// but "wait, or reach the same models through a kind whose wire carries it".
+/// A reader who is told the wrong one goes looking for a typo.
+///
+/// Only the two things the compiler must decide are decided here: that every
+/// entry is a mapping, and that each one names a plain-string `type:`. The
+/// **contents** are the validator's (`check/providers.rs`), because which fields
+/// a tool has depends on the provider `kind:` — one literal away in the same
+/// mapping, but read through a table that also has to answer the second tier's
+/// "this one is not in the table at all", which is a warning rather than an
+/// error and belongs where the other provider-plugin checks are.
+fn server_tools(
+    fields: &mut Fields<'_>,
+    kind: Option<&Spanned<ProviderKind>>,
+    subject: &str,
+    cx: &mut Cx,
+) -> Vec<crate::ast::definition::ServerToolDef> {
+    let Some(entry) = fields.take_entry("server_tools") else {
+        return Vec::new();
+    };
+    if let Some(kind) = kind
+        && !kind.value.serves_server_tools()
+    {
+        cx.push(
+            Diagnostic::error(
+                DiagnosticCode::UnsupportedServerTools,
+                entry.key.span.clone(),
+                format!(
+                    "{subject} declares `kind: {}`, whose wire this compiler release does not \
+                     carry server tools on",
+                    kind.value.as_str()
+                ),
+            )
+            .with_label(kind.span.clone(), "the kind is declared here")
+            .with_help(format!(
+                "server tools launched on {} — a tool that runs on the provider's side rides the \
+                 request that provider serves, and the other wires have not been taught the \
+                 shape, so a config declared here would never reach one (grammar 12.1, \
+                 Decision D122)",
+                list(
+                    ProviderKind::ALL
+                        .iter()
+                        .filter(|kind| kind.serves_server_tools())
+                        .map(|kind| format!("kind: {}", kind.as_str()))
+                        .collect::<Vec<_>>()
+                )
+            )),
+        );
+        return Vec::new();
+    }
+    let Some(items) = expect_sequence(&entry.value, "`server_tools`", cx) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| server_tool(item, index, cx))
+        .collect()
+}
+
+/// One entry of `server_tools:`.
+fn server_tool(node: &Node, index: usize, cx: &mut Cx) -> crate::ast::definition::ServerToolDef {
+    let context = format!("`server_tools[{index}]`");
+    let empty = crate::ast::definition::ServerToolDef {
+        type_name: None,
+        config: Vec::new(),
+        span: node.span.clone(),
+    };
+    let Some(mapping) = expect_mapping(node, &context, cx) else {
+        return empty;
+    };
+    let type_name = match mapping.get("type") {
+        Some(node) => lexical::text(node, &format!("`type` of {context}"), cx),
+        None => {
+            cx.error(
+                DiagnosticCode::MissingKey,
+                &node.span,
+                format!(
+                    "missing required key `type` in {context}: a server tool is named by the \
+                     `type:` its provider's wire takes"
+                ),
+            );
+            None
+        }
+    };
+    // Everything else is the provider's vocabulary and travels verbatim: an
+    // unknown key here is not a mistake but the whole point of the key
+    // (Decision D50's plugin-config exception, grammar 12.1).
+    let config = mapping
+        .entries()
+        .iter()
+        .filter(|entry| entry.key.value != "type")
+        .map(|entry| {
+            lexical::reject_env_refs(&entry.key, &format!("a config key of {context}"), cx);
+            crate::ast::deploy::PluginEntry {
+                key: entry.key.clone(),
+                value: super::deploy::plugin_value(
+                    &entry.value,
+                    &format!("`{}` of {context}", entry.key.value),
+                    cx,
+                ),
+            }
+        })
+        .collect();
+    crate::ast::definition::ServerToolDef {
+        type_name,
+        config,
+        span: node.span.clone(),
     }
 }
 

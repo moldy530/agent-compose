@@ -288,6 +288,38 @@ const GRAMMAR: &[Check] = &[
         codes: &["missing-credential"],
         evidence: Evidence::Fixture,
     },
+    // The two-tier rule of resolved q30, split across the two passes it is
+    // decidable in. The **kind gate** is one literal beside another in one
+    // mapping, so it is the parser's, exactly as D120's credential rule is; the
+    // **contents** need the kind's curated table read for a warning as well as
+    // for an error, which is the same shape of work `settings:` already does
+    // here.
+    Check {
+        rule: "`server_tools:` is declared on a kind whose wire carries them (12.1, D122)",
+        pass: "parse/definition.rs",
+        codes: &["unsupported-server-tools"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        rule: "a `server_tools:` entry in the kind's curated table is checked against it, and one outside it is carried with a warning (12.1, D122)",
+        pass: "check/providers.rs",
+        codes: &[
+            "unknown-server-tool",
+            "unknown-key",
+            "missing-key",
+            "conflicting-keys",
+            "type-mismatch",
+            "unknown-variant",
+            "value-out-of-range",
+        ],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        rule: "a route's members declare one `server_tools:` suite (12.2, D122)",
+        pass: "check/providers.rs",
+        codes: &["mismatched-server-tools"],
+        evidence: Evidence::Fixture,
+    },
     Check {
         rule: "a `method: GET` trigger does not read through `payload.body` (13.3, D117)",
         pass: "check/triggers.rs",

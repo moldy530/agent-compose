@@ -421,6 +421,17 @@ pub enum DiagnosticCode {
     // --- providers and models (grammar 12) --------------------------------
     /// A provider cannot serve what a model, an agent, or a store asks of it.
     MissingCapability,
+    /// A provider declares `server_tools:` on a kind whose wire this compiler
+    /// release does not carry them on (grammar 12.1, Decision D122).
+    UnsupportedServerTools,
+    /// **Warning.** A `server_tools:` entry names a `type:` the kind's curated
+    /// table does not have, so nothing about its config could be verified — it
+    /// travels to the wire verbatim (grammar 12.1, Decision D122).
+    UnknownServerTool,
+    /// **Warning.** The members of a failover route declare different
+    /// `server_tools:` suites, so which tools the model is offered depends on
+    /// which member served the call (grammar 12.2, Decision D122).
+    MismatchedServerTools,
 
     // --- graph analyses (grammar 7.4–7.8, 8.6, 13.3) ----------------------
     /// A node has a pass on which its branch takes no outgoing edge: it has
@@ -514,6 +525,9 @@ impl DiagnosticCode {
         Self::ToolNameCollision,
         Self::MissingSessionKey,
         Self::MissingCapability,
+        Self::UnsupportedServerTools,
+        Self::UnknownServerTool,
+        Self::MismatchedServerTools,
         Self::DeadEnd,
         Self::UnboundedCycle,
         Self::UnbalancedConvergence,
@@ -578,6 +592,9 @@ impl DiagnosticCode {
             Self::ToolNameCollision => "tool-name-collision",
             Self::MissingSessionKey => "missing-session-key",
             Self::MissingCapability => "missing-capability",
+            Self::UnsupportedServerTools => "unsupported-server-tools",
+            Self::UnknownServerTool => "unknown-server-tool",
+            Self::MismatchedServerTools => "mismatched-server-tools",
             Self::DeadEnd => "dead-end",
             Self::UnboundedCycle => "unbounded-cycle",
             Self::UnbalancedConvergence => "unbalanced-convergence",

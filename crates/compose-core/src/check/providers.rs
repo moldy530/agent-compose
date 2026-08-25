@@ -46,8 +46,10 @@
 
 use crate::ast::common::{Address, Literal};
 use crate::ast::definition::ProviderKind;
+use crate::ast::deploy::PluginValue;
+use crate::ast::server_tools::{self, FieldShape, ObjectShape};
 use crate::diag::{Diagnostic, DiagnosticCode, Span, Spanned};
-use crate::ir::definition::{DefinitionBody, Model};
+use crate::ir::definition::{DefinitionBody, Model, Provider, ServerTool};
 
 use super::Ctx;
 
@@ -155,13 +157,338 @@ pub(crate) fn check(ctx: &mut Ctx) {
                     setting(ctx, key, value, kind, address, &model.provider);
                 }
             }
-            DefinitionBody::Model(Model::Route(route)) => equivalence(ctx, address, route),
+            DefinitionBody::Model(Model::Route(route)) => {
+                equivalence(ctx, address, route);
+                server_tool_suites(ctx, address, route);
+            }
             DefinitionBody::Agent(agent) => {
                 structured_output(ctx, &agent.model, address);
+            }
+            DefinitionBody::Provider(provider) => {
+                for tool in &provider.config.server_tools {
+                    server_tool(ctx, address, provider.kind, tool);
+                }
             }
             _ => {}
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Server tools (grammar 12.1, Decision D122)
+// ---------------------------------------------------------------------------
+
+/// One `server_tools:` entry, two tiers (Decision D122, resolved q30).
+///
+/// A tool the kind's curated table names is checked **strictly** — every field
+/// against its documented shape, every constraint the vendor states — because a
+/// config the provider will refuse is a run that fails on its first model call
+/// with a 400 and no span. A tool the table does not name is **warned about and
+/// carried**: the table is a convenience that buys diagnostics, never a gate,
+/// and a server tool the vendor ships tomorrow has to be usable the day it ships
+/// (the no-treadmill constraint q30 settles).
+fn server_tool(ctx: &mut Ctx, address: &str, kind: ProviderKind, tool: &ServerTool) {
+    let type_name = tool.type_name.value.as_str();
+    let Some(known) = server_tools::lookup(kind, type_name) else {
+        let names = server_tools::type_names(kind);
+        let help = crate::parse::reader::suggest(type_name, &names).map_or_else(
+            || unverifiable(kind, &names),
+            |name| format!("did you mean `{name}`?"),
+        );
+        ctx.push(
+            Diagnostic::warning(
+                DiagnosticCode::UnknownServerTool,
+                tool.type_name.span.clone(),
+                format!(
+                    "`{address}` declares the server tool `{type_name}`, which is not one this \
+                     compiler release knows `{}` serves: its config is unchecked and travels to \
+                     the provider as written",
+                    kind.as_str()
+                ),
+            )
+            .with_help(help),
+        );
+        return;
+    };
+    let subject = format!("server tool `{type_name}` of `{address}`");
+    for required in known.shape.required {
+        if !tool.config.contains_key(*required) {
+            ctx.error(
+                DiagnosticCode::MissingKey,
+                &tool.span,
+                format!("missing required key `{required}` in {subject}"),
+            );
+        }
+    }
+    for [left, right] in known.shape.exclusive {
+        let (Some(first), Some(second)) = (tool.config.get(*left), tool.config.get(*right)) else {
+            continue;
+        };
+        ctx.push(
+            Diagnostic::error(
+                DiagnosticCode::ConflictingKeys,
+                second.span.clone(),
+                format!("{subject} declares both `{left}` and `{right}`"),
+            )
+            .with_label(first.span.clone(), format!("`{left}` is declared here"))
+            .with_help(format!(
+                "one is an allow-list and the other is a deny-list, and a tool carrying both has \
+                 no answer to which applies: keep `{left}` or `{right}`, not both"
+            )),
+        );
+    }
+    for (key, value) in &tool.config {
+        let Some(shape) = known.shape.field(key) else {
+            let names = known.shape.names();
+            let help = crate::parse::reader::suggest(key, &names).map_or_else(
+                || format!("`{type_name}` takes {}", crate::parse::reader::list(&names)),
+                |name| format!("did you mean `{name}`?"),
+            );
+            ctx.push(
+                Diagnostic::error(
+                    DiagnosticCode::UnknownKey,
+                    value.span.clone(),
+                    format!("`{key}` is not a field of {subject}"),
+                )
+                .with_help(help),
+            );
+            continue;
+        };
+        plugin(ctx, &format!("`{key}` of {subject}"), value, shape);
+    }
+}
+
+/// The help line a second-tier tool carries: what could not be verified, and
+/// what the table does know.
+fn unverifiable(kind: ProviderKind, names: &[&str]) -> String {
+    if names.is_empty() {
+        return format!(
+            "this compiler release publishes no server-tool table for `{}` — a gateway may serve \
+             any vocabulary — so every entry here is carried unchecked (grammar 12.1, \
+             Decision D122)",
+            kind.as_str()
+        );
+    }
+    format!(
+        "the `{}` server tools this release checks are {}; anything else is carried unchecked, \
+         so a tool the vendor ships later works here the day it ships (grammar 12.1, \
+         Decision D122)",
+        kind.as_str(),
+        crate::parse::reader::list(names)
+    )
+}
+
+/// One config value against its documented shape.
+fn plugin(ctx: &mut Ctx, subject: &str, value: &Spanned<PluginValue>, shape: FieldShape) {
+    match (shape, &value.value) {
+        (FieldShape::Integer(low, high), PluginValue::Int(number)) => {
+            if *number < low || *number > high {
+                ctx.error(
+                    DiagnosticCode::ValueOutOfRange,
+                    &value.span,
+                    format!(
+                        "{subject} is {number}, outside {}",
+                        bounds(low as f64, high as f64)
+                    ),
+                );
+            }
+        }
+        (FieldShape::Number(low, high), PluginValue::Int(number)) => {
+            range(ctx, subject, &value.span, *number as f64, low, high);
+        }
+        (FieldShape::Number(low, high), PluginValue::Float(number)) => {
+            range(ctx, subject, &value.span, *number, low, high);
+        }
+        (FieldShape::Boolean, PluginValue::Bool(_)) => {}
+        (FieldShape::Text, PluginValue::Text(_)) => {}
+        (FieldShape::Choice(choices), PluginValue::Text(text)) => {
+            // A value that embeds an `${ENV}` reference is not decided here:
+            // what it says is whatever the process is started with, and the
+            // whole point of grammar 4.3 class 2 is that the compiler does not
+            // read it (PRD 5.9).
+            if text.references.is_empty() && !choices.contains(&text.as_str()) {
+                ctx.push(
+                    Diagnostic::error(
+                        DiagnosticCode::UnknownVariant,
+                        value.span.clone(),
+                        format!(
+                            "{subject} is `{}`, which the provider does not accept",
+                            text.as_str()
+                        ),
+                    )
+                    .with_help(format!(
+                        "the accepted values are {}",
+                        crate::parse::reader::list(choices)
+                    )),
+                );
+            }
+        }
+        (FieldShape::Strings, PluginValue::Sequence(items)) => {
+            for item in items {
+                if !matches!(item.value, PluginValue::Text(_)) {
+                    ctx.error(
+                        DiagnosticCode::TypeMismatch,
+                        &item.span,
+                        format!(
+                            "{subject} takes an array of strings, and this entry is {}",
+                            describe_value(&item.value)
+                        ),
+                    );
+                }
+            }
+        }
+        (FieldShape::Object(nested), PluginValue::Mapping(_))
+        | (FieldShape::TextOrObject(nested), PluginValue::Mapping(_)) => {
+            object(ctx, subject, value, nested);
+        }
+        (FieldShape::TextOrObject(_), PluginValue::Text(_)) => {}
+        (shape, found) => {
+            ctx.error(
+                DiagnosticCode::TypeMismatch,
+                &value.span,
+                format!(
+                    "{subject} takes {}, found {}",
+                    shape.description(),
+                    describe_value(found)
+                ),
+            );
+        }
+    }
+}
+
+/// A nested config object: its required fields, and each field it declares.
+fn object(ctx: &mut Ctx, subject: &str, value: &Spanned<PluginValue>, shape: &ObjectShape) {
+    let PluginValue::Mapping(entries) = &value.value else {
+        return;
+    };
+    for required in shape.required {
+        if !entries
+            .iter()
+            .any(|entry| entry.key.value.as_str() == *required)
+        {
+            ctx.error(
+                DiagnosticCode::MissingKey,
+                &value.span,
+                format!("missing required key `{required}` in {subject}"),
+            );
+        }
+    }
+    for entry in entries {
+        let key = entry.key.value.as_str();
+        let Some(nested) = shape.field(key) else {
+            let names = shape.names();
+            ctx.push(
+                Diagnostic::error(
+                    DiagnosticCode::UnknownKey,
+                    entry.key.span.clone(),
+                    format!("`{key}` is not a key of {subject}"),
+                )
+                .with_help(format!("it takes {}", crate::parse::reader::list(&names))),
+            );
+            continue;
+        };
+        plugin(ctx, &format!("`{key}` of {subject}"), &entry.value, nested);
+    }
+}
+
+/// How a diagnostic names one config value it found.
+const fn describe_value(value: &PluginValue) -> &'static str {
+    match value {
+        PluginValue::Null => "null",
+        PluginValue::Bool(_) => "a boolean",
+        PluginValue::Int(_) => "an integer",
+        PluginValue::Float(_) => "a number",
+        PluginValue::Text(_) => "a string",
+        PluginValue::Sequence(_) => "a sequence",
+        PluginValue::Mapping(_) => "a mapping",
+    }
+}
+
+/// A route's members declare one server-tool suite (grammar 12.2,
+/// Decision D122).
+///
+/// **A warning, not an error.** Failover capability is per-chain-member by
+/// construction — each provider in a chain declares its own array — so a route
+/// whose members differ is a composition where which tools the model was offered
+/// depends on which member answered. That is a real thing to know and a legal
+/// thing to want (a fallback vendor that has no web search is still a fallback),
+/// so q30 makes it visible rather than refused.
+fn server_tool_suites(ctx: &mut Ctx, address: &str, route: &crate::ir::definition::RouteModel) {
+    let mut baseline: Option<(String, Vec<String>, Span)> = None;
+    for member in &route.route {
+        let Some((provider, definition)) = provider_of(ctx, &member.value) else {
+            continue;
+        };
+        let suite: Vec<String> = definition
+            .config
+            .server_tools
+            .iter()
+            .map(|tool| tool.type_name.value.clone())
+            .collect();
+        match &baseline {
+            None => baseline = Some((provider, suite, member.span.clone())),
+            Some((first, want, at)) => {
+                if *want == suite {
+                    continue;
+                }
+                ctx.push(
+                    Diagnostic::warning(
+                        DiagnosticCode::MismatchedServerTools,
+                        member.span.clone(),
+                        format!(
+                            "`{address}` fails over from `{first}` to `{provider}`, which \
+                             declares a different `server_tools:` suite: {}",
+                            difference(want, &suite)
+                        ),
+                    )
+                    .with_label(
+                        at.clone(),
+                        format!("`{first}` is the first member's provider"),
+                    )
+                    .with_help(
+                        "a server tool runs on the provider's side, so each member of a route \
+                         offers its own suite and which tools the model had depends on which \
+                         member served the call: declare the same suite on both providers, or \
+                         keep this one knowing the difference (grammar 12.2, Decision D122)",
+                    ),
+                );
+            }
+        }
+    }
+}
+
+/// What two suites disagree about, as one clause a reader can act on.
+fn difference(first: &[String], second: &[String]) -> String {
+    let missing: Vec<&String> = first.iter().filter(|tool| !second.contains(tool)).collect();
+    let extra: Vec<&String> = second.iter().filter(|tool| !first.contains(tool)).collect();
+    let mut clauses = Vec::new();
+    if !missing.is_empty() {
+        clauses.push(format!(
+            "it does not declare {}",
+            crate::parse::reader::list(&missing)
+        ));
+    }
+    if !extra.is_empty() {
+        clauses.push(format!(
+            "it declares {}",
+            crate::parse::reader::list(&extra)
+        ));
+    }
+    if clauses.is_empty() {
+        // Same tools, different order — which is a difference the wire can see,
+        // since the array reaches the request as written.
+        return "the same tools in a different order".to_string();
+    }
+    clauses.join(", and ")
+}
+
+/// The provider one direct `model.*` member resolves to.
+fn provider_of<'a>(ctx: &Ctx<'a>, model: &Address) -> Option<(String, &'a Provider)> {
+    let Some(Model::Direct(direct)) = ctx.model(model) else {
+        return None;
+    };
+    ctx.provider(&direct.provider.value)
+        .map(|provider| (direct.provider.value.to_string(), provider))
 }
 
 /// One `settings:` entry against the provider kind's published schema.
