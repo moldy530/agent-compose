@@ -2089,10 +2089,14 @@ async function callMessages(
   const maxTokens = settings["max_tokens"] ?? ANTHROPIC_MAX_TOKENS;
   delete settings["max_tokens"];
 
-  const messages = request.turns.map((turn) => {
-    if (turn.role === "user") return { role: "user", content: turn.text };
+  const messages: Record<string, unknown>[] = [];
+  for (const turn of request.turns) {
+    if (turn.role === "user") {
+      messages.push({ role: "user", content: turn.text });
+      continue;
+    }
     if (turn.role === "tool") {
-      return {
+      messages.push({
         role: "user",
         content: turn.results.map((result) => ({
           type: "tool_result",
@@ -2107,7 +2111,8 @@ async function callMessages(
           // be sending a field no successful call has.
           ...(result.isError === true ? { is_error: true } : {}),
         })),
-      };
+      });
+      continue;
     }
     // A turn *this* wire sent goes back exactly as it came — thinking blocks and
     // all, which the Messages API requires unaltered beside the `tool_use`
@@ -2117,15 +2122,39 @@ async function callMessages(
     // ([`ContentWire`]) — a route that fails over from a Responses member to an
     // Anthropic one replays its history across that seam.
     if (turn.blocks !== undefined && (turn.wire ?? "messages") === "messages") {
-      return { role: "assistant", content: [...turn.blocks] };
+      messages.push({ role: "assistant", content: [...turn.blocks] });
+      continue;
     }
     const content: unknown[] = [];
     if (turn.text !== undefined && turn.text !== "") content.push({ type: "text", text: turn.text });
     for (const call of turn.toolCalls ?? []) {
       content.push({ type: "tool_use", id: call.id, name: call.name, input: call.args });
     }
-    return { role: "assistant", content };
-  });
+    if (content.length === 0) {
+      // Nothing of that turn has a spelling on this wire, and
+      // `{"role": "assistant", "content": []}` is a message the Messages API
+      // refuses (`content: List should have at least 1 item`) — the very 400
+      // [`replayed`] exists to keep this runtime from sending. The turn is
+      // dropped rather than padded with a text block the model never wrote,
+      // which is what [`callChatCompletions`] does with the same situation.
+      //
+      // It is reachable off the **other** block-carrying wire and nowhere else:
+      // a Responses member can end a turn having only run a server tool — a
+      // `web_search_call` item and no `output_text`, which is also the shape an
+      // answer cut short by `max_output_tokens` takes — and a ladder that then
+      // falls to an Anthropic member arrives here with a turn whose whole
+      // content is items this surface has no vocabulary for. Those items are
+      // lost across the seam either way; what the guard decides is whether the
+      // loss is silent or is a provider 400 about the wrong request.
+      //
+      // Roles still alternate for the mock and the API alike (`WIRE-NOTES`
+      // (18)): a turn this empty carried no tool call, so the loop ended on it
+      // and it is the **last** turn — the request that drops it ends on the
+      // user turn before it.
+      continue;
+    }
+    messages.push({ role: "assistant", content });
+  }
 
   const offered = [...request.tools, ...(request.pinned === undefined ? [] : [request.pinned])];
   const body: Record<string, unknown> = {

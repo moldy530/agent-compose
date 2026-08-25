@@ -179,6 +179,19 @@ These are load-bearing and pinned by tests in `src/` and `tests/`:
   reduces to nothing under that reading; a compiled graph must stop on the empty
   answer instead, and this is the rule that says which of the two happened.
 
+  It has a **second** source since Decision D122, and the remedy there is the
+  opposite one. A turn a *Responses* member answered can be nothing but items
+  this surface has no vocabulary for — a `web_search_call` and no `output_text`,
+  which is what a turn that ran only the provider's search looks like and what
+  an answer cut short at `max_output_tokens` looks like too. The model did
+  answer, so the loop does not stop; but a ladder that then falls to an
+  Anthropic member has to *render* that turn for this wire (see (19)) and has
+  nothing to render it into. The runtime drops the turn rather than sending an
+  empty message or padding it with prose the model never wrote — which is what
+  it already does with the Chat Completions turn of (18) that reduces to
+  nothing. Roles still alternate: a turn that empty carried no tool call, so it
+  is the last one, and the request ends on the user turn before it.
+
 ---
 
 ## Assumed
