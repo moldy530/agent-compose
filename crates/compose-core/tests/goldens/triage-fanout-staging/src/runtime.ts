@@ -1439,6 +1439,10 @@ export type Turn =
        * answer and a replay must be the answer.
        */
       readonly blocks?: readonly unknown[];
+      /**
+       * Which wire's vocabulary [`blocks`] is written in (see [`ContentWire`]).
+       */
+      readonly wire?: ContentWire;
     }
   | {
       readonly role: "tool";
@@ -1466,6 +1470,29 @@ export type Turn =
       }[];
     };
 
+/**
+ * Which wire's vocabulary a replayed assistant turn's blocks are written in.
+ *
+ * Two surfaces send an answer as a list of objects and each takes back **its
+ * own** list: the Messages wire's `text`/`tool_use`/`thinking` blocks and the
+ * Responses wire's `message`/`function_call`/`reasoning`/`*_call` items are
+ * disjoint vocabularies, and either one sent to the other is a 400 naming a
+ * type that surface has never heard of. A route may cross the two — each member
+ * of a ladder speaks its own provider's wire (Decision D122) — so a turn one
+ * member answered can be replayed to another, and the reader has to be able to
+ * tell whether the blocks in hand are its own. Where they are not, the turn is
+ * rebuilt from the `text` and `toolCalls` read out of them, which is what every
+ * wire can render.
+ *
+ * **Absent is `"messages"`,** and that is load-bearing rather than terse: a
+ * `Turn` is part of a journaled model call's request identity ([`callModel`]),
+ * so a key written onto every Messages turn would re-key every journal recorded
+ * before this wire existed. The Messages wire was the only one that ever
+ * produced blocks, so leaving its turns untagged keeps those identities exactly
+ * as they were and `JOURNAL_VERSION` where it is (`docs/durability.md` §11.2).
+ */
+export type ContentWire = "messages" | "responses";
+
 /** What a model answered. */
 export interface ModelAnswer {
   readonly text: string | null;
@@ -1484,6 +1511,11 @@ export interface ModelAnswer {
    * Completions, whose answer is a message rather than a block list).
    */
   readonly content?: readonly unknown[];
+  /**
+   * Which wire wrote `content`, where that is not the Messages wire
+   * ([`ContentWire`]).
+   */
+  readonly wire?: ContentWire;
   /**
    * The reason the model gave for declining, on a surface that states one.
    *
@@ -2083,11 +2115,16 @@ async function callMessages(
         })),
       };
     }
-    // A turn the model sent goes back exactly as it came — thinking blocks and
+    // A turn *this* wire sent goes back exactly as it came — thinking blocks and
     // all, which the Messages API requires unaltered beside the `tool_use`
-    // blocks they preceded. Only a turn this runtime *composed* (the shared
-    // history channel of grammar 10.4) is rendered from its parts.
-    if (turn.blocks !== undefined) return { role: "assistant", content: [...turn.blocks] };
+    // blocks they preceded. Two turns are rendered from their parts instead: one
+    // this runtime *composed* (the shared history channel of grammar 10.4), and
+    // one another **wire** answered, whose items this surface has never heard of
+    // ([`ContentWire`]) — a route that fails over from a Responses member to an
+    // Anthropic one replays its history across that seam.
+    if (turn.blocks !== undefined && (turn.wire ?? "messages") === "messages") {
+      return { role: "assistant", content: [...turn.blocks] };
+    }
     const content: unknown[] = [];
     if (turn.text !== undefined && turn.text !== "") content.push({ type: "text", text: turn.text });
     for (const call of turn.toolCalls ?? []) {
@@ -2238,11 +2275,24 @@ async function callChatCompletions(
   }
 
   const body: Record<string, unknown> = { model: model.id, messages, ...model.settings };
-  if (request.tools.length > 0) {
-    body["tools"] = request.tools.map((tool) => ({
-      type: "function",
-      function: { name: tool.name, description: tool.description, parameters: tool.schema },
-    }));
+  // The agent's own tools first, then the provider's server tools — the same
+  // order the other two wires use, and pinned by the goldens for the same
+  // reason. The only kind that reaches here carrying a suite is
+  // `openai_compatible`: an `openai` provider that declares one speaks Responses
+  // instead ([`speaksResponses`]), and the remaining kinds are refused the key
+  // at compile time. A gateway's suite rides this array verbatim — no table
+  // could be authoritative about what a gateway honours, so the compiler warns
+  // and carries, and dropping it here would make that warning a lie
+  // (Decision D122).
+  const server = model.provider.serverTools ?? [];
+  if (request.tools.length > 0 || server.length > 0) {
+    body["tools"] = [
+      ...request.tools.map((tool) => ({
+        type: "function",
+        function: { name: tool.name, description: tool.description, parameters: tool.schema },
+      })),
+      ...server,
+    ];
   }
   if (request.pinned !== undefined) {
     // `response_format` rather than a forced function: the schema shapes the
@@ -2318,7 +2368,18 @@ async function callChatCompletions(
  *   which means a knob this wire does not have (`stop`, `seed`) reaches the
  *   service and is refused by it — visibly, in the run that declared it, rather
  *   than dropped here into a request that quietly did something else.
- *   `docs/topics/models.md` says so where an author meets the seam.
+ *   `docs/topics/models.md` says so where an author meets the seam, and
+ *   `agent-compose validate` refuses those two on a provider that speaks this
+ *   wire rather than leaving them to the 400.
+ * * **`store` is the service's, and its default here is `true`** where Chat
+ *   Completions' is `false` — so a connection moved onto this wire has its
+ *   prompts and completions retained by the provider where before they were
+ *   not. This request does not pin the key, and that is a decision rather than
+ *   an omission: `store: false` makes the service refuse a replayed `reasoning`
+ *   item, which is exactly what the loop above sends back on every turn of a
+ *   reasoning model, so pinning it would trade a documented retention default
+ *   for a broken tool loop. `docs/topics/models.md` says what moving wires
+ *   changes about retention, where an author can act on it.
  *
  * # What does not change
  *
@@ -2368,15 +2429,21 @@ async function callResponses(
       }
       continue;
     }
-    // An answer this surface produced goes back as it came. Everything the
+    // An answer **this** surface produced goes back as it came. Everything the
     // reading below does not read — a `reasoning` item, a `web_search_call`,
     // the annotations on an `output_text` — is in here and nowhere else.
-    if (turn.blocks !== undefined) {
+    //
+    // Blocks another wire wrote are not: the Messages wire's `text`/`tool_use`
+    // vocabulary is not an item type this surface has, and a ladder that failed
+    // over from an Anthropic member to this one replays exactly such a turn
+    // ([`ContentWire`]). Those are rebuilt below, from the reading — which is
+    // what the wire that produced them is *also* holding this turn to.
+    if (turn.blocks !== undefined && turn.wire === "responses") {
       input.push(...turn.blocks);
       continue;
     }
-    // The one turn this runtime composed rather than received: the shared
-    // history channel of grammar 10.4.
+    // The turns this runtime composed rather than received: the shared history
+    // channel of grammar 10.4, and an answer off another wire.
     const text = turn.text ?? "";
     if (text !== "") {
       input.push({
@@ -2474,6 +2541,9 @@ async function callResponses(
       request.pinned === undefined || text === null ? null : (JSON.parse(text) as unknown),
     stopReason,
     content: output,
+    // …and whose vocabulary those are, because a failover ladder may hand this
+    // turn to a member on another wire ([`ContentWire`]).
+    wire: "responses",
     refusal,
   };
 }
@@ -2842,7 +2912,9 @@ export async function callSubflowTool(
  *
  * Every loop answer is replayed by [`replayed`], which is where an answer that
  * carried nothing at all stops the node instead of becoming an empty turn the
- * next request could not legally carry.
+ * next request could not legally carry — and where the turn records which wire
+ * wrote it, so a ladder that fails over to a member on the *other* wire replays
+ * a turn that member can read ([`ContentWire`]).
  */
 export async function callAgent(
   agent: AgentBinding,
@@ -3123,6 +3195,11 @@ function replayed(agent: AgentBinding, answer: ModelAnswer): Turn {
     text: answer.text ?? "",
     ...(answer.toolCalls.length > 0 ? { toolCalls: answer.toolCalls } : {}),
     ...(blocks === undefined ? {} : { blocks }),
+    // Which wire's vocabulary those blocks are, where it is not the Messages
+    // one. Absent for a Messages answer on purpose — a key written there would
+    // re-key every journal recorded before the second wire existed
+    // ([`ContentWire`]).
+    ...(answer.wire === undefined ? {} : { wire: answer.wire }),
   };
 }
 

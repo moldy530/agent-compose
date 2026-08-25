@@ -68,6 +68,19 @@ provider.plain_openai:
   api_key: ${MOCK_API_KEY}
   base_url: ${MOCK_BASE_URL}
 
+# The third kind that takes the key, and the one whose entries are **all**
+# second-tier: no table could be authoritative about what a gateway honours, so
+# `validate` warns (`unknown-server-tool`) and the array rides this connection's
+# Chat Completions `tools` verbatim. Dropping it there would be the silent no-op
+# D50 refuses everywhere else — and would make the warning's own sentence a lie.
+provider.searching_gateway:
+  kind: openai_compatible
+  api_key: ${MOCK_API_KEY}
+  base_url: ${MOCK_BASE_URL}
+  server_tools:
+    - type: web_search
+      search_context_size: medium
+
 model.searching_claude:
   provider: provider.searching_anthropic
   id: claude-sonnet-4-6
@@ -84,9 +97,33 @@ model.plain_gpt:
   provider: provider.plain_openai
   id: gpt-4o-mini
 
+model.searching_local:
+  provider: provider.searching_gateway
+  id: qwen3-coder-30b
+
 model.crossing_wires:
   description: A route whose members answer on two different wires.
   route: [model.searching_gpt, model.plain_gpt]
+  route_on: [rate_limit]
+
+# The two ladders that cross the **block-carrying** wires, in both directions.
+#
+# `model.crossing_wires` above falls back onto Chat Completions, which rebuilds
+# every assistant turn from `text`/`toolCalls` and so cannot see the problem
+# these two are for: the Messages and Responses wires each answer with a list of
+# objects and each take back only their own vocabulary, so a ladder that replays
+# a conversation across the seam has to render the other wire's turn rather than
+# forward it. That is only observable once there *is* an assistant turn to
+# replay, which is why both agents below carry a client tool: the failover has
+# to happen on the loop's second call, not its first.
+model.responses_then_messages:
+  description: A route that answers on the Responses wire and falls back to the Messages one.
+  route: [model.searching_gpt, model.searching_claude]
+  route_on: [rate_limit]
+
+model.messages_then_responses:
+  description: The same seam, crossed in the other direction.
+  route: [model.searching_claude, model.searching_gpt]
   route_on: [rate_limit]
 
 tool.lookup:
@@ -177,6 +214,69 @@ agent.crosser:
       description: The answer, as text.
       type: string
 
+agent.responses_relayer:
+  # The Responses-wire twin of `agent.searcher`: no client tool, so a node is one
+  # model call and a frontier is observable between two of them. It is what makes
+  # crash-and-resume decidable on *this* wire rather than argued from the other.
+  description: Answers on the Responses wire, with no tool loop in the way.
+  model: model.searching_gpt
+  prompt: |
+    You are a researcher. Answer the question.
+  input:
+    question:
+      description: What to answer.
+      type: string
+  output:
+    answer:
+      description: The answer, as text.
+      type: string
+
+agent.gateway_searcher:
+  description: Answers through a gateway that runs a search of its own.
+  model: model.searching_local
+  prompt: |
+    You are a researcher. Answer the question.
+  input:
+    question:
+      description: What to answer.
+      type: string
+  output:
+    answer:
+      description: The answer, as text.
+      type: string
+
+agent.responses_then_messages_crosser:
+  description: Loops on the Responses wire and finishes on the Messages one.
+  model: model.responses_then_messages
+  prompt: |
+    You are a researcher. Look something up, then answer.
+  tools: [tool.lookup]
+  max_tool_iterations: 3
+  input:
+    question:
+      description: What to answer.
+      type: string
+  output:
+    answer:
+      description: The answer, as text.
+      type: string
+
+agent.messages_then_responses_crosser:
+  description: The same, starting on the Messages wire.
+  model: model.messages_then_responses
+  prompt: |
+    You are a researcher. Look something up, then answer.
+  tools: [tool.lookup]
+  max_tool_iterations: 3
+  input:
+    question:
+      description: What to answer.
+      type: string
+  output:
+    answer:
+      description: The answer, as text.
+      type: string
+
 flow.search:
   description: One agent whose provider searches the web for it.
   inputs:
@@ -249,6 +349,60 @@ flow.cross:
     - { from: start, to: ask }
     - { from: ask, to: end }
 
+flow.gateway:
+  description: One agent on a gateway whose suite rides Chat Completions.
+  inputs:
+    question:
+      type: string
+      min_length: 1
+  outputs:
+    answer:
+      type: string
+  nodes:
+    ask:
+      agent: agent.gateway_searcher
+      input:
+        question: "input.question"
+  edges:
+    - { from: start, to: ask }
+    - { from: ask, to: end }
+
+flow.cross_from_responses:
+  description: A tool loop that starts on the Responses wire and fails over to the Messages one.
+  inputs:
+    question:
+      type: string
+      min_length: 1
+  outputs:
+    answer:
+      type: string
+  nodes:
+    ask:
+      agent: agent.responses_then_messages_crosser
+      input:
+        question: "input.question"
+  edges:
+    - { from: start, to: ask }
+    - { from: ask, to: end }
+
+flow.cross_from_messages:
+  description: The same seam, crossed the other way.
+  inputs:
+    question:
+      type: string
+      min_length: 1
+  outputs:
+    answer:
+      type: string
+  nodes:
+    ask:
+      agent: agent.messages_then_responses_crosser
+      input:
+        question: "input.question"
+  edges:
+    - { from: start, to: ask }
+    - { from: ask, to: end }
+
 flow.relay:
   # Two model calls in a row on a provider that carries a server-tool suite —
   # the smallest shape a *frontier* is observable in. Kill the run while the
@@ -286,6 +440,43 @@ flow.relay:
     - { from: first, to: second }
     - { from: second, to: end }
 
+flow.relay_responses:
+  # The same shape on the **Responses** wire, so crash-and-resume is decided on
+  # both block-carrying surfaces rather than argued from one. It is the wire
+  # whose answer a journal now records the vocabulary of, and whose items — the
+  # `web_search_call`, the ids on every one of them — travel inside the recorded
+  # answer and therefore inside the next call's request identity
+  # (`docs/durability.md` §3.1, §11.1).
+  description: Two searching calls in a row on the Responses wire.
+  inputs:
+    question:
+      type: string
+      min_length: 1
+  outputs:
+    relayed:
+      type: string
+    final:
+      type: string
+  nodes:
+    first:
+      agent: agent.responses_relayer
+      input:
+        question: "input.question"
+      writes:
+        answer: relayed
+
+    second:
+      agent: agent.responses_relayer
+      input:
+        question: "state.relayed"
+      writes:
+        answer: final
+
+  edges:
+    - { from: start, to: first }
+    - { from: first, to: second }
+    - { from: second, to: end }
+
 triggers:
   search:
     type: manual
@@ -296,9 +487,21 @@ triggers:
   relay:
     type: manual
     flow: flow.relay
+  relay_responses:
+    type: manual
+    flow: flow.relay_responses
   respond:
     type: manual
     flow: flow.respond
   cross:
     type: manual
     flow: flow.cross
+  gateway:
+    type: manual
+    flow: flow.gateway
+  cross_from_responses:
+    type: manual
+    flow: flow.cross_from_responses
+  cross_from_messages:
+    type: manual
+    flow: flow.cross_from_messages
