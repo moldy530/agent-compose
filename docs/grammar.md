@@ -3494,7 +3494,10 @@ provider.anthropic:
 Each entry MUST carry a string `type`, which is the key the provider's
 vocabulary is looked up under and is never interpolated. Every other key is the
 provider's, travels verbatim, and is grammar 4.3 class 2 — non-secret provider
-config, so its string values MAY interpolate.
+config, so its string values MAY interpolate. A key the curated table below
+types as anything but a string is read at compile time and takes a literal: an
+`${ENV}` there is a `type-mismatch` naming the rule, since interpolation
+produces a string and the wire is given the value.
 
 **The array a request carries is one namespace.** A suite is appended to the
 `tools` of every request the connection serves, beside the agent's own tools, and
