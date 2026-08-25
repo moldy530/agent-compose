@@ -3496,6 +3496,18 @@ vocabulary is looked up under and is never interpolated. Every other key is the
 provider's, travels verbatim, and is grammar 4.3 class 2 — non-secret provider
 config, so its string values MAY interpolate.
 
+**The array a request carries is one namespace.** A suite is appended to the
+`tools` of every request the connection serves, beside the agent's own tools, and
+the provider surfaces refuse a request offering two tools under one name. So two
+entries that reach the wire as one tool, and a server tool whose name an agent's
+attached or synthesized tool already takes, are a compile error
+(`tool-name-collision`) — §11.5's rule and §11.5's reason, reached from the
+connection's side. On the Messages wire the name is the one the table pairs with
+each dated `type`, which is what makes `code_execution_20250522` beside
+`code_execution_20250825` two types with one name; the agent-side half is stated
+over that wire alone, since a Responses built-in is addressed by its `type` and a
+function tool by its `name`, two keys that cannot collide.
+
 The checking is **two-tier**, and the constraint behind it is that a server tool
 a vendor ships tomorrow must be usable the day it ships:
 
@@ -6386,7 +6398,22 @@ provider — providers are cheap. Failover capability is therefore per-chain-mem
 by construction, so `validate` **warns** when a route's members declare differing
 suites: which tools were on offer depends on which member answered, and that is
 a legal thing to want (a fallback vendor that has no web search is still a
-fallback) as well as a real thing to know. *PRD 5.9, resolved q30.*
+fallback) as well as a real thing to know.
+
+**One name, one tool — §11.5's rule, reached from the connection.** The suite is
+appended to the same `tools` array the agent's own tools land in, and the
+provider surfaces refuse a request offering two tools under one name, so
+`tool-name-collision` is an **error** on two more pairs: two entries of one suite
+that reach the wire as one tool, and a server tool whose name an attached
+`tool.*`/`flow.*` or a synthesized store tool already takes on an agent whose
+model reaches that provider. The first is what the Messages wire's canonical
+`name:` pinning makes decidable — both dated `code_execution_*` revisions *are*
+`code_execution`, so the strict tier checking each entry in isolation would let
+the pair through to a 400 with no span, which is the failure that pinning exists
+to prevent. The second is stated over the Messages wire alone: it is the wire
+where a server tool and a client tool sit under one key, a Responses built-in is
+addressed by its `type` while a function tool carries a `name`, and no table
+could say what a gateway keys its vocabulary on. *PRD 5.9, resolved q30.*
 
 ---
 

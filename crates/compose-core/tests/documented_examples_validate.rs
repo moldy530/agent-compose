@@ -477,6 +477,7 @@ const TOPICS_THAT_TRIGGER_A_CODE: &[(&str, &str)] = &[
     ("models", "unknown-server-tool"),
     ("models", "unknown-server-tool-field"),
     ("models", "unknown-key"),
+    ("models", "tool-name-collision"),
 ];
 
 /// A topic's `yaml triggers <code>` block reports the code it names.

@@ -321,6 +321,19 @@ const GRAMMAR: &[Check] = &[
         evidence: Evidence::Fixture,
     },
     Check {
+        // §11.5's collision rule reached from the connection's side, which is
+        // why the citation carries both sections: the *reason* is §11.5's
+        // verbatim ("the model is offered two different things under one name")
+        // and the array the names share is §12.1's, since a suite is appended
+        // to the `tools` of every request the provider serves. Two sites,
+        // because a suite collides with itself in one provider definition and
+        // with a client tool only once an agent's model reaches that provider.
+        rule: "a `server_tools:` suite offers each name once, and none an agent's own tools take (12.1, 11.5, D122)",
+        pass: "check/providers.rs, check/bindings.rs",
+        codes: &["tool-name-collision"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
         rule: "a `method: GET` trigger does not read through `payload.body` (13.3, D117)",
         pass: "check/triggers.rs",
         codes: &["invalid-expression"],

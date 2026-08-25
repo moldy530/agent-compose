@@ -166,6 +166,30 @@ the rest of a provider's non-secret config — may embed `${ENV}` references.
 that provider holds it; to give one agent a search and not another, define a
 second provider. Providers are cheap.
 
+**One name, one tool.** The suite lands in the same `tools` array as the agent's
+own, and the provider surfaces refuse a request offering two tools under one
+name — so a name spent twice is `tool-name-collision`, the same code and the same
+reason as two colliding client tools (grammar 11.5). Two ways to spend one:
+
+```yaml triggers tool-name-collision
+version: "0.1"
+
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+  server_tools:
+    - type: code_execution_20250522
+      name: code_execution
+    - type: code_execution_20250825
+      name: code_execution
+```
+
+Both dated revisions are `code_execution` — that is what the Messages wire pairs
+with either `type:` — so one of the two goes. The other way is an attachment: an
+`agent.*` holding `tool.web_search` whose model reaches a provider declaring
+`web_search_20250305` offers `web_search` twice, and the fix is to rename the
+attachment or to move the suite onto a provider that agent does not use.
+
 ### Two tiers of checking, and why
 
 The compiler keeps a curated table of the server tools each kind is known to

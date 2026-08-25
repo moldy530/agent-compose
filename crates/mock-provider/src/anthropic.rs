@@ -304,11 +304,26 @@ fn check_tools(checker: &mut Checker, body: &Map<String, Value>) -> Tools {
         // shape, and this server cannot know which are legal for a dated type it
         // may predate — so the entry is recorded and carried, and only the one
         // thing every tool entry needs is required: a `name`. `WIRE-NOTES` (22).
+        //
+        // That name goes into the same `seen` set a client tool's does, because
+        // the array is one namespace: the API refuses a request offering two
+        // tools under one name whichever side runs them, and a server that let
+        // `code_execution_20250522` sit beside `code_execution_20250825` would
+        // accept the one request the compiler's canonical-name pinning exists
+        // to stop (grammar 12.1, `check::providers`'s `suite_collisions`).
         if let Some(kind) = tool.get("type").and_then(Value::as_str)
             && kind != "custom"
         {
             server.push(kind.to_string());
-            let _ = checker.required_string(&pointer, tool, "name");
+            if let Some(name) = checker.required_string(&pointer, tool, "name") {
+                let name = name.to_string();
+                if !seen.insert(name.clone()) {
+                    checker.fail(
+                        &at(&pointer, "name"),
+                        format!("tools: Duplicate tool name `{name}`."),
+                    );
+                }
+            }
             continue;
         }
         checker.closed(
