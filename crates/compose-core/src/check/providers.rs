@@ -474,11 +474,40 @@ fn plugin(ctx: &mut Ctx, subject: &str, value: &Spanned<PluginValue>, shape: Fie
         (FieldShape::Boolean, PluginValue::Bool(_)) => {}
         (FieldShape::Text, PluginValue::Text(_)) => {}
         (FieldShape::Choice(choices), PluginValue::Text(text)) => {
-            // A value that embeds an `${ENV}` reference is not decided here:
-            // what it says is whatever the process is started with, and the
-            // whole point of grammar 4.3 class 2 is that the compiler does not
-            // read it (PRD 5.9).
-            if text.references.is_empty() && !choices.contains(&text.as_str()) {
+            if !text.references.is_empty() {
+                // A **knob** that embeds an `${ENV}` reference is not decided
+                // here: what it says is whatever the process is started with,
+                // and the whole point of grammar 4.3 class 2 is that the
+                // compiler does not read it (PRD 5.9). `search_context_size:
+                // ${SEARCH_DEPTH}` is a staging deployment searching shallowly,
+                // and refusing it would be refusing the class.
+                //
+                // A **pin** is the one closed set where that reasoning inverts,
+                // because the set has one member: the value is the table's,
+                // decided by the entry's own `type:`, and an `${ENV}` is
+                // redundant where the process holds that constant and a refused
+                // request everywhere else. See `FieldShape::pinned`.
+                if let Some(only) = shape.pinned() {
+                    ctx.push(
+                        Diagnostic::error(
+                            DiagnosticCode::UnexpectedEnvRef,
+                            value.span.clone(),
+                            format!(
+                                "{subject} is `{}`, and this field takes one value: `{only}`",
+                                text.as_str()
+                            ),
+                        )
+                        .with_help(format!(
+                            "the wire decides this key from the entry's `type:` and refuses a \
+                             request that spells it otherwise, so it is read at compile time \
+                             rather than at process start: write `{only}` (grammar 12.1, 4.3, \
+                             Decision D122)"
+                        )),
+                    );
+                }
+                return;
+            }
+            if !choices.contains(&text.as_str()) {
                 ctx.push(
                     Diagnostic::error(
                         DiagnosticCode::UnknownVariant,
@@ -1305,6 +1334,129 @@ provider.g:
                 "tool-name-collision",
                 "unknown-server-tool"
             ]
+        );
+    }
+
+    /// A closed set of **more than one** is a deployment knob, and interpolates
+    /// like every other class 2 provider string (grammar 12.1, 4.3).
+    ///
+    /// The value is a string either way — `FieldShape::description` says so of
+    /// `Choice` and `Text` alike — so nothing here is read at compile time
+    /// except when the compiler can see what was written. A staging deployment
+    /// that searches shallowly and a production one that does not is the whole
+    /// of why class 2 exists, and refusing this would be refusing the class.
+    ///
+    /// Held against the published schema by
+    /// `tests/schema_conformance.rs`'s
+    /// `the_published_schema_interpolates_a_closed_set_the_table_does_not_pin`,
+    /// which is the other authority an author's editor consults: the two
+    /// disagreeing means a red squiggle on YAML that validates.
+    #[test]
+    fn a_closed_set_of_several_values_is_a_knob_a_deployment_may_turn() {
+        assert_eq!(
+            codes(
+                r#"
+provider.o:
+  kind: openai
+  api_key: ${K}
+  server_tools:
+    - type: web_search
+      search_context_size: ${SEARCH_DEPTH}
+    - type: image_generation
+      quality: ${IMAGE_QUALITY}
+"#
+            ),
+            Vec::<String>::new(),
+            "what the process is started with is not the compiler's to read (PRD 5.9)"
+        );
+        // …and the set is still closed for a value the compiler *can* read.
+        assert_eq!(
+            codes(
+                r#"
+provider.o:
+  kind: openai
+  api_key: ${K}
+  server_tools:
+    - type: web_search
+      search_context_size: medum
+"#
+            ),
+            ["unknown-variant"]
+        );
+    }
+
+    /// A closed set of **one** is a pin rather than a knob, and inverts every
+    /// clause of the test above (`FieldShape::pinned`).
+    ///
+    /// The only legal value is a constant the curated table already holds,
+    /// decided by the entry's own `type:` — so a reference here is redundant
+    /// where the process happens to hold that constant and a 400 everywhere
+    /// else, which is exactly the failure the pin was added to move to compile
+    /// time. Skipping it because the value carries an `${ENV}` is that pin not
+    /// holding, on either of the two wires that has one and at either depth.
+    #[test]
+    fn a_closed_set_of_one_value_is_decided_by_the_table_and_not_the_environment() {
+        assert_eq!(
+            codes(
+                r#"
+provider.a:
+  kind: anthropic
+  api_key: ${K}
+  server_tools:
+    - type: web_search_20250305
+      name: ${WS_NAME}
+"#
+            ),
+            ["unexpected-env-ref"]
+        );
+        // Nested, one level down: `user_location:` is an `approximate` one, and
+        // the row's own `cache_control:` is `ephemeral`.
+        assert_eq!(
+            codes(
+                r#"
+provider.a:
+  kind: anthropic
+  api_key: ${K}
+  server_tools:
+    - type: web_search_20250305
+      name: web_search
+      user_location:
+        type: ${LOCATION_KIND}
+      cache_control:
+        type: ${CACHE_KIND}
+"#
+            ),
+            ["unexpected-env-ref", "unexpected-env-ref"]
+        );
+        // And on the Responses wire, whose `container:` is written both ways —
+        // a container id interpolates, the object form's `type:` does not.
+        assert_eq!(
+            codes(
+                r#"
+provider.o:
+  kind: openai
+  api_key: ${K}
+  server_tools:
+    - type: code_interpreter
+      container: ${CONTAINER_ID}
+"#
+            ),
+            Vec::<String>::new(),
+            "`container:` in its string form is a class 2 value like any other"
+        );
+        assert_eq!(
+            codes(
+                r#"
+provider.o:
+  kind: openai
+  api_key: ${K}
+  server_tools:
+    - type: code_interpreter
+      container:
+        type: ${CONTAINER_KIND}
+"#
+            ),
+            ["unexpected-env-ref"]
         );
     }
 

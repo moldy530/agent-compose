@@ -826,13 +826,52 @@ fn same_field(subject: &str, node: &Value, shape: compose_core::ast::server_tool
                 "{subject} is an interpolable string"
             );
         }
+        // A closed set, published in one of two shapes — and which of the two
+        // is the whole of what the compiler does with an `${ENV}` written here.
+        //
+        // A **pin** (one member) is a bare `const`/`enum`: the value is decided
+        // by the entry's own `type:`, so a reference there is refused rather
+        // than carried (`unexpected-env-ref`) and the schema must not offer an
+        // arm for one. A **knob** (more than one) is class 2 like every other
+        // provider string, so the compiler leaves an interpolated value
+        // undecided — and a schema that published only the `enum` would put a
+        // red squiggle on YAML `validate` accepts, which is the asymmetry this
+        // whole file exists to refuse (see the module header).
         FieldShape::Choice(choices) => {
-            let published = variants(node)
-                .unwrap_or_else(|| panic!("{subject} is a closed set of strings in the schema"));
             let tabled: BTreeSet<String> = choices.iter().map(|name| (*name).to_string()).collect();
+            if shape.pinned().is_some() {
+                let published = variants(node).unwrap_or_else(|| {
+                    panic!("{subject} is a closed set of one string in the schema")
+                });
+                assert_eq!(
+                    published, tabled,
+                    "{subject} and the compiler's table disagree about the accepted values"
+                );
+                assert_eq!(
+                    node["anyOf"],
+                    Value::Null,
+                    "{subject} is pinned to one value the compiler reads at compile time, so \
+                     the schema must not offer an interpolation arm the compiler would refuse"
+                );
+                return;
+            }
+            let arms = node["anyOf"].as_array().unwrap_or_else(|| {
+                panic!("{subject} is a closed set of strings **or** an `${{ENV}}` reference")
+            });
+            let published = arms
+                .iter()
+                .find_map(variants)
+                .unwrap_or_else(|| panic!("{subject} publishes the closed set as one arm"));
             assert_eq!(
                 published, tabled,
                 "{subject} and the compiler's table disagree about the accepted values"
+            );
+            assert!(
+                arms.iter()
+                    .any(|arm| arm["$ref"] == json!("#/$defs/envRefString")),
+                "{subject} is interpolable, like every other class 2 provider string: \
+                 `validate` does not decide a value carrying an `${{ENV}}` reference, and the \
+                 schema must not either"
             );
         }
         FieldShape::Strings => {
@@ -1101,5 +1140,106 @@ fn the_published_schema_checks_a_known_server_tool_and_carries_an_unknown_one() 
     assert!(
         !validation_errors(&validator, &bad_fidelity).is_empty(),
         "a tabled field's closed set is still closed"
+    );
+}
+
+/// A closed set and an `${ENV}` reference: the one place the two authorities
+/// could disagree about the same key and each look right on its own.
+///
+/// `server_tools:` is provider config, so grammar 4.3 class 2 promises its
+/// **string** values interpolate, and a closed set of strings is a string.
+/// `agent-compose validate` therefore leaves `search_context_size:
+/// ${SEARCH_DEPTH}` undecided — a staging deployment searching shallowly is a
+/// legal thing to want — and a schema publishing only the `enum` would put a red
+/// squiggle on YAML the compiler accepts and CI passes. That asymmetry is what
+/// this file exists to refuse (see the module header).
+///
+/// The **pin** is the other half of the same sentence and inverts every clause:
+/// a set of one is not a knob, its value is decided by the entry's own `type:`,
+/// and the compiler refuses a reference there (`unexpected-env-ref`,
+/// `check::providers`'s `plugin`). So the schema must refuse it too, or the
+/// squiggle goes missing on the one field whose whole purpose is to catch a
+/// copied-and-edited config before the wire answers 400.
+///
+/// `same_field` holds the *shapes* to the table; this holds what the shapes buy
+/// an author, which is the thing a reader of a bug report has in hand.
+#[test]
+fn the_published_schema_interpolates_a_closed_set_the_table_does_not_pin() {
+    let validator = compile_schema();
+    let with = |tool: Value| {
+        json!({
+            "version": "0.1",
+            "provider.p": {
+                "kind": "openai",
+                "api_key": "${OPENAI_API_KEY}",
+                "server_tools": [tool],
+            },
+        })
+    };
+
+    for (key, reference) in [
+        ("search_context_size", "${SEARCH_DEPTH}"),
+        ("quality", "${IMAGE_QUALITY}"),
+        // Embedded rather than whole, which is the shape class 2 states.
+        ("output_format", "${IMAGE_FORMAT}"),
+    ] {
+        let tool = if key == "search_context_size" {
+            json!({ "type": "web_search", key: reference })
+        } else {
+            json!({ "type": "image_generation", key: reference })
+        };
+        let errors = validation_errors(&validator, &with(tool));
+        assert!(
+            errors.is_empty(),
+            "`{key}: {reference}` is a class 2 provider value `agent-compose validate` \
+             accepts, so the editor must not squiggle it:\n{}",
+            errors.join("\n")
+        );
+    }
+
+    // …and the set is still closed for everything that is not a reference: a
+    // typo does not buy itself an exemption by looking like one.
+    for spelling in ["medum", "$${SEARCH_DEPTH}", "${lowercase}", "${UNCLOSED"] {
+        assert!(
+            !validation_errors(
+                &validator,
+                &with(json!({ "type": "web_search", "search_context_size": spelling })),
+            )
+            .is_empty(),
+            "`search_context_size: {spelling}` reaches the wire as written and the service \
+             refuses it, so both authorities must"
+        );
+    }
+
+    // The pin, on the wire that has one. Both spellings the compiler refuses.
+    let anthropic = |name: &str| {
+        json!({
+            "version": "0.1",
+            "provider.p": {
+                "kind": "anthropic",
+                "api_key": "${ANTHROPIC_API_KEY}",
+                "server_tools": [{ "type": "web_search_20250305", "name": name }],
+            },
+        })
+    };
+    assert!(
+        !validation_errors(&validator, &anthropic("${WS_NAME}")).is_empty(),
+        "a pinned `name:` is decided by the `type:` rather than by the environment"
+    );
+    let nested = json!({
+        "version": "0.1",
+        "provider.p": {
+            "kind": "anthropic",
+            "api_key": "${ANTHROPIC_API_KEY}",
+            "server_tools": [{
+                "type": "web_search_20250305",
+                "name": "web_search",
+                "user_location": { "type": "${LOCATION_KIND}" },
+            }],
+        },
+    });
+    assert!(
+        !validation_errors(&validator, &nested).is_empty(),
+        "…and so is a nested object's pinned `type:`"
     );
 }

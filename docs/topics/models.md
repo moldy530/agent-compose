@@ -167,6 +167,17 @@ nothing to read, and interpolation produces a string, which is not what
 `max_uses:` carries to the wire. `max_uses: ${SEARCH_BUDGET}` is therefore a
 `type-mismatch` whose help says so.
 
+One kind of string does not interpolate either, for the same reason read the
+other way round: a field the table pins to a **single** value. The Messages
+wire's `name:` is the one you will meet, and a nested object's `type:` — the
+`approximate` of a `user_location:`, the `ephemeral` of a `cache_control:` — is
+the same shape. That value is decided by the entry's own `type:` and the service
+refuses a request that spells it otherwise, so `name: ${WEB_SEARCH_NAME}` is an
+`unexpected-env-ref` naming the one value the field takes rather than a knob read
+at process start. A closed set of *several* values is an ordinary interpolable
+string: `search_context_size: ${SEARCH_DEPTH}` is a staging deployment searching
+shallowly, and validates.
+
 **The suite belongs to the connection.** Every agent whose model resolves to
 that provider holds it; to give one agent a search and not another, define a
 second provider. Providers are cheap.

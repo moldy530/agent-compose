@@ -3497,7 +3497,14 @@ provider's, travels verbatim, and is grammar 4.3 class 2 — non-secret provider
 config, so its string values MAY interpolate. A key the curated table below
 types as anything but a string is read at compile time and takes a literal: an
 `${ENV}` there is a `type-mismatch` naming the rule, since interpolation
-produces a string and the wire is given the value.
+produces a string and the wire is given the value. A key the table pins to a
+**single** value — the Messages wire's `name:`, and a nested object's `type:`
+(`user_location:`'s `approximate`, `cache_control:`'s `ephemeral`,
+`container:`'s `auto`) — takes that value: it is decided by the entry's own
+`type:` and the service refuses any other spelling, so an `${ENV}` there is
+`unexpected-env-ref` rather than a value read at process start. A closed set of
+*several* values is an ordinary class 2 string and interpolates
+(`search_context_size: ${SEARCH_DEPTH}`).
 
 **The array a request carries is one namespace.** A suite is appended to the
 `tools` of every request the connection serves, beside the agent's own tools, and
