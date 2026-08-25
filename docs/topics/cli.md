@@ -25,8 +25,18 @@ agent-compose skill [--agent <name>] [--global]
 
 Parses the entrypoint, follows its `imports:`, resolves every name, and runs
 every static check. This is the loop — run it after every edit. Human output
-goes to **stderr**; `--format json` writes `{"diagnostics": [ … ]}` to stdout,
-one shape whatever the outcome.
+goes to **stderr**; `--format json` writes
+`{"diagnostics": [ … ], "warnings": [ … ]}` to stdout, one shape whatever the
+outcome — both keys always present, and a clean run is two empty arrays.
+
+**The split is the verdict.** `diagnostics` holds what *refuses* the
+composition and `warnings` holds what does not, so "is `diagnostics` empty" and
+"did this exit `0`" are one question rather than two, and no consumer has to
+filter on `severity` to answer it. A composition reported with nothing but
+warnings is one this compiler **accepts**: the verdict line says it is valid and
+counts them, the exit code is `0`, and `build`, `run` and `serve` go ahead. A CI
+step that wants a warning to fail its build reads the `warnings` array and
+decides for itself.
 
 When it reported anything, the human output ends with one line pointing at
 `explain`, once per run rather than once per diagnostic. So does every other
@@ -52,21 +62,37 @@ a consumer pins `plan_version` on.
 
 ## `build`
 
-Validates first and emits **only on a clean report** — a warning included.
-Generated code is a build artifact of a valid composition; a project emitted
-from a broken one would report the same problem later as a `tsc` error with no
-span.
+Validates first, and an **error** refuses the emission: generated code is a
+build artifact of a valid composition, and a project emitted from a broken one
+would report the same problem later as a `tsc` error with no span.
 
-A clean report is then asked a second question `validate` never asks: whether
-*this target* can express the composition. `pattern:` is RE2 and RE2 is not a
-subset of ECMAScript, so a composition can be valid and have no TypeScript
-project.
+A **warning** does not refuse it. The files are written, the exit code is `0`,
+and the warnings are printed above a verdict that counts them:
+
+```
+warning: wrote 16 files to `build/local` (target `local`), with 1 warning
+```
+
+That is the whole of what the severity means, and `unknown-server-tool` is the
+code that makes it load-bearing: a provider declaring a server tool this release
+predates is a composition the compiler cannot fully check and does not refuse —
+it builds, it runs, and the warning names what could not be verified.
+
+An accepted composition is then asked a second question `validate` never asks:
+whether *this target* can express it. `pattern:` is RE2 and RE2 is not a subset
+of ECMAScript, so a composition can be valid and have no TypeScript project.
 
 `--out` defaults to `<project>/build/<target>`. `--check` writes nothing and
 reports whether the directory already matches the spec — that is the CI step,
 and it exits `1` on drift. `build` replaces and removes only files carrying its
 own generated-file header, so a directory holding somebody else's TypeScript is
 refused rather than overwritten.
+
+`build --format json` writes `validate`'s two keys and a third:
+`{"diagnostics": [ … ], "warnings": [ … ], "drift": [ … ]}`, where `drift` names
+the files that do not match. All three are always present, so a clean build is
+three empty arrays and a `--check` that found something is the same document
+with the last one populated.
 
 ## `run`
 
@@ -183,8 +209,8 @@ dropped would leave you believing something had been installed under `$HOME`.
 
 | code | meaning |
 |---|---|
-| `0` | clean: nothing was reported, or a `plan` was produced, or a document was printed |
-| `1` | diagnostics were reported, `build --check` found drift, a `run` produced no answer, a `resume` diverged from its journal, a `plan`'s spec did not resolve, or a discovery verb found something already there and would not replace it |
+| `0` | clean: nothing was reported, or nothing but **warnings** was, or a `plan` was produced, or a document was printed |
+| `1` | **errors** were reported, `build --check` found drift, a `run` produced no answer, a `resume` diverged from its journal, a `plan`'s spec did not resolve, or a discovery verb found something already there and would not replace it |
 | `2` | the command could not run: bad usage, an unreadable entrypoint, an unwritable output directory, a missing or malformed environment variable, an uninstalled dependency set, no JavaScript runtime to launch, or a `resume` naming an execution the journal does not hold open |
 | `3` | a `run` or `resume` with nobody to ask stopped at a `human` pause |
 
