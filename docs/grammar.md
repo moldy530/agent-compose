@@ -3500,8 +3500,12 @@ The checking is **two-tier**, and the constraint behind it is that a server tool
 a vendor ships tomorrow must be usable the day it ships:
 
 - a `type` in the compiler's **curated table** for that kind is validated
-  strictly — a field the tool does not have, a mistyped one, or a constraint
-  violation is an error naming the repair;
+  strictly — a field the tool does not have, a mistyped one, a constraint
+  violation, or a value outside a closed set is an error naming the repair. On
+  the Messages wire that closed set includes the required `name`, which the API
+  pairs with each dated `type` and refuses a request that spells otherwise:
+  `web_search_20250305` is `web_search`, `web_fetch_20250910` is `web_fetch`,
+  and either `code_execution_*` is `code_execution`;
 - a `type` outside it is a **warning** (`unknown-server-tool`) naming exactly
   what could not be verified, and the entry then travels to the wire as written.
   The composition still builds and still runs.
@@ -3510,6 +3514,15 @@ The key is legal on the three kinds whose rows name it and is an error
 (`unsupported-server-tools`) on `azure_openai`, `bedrock` and `vertex`, whose
 wires this release has not been taught to carry it on. On `openai_compatible`
 every entry is second-tier: a gateway may honour any vocabulary at all.
+
+**The key can move the connection's wire, and §12.2's settings row moves with
+it.** An `openai` provider that declares `server_tools:` speaks the Responses
+API for all of its calls (D122), and two of §12.2's published `settings:` keys
+have no equivalent there: `stop:` and `seed:` are Chat Completions'. A model
+bound to such a provider that declares either is a compile error
+(`unknown-key`) naming the wire, rather than a request the service refuses on
+the first call — the same reasoning as the strict tier above. Both keys stay
+legal on an `openai` provider that declares no suite.
 
 **A suite belongs to a connection**, so every agent whose model resolves to that
 provider holds it; scoping a suite to one agent is done by defining a second
@@ -6331,6 +6344,19 @@ second-tier — a gateway may honour any vocabulary, and refusing would recreate
 the treadmill — and rides its Chat Completions `tools` array. `azure_openai`,
 `bedrock` and `vertex` refuse it outright rather than dropping it silently
 (D50).
+
+**Moving the wire moves what that wire has.** Two of §12.2's `settings:` keys
+are Chat Completions' and have no Responses spelling — `stop:` and `seed:` — so
+declaring a suite makes them a compile error on the models that connection
+serves rather than a 400 on the first call. Two others change spelling and the
+runtime translates them (`max_tokens` → `max_output_tokens`, `reasoning_effort`
+→ `reasoning: { effort }`). One thing changes that the compiler does not decide:
+the Responses API's service-side default for `store` is `true` where Chat
+Completions' is `false`, so the provider retains prompts and completions for a
+connection that has moved. The emitted request does not pin the key, because
+`store: false` makes the service refuse a replayed `reasoning` item and a tool
+loop replays every turn; `docs/topics/models.md` says so where an author meets
+the seam.
 
 **A suite belongs to a connection.** Every agent whose model resolves to that
 provider holds it, and scoping a suite to one agent is done by defining a second

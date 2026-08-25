@@ -267,6 +267,23 @@ suite, which is what keeps every composition that predates it deriving the
 identity it already derived: a journal written by an earlier build still
 replays, and `JOURNAL_VERSION` does not move for it (§11.2).
 
+**The conversation carries which wire wrote it**, on a turn that came off one
+of the two surfaces that answer with a list of objects. The Messages and
+Responses vocabularies are disjoint, and a failover ladder may cross them, so an
+assistant turn records the wire that produced its blocks and each surface
+replays only its own — rendering the other's turn from the same reading it
+renders its own composed turns from. This is in the identity because it is in
+the conversation, and it is written **only** for a Responses turn: the Messages
+wire was the only surface that ever produced blocks, so leaving its turns
+untagged keeps every identity an earlier build derived, on the same terms as the
+paragraph above (§11.2).
+
+Nothing else about the Responses wire is in the identity. The runtime sends no
+`previous_response_id` and holds no continuity token, so what a resumed
+generation replays is the recorded answer's own items — ids and all, which is
+why it derives the same identity only by going on with the *kept* answer rather
+than a re-reading of it (§11.1).
+
 ### 3.2 A tool execution
 
 One record per `exec:`, `http:` or `function:` invocation, at either of the two

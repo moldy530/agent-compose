@@ -657,8 +657,23 @@ that Chat Completions takes and the Responses API does not, so a provider that
 speaks this wire and declares one has declared a knob nothing will read. The
 closed `REQUEST_KEYS` list refuses the request, which is the intended failure
 mode (see *Accepted-key lists*): the alternative is a run whose declared `stop`
-sequence silently never applies. `docs/topics/models.md` says so where an author
-meets the seam.
+sequence silently never applies.
+
+A composition should never get this far, and since Decision D122's fork is the
+**compiler's** own — `kind: openai` plus a non-empty `server_tools:` is what
+decides the wire, not the endpoint — `agent-compose validate` refuses those two
+settings on such a provider with an `unknown-key` naming the wire. This route's
+refusal is therefore the second line rather than the first: what it now catches
+is a *codegen* bug that sent one anyway. `docs/topics/models.md` says so where an
+author meets the seam.
+
+**`store` is accepted and has no default here.** The real service defaults it to
+`true` on this route and to `false` on Chat Completions, and the emitted runtime
+pins neither, so no request this server sees carries the key and nothing here
+stands in for the difference. It is listed in `REQUEST_KEYS` because a
+composition that one day pins it must not be refused, and the retention
+consequence of moving wires is an author-facing fact rather than a wire shape —
+`docs/topics/models.md` carries it.
 
 ### 20. `max_tokens` is `max_output_tokens` here, and the mock will not translate
 
@@ -707,6 +722,14 @@ checks is what it can decide from one request: the Messages wire requires the
 `name:` every tool entry there carries, and both wires refuse a **scripted** use
 of a server tool the request did not declare — a provider runs only the tools it
 was given.
+
+The Messages `name:` is a *presence* check here and deliberately not a value
+one, and the two tiers are why: this server cannot know which name the real API
+pairs with a dated type it may predate, while the **compiler** can for the types
+in its curated table, and does — `web_search_20250305` must be named
+`web_search` (grammar 12.1). A wrong name is therefore an
+`agent-compose validate` error rather than something this route catches, which
+is the right place for it: the run never happens.
 
 The answer side is the mirror. A scripted `server_tools` entry becomes, on the
 Messages wire, a `server_tool_use` block and the `<name>_tool_result` that
