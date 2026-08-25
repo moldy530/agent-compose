@@ -973,6 +973,31 @@ mod tests {
         assert!(capabilities(ProviderKind::OpenAiCompatible).embeddings);
     }
 
+    /// The Responses wire refuses exactly the keys the `openai` plugin
+    /// **publishes** and that wire does not have.
+    ///
+    /// Both halves matter. A key the plugin does not publish would already be
+    /// `unknown-key` on every `openai` provider, so listing one here would be
+    /// dead code wearing a more specific message; and a key that quietly left
+    /// [`COMMON`] would turn this rule's diagnostic back into the generic one
+    /// without any test noticing. The pair is the launch scope of Decision
+    /// D122's wire fork, so it is pinned rather than merely derived.
+    #[test]
+    fn the_responses_wire_refuses_only_keys_the_openai_plugin_publishes() {
+        let openai: Vec<&str> = published(ProviderKind::OpenAi)
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        for key in RESPONSES_HAS_NO {
+            assert!(
+                openai.contains(key),
+                "`{key}` is refused on the Responses wire, and the `openai` plugin does not \
+                 publish it — so the refusal can never fire and `unknown-key` answers first"
+            );
+        }
+        assert_eq!(RESPONSES_HAS_NO, ["stop", "seed"]);
+    }
+
     #[test]
     fn thinking_is_published_by_the_kinds_that_serve_it() {
         let anthropic: Vec<&str> = published(ProviderKind::Anthropic)
