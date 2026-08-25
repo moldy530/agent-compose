@@ -1,0 +1,13 @@
+# rule: a built-in's `root:` names a directory; an empty one would bound the tool
+# rule: to wherever the runtime was started (grammar 5.5, D123)
+# code: invalid-value
+# message: `root` in `builtin.read_file` in agent definition `agent.reviewer` must not be empty
+# at: 11:34
+# help: name the directory this tool is bounded to — `- builtin.read_file: { root: ./workspace }`; an empty root would bound it to wherever the runtime was started instead (grammar 5.5)
+agent.reviewer:
+  model: model.smart
+  prompt: Review the draft.
+  tools:
+    - builtin.read_file: { root: "" }
+  output:
+    verdict: { enum: [approve, revise] }

@@ -167,6 +167,47 @@ flow.tolerant:
     - { from: attempt, to: after }
     - { from: after, to: end }
 
+flow.outlived:
+  # The deadline again, absorbed rather than raised — the only shape in which a
+  # run that **completed** can be asked what the runtime is still holding on to.
+  #
+  # A killed shell can leave a grandchild holding the output pipes this runtime
+  # reads (`sleep 60 & wait` is the shape). Those pipes and their `data` handlers
+  # are the call's, and a call that has already failed must not keep them: a
+  # handler still appending to a buffer nobody will read is unbounded memory in a
+  # long-lived host, and an open pipe is an event-loop handle that keeps the
+  # process alive for as long as the grandchild does. A run that *ended* at the
+  # failure would hide both behind its own exit, which is why this flow absorbs
+  # the failure and lets the process decide when it is done.
+  description: An agent whose command outruns its deadline, absorbed by the node's `on_error:`.
+  inputs:
+    goal:
+      type: string
+      min_length: 1
+  outputs:
+    summary:
+      type: string
+  nodes:
+    attempt:
+      agent: agent.impatient
+      input:
+        goal: "input.goal"
+      on_error: skip
+
+    after:
+      exec:
+        command: printf
+        args: ["%s", "the node was skipped"]
+        output:
+          stdout: { type: string }
+      writes:
+        stdout: summary
+
+  edges:
+    - { from: start, to: attempt }
+    - { from: attempt, to: after }
+    - { from: after, to: end }
+
 flow.relay:
   # Two agent nodes in a row — the smallest shape a *frontier* is observable in.
   # The first one's loop runs a `bash` with a side effect a test can count; kill

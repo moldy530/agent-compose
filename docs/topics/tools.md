@@ -239,15 +239,25 @@ directory. `builtin.bash` runs with the root as its working directory. The value
 is interpolable, so `${WORKSPACE}` is the usual spelling and the directory is a
 property of the machine running the graph rather than of the composition.
 
+It has to name something, too: an empty `root:` is a compile error, and a
+`${WORKSPACE}` that comes back empty fails the call rather than resolving. An
+empty path is the runtime's own working directory, so a bound that accepted one
+would be the ambient capability these entries exist to refuse — read off no
+entry, and different on a developer's machine and a deployment's.
+
 **`timeout:` is required on `builtin.bash`** and illegal on the file tools, which
 run no command. It bounds one command; the node's own `timeout:` bounds the whole
-agent node, tool loop included, and the two compose.
+agent node, tool loop included, and the two compose. The deadline kills the shell
+and ends the call: a command that backgrounded something leaves it running, as it
+would have from a hand-rolled `exec:` tool, and the runtime stops reading after
+it rather than waiting for it.
 
 **What fails and what bounces.** Arguments the tool's schema refuses go back to
 the model, which can call again — a missing `path`, an empty `command`.
 Everything else fails the agent node under its `retry:`/`on_error:`, exactly as a
 failing `exec:` tool does: a nonzero exit, a command killed at the timeout, a
-path that resolved outside the root, a host with no `bash` on `PATH`.
+path that resolved outside the root, a `root:` that names no directory, a host
+with no `bash` on `PATH`.
 
 **Containment is the root and the timeout, and nothing more.** The tools run with
 the privileges of the process running the graph. Container and syscall isolation,
