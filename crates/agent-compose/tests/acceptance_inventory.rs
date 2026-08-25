@@ -968,6 +968,31 @@ const HARNESS: &[Criterion] = &[Criterion {
             "a_scripted_delay_makes_completion_order_differ_from_item_order",
             Status::Live,
         ),
+        // The fixture list's own guard, which grew a second arm when the first
+        // fixture that validates with a *warning* arrived (Decision D122).
+        ("every_fixture_with_a_declared_warning_exists", Status::Live),
+        // Server tools (grammar 12.1, Decision D122, resolved q30), which are
+        // this bullet's criterion on both counts: they are what a scripted model
+        // response now has to be able to *carry*, and the Responses wire they
+        // move an `openai` provider onto is a surface the harness had to learn.
+        // Each of the five is one claim a transcript decides.
+        (
+            "a_providers_server_tools_reach_the_messages_wire_verbatim",
+            Status::Live,
+        ),
+        (
+            "an_openai_provider_with_server_tools_runs_its_loop_on_the_responses_wire",
+            Status::Live,
+        ),
+        (
+            "a_server_tool_outside_the_table_is_warned_about_and_still_reaches_the_wire",
+            Status::Live,
+        ),
+        ("a_failover_that_crosses_two_wires_composes", Status::Live),
+        (
+            "server_tools_on_a_kind_whose_wire_has_none_is_refused_by_name",
+            Status::Live,
+        ),
     ],
 }];
 
@@ -1046,6 +1071,15 @@ const DURABILITY: &[Criterion] = &[
             // it disagrees at.
             (
                 "a_resume_whose_journal_no_longer_describes_the_run_names_the_divergent_step",
+                Status::Live,
+            ),
+            // …and the one composition shape that could have made replay a
+            // different question and does not: a provider that runs **server
+            // tools** (Decision D122). The use happens inside the recorded model
+            // call, so it gets no record and no key of its own, and the resumed
+            // generation replays the whole turn — search and all.
+            (
+                "a_resumed_run_replays_a_server_tools_answer_without_asking_again",
                 Status::Live,
             ),
             // …the other divergence resolved q29 names, which is not a request

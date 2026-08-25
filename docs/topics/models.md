@@ -65,9 +65,9 @@ other key belongs to the rows its `kind` names.
 
 | `kind` | Required | Optional |
 |---|---|---|
-| `anthropic` | `api_key` — **or** a `base_url` naming the gateway that holds one | `api_key` (beside a `base_url`), `base_url`, `headers` |
-| `openai` | `api_key` — **or** a `base_url` naming the gateway that holds one | `api_key` (beside a `base_url`), `base_url`, `headers`, `organization` |
-| `openai_compatible` | `base_url` | `api_key`, `headers` |
+| `anthropic` | `api_key` — **or** a `base_url` naming the gateway that holds one | `api_key` (beside a `base_url`), `base_url`, `headers`, `server_tools` |
+| `openai` | `api_key` — **or** a `base_url` naming the gateway that holds one | `api_key` (beside a `base_url`), `base_url`, `headers`, `organization`, `server_tools` |
+| `openai_compatible` | `base_url` | `api_key`, `headers`, `server_tools` |
 | `azure_openai` | `base_url`, `api_key`, `api_version` | `headers` |
 | `bedrock` | `region` | `access_key_id`, `secret_access_key`, `session_token`, `profile` |
 | `vertex` | `project`, `location` | `credentials_json` |
@@ -136,6 +136,94 @@ and `api_version` are plain strings and may be interpolated.
 Env refs survive **unresolved** into the artifact: `validate` and `build` check
 syntax only, so a build succeeds in CI holding no keys. Presence is checked at
 process start, and `run`/`serve` fail fast naming the missing variable.
+
+## Server tools
+
+A **server tool** runs on the provider's side, *inside* the model call: the
+compiled graph dispatches nothing, and what the tool found arrives woven into
+the assistant's turn. Web search is the one everybody meets first.
+
+`server_tools:` is an array of config objects written in **that provider's own
+wire vocabulary**, and the runtime appends it to the `tools` of every request the
+connection serves, after the agent's own:
+
+```yaml
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+  server_tools:
+    - type: web_search_20250305
+      name: web_search
+      max_uses: 5
+      allowed_domains: ["docs.example.com"]
+```
+
+Every entry needs a `type:`, which is the vendor's own key for the tool and is
+never interpolated. Everything else is the vendor's, travels verbatim, and — like
+the rest of a provider's non-secret config — may embed `${ENV}` references.
+
+**The suite belongs to the connection.** Every agent whose model resolves to
+that provider holds it; to give one agent a search and not another, define a
+second provider. Providers are cheap.
+
+### Two tiers of checking, and why
+
+The compiler keeps a curated table of the server tools each kind is known to
+serve. A `type:` **in** it is checked strictly — the fields it has, their types,
+their ranges, and the constraints the vendor states, like web search's allow-list
+and deny-list being mutually exclusive. A config the provider will refuse is
+otherwise a run that dies on its first model call with a 400 and no span.
+
+A `type:` **outside** it is a warning and is carried to the wire as written:
+
+```yaml triggers unknown-server-tool
+version: "0.1"
+
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+  server_tools:
+    - type: web_search
+      name: web_search
+```
+
+That composition **builds and runs**. The warning names exactly what could not
+be verified — here, that `web_search` is the OpenAI spelling and the Messages
+wire takes the dated `web_search_20250305` — and the point of the second tier is
+the case where the spelling is right and this release is simply older than the
+tool: a server tool the vendor ships tomorrow is usable the day it ships.
+
+`azure_openai`, `bedrock` and `vertex` refuse the key outright
+(`unsupported-server-tools`): their wires have not been taught the shape, so a
+suite declared there would be dropped on the floor rather than merely unchecked.
+
+### The OpenAI seam
+
+OpenAI's built-in tool suite lives on the **Responses API**, which Chat
+Completions does not carry. So an `openai` provider that declares
+`server_tools:` speaks `POST /v1/responses` for **all** of its calls, and one
+that declares none keeps Chat Completions exactly as before. One provider, one
+wire — a connection that switched per request would make "what did this model
+see" depend on which agent asked.
+
+Two `settings:` keys change spelling on that wire and the runtime translates
+them: `max_tokens` becomes `max_output_tokens`, and `reasoning_effort` becomes
+`reasoning: { effort }`. Two others have **no** Responses equivalent — `stop:`
+and `seed:` — and reach the service, which refuses them. If you need either,
+keep the suite off that provider and declare a second one for the agents that
+want a search.
+
+`openai_compatible` is unaffected: a gateway's suite rides its Chat Completions
+`tools` array verbatim, and every entry there is second-tier, because no table
+could be authoritative about what a gateway honours.
+
+### Failover
+
+A route's members each name their own provider, so which tools were on offer
+depends on which member answered. A route whose members declare **different**
+suites is a warning (`mismatched-server-tools`), not a refusal: a fallback vendor
+with no web search is still a fallback, and the compiler's job is to make the
+difference visible rather than to choose for you.
 
 ## Models
 

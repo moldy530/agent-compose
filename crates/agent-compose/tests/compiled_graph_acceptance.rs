@@ -77,7 +77,7 @@ use std::time::Duration;
 
 use mock_provider::{
     Client, HARNESS_HEADER, MockProvider, Outcome, REFUSED_INVALID, REFUSED_UNSCRIPTED,
-    RecordedRequest, Request, Script, StructuredOutput, Surface, ToolCall,
+    RecordedRequest, Request, Script, ServerToolUse, StructuredOutput, Surface, ToolCall,
 };
 use serde_json::{Value, json};
 
@@ -85,6 +85,10 @@ use serde_json::{Value, json};
 const SONNET: &str = "claude-sonnet-4-6";
 const HAIKU: &str = "claude-haiku-4-5";
 const LOCAL: &str = "qwen3-coder-30b";
+/// The `server-tools` fixture's two OpenAI models: one on each wire, which is
+/// the whole point of the pair (Decision D122).
+const GPT5: &str = "gpt-5";
+const GPT_MINI: &str = "gpt-4o-mini";
 /// The `provider-kinds` fixture's two models: one per Chat Completions kind that
 /// is neither `openai_compatible` nor already bound elsewhere.
 const AZURE_HOSTED: &str = "gpt-4o-mini";
@@ -93,6 +97,18 @@ const OPENAI_DIRECT: &str = "gpt-4o";
 // ---------------------------------------------------------------------------
 // PRD §7 M1, bullet 3 — "Mock provider server + e2e harness". Live.
 // ---------------------------------------------------------------------------
+
+/// The fixtures that validate with a **warning**, and the codes they carry.
+///
+/// A warning is not a failure — the composition builds and runs — but it is also
+/// not something a fixture should acquire quietly, so the ones that carry any
+/// are named here with what they carry. `server-tools` is the only entry and it
+/// is deliberate: its `model.crossing_wires` route has one member with a
+/// server-tool suite and one without, which is what makes "a failover that
+/// crosses two wires composes" testable at all, and grammar 12.2 warns about
+/// exactly that shape (Decision D122).
+const FIXTURES_WITH_A_WARNING: &[(&str, &[&str])] =
+    &[("server-tools", &["mismatched-server-tools"])];
 
 /// Every fixture the suite is written against is a valid composition **today**,
 /// under the real `validate`.
@@ -111,9 +127,47 @@ fn the_acceptance_fixtures_validate_clean() {
             Some(0),
             "the acceptance fixture `{name}` does not validate:\n{stderr}"
         );
+        let expected = FIXTURES_WITH_A_WARNING
+            .iter()
+            .find(|(fixture, _)| fixture == name)
+            .map(|(_, codes)| *codes)
+            .unwrap_or_default();
+        if expected.is_empty() {
+            assert!(
+                stderr.ends_with("is valid (target `local`)\n"),
+                "unexpected verdict for `{name}`: {stderr}"
+            );
+            continue;
+        }
         assert!(
-            stderr.ends_with("is valid (target `local`)\n"),
+            stderr.contains(&format!(
+                "is valid (target `local`), with {} warning{}\n",
+                expected.len(),
+                if expected.len() == 1 { "" } else { "s" }
+            )),
             "unexpected verdict for `{name}`: {stderr}"
+        );
+        for code in expected {
+            assert!(
+                stderr.contains(&format!("warning[{code}]")),
+                "`{name}` no longer carries the `{code}` warning it is written for:\n{stderr}"
+            );
+        }
+    }
+}
+
+/// The list above names fixtures that exist, so a renamed one cannot leave an
+/// entry excusing nothing.
+#[test]
+fn every_fixture_with_a_declared_warning_exists() {
+    for (fixture, codes) in FIXTURES_WITH_A_WARNING {
+        assert!(
+            harness::FIXTURES.contains(fixture),
+            "`{fixture}` is not an acceptance fixture"
+        );
+        assert!(
+            !codes.is_empty(),
+            "`{fixture}` names the warnings it carries"
         );
     }
 }
@@ -509,6 +563,370 @@ fn a_scripted_delay_makes_completion_order_differ_from_item_order() {
         finished[1].1,
         finished[0].1
     );
+}
+
+/// A provider's `server_tools:` reach the Messages wire **verbatim**, beside the
+/// agent's own tools, and a scripted use of one flows through the loop without
+/// being dispatched (grammar 12.1, Decision D122, resolved q30).
+///
+/// Three claims in one run, and each is one a transcript can decide:
+///
+///  * the config the composition declared is the object on the wire, field for
+///    field — the whole of what q30's pass-through promises, and the thing a
+///    compiler that "supported" a tool by rewriting it would fail;
+///  * the suite is **appended** to the agent's own tools rather than replacing
+///    them, which is why the pinned output schema is still there;
+///  * a `server_tool_use` block and the result the provider paired with it come
+///    back inside the answer, and the agent completes. Nothing was dispatched:
+///    the tool ran on the provider's side, and a runtime that read the block as
+///    a tool call would have bounced it back as a refusal (Decision D119) and
+///    spent the loop.
+#[test]
+fn a_providers_server_tools_reach_the_messages_wire_verbatim() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "answer": "the docs say yes" })).with_server_tools(vec![
+            ServerToolUse::new(
+                "web_search_20250305",
+                json!({ "query": "does it?" }),
+                json!([{ "type": "web_search_result", "url": "https://docs.example.com/a" }]),
+            ),
+        ]),
+    ));
+
+    let Some(run) = harness::invoke(
+        "server-tools",
+        "flow.search",
+        &[("question", "does it?")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(run.outputs()["answer"], "the docs say yes");
+
+    let asked = provider.requests();
+    assert_eq!(asked.len(), 1, "one call, and its answer needed no second");
+    assert!(asked[0].is_valid(), "{:?}", asked[0].failures());
+    assert_eq!(asked[0].surface, Surface::Anthropic);
+    assert_eq!(
+        asked[0].server_tools,
+        ["web_search_20250305"],
+        "the provider's suite reached the request"
+    );
+    // Verbatim: what the spec declared, as JSON, unrewritten.
+    let tools = asked[0].body()["tools"]
+        .as_array()
+        .expect("a tool array")
+        .clone();
+    assert_eq!(
+        tools.last(),
+        Some(&json!({
+            "type": "web_search_20250305",
+            "name": "web_search",
+            "max_uses": 5,
+            "allowed_domains": ["docs.example.com"],
+        })),
+        "the server tool is the config the composition wrote: {tools:?}"
+    );
+    assert_eq!(
+        asked[0].tools,
+        ["searcher_output"],
+        "and it is appended to the agent's own tools rather than replacing them"
+    );
+    assert!(provider.snapshot().is_drained());
+}
+
+/// An `openai` provider that declares a suite speaks the **Responses** API for
+/// every call it makes, and everything else about the call still works there
+/// (Decision D122).
+///
+/// The seam is all-or-nothing per provider, so what this decides is that the
+/// whole conversation moved: the route the requests arrived at, the function
+/// tool the agent declares still being dispatched through its loop, and the
+/// structured output still parsing — on a wire where it is `text.format` rather
+/// than `response_format`.
+#[test]
+fn an_openai_provider_with_server_tools_runs_its_loop_on_the_responses_wire() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        // The loop's first turn: a server search the provider ran, and a call to
+        // the agent's own tool, which the runtime *does* dispatch.
+        Script::new(
+            GPT5,
+            Outcome::tool_calls(vec![ToolCall::new("lookup", json!({ "query": "what" }))])
+                .with_server_tools(vec![ServerToolUse::new(
+                    "web_search",
+                    json!({ "type": "search", "query": "what" }),
+                    json!([{ "url": "https://docs.example.com/a" }]),
+                )]),
+        ),
+        // The turn that ends the loop: prose, no calls (grammar 5, D51).
+        Script::new(GPT5, Outcome::text("I have what I need.")),
+        // …and the pinned call that answers the node.
+        Script::new(
+            GPT5,
+            Outcome::structured(json!({ "answer": "a looked-up snippet" })),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke(
+        "server-tools",
+        "flow.respond",
+        &[("question", "what?")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(run.outputs()["answer"], "a looked-up snippet");
+
+    let asked = provider.requests();
+    assert_eq!(asked.len(), 3, "the loop turned twice, then answered");
+    for request in &asked {
+        assert!(request.is_valid(), "{:?}", request.failures());
+        assert_eq!(
+            request.surface,
+            Surface::Responses,
+            "one provider, one wire: every call it serves is a Responses call"
+        );
+        assert_eq!(request.path, "/v1/responses");
+        assert_eq!(request.server_tools, ["web_search"]);
+    }
+    // The client tool is declared flat on this wire, and its call came back to
+    // the graph — a server tool in the same array changed neither.
+    assert_eq!(asked[0].tools, ["lookup"]);
+    assert!(
+        asked[1].body()["input"]
+            .as_array()
+            .expect("an input list")
+            .iter()
+            .any(|item| item["type"] == "function_call_output"),
+        "the dispatched tool's result went back as an item: {}",
+        asked[1].body_text
+    );
+    // …the server tool's own item is replayed beside it, and is answered by
+    // nothing: the provider already ran it (Decision D122).
+    assert!(
+        asked[1].body()["input"]
+            .as_array()
+            .expect("an input list")
+            .iter()
+            .any(|item| item["type"] == "web_search_call"),
+        "the server tool's record travelled back untouched: {}",
+        asked[1].body_text
+    );
+    // …and structured output is `text.format` here, and still parsed.
+    assert!(matches!(
+        asked[2].structured_output,
+        Some(StructuredOutput::JsonSchema { .. })
+    ));
+    assert!(provider.snapshot().is_drained());
+}
+
+/// A tool outside the compiler's curated table travels to the wire as written —
+/// the second tier of resolved q30, end to end.
+///
+/// `validate` warns and exits `0`, `build` emits, and the run puts the config on
+/// the request unchanged. That is the whole no-treadmill promise: a server tool
+/// the vendor ships after this compiler release is usable the day it ships.
+#[test]
+fn a_server_tool_outside_the_table_is_warned_about_and_still_reaches_the_wire() {
+    let scratch = harness::Scratch::new("server-tool-after-this-release");
+    let entrypoint = scratch.path().join("main.yml");
+    std::fs::write(
+        &entrypoint,
+        unverified_server_tool_spec("web_search_20260101"),
+    )
+    .expect("the scratch spec is writable");
+
+    let validated = harness::validate_entrypoint(&entrypoint, "local");
+    let stderr = String::from_utf8_lossy(&validated.stderr);
+    assert_eq!(
+        validated.status.code(),
+        Some(0),
+        "a warning does not refuse a composition:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("warning[unknown-server-tool]") && stderr.contains("web_search_20260101"),
+        "the warning names exactly what could not be verified:\n{stderr}"
+    );
+
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "answer": "carried anyway" })),
+    ));
+    let Some(run) = harness::invoke_entrypoint(
+        &entrypoint,
+        "server-tool-after-this-release",
+        "flow.search",
+        &json!({ "question": "does it?" }),
+        &harness::environment(&provider),
+        None,
+    ) else {
+        return;
+    };
+    run.succeeded();
+
+    let asked = provider.requests();
+    assert_eq!(
+        asked[0].server_tools,
+        ["web_search_20260101"],
+        "the unverified tool reached the wire"
+    );
+    assert_eq!(
+        asked[0].body()["tools"].as_array().expect("a tool array")[1]["max_uses"],
+        7,
+        "…with the config the compiler could not check, as written: {}",
+        asked[0].body_text
+    );
+}
+
+/// A failover route whose members are on **two different wires** composes: each
+/// attempt speaks its own provider's (Decision D122).
+///
+/// The first member's provider carries a suite, so its call goes to
+/// `/v1/responses`; the second's does not, so its call goes to
+/// `/v1/chat/completions`. A rate limit on the first is what moves the ladder,
+/// and the answer comes back off a wire the first attempt never touched. The
+/// differing suites are also what `validate` warns about, which
+/// `the_acceptance_fixtures_validate_clean` pins.
+#[test]
+fn a_failover_that_crosses_two_wires_composes() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(GPT5, Outcome::rate_limit()),
+        Script::new(
+            GPT_MINI,
+            Outcome::structured(json!({ "answer": "the fallback answered" })),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke(
+        "server-tools",
+        "flow.cross",
+        &[("question", "who answers?")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(run.outputs()["answer"], "the fallback answered");
+
+    let asked = provider.requests();
+    assert_eq!(
+        asked
+            .iter()
+            .map(|request| (request.surface, request.path.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (Surface::Responses, "/v1/responses"),
+            (Surface::OpenAi, "/v1/chat/completions"),
+        ],
+        "each member of the ladder spoke its own provider's wire"
+    );
+    assert_eq!(asked[0].server_tools, ["web_search"]);
+    assert!(
+        asked[1].server_tools.is_empty(),
+        "the fallback's provider declares none, and none was invented for it"
+    );
+    assert!(provider.snapshot().is_drained());
+}
+
+/// `server_tools:` on a kind whose wire this release has not been taught is an
+/// **error**, and the message says which kinds carry it.
+///
+/// The other half of the two-tier design, and the one that is not a warning: a
+/// suite declared here would be dropped on the floor rather than merely
+/// unverified, which is the silent no-op D50 refuses everywhere else.
+#[test]
+fn server_tools_on_a_kind_whose_wire_has_none_is_refused_by_name() {
+    let scratch = harness::Scratch::new("server-tools-on-azure");
+    let entrypoint = scratch.path().join("main.yml");
+    std::fs::write(
+        &entrypoint,
+        "version: \"0.1\"\n\nprovider.azure:\n  kind: azure_openai\n  base_url: ${AZURE_ENDPOINT}\n  \
+         api_key: ${AZURE_API_KEY}\n  api_version: \"2024-10-21\"\n  server_tools:\n    - type: web_search\n",
+    )
+    .expect("the scratch spec is writable");
+
+    let validated = harness::validate_entrypoint(&entrypoint, "local");
+    let stderr = String::from_utf8_lossy(&validated.stderr);
+    assert_eq!(validated.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains(
+            "error[unsupported-server-tools]: provider definition `provider.azure` declares \
+             `kind: azure_openai`, whose wire this compiler release does not carry server tools on"
+        ),
+        "the refusal names the kind:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "server tools launched on `kind: anthropic`, `kind: openai`, `kind: openai_compatible`"
+        ),
+        "…and the launch scope:\n{stderr}"
+    );
+}
+
+/// One spec whose provider declares a server tool the compiler's table does not
+/// name.
+fn unverified_server_tool_spec(type_name: &str) -> String {
+    format!(
+        r#"version: "0.1"
+
+state:
+  answer:
+    type: string
+    default: nothing yet
+
+provider.searching:
+  kind: anthropic
+  api_key: ${{MOCK_API_KEY}}
+  base_url: ${{MOCK_BASE_URL}}
+  server_tools:
+    - type: {type_name}
+      name: web_search
+      max_uses: 7
+
+model.smart:
+  provider: provider.searching
+  id: {SONNET}
+
+agent.searcher:
+  description: Answers with whatever its provider found.
+  model: model.smart
+  prompt: |
+    You are a researcher. Answer the question.
+  input:
+    question:
+      description: What to answer.
+      type: string
+  output:
+    answer:
+      description: The answer, as text.
+      type: string
+
+flow.search:
+  description: One agent whose provider searches for it.
+  inputs:
+    question:
+      type: string
+      min_length: 1
+  outputs:
+    answer:
+      type: string
+  nodes:
+    ask:
+      agent: agent.searcher
+      input:
+        question: "input.question"
+  edges:
+    - {{ from: start, to: ask }}
+    - {{ from: ask, to: end }}
+"#
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -10848,6 +11266,105 @@ fn a_resumed_run_consumes_its_recorded_model_answers_instead_of_asking_again() {
     // it handed the graph the value the first generation got.
     assert!(
         asked[0].body_text.contains("the first note"),
+        "the live call is the second node's, asked about what the replayed answer \
+         wrote: {}",
+        asked[0].body_text
+    );
+}
+
+/// The same claim over a composition whose provider runs **server tools**:
+/// replay is untouched, because the use happened inside the recorded model call
+/// (Decision D122, `docs/durability.md` §3.1).
+///
+/// This is the one durability question q30 raises and answers: a server tool is
+/// not an effect of its own, so it gets no journal record and no key — what is
+/// recorded is the model call it happened inside, whose answer already carries
+/// the `server_tool_use` block and the result the provider paired with it. A
+/// resumed generation therefore replays the whole turn, search and all, and the
+/// provider is asked once for the one call still ahead of the frontier.
+///
+/// It also exercises the half that *did* move: the recorded call's **request
+/// identity** now carries the provider's suite, so this is a resume where the
+/// suite matched. The other side — a suite that changed between generations —
+/// is a divergence by construction, and `docs/durability.md` §7 says so.
+#[test]
+fn a_resumed_run_replays_a_server_tools_answer_without_asking_again() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "answer": "the first finding" })).with_server_tools(vec![
+            ServerToolUse::new(
+                "web_search_20250305",
+                json!({ "query": "the question" }),
+                json!([{ "type": "web_search_result", "url": "https://docs.example.com/a" }]),
+            ),
+        ]),
+    ));
+    // Held past the kill, so the frontier lands exactly one effect in.
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "answer": "the second finding" }))
+            .after(Duration::from_secs(120)),
+    ));
+
+    let Some((project, built)) =
+        harness::build_under_toolchain("server-tools", "resume-server-tools")
+    else {
+        return;
+    };
+    assert!(
+        built.status.success(),
+        "the server-tools fixture did not build:\n{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+
+    let environment = harness::environment(&provider);
+    let killed = harness::crash_run(
+        &project,
+        &["run", "flow.relay", "--input", "question=does it?"],
+        &environment,
+        |_| provider.snapshot().requests >= 2,
+    );
+
+    provider.reset();
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "answer": "the second finding" })),
+    ));
+
+    let resumed = harness::resume(
+        &project,
+        "server-tools",
+        &killed.execution,
+        Some("json"),
+        &environment,
+    );
+    resumed.succeeded();
+    let answered = resumed.outputs();
+    assert_eq!(answered["status"], "completed", "{answered}");
+    assert_eq!(
+        answered["outputs"]["relayed"], "the first finding",
+        "the replayed call's answer — the one the search was woven into — reaches \
+         the resumed run's state: {answered}"
+    );
+    assert_eq!(
+        answered["outputs"]["final"], "the second finding",
+        "{answered}"
+    );
+
+    let asked = provider.requests();
+    assert_eq!(
+        asked.len(),
+        1,
+        "the recorded call is replayed rather than re-issued, server tool and all"
+    );
+    assert_eq!(
+        asked[0].server_tools,
+        ["web_search_20250305"],
+        "and the live call past the frontier still carries the provider's suite"
+    );
+    assert!(
+        asked[0].body_text.contains("the first finding"),
         "the live call is the second node's, asked about what the replayed answer \
          wrote: {}",
         asked[0].body_text
