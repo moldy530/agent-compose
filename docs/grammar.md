@@ -6681,7 +6681,13 @@ including the confinement of `input:`/`writes:`/`detach:` to the homogeneous for
 alone because a dispatch's history isolation is unconditional (rule 13, D105) —
 the field-map-only `input:` on the node kinds that name their
 fields (§8.0, D88), the non-empty `expect_exit`/`expect_status` lists (§6.1), the
-direct-XOR-route split on model definitions (§12.2), the `human` timeout/route
+direct-XOR-route split on model definitions (§12.2), the built-in entries of an
+agent's `tools:` — one name per entry over the closed four, `root:` required on
+every one of them and `timeout:` required on `builtin.bash` and refused on the
+file tools (§5.5, D123), which is a third `if`/`then`, keyed on the entry's own
+*type* rather than on a sibling literal: a string is an address and a mapping is
+a built-in, so an editor underlines the missing `root:` rather than reporting
+that the entry is neither kind of thing — the `human` timeout/route
 pairing (§8.7) and the absence of node-level `timeout:`/`retry:` on a `human`
 node (§8.7, D52 — the other two levels of that exemption are resolution
 semantics, with nothing to reject), the `fail`/`skip`-only `on_error:` in

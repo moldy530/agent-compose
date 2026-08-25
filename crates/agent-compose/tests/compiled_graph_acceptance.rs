@@ -12244,11 +12244,16 @@ fn a_command_that_outruns_its_timeout_is_killed_and_fails_the_node() {
     let provider = MockProvider::start().expect("a loopback port");
     let (_scratch, environment) = bounded_root(&provider, "builtins-timeout");
 
+    // Written to leave a **grandchild** holding the output pipes after the shell
+    // is killed, which is the shape a deadline is silently lost in: a runtime
+    // that waited for the child's streams to close would wait for the `sleep`
+    // rather than for its own timer, and the bound would become the command's to
+    // honour rather than the composition's.
     provider.enqueue(Script::new(
         SONNET,
         Outcome::tool_calls(vec![ToolCall::new(
             "bash",
-            json!({ "command": "sleep 60" }),
+            json!({ "command": "sleep 30 & wait" }),
         )]),
     ));
 
@@ -12266,8 +12271,10 @@ fn a_command_that_outruns_its_timeout_is_killed_and_fails_the_node() {
         said.contains("ran longer than `1s`"),
         "the failure names the bound the composition wrote: {said}"
     );
+    // Comfortably under the `sleep`, and comfortably over the deadline plus a
+    // build: what this rules out is the run having waited for the grandchild.
     assert!(
-        started.elapsed() < Duration::from_secs(50),
+        started.elapsed() < Duration::from_secs(15),
         "the command was killed at its deadline rather than waited out"
     );
     let calls = tool_calls_of(&run, "do");
