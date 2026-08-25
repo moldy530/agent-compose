@@ -848,6 +848,161 @@ fn an_openai_provider_with_server_tools_runs_its_loop_on_the_responses_wire() {
     assert!(provider.snapshot().is_drained());
 }
 
+/// A pinned Responses turn that carries **more than one** `message` is read at
+/// the message `text.format` shaped, not at the concatenation of all of them.
+///
+/// This is the one shape server tools make reachable and the other two wires
+/// cannot produce. The Messages wire reads the pinned `tool_use` block's `input`
+/// and Chat Completions parses the single `choices[0].message.content`; a
+/// Responses turn is a **list of items**, and a model that says something before
+/// its provider's search runs sends a preamble `message`, the `web_search_call`,
+/// and then the shaped `message`. Joining the two texts and parsing the join is
+/// `Let me look that up.{"answer":"…"}` reaching `JSON.parse` — a bare
+/// `SyntaxError` naming no agent and no model, thrown inside the journaled model
+/// call, so a resume replays a recorded failure and the run never recovers.
+///
+/// Served with [`Outcome::raw`] because it is precisely what the scripted
+/// shapes will not compose: `reply_answer` pushes at most one `message` item per
+/// answer, so the harness cannot script two.
+#[test]
+fn a_pinned_responses_turn_is_read_at_the_message_the_format_shaped() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        // The turn that ends the loop: prose, no calls.
+        Script::new(GPT5, Outcome::text("I have what I need.")),
+        // …and the pinned call, answered the way a turn with a server tool in it
+        // legitimately arrives.
+        Script::new(
+            GPT5,
+            Outcome::raw(
+                200,
+                json!({
+                    "id": "resp_preamble",
+                    "object": "response",
+                    "status": "completed",
+                    "model": GPT5,
+                    "output": [
+                        {
+                            "type": "message",
+                            "id": "msg_preamble",
+                            "status": "completed",
+                            "role": "assistant",
+                            "content": [{
+                                "type": "output_text",
+                                "text": "Let me look that up.",
+                                "annotations": [],
+                            }],
+                        },
+                        {
+                            "type": "web_search_call",
+                            "id": "srv_preamble",
+                            "status": "completed",
+                            "action": { "type": "search", "query": "what" },
+                        },
+                        {
+                            "type": "message",
+                            "id": "msg_answer",
+                            "status": "completed",
+                            "role": "assistant",
+                            "content": [{
+                                "type": "output_text",
+                                "text": "{\"answer\":\"a searched-for snippet\"}",
+                                "annotations": [],
+                            }],
+                        },
+                    ],
+                    "incomplete_details": null,
+                    "parallel_tool_calls": true,
+                }),
+            ),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke(
+        "server-tools",
+        "flow.respond",
+        &[("question", "what?")],
+        &provider,
+    ) else {
+        return;
+    };
+    // The node completed, and what it produced is the *second* message's object.
+    // A runtime reading the join fails the node instead, with a parser message.
+    run.succeeded();
+    assert_eq!(run.outputs()["answer"], "a searched-for snippet");
+    assert_eq!(
+        provider.requests().len(),
+        2,
+        "the loop turned once, then answered"
+    );
+    assert!(provider.snapshot().is_drained());
+}
+
+/// …and a pinned Responses turn that carried no parseable object at all fails
+/// the node with the sentence the other wires fail it with.
+///
+/// The other half of the reading above. `text.format` is the service's promise
+/// and not this runtime's, so a turn that came back with prose where the schema
+/// was asked for is an answer the node cannot use — reported as the *absence* of
+/// structured output, exactly as the Messages wire reports a turn missing its
+/// pinned `tool_use` block. What that buys is a node error naming the agent, the
+/// output it asked for, and what the surface said about why; a `SyntaxError`
+/// raised inside `callResponses` names none of the three, and is raised inside
+/// the journaled model call, so a resume would replay a recorded failure of a
+/// call that had in fact answered.
+#[test]
+fn a_pinned_responses_turn_carrying_no_object_is_reported_as_no_structured_output() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(GPT5, Outcome::text("I have what I need.")),
+        Script::new(
+            GPT5,
+            Outcome::raw(
+                200,
+                json!({
+                    "id": "resp_prose",
+                    "object": "response",
+                    "status": "completed",
+                    "model": GPT5,
+                    "output": [{
+                        "type": "message",
+                        "id": "msg_prose",
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "Sorry, I could not find anything.",
+                            "annotations": [],
+                        }],
+                    }],
+                    "incomplete_details": null,
+                    "parallel_tool_calls": true,
+                }),
+            ),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke(
+        "server-tools",
+        "flow.respond",
+        &[("question", "what?")],
+        &provider,
+    ) else {
+        return;
+    };
+    let failure = run.failed();
+    assert!(
+        failure.contains("`agent.responder` asked for")
+            && failure.contains("the answer carried no structured output"),
+        "the node error names the agent and what it asked for: {failure}"
+    );
+    assert!(
+        !failure.contains("SyntaxError"),
+        "…rather than the parser's message: {failure}"
+    );
+    assert!(provider.snapshot().is_drained());
+}
+
 /// A tool outside the compiler's curated table travels to the wire as written —
 /// the second tier of resolved q30, end to end.
 ///
