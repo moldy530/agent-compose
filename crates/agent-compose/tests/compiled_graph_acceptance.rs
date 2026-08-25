@@ -753,6 +753,10 @@ fn a_server_tool_block_is_neither_dispatched_nor_refused_by_the_loop() {
 /// tool the agent declares still being dispatched through its loop, and the
 /// structured output still parsing — on a wire where it is `text.format` rather
 /// than `response_format`.
+///
+/// It also pins the two keys the request does **not** carry, `store` and
+/// `previous_response_id`, which three documents state as behaviour and no other
+/// check can see.
 #[test]
 fn an_openai_provider_with_server_tools_runs_its_loop_on_the_responses_wire() {
     let provider = MockProvider::start().expect("a loopback port");
@@ -814,6 +818,31 @@ fn an_openai_provider_with_server_tools_runs_its_loop_on_the_responses_wire() {
             request.body()["reasoning"],
             json!({ "effort": "high" }),
             "…and `reasoning_effort` is `reasoning: {{ effort }}`: {}",
+            request.body_text
+        );
+        // …and the two keys this wire has that the emitted request deliberately
+        // does **not** carry. Both are documented as absences with consequences
+        // — `docs/topics/models.md` and `docs/grammar.md` D122 on retention,
+        // `WIRE-NOTES` (19) on why no request this server sees holds `store` —
+        // and neither is a thing the mock can decide: both are in
+        // `responses::REQUEST_KEYS` and `check_settings` takes `store` as any
+        // boolean, so a request that pinned either would validate. Pinning
+        // `store: false` is the regression that matters, and it is reachable
+        // only against the real service: it makes the API refuse a replayed
+        // `reasoning` item, so every reasoning-model tool loop on a real
+        // `openai` provider with a suite would break on its second turn, with
+        // this suite still green.
+        assert_eq!(
+            request.body()["store"],
+            Value::Null,
+            "`store` is left to the service's default rather than pinned: {}",
+            request.body_text
+        );
+        assert_eq!(
+            request.body()["previous_response_id"],
+            Value::Null,
+            "…and the conversation travels in `input`, not behind a continuity \
+             token the runtime does not hold (`docs/durability.md` §3.1): {}",
             request.body_text
         );
     }
