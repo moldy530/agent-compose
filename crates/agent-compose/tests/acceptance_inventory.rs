@@ -975,7 +975,7 @@ const HARNESS: &[Criterion] = &[Criterion {
         // this bullet's criterion on both counts: they are what a scripted model
         // response now has to be able to *carry*, and the Responses wire they
         // move an `openai` provider onto is a surface the harness had to learn.
-        // Each of the five is one claim a transcript decides.
+        // Each is one claim a transcript decides.
         (
             "a_providers_server_tools_reach_the_messages_wire_verbatim",
             Status::Live,
@@ -988,11 +988,29 @@ const HARNESS: &[Criterion] = &[Criterion {
             "an_openai_provider_with_server_tools_runs_its_loop_on_the_responses_wire",
             Status::Live,
         ),
+        // …and the third route the key reaches, which is on neither of those
+        // two wires: a gateway keeps Chat Completions and its suite rides that
+        // request's own `tools` array.
+        (
+            "a_gateways_server_tools_ride_its_chat_completions_tools_array",
+            Status::Live,
+        ),
         (
             "a_server_tool_outside_the_table_is_warned_about_and_still_reaches_the_wire",
             Status::Live,
         ),
         ("a_failover_that_crosses_two_wires_composes", Status::Live),
+        // …and the half of that seam a first-call failover cannot reach: a
+        // *replayed* assistant turn, which each wire will only take back in its
+        // own vocabulary.
+        (
+            "a_failover_off_the_responses_wire_rewrites_the_turn_for_the_messages_one",
+            Status::Live,
+        ),
+        (
+            "a_failover_off_the_messages_wire_rewrites_the_turn_for_the_responses_one",
+            Status::Live,
+        ),
         (
             "server_tools_on_a_kind_whose_wire_has_none_is_refused_by_name",
             Status::Live,
@@ -1084,6 +1102,13 @@ const DURABILITY: &[Criterion] = &[
             // generation replays the whole turn — search and all.
             (
                 "a_resumed_run_replays_a_server_tools_answer_without_asking_again",
+                Status::Live,
+            ),
+            // …and the same claim on the second block-carrying wire, whose
+            // service-minted item ids travel inside the recorded answer and so
+            // inside the next call's request identity (Decision D122).
+            (
+                "a_resumed_run_replays_a_responses_wire_answer_without_asking_again",
                 Status::Live,
             ),
             // …the other divergence resolved q29 names, which is not a request

@@ -98,17 +98,30 @@ const OPENAI_DIRECT: &str = "gpt-4o";
 // PRD §7 M1, bullet 3 — "Mock provider server + e2e harness". Live.
 // ---------------------------------------------------------------------------
 
-/// The fixtures that validate with a **warning**, and the codes they carry.
+/// The fixtures that validate with a **warning**, one entry per warning.
 ///
 /// A warning is not a failure — the composition builds and runs — but it is also
 /// not something a fixture should acquire quietly, so the ones that carry any
-/// are named here with what they carry. `server-tools` is the only entry and it
-/// is deliberate: its `model.crossing_wires` route has one member with a
-/// server-tool suite and one without, which is what makes "a failover that
-/// crosses two wires composes" testable at all, and grammar 12.2 warns about
-/// exactly that shape (Decision D122).
-const FIXTURES_WITH_A_WARNING: &[(&str, &[&str])] =
-    &[("server-tools", &["mismatched-server-tools"])];
+/// are named here with what they carry, repeats and all: the list's length is
+/// the count `validate` must report, which is what makes a *new* warning a test
+/// failure rather than a line nobody reads.
+///
+/// `server-tools` is the only entry and every one of its four is deliberate.
+/// Three are the routes that cross a wire seam — a member with a suite failing
+/// over to a member with a different one, which is the shape that makes
+/// "a failover across two wires composes" testable at all, and exactly what
+/// grammar 12.2 warns about. The fourth is `provider.searching_gateway`: every
+/// `openai_compatible` entry is second-tier by construction, since no table
+/// could be authoritative about what a gateway honours (Decision D122).
+const FIXTURES_WITH_A_WARNING: &[(&str, &[&str])] = &[(
+    "server-tools",
+    &[
+        "unknown-server-tool",
+        "mismatched-server-tools",
+        "mismatched-server-tools",
+        "mismatched-server-tools",
+    ],
+)];
 
 /// Every fixture the suite is written against is a valid composition **today**,
 /// under the real `validate`.
@@ -926,6 +939,264 @@ fn a_failover_that_crosses_two_wires_composes() {
         "the fallback's provider declares none, and none was invented for it"
     );
     assert!(provider.snapshot().is_drained());
+}
+
+/// A gateway's suite rides its **Chat Completions** `tools` array, verbatim and
+/// beside the agent's own (grammar 12.1, Decision D122).
+///
+/// The third kind that takes the key, and the one with no curated table at all:
+/// every entry on an `openai_compatible` provider is second-tier, so `validate`
+/// warns and the array travels as written. That makes the runtime half the whole
+/// of the promise — a suite the compiler carried through validation and codegen
+/// and then dropped on the floor at the request would be the silent no-op D50
+/// refuses, and would make the warning's own sentence ("its config … travels to
+/// the provider as written") false.
+///
+/// This is also the one route of the three where the answer is not on a wire the
+/// suite moved the connection to: `openai_compatible` stays on Chat Completions
+/// precisely because moving a gateway onto a wire it may not implement would
+/// break the compositions that work today.
+#[test]
+fn a_gateways_server_tools_ride_its_chat_completions_tools_array() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        LOCAL,
+        Outcome::structured(json!({ "answer": "the gateway searched" })),
+    ));
+
+    let Some(run) = harness::invoke(
+        "server-tools",
+        "flow.gateway",
+        &[("question", "does it?")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(run.outputs()["answer"], "the gateway searched");
+
+    let asked = provider.requests();
+    assert_eq!(asked.len(), 1, "one call, and its answer needed no second");
+    assert!(asked[0].is_valid(), "{:?}", asked[0].failures());
+    assert_eq!(
+        (asked[0].surface, asked[0].path.as_str()),
+        (Surface::OpenAi, "/v1/chat/completions"),
+        "a gateway keeps the wire it had"
+    );
+    assert_eq!(
+        asked[0].server_tools,
+        ["web_search"],
+        "the suite the composition declared reached the request: {}",
+        asked[0].body_text
+    );
+    let tools = asked[0].body()["tools"]
+        .as_array()
+        .expect("a tool array")
+        .clone();
+    assert_eq!(
+        tools.last(),
+        Some(&json!({ "type": "web_search", "search_context_size": "medium" })),
+        "…as the config the composition wrote, unrewritten: {tools:?}"
+    );
+    assert!(provider.snapshot().is_drained());
+}
+
+/// A failover that crosses the two **block-carrying** wires replays a turn the
+/// member it landed on can read (Decision D122).
+///
+/// Both surfaces answer with a list of objects and both take their own list
+/// back — a `tool_use` block is not an item type the Responses API has, and a
+/// `function_call` item is not a content block the Messages API has — so a turn
+/// forwarded across the seam is a 400 naming a type the member never heard of.
+/// The turn is therefore *rendered* into the wire that is about to send it,
+/// out of the same reading its own composed turns are rendered from.
+///
+/// The loop is what makes this reachable and is why the agent carries a client
+/// tool: the failover has to happen on the **second** call, when there is an
+/// assistant turn to replay. `a_failover_that_crosses_two_wires_composes` above
+/// rate-limits the first call, where the history is one user turn and any wire
+/// can render it.
+#[test]
+fn a_failover_off_the_responses_wire_rewrites_the_turn_for_the_messages_one() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        // Turn one, on the Responses wire: a search the provider ran, and a call
+        // to the agent's own tool, which the runtime dispatches.
+        Script::new(
+            GPT5,
+            Outcome::tool_calls(vec![ToolCall::new("lookup", json!({ "query": "what" }))])
+                .with_server_tools(vec![ServerToolUse::new(
+                    "web_search",
+                    json!({ "type": "search", "query": "what" }),
+                    json!([{ "url": "https://docs.example.com/a" }]),
+                )]),
+        ),
+        // …and from here the first member refuses, so both remaining calls —
+        // the one that ends the loop and the pinned one that answers the node —
+        // are served by the Anthropic member, each replaying a history whose
+        // assistant turn came off the other wire.
+        Script::new(GPT5, Outcome::rate_limit()).times(2),
+        Script::new(SONNET, Outcome::text("I have what I need.")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "answer": "the fallback finished the loop" })),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke(
+        "server-tools",
+        "flow.cross_from_responses",
+        &[("question", "what?")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(run.outputs()["answer"], "the fallback finished the loop");
+
+    let asked = provider.requests();
+    assert_eq!(
+        asked
+            .iter()
+            .map(|request| (request.surface, request.path.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (Surface::Responses, "/v1/responses"),
+            (Surface::Responses, "/v1/responses"),
+            (Surface::Anthropic, "/v1/messages"),
+            (Surface::Responses, "/v1/responses"),
+            (Surface::Anthropic, "/v1/messages"),
+        ],
+        "each call starts at the head of the ladder and falls to the member that answers"
+    );
+
+    // The one this test exists for: the first Messages request, whose history
+    // holds a turn the Responses wire produced.
+    let replayed = &asked[2];
+    assert!(
+        replayed.is_valid(),
+        "the replayed turn is a Messages turn: {:?}\n{}",
+        replayed.failures(),
+        replayed.body_text
+    );
+    assert_eq!(
+        block_types(
+            replayed.body()["messages"]
+                .as_array()
+                .expect("a message list")
+        ),
+        [
+            vec!["<user>".to_string()],
+            vec!["tool_use".to_string()],
+            vec!["tool_result".to_string()],
+        ],
+        "the answer was rendered into this wire's vocabulary rather than forwarded: {}",
+        replayed.body_text
+    );
+    assert!(
+        !replayed.body_text.contains("web_search_call"),
+        "…and the Responses item that has no Messages spelling did not travel: {}",
+        replayed.body_text
+    );
+    assert!(provider.snapshot().is_drained());
+}
+
+/// The same seam, crossed the other way: a Messages answer replayed to the
+/// Responses wire (Decision D122).
+///
+/// The mirror is worth its own run because the two renderings are two pieces of
+/// code and the failure is asymmetric: a `tool_use` block sent to `/v1/responses`
+/// is refused by a closed item-type list, and a `function_call` item sent to
+/// `/v1/messages` is refused by a closed block-type list *and* leaves a
+/// `tool_result` answering a `tool_use` nothing asked for.
+#[test]
+fn a_failover_off_the_messages_wire_rewrites_the_turn_for_the_responses_one() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new("lookup", json!({ "query": "what" }))])
+                .with_server_tools(vec![ServerToolUse::new(
+                    "web_search_20250305",
+                    json!({ "query": "what" }),
+                    json!([{ "type": "web_search_result", "url": "https://docs.example.com/a" }]),
+                )]),
+        ),
+        Script::new(SONNET, Outcome::rate_limit()).times(2),
+        Script::new(GPT5, Outcome::text("I have what I need.")),
+        Script::new(
+            GPT5,
+            Outcome::structured(json!({ "answer": "the fallback finished the loop" })),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke(
+        "server-tools",
+        "flow.cross_from_messages",
+        &[("question", "what?")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(run.outputs()["answer"], "the fallback finished the loop");
+
+    let asked = provider.requests();
+    assert_eq!(
+        asked
+            .iter()
+            .map(|request| (request.surface, request.path.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (Surface::Anthropic, "/v1/messages"),
+            (Surface::Anthropic, "/v1/messages"),
+            (Surface::Responses, "/v1/responses"),
+            (Surface::Anthropic, "/v1/messages"),
+            (Surface::Responses, "/v1/responses"),
+        ],
+        "each call starts at the head of the ladder and falls to the member that answers"
+    );
+
+    let replayed = &asked[2];
+    assert!(
+        replayed.is_valid(),
+        "the replayed turn is a Responses input list: {:?}\n{}",
+        replayed.failures(),
+        replayed.body_text
+    );
+    assert_eq!(
+        replayed.body()["input"]
+            .as_array()
+            .expect("an input list")
+            .iter()
+            .map(|item| item["type"].as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>(),
+        ["message", "function_call", "function_call_output"],
+        "the answer was rendered into this wire's vocabulary rather than forwarded: {}",
+        replayed.body_text
+    );
+    assert!(
+        !replayed.body_text.contains("server_tool_use"),
+        "…and the Messages block that has no Responses spelling did not travel: {}",
+        replayed.body_text
+    );
+    assert!(provider.snapshot().is_drained());
+}
+
+/// The `type` of every content block of every Messages-wire message, in order.
+/// A message whose `content` is a bare string — which is what a user turn is —
+/// reports as `<user>`, since it has no blocks to name.
+fn block_types(messages: &[Value]) -> Vec<Vec<String>> {
+    messages
+        .iter()
+        .map(|message| match message["content"].as_array() {
+            None => vec!["<user>".to_string()],
+            Some(blocks) => blocks
+                .iter()
+                .map(|block| block["type"].as_str().unwrap_or_default().to_string())
+                .collect(),
+        })
+        .collect()
 }
 
 /// `server_tools:` on a kind whose wire this release has not been taught is an
@@ -11455,6 +11726,115 @@ fn a_resumed_run_replays_a_server_tools_answer_without_asking_again() {
         asked[0].server_tools,
         ["web_search_20250305"],
         "and the live call past the frontier still carries the provider's suite"
+    );
+    assert!(
+        asked[0].body_text.contains("the first finding"),
+        "the live call is the second node's, asked about what the replayed answer \
+         wrote: {}",
+        asked[0].body_text
+    );
+}
+
+/// …and the same claim on the **Responses** wire, which is the one the
+/// durability argument was otherwise only made about (Decision D122).
+///
+/// The wire matters to replay for a reason the Messages one does not raise:
+/// this surface answers with a list of items carrying service-minted ids — the
+/// `web_search_call`, the `message`, the `function_call` — and the runtime
+/// replays that list into the next request verbatim. Those ids are therefore
+/// inside the next call's **request identity** (`docs/durability.md` §11.1), so
+/// a resumed generation only derives the same identity if it went on with the
+/// recorded answer rather than a re-read of it. That is exactly what
+/// [`callModel`]'s "the kept answer, not the live one" rule buys, and it is
+/// unfalsifiable without a run: the composition is two calls in a row on this
+/// wire, killed between them.
+///
+/// Nothing Responses-specific is *added* to the identity beyond what the answer
+/// carries — no `previous_response_id`, no continuity token — which is why the
+/// journal's version does not move for this wire either.
+#[test]
+fn a_resumed_run_replays_a_responses_wire_answer_without_asking_again() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        GPT5,
+        Outcome::structured(json!({ "answer": "the first finding" })).with_server_tools(vec![
+            ServerToolUse::new(
+                "web_search",
+                json!({ "type": "search", "query": "the question" }),
+                json!([{ "url": "https://docs.example.com/a" }]),
+            ),
+        ]),
+    ));
+    // Held past the kill, so the frontier lands exactly one effect in.
+    provider.enqueue(Script::new(
+        GPT5,
+        Outcome::structured(json!({ "answer": "the second finding" }))
+            .after(Duration::from_secs(120)),
+    ));
+
+    let Some((project, built)) = harness::build_under_toolchain("server-tools", "resume-responses")
+    else {
+        return;
+    };
+    assert!(
+        built.status.success(),
+        "the server-tools fixture did not build:\n{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+
+    let environment = harness::environment(&provider);
+    let killed = harness::crash_run(
+        &project,
+        &[
+            "run",
+            "flow.relay_responses",
+            "--input",
+            "question=does it?",
+        ],
+        &environment,
+        |_| provider.snapshot().requests >= 2,
+    );
+
+    provider.reset();
+    provider.enqueue(Script::new(
+        GPT5,
+        Outcome::structured(json!({ "answer": "the second finding" })),
+    ));
+
+    let resumed = harness::resume(
+        &project,
+        "server-tools",
+        &killed.execution,
+        Some("json"),
+        &environment,
+    );
+    resumed.succeeded();
+    let answered = resumed.outputs();
+    assert_eq!(answered["status"], "completed", "{answered}");
+    assert_eq!(
+        answered["outputs"]["relayed"], "the first finding",
+        "the replayed Responses answer reaches the resumed run's state: {answered}"
+    );
+    assert_eq!(
+        answered["outputs"]["final"], "the second finding",
+        "{answered}"
+    );
+
+    let asked = provider.requests();
+    assert_eq!(
+        asked.len(),
+        1,
+        "the recorded call is replayed rather than re-issued, on this wire too"
+    );
+    assert_eq!(
+        (asked[0].surface, asked[0].path.as_str()),
+        (Surface::Responses, "/v1/responses"),
+        "…and the one live call is still this connection's wire"
+    );
+    assert_eq!(
+        asked[0].server_tools,
+        ["web_search"],
+        "…still carrying the provider's suite"
     );
     assert!(
         asked[0].body_text.contains("the first finding"),
