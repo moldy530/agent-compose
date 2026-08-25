@@ -1364,6 +1364,13 @@ const BUILTINS: &[Criterion] = &[
                 "every_builtin_runs_inside_its_root_and_answers_the_model",
                 Status::Live,
             ),
+            // …and the one of the four whose answer is a shape rather than a
+            // value: a listing's ordering, its glob, and the flag that says it
+            // stopped short.
+            (
+                "a_listing_matches_globs_in_order_and_says_when_it_stopped_short",
+                Status::Live,
+            ),
             // …and the half of the loop that is not the tool running: a call the
             // schema refuses is the model's to make again, which is what keeps a
             // built-in's contract the same contract every other tool surface has
