@@ -174,6 +174,12 @@ their ranges, and the constraints the vendor states, like web search's allow-lis
 and deny-list being mutually exclusive. A config the provider will refuse is
 otherwise a run that dies on its first model call with a 400 and no span.
 
+On the Messages wire that includes the `name:` beside the `type:`, which is not
+free text: Anthropic pairs each dated type with one fixed name and refuses a
+request whose two disagree. `web_search_20250305` is `web_search`,
+`web_fetch_20250910` is `web_fetch`, and both `code_execution_*` revisions are
+`code_execution`.
+
 A `type:` **outside** it is a warning and is carried to the wire as written:
 
 ```yaml triggers unknown-server-tool
@@ -209,13 +215,43 @@ see" depend on which agent asked.
 Two `settings:` keys change spelling on that wire and the runtime translates
 them: `max_tokens` becomes `max_output_tokens`, and `reasoning_effort` becomes
 `reasoning: { effort }`. Two others have **no** Responses equivalent — `stop:`
-and `seed:` — and reach the service, which refuses them. If you need either,
-keep the suite off that provider and declare a second one for the agents that
-want a search.
+and `seed:` — and are a **compile error** on a model bound to a provider that
+declares a suite:
 
-`openai_compatible` is unaffected: a gateway's suite rides its Chat Completions
-`tools` array verbatim, and every entry there is second-tier, because no table
-could be authoritative about what a gateway honours.
+```yaml triggers unknown-key
+version: "0.1"
+
+provider.searching:
+  kind: openai
+  api_key: ${OPENAI_API_KEY}
+  server_tools:
+    - type: web_search
+
+model.smart:
+  provider: provider.searching
+  id: gpt-5
+  settings:
+    stop: ["\n\n"]
+```
+
+Which wire the connection speaks is the compiler's own decision — one key beside
+another decides it — so a knob that wire will not read is decidable here rather
+than on the first model call. If you need either, keep the suite off that
+provider and declare a second one for the agents that want a search.
+
+**One thing the compiler does not decide: retention.** The Responses API's
+service-side default for `store` is `true`, where Chat Completions' is `false`,
+so a connection that moves onto this wire has its prompts and completions
+retained by the provider where before they were not. The emitted request does
+not pin the key — `store: false` makes the service refuse a replayed `reasoning`
+item, and a tool loop replays every turn it takes — so a deployment with a
+retention policy declares the suite on a provider whose data it may retain, and
+leaves the rest of the graph on a connection that never moved.
+
+`openai_compatible` is unaffected on every count: a gateway keeps Chat
+Completions, its suite rides that request's own `tools` array verbatim, and
+every entry there is second-tier, because no table could be authoritative about
+what a gateway honours.
 
 ### Failover
 
@@ -224,6 +260,11 @@ depends on which member answered. A route whose members declare **different**
 suites is a warning (`mismatched-server-tools`), not a refusal: a fallback vendor
 with no web search is still a fallback, and the compiler's job is to make the
 difference visible rather than to choose for you.
+
+Different means **field for field**, not tool for tool: two members that both
+declare web search and give it `max_uses: 1` and `max_uses: 99` offered the
+model materially different tools, and a copy-then-edit of one provider is
+exactly how that arrives.
 
 ## Models
 

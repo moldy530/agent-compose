@@ -559,7 +559,7 @@ fn the_published_schema_accepts_a_keyless_provider_that_names_its_endpoint() {
 }
 
 /// The published schema knows every server tool the compiler's table does, and
-/// checks each one's shape (grammar 12.1, Decision D122).
+/// checks each one's shape the same way (grammar 12.1, Decision D122).
 ///
 /// The two halves of resolved q30's first tier have to agree, and they are two
 /// hand-written documents: `ast::server_tools` is what `agent-compose validate`
@@ -568,9 +568,13 @@ fn the_published_schema_accepts_a_keyless_provider_that_names_its_endpoint() {
 /// editor on a config the compiler refuses — and both look to an author like
 /// the tool being unsupported.
 ///
-/// So the `type` strings are **derived** from the table rather than listed: a
-/// tool added to the table with no mirrored `if`/`then` in the schema fails
-/// here, on the row it was added for.
+/// So the schema is **derived from** the table rather than compared to a list:
+/// the branch is found by the `type` it accepts, and then every field, every
+/// `required`, every range, every closed choice and every mutually exclusive
+/// pair is read out of the table and asserted against that branch. A tool added
+/// with no mirrored `if`/`then` fails here on the row it was added for, and so
+/// does a *field* added to a row that already has one — which is the drift the
+/// weaker "the type string appears somewhere" reading could not see.
 #[test]
 fn the_published_schema_knows_every_server_tool_the_table_does() {
     let schema = read_schema();
@@ -581,11 +585,12 @@ fn the_published_schema_knows_every_server_tool_the_table_does() {
         (ProviderKind::Anthropic, "anthropicServerTool"),
         (ProviderKind::OpenAi, "openaiServerTool"),
     ] {
-        let published = serde_json::to_string(
-            defs.get(def)
-                .unwrap_or_else(|| panic!("the schema declares `{def}`")),
-        )
-        .expect("a printable subschema");
+        let published = defs
+            .get(def)
+            .unwrap_or_else(|| panic!("the schema declares `{def}`"));
+        let branches = published["allOf"]
+            .as_array()
+            .unwrap_or_else(|| panic!("`{def}` is an `allOf` of one `if`/`then` per tool"));
         let known = compose_core::ast::server_tools::known(kind);
         assert!(
             !known.is_empty(),
@@ -593,14 +598,284 @@ fn the_published_schema_knows_every_server_tool_the_table_does() {
             kind.as_str()
         );
         for tool in known {
-            assert!(
-                published.contains(&format!("\"{}\"", tool.type_name)),
-                "`{}`'s `{}` is in the compiler's table and not in the published schema's `{def}`",
-                kind.as_str(),
-                tool.type_name
+            let branch = branches
+                .iter()
+                .find(|branch| gates_on(branch, tool.type_name))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "`{}`'s `{}` is in the compiler's table and not in the published \
+                         schema's `{def}`",
+                        kind.as_str(),
+                        tool.type_name
+                    )
+                });
+            let subject = format!("`{def}`'s `{}`", tool.type_name);
+            let then = &branch["then"];
+            assert_eq!(
+                then["additionalProperties"],
+                json!(false),
+                "{subject} must be closed, as the compiler's table is"
             );
+            assert!(
+                required_of(then).contains("type"),
+                "{subject} requires its own `type`"
+            );
+            same_object(&subject, then, tool.shape);
+        }
+        // …and the other direction: a branch gating on a `type` the table does
+        // not have would squiggle-check a tool `agent-compose validate` carries
+        // unchecked, which is the second tier's own promise broken from the
+        // editor's side.
+        for branch in branches {
+            for gated in gated_types(branch) {
+                assert!(
+                    compose_core::ast::server_tools::lookup(kind, &gated).is_some(),
+                    "`{def}` checks `{gated}`, which is not in the compiler's `{}` table",
+                    kind.as_str()
+                );
+            }
         }
     }
+}
+
+/// The `type` strings one `if`/`then` branch of a server-tool subschema gates
+/// on. Empty for the `$ref` branch that carries the shared shape.
+fn gated_types(branch: &Value) -> Vec<String> {
+    branch["if"]["properties"]["type"]["enum"]
+        .as_array()
+        .map(|names| {
+            names
+                .iter()
+                .filter_map(|name| name.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether this branch is the one that checks `type_name`.
+fn gates_on(branch: &Value, type_name: &str) -> bool {
+    gated_types(branch).iter().any(|name| name == type_name)
+}
+
+/// The `required` list of one subschema, as a set.
+fn required_of(node: &Value) -> BTreeSet<String> {
+    node["required"]
+        .as_array()
+        .map(|names| {
+            names
+                .iter()
+                .filter_map(|name| name.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// One tool's `then` branch against the table's [`ObjectShape`] for it.
+///
+/// `type` is the row's **identity** rather than one of its fields, so it is
+/// excluded on the schema side here; every nested object goes through
+/// [`same_nested`] instead, where `type` is an ordinary field.
+fn same_object(subject: &str, node: &Value, shape: &compose_core::ast::server_tools::ObjectShape) {
+    let published: BTreeSet<String> = node["properties"]
+        .as_object()
+        .unwrap_or_else(|| panic!("{subject} declares `properties`"))
+        .keys()
+        .filter(|key| *key != "type")
+        .cloned()
+        .collect();
+    let tabled: BTreeSet<String> = shape
+        .names()
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
+    assert_eq!(
+        published, tabled,
+        "{subject} and the compiler's table disagree about which fields the tool has"
+    );
+    let published_required: BTreeSet<String> = required_of(node)
+        .into_iter()
+        .filter(|key| key != "type")
+        .collect();
+    let tabled_required: BTreeSet<String> = shape
+        .required
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
+    assert_eq!(
+        published_required, tabled_required,
+        "{subject} and the compiler's table disagree about which fields are required"
+    );
+    // The mutually exclusive pairs, which the schema spells as a `not`/`required`
+    // beside the properties.
+    let published_pairs: BTreeSet<Vec<String>> = node["allOf"]
+        .as_array()
+        .map(|clauses| {
+            clauses
+                .iter()
+                .filter_map(|clause| {
+                    let pair: Vec<String> = required_of(&clause["not"]).into_iter().collect();
+                    (!pair.is_empty()).then_some(pair)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let tabled_pairs: BTreeSet<Vec<String>> = shape
+        .exclusive
+        .iter()
+        .map(|[left, right]| {
+            let mut pair = vec![(*left).to_string(), (*right).to_string()];
+            pair.sort();
+            pair
+        })
+        .collect();
+    assert_eq!(
+        published_pairs, tabled_pairs,
+        "{subject} and the compiler's table disagree about which fields exclude each other"
+    );
+    for field in shape.fields {
+        same_field(
+            &format!("{subject}'s `{}`", field.name),
+            &node["properties"][field.name],
+            field.shape,
+        );
+    }
+}
+
+/// A nested config object, where `type` **is** an ordinary field —
+/// `user_location: { type: approximate }`.
+fn same_nested(subject: &str, node: &Value, shape: &compose_core::ast::server_tools::ObjectShape) {
+    assert_eq!(node["type"], json!("object"), "{subject} is a mapping");
+    assert_eq!(
+        node["additionalProperties"],
+        json!(false),
+        "{subject} is closed, as the compiler's table is"
+    );
+    let published: BTreeSet<String> = node["properties"]
+        .as_object()
+        .unwrap_or_else(|| panic!("{subject} declares `properties`"))
+        .keys()
+        .cloned()
+        .collect();
+    let tabled: BTreeSet<String> = shape
+        .names()
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
+    assert_eq!(
+        published, tabled,
+        "{subject} and the compiler's table disagree about which keys it has"
+    );
+    let tabled_required: BTreeSet<String> = shape
+        .required
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
+    assert_eq!(
+        required_of(node),
+        tabled_required,
+        "{subject} and the compiler's table disagree about which keys are required"
+    );
+    for field in shape.fields {
+        same_field(
+            &format!("{subject}.`{}`", field.name),
+            &node["properties"][field.name],
+            field.shape,
+        );
+    }
+}
+
+/// One field's subschema against the [`FieldShape`] the compiler checks it with.
+fn same_field(subject: &str, node: &Value, shape: compose_core::ast::server_tools::FieldShape) {
+    use compose_core::ast::server_tools::FieldShape;
+    match shape {
+        FieldShape::Integer(low, high) => {
+            assert_eq!(node["type"], json!("integer"), "{subject} is an integer");
+            same_bound(
+                subject,
+                node,
+                "minimum",
+                (low != i64::MIN).then_some(low as f64),
+            );
+            same_bound(
+                subject,
+                node,
+                "maximum",
+                (high != i64::MAX).then_some(high as f64),
+            );
+        }
+        FieldShape::Number(low, high) => {
+            assert_eq!(node["type"], json!("number"), "{subject} is a number");
+            same_bound(subject, node, "minimum", Some(low));
+            same_bound(subject, node, "maximum", Some(high));
+        }
+        FieldShape::Boolean => {
+            assert_eq!(node["type"], json!("boolean"), "{subject} is a boolean");
+        }
+        // Interpolable, like every other non-secret provider value (grammar 4.3
+        // class 2), which on the schema side is the shared `interpolatedString`.
+        FieldShape::Text => {
+            assert_eq!(
+                node["$ref"],
+                json!("#/$defs/interpolatedString"),
+                "{subject} is an interpolable string"
+            );
+        }
+        FieldShape::Choice(choices) => {
+            let published = variants(node)
+                .unwrap_or_else(|| panic!("{subject} is a closed set of strings in the schema"));
+            let tabled: BTreeSet<String> = choices.iter().map(|name| (*name).to_string()).collect();
+            assert_eq!(
+                published, tabled,
+                "{subject} and the compiler's table disagree about the accepted values"
+            );
+        }
+        FieldShape::Strings => {
+            assert_eq!(node["type"], json!("array"), "{subject} is an array");
+            assert_eq!(
+                node["items"]["$ref"],
+                json!("#/$defs/interpolatedString"),
+                "{subject} holds interpolable strings"
+            );
+        }
+        FieldShape::Object(nested) => same_nested(subject, node, nested),
+        FieldShape::TextOrObject(nested) => {
+            let arms = node["anyOf"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{subject} is a string **or** a mapping"));
+            assert!(
+                arms.iter()
+                    .any(|arm| arm["$ref"] == json!("#/$defs/interpolatedString")),
+                "{subject} takes an interpolable string"
+            );
+            let object = arms
+                .iter()
+                .find(|arm| arm["type"] == json!("object"))
+                .unwrap_or_else(|| panic!("{subject} takes a mapping too"));
+            same_nested(subject, object, nested);
+        }
+    }
+}
+
+/// One numeric bound, present exactly when the table states one.
+fn same_bound(subject: &str, node: &Value, keyword: &str, expected: Option<f64>) {
+    let published = node[keyword].as_f64();
+    assert_eq!(
+        published, expected,
+        "{subject} and the compiler's table disagree about `{keyword}`"
+    );
+}
+
+/// The strings a closed subschema accepts, however it spells the closure.
+fn variants(node: &Value) -> Option<BTreeSet<String>> {
+    if let Some(only) = node["const"].as_str() {
+        return Some(BTreeSet::from([only.to_string()]));
+    }
+    node["enum"].as_array().map(|names| {
+        names
+            .iter()
+            .filter_map(|name| name.as_str().map(str::to_string))
+            .collect()
+    })
 }
 
 /// Every kind the compiler admits `server_tools:` on accepts one in the

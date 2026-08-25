@@ -175,10 +175,33 @@ const CITATIONS: ObjectShape = ObjectShape {
 };
 
 /// Every Messages-wire server tool's `name:`, which the API requires beside the
-/// `type:` and which must be the tool's canonical name.
-const NAME: Field = Field {
+/// `type:` and which **must be the tool's canonical name**.
+///
+/// A closed choice of one rather than free text, because the constraint is the
+/// vendor's: the Messages API pairs each dated `type:` with one fixed `name:` —
+/// `web_search_20250305` is `web_search`, `web_fetch_20250910` is `web_fetch`,
+/// either `code_execution_*` is `code_execution` — and answers a request whose
+/// two disagree with a 400. That is precisely the failure the strict tier
+/// exists to move to compile time, and a shape that only asked for *a* string
+/// would let a copied-and-edited config through to it.
+///
+/// One [`Field`] per canonical name rather than a shared constant, since the
+/// name is what makes the row's own `type:` legal on the wire.
+const WEB_SEARCH_NAME: Field = Field {
     name: "name",
-    shape: FieldShape::Text,
+    shape: FieldShape::Choice(&["web_search"]),
+};
+
+/// See [`WEB_SEARCH_NAME`].
+const WEB_FETCH_NAME: Field = Field {
+    name: "name",
+    shape: FieldShape::Choice(&["web_fetch"]),
+};
+
+/// See [`WEB_SEARCH_NAME`]. Both dated code-execution revisions carry it.
+const CODE_EXECUTION_NAME: Field = Field {
+    name: "name",
+    shape: FieldShape::Choice(&["code_execution"]),
 };
 
 const CACHE_CONTROL: ObjectShape = ObjectShape {
@@ -192,7 +215,7 @@ const CACHE_CONTROL: ObjectShape = ObjectShape {
 
 const WEB_SEARCH_SHAPE: ObjectShape = ObjectShape {
     fields: &[
-        NAME,
+        WEB_SEARCH_NAME,
         Field {
             name: "max_uses",
             shape: FieldShape::Integer(1, i64::MAX),
@@ -223,7 +246,7 @@ const WEB_SEARCH_SHAPE: ObjectShape = ObjectShape {
 
 const WEB_FETCH_SHAPE: ObjectShape = ObjectShape {
     fields: &[
-        NAME,
+        WEB_FETCH_NAME,
         Field {
             name: "max_uses",
             shape: FieldShape::Integer(1, i64::MAX),
@@ -254,7 +277,17 @@ const WEB_FETCH_SHAPE: ObjectShape = ObjectShape {
 };
 
 const CODE_EXECUTION_SHAPE: ObjectShape = ObjectShape {
-    fields: &[NAME],
+    fields: &[
+        CODE_EXECUTION_NAME,
+        // `cache_control:` is a property of a **tool definition** on this wire
+        // rather than of any one tool, so it is here for the same reason it is
+        // on the two above: the request carries it, and a row that left it out
+        // would refuse a config the service takes.
+        Field {
+            name: "cache_control",
+            shape: FieldShape::Object(&CACHE_CONTROL),
+        },
+    ],
     required: &["name"],
     exclusive: &[],
 };
@@ -603,6 +636,47 @@ mod tests {
                 kind.as_str()
             );
         }
+    }
+
+    /// Every Messages-wire row pins its `name:` to the one canonical name the
+    /// vendor pairs with that `type:` — a closed choice of exactly one, not
+    /// free text (see [`WEB_SEARCH_NAME`]).
+    ///
+    /// Stated over the table so a row added later has to answer it: the
+    /// Messages API 400s on a `type:`/`name:` pair that disagrees, and a shape
+    /// that only asked for *a* string would let that through to the first model
+    /// call, which is the failure the strict tier exists to move here.
+    #[test]
+    fn every_messages_wire_tool_pins_its_canonical_name() {
+        for tool in known(ProviderKind::Anthropic) {
+            assert!(
+                tool.shape.required.contains(&"name"),
+                "`{}` requires the `name:` the wire requires beside its `type:`",
+                tool.type_name
+            );
+            match tool.shape.field("name") {
+                Some(FieldShape::Choice([_])) => {}
+                other => panic!(
+                    "`{}`'s `name:` is {other:?} rather than the one name the wire pairs with it",
+                    tool.type_name
+                ),
+            }
+        }
+        assert_eq!(
+            lookup(ProviderKind::Anthropic, "web_search_20250305")
+                .expect("the launch scope has web search")
+                .shape
+                .field("name"),
+            Some(FieldShape::Choice(&["web_search"]))
+        );
+        assert_eq!(
+            lookup(ProviderKind::Anthropic, "code_execution_20250825")
+                .expect("the launch scope has the newer code execution")
+                .shape
+                .field("name"),
+            Some(FieldShape::Choice(&["code_execution"])),
+            "both dated revisions carry the same canonical name"
+        );
     }
 
     #[test]
