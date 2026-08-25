@@ -1154,6 +1154,14 @@ const DURABILITY: &[Criterion] = &[
                 "a_composition_with_no_server_tools_keeps_the_identity_it_always_derived",
                 Status::Live,
             ),
+            // …and the same argument on the second key `JOURNAL_VERSION` did not
+            // move for: a Messages-wire turn is replayed untagged, so a tool loop
+            // on that wire puts no `wire` key in the identity either
+            // (`docs/durability.md` §3.1).
+            (
+                "a_messages_wire_tool_loop_keeps_the_untagged_turns_it_always_derived",
+                Status::Live,
+            ),
             // …the other divergence resolved q29 names, which is not a request
             // that moved but an answer this composition no longer accepts.
             (
