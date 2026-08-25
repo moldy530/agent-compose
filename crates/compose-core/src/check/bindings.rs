@@ -21,7 +21,7 @@
 //! D14, D75).
 
 use crate::ast::common::Namespace;
-use crate::ast::definition::{AgentAccess, StoreKind};
+use crate::ast::definition::{AgentAccess, ProviderKind, StoreKind};
 use crate::cel::Scope;
 use crate::cel::ty::Type;
 use crate::diag::{Diagnostic, DiagnosticCode, Span, Spanned};
@@ -471,12 +471,24 @@ fn store_tool_collisions(ctx: &mut Ctx, address: &str, agent: &Agent) {
 /// other side: the model is offered two different things under one name, and
 /// the Messages API answers such a request 400.
 ///
-/// **The Messages wire only**, and that is the rule rather than a gap. It is the
-/// one wire where a server tool and a client tool sit under the same key: a
-/// Responses built-in is addressed by its `type:` while a function tool carries
-/// a `name:`, two different keys that cannot collide, and no table could say
-/// what a gateway keys its vocabulary on (`check::providers`'s `Slot`). Which
-/// providers the agent might reach is the ladder's whole width — a route's
+/// **The Messages wire only**, and that is the rule rather than a gap — which
+/// is why the loop below is keyed on [`ProviderKind::Anthropic`] rather than on
+/// whether a name is knowable. It is the one wire where a server tool and a
+/// client tool sit under the same key: a Responses built-in is addressed by its
+/// `type:` while a function tool carries a `name:`, two different keys that
+/// cannot collide. Chat Completions is the same shape one level down — a
+/// function tool's name lives at `tools[i].function.name` while a suite entry's
+/// `name:` is the entry's own key — and above that, no table could say what a
+/// gateway keys its vocabulary on, so `openai_compatible` is out for both
+/// reasons at once (`check::providers`'s `Slot`, grammar 12.1, D122).
+///
+/// A suite entry's `name:` is still compared against the **rest of its own
+/// suite** on every kind, which is a different claim and stays where it is
+/// (`check::providers`'s `suite_collisions`): two entries of one array under one
+/// key are two tools under one identity by the author's own reckoning, whatever
+/// the wire keys on.
+///
+/// Which providers the agent might reach is the ladder's whole width — a route's
 /// members each declare their own suite, and any of them may serve the call.
 fn server_tool_collisions(ctx: &mut Ctx, address: &str, agent: &Agent) {
     let mut offered: Vec<(String, Span, String)> = agent
@@ -512,6 +524,9 @@ fn server_tool_collisions(ctx: &mut Ctx, address: &str, agent: &Agent) {
     }
     let providers = super::providers::providers_of(ctx, &agent.model.value);
     for (provider_address, provider) in providers {
+        if provider.kind != ProviderKind::Anthropic {
+            continue;
+        }
         for server in &provider.config.server_tools {
             let Some(name) = super::providers::wire_name(provider.kind, server) else {
                 continue;
@@ -682,6 +697,108 @@ flow.f:
 "#
             ),
             Vec::<String>::new()
+        );
+    }
+
+    /// …and the same over a **gateway**, which is the other half of the same
+    /// sentence and the one a compiler is likeliest to get wrong by accident.
+    ///
+    /// `openai_compatible` is off this rule for two reasons at once, either of
+    /// which is enough. No table could say what key a gateway addresses its
+    /// vocabulary on — that is the whole reason every entry on the kind is
+    /// second-tier — and the surface it rides is Chat Completions, where a
+    /// client tool's name lives at `tools[i].function.name` while a suite entry
+    /// carries its `name:` at the top of its own object: two keys, not one.
+    ///
+    /// The failure this pins is a legal composition refused with no workaround
+    /// but renaming, against a published grammar (§12.1, D122) that tells the
+    /// author it compiles. The entry's `unknown-server-tool` warning is the
+    /// whole of what this release has to say about it.
+    #[test]
+    fn a_gateways_suite_is_not_compared_with_the_agents_own_tools() {
+        assert_eq!(
+            codes(
+                r#"
+provider.g:
+  kind: openai_compatible
+  base_url: ${GATEWAY_URL}
+  server_tools:
+    - type: retrieval
+      name: search_docs
+model.m:
+  provider: provider.g
+  id: qwen3-coder-30b
+tool.search_docs:
+  description: Search the docs the long way round.
+  input:
+    query: { type: string }
+  output:
+    value: { type: string }
+  exec:
+    command: search-the-docs
+agent.a:
+  model: model.m
+  prompt: Decide.
+  tools: [tool.search_docs]
+  output:
+    verdict: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    n: { agent: agent.a, input: "'x'" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }
+"#
+            ),
+            ["unknown-server-tool"],
+            "a gateway's suite is carried unchecked, and that includes not \
+             deciding whose name space its `name:` lands in"
+        );
+    }
+
+    /// A **store**'s synthesized tools reach the same rule by the same route, so
+    /// the wire gate has to hold for them too: an `openai_compatible` connection
+    /// whose suite names `notes_get` beside an attached `store.notes` is the
+    /// same legal composition as the one above, spelled with the name the
+    /// runtime makes rather than one the author wrote.
+    #[test]
+    fn a_gateways_suite_is_not_compared_with_a_synthesized_store_tool_either() {
+        assert_eq!(
+            codes(
+                r#"
+provider.g:
+  kind: openai_compatible
+  base_url: ${GATEWAY_URL}
+  server_tools:
+    - type: retrieval
+      name: notes_get
+model.m:
+  provider: provider.g
+  id: qwen3-coder-30b
+store.notes:
+  kind: kv
+  scope: execution
+  description: What the run has been told.
+  agent_access: read
+  value_schema:
+    theme: { type: string }
+agent.a:
+  model: model.m
+  prompt: Decide.
+  stores: [store.notes]
+  output:
+    verdict: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    n: { agent: agent.a, input: "'x'" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }
+"#
+            ),
+            ["unknown-server-tool"]
         );
     }
 }
