@@ -90,8 +90,15 @@ model.searching_claude:
 model.searching_gpt:
   provider: provider.searching_openai
   id: gpt-5
+  # Both settings the runtime **renames** on its way to the Responses wire, on
+  # the one model that reaches it: `max_tokens` becomes `max_output_tokens` and
+  # `reasoning_effort` becomes `reasoning: { effort }` (`WIRE-NOTES` (20)). The
+  # mock's key list is closed and holds only the translated spellings, so a
+  # release that stopped translating either one is a 400 on the first call of
+  # every flow below rather than a knob the service silently ignored.
   settings:
     max_tokens: 4096
+    reasoning_effort: high
 
 model.plain_gpt:
   provider: provider.plain_openai
