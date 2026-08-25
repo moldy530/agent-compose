@@ -1410,6 +1410,26 @@ const BUILTINS: &[Criterion] = &[
                 "a_symlink_that_points_out_of_the_root_is_refused",
                 Status::Live,
             ),
+            // …and the two shapes of that same crossing where there is nothing
+            // at the path to resolve, which is where q31 says the *parent* is
+            // resolved instead: a link pointing at a file that does not exist
+            // yet, and a new file under a linked directory. Both are writes, and
+            // a write is the one built-in whose escape leaves something behind.
+            (
+                "a_write_through_a_dangling_symlink_is_refused",
+                Status::Live,
+            ),
+            (
+                "a_write_to_a_new_file_under_a_symlinked_directory_is_refused",
+                Status::Live,
+            ),
+            // …and the crossing that asks no path at all: a listing walks where
+            // the tree goes, so it is the root check's other half — the walk
+            // stops at a link rather than reporting what is behind it.
+            (
+                "a_listing_does_not_descend_into_a_symlinked_directory",
+                Status::Live,
+            ),
             // …and the two ways a bound can fail to be a bound at all: a root
             // that names no directory, and one the environment answered with
             // nothing — which would leave the tool bounded to wherever the

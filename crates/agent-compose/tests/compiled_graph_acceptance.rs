@@ -12233,6 +12233,174 @@ fn a_symlink_that_points_out_of_the_root_is_refused() {
     );
 }
 
+/// A **write** through a symlink whose target does not exist yet is refused
+/// rather than creating the file the link points at (PRD resolved q31).
+///
+/// This is the escape a resolution check can pass *by resolving nothing*.
+/// Resolving the whole path fails — there is nothing at the other end of the
+/// link — so what is left is the not-yet-existing case, where the **parent** is
+/// resolved and the last component appended: the parent is the root itself, the
+/// result sits under it, and every check says yes. `writeFile` then follows the
+/// link and creates a file outside the bound. Refusing the dangling link is what
+/// closes that, and the target being a path that does not exist yet is exactly
+/// what makes it a file this call would have created.
+#[cfg(unix)]
+#[test]
+fn a_write_through_a_dangling_symlink_is_refused() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (scratch, environment) = bounded_root(&provider, "builtins-dangling");
+    let outside = scratch.path().join("not-yet.txt");
+    assert!(
+        !outside.exists(),
+        "the link points at nothing to begin with"
+    );
+    std::os::unix::fs::symlink(&outside, root_of(&scratch).join("dangling.txt"))
+        .expect("the root is writable");
+
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::tool_calls(vec![ToolCall::new(
+            "write_file",
+            json!({ "path": "dangling.txt", "content": "written out of the root" }),
+        )]),
+    ));
+
+    let Some(run) = harness::invoke_with(
+        "builtin-tools",
+        "flow.work",
+        &json!({ "goal": "write through the link" }),
+        &environment,
+    ) else {
+        return;
+    };
+    let said = run.failed();
+    assert!(
+        said.contains("will not follow `dangling.txt`")
+            && said.contains("symbolic link whose target does not exist"),
+        "a link with nothing to resolve is refused rather than written through: {said}"
+    );
+    assert!(
+        !outside.exists(),
+        "the write reached `{}`, outside the root",
+        outside.display()
+    );
+    let calls = tool_calls_of(&run, "do");
+    assert_eq!(calls[0]["outcome"], "failed");
+}
+
+/// A write to a file that does not exist yet, under a directory that is a
+/// **symlink out of the root**, is refused — which is the case resolved q31
+/// names in as many words ("a write to a not-yet-existing path resolves its
+/// parent").
+///
+/// Nothing at the requested path exists, so there is nothing to resolve whole;
+/// where the *parent* really is decides the call. A runtime that checked the
+/// lexically-resolved path instead would find no `..` in `linkdir/new.txt`,
+/// agree it sits under the root, and write into a directory the composition
+/// never granted.
+#[cfg(unix)]
+#[test]
+fn a_write_to_a_new_file_under_a_symlinked_directory_is_refused() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (scratch, environment) = bounded_root(&provider, "builtins-linked-parent");
+    let outside = scratch.path().join("elsewhere");
+    std::fs::create_dir_all(&outside).expect("the scratch area is writable");
+    std::os::unix::fs::symlink(&outside, root_of(&scratch).join("linkdir"))
+        .expect("the root is writable");
+
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::tool_calls(vec![ToolCall::new(
+            "write_file",
+            json!({ "path": "linkdir/new.txt", "content": "written out of the root" }),
+        )]),
+    ));
+
+    let Some(run) = harness::invoke_with(
+        "builtin-tools",
+        "flow.work",
+        &json!({ "goal": "write through the linked directory" }),
+        &environment,
+    ) else {
+        return;
+    };
+    let said = run.failed();
+    assert!(
+        said.contains("resolves outside `root:`") && said.contains("linkdir/new.txt"),
+        "a new file is checked against where its parent really is: {said}"
+    );
+    assert!(
+        !outside.join("new.txt").exists(),
+        "the write reached `{}`, outside the root",
+        outside.join("new.txt").display()
+    );
+    let calls = tool_calls_of(&run, "do");
+    assert_eq!(calls[0]["outcome"], "failed");
+}
+
+/// A listing **does not descend into** a symlinked directory, so no path outside
+/// the root reaches the model through a walk nobody asked a path check of
+/// (grammar 5.5, PRD resolved q31).
+///
+/// `list` is the one built-in that answers with paths the model never named: a
+/// glob walk goes wherever the tree goes, and every entry it finds is reported
+/// without going back through the root check the *listed* path went through. Not
+/// following links is what keeps that sound. The link itself is still an entry —
+/// reported as a link, without the trailing `/` a directory gets — and reading
+/// it is a `read_file` call, where the check is asked and refused.
+#[cfg(unix)]
+#[test]
+fn a_listing_does_not_descend_into_a_symlinked_directory() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (scratch, environment) = bounded_root(&provider, "builtins-linked-listing");
+    let root = root_of(&scratch);
+    let outside = scratch.path().join("elsewhere");
+    std::fs::create_dir_all(&outside).expect("the scratch area is writable");
+    std::fs::write(outside.join("not-for-the-model.txt"), "x")
+        .expect("the scratch area is writable");
+    // …and a real subdirectory beside the link, so what the walk *does* descend
+    // into is asserted in the same answer as what it does not.
+    std::fs::create_dir_all(root.join("sub")).expect("the root is writable");
+    std::fs::write(root.join("a.txt"), "x").expect("the root is writable");
+    std::fs::write(root.join("sub/b.txt"), "x").expect("the root is writable");
+    std::os::unix::fs::symlink(&outside, root.join("linkdir")).expect("the root is writable");
+
+    provider.enqueue_all([
+        // `**` spans segments, so this asks for everything the walk can reach.
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "list",
+                json!({ "path": ".", "glob": "**" }),
+            )]),
+        ),
+        Script::new(SONNET, Outcome::text("I have the listing.")),
+        Script::new(SONNET, Outcome::structured(json!({ "summary": "listed" }))),
+    ]);
+
+    let Some(run) = harness::invoke_with(
+        "builtin-tools",
+        "flow.work",
+        &json!({ "goal": "list everything" }),
+        &environment,
+    ) else {
+        return;
+    };
+    run.succeeded();
+
+    let handed = provider.requests()[1].body().to_string();
+    assert!(
+        handed.contains(r#"[\"a.txt\",\"linkdir\",\"sub/\",\"sub/b.txt\"]"#),
+        "the walk descended the real directory and stopped at the link, which is \
+         reported as an entry rather than as a directory: {handed}"
+    );
+    assert!(
+        !handed.contains("not-for-the-model.txt"),
+        "a name from outside the root reached the model through the listing: {handed}"
+    );
+    assert!(provider.snapshot().is_drained());
+}
+
 /// A command that outruns its attachment's `timeout:` is **killed**, and the
 /// call fails the node (grammar 5.5, PRD resolved q31).
 ///
