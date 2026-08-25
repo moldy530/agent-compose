@@ -1,6 +1,16 @@
 provider.anthropic:
   kind: anthropic
   api_key: ${ANTHROPIC_API_KEY}
+  # A tool the *provider* runs, inside the model call: the compiled graph
+  # dispatches nothing and the results arrive woven into the assistant's turn
+  # (grammar 12.1, Decision D122). Written in Anthropic's own wire vocabulary,
+  # and appended to the `tools` of every request this connection serves — after
+  # the agent's own, which the emitted `src/graph.ts` pins.
+  server_tools:
+    - type: web_search_20250305
+      name: web_search
+      max_uses: 3
+      allowed_domains: ["docs.example.com"]
 
 # Same graph, local inference: only the connection layer changes (PRD 5.9).
 provider.local:

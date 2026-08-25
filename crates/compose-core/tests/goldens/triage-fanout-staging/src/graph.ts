@@ -186,6 +186,11 @@ const providerAnthropic: runtime.ProviderBinding = {
   get apiKey(): string {
     return runtime.environmentValue("ANTHROPIC_API_KEY", "provider.anthropic.api_key");
   },
+  get serverTools(): readonly runtime.ServerToolConfig[] {
+    return [
+      { "type": "web_search_20250305", "allowed_domains": ["docs.example.com"], "max_uses": 3, "name": "web_search" },
+    ];
+  },
 };
 
 /**
