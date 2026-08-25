@@ -12602,6 +12602,122 @@ fn a_root_that_resolves_to_nothing_fails_the_call() {
     );
 }
 
+/// A `root:` naming a directory that does not exist fails the call, as itself
+/// (grammar 5.5).
+///
+/// The root is resolved once per call precisely so that this is reported as the
+/// bound being wrong rather than as every path inside it failing to resolve, and
+/// it is an *execution* failure, so `retry:`/`on_error:` decide the run
+/// (Decision D119). Nothing else in the suite holds that message, and the
+/// degradation it guards against is quiet: a `root:` pointing at a **file**, or
+/// at a path with a typo, would otherwise surface as a confusing per-path error
+/// from inside the tool.
+#[test]
+fn a_root_that_names_no_directory_fails_the_call() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (scratch, mut environment) = bounded_root(&provider, "builtins-absent-root");
+    let absent = scratch.path().join("not-a-directory");
+    environment.push(("BUILTIN_ROOT".to_string(), absent.display().to_string()));
+
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::tool_calls(vec![ToolCall::new(
+            "read_file",
+            json!({ "path": "notes.txt" }),
+        )]),
+    ));
+
+    let Some(run) = harness::invoke_with(
+        "builtin-tools",
+        "flow.work",
+        &json!({ "goal": "read a note" }),
+        &environment,
+    ) else {
+        return;
+    };
+    let said = run.failed();
+    assert!(
+        said.contains("is not a directory that exists") && said.contains("${BUILTIN_ROOT}"),
+        "the failure is the root's, named as the root: {said}"
+    );
+    let calls = tool_calls_of(&run, "do");
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_eq!(calls[0]["outcome"], "failed");
+}
+
+/// A host with **no `bash` on `PATH`** fails the call with an error naming the
+/// requirement (PRD resolved q31, grammar 5.5).
+///
+/// q31 fixes the posture: the shell is "resolved from `PATH` at runtime, and a
+/// host with no bash fails the call as an execution failure with an error naming
+/// the requirement" — the compiler does not decide at build time what a
+/// deployment machine has. So the `PATH` the graph runs under is the subject
+/// here, and it carries the JavaScript runtime and nothing else: an empty one
+/// would decide the test before the graph started.
+#[cfg(unix)]
+#[test]
+fn a_host_with_no_bash_on_path_fails_the_call_naming_the_requirement() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (scratch, mut environment) = bounded_root(&provider, "builtins-no-bash");
+    let Some(path) = a_path_without_bash(&scratch) else {
+        return;
+    };
+    environment.push(("PATH".to_string(), path));
+
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::tool_calls(vec![ToolCall::new(
+            "bash",
+            json!({ "command": "printf 'ran'" }),
+        )]),
+    ));
+
+    let Some(run) = harness::invoke_with(
+        "builtin-tools",
+        "flow.work",
+        &json!({ "goal": "run something" }),
+        &environment,
+    ) else {
+        return;
+    };
+    let said = run.failed();
+    assert!(
+        said.contains("this host has no `bash` on `PATH`"),
+        "a missing shell is reported as the requirement it is, not as an errno: {said}"
+    );
+    let calls = tool_calls_of(&run, "do");
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_eq!(calls[0]["outcome"], "failed");
+}
+
+/// A `PATH` holding the JavaScript runtime and no `bash`, or `None` when the
+/// toolchain is absent and the caller has nothing to run.
+///
+/// The harness starts an emitted project with `bun`, which it may resolve from
+/// `PATH` by name — so the directory is built rather than emptied: one link to
+/// the runtime, and nothing else on it.
+#[cfg(unix)]
+fn a_path_without_bash(scratch: &harness::Scratch) -> Option<String> {
+    let runtime = harness::bun_command()?;
+    let program = std::path::PathBuf::from(runtime.get_program());
+    let executable = if program.is_absolute() {
+        program
+    } else {
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|directory| directory.join(&program))
+            .find(|candidate| candidate.is_file())
+            .expect("the runtime was found on `PATH`, so it is on it")
+    };
+    let bin = scratch.path().join("bin");
+    std::fs::create_dir_all(&bin).expect("the scratch area is writable");
+    std::os::unix::fs::symlink(executable, bin.join("bun")).expect("the scratch area is writable");
+    assert!(
+        !bin.join("bash").exists(),
+        "the point of this directory is the shell it does not hold"
+    );
+    Some(bin.display().to_string())
+}
+
 /// Every `ToolCallRecord` one agent node's model calls filed, in call order
 /// (`docs/trace.md` §7.3).
 fn tool_calls_of(run: &harness::Invocation, node: &str) -> Vec<Value> {
