@@ -1011,7 +1011,15 @@ root as its working directory.
 **`timeout:` is required on `builtin.bash`** and is a §4.4 duration. It bounds
 one command; §9.2's node-level `timeout:` bounds the whole agent node, deadline
 included, and the two compose rather than replace one another. `timeout:` on a
-file tool is an unknown key — there is no command there to bound.
+file tool is an unknown key — there is no command there to bound. What bounds a
+file tool is that node-level deadline: a `builtin.list` walk stops where it is
+when the node's `timeout:` runs out or the run is cancelled, rather than
+finishing a listing the graph has already stopped waiting for
+([D124](#d124-a-built-ins-deadline-kills-the-commands-process-group-not-just-the-shell)).
+
+`builtin.list`'s `glob` matches `*` and `?` within one path segment and `**`
+across them, which is the spelling most tools use. `**` matches *zero* or more
+segments, so a run of them accepts exactly what one accepts.
 
 What the deadline kills is the shell **and every process it started**, and what
 it ends is the **call**. The command runs in a process group of its own and the
@@ -6665,7 +6673,17 @@ handlers exist only for as long as a command does.
 identically, and containing them is the distribution work's, beside the container
 and syscall isolation §5.5 defers there. The runtime stops **reading** what such a
 process holds rather than waiting on it, so the call is still bounded even when
-the process is not. *PRD resolved q31, §5.5, §9.2.*
+the process is not.
+
+**The same rule inside this process.** `builtin.list` is the one built-in whose
+work is the runtime's own — a walk over a directory the model named, matching a
+glob the model wrote — and both of those size it. An abort stops that walk where
+it is, for the reason it kills a process group: an activity the graph has stopped
+*waiting* for is not an activity that may go on working, and a compiled graph is
+embedded code, so a listing left running is a core taken from every other
+execution in the same process. The walk also hands the event loop back as it
+goes, because a deadline is a timer and a timer cannot fire inside work that
+never yields. *PRD resolved q31, §5.5, §9.2.*
 
 ---
 
