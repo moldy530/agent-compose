@@ -1386,6 +1386,13 @@ const BUILTINS: &[Criterion] = &[
                 "a_resumed_run_consumes_a_recorded_builtin_instead_of_running_it_again",
                 Status::Live,
             ),
+            // …and the one thing q31 says about *where* the shell comes from:
+            // `PATH`, at the call, with a host that has none failing as an
+            // execution failure that names the requirement.
+            (
+                "a_host_with_no_bash_on_path_fails_the_call_naming_the_requirement",
+                Status::Live,
+            ),
         ],
     },
     Criterion {
@@ -1403,9 +1410,14 @@ const BUILTINS: &[Criterion] = &[
                 "a_symlink_that_points_out_of_the_root_is_refused",
                 Status::Live,
             ),
-            // …and the bound the environment can answer with nothing, which
-            // would leave the tool bounded to wherever the runtime was started —
-            // the ambient capability D123 refuses.
+            // …and the two ways a bound can fail to be a bound at all: a root
+            // that names no directory, and one the environment answered with
+            // nothing — which would leave the tool bounded to wherever the
+            // runtime was started, the ambient capability D123 refuses.
+            (
+                "a_root_that_names_no_directory_fails_the_call",
+                Status::Live,
+            ),
             (
                 "a_root_that_resolves_to_nothing_fails_the_call",
                 Status::Live,
