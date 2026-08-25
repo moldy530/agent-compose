@@ -197,6 +197,69 @@ An inline node's `query:`/`body:` CEL is **flow**-scoped (`input`, `state`,
 key that would carry it — `body:` on a body-bearing method, `query:` on
 `GET`/`HEAD` — is a compile error rather than a silently ignored key.
 
+## Runtime built-ins
+
+Four tools the runtime implements — a shell and three file operations — are
+attached from an agent's `tools:` list, **one name per entry**, each carrying the
+bounds it runs under. They are the boilerplate removed from a `tool.*` an author
+could already have hand-rolled with `exec:`, and they move the trust boundary
+nowhere: a model holding `builtin.bash` holds arbitrary code execution on the
+host running the graph.
+
+```yaml
+agent.fixer:
+  model: model.smart
+  prompt: Fix the failing test, then say what you changed.
+  tools:
+    - tool.repo_grep
+    - builtin.read_file:  { root: "${WORKSPACE}" }
+    - builtin.write_file: { root: "${WORKSPACE}" }
+    - builtin.list:       { root: "${WORKSPACE}" }
+    - builtin.bash:       { root: "${WORKSPACE}", timeout: 30s }
+  output:
+    summary: { type: string }
+```
+
+| Built-in | Arguments | Result |
+|---|---|---|
+| `builtin.bash` | `command` | `stdout`, `stderr` |
+| `builtin.read_file` | `path` | `content` |
+| `builtin.write_file` | `path`, `content` | `bytes_written` |
+| `builtin.list` | `path` (default `.`), `glob` (default none) | `entries`, `truncated` |
+
+The set is closed. There is no key that grants all four, and no ambient default:
+which capabilities an agent holds is meant to be readable off the entries that
+hold them.
+
+**`root:` is required on all four.** Every path argument is relative to it, and a
+path that *resolves* outside it is refused — resolution, not string comparison,
+so `../../etc/passwd` and a symlink pointing out of the tree are both refused,
+and a write to a file that does not exist yet is checked through its parent
+directory. `builtin.bash` runs with the root as its working directory. The value
+is interpolable, so `${WORKSPACE}` is the usual spelling and the directory is a
+property of the machine running the graph rather than of the composition.
+
+**`timeout:` is required on `builtin.bash`** and illegal on the file tools, which
+run no command. It bounds one command; the node's own `timeout:` bounds the whole
+agent node, tool loop included, and the two compose.
+
+**What fails and what bounces.** Arguments the tool's schema refuses go back to
+the model, which can call again — a missing `path`, an empty `command`.
+Everything else fails the agent node under its `retry:`/`on_error:`, exactly as a
+failing `exec:` tool does: a nonzero exit, a command killed at the timeout, a
+path that resolved outside the root, a host with no `bash` on `PATH`.
+
+**Containment is the root and the timeout, and nothing more.** The tools run with
+the privileges of the process running the graph. Container and syscall isolation,
+and any refusal keyed on where a component is deployed, are not in this release
+and are not implied by anything on this page.
+
+A built-in call is recorded in the trace like any other tool call — the address
+`builtin.bash` as the target, and no result, because
+`agent-compose docs trace` keeps tool answers out of that format. The durability
+journal keeps the answer in full, which is why a resumed execution consumes a
+recorded `bash` instead of running the command a second time.
+
 ## `function:` nodes
 
 ```yaml
@@ -210,4 +273,4 @@ file:
 schema at compile time. A mismatch here **fails the node** — nothing proposed
 this call, so there is nobody to hand a refusal back to.
 
-Normative source: `docs/grammar.md` §6, §6.1, §6.2, §8.2, §8.3, §8.4
+Normative source: `docs/grammar.md` §5.5, §6, §6.1, §6.2, §8.2, §8.3, §8.4

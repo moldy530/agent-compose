@@ -37,7 +37,7 @@
 use std::sync::Arc;
 
 use crate::ast::common::{Ident, Literal};
-use crate::ast::definition::{AgentAccess, StoreKind};
+use crate::ast::definition::{AgentAccess, Builtin, StoreKind};
 use crate::ast::flow::StoreOp;
 use crate::ast::schema::{Number, ScalarKind, Surface};
 use crate::cel::ty::{ObjectShape, Origin, Property, Type, UnionShape, UnionVariant};
@@ -997,6 +997,85 @@ fn partial_object(properties: FieldMap, span: &Span) -> TypeNode {
         }),
         span,
     )
+}
+
+/// The **arguments** one runtime built-in takes (grammar 5.5, Decision D123,
+/// PRD resolved q31).
+///
+/// Written here beside [`store_tool_input`] for the same reason: both are tool
+/// surfaces the composition does not spell out, and both have to be one field
+/// map, so that the JSON the model is constrained by and the Zod the arguments
+/// are parsed with stay one document (PRD §9.16).
+///
+/// What is **not** here is the bound. `root:` and `timeout:` belong to the
+/// attachment rather than to the call — a model that could name its own root
+/// would hold the capability the attachment exists to bound — so neither is a
+/// parameter, and every path is read relative to the root the entry declared.
+pub(crate) fn builtin_tool_input(builtin: Builtin, span: &Span) -> FieldMap {
+    let described = |description: &str| {
+        let mut ty = scalar_node(ScalarKind::String, span);
+        ty.description = Some(Spanned::new(description.to_string(), span.clone()));
+        ty
+    };
+    let required = |description: &str| {
+        let mut ty = described(description);
+        if let TypeForm::Scalar(scalar) = &mut ty.form {
+            scalar.min_length = Some(1);
+        }
+        ty
+    };
+    let defaulted = |description: &str, value: &str| {
+        let mut ty = described(description);
+        if let TypeForm::Scalar(scalar) = &mut ty.form {
+            scalar.default = Some(Spanned::new(
+                Literal::String(value.to_string()),
+                span.clone(),
+            ));
+        }
+        ty
+    };
+    let fields: Vec<(&str, TypeNode)> = match builtin {
+        Builtin::Bash => vec![(
+            "command",
+            required("The shell command to run, as one line of `bash`."),
+        )],
+        Builtin::ReadFile => vec![(
+            "path",
+            required("The file to read, relative to the tool's root directory."),
+        )],
+        Builtin::WriteFile => vec![
+            (
+                "path",
+                required("The file to write, relative to the tool's root directory."),
+            ),
+            (
+                "content",
+                described("The bytes to write, replacing whatever the file held."),
+            ),
+        ],
+        Builtin::List => vec![
+            (
+                "path",
+                defaulted(
+                    "The directory to list, relative to the tool's root directory.",
+                    ".",
+                ),
+            ),
+            (
+                "glob",
+                defaulted(
+                    "A glob to match entries against — `*` and `?` within one path segment, \
+                     `**` across segments. Empty lists the directory's own entries.",
+                    "",
+                ),
+            ),
+        ],
+    };
+    let mut map = field_map(fields, span);
+    // A tool's arguments are an input surface, which is what makes a `default:`
+    // on one of them legal (grammar 3.9).
+    map.surface = Surface::Input;
+    map
 }
 
 /// `{ type: string, default: "" }` — an optional string parameter.

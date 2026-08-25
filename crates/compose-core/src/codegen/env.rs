@@ -145,7 +145,19 @@ impl References {
                         }
                     }
                 }
-                DefinitionBody::Agent(_) | DefinitionBody::Store(_) | DefinitionBody::Model(_) => {}
+                DefinitionBody::Agent(agent) => {
+                    // A built-in's `root:` is grammar 4.3 class 2 like an
+                    // `exec:`'s `cwd:`, and for the same reason: where a graph
+                    // is allowed to read and write is a property of the machine
+                    // running it, not of the composition (Decision D123).
+                    for builtin in &agent.builtins {
+                        references.text(
+                            &builtin.root.value,
+                            &format!("{address}.tools.{}.root", builtin.tool.value.address()),
+                        );
+                    }
+                }
+                DefinitionBody::Store(_) | DefinitionBody::Model(_) => {}
             }
         }
 

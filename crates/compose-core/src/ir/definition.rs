@@ -10,8 +10,10 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
-use crate::ast::common::{Address, Ident, Interpolated, Literal};
-use crate::ast::definition::{AgentAccess, ProviderKind, RouteCondition, StoreKind, StoreScope};
+use crate::ast::common::{Address, Duration, Ident, Interpolated, Literal};
+use crate::ast::definition::{
+    AgentAccess, Builtin, ProviderKind, RouteCondition, StoreKind, StoreScope,
+};
 use crate::diag::{Span, Spanned};
 
 use super::binding::InterpolatedEntry;
@@ -71,6 +73,13 @@ pub struct Agent {
     /// `tools:` — `tool.*` and `flow.*` addresses, in declaration order.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<Spanned<Address>>,
+    /// `tools:` — the `builtin.*` entries of the same list, in declaration
+    /// order (grammar 5.5, Decision D123).
+    ///
+    /// Omitted from the artifact when empty, which is what keeps a composition
+    /// that attaches none byte-identical to one written before the key existed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub builtins: Vec<BuiltinTool>,
     /// `stores:` — `store.*` addresses, in declaration order.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub stores: Vec<Spanned<Address>>,
@@ -80,6 +89,27 @@ pub struct Agent {
     /// `max_tool_iterations:` — absent means the default, `8` (Decision D51).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tool_iterations: Option<i64>,
+}
+
+/// One `builtin.*` entry of an agent's `tools:` list, with the bounds it
+/// declared (grammar 5.5, Decision D123, PRD resolved q31).
+///
+/// The bounds are not defaults and not optional here: `root:` is required of
+/// every built-in and `timeout:` of `builtin.bash`, so an artifact that carries
+/// one carries what bounds it.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct BuiltinTool {
+    /// Which built-in, and the span of the entry key that named it.
+    pub tool: Spanned<Builtin>,
+    /// `root:` — the directory every path this tool touches must resolve
+    /// inside, and `builtin.bash`'s working directory.
+    pub root: Spanned<Interpolated>,
+    /// `timeout:` — how long `builtin.bash`'s command may run. Absent on the
+    /// file tools, which run no command.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<Spanned<Duration>>,
+    /// The whole entry, key and bounds together.
+    pub span: Span,
 }
 
 /// A `tool.*` definition: one implementation, two usage surfaces (grammar 6).

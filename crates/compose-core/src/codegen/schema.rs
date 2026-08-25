@@ -206,10 +206,10 @@ use std::borrow::Cow;
 use serde_json::{Map, Value, json};
 
 use crate::ast::common::Ident;
-use crate::ast::definition::AgentAccess;
+use crate::ast::definition::{AgentAccess, Builtin};
 use crate::ast::schema::{Number, ScalarKind, StringFormat};
 use crate::check::model;
-use crate::diag::Spanned;
+use crate::diag::{Span, Spanned};
 use crate::ir::definition::DefinitionBody;
 use crate::ir::flow::NodeKind;
 use crate::ir::schema::{
@@ -464,6 +464,23 @@ pub fn surfaces(ir: &Ir) -> Vec<Surface<'_>> {
         }
     }
 
+    // The built-ins' argument surfaces (grammar 5.5, Decision D123). One per
+    // *kind* rather than per attachment: the schema is the compiler's and is the
+    // same wherever it is attached, while what differs between two attachments —
+    // `root:` and `timeout:` — is a bound the model never names. A built-in no
+    // agent attaches gets none, exactly as an unattached store synthesizes none.
+    for (builtin, at) in attached_builtins(ir) {
+        surfaces.push(Surface {
+            path: format!("{}.input", builtin.address()),
+            about: format!(
+                "`{}` — the arguments of the runtime built-in of that name, which every \
+                 attachment of it offers (grammar 5.5).",
+                builtin.address()
+            ),
+            body: owned(model::builtin_tool_input(builtin, &at)),
+        });
+    }
+
     if let Some(state) = &ir.state {
         for (name, channel) in &state.entries {
             surfaces.push(Surface {
@@ -493,6 +510,31 @@ fn attached_stores(ir: &Ir) -> std::collections::BTreeSet<String> {
         }
     }
     found
+}
+
+/// Every runtime built-in some agent attaches, in grammar 5.5's own order, each
+/// with the span of the **first** entry that attached it.
+///
+/// The span is what the synthesized field map carries, so a diagnostic about the
+/// built-in's own schema — there is none today, and there would be one the day a
+/// bound became schema-shaped — underlines an entry an author wrote rather than
+/// a position inside this compiler.
+fn attached_builtins(ir: &Ir) -> Vec<(Builtin, Span)> {
+    let mut found: std::collections::BTreeMap<Builtin, Span> = std::collections::BTreeMap::new();
+    for definition in ir.definitions.values() {
+        let DefinitionBody::Agent(agent) = &definition.body else {
+            continue;
+        };
+        for builtin in &agent.builtins {
+            found
+                .entry(builtin.tool.value)
+                .or_insert_with(|| builtin.span.clone());
+        }
+    }
+    Builtin::ALL
+        .iter()
+        .filter_map(|builtin| found.get(builtin).map(|at| (*builtin, at.clone())))
+        .collect()
 }
 
 /// A field map the composition wrote, as a [`Body`].

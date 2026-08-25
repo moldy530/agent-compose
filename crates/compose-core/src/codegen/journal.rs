@@ -137,6 +137,7 @@ mod tests {
         for (site, source, module) in [
             ("callModel", runtime, "src/runtime.ts"),
             ("runExec", runtime, "src/runtime.ts"),
+            ("runBuiltin", runtime, "src/runtime.ts"),
             ("runHttp", runtime, "src/runtime.ts"),
             ("callFunction", runtime, "src/runtime.ts"),
             ("runHuman", runtime, "src/runtime.ts"),
@@ -153,43 +154,44 @@ mod tests {
             );
         }
 
-        // …and no seventh. The count is over both emitted modules, because the
+        // …and no eighth. The count is over both emitted modules, because the
         // document's table is.
         let reached = runtime.matches("journaled(").count()
             + runtime.matches(".claim(").count()
             + stores.matches("journaled(").count()
             + stores.matches(".claim(").count();
         assert_eq!(
-            reached, 6,
-            "`docs/durability.md` §3 says there are exactly six effect sites and this build              has {reached}: a new one belongs in that table, and a lost one is a replay that              re-issues an effect"
+            reached, 7,
+            "`docs/durability.md` §3 says there are exactly seven effect sites and this build              has {reached}: a new one belongs in that table, and a lost one is a replay that              re-issues an effect"
         );
     }
 
-    /// The six journaled seams, by the name each is declared under.
-    const SEAMS: [&str; 6] = [
+    /// The seven journaled seams, by the name each is declared under.
+    const SEAMS: [&str; 7] = [
         "callModel",
         "runExec",
+        "runBuiltin",
         "runHttp",
         "callFunction",
         "runHuman",
         "runStoreOp",
     ];
 
-    /// **Nothing calls the world except through one of the six.**
+    /// **Nothing calls the world except through one of the seven.**
     ///
-    /// The sibling above reads the inventory from the top down: the six
+    /// The sibling above reads the inventory from the top down: the seven
     /// functions `docs/durability.md` §3 names reach the journal, and no
-    /// seventh does. That direction cannot see the failure its own docstring
+    /// eighth does. That direction cannot see the failure its own docstring
     /// calls load-bearing — a *new* surface, `runGrpc` say, that spawns a
     /// process or opens a socket and never reaches the journal at all. It is
-    /// not one of the six, so no per-site assertion applies to it; it contains
-    /// no `journaled(` and no `.claim(`, so the count still answers six; the
+    /// not one of the seven, so no per-site assertion applies to it; it contains
+    /// no `journaled(` and no `.claim(`, so the count still answers seven; the
     /// table is untouched, so the documentation assertions pass. `cargo test`
     /// is green and every replay past that node issues its call again.
     ///
     /// So this reads it from the bottom up instead, off the **primitives**
     /// rather than off the seams: every call to the world in **every** emitted
-    /// constant module has to sit somewhere the six can reach, or be named below
+    /// constant module has to sit somewhere the seven can reach, or be named below
     /// as something that is not an effect the graph issues. `runGrpc` fails here
     /// on the first line of its body.
     ///
@@ -388,7 +390,7 @@ mod tests {
             );
         }
 
-        // Everything the six reach, followed until it stops growing.
+        // Everything the seven reach, followed until it stops growing.
         let mut reached: BTreeSet<&str> = SEAMS.into_iter().collect();
         loop {
             let mut grew = false;

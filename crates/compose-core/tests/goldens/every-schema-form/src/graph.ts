@@ -21,6 +21,10 @@ import * as stores from "./stores.ts";
 import {
   agentShaperOutput,
   agentSpreaderOutput,
+  builtinBashInput,
+  builtinListInput,
+  builtinReadFileInput,
+  builtinWriteFileInput,
   flowCondenseInputs,
   flowCondenseNodeReduceOutput,
   flowShapeInputs,
@@ -506,6 +510,127 @@ const agentShaper: runtime.AgentBinding = {
           args,
           context,
           call,
+        ),
+    },
+    {
+      name: "read_file",
+      address: "builtin.read_file",
+      description: "Read one text file and return its contents. The path is relative to this agent's root directory, and a path that resolves outside it is refused.",
+      schema: {
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "description": "The file to read, relative to the tool's root directory.",
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      },
+      invoke: (args, context) =>
+        runtime.runBuiltin(
+          {
+            tool: "read_file",
+            root: [{ env: "WORKSPACE", site: "agent.shaper.tools.builtin.read_file.root" }],
+          },
+          runtime.parseToolArguments(builtinReadFileInput, args, "the arguments `read_file` was called with"),
+          context,
+        ),
+    },
+    {
+      name: "write_file",
+      address: "builtin.write_file",
+      description: "Write one text file, replacing whatever it held, and return how many bytes were written. The path is relative to this agent's root directory, a path that resolves outside it is refused, and the directory it names must already exist.",
+      schema: {
+        "additionalProperties": false,
+        "properties": {
+          "content": {
+            "description": "The bytes to write, replacing whatever the file held.",
+            "type": "string"
+          },
+          "path": {
+            "description": "The file to write, relative to the tool's root directory.",
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "content"
+        ],
+        "type": "object"
+      },
+      invoke: (args, context) =>
+        runtime.runBuiltin(
+          {
+            tool: "write_file",
+            root: [{ env: "WORKSPACE", site: "agent.shaper.tools.builtin.write_file.root" }],
+          },
+          runtime.parseToolArguments(builtinWriteFileInput, args, "the arguments `write_file` was called with"),
+          context,
+        ),
+    },
+    {
+      name: "list",
+      address: "builtin.list",
+      description: "List the entries of one directory, optionally filtered by a glob. Paths are relative to this agent's root directory, a path that resolves outside it is refused, and a directory entry is reported with a trailing `/`.",
+      schema: {
+        "additionalProperties": false,
+        "properties": {
+          "glob": {
+            "default": "",
+            "description": "A glob to match entries against — `*` and `?` within one path segment, `**` across segments. Empty lists the directory's own entries.",
+            "type": "string"
+          },
+          "path": {
+            "default": ".",
+            "description": "The directory to list, relative to the tool's root directory.",
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      invoke: (args, context) =>
+        runtime.runBuiltin(
+          {
+            tool: "list",
+            root: [{ env: "WORKSPACE", site: "agent.shaper.tools.builtin.list.root" }],
+          },
+          runtime.parseToolArguments(builtinListInput, args, "the arguments `list` was called with"),
+          context,
+        ),
+    },
+    {
+      name: "bash",
+      address: "builtin.bash",
+      description: "Run one `bash` command in this agent's root directory and return what it printed. The command runs under a deadline, and a command that exits nonzero or outruns it fails the node rather than answering.",
+      schema: {
+        "additionalProperties": false,
+        "properties": {
+          "command": {
+            "description": "The shell command to run, as one line of `bash`.",
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "command"
+        ],
+        "type": "object"
+      },
+      invoke: (args, context) =>
+        runtime.runBuiltin(
+          {
+            tool: "bash",
+            root: [{ env: "WORKSPACE", site: "agent.shaper.tools.builtin.bash.root" }, "/build"],
+            timeout: { millis: 30000, written: "30s" },
+          },
+          runtime.parseToolArguments(builtinBashInput, args, "the arguments `bash` was called with"),
+          context,
         ),
     },
   ],
