@@ -12658,21 +12658,178 @@ fn a_resumed_run_consumes_a_recorded_builtin_instead_of_running_it_again() {
     );
 }
 
-/// A killed command's **grandchild** does not keep this runtime alive, and the
+/// The deadline kills the command's **process group**, so work the command
+/// forked stops with it (grammar 5.5, Decision D124).
+///
+/// The shell is almost never where the work is: `npm run build`, `a | b`,
+/// `(cd sub && make)` are all `bash` *forking*, and a `SIGKILL` aimed at the
+/// shell's own pid ends the shell while every one of those children keeps
+/// running — inside the very `root:` the attachment bounded them to — with the
+/// graph already told the call failed. Under `retry:` that is two generations of
+/// one command writing one root; with `on_error: skip` it is a downstream node
+/// reading files a "killed" command is still producing. Either way the
+/// `timeout:` would be a message rather than a bound.
+///
+/// So the command forks a **foreground** subshell — not a backgrounded job,
+/// which is the only shape the grammar ever set aside — that writes nothing
+/// until long after the one-second deadline, and the file system is asked
+/// afterwards. `; echo done` is load-bearing: without a command after it, `bash`
+/// may `exec` the subshell in place of itself, which is the one shape where
+/// killing the shell would have killed the work by accident and this test would
+/// pass against a runtime that never fixed anything.
+#[test]
+fn a_killed_command_takes_the_work_it_forked_with_it() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (scratch, environment) = bounded_root(&provider, "builtins-forked");
+    let escaped = root_of(&scratch).join("escaped.txt");
+
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::tool_calls(vec![ToolCall::new(
+            "bash",
+            json!({ "command": "( sleep 4; printf escaped > escaped.txt ); echo done" }),
+        )]),
+    ));
+
+    let Some(run) = harness::invoke_with(
+        "builtin-tools",
+        "flow.outlived",
+        &json!({ "goal": "fork something that would outlive the deadline" }),
+        &environment,
+    ) else {
+        return;
+    };
+
+    // The node failed at its own bound, and the run went on without it.
+    run.succeeded();
+    assert_eq!(run.outputs()["summary"], "the node was skipped");
+    let entries = run.entries("attempt");
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0]["outcome"], "skipped");
+    let said = entries[0]["error"].as_str().unwrap_or_default();
+    assert!(
+        said.contains("ran longer than `1s`"),
+        "the node's error names the bound the attachment wrote: {said}"
+    );
+
+    // Past the moment the forked work would have written, had anything been left
+    // running to write. The run is long over; this is the file system being asked
+    // whether the bound was a fact.
+    std::thread::sleep(Duration::from_secs(8));
+    assert!(
+        !escaped.exists(),
+        "the subshell the killed command forked wrote `{}` after the node had \
+         already failed: the deadline ended the shell and left the work running \
+         (grammar 5.5, D124)",
+        escaped.display()
+    );
+}
+
+/// A run **asked to stop** takes the command it was running with it, and still
+/// stops (grammar 5.5, Decision D124).
+///
+/// Detaching the command is what puts its process group within the deadline's
+/// reach, and the same move puts it outside the *terminal's*: its group is no
+/// longer the foreground one, so the `SIGINT` a person types reaches this process
+/// and nothing below it. Left there, `Ctrl-C` would have traded the deadline's
+/// orphan for its own — a build still writing into `root:` with the graph gone —
+/// and done it where an `exec:` tool's child dies. So the runtime sweeps the live
+/// groups itself.
+///
+/// The sweep is a signal handler, which is the other half of what this asserts
+/// and the half that would hurt a person rather than a file: a handler that ate
+/// the signal instead of handing it back would leave a terminal wedged on a run
+/// that will not stop. So both are checked — the process **ended**, promptly, and
+/// the command it was running did not outlive it.
+#[cfg(unix)]
+#[test]
+fn a_run_asked_to_stop_takes_its_command_with_it() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (scratch, environment) = bounded_root(&provider, "builtins-stopped");
+    let root = root_of(&scratch);
+    let started = root.join("started.txt");
+    let escaped = root.join("escaped.txt");
+
+    // The marker is written by the **subshell**, not by the shell above it, so
+    // the moment the test sees it the fork it is about has certainly happened.
+    // Thirty seconds is `agent.worker`'s bound, which nothing here reaches: what
+    // ends this command is the signal, not the deadline.
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::tool_calls(vec![ToolCall::new(
+            "bash",
+            json!({
+                "command":
+                    "( printf started > started.txt; sleep 4; printf escaped > escaped.txt ); \
+                     echo done"
+            }),
+        )]),
+    ));
+
+    let Some((project, built)) = harness::build_under_toolchain("builtin-tools", "stop-builtin")
+    else {
+        return;
+    };
+    assert!(
+        built.status.success(),
+        "the builtin-tools fixture did not build:\n{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+
+    let stopped = harness::stop_run(
+        &project,
+        &["run", "flow.work", "--input", "goal=start something long"],
+        &environment,
+        libc::SIGINT,
+        || started.exists(),
+    );
+
+    let status = stopped.status.expect(
+        "the run never ended: the sweep installed a handler and did not hand the signal back",
+    );
+    assert!(
+        !status.success(),
+        "a run stopped by a signal does not report success: {status:?}"
+    );
+    assert!(
+        stopped.took < Duration::from_secs(10),
+        "the run ended when it was asked to rather than whenever it got round to \
+         it (took {:?})",
+        stopped.took
+    );
+
+    std::thread::sleep(Duration::from_secs(8));
+    assert!(
+        !escaped.exists(),
+        "the command the stopped run was in the middle of wrote `{}` after the \
+         run had gone: `Ctrl-C` left the work behind (grammar 5.5, D124)",
+        escaped.display()
+    );
+}
+
+/// A killed command's **escapee** does not keep this runtime alive, and the
 /// output it goes on writing is not still being read (grammar 5.5, resolved
 /// q31).
 ///
 /// `builtin.bash` settles its call at the deadline rather than at the child's
-/// `close`, because a killed shell can leave a background grandchild holding the
-/// output pipes. Settling is only half of ending the call: the pipes and their
-/// `data` handlers are still this runtime's, and a call that has already failed
-/// must not keep them. Kept, they are an event-loop handle that holds the
-/// process open for as long as the grandchild lives and a buffer that goes on
+/// `close`, because a process the group kill cannot reach can still be holding
+/// the output pipes. Settling is only half of ending the call: the pipes and
+/// their `data` handlers are still this runtime's, and a call that has already
+/// failed must not keep them. Kept, they are an event-loop handle that holds the
+/// process open for as long as that process lives and a buffer that goes on
 /// growing for a result nobody will ever read — in `serve`, or any host
 /// embedding a compiled graph, unbounded memory minutes after the node failed.
 ///
+/// `set -m` is what makes this a test rather than a tautology. The deadline kills
+/// the command's process group (Decision D124, asserted above), which is where an
+/// ordinary background job lives — so a plain `&` would now be swept and the
+/// pipes would close on their own, proving nothing about the runtime. Job control
+/// puts the job in a **group of its own**, which is the portable spelling of the
+/// escape `setsid` and a double-forking daemon reach the same way, and no
+/// external program is needed to write it.
+///
 /// The two are one defect and this is the observable half: the command leaves a
-/// grandchild holding the pipes for a minute, the node fails at its one-second
+/// process holding the pipes for a minute, the node fails at its one-second
 /// deadline, `on_error: skip` absorbs it — and the **process** is asked when it
 /// is done. A run that ended at the failure would exit on its own and prove
 /// nothing, which is why this flow completes instead.
@@ -12681,13 +12838,13 @@ fn a_killed_commands_grandchild_does_not_hold_the_runtime_open() {
     let provider = MockProvider::start().expect("a loopback port");
     let (_scratch, environment) = bounded_root(&provider, "builtins-outlived");
 
-    // The grandchild writes once and then holds both pipes open for a minute,
-    // long after the shell above it is killed at one second.
+    // The escapee writes once and then holds both pipes open for a minute, long
+    // after the shell above it is killed at one second.
     provider.enqueue(Script::new(
         SONNET,
         Outcome::tool_calls(vec![ToolCall::new(
             "bash",
-            json!({ "command": "{ printf 'still here'; sleep 60; } & wait" }),
+            json!({ "command": "set -m; { printf 'still here'; sleep 60; } & wait" }),
         )]),
     ));
 

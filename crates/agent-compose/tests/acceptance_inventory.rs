@@ -1460,9 +1460,25 @@ const BUILTINS: &[Criterion] = &[
                 "a_command_that_exits_nonzero_fails_the_node_under_its_on_error",
                 Status::Live,
             ),
-            // …and what the deadline has to end besides the shell: the pipes a
-            // surviving grandchild holds, which a runtime that kept them would
-            // go on reading — and be held open by — long after the call failed.
+            // …and what the deadline has to end besides the shell: the work the
+            // command *forked*, which is where a shell's work almost always is
+            // — a kill aimed at the shell alone leaves it writing inside `root:`
+            // after the node has already failed (D124).
+            (
+                "a_killed_command_takes_the_work_it_forked_with_it",
+                Status::Live,
+            ),
+            // …and the same bound reached the other way, where the *run* is what
+            // ends: a command detached far enough for the deadline to reach it is
+            // detached out of the terminal's reach, so stopping the run has to
+            // take it along — and has to still stop the run.
+            (
+                "a_run_asked_to_stop_takes_its_command_with_it",
+                Status::Live,
+            ),
+            // …and what is left when the group kill cannot reach it: the pipes an
+            // escapee holds, which a runtime that kept them would go on reading —
+            // and be held open by — long after the call failed.
             (
                 "a_killed_commands_grandchild_does_not_hold_the_runtime_open",
                 Status::Live,
