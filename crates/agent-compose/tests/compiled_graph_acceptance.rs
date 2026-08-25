@@ -7343,12 +7343,20 @@ fn the_triage_fanout_example_routes_every_finding_and_joins_them_in_source_order
         ),
         // Item 0 answers last. Completion order is the reverse of source order,
         // which is the only arrangement under which the join means anything.
+        //
+        // Two calls per dispatched instance, for `agent.triage`'s reason one
+        // level down: `agent.fixer` holds `builtin.read_file` (grammar 5.5), so
+        // each instance makes a loop call before its pinned one. The pair is
+        // told apart by which item the request carries rather than by position,
+        // since two instances run concurrently and either may ask first.
+        Script::new(HAIKU, Outcome::text("I have read enough.")).matching("src/a.rs"),
         Script::new(
             HAIKU,
             Outcome::structured(json!({ "patch": "patch-a", "explanation": "renamed" }))
                 .after(Duration::from_millis(300)),
         )
         .matching("src/a.rs"),
+        Script::new(HAIKU, Outcome::text("I have read enough.")).matching("src/b.rs"),
         Script::new(
             HAIKU,
             Outcome::structured(json!({ "patch": "patch-b", "explanation": "widened" })),

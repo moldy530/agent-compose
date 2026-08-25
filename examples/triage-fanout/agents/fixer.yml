@@ -5,8 +5,15 @@ agent.fixer:
   description: Produces a patch for one mechanically fixable finding.
   model: model.fast
   prompt: |
-    You write minimal unified diffs. Fix exactly the described defect in the
-    named file and change nothing else.
+    You write minimal unified diffs. Read the file, fix exactly the described
+    defect in it, and change nothing else.
+  # A runtime built-in, opted into by name and bounded by the one directory it
+  # may reach (grammar 5.5). Reading is all this agent needs: it answers with a
+  # diff rather than applying one, so it holds no `builtin.write_file` and no
+  # `builtin.bash` — which is the whole point of an opt-in that is read off the
+  # entry rather than granted by a switch.
+  tools:
+    - builtin.read_file: { root: "${REPO_ROOT}" }
   input:
     file: { type: string }
     patch_hint: { type: string }
