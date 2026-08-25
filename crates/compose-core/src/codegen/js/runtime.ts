@@ -779,10 +779,21 @@ export function delivering(context: RunContext, site: DispatchSite): RunContext 
   return { ...context, idempotency_key: site.idempotencyKey };
 }
 
+/**
+ * What an aborted signal is raised as.
+ *
+ * A `reason` is whatever the aborting side passed, and the one this runtime
+ * passes is the node's own deadline failure — so it is re-raised as it came, and
+ * anything else becomes an `Error` rather than reaching a `catch` as a string.
+ */
+function abortReason(signal: AbortSignal): Error {
+  return signal.reason instanceof Error ? signal.reason : new Error("aborted");
+}
+
 const sleep = (ms: number, signal: AbortSignal): Promise<void> =>
   new Promise((resolve, reject) => {
     if (signal.aborted) {
-      reject(signal.reason instanceof Error ? signal.reason : new Error("aborted"));
+      reject(abortReason(signal));
       return;
     }
     const timer = setTimeout(() => {
@@ -791,7 +802,7 @@ const sleep = (ms: number, signal: AbortSignal): Promise<void> =>
     }, ms);
     const onAbort = () => {
       clearTimeout(timer);
-      reject(signal.reason instanceof Error ? signal.reason : new Error("aborted"));
+      reject(abortReason(signal));
     };
     signal.addEventListener("abort", onAbort, { once: true });
   });
@@ -805,8 +816,7 @@ const sleep = (ms: number, signal: AbortSignal): Promise<void> =>
  */
 function untilAborted(signal: AbortSignal): Promise<never> {
   return new Promise<never>((_, reject) => {
-    const fail = () =>
-      reject(signal.reason instanceof Error ? signal.reason : new Error("aborted"));
+    const fail = () => reject(abortReason(signal));
     if (signal.aborted) {
       fail();
       return;
@@ -3613,6 +3623,25 @@ export interface BuiltinBinding {
 const LISTING_LIMIT = 1000;
 
 /**
+ * How many entries one `list` matches before it hands the event loop back.
+ *
+ * The walk `await`s a `readdir` per directory, so a turn of the loop already
+ * falls between two directories; this is what puts one *inside* a directory too.
+ * Both halves of the work in that loop are a model's to size — how many entries
+ * the directory it named holds, and how long the glob it wrote is — and an
+ * emitted graph is embedded code: a `serve` process runs every other execution
+ * and its own listener on this same loop.
+ *
+ * It is also what lets the node's own `timeout:` (grammar 9.2) fire *during* a
+ * listing rather than after it. A deadline is a timer, and a timer cannot run
+ * inside a burst that never yields — so a walk that never breathed would
+ * overshoot the bound by the length of the burst, and [`walkListing`]'s abort
+ * check would not be reached until the burst it is meant to cut short had
+ * already finished.
+ */
+const LISTING_YIELD = 256;
+
+/**
  * Run one built-in call (grammar 5.5, Decision D123).
  *
  * The seam every built-in goes through, journaled like every other tool
@@ -3668,7 +3697,7 @@ async function runBuiltinLive(
     case "write_file":
       return await writeWithinRoot(binding, root, String(args.path), String(args.content));
     case "list":
-      return await listWithinRoot(binding, root, String(args.path), String(args.glob));
+      return await listWithinRoot(binding, root, String(args.path), String(args.glob), context);
     default:
       // Unreachable over a project this compiler emitted: the set is closed in
       // the grammar and the emitter writes one of the four. Said rather than
@@ -4099,12 +4128,21 @@ async function listWithinRoot(
   root: string,
   requested: string,
   glob: string,
+  context: RunContext,
 ): Promise<unknown> {
   const target = await targetWithinRoot(binding, root, requested);
   const found: string[] = [];
+  // Split once per call rather than once per candidate: the pattern is as long
+  // as the *model* wrote it, and a walk that re-split it for every entry would
+  // multiply one long argument by the size of the tree.
+  const pattern = glob === "" ? undefined : globPattern(glob);
   try {
-    await walkListing(target, "", glob === "", glob, found);
+    await walkListing(target, "", pattern, found, context);
   } catch (error) {
+    // A deadline on the *node*, or a run somebody cancelled, arrives here as an
+    // abort rather than as this call's failure, and is raised as it came —
+    // [`runBuiltinBash`]'s rule, for its reason.
+    if (context.signal.aborted) throw error;
     throw builtinFailure(binding, "list", requested, error);
   }
   found.sort();
@@ -4117,56 +4155,105 @@ async function listWithinRoot(
 /**
  * One level of a listing, and every level beneath it when a glob asked for one.
  *
- * `shallow` is the no-glob case rather than a separate function, because the two
- * differ only in whether the walk goes on: the entry shapes, the trailing `/`
- * and the relative spelling are the same answer either way.
+ * An **absent** `pattern` is the no-glob case rather than a separate function,
+ * because the two differ only in whether the walk goes on: the entry shapes, the
+ * trailing `/` and the relative spelling are the same answer either way.
+ *
+ * The walk stops where it is when the node's deadline runs out or the run is
+ * cancelled (grammar 9.2). How much work a listing is depends on a directory
+ * this runtime did not choose and a glob a *model* wrote, so a walk that only
+ * ever ran to completion would keep reading a tree for a node the graph had
+ * already reported as failed — the same hold on what outlived a call that
+ * [`runBuiltinBash`] refuses to leave behind.
  */
 async function walkListing(
   directory: string,
   prefix: string,
-  shallow: boolean,
-  glob: string,
+  pattern: readonly string[] | undefined,
   found: string[],
+  context: RunContext,
 ): Promise<void> {
   const entries = await fs.promises.readdir(directory, { withFileTypes: true });
+  let seen = 0;
   for (const entry of entries) {
+    if (context.signal.aborted) throw abortReason(context.signal);
     // `isDirectory` is `lstat`'s answer here, so a symlink to a directory is a
     // symlink: reported, not descended into.
     const directoryEntry = entry.isDirectory();
     const relative = prefix === "" ? entry.name : `${prefix}/${entry.name}`;
     const listed = directoryEntry ? `${relative}/` : relative;
-    if (shallow || globMatches(glob, relative)) found.push(listed);
-    if (!shallow && directoryEntry) {
-      await walkListing(path.join(directory, entry.name), relative, false, glob, found);
+    if (pattern === undefined || matchSegments(pattern, relative.split("/"))) found.push(listed);
+    if (pattern !== undefined && directoryEntry) {
+      await walkListing(path.join(directory, entry.name), relative, pattern, found, context);
     }
+    seen += 1;
+    if (seen % LISTING_YIELD === 0) await sleep(0, context.signal);
   }
 }
 
 /**
- * Whether one relative path matches a glob.
+ * A glob split into the segments [`matchSegments`] matches it as, with runs of
+ * `**` collapsed to one.
  *
- * `*` and `?` match within a single path segment and `**` matches across
- * segments, which is the spelling every tool a model has met uses. Written here
- * rather than taken from a library for the reason this whole runtime is: one
- * fewer pinned dependency, and a matcher whose behaviour is this project's to
- * state (PRD 5.12).
+ * `*` and `?` match within a single path segment and `**` matches across them,
+ * which is the spelling every tool a model has met uses. Written here rather
+ * than taken from a library for the reason this whole runtime is: one fewer
+ * pinned dependency, and a matcher whose behaviour is this project's to state
+ * (PRD 5.12).
+ *
+ * `**` is *zero or more* segments, so two of them in a row accept exactly what
+ * one of them accepts, and the only difference between the two spellings is what
+ * the match costs: each `**` is a place the matcher may have to give a segment
+ * back, and a run of them is the shape that makes it do so the most times.
+ * Collapsed here — once per call,
+ * over an argument a model chose — so the length of that run cannot become the
+ * length of the search. See [`matchSegments`].
  */
-function globMatches(glob: string, candidate: string): boolean {
-  return matchSegments(glob.split("/"), candidate.split("/"));
+function globPattern(glob: string): readonly string[] {
+  return glob.split("/").filter((segment, at, all) => segment !== "**" || all[at - 1] !== "**");
 }
 
-/** [`globMatches`] over the segments, with `**` the one that may span several. */
+/**
+ * [`globPattern`]'s segments against a candidate's, with `**` the one that may
+ * span several.
+ *
+ * Iterative, and for the reason [`matchSegment`] is: the pattern is a **model's**
+ * argument. The recursion this replaced tried every split of the target at every
+ * `**` and re-tried it under the next one, which is exponential in how many of
+ * them a glob holds — a pattern one line long and a directory twelve deep were
+ * hours of a core spent inside a call, and `**` is not even the only way to
+ * write that pattern. The walk here is the standard two-pointer one, which
+ * accepts the same language in `pattern.length × target.length` steps: the last
+ * `**` passed is remembered, and a mismatch after it hands that one more segment
+ * rather than starting the search again.
+ */
 function matchSegments(pattern: readonly string[], target: readonly string[]): boolean {
-  if (pattern.length === 0) return target.length === 0;
-  const [head, ...rest] = pattern;
-  if (head === "**") {
-    for (let taken = 0; taken <= target.length; taken += 1) {
-      if (matchSegments(rest, target.slice(taken))) return true;
+  let patternAt = 0;
+  let targetAt = 0;
+  let star = -1;
+  let resume = 0;
+  while (targetAt < target.length) {
+    const head = patternAt < pattern.length ? pattern[patternAt] : undefined;
+    if (head === "**") {
+      star = patternAt;
+      resume = targetAt;
+      patternAt += 1;
+    } else if (head !== undefined && matchSegment(head, target[targetAt] ?? "")) {
+      patternAt += 1;
+      targetAt += 1;
+    } else if (star >= 0) {
+      // Backtrack: the last `**` spans one more segment.
+      patternAt = star + 1;
+      resume += 1;
+      targetAt = resume;
+    } else {
+      return false;
     }
-    return false;
   }
-  if (target.length === 0) return false;
-  return matchSegment(head, target[0] ?? "") && matchSegments(rest, target.slice(1));
+  // A trailing `**` spans nothing, which is a match; anything else left over is
+  // a segment the candidate does not have.
+  while (pattern[patternAt] === "**") patternAt += 1;
+  return patternAt === pattern.length;
 }
 
 /** One segment against one name: `*` any run of characters, `?` exactly one. */
