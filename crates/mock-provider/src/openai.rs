@@ -85,6 +85,7 @@ pub(crate) struct Parsed {
     pub(crate) model: String,
     pub(crate) failures: Vec<ValidationFailure>,
     pub(crate) tools: Vec<String>,
+    pub(crate) server_tools: Vec<String>,
     pub(crate) structured_output: Option<StructuredOutput>,
 }
 
@@ -146,6 +147,7 @@ pub(crate) fn parse(
             model: deployment.unwrap_or_default().to_string(),
             failures: checker.into_failures(),
             tools: Vec::new(),
+            server_tools: Vec::new(),
             structured_output: None,
         };
     };
@@ -173,8 +175,8 @@ pub(crate) fn parse(
 
     check_settings(&mut checker, body);
     let tools = check_tools(&mut checker, body);
-    let forced = check_tool_choice(&mut checker, body, &tools);
-    check_messages(&mut checker, body, &tools);
+    let forced = check_tool_choice(&mut checker, body, &tools.names);
+    check_messages(&mut checker, body, &tools.names);
     let response_format = check_response_format(&mut checker, body);
     check_streaming(&mut checker, body);
 
@@ -187,7 +189,8 @@ pub(crate) fn parse(
     Parsed {
         model,
         failures: checker.into_failures(),
-        tools,
+        tools: tools.names,
+        server_tools: tools.server,
         structured_output,
     }
 }
@@ -237,6 +240,17 @@ pub(crate) fn parse(
 /// with neither spelling of the credential is a codegen bug there as well — and
 /// a malformed `authorization` with no `api-key` beside it lands on the same
 /// refusal, since a bearer token that is not one leaves the route with nothing.
+/// The header rules of a **direct** OpenAI connection, shared with the
+/// Responses route.
+///
+/// How a connection authenticates belongs to the connection, not to the wire
+/// (PRD 5.9), so `POST /v1/responses` is held to exactly what
+/// `POST /v1/chat/completions` is held to — the keyless-gateway reading of
+/// WIRE-NOTES (12) included.
+pub(crate) fn check_direct_headers(checker: &mut Checker, headers: &BTreeMap<String, String>) {
+    check_headers(checker, Route::Direct, headers);
+}
+
 fn check_headers(checker: &mut Checker, route: Route, headers: &BTreeMap<String, String>) {
     let value = |name: &str| headers.get(name).filter(|value| !value.is_empty());
     let bearer = value("authorization")
@@ -338,10 +352,11 @@ fn check_stop(checker: &mut Checker, body: &Map<String, Value>) {
 }
 
 /// The tool surface, in request order.
-fn check_tools(checker: &mut Checker, body: &Map<String, Value>) -> Vec<String> {
+fn check_tools(checker: &mut Checker, body: &Map<String, Value>) -> Tools {
     let mut names = Vec::new();
+    let mut server = Vec::new();
     let Some(tools) = checker.optional("", body, "tools", Kind::Array) else {
-        return names;
+        return Tools { names, server };
     };
     // An empty list is refused, not ignored: `tools: []` is what codegen emits
     // for an agent with no `tools:` and no `stores:` if it always writes the
@@ -351,7 +366,7 @@ fn check_tools(checker: &mut Checker, body: &Map<String, Value>) -> Vec<String> 
             "tools",
             "Invalid 'tools': empty array. Expected an array with minimum length 1.",
         );
-        return names;
+        return Tools { names, server };
     }
     let mut seen = BTreeSet::new();
     for (index, tool) in tools.as_array().into_iter().flatten().enumerate() {
@@ -362,6 +377,20 @@ fn check_tools(checker: &mut Checker, body: &Map<String, Value>) -> Vec<String> 
         else {
             continue;
         };
+        // A **server tool** on this route (grammar 12.1, Decision D122). Only an
+        // `openai_compatible` provider puts one here — an `openai` one that
+        // declares a suite speaks Responses instead — and a gateway may honour
+        // any vocabulary at all, which is exactly why q30 leaves those entries
+        // unverified in the compiler too. So the type is recorded and the entry
+        // is carried: `api.openai.com` would answer this route's own 400, and a
+        // mock that did the same would refuse a composition that works.
+        // `WIRE-NOTES` (22).
+        if let Some(kind) = tool.get("type").and_then(Value::as_str)
+            && kind != "function"
+        {
+            server.push(kind.to_string());
+            continue;
+        }
         checker.closed(&pointer, tool, &["type", "function"]);
         if let Some(kind) = checker.required(&pointer, tool, "type") {
             checker.one_of(&at(&pointer, "type"), kind, &["function"]);
@@ -416,7 +445,17 @@ fn check_tools(checker: &mut Checker, body: &Map<String, Value>) -> Vec<String> 
         }
         names.push(name);
     }
-    names
+    Tools { names, server }
+}
+
+/// What a request's `tools` array holds, split by who runs them.
+pub(crate) struct Tools {
+    /// The client functions, by name, in request order — what the graph
+    /// dispatches.
+    pub(crate) names: Vec<String>,
+    /// The server tools, by `type:`, in request order — what the provider runs
+    /// itself (grammar 12.1, Decision D122).
+    pub(crate) server: Vec<String>,
 }
 
 /// `tool_choice`, and the function it forces if it forces one.
@@ -566,7 +605,12 @@ fn check_response_format(
 /// Distinct from [`check_strict_schema`], which is about how tightly the decoder
 /// is constrained *below* the root and only applies when `strict: true` was
 /// asked for: these two hold at any `strict`.
-fn check_root_schema(checker: &mut Checker, pointer: &str, subject: &str, schema: &Value) {
+pub(crate) fn check_root_schema(
+    checker: &mut Checker,
+    pointer: &str,
+    subject: &str,
+    schema: &Value,
+) {
     if schema.get("type").and_then(Value::as_str) != Some("object") {
         checker.fail(
             &at(pointer, "type"),
@@ -602,7 +646,12 @@ fn check_root_schema(checker: &mut Checker, pointer: &str, subject: &str, schema
 /// The complaint is the service's own, `context=` and all: it addresses the
 /// offending object by its path *inside the schema*, which is the only address
 /// that means anything once the schema nests.
-fn check_strict_schema(checker: &mut Checker, pointer: &str, subject: &str, schema: &Value) {
+pub(crate) fn check_strict_schema(
+    checker: &mut Checker,
+    pointer: &str,
+    subject: &str,
+    schema: &Value,
+) {
     walk_strict_schema(checker, pointer, subject, &mut Vec::new(), schema);
 }
 
@@ -982,7 +1031,7 @@ fn check_streaming(checker: &mut Checker, body: &Map<String, Value>) {
     }
 }
 
-fn well_formed(name: &str) -> bool {
+pub(crate) fn well_formed(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
         && name.chars().all(|character| {
@@ -1410,7 +1459,7 @@ fn call_block(sequence: u64, index: usize, name: &str, input: &Value) -> Value {
     })
 }
 
-fn failure_answer(sequence: u64, failure: &Failure) -> Answer {
+pub(crate) fn failure_answer(sequence: u64, failure: &Failure) -> Answer {
     match failure {
         Failure::RateLimit {
             retry_after_seconds,
@@ -1455,7 +1504,13 @@ fn failure_answer(sequence: u64, failure: &Failure) -> Answer {
 /// SDK hangs on its error objects and what support tooling asks for
 /// (WIRE-NOTES §9). The body is left as the service sends it — the envelope has
 /// no request-id member of its own on this surface.
-fn error(sequence: u64, status: u16, kind: &str, code: Option<&str>, message: &str) -> Response {
+pub(crate) fn error(
+    sequence: u64,
+    status: u16,
+    kind: &str,
+    code: Option<&str>,
+    message: &str,
+) -> Response {
     Response::new(
         status,
         json!({

@@ -73,6 +73,7 @@ pub(crate) struct Parsed {
     pub(crate) model: String,
     pub(crate) failures: Vec<ValidationFailure>,
     pub(crate) tools: Vec<String>,
+    pub(crate) server_tools: Vec<String>,
     pub(crate) structured_output: Option<StructuredOutput>,
 }
 
@@ -90,6 +91,7 @@ pub(crate) fn parse(headers: &BTreeMap<String, String>, body: Option<&Value>) ->
             model: String::new(),
             failures: checker.into_failures(),
             tools: Vec::new(),
+            server_tools: Vec::new(),
             structured_output: None,
         };
     };
@@ -110,7 +112,7 @@ pub(crate) fn parse(headers: &BTreeMap<String, String>, body: Option<&Value>) ->
     check_settings(&mut checker, body);
     check_system(&mut checker, body);
     let tools = check_tools(&mut checker, body);
-    let forced = check_tool_choice(&mut checker, body, &tools);
+    let forced = check_tool_choice(&mut checker, body, &tools.names);
     let uses_tool_blocks = check_messages(&mut checker, body);
     if uses_tool_blocks && !body.contains_key("tools") {
         checker.fail(
@@ -128,7 +130,8 @@ pub(crate) fn parse(headers: &BTreeMap<String, String>, body: Option<&Value>) ->
     Parsed {
         model,
         failures: checker.into_failures(),
-        tools: tools.into_iter().collect(),
+        tools: tools.names,
+        server_tools: tools.server,
         structured_output,
     }
 }
@@ -280,10 +283,11 @@ fn check_system(checker: &mut Checker, body: &Map<String, Value>) {
 
 /// The tool surface, returned in request order so a test can assert on which
 /// tools an agent's `tools:` and `stores:` lists put on the wire (11.5).
-fn check_tools(checker: &mut Checker, body: &Map<String, Value>) -> Vec<String> {
+fn check_tools(checker: &mut Checker, body: &Map<String, Value>) -> Tools {
     let mut names = Vec::new();
+    let mut server = Vec::new();
     let Some(tools) = checker.optional("", body, "tools", Kind::Array) else {
-        return names;
+        return Tools { names, server };
     };
     let mut seen = BTreeSet::new();
     for (index, tool) in tools.as_array().into_iter().flatten().enumerate() {
@@ -294,6 +298,19 @@ fn check_tools(checker: &mut Checker, body: &Map<String, Value>) -> Vec<String> 
         else {
             continue;
         };
+        // A **server tool**: a tool the service runs on its own side, named by a
+        // `type:` out of Anthropic's own vocabulary (grammar 12.1, Decision
+        // D122). Its config keys are the vendor's, not this API's closed entry
+        // shape, and this server cannot know which are legal for a dated type it
+        // may predate — so the entry is recorded and carried, and only the one
+        // thing every tool entry needs is required: a `name`. `WIRE-NOTES` (22).
+        if let Some(kind) = tool.get("type").and_then(Value::as_str)
+            && kind != "custom"
+        {
+            server.push(kind.to_string());
+            let _ = checker.required_string(&pointer, tool, "name");
+            continue;
+        }
         checker.closed(
             &pointer,
             tool,
@@ -338,7 +355,16 @@ fn check_tools(checker: &mut Checker, body: &Map<String, Value>) -> Vec<String> 
         }
         names.push(name);
     }
-    names
+    Tools { names, server }
+}
+
+/// What a request's `tools` array holds, split by who runs them.
+pub(crate) struct Tools {
+    /// The client tools, by name, in request order — what the graph dispatches.
+    pub(crate) names: Vec<String>,
+    /// The server tools, by `type:`, in request order — what the provider runs
+    /// itself (grammar 12.1, Decision D122).
+    pub(crate) server: Vec<String>,
 }
 
 /// `tool_choice`, and the name of the tool it forces if it forces one.
@@ -607,6 +633,21 @@ fn check_content(
         let Some(kind) = checker.required(&pointer, block, "type") else {
             continue;
         };
+        // A **server-tool** block, replayed back to the wire that produced it
+        // (grammar 12.1, Decision D122): the `server_tool_use` the service filed
+        // and the `<name>_tool_result` it answered itself with. A compiled graph
+        // must send these back unaltered and must **not** answer them — the call
+        // already happened, on the provider's side — so what is checked here is
+        // that they arrived at all, and their innards are the vendor's rather
+        // than this closed block vocabulary. `WIRE-NOTES` (22).
+        if let Some(name) = kind.as_str()
+            && (name == "server_tool_use"
+                || name.ends_with("_tool_result") && name != "tool_result")
+        {
+            seen_other = true;
+            blocks.uses_tool_blocks = true;
+            continue;
+        }
         let Some(kind) = checker
             .one_of(
                 &at(&pointer, "type"),
@@ -930,6 +971,15 @@ fn reply_answer(
         }
     };
 
+    // Server-tool activity goes **in front** of whatever the model then said:
+    // the provider ran the tool inside this turn, so its record precedes the
+    // text or the calls that were written knowing what it found (grammar 12.1,
+    // Decision D122).
+    let content = match server_tool_blocks(sequence, request, &reply.server_tools) {
+        Ok(blocks) => blocks.into_iter().chain(content).collect::<Vec<Value>>(),
+        Err(refusal) => return refusal,
+    };
+
     let model = request
         .get("model")
         .and_then(Value::as_str)
@@ -1136,6 +1186,70 @@ fn tool_use_block(sequence: u64, index: usize, name: &str, input: &Value) -> Val
         "name": name,
         "input": input,
     })
+}
+
+/// The blocks a scripted server-tool use becomes on the Messages wire
+/// (grammar 12.1, Decision D122).
+///
+/// **Two blocks per use, and both are the answer**: a `server_tool_use` saying
+/// what the service was asked, and the `<name>_tool_result` that answers it.
+/// The service ran the tool itself, so the result is already here — this is the
+/// shape a compiled graph must carry through its loop *without* dispatching
+/// anything, which is what the acceptance suite reads it for.
+///
+/// A use is held to the request the same way a scripted tool call is: a provider
+/// does not run a tool it was not given, so a `type:` this request's `tools`
+/// array does not declare is a `script-mismatch` rather than an answer. The
+/// tool's `name` comes off that same declaration — the Messages wire carries
+/// both, and the result block is named after the name rather than the dated
+/// type.
+fn server_tool_blocks(
+    sequence: u64,
+    request: &Value,
+    uses: &[crate::control::ServerToolUse],
+) -> Result<Vec<Value>, Answer> {
+    let mut blocks = Vec::new();
+    for (index, use_) in uses.iter().enumerate() {
+        let Some(name) = declared_server_tool(request, &use_.type_name) else {
+            return Err(mismatch(
+                sequence,
+                &format!(
+                    "the script runs the server tool `{}`, which this request does not declare: a \
+                     provider runs only the server tools its `tools` array carries. Declare it on \
+                     the provider's `server_tools:`, or script a `raw` response",
+                    use_.type_name
+                ),
+            ));
+        };
+        let id = use_
+            .id
+            .clone()
+            .unwrap_or_else(|| format!("srvtoolu_mock_{sequence:08}_{index}"));
+        blocks.push(json!({
+            "type": "server_tool_use",
+            "id": id,
+            "name": name,
+            "input": use_.input.clone().unwrap_or_else(|| json!({})),
+        }));
+        blocks.push(json!({
+            "type": format!("{name}_tool_result"),
+            "tool_use_id": id,
+            "content": use_.result.clone().unwrap_or(Value::Null),
+        }));
+    }
+    Ok(blocks)
+}
+
+/// The `name` this request declared for a server tool of this `type`, if it
+/// declared one at all.
+fn declared_server_tool(request: &Value, type_name: &str) -> Option<String> {
+    request
+        .get("tools")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|tool| tool.get("type").and_then(Value::as_str) == Some(type_name))
+        .and_then(|tool| tool.get("name").and_then(Value::as_str))
+        .map(str::to_string)
 }
 
 fn failure_answer(sequence: u64, failure: &Failure) -> Answer {
