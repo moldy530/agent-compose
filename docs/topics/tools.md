@@ -239,6 +239,15 @@ directory. `builtin.bash` runs with the root as its working directory. The value
 is interpolable, so `${WORKSPACE}` is the usual spelling and the directory is a
 property of the machine running the graph rather than of the composition.
 
+Two consequences of "resolution" worth knowing before you meet them. A link
+whose target does not exist is **refused rather than followed** — there is
+nothing to resolve, so where it points cannot be checked, and writing through it
+would create the file it names. And a `builtin.list` walk **does not descend into
+a symlinked directory**: the link is reported as an entry, without the trailing
+`/` a directory gets, because a walk that followed it would answer with paths
+outside the root that no path check was ever asked about. Reading through such a
+link is a `read_file` call, where the check is asked.
+
 It has to name something, too: an empty `root:` is a compile error, and a
 `${WORKSPACE}` that comes back empty fails the call rather than resolving. An
 empty path is the runtime's own working directory, so a bound that accepted one

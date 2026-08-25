@@ -999,8 +999,14 @@ naming a directory that does not exist fails the call. Every path argument is
 taken relative to it, and a path that **resolves** outside it is refused:
 resolution, not string comparison, so a `..` that climbs out and a symlink that
 points out are both refused, and a write to a file that does not exist yet
-resolves through its parent. `builtin.bash` runs with the resolved root as its
-working directory.
+resolves through its parent. A symlink whose target does not exist is refused
+rather than followed: there is nothing to resolve, so where it points cannot be
+checked, and a write through it would create the file it names. A `builtin.list`
+walk does not **descend** into a symlinked directory for the same bound's sake —
+the link is one entry of the listing, reported without the trailing `/` a
+directory gets, because a walk that followed it would answer with paths outside
+the root that no path check was asked of. `builtin.bash` runs with the resolved
+root as its working directory.
 
 **`timeout:` is required on `builtin.bash`** and is a §4.4 duration. It bounds
 one command; §9.2's node-level `timeout:` bounds the whole agent node, deadline
