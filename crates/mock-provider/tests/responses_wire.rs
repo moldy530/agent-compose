@@ -307,6 +307,51 @@ fn the_chat_completions_spelling_of_the_token_bound_is_refused() {
     );
 }
 
+/// The other half of that same translation: `reasoning_effort` is the Chat
+/// Completions spelling, and `reasoning: { effort }` is this wire's
+/// (`WIRE-NOTES` (20)).
+///
+/// Both directions in one test, because either alone would pass a server that
+/// had quietly stopped distinguishing them: the flat key is refused by the
+/// closed list, and the nested one is served.
+#[test]
+fn the_chat_completions_spelling_of_the_reasoning_knob_is_refused() {
+    let provider = MockProvider::start().expect("a port");
+    // One script for two requests: a refused request never reaches the queue,
+    // so the served one takes it and the queue drains.
+    provider.enqueue(Script::new(MODEL, Outcome::text("hello")));
+    let client = provider.client();
+    let input = json!([{ "type": "message", "role": "user", "content": "hello" }]);
+
+    let untranslated = send(
+        &client,
+        &json!({ "model": MODEL, "input": input, "reasoning_effort": "high" }),
+    );
+    assert_eq!(untranslated.status, 400);
+    assert!(
+        untranslated.json()["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("reasoning_effort")),
+        "{}",
+        untranslated.json()
+    );
+
+    let translated = send(
+        &client,
+        &json!({ "model": MODEL, "input": input, "reasoning": { "effort": "high" } }),
+    );
+    assert_eq!(translated.status, 200, "{}", translated.json());
+    let recorded = provider.requests();
+    assert!(recorded[1].is_valid(), "{:?}", recorded[1].failures());
+    // Not `is_drained`: this run refused a request on purpose, and that is one
+    // of the counts a drained snapshot requires to be zero. What it does say is
+    // that the served request took the one script — the refusal never reached
+    // the queue.
+    let snapshot = provider.snapshot();
+    assert!(snapshot.queues.is_empty());
+    assert_eq!(snapshot.invalid, 1);
+}
+
 /// An assistant turn replayed back — the shape a tool loop's second call carries
 /// — is accepted with its own items, server-tool records included.
 #[test]

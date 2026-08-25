@@ -799,6 +799,23 @@ fn an_openai_provider_with_server_tools_runs_its_loop_on_the_responses_wire() {
         );
         assert_eq!(request.path, "/v1/responses");
         assert_eq!(request.server_tools, ["web_search"]);
+        // …and both settings this wire spells differently arrived spelled its
+        // way (`WIRE-NOTES` (20)). `is_valid()` above is already the half that
+        // catches the untranslated spelling — the key list is closed — so what
+        // these pin is that the translation produced the right *value* rather
+        // than dropping the knob on the floor, which a closed list cannot see.
+        assert_eq!(
+            request.body()["max_output_tokens"],
+            json!(4096),
+            "`max_tokens` is `max_output_tokens` here: {}",
+            request.body_text
+        );
+        assert_eq!(
+            request.body()["reasoning"],
+            json!({ "effort": "high" }),
+            "…and `reasoning_effort` is `reasoning: {{ effort }}`: {}",
+            request.body_text
+        );
     }
     // The client tool is declared flat on this wire, and its call came back to
     // the graph — a server tool in the same array changed neither.
