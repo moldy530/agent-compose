@@ -627,6 +627,105 @@ surface the way the Chat Completions path is rendered here.
 
 ---
 
+### 19. The Responses surface is a wire, not a route
+
+`POST /v1/responses` is served by `src/responses.rs` rather than by
+`src/openai.rs`, and that is a decision rather than a filing convenience: four
+things differ from Chat Completions, and each is a shape a codegen bug takes —
+the conversation is a list of **items** (a `function_call` is its own item beside
+the message, and a result is a `function_call_output` keyed by `call_id`), the
+system prompt is the top-level `instructions`, a tool is **flat**
+(`{type: "function", name, parameters}`), and structured output is `text.format`
+rather than `response_format`. A module that tried to serve both would have to
+branch on the route at every one of those points.
+
+What the two **do** share is the error envelope and the credential rules, and
+those are shared in code: `openai::rejected` and `openai::unscripted` answer this
+route, and its header check is `openai::check_direct_headers` — the same function,
+including WIRE-NOTES (12)'s keyless-gateway reading. How a connection
+authenticates belongs to the connection, not to the wire (PRD 5.9).
+
+*What is assumed*: that `api.openai.com` answers a malformed Responses request in
+the Chat Completions envelope (`{"error": {message, type, param, code}}`) with
+`x-request-id` beside it. The published error documentation is written once for
+the API rather than per surface, so this is the reading it invites; if it is
+wrong, what differs is the *shape a client sees on a 400*, which no compiled
+graph branches on — the runtime classifies by status (PRD 5.9).
+
+**`stop` and `seed` are refused here.** They are grammar 12.2 `settings:` keys
+that Chat Completions takes and the Responses API does not, so a provider that
+speaks this wire and declares one has declared a knob nothing will read. The
+closed `REQUEST_KEYS` list refuses the request, which is the intended failure
+mode (see *Accepted-key lists*): the alternative is a run whose declared `stop`
+sequence silently never applies. `docs/topics/models.md` says so where an author
+meets the seam.
+
+### 20. `max_tokens` is `max_output_tokens` here, and the mock will not translate
+
+The emitted runtime translates two `settings:` keys on its way to this wire —
+`max_tokens` becomes `max_output_tokens`, and `reasoning_effort` becomes
+`reasoning: { effort }`. This server deliberately accepts **only** the translated
+spellings, so a runtime that stopped translating is refused rather than served a
+request whose bound the service would have ignored. That is a mock being stricter
+than nothing at all: the real service accepts neither `max_tokens` nor
+`reasoning_effort` on this route, so the refusal is the service's own.
+
+### 21. A Responses history is an echo, and a `function_call_output` carries no error flag
+
+Two concessions, both about the same list of items:
+
+*A tool **name** the current request does not declare* is **accepted** in the
+history here, where Chat Completions refuses it (see (18)). The reasoning is the
+one that surface's row gives, applied to a wire whose input items are an echo of
+the service's own output rather than a re-declaration: a `function_call` item was
+produced by the service and is being handed back, so there is nothing for the
+request's `tools` to have declared it as. *What is assumed* is that
+`api.openai.com` agrees. If it does not, the failure is the one Chat Completions
+already has a written remedy for — drop the undeclared call from the replayed
+items and send its refusal as a `user` message — and the runtime's Responses
+branch would adopt it.
+
+*A refusal carries no flag.* A `function_call_output` is closed to its `call_id`
+and its `output`, so a refused tool call's text **is** the output — the same
+concession Chat Completions makes, and for the same reason (Decision D119). What
+stays load-bearing is that the output is sent at all: an unanswered `call_id` is
+refused here in both directions, exactly as the other two wires are checked.
+
+### 22. Server tools are recorded and carried, never checked
+
+A `tools` array may carry entries the **provider** runs rather than the graph
+(grammar 12.1, Decision D122). This server tells them apart by `type:` —
+anything but `custom` on the Messages wire, anything but `function` on the two
+OpenAI ones — and then **records the type and carries the entry unchecked**, on
+all three routes.
+
+That is a deliberate hole in an otherwise strict server, and it is the same hole
+resolved q30 puts in the compiler: the whole point of the key is that a server
+tool the vendor ships tomorrow is usable the day it ships, so a mock that refused
+a config it did not recognise would refuse compositions that work. What it still
+checks is what it can decide from one request: the Messages wire requires the
+`name:` every tool entry there carries, and both wires refuse a **scripted** use
+of a server tool the request did not declare — a provider runs only the tools it
+was given.
+
+The answer side is the mirror. A scripted `server_tools` entry becomes, on the
+Messages wire, a `server_tool_use` block and the `<name>_tool_result` that
+answers it; on Responses, one `<type>_call` item carrying `status` and — where
+the script named one — the `results` the service found. Both are **already
+answered**: the graph must replay them and must not dispatch anything, which is
+what `check_content` (Messages) and `check_input` (Responses) accept them back
+for.
+
+*What is assumed* is the shape of the result: the Messages wire's
+`<name>_tool_result` naming, and the Responses item's `results`/`action` members.
+Both are read from the vendors' published examples rather than confirmed against
+a live call, and neither is something a compiled graph reads — the runtime
+carries these blocks through its loop opaquely, which is exactly the property the
+acceptance suite asserts. A wrong member name here would therefore fail nothing
+that is not already failing.
+
+---
+
 ## Accepted-key lists are curated, not exhaustive
 
 Both surfaces refuse unknown top-level keys, checked against a list in

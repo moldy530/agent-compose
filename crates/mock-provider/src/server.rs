@@ -29,7 +29,7 @@ use crate::control::{
     Decision, Delay, HARNESS_HEADER, Incoming, Outcome, Script, Store, Surface, canonical,
 };
 use crate::wire::{Answer, HARNESS_STATUS, MISMATCH, Response as Wire, UNSENDABLE};
-use crate::{anthropic, openai};
+use crate::{anthropic, openai, responses};
 
 /// The largest request body this server will read.
 ///
@@ -150,6 +150,10 @@ fn route(
     };
     match (method.as_str(), path) {
         ("POST", "/v1/messages") => provider(store, Reached::Anthropic, arriving),
+        // OpenAI's Responses API, which an `openai` provider declaring
+        // `server_tools:` speaks for every call it makes (grammar 12.1,
+        // Decision D122).
+        ("POST", "/v1/responses") => provider(store, Reached::Responses, arriving),
         ("POST", "/v1/chat/completions") => provider(
             store,
             Reached::ChatCompletions {
@@ -195,7 +199,7 @@ fn route(
                 "mock_provider": format!(
                     "no route for {method} {path}; this server serves /v1/messages, \
                      /v1/chat/completions, the Azure chat-completions routes, \
-                     /v1/embeddings, and /_mock/*"
+                     /v1/responses, /v1/embeddings, and /_mock/*"
                 )
             }),
         )
@@ -242,6 +246,8 @@ enum Reached<'a> {
         /// The Azure deployment in the path, on the one route that has one.
         deployment: Option<&'a str>,
     },
+    /// The Responses API (grammar 12.1, Decision D122).
+    Responses,
 }
 
 impl Reached<'_> {
@@ -254,6 +260,7 @@ impl Reached<'_> {
                 ..
             } => Surface::OpenAi,
             Self::ChatCompletions { .. } => Surface::AzureOpenAi,
+            Self::Responses => Surface::Responses,
         }
     }
 }
@@ -271,13 +278,14 @@ fn provider(store: &Store, reached: Reached<'_>, arriving: Arriving<'_>) -> Answ
     let body: Option<Value> = serde_json::from_slice(bytes).ok();
     let surface = reached.surface();
 
-    let (model, failures, tools, structured): (String, _, _, _) = match reached {
+    let (model, failures, tools, server_tools, structured): (String, _, _, _, _) = match reached {
         Reached::Anthropic => {
             let parsed = anthropic::parse(&headers, body.as_ref());
             (
                 parsed.model,
                 parsed.failures,
                 parsed.tools,
+                parsed.server_tools,
                 parsed.structured_output,
             )
         }
@@ -287,6 +295,17 @@ fn provider(store: &Store, reached: Reached<'_>, arriving: Arriving<'_>) -> Answ
                 parsed.model,
                 parsed.failures,
                 parsed.tools,
+                parsed.server_tools,
+                parsed.structured_output,
+            )
+        }
+        Reached::Responses => {
+            let parsed = responses::parse(&headers, body.as_ref());
+            (
+                parsed.model,
+                parsed.failures,
+                parsed.tools,
+                parsed.server_tools,
                 parsed.structured_output,
             )
         }
@@ -303,6 +322,7 @@ fn provider(store: &Store, reached: Reached<'_>, arriving: Arriving<'_>) -> Answ
         body_text,
         failures,
         tools,
+        server_tools,
         structured_output: structured.clone(),
     });
 
@@ -321,6 +341,19 @@ fn provider(store: &Store, reached: Reached<'_>, arriving: Arriving<'_>) -> Answ
         Surface::OpenAi | Surface::AzureOpenAi => match decision {
             Decision::Serve(outcome) => {
                 let answer = openai::render(sequence, &body, &model, structured.as_ref(), &outcome);
+                recorded(store, sequence, &outcome, answer)
+            }
+            Decision::Rejected(failures) => openai::rejected(sequence, &failures),
+            Decision::Unscripted { model, reason } => openai::unscripted(sequence, &model, &reason),
+        },
+        // The Responses surface renders its own answers and borrows the two
+        // refusals: how a connection authenticates and how it reports a bad
+        // request belong to the connection rather than to the wire, so its error
+        // envelope is Chat Completions' (see `responses`).
+        Surface::Responses => match decision {
+            Decision::Serve(outcome) => {
+                let answer =
+                    responses::render(sequence, &body, &model, structured.as_ref(), &outcome);
                 recorded(store, sequence, &outcome, answer)
             }
             Decision::Rejected(failures) => openai::rejected(sequence, &failures),

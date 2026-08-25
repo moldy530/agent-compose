@@ -696,6 +696,156 @@ fn every_answer_carries_a_request_id_including_the_errors() {
     assert_eq!(malformed.json()["request_id"], "req_mock_00000004");
 }
 
+/// A provider's `server_tools:` ride the same `tools` array as the agent's own,
+/// arrive **verbatim**, and are recorded apart from what the graph dispatches
+/// (grammar 12.1, Decision D122).
+#[test]
+fn a_declared_server_tool_arrives_verbatim_and_is_recorded_as_one() {
+    let provider = MockProvider::start().expect("a port");
+    provider.enqueue(Script::new(
+        MODEL,
+        Outcome::structured(json!({ "verdict": "approve", "feedback": "" })),
+    ));
+
+    let web_search = json!({
+        "type": "web_search_20250305",
+        "name": "web_search",
+        "max_uses": 5,
+        "allowed_domains": ["docs.example.com"],
+    });
+    let mut tools = output_schema_tool();
+    tools
+        .as_array_mut()
+        .expect("a tool list")
+        .push(web_search.clone());
+    let response = send(
+        &provider.client(),
+        &structured_request(tools, "reviewer_output"),
+    );
+    assert_eq!(response.status, 200, "{}", response.json());
+
+    let recorded = provider.requests();
+    assert!(recorded[0].is_valid(), "{:?}", recorded[0].failures());
+    assert_eq!(recorded[0].tools, ["reviewer_output"]);
+    assert_eq!(recorded[0].server_tools, ["web_search_20250305"]);
+    // Verbatim, field for field: this is the assertion resolved q30's
+    // pass-through exists for.
+    assert_eq!(recorded[0].body()["tools"][1], web_search);
+}
+
+/// A scripted server-tool use comes back as the pair of blocks the Messages wire
+/// answers with — the use, and the result the service produced for it — ahead of
+/// whatever the model then said. Nothing here is for the graph to run.
+#[test]
+fn a_scripted_server_tool_use_arrives_already_answered() {
+    let provider = MockProvider::start().expect("a port");
+    provider.enqueue(Script::new(
+        MODEL,
+        Outcome::structured(json!({ "verdict": "approve", "feedback": "" })).with_server_tools(
+            vec![mock_provider::ServerToolUse::new(
+                "web_search_20250305",
+                json!({ "query": "agent-compose" }),
+                json!([{ "type": "web_search_result", "url": "https://docs.example.com/a" }]),
+            )],
+        ),
+    ));
+
+    let mut tools = output_schema_tool();
+    tools.as_array_mut().expect("a tool list").push(json!({
+        "type": "web_search_20250305",
+        "name": "web_search",
+    }));
+    let body = send(
+        &provider.client(),
+        &structured_request(tools, "reviewer_output"),
+    )
+    .json();
+    let content = body["content"].as_array().expect("a content list");
+    assert_eq!(
+        content.len(),
+        3,
+        "use, result, then the answer: {content:?}"
+    );
+    assert_eq!(content[0]["type"], "server_tool_use");
+    assert_eq!(content[0]["name"], "web_search");
+    assert_eq!(content[1]["type"], "web_search_tool_result");
+    assert_eq!(content[1]["tool_use_id"], content[0]["id"]);
+    assert_eq!(content[2]["type"], "tool_use");
+    assert_eq!(content[2]["name"], "reviewer_output");
+}
+
+/// The turn above, replayed back on the next request — which is what a tool loop
+/// does — is accepted with its server-tool blocks intact.
+#[test]
+fn a_replayed_turn_carrying_server_tool_blocks_is_accepted() {
+    let provider = MockProvider::start().expect("a port");
+    provider.enqueue(Script::new(
+        MODEL,
+        Outcome::structured(json!({ "verdict": "approve", "feedback": "" })),
+    ));
+
+    let mut tools = output_schema_tool();
+    tools.as_array_mut().expect("a tool list").push(json!({
+        "type": "web_search_20250305",
+        "name": "web_search",
+    }));
+    let request = json!({
+        "model": MODEL,
+        "max_tokens": 4096,
+        "system": "You are a meticulous technical reviewer.",
+        "messages": [
+            { "role": "user", "content": "look it up" },
+            {
+                "role": "assistant",
+                "content": [
+                    { "type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search", "input": { "query": "x" } },
+                    { "type": "web_search_tool_result", "tool_use_id": "srvtoolu_1", "content": [] },
+                    { "type": "text", "text": "I looked it up." },
+                ],
+            },
+            { "role": "user", "content": "now answer" },
+        ],
+        "tools": tools,
+        "tool_choice": { "type": "tool", "name": "reviewer_output" },
+    });
+    let response = send(&provider.client(), &request);
+    assert_eq!(response.status, 200, "{}", response.json());
+    assert!(
+        provider.requests()[0].is_valid(),
+        "{:?}",
+        provider.requests()[0].failures()
+    );
+}
+
+/// A provider runs only the server tools it was given.
+#[test]
+fn a_server_tool_the_request_did_not_declare_is_refused() {
+    let provider = MockProvider::start().expect("a port");
+    provider.enqueue(Script::new(
+        MODEL,
+        Outcome::text("looked it up").with_server_tools(vec![mock_provider::ServerToolUse::new(
+            "web_fetch_20250910",
+            json!({}),
+            json!({}),
+        )]),
+    ));
+
+    let request = json!({
+        "model": MODEL,
+        "max_tokens": 4096,
+        "messages": [{ "role": "user", "content": "hello" }],
+    });
+    let response = send(&provider.client(), &request);
+    assert_eq!(response.status, HARNESS_STATUS);
+    assert!(
+        response.json()["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("web_fetch_20250910")),
+        "{}",
+        response.json()
+    );
+}
+
 /// The same script answered twice is the same bytes, which is what makes a
 /// transcript assertable and a golden run repeatable.
 #[test]

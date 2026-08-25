@@ -141,6 +141,16 @@ pub enum Surface {
     /// `POST /openai/v1/chat/completions`.
     #[serde(rename = "azure_openai")]
     AzureOpenAi,
+    /// `POST /v1/responses` — OpenAI's Responses API.
+    ///
+    /// Its own surface rather than a route of [`OpenAi`](Self::OpenAi): the
+    /// request is a list of *items* rather than messages, the tool shape is
+    /// flat, structured output is `text.format` rather than `response_format`,
+    /// and it is the only OpenAI wire that carries the built-in server-tool
+    /// suite at all. A compiled graph reaches it when its `openai` provider
+    /// declares `server_tools:` (grammar 12.1, Decision D122).
+    #[serde(rename = "responses")]
+    Responses,
 }
 
 impl Surface {
@@ -151,6 +161,7 @@ impl Surface {
             Self::Anthropic => "anthropic",
             Self::OpenAi => "openai",
             Self::AzureOpenAi => "azure_openai",
+            Self::Responses => "responses",
         }
     }
 }
@@ -387,6 +398,30 @@ impl Outcome {
         })
     }
 
+    /// The same reply, with server-tool activity woven into the turn ahead of
+    /// it (Decision D122).
+    ///
+    /// # Panics
+    ///
+    /// If the outcome is not a reply. A failure and a `raw` body have no turn
+    /// for a server tool to have run inside, so a builder that accepted one
+    /// would have to drop it — the same rule, and the same reason, as
+    /// [`Outcome::after`]'s.
+    #[must_use]
+    pub fn with_server_tools(self, uses: Vec<ServerToolUse>) -> Self {
+        match self {
+            Self::Reply(reply) => Self::Reply(Reply {
+                server_tools: uses,
+                ..reply
+            }),
+            other => panic!(
+                "`{}` is not a model turn, so a server tool cannot have run inside it: script a \
+                 `reply`, or `raw` for a response generated code must reject",
+                other.served()
+            ),
+        }
+    }
+
     /// Answer only after `delay`.
     ///
     /// The scheduling knob a fan-out test needs: with completion order forced,
@@ -459,6 +494,19 @@ pub struct Reply {
     /// [`ReplyBody`] is. Anything else is [`Outcome::Raw`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,
+    /// Server tools the provider ran **inside** this turn, in the order they
+    /// ran (grammar 12.1, Decision D122).
+    ///
+    /// Not tool calls: a server tool executes on the provider's side and its
+    /// record arrives already answered, woven into the turn ahead of whatever
+    /// the model then said. So this is not a [`ReplyBody`] variant — it composes
+    /// with all three of them — and a graph that receives one runs nothing.
+    ///
+    /// Each entry must name a `type:` **this request declared**, for the same
+    /// reason a scripted tool call must name a function the request offered: a
+    /// provider does not run a tool it was not given.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub server_tools: Vec<ServerToolUse>,
     /// How long to wait before answering.
     #[serde(default, skip_serializing_if = "Delay::is_none")]
     pub delay: Delay,
@@ -470,7 +518,46 @@ impl Reply {
             body,
             usage: None,
             stop_reason: None,
+            server_tools: Vec::new(),
             delay: Delay::none(),
+        }
+    }
+}
+
+/// One server-tool use in a scripted reply (Decision D122).
+///
+/// Written once and rendered into whichever wire is answering: the Messages API
+/// puts it on the turn as a `server_tool_use` block and its paired
+/// `*_tool_result`, the Responses API as a `<type>_call` item. A test scripts
+/// the *use*, not either spelling, so the same script drives both wires.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerToolUse {
+    /// The tool's `type:`, exactly as the request's `server_tools:` declared it
+    /// — `web_search_20250305` on the Messages wire, `web_search` on Responses.
+    #[serde(rename = "type")]
+    pub type_name: String,
+    /// What the provider was asked, as the use block carries it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<Value>,
+    /// What it found, as the result block carries it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
+    /// Overrides the derived id, for a test that wants to pin the correlation
+    /// between the use and its result itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+}
+
+impl ServerToolUse {
+    /// A use of `type_name` that found `result`.
+    #[must_use]
+    pub fn new(type_name: impl Into<String>, input: Value, result: Value) -> Self {
+        Self {
+            type_name: type_name.into(),
+            input: Some(input),
+            result: Some(result),
+            id: None,
         }
     }
 }
@@ -897,6 +984,15 @@ pub struct RecordedRequest {
     /// the tools codegen synthesizes from an agent's attached stores (11.5), so
     /// `agent_access` narrowing is observable here.
     pub tools: Vec<String>,
+    /// The `type:` of every **server** tool the request declared, in request
+    /// order (grammar 12.1, Decision D122).
+    ///
+    /// Kept apart from `tools` because they are different things on the wire and
+    /// in the graph: `tools` are the functions the runtime dispatches, and these
+    /// are the tools the provider runs itself. A test asserting that a
+    /// provider's suite reached the request reads this for the names and
+    /// [`Self::body`] for the configs, which arrive verbatim.
+    pub server_tools: Vec<String>,
     /// How the request asked for structured output, if it did.
     pub structured_output: Option<StructuredOutput>,
     /// What the server **answered** it with — not merely what the queue handed
@@ -1017,6 +1113,7 @@ pub(crate) struct Incoming {
     pub(crate) body_text: String,
     pub(crate) failures: Vec<ValidationFailure>,
     pub(crate) tools: Vec<String>,
+    pub(crate) server_tools: Vec<String>,
     pub(crate) structured_output: Option<StructuredOutput>,
 }
 
@@ -1149,6 +1246,7 @@ impl Store {
             body_text: incoming.body_text,
             verdict,
             tools: incoming.tools,
+            server_tools: incoming.server_tools,
             structured_output: incoming.structured_output,
             served,
         });

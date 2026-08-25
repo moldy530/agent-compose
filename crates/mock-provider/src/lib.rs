@@ -27,8 +27,14 @@
 //! |---|---|
 //! | `anthropic` | [`anthropic`]: `POST /v1/messages` |
 //! | `openai`, `openai_compatible` | [`openai`]: `POST /v1/chat/completions` |
+//! | `openai` **with `server_tools:`** | [`responses`]: `POST /v1/responses` |
 //! | `azure_openai` | [`openai`], reached at the Azure routes |
 //! | `bedrock`, `vertex` | **out of scope in v0** — reached through cloud SDKs, not an HTTP endpoint the spec points at (grammar 12.1); see `WIRE-NOTES.md` |
+//!
+//! The third row is the one that is not decided by the kind alone: an `openai`
+//! provider declaring a server-tool suite speaks the Responses API for **every**
+//! call it makes, because that is the only OpenAI wire the built-in tool suite
+//! rides (grammar 12.1, Decision D122).
 //!
 //! # Using it from a test
 //!
@@ -105,6 +111,7 @@ mod wire;
 
 mod anthropic;
 mod openai;
+mod responses;
 mod server;
 
 use std::io;
@@ -115,8 +122,8 @@ pub use client::{Client, Request, Response};
 pub use control::{
     CREATED, Delay, Failure, HARNESS_HEADER, HARNESS_STATUS, Outcome, REFUSED_INVALID,
     REFUSED_MISMATCH, REFUSED_UNSCRIPTED, REFUSED_UNSENDABLE, RecordedRequest, Reply, ReplyBody,
-    Script, Snapshot, Store, StructuredOutput, Surface, ToolCall, Usage, ValidationFailure,
-    Verdict,
+    Script, ServerToolUse, Snapshot, Store, StructuredOutput, Surface, ToolCall, Usage,
+    ValidationFailure, Verdict,
 };
 pub use server::serve;
 
