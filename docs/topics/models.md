@@ -159,8 +159,13 @@ provider.anthropic:
 ```
 
 Every entry needs a `type:`, which is the vendor's own key for the tool and is
-never interpolated. Everything else is the vendor's, travels verbatim, and — like
-the rest of a provider's non-secret config — may embed `${ENV}` references.
+never interpolated. Everything else is the vendor's and travels verbatim, and —
+like the rest of a provider's non-secret config — its **string** values may embed
+`${ENV}` references. Numbers and booleans may not, and the two tiers below are
+why: a field the compiler's table types is read at compile time, where there is
+nothing to read, and interpolation produces a string, which is not what
+`max_uses:` carries to the wire. `max_uses: ${SEARCH_BUDGET}` is therefore a
+`type-mismatch` whose help says so.
 
 **The suite belongs to the connection.** Every agent whose model resolves to
 that provider holds it; to give one agent a search and not another, define a

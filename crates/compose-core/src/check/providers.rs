@@ -510,15 +510,35 @@ fn plugin(ctx: &mut Ctx, subject: &str, value: &Spanned<PluginValue>, shape: Fie
         // the whole of what it buys: no warning, and no claim about the value.
         (FieldShape::Opaque, _) => {}
         (shape, found) => {
-            ctx.error(
+            let mut report = Diagnostic::error(
                 DiagnosticCode::TypeMismatch,
-                &value.span,
+                value.span.clone(),
                 format!(
                     "{subject} takes {}, found {}",
                     shape.description(),
                     describe_value(found)
                 ),
             );
+            // The one mismatch here that is a *rule* rather than a slip, and
+            // the one an author is walked into: `server_tools:` is provider
+            // config, so grammar 4.3 class 2 says its string values
+            // interpolate — and a field the table types as anything else is
+            // read *here*, where there is nothing to read. Saying only that a
+            // string was found names the symptom; the reason the value is a
+            // string is the `${ENV}` the author wrote on purpose, and the
+            // second tier walks them into it (`max_usages: ${N}` validates
+            // with a warning whose help says "did you mean `max_uses`?").
+            if let PluginValue::Text(text) = found
+                && !text.references.is_empty()
+            {
+                report = report.with_help(
+                    "a field the curated table models is read at compile time, and an `${ENV}` \
+                     reference reaches the wire as the string it expands to rather than as the \
+                     value: only the fields the table types as strings interpolate (grammar 12.1, \
+                     4.3 class 2)",
+                );
+            }
+            ctx.push(report);
         }
     }
 }
