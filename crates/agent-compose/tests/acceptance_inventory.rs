@@ -60,6 +60,15 @@ enum Bullet {
     Strategy,
     /// PRD §7 M3's first bullet: "**Durable execution**: …".
     Durability,
+    /// PRD §7 M3's second bullet, its runtime half: "**Built-in tools** … and
+    /// runtime bash/file tools opted into per agent node, bounded by root +
+    /// timeout (resolved q31)".
+    ///
+    /// The *other* half of that bullet — provider-executed server tools — is
+    /// filed under [`Self::Harness`], because what it changed was what a
+    /// scripted answer has to be able to carry. This half changed what a
+    /// compiled graph *does*, so it gets a heading of its own.
+    BuiltinTools,
 }
 
 /// Whether a criterion's tests run today.
@@ -1334,6 +1343,81 @@ const DURABILITY: &[Criterion] = &[
     },
 ];
 
+/// PRD §7 M3's second bullet, its runtime half: the four built-ins, what bounds
+/// them, and what a bound being crossed does.
+///
+/// One sentence rather than an enumeration, so — like `HARNESS` and
+/// `DURABILITY` — its phrases are held to it by containment. Three claims: that
+/// the tools exist and run, that the root bounds them, and that the timeout
+/// does. The failure and refusal rules are not separate phrases of the bullet —
+/// resolved q31 states them as "the standing rules" — so they hang off the two
+/// bounds they are reached through.
+const BUILTINS: &[Criterion] = &[
+    Criterion {
+        bullet: Bullet::BuiltinTools,
+        phrase: "runtime bash/file tools",
+        tests: &[
+            // All four, in one turn, each asserted on something only a real call
+            // could produce — including the one whose effect outlives the
+            // process.
+            (
+                "every_builtin_runs_inside_its_root_and_answers_the_model",
+                Status::Live,
+            ),
+            // …and the half of the loop that is not the tool running: a call the
+            // schema refuses is the model's to make again, which is what keeps a
+            // built-in's contract the same contract every other tool surface has
+            // (Decision D119).
+            (
+                "arguments_a_builtin_refuses_bounce_back_to_the_model",
+                Status::Live,
+            ),
+            // …and what a built-in buys over the `exec:` tool an author could
+            // have hand-rolled: the journal holds its answer, so a resumed
+            // execution consumes it rather than running the command again.
+            (
+                "a_resumed_run_consumes_a_recorded_builtin_instead_of_running_it_again",
+                Status::Live,
+            ),
+        ],
+    },
+    Criterion {
+        bullet: Bullet::BuiltinTools,
+        phrase: "opted into per agent node, bounded by root",
+        tests: &[
+            // The bound, crossed the way a string comparison would catch…
+            (
+                "a_path_that_climbs_out_of_the_root_is_refused_and_fails_the_node",
+                Status::Live,
+            ),
+            // …and the way only resolution does, which is what resolved q31
+            // spells out ("symlinks and `..` count").
+            (
+                "a_symlink_that_points_out_of_the_root_is_refused",
+                Status::Live,
+            ),
+        ],
+    },
+    Criterion {
+        bullet: Bullet::BuiltinTools,
+        phrase: "bounded by root + timeout",
+        tests: &[
+            // The deadline, reached — and reached at the *attachment's* value,
+            // since the fixture binds the same built-in at two.
+            (
+                "a_command_that_outruns_its_timeout_is_killed_and_fails_the_node",
+                Status::Live,
+            ),
+            // …and the other execution failure a shell has, which is where the
+            // node's own `on_error:` gets to decide the run.
+            (
+                "a_command_that_exits_nonzero_fails_the_node_under_its_on_error",
+                Status::Live,
+            ),
+        ],
+    },
+];
+
 fn rows() -> impl Iterator<Item = &'static Criterion> {
     CODEGEN
         .iter()
@@ -1341,6 +1425,7 @@ fn rows() -> impl Iterator<Item = &'static Criterion> {
         .chain(HARNESS)
         .chain(STRATEGY)
         .chain(DURABILITY)
+        .chain(BUILTINS)
 }
 
 fn repository() -> PathBuf {
@@ -1560,6 +1645,25 @@ fn the_durability_rows_transcribe_the_prd_m3_bullet() {
     }
 }
 
+/// The built-in rows are phrases of PRD §7 M3's second bullet.
+///
+/// Containment and normalization, for the reason the sibling above gives: the
+/// bullet is one sentence about two things — provider-executed server tools and
+/// runtime ones — and the PRD wraps its prose, so a clause a reader hears as one
+/// spans two lines in the file.
+#[test]
+fn the_builtin_rows_transcribe_the_prd_m3_bullet() {
+    let bullet = distribution_bullet("**Built-in tools**");
+    let flattened = bullet.split_whitespace().collect::<Vec<_>>().join(" ");
+    for criterion in BUILTINS {
+        assert!(
+            flattened.contains(criterion.phrase),
+            "`{}` is not a phrase of PRD §7 M3's built-in-tools bullet: {flattened}",
+            criterion.phrase
+        );
+    }
+}
+
 /// The rows CLAUDE.md contributes are its own phrases too.
 #[test]
 fn the_strategy_rows_transcribe_claude_md() {
@@ -1725,6 +1829,11 @@ fn every_bullet_contributes_criteria() {
             Bullet::Durability,
             3,
             "the durable-execution bullet's three claims",
+        ),
+        (
+            Bullet::BuiltinTools,
+            3,
+            "the built-in tools bullet's runtime half: the tools, the root, the timeout",
         ),
     ] {
         let count = rows()

@@ -11900,6 +11900,527 @@ fn openai_agent_request() -> Value {
 }
 
 // ---------------------------------------------------------------------------
+// PRD §7 M3, second bullet — "Built-in tools", the runtime half (resolved q31).
+// ---------------------------------------------------------------------------
+
+/// A scratch directory a `builtin-tools` run is bounded to, and the environment
+/// that points the fixture at it.
+///
+/// The `root:` every entry declares is `${BUILTIN_ROOT}` — a class 2 surface
+/// (grammar 4.3) resolved at process start — so the bound is a property of the
+/// machine running the graph. Each test gets its own directory, which is what
+/// lets the suite run in parallel and what makes "the file is there afterwards"
+/// an assertion about *this* run.
+fn bounded_root(
+    provider: &MockProvider,
+    purpose: &str,
+) -> (harness::Scratch, Vec<(String, String)>) {
+    let scratch = harness::Scratch::new(purpose);
+    let root = scratch.path().join("root");
+    std::fs::create_dir_all(&root).expect("the scratch area is writable");
+    let mut environment = harness::environment(provider);
+    environment.push(("BUILTIN_ROOT".to_string(), root.display().to_string()));
+    (scratch, environment)
+}
+
+/// Where a `builtin-tools` run's tools are bounded to, under its scratch.
+fn root_of(scratch: &harness::Scratch) -> std::path::PathBuf {
+    scratch.path().join("root")
+}
+
+/// All four built-ins, called by a real model loop, doing real work
+/// (grammar 5.5, Decision D123, PRD resolved q31).
+///
+/// One answer carries four calls, so the whole set is exercised in one turn and
+/// the results come back in one tool-result message the transcript can be read
+/// off. What each one is asserted on is the thing only a real call could
+/// produce: the bytes of a file that was on disk before the run, the entries of
+/// a directory the harness made, the stdout of a command, and — the only one
+/// visible outside the transcript — a file that exists on disk afterwards.
+#[test]
+fn every_builtin_runs_inside_its_root_and_answers_the_model() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (scratch, environment) = bounded_root(&provider, "builtins-run");
+    let root = root_of(&scratch);
+    std::fs::write(root.join("notes.txt"), "the note this file held")
+        .expect("the root is writable");
+    std::fs::create_dir_all(root.join("sub")).expect("the root is writable");
+
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![
+                ToolCall::new("read_file", json!({ "path": "notes.txt" })),
+                ToolCall::new("list", json!({ "path": ".", "glob": "" })),
+                ToolCall::new(
+                    "write_file",
+                    json!({ "path": "written.txt", "content": "what the graph wrote" }),
+                ),
+                ToolCall::new(
+                    "bash",
+                    json!({ "command": "printf 'ran in %s' \"$(basename \"$PWD\")\"" }),
+                ),
+            ]),
+        ),
+        Script::new(SONNET, Outcome::text("I have what I need.")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "summary": "read, listed, wrote and ran" })),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke_with(
+        "builtin-tools",
+        "flow.work",
+        &json!({ "goal": "do the four things" }),
+        &environment,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(run.outputs()["summary"], "read, listed, wrote and ran");
+
+    // The one effect that outlives the process: `write_file` really wrote.
+    assert_eq!(
+        std::fs::read_to_string(root.join("written.txt")).expect("the file was written"),
+        "what the graph wrote"
+    );
+
+    // …and the three that are only visible in what the model was handed back,
+    // which is the request that replays this turn's results.
+    let asked = provider.requests();
+    assert_eq!(asked.len(), 3, "the loop turned twice and then pinned");
+    let handed = asked[1].body().to_string();
+    for expected in [
+        // `read_file` answered with the bytes that were on disk.
+        "the note this file held",
+        // `list` answered with the directory's entries, a directory marked.
+        "notes.txt",
+        "sub/",
+        // `write_file` answered with the byte count.
+        "bytes_written",
+        // …and `bash` ran with the root as its working directory, which is what
+        // the command printed the basename of.
+        "ran in root",
+    ] {
+        assert!(
+            handed.contains(expected),
+            "the model was not handed `{expected}` back: {handed}"
+        );
+    }
+
+    // The trace records each call as a `ToolCallRecord` and nothing more:
+    // `docs/trace.md` §11 keeps a tool's answer out of the format, and a
+    // built-in is a tool (PRD resolved q31 — "traces are unchanged").
+    let calls = tool_calls_of(&run, "do");
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| (
+                call["name"].as_str().unwrap_or_default().to_string(),
+                call["target"].as_str().unwrap_or_default().to_string(),
+                call["outcome"].as_str().unwrap_or_default().to_string(),
+                call.get("result").is_some(),
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "read_file".to_string(),
+                "builtin.read_file".to_string(),
+                "completed".to_string(),
+                false
+            ),
+            (
+                "list".to_string(),
+                "builtin.list".to_string(),
+                "completed".to_string(),
+                false
+            ),
+            (
+                "write_file".to_string(),
+                "builtin.write_file".to_string(),
+                "completed".to_string(),
+                false
+            ),
+            (
+                "bash".to_string(),
+                "builtin.bash".to_string(),
+                "completed".to_string(),
+                false
+            ),
+        ],
+        "each call is recorded under the built-in's address, with no result beside it"
+    );
+    assert!(provider.snapshot().is_drained());
+}
+
+/// A path that climbs out of the root with `..` is **refused**, and refusing it
+/// fails the node rather than going back to the model (PRD resolved q31).
+///
+/// The file it climbs to really exists, which is what makes the assertion about
+/// the *rule* rather than about a missing file: a runtime comparing strings, or
+/// one resolving the path and then opening the raw one, would read it.
+#[test]
+fn a_path_that_climbs_out_of_the_root_is_refused_and_fails_the_node() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (scratch, environment) = bounded_root(&provider, "builtins-escape");
+    std::fs::write(scratch.path().join("secret.txt"), "not for the model")
+        .expect("the scratch area is writable");
+
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::tool_calls(vec![ToolCall::new(
+            "read_file",
+            json!({ "path": "../secret.txt" }),
+        )]),
+    ));
+
+    let Some(run) = harness::invoke_with(
+        "builtin-tools",
+        "flow.work",
+        &json!({ "goal": "read the secret" }),
+        &environment,
+    ) else {
+        return;
+    };
+    let said = run.failed();
+    assert!(
+        said.contains("resolves outside `root:`") && said.contains("../secret.txt"),
+        "the refusal names the path and the bound it left: {said}"
+    );
+
+    // …and it is a *failure*, not a refusal handed back: the model saw nothing,
+    // the node ended, and the trace says so (Decision D119).
+    let calls = tool_calls_of(&run, "do");
+    assert_eq!(
+        calls.len(),
+        1,
+        "the loop ended at the first call: {calls:?}"
+    );
+    assert_eq!(calls[0]["outcome"], "failed");
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "a failed call ends the node, so the loop does not turn again"
+    );
+}
+
+/// A **symlink** that points out of the root is refused too, which is the half a
+/// string comparison passes and a resolution does not (PRD resolved q31:
+/// "resolution, not string prefix — symlinks and `..` count").
+#[cfg(unix)]
+#[test]
+fn a_symlink_that_points_out_of_the_root_is_refused() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (scratch, environment) = bounded_root(&provider, "builtins-symlink");
+    let outside = scratch.path().join("secret.txt");
+    std::fs::write(&outside, "not for the model").expect("the scratch area is writable");
+    // The link's own path is inside the root and stays inside it under every
+    // string rule there is; only resolving it says otherwise.
+    std::os::unix::fs::symlink(&outside, root_of(&scratch).join("inside.txt"))
+        .expect("the root is writable");
+
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::tool_calls(vec![ToolCall::new(
+            "read_file",
+            json!({ "path": "inside.txt" }),
+        )]),
+    ));
+
+    let Some(run) = harness::invoke_with(
+        "builtin-tools",
+        "flow.work",
+        &json!({ "goal": "read through the link" }),
+        &environment,
+    ) else {
+        return;
+    };
+    let said = run.failed();
+    assert!(
+        said.contains("resolves outside `root:`") && said.contains("inside.txt"),
+        "a link out of the root is refused where it points, not where it sits: {said}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&outside).expect("the file is still there"),
+        "not for the model",
+        "nothing outside the root was touched"
+    );
+}
+
+/// A command that outruns its attachment's `timeout:` is **killed**, and the
+/// call fails the node (grammar 5.5, PRD resolved q31).
+///
+/// `agent.impatient` binds the same `builtin.bash` at one second where
+/// `agent.worker` binds it at thirty, so what this decides is the *attachment's*
+/// bound rather than a constant: the command asks for far longer than either.
+#[test]
+fn a_command_that_outruns_its_timeout_is_killed_and_fails_the_node() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_scratch, environment) = bounded_root(&provider, "builtins-timeout");
+
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::tool_calls(vec![ToolCall::new(
+            "bash",
+            json!({ "command": "sleep 60" }),
+        )]),
+    ));
+
+    let started = std::time::Instant::now();
+    let Some(run) = harness::invoke_with(
+        "builtin-tools",
+        "flow.deadline",
+        &json!({ "goal": "wait forever" }),
+        &environment,
+    ) else {
+        return;
+    };
+    let said = run.failed();
+    assert!(
+        said.contains("ran longer than `1s`"),
+        "the failure names the bound the composition wrote: {said}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(50),
+        "the command was killed at its deadline rather than waited out"
+    );
+    let calls = tool_calls_of(&run, "do");
+    assert_eq!(calls[0]["outcome"], "failed");
+}
+
+/// A command that exits nonzero fails the agent node, and the node's own
+/// `on_error:` decides the run — the standing rule for every `exec:` tool,
+/// reached by a built-in (grammar 9.2, PRD resolved q31).
+#[test]
+fn a_command_that_exits_nonzero_fails_the_node_under_its_on_error() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_scratch, environment) = bounded_root(&provider, "builtins-nonzero");
+
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::tool_calls(vec![ToolCall::new(
+            "bash",
+            json!({ "command": "echo 'the command said why' >&2; exit 3" }),
+        )]),
+    ));
+
+    let Some(run) = harness::invoke_with(
+        "builtin-tools",
+        "flow.tolerant",
+        &json!({ "goal": "run something that fails" }),
+        &environment,
+    ) else {
+        return;
+    };
+    // The run **completes**, which is only possible because the node failed and
+    // `on_error: skip` absorbed it: the value in `summary` is the one the node
+    // after it wrote, not the agent's.
+    run.succeeded();
+    assert_eq!(run.outputs()["summary"], "the node was skipped");
+
+    let entries = run.entries("attempt");
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0]["outcome"], "skipped");
+    let said = entries[0]["error"].as_str().unwrap_or_default();
+    assert!(
+        said.contains("`builtin.bash` exited 3") && said.contains("the command said why"),
+        "the node's error names the exit status and what the command said: {said}"
+    );
+}
+
+/// Arguments a built-in's own schema refuses go **back to the model**, which is
+/// the other side of the split (Decision D119, PRD resolved q22 and q31).
+///
+/// The first answer calls `read_file` with no `path` at all; the loop hands the
+/// refusal back, the model corrects itself, and the run completes. A runtime
+/// that failed the node on a schema refusal would end the run here, and one that
+/// answered the bad call would read a file nobody named.
+#[test]
+fn arguments_a_builtin_refuses_bounce_back_to_the_model() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (scratch, environment) = bounded_root(&provider, "builtins-refusal");
+    std::fs::write(
+        root_of(&scratch).join("notes.txt"),
+        "the note this file held",
+    )
+    .expect("the root is writable");
+
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new("read_file", json!({}))]),
+        ),
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "read_file",
+                json!({ "path": "notes.txt" }),
+            )]),
+        ),
+        Script::new(SONNET, Outcome::text("Now I have it.")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "summary": "read it on the second try" })),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke_with(
+        "builtin-tools",
+        "flow.work",
+        &json!({ "goal": "read the notes" }),
+        &environment,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(run.outputs()["summary"], "read it on the second try");
+
+    let calls = tool_calls_of(&run, "do");
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| call["outcome"].as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>(),
+        ["refused", "completed"],
+        "the schema refusal came back to the model and the corrected call ran: {calls:?}"
+    );
+    let refusal = calls[0]["error"].as_str().unwrap_or_default();
+    assert!(
+        refusal.starts_with("ToolCallRefused: ") && refusal.contains("read_file"),
+        "the refusal is recorded in the shape `docs/trace.md` §3 gives one: {refusal}"
+    );
+    // …and the model was handed the same sentence, which is what it corrects on.
+    let handed = provider.requests()[1].body().to_string();
+    assert!(
+        handed.contains("read_file"),
+        "the refusal reached the model: {handed}"
+    );
+    assert!(provider.snapshot().is_drained());
+}
+
+/// A run killed mid-graph resumes **without running its recorded `bash` again**
+/// (PRD resolved q31, `docs/durability.md` §3.2).
+///
+/// The command appends a line to a file outside the graph's own state, so
+/// "it ran twice" is a fact a test can count rather than one it has to infer:
+/// after the crash the file holds one line, and after the resume it still holds
+/// one. A built-in that reached the journal like every other tool execution is
+/// the only way that happens.
+#[test]
+fn a_resumed_run_consumes_a_recorded_builtin_instead_of_running_it_again() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (scratch, environment) = bounded_root(&provider, "builtins-resume");
+    let ledger = root_of(&scratch).join("ledger.txt");
+
+    provider.enqueue_all([
+        // The first node's loop: one command with a side effect, then the pinned
+        // answer that ends the node.
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "bash",
+                json!({ "command": "echo ran >> ledger.txt" }),
+            )]),
+        ),
+        Script::new(SONNET, Outcome::text("Recorded.")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "summary": "the first pass" })),
+        ),
+    ]);
+    // The second node's first call — a loop call, since the agent carries tools
+    // — held past the kill, so the frontier lands with the whole of the first
+    // node recorded and none of the second.
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::text("Nothing more to do.").after(Duration::from_secs(120)),
+    ));
+
+    let Some((project, built)) = harness::build_under_toolchain("builtin-tools", "resume-builtin")
+    else {
+        return;
+    };
+    assert!(
+        built.status.success(),
+        "the builtin-tools fixture did not build:\n{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+
+    let killed = harness::crash_run(
+        &project,
+        &["run", "flow.relay", "--input", "goal=append a line"],
+        &environment,
+        |_| provider.snapshot().requests >= 4,
+    );
+    assert_eq!(
+        harness::lines_in(&ledger),
+        1,
+        "the first generation ran the command once"
+    );
+
+    provider.reset();
+    // What a correct replay still owes the provider: the second node's loop and
+    // its pinned answer. The first node's three calls — and the `bash` inside
+    // them — are behind the frontier.
+    provider.enqueue_all([
+        Script::new(SONNET, Outcome::text("Nothing more to do.")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "summary": "the second pass" })),
+        ),
+    ]);
+
+    let resumed = harness::resume(
+        &project,
+        "builtin-tools",
+        &killed.execution,
+        Some("json"),
+        &environment,
+    );
+    resumed.succeeded();
+    let answered = resumed.outputs();
+    assert_eq!(answered["status"], "completed", "{answered}");
+    assert_eq!(
+        answered["outputs"]["relayed"], "the first pass",
+        "the replayed node's answer reaches the resumed run's state: {answered}"
+    );
+    assert_eq!(
+        answered["outputs"]["final"], "the second pass",
+        "{answered}"
+    );
+
+    assert_eq!(
+        harness::lines_in(&ledger),
+        1,
+        "the resumed generation was handed the recorded answer and ran no command \
+         (`docs/durability.md` §3.2): the ledger would hold two lines if it had"
+    );
+}
+
+/// Every `ToolCallRecord` one agent node's model calls filed, in call order
+/// (`docs/trace.md` §7.3).
+fn tool_calls_of(run: &harness::Invocation, node: &str) -> Vec<Value> {
+    run.entries(node)
+        .iter()
+        .flat_map(|entry| {
+            entry["models"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+        })
+        .flat_map(|call| {
+            call["toolCalls"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // PRD §7 M3, first bullet — "Durable execution" (resolved q26–q29). Live.
 // ---------------------------------------------------------------------------
 
