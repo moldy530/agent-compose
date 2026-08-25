@@ -3500,15 +3500,24 @@ The checking is **two-tier**, and the constraint behind it is that a server tool
 a vendor ships tomorrow must be usable the day it ships:
 
 - a `type` in the compiler's **curated table** for that kind is validated
-  strictly — a field the tool does not have, a mistyped one, a constraint
-  violation, or a value outside a closed set is an error naming the repair. On
-  the Messages wire that closed set includes the required `name`, which the API
-  pairs with each dated `type` and refuses a request that spells otherwise:
-  `web_search_20250305` is `web_search`, `web_fetch_20250910` is `web_fetch`,
-  and either `code_execution_*` is `code_execution`;
+  strictly **against the fields that table models** — a mistyped value, a value
+  outside a stated range or a closed set, a missing required field, or a
+  constraint violation is an error naming the repair. On the Messages wire that
+  closed set includes the required `name`, which the API pairs with each dated
+  `type` and refuses a request that spells otherwise: `web_search_20250305` is
+  `web_search`, `web_fetch_20250910` is `web_fetch`, and either
+  `code_execution_*` is `code_execution`;
 - a `type` outside it is a **warning** (`unknown-server-tool`) naming exactly
   what could not be verified, and the entry then travels to the wire as written.
-  The composition still builds and still runs.
+  The composition still builds and still runs;
+- a **key** outside the row of a `type` that is in the table is the same
+  warning one level down (`unknown-server-tool-field`), and travels the same
+  way. A row is keyed on `type` alone and is a snapshot of that tool taken at
+  the compiler's release, so a parameter the vendor adds afterwards would
+  otherwise block every author of a tool the table names — the treadmill again,
+  at field granularity, with no entry-level way out. The compiler cannot tell
+  such a key from a misspelling, so the diagnostic names the near miss where
+  there is one and claims nothing where there is not.
 
 The key is legal on the three kinds whose rows name it and is an error
 (`unsupported-server-tools`) on `azure_openai`, `bedrock` and `vertex`, whose
@@ -6313,16 +6322,29 @@ provider's own wire vocabulary, and the runtime appends them to the `tools` of
 every request that provider serves. Each entry requires a string `type:`;
 everything else is the provider's and travels verbatim, as grammar 4.3 class 2
 values. The compiler keeps a **curated table** of the server tools each kind is
-known to serve: an entry naming one is checked strictly against it, and an entry
-naming anything else is a **warning** that says so and is carried to the wire
-unchanged. **Rationale**: PRD resolved q30. The governing constraint is *no
+known to serve: an entry naming one is checked strictly against it, and anything
+the table cannot speak for is a **warning** that says so and is carried to the
+wire unchanged. **Rationale**: PRD resolved q30. The governing constraint is *no
 manual support treadmill* — a server tool the vendor ships tomorrow must be
 usable the day it ships, without waiting for a compiler release — and the two
 tiers are how that coexists with G3 diagnostics: the table buys a real error
-message for the tools it knows, and buys nothing at the cost of a warning for
-the tools it does not. A table that *gated* would be the treadmill; no table at
-all would make a misspelled `max_uses` a 400 on the first live call, with no
-span.
+message for what it knows, and buys nothing at the cost of a warning for what it
+does not. A table that *gated* would be the treadmill; no table at all would
+make a misspelled `max_uses` a 400 on the first live call, with no span.
+
+**"Anything the table cannot speak for" is two things, not one.** A `type` it
+does not name (`unknown-server-tool`), and a **key** it does not name inside a
+`type` it does (`unknown-server-tool-field`). The second is the same rule read
+at field granularity, and it has to be, for the same reason: a row is keyed on
+`type` alone and is a snapshot of one tool at one release, vendors add
+parameters to tools they already ship, and a strict tier nobody can opt an entry
+out of would refuse them until a new binary shipped. What stays an **error** is
+everything the table genuinely knows: a field it models given the wrong kind of
+value, a value outside a stated range or closed set, a required field left out,
+two fields the vendor refuses together. A field the vendor documents whose
+interior the compiler's vocabulary cannot state — `file_search`'s recursive
+`filters` — is *in* the row as an unconstrained key, since a documented
+parameter warned about is a diagnostic that teaches nothing.
 
 **The runtime dispatches nothing.** A server tool executes on the provider's
 side, inside the model call, and its results arrive woven into the assistant's

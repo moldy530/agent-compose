@@ -13,16 +13,28 @@
 //! vendor ships tomorrow must be usable the day it ships, without waiting for a
 //! compiler release. So the checking is two-tier (q30):
 //!
-//! * a config naming a tool **in this table** is validated **strictly** — a
-//!   misspelled or mistyped field and a constraint violation are errors with
-//!   diagnostics naming the repair (PRD G3);
-//! * a config naming anything else is a **warning** that names exactly what
-//!   could not be verified, and then travels to the wire verbatim.
+//! * a config naming a tool **in this table** is validated **strictly** against
+//!   the fields the table models — a mistyped value, a value outside a closed
+//!   set or a stated range, a missing required field and a constraint violation
+//!   are errors with diagnostics naming the repair (PRD G3);
+//! * anything the table cannot speak for is a **warning** that names exactly
+//!   what could not be verified, and then travels to the wire verbatim.
 //!
-//! The table is therefore a convenience that buys diagnostics, never a gate. A
-//! kind with **no** row — `openai_compatible`, whose gateway may honour any
-//! vocabulary at all — is served by the second tier alone, which is why
-//! [`known`] answers an empty slice for it rather than being unimplemented.
+//! The second tier is reached at **two** granularities, and for one reason. A
+//! `type:` outside the table is the obvious one. The other is a *field* outside
+//! a tabled tool's row: a vendor adds parameters to a tool it already ships, and
+//! a compiler that refused every field its own table predates would be the
+//! treadmill again — narrower, and just as blocking, since a row is keyed on
+//! `type:` alone and there is no way to opt one entry out of the strict tier.
+//! Nothing here can tell "a field this release is older than" from "a
+//! misspelling" — so both are warned about, the near miss is named in the help
+//! when there is one, and the key travels.
+//!
+//! The table is therefore a convenience that buys diagnostics, never a gate —
+//! at either granularity. A kind with **no** row — `openai_compatible`, whose
+//! gateway may honour any vocabulary at all — is served by the second tier
+//! alone, which is why [`known`] answers an empty slice for it rather than being
+//! unimplemented.
 //!
 //! # One source
 //!
@@ -62,6 +74,17 @@ pub enum FieldShape {
     /// is written both ways (`code_interpreter`'s `container:`, which is either
     /// a container id or a request to make one).
     TextOrObject(&'static ObjectShape),
+    /// A field the vendor documents whose **interior** this vocabulary cannot
+    /// state: a recursive shape, or a union of several. Any value at all is
+    /// accepted and travels verbatim.
+    ///
+    /// It is here so that such a field is a *known* field — the row says the
+    /// tool has it, so no warning — rather than one the table is silent about.
+    /// The alternative is worse in both directions: leaving it out warns on a
+    /// documented parameter, and modelling it badly refuses one.
+    /// `file_search`'s `filters:` is the launch scope's only case (a comparison
+    /// filter, or a compound one holding more filters).
+    Opaque,
 }
 
 impl FieldShape {
@@ -76,6 +99,7 @@ impl FieldShape {
             Self::Strings => "an array of strings",
             Self::Object(_) => "a mapping",
             Self::TextOrObject(_) => "a string or a mapping",
+            Self::Opaque => "any value",
         }
     }
 }
@@ -370,6 +394,15 @@ const FILE_SEARCH_SHAPE: ObjectShape = ObjectShape {
             name: "vector_store_ids",
             shape: FieldShape::Strings,
         },
+        // A comparison filter — `{ type: eq, key: kind, value: handbook }` — or
+        // a compound one, `{ type: and, filters: [ … ] }`, which holds filters
+        // of either sort to any depth. [`FieldShape`] states neither unions nor
+        // recursion, and a field is better known-and-uninspected than absent:
+        // see [`FieldShape::Opaque`].
+        Field {
+            name: "filters",
+            shape: FieldShape::Opaque,
+        },
         Field {
             name: "max_num_results",
             shape: FieldShape::Integer(1, 50),
@@ -416,6 +449,11 @@ const IMAGE_GENERATION_SHAPE: ObjectShape = ObjectShape {
         Field {
             name: "background",
             shape: FieldShape::Choice(&["transparent", "opaque", "auto"]),
+        },
+        // How much of an input image the edit preserves.
+        Field {
+            name: "input_fidelity",
+            shape: FieldShape::Choice(&["high", "low"]),
         },
         Field {
             name: "model",
@@ -676,6 +714,35 @@ mod tests {
                 .field("name"),
             Some(FieldShape::Choice(&["code_execution"])),
             "both dated revisions carry the same canonical name"
+        );
+    }
+
+    /// A documented parameter of a tabled tool is **in** its row, however little
+    /// the row can say about it.
+    ///
+    /// The two below are the launch scope's awkward cases, and they are here
+    /// because leaving a documented field out has a cost the second tier only
+    /// softens: `agent-compose validate` warns about a config the service serves
+    /// happily, and the published schema — derived from this table by
+    /// `tests/schema_conformance.rs` — describes it to an editor as a key nobody
+    /// knows. `filters:` is the shape [`FieldShape`] cannot state and
+    /// `input_fidelity:` is the one an earlier revision of this table simply
+    /// predated.
+    #[test]
+    fn a_documented_field_is_tabled_even_where_its_interior_is_not() {
+        let file_search =
+            lookup(ProviderKind::OpenAi, "file_search").expect("the launch scope has file search");
+        assert_eq!(
+            file_search.shape.field("filters"),
+            Some(FieldShape::Opaque),
+            "`file_search` takes the vendor's attribute filter, whose interior is a union this \
+             vocabulary does not state"
+        );
+        let image = lookup(ProviderKind::OpenAi, "image_generation")
+            .expect("the launch scope has image generation");
+        assert_eq!(
+            image.shape.field("input_fidelity"),
+            Some(FieldShape::Choice(&["high", "low"]))
         );
     }
 

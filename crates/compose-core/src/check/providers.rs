@@ -182,12 +182,20 @@ pub(crate) fn check(ctx: &mut Ctx) {
 /// One `server_tools:` entry, two tiers (Decision D122, resolved q30).
 ///
 /// A tool the kind's curated table names is checked **strictly** — every field
-/// against its documented shape, every constraint the vendor states — because a
-/// config the provider will refuse is a run that fails on its first model call
-/// with a 400 and no span. A tool the table does not name is **warned about and
-/// carried**: the table is a convenience that buys diagnostics, never a gate,
-/// and a server tool the vendor ships tomorrow has to be usable the day it ships
-/// (the no-treadmill constraint q30 settles).
+/// the table models against its documented shape, every constraint the vendor
+/// states — because a config the provider will refuse is a run that fails on its
+/// first model call with a 400 and no span. A tool the table does not name is
+/// **warned about and carried**: the table is a convenience that buys
+/// diagnostics, never a gate, and a server tool the vendor ships tomorrow has to
+/// be usable the day it ships (the no-treadmill constraint q30 settles).
+///
+/// The second tier is reached at two granularities, because the same constraint
+/// applies inside a row. A vendor adds parameters to a tool it already ships,
+/// and a row is keyed on `type:` alone — so a *field* outside the row is warned
+/// about and carried too, rather than refused. What survives as an error is
+/// everything the table can actually speak for: a field it models given the
+/// wrong kind of value, a value outside a stated range or a closed set, a
+/// required field missing, a pair the vendor refuses together.
 fn server_tool(ctx: &mut Ctx, address: &str, kind: ProviderKind, tool: &ServerTool) {
     let type_name = tool.type_name.value.as_str();
     let Some(known) = server_tools::lookup(kind, type_name) else {
@@ -240,18 +248,17 @@ fn server_tool(ctx: &mut Ctx, address: &str, kind: ProviderKind, tool: &ServerTo
     }
     for (key, value) in &tool.config {
         let Some(shape) = known.shape.field(key) else {
-            let names = known.shape.names();
-            let help = crate::parse::reader::suggest(key, &names).map_or_else(
-                || format!("`{type_name}` takes {}", crate::parse::reader::list(&names)),
-                |name| format!("did you mean `{name}`?"),
-            );
             ctx.push(
-                Diagnostic::error(
-                    DiagnosticCode::UnknownKey,
+                Diagnostic::warning(
+                    DiagnosticCode::UnknownServerToolField,
                     value.span.clone(),
-                    format!("`{key}` is not a field of {subject}"),
+                    format!(
+                        "{subject} declares `{key}`, which is not a field this compiler release \
+                         knows it has: the value is unchecked and travels to the provider as \
+                         written"
+                    ),
                 )
-                .with_help(help),
+                .with_help(unverified_field(type_name, &known.shape.names(), key)),
             );
             continue;
         };
@@ -275,6 +282,31 @@ fn unverifiable(kind: ProviderKind, names: &[&str]) -> String {
          so a tool the vendor ships later works here the day it ships (grammar 12.1, \
          Decision D122)",
         kind.as_str(),
+        crate::parse::reader::list(names)
+    )
+}
+
+/// The help line a field the table cannot speak for carries: the near miss when
+/// there is one, and otherwise what this release does check on that tool.
+///
+/// The two cases the one warning covers are a misspelling and a parameter newer
+/// than this compiler, and nothing here can tell them apart — so the help names
+/// the near miss where one exists and says what the alternative is where one
+/// does not, rather than asserting which case the author is in.
+fn unverified_field(type_name: &str, names: &[&str], key: &str) -> String {
+    if let Some(near) = crate::parse::reader::suggest(key, names) {
+        return format!("did you mean `{near}`?");
+    }
+    if names.is_empty() {
+        return format!(
+            "this release models no fields on `{type_name}`, so every key beside `type:` is \
+             carried unchecked (grammar 12.1, Decision D122)"
+        );
+    }
+    format!(
+        "the fields this release checks on `{type_name}` are {}; anything else is carried \
+         unchecked, so a parameter the vendor adds later works here the day it ships \
+         (grammar 12.1, Decision D122)",
         crate::parse::reader::list(names)
     )
 }
@@ -343,6 +375,10 @@ fn plugin(ctx: &mut Ctx, subject: &str, value: &Spanned<PluginValue>, shape: Fie
             object(ctx, subject, value, nested);
         }
         (FieldShape::TextOrObject(_), PluginValue::Text(_)) => {}
+        // A documented field whose interior this vocabulary cannot state — a
+        // union, or a recursive shape. The row knows the tool *has* it, which is
+        // the whole of what it buys: no warning, and no claim about the value.
+        (FieldShape::Opaque, _) => {}
         (shape, found) => {
             ctx.error(
                 DiagnosticCode::TypeMismatch,
@@ -358,6 +394,11 @@ fn plugin(ctx: &mut Ctx, subject: &str, value: &Spanned<PluginValue>, shape: Fie
 }
 
 /// A nested config object: its required fields, and each field it declares.
+///
+/// A key the nested shape does not name is the same case as one its tool does
+/// not name, one level down — a vendor grows `user_location:` a field, and the
+/// table is a release behind — so it carries the same warning rather than an
+/// error (see [`server_tool`]).
 fn object(ctx: &mut Ctx, subject: &str, value: &Spanned<PluginValue>, shape: &ObjectShape) {
     let PluginValue::Mapping(entries) = &value.value else {
         return;
@@ -378,13 +419,27 @@ fn object(ctx: &mut Ctx, subject: &str, value: &Spanned<PluginValue>, shape: &Ob
         let key = entry.key.value.as_str();
         let Some(nested) = shape.field(key) else {
             let names = shape.names();
+            let help = crate::parse::reader::suggest(key, &names).map_or_else(
+                || {
+                    format!(
+                        "the keys this release checks there are {}; anything else is carried \
+                         unchecked (grammar 12.1, Decision D122)",
+                        crate::parse::reader::list(&names)
+                    )
+                },
+                |near| format!("did you mean `{near}`?"),
+            );
             ctx.push(
-                Diagnostic::error(
-                    DiagnosticCode::UnknownKey,
+                Diagnostic::warning(
+                    DiagnosticCode::UnknownServerToolField,
                     entry.key.span.clone(),
-                    format!("`{key}` is not a key of {subject}"),
+                    format!(
+                        "{subject} declares `{key}`, which is not a key this compiler release \
+                         knows it has: the value is unchecked and travels to the provider as \
+                         written"
+                    ),
                 )
-                .with_help(format!("it takes {}", crate::parse::reader::list(&names))),
+                .with_help(help),
             );
             continue;
         };

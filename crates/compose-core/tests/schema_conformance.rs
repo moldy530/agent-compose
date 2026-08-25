@@ -611,10 +611,16 @@ fn the_published_schema_knows_every_server_tool_the_table_does() {
                 });
             let subject = format!("`{def}`'s `{}`", tool.type_name);
             let then = &branch["then"];
+            // …and **open**, as the compiler's tier is. `agent-compose validate`
+            // carries a key the row does not name with a warning rather than
+            // refusing it (`unknown-server-tool-field`), so a schema that closed
+            // the object would squiggle exactly the config the compiler ships to
+            // the wire — the editor claiming an error where the authority has
+            // none.
             assert_eq!(
                 then["additionalProperties"],
-                json!(false),
-                "{subject} must be closed, as the compiler's table is"
+                Value::Null,
+                "{subject} must stay open: a field this release predates is carried, not refused"
             );
             assert!(
                 required_of(then).contains("type"),
@@ -747,8 +753,8 @@ fn same_nested(subject: &str, node: &Value, shape: &compose_core::ast::server_to
     assert_eq!(node["type"], json!("object"), "{subject} is a mapping");
     assert_eq!(
         node["additionalProperties"],
-        json!(false),
-        "{subject} is closed, as the compiler's table is"
+        Value::Null,
+        "{subject} stays open, as the compiler's tier is one level down too"
     );
     let published: BTreeSet<String> = node["properties"]
         .as_object()
@@ -837,6 +843,35 @@ fn same_field(subject: &str, node: &Value, shape: compose_core::ast::server_tool
                 "{subject} holds interpolable strings"
             );
         }
+        // A field the table knows the tool has and nothing more (a recursive or
+        // union shape). The schema says the same thing: a property with a
+        // description and no constraint at all, so an editor offers the key,
+        // completes nothing inside it, and refuses nothing either.
+        FieldShape::Opaque => {
+            assert!(
+                node["description"].is_string(),
+                "{subject} says what it is, since it constrains nothing"
+            );
+            for keyword in [
+                "type",
+                "enum",
+                "const",
+                "$ref",
+                "anyOf",
+                "allOf",
+                "oneOf",
+                "properties",
+                "items",
+                "required",
+            ] {
+                assert_eq!(
+                    node[keyword],
+                    Value::Null,
+                    "{subject} is carried verbatim by the compiler and must not be constrained \
+                     here by `{keyword}`"
+                );
+            }
+        }
         FieldShape::Object(nested) => same_nested(subject, node, nested),
         FieldShape::TextOrObject(nested) => {
             let arms = node["anyOf"]
@@ -919,12 +954,15 @@ fn the_published_schema_gates_server_tools_by_kind() {
     }
 }
 
-/// The strict tier really is strict in the schema too: a known tool's misspelled
-/// field is rejected, and the same object under an unknown `type` is not.
+/// The strict tier really is strict in the schema too: a known tool's field
+/// given a value the vendor refuses is rejected, and what neither half of the
+/// compiler can verify is left alone.
 ///
 /// This is the property the two tiers are *made of*, and it is the one an editor
 /// shows: the config the provider will refuse is squiggled where it was written,
-/// and the config nobody can verify is left alone.
+/// and the config nobody can verify — an unknown `type:`, or a key outside a
+/// known one's row — is not squiggled at all, because `agent-compose validate`
+/// carries both to the wire.
 #[test]
 fn the_published_schema_checks_a_known_server_tool_and_carries_an_unknown_one() {
     let validator = compile_schema();
@@ -933,12 +971,50 @@ fn the_published_schema_checks_a_known_server_tool_and_carries_an_unknown_one() 
         "provider.p": {
             "kind": "anthropic",
             "api_key": "${ANTHROPIC_API_KEY}",
-            "server_tools": [{ "type": "web_search_20250305", "name": "web_search", "max_usages": 5 }],
+            "server_tools": [{ "type": "web_search_20250305", "name": "web_search", "max_uses": 0 }],
         },
     });
     assert!(
         !validation_errors(&validator, &strict).is_empty(),
-        "a field `web_search_20250305` does not have is refused"
+        "a value outside the bound the table states is refused"
+    );
+
+    let wrong_name = json!({
+        "version": "0.1",
+        "provider.p": {
+            "kind": "anthropic",
+            "api_key": "${ANTHROPIC_API_KEY}",
+            "server_tools": [{ "type": "web_search_20250305", "name": "search_the_web" }],
+        },
+    });
+    assert!(
+        !validation_errors(&validator, &wrong_name).is_empty(),
+        "the canonical `name` the Messages wire pairs with the `type` is fixed"
+    );
+
+    // The field tier, from the editor's side: the compiler warns and carries, so
+    // the schema must not refuse — squiggling a key `agent-compose validate`
+    // ships to the wire is the editor claiming an error the authority does not
+    // have (`unknown-server-tool-field`).
+    let newer_than_this_release = json!({
+        "version": "0.1",
+        "provider.p": {
+            "kind": "anthropic",
+            "api_key": "${ANTHROPIC_API_KEY}",
+            "server_tools": [{
+                "type": "web_search_20250305",
+                "name": "web_search",
+                "max_uses": 5,
+                "result_freshness": "week",
+                "user_location": { "type": "approximate", "postcode": "SW1A" },
+            }],
+        },
+    });
+    let errors = validation_errors(&validator, &newer_than_this_release);
+    assert!(
+        errors.is_empty(),
+        "a parameter the vendor added after this release is carried, nested or not:\n{}",
+        errors.join("\n")
     );
 
     let both_lists = json!({
@@ -993,8 +1069,17 @@ fn the_published_schema_checks_a_known_server_tool_and_carries_an_unknown_one() 
             "kind": "openai",
             "api_key": "${OPENAI_API_KEY}",
             "server_tools": [
-                { "type": "file_search", "vector_store_ids": ["${HANDBOOK_STORE}"], "max_num_results": 5 },
+                {
+                    "type": "file_search",
+                    "vector_store_ids": ["${HANDBOOK_STORE}"],
+                    "max_num_results": 5,
+                    // A documented parameter whose interior is a union the
+                    // compiler's vocabulary does not state, so neither half of
+                    // it constrains the value — but both know the field exists.
+                    "filters": { "type": "eq", "key": "kind", "value": "handbook" },
+                },
                 { "type": "code_interpreter", "container": { "type": "auto" } },
+                { "type": "image_generation", "input_fidelity": "high" },
             ],
         },
     });
@@ -1003,5 +1088,18 @@ fn the_published_schema_checks_a_known_server_tool_and_carries_an_unknown_one() 
         errors.is_empty(),
         "a well-formed Responses suite is accepted, `${{ENV}}` values and all:\n{}",
         errors.join("\n")
+    );
+
+    let bad_fidelity = json!({
+        "version": "0.1",
+        "provider.p": {
+            "kind": "openai",
+            "api_key": "${OPENAI_API_KEY}",
+            "server_tools": [{ "type": "image_generation", "input_fidelity": "highest" }],
+        },
+    });
+    assert!(
+        !validation_errors(&validator, &bad_fidelity).is_empty(),
+        "a tabled field's closed set is still closed"
     );
 }

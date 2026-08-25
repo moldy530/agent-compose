@@ -167,6 +167,7 @@ const EXPLANATIONS_WITH_A_CORRECTED_EXAMPLE: &[&str] = &[
     "undefined-channel",
     "unkeyed-map-write",
     "unknown-server-tool",
+    "unknown-server-tool-field",
     "unsupported-server-tools",
 ];
 
@@ -461,17 +462,22 @@ fn only_the_named_topics_lack_a_runnable_example() {
 /// would go unchecked while still reading as a worked example, and one that
 /// gained a block nobody listed would be teaching a code no reviewer chose.
 ///
-/// The first entry is a warning, which is why the marker exists at all: a
+/// The first two entries are warnings, which is why the marker exists at all: a
 /// warning's spec is a spec that *works*, so `yaml spec` — held to a clean
 /// verdict — is exactly what it cannot be marked as, and a bare fence would
-/// leave the one block in the curriculum that reports something checked by
-/// nothing. The second is an error, and is here for the neighbouring reason: it
-/// is the one settings key the topic teaches by showing a spec that does **not**
+/// leave the blocks in the curriculum that report something checked by nothing.
+/// They are the two granularities of resolved q30's second tier: a `type:` the
+/// curated table does not name, and a key it does not name inside a `type:` it
+/// does. The third is an error, and is here for the neighbouring reason: it is
+/// the one settings key the topic teaches by showing a spec that does **not**
 /// compile — `stop:` on a connection a server-tool suite moved onto the
 /// Responses wire (Decision D122) — and `yaml spec` would hold that block to a
 /// clean verdict it is written to fail.
-const TOPICS_THAT_TRIGGER_A_CODE: &[(&str, &str)] =
-    &[("models", "unknown-server-tool"), ("models", "unknown-key")];
+const TOPICS_THAT_TRIGGER_A_CODE: &[(&str, &str)] = &[
+    ("models", "unknown-server-tool"),
+    ("models", "unknown-server-tool-field"),
+    ("models", "unknown-key"),
+];
 
 /// A topic's `yaml triggers <code>` block reports the code it names.
 ///

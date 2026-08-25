@@ -69,6 +69,7 @@ const CHECK_CODES: &[&str] = &[
     "missing-session-key",
     "missing-capability",
     "unknown-server-tool",
+    "unknown-server-tool-field",
     "mismatched-server-tools",
     "missing-key",
     "unknown-key",
