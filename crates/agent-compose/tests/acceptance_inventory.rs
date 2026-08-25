@@ -999,6 +999,13 @@ const HARNESS: &[Criterion] = &[Criterion {
             "a_server_tool_outside_the_table_is_warned_about_and_still_reaches_the_wire",
             Status::Live,
         ),
+        // …and the same tier one level in: a key the row of a *known* tool does
+        // not name, which a compiler that refused it would block every author of
+        // that tool over until a new binary shipped.
+        (
+            "a_server_tool_field_outside_the_table_is_warned_about_and_still_reaches_the_wire",
+            Status::Live,
+        ),
         ("a_failover_that_crosses_two_wires_composes", Status::Live),
         // …and the half of that seam a first-call failover cannot reach: a
         // *replayed* assistant turn, which each wire will only take back in its

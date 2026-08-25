@@ -890,6 +890,74 @@ fn a_server_tool_outside_the_table_is_warned_about_and_still_reaches_the_wire() 
     );
 }
 
+/// A **field** the compiler's table cannot check, on a tool it knows, travels to
+/// the wire as written — the second tier one level in (Decision D122).
+///
+/// A row is keyed on `type:` alone and is a snapshot of that tool at this
+/// compiler's release, so a parameter the vendor added since must not be a
+/// build-blocking error: there is no way to opt one entry out of the strict
+/// tier, and renaming the `type:` to reach the unchecked tier would change which
+/// tool runs. So `validate` warns and exits `0`, the strict half of the same
+/// entry is still checked, and the run puts the whole config on the request.
+#[test]
+fn a_server_tool_field_outside_the_table_is_warned_about_and_still_reaches_the_wire() {
+    let scratch = harness::Scratch::new("server-tool-field-after-this-release");
+    let entrypoint = scratch.path().join("main.yml");
+    std::fs::write(
+        &entrypoint,
+        server_tool_spec("web_search_20250305", "\n      result_freshness: week"),
+    )
+    .expect("the scratch spec is writable");
+
+    let validated = harness::validate_entrypoint(&entrypoint, "local");
+    let stderr = String::from_utf8_lossy(&validated.stderr);
+    assert_eq!(
+        validated.status.code(),
+        Some(0),
+        "a warning does not refuse a composition:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("warning[unknown-server-tool-field]")
+            && stderr.contains("result_freshness"),
+        "the warning names exactly the key that could not be verified:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("warning[unknown-server-tool]:"),
+        "the tool itself is one the table knows, and is not warned about:\n{stderr}"
+    );
+
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "answer": "carried anyway" })),
+    ));
+    let Some(run) = harness::invoke_entrypoint(
+        &entrypoint,
+        "server-tool-field-after-this-release",
+        "flow.search",
+        &json!({ "question": "does it?" }),
+        &harness::environment(&provider),
+        None,
+    ) else {
+        return;
+    };
+    run.succeeded();
+
+    let asked = provider.requests();
+    assert_eq!(asked[0].server_tools, ["web_search_20250305"]);
+    let declared = &asked[0].body()["tools"].as_array().expect("a tool array")[1];
+    assert_eq!(
+        declared["result_freshness"], "week",
+        "the key the compiler could not check reached the wire as written: {}",
+        asked[0].body_text
+    );
+    assert_eq!(
+        declared["max_uses"], 7,
+        "…beside the fields of the same entry that it could: {}",
+        asked[0].body_text
+    );
+}
+
 /// A failover route whose members are on **two different wires** composes: each
 /// attempt speaks its own provider's (Decision D122).
 ///
@@ -1237,6 +1305,15 @@ fn server_tools_on_a_kind_whose_wire_has_none_is_refused_by_name() {
 /// One spec whose provider declares a server tool the compiler's table does not
 /// name.
 fn unverified_server_tool_spec(type_name: &str) -> String {
+    server_tool_spec(type_name, "")
+}
+
+/// The same spec with one server tool of `type_name`, carrying `extra` as a
+/// further line of that entry's config.
+///
+/// The two callers are the two granularities the second tier is reached at: an
+/// unknown `type:`, and a key the row of a known one does not name.
+fn server_tool_spec(type_name: &str, extra: &str) -> String {
     format!(
         r#"version: "0.1"
 
@@ -1252,7 +1329,7 @@ provider.searching:
   server_tools:
     - type: {type_name}
       name: web_search
-      max_uses: 7
+      max_uses: 7{extra}
 
 model.smart:
   provider: provider.searching
