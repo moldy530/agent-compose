@@ -1,0 +1,10 @@
+# rule: `builtin.bash` takes a mandatory `timeout` beside its `root` (grammar 5.5 / D123)
+# at: /agent.reviewer/tools/0/builtin.bash
+# via: /$defs/builtinTool/properties/builtin.bash/required
+agent.reviewer:
+  model: model.smart
+  prompt: Review the draft.
+  tools:
+    - builtin.bash: { root: "./work" }
+  output:
+    verdict: { enum: [approve, revise] }

@@ -1983,3 +1983,81 @@ flow.f:
 "#,
     );
 }
+
+/// All four built-ins on one agent, beside a `tool.*` of its own, each with the
+/// bounds it requires (grammar 5.5, Decision D123).
+///
+/// The accepting half of the corpus that pins every rejection: a missing
+/// `root:`, a `builtin.bash` with no `timeout:`, a `timeout:` on a file tool, a
+/// name outside the set, a bare address, two names in one entry. Each of those
+/// is a fixture; this is the shape they are each *nearly*, and a rule written
+/// one notch tighter than §5.5 would make it unwritable with nothing else
+/// noticing.
+///
+/// It is emitted as well as checked, which is this file's second claim and the
+/// one that matters most for a construct the emitter learned last: the
+/// attachment reaches `codegen::graph` through a list every other agent leaves
+/// empty.
+#[test]
+fn every_builtin_attached_to_one_agent_beside_a_tool() {
+    accepts(
+        "every-builtin",
+        r#"
+tool.repo_grep:
+  description: Search the repository.
+  input:
+    pattern: { type: string }
+  output:
+    matches: { type: string }
+  exec:
+    command: rg
+agent.a:
+  model: model.m
+  prompt: Fix it.
+  tools:
+    - tool.repo_grep
+    - builtin.read_file: { root: "${WORKSPACE}" }
+    - builtin.write_file: { root: "${WORKSPACE}" }
+    - builtin.list: { root: "./relative/to/the/process" }
+    - builtin.bash: { root: "${WORKSPACE}/build", timeout: 30s }
+  output:
+    verdict: { enum: [approve, revise] }
+flow.f:
+  outputs: {}
+  nodes:
+    n: { agent: agent.a, input: "'x'" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }
+"#,
+    );
+}
+
+/// One built-in, on an agent carrying no `tool.*` and no `stores:` at all.
+///
+/// The list every other case leaves non-empty: an agent whose whole tool
+/// surface is a built-in is where the emitter's "no tools at all" branch and its
+/// "some tools" branch meet, and where a reader first meets the construct
+/// (grammar 5.5).
+#[test]
+fn one_builtin_is_a_whole_tool_surface() {
+    accepts(
+        "one-builtin",
+        r#"
+agent.a:
+  model: model.m
+  prompt: Read it.
+  tools:
+    - builtin.read_file: { root: "${WORKSPACE}" }
+  output:
+    verdict: { enum: [approve, revise] }
+flow.f:
+  outputs: {}
+  nodes:
+    n: { agent: agent.a, input: "'x'" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }
+"#,
+    );
+}

@@ -27,6 +27,13 @@ that array on every request the connection serves (grammar 12.1), so:
 
 Both are reported against the entry written second, with the first labelled.
 
+A **runtime built-in** fills the same array under the same key (grammar 5.5), so
+`builtin.bash` on an agent that also attaches a `tool.bash` is the same event
+once more, and so is a built-in whose name a provider's suite takes. The repair
+there is one-sided: a built-in's name — `bash`, `read_file`, `write_file`,
+`list` — is the compiler's rather than an author's, so what moves is the other
+entry, or the built-in attachment goes.
+
 ## A spec that triggers it
 
 ```yaml triggers
@@ -80,6 +87,6 @@ collides with, or — since a suite belongs to the connection rather than to one
 agent — declare it on a second provider that this agent's model does not reach.
 Providers are cheap.
 
-Grammar: `docs/grammar.md` §11.5, §12.1. Topics:
+Grammar: `docs/grammar.md` §5.5, §11.5, §12.1, Decision D123. Topics:
 `agent-compose docs stores`, `agent-compose docs agents`,
-`agent-compose docs models`.
+`agent-compose docs models`, `agent-compose docs tools`.

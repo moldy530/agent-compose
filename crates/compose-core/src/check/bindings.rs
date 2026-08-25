@@ -538,29 +538,44 @@ fn store_tool_collisions(ctx: &mut Ctx, address: &str, agent: &Agent) {
 /// Which providers the agent might reach is the ladder's whole width — a route's
 /// members each declare their own suite, and any of them may serve the call.
 fn server_tool_collisions(ctx: &mut Ctx, address: &str, agent: &Agent) {
-    let mut offered: Vec<(String, Span, String)> = agent
+    /// One name this agent puts on the wire, and how a report talks about it.
+    struct Offered {
+        /// The name the model is offered it under.
+        local: String,
+        /// The entry that offers it — what the report underlines.
+        at: Span,
+        /// What the agent did, as the message's middle clause.
+        subject: String,
+        /// The repair on *this* side of the pair. It differs by kind: an
+        /// attachment can be renamed by renaming its definition, and a built-in
+        /// cannot — its name is the compiler's — so the only move left there is
+        /// to drop the entry (PRD G3).
+        repair: &'static str,
+    }
+
+    let mut offered: Vec<Offered> = agent
         .tools
         .iter()
-        .map(|tool| {
-            (
-                tool.value.name.as_str().to_string(),
-                tool.span.clone(),
-                format!("attaches `{}`, whose name collides with", tool.value),
-            )
+        .map(|tool| Offered {
+            local: tool.value.name.as_str().to_string(),
+            at: tool.span.clone(),
+            subject: format!("attaches `{}`, whose name collides with", tool.value),
+            repair: "rename the attachment",
         })
         .collect();
     // A built-in reaches the same `tools` array under the same key, so a suite
     // declaring `bash` and an agent holding `builtin.bash` is the same 400 as
     // any other pair (grammar 5.5, Decision D123).
     for builtin in &agent.builtins {
-        offered.push((
-            builtin.tool.value.as_str().to_string(),
-            builtin.tool.span.clone(),
-            format!(
+        offered.push(Offered {
+            local: builtin.tool.value.as_str().to_string(),
+            at: builtin.tool.span.clone(),
+            subject: format!(
                 "attaches `{}`, whose name collides with",
                 builtin.tool.value.address()
             ),
-        ));
+            repair: "drop the built-in, whose name is not an author's to change",
+        });
     }
     for attached in &agent.stores {
         let Some(store) = ctx.store(&attached.value) else {
@@ -569,14 +584,15 @@ fn server_tool_collisions(ctx: &mut Ctx, address: &str, agent: &Agent) {
         let local = attached.value.name.as_str();
         for suffix in synthesized_tools(store) {
             let synthesized = format!("{local}_{suffix}");
-            offered.push((
-                synthesized.clone(),
-                attached.span.clone(),
-                format!(
+            offered.push(Offered {
+                local: synthesized.clone(),
+                at: attached.span.clone(),
+                subject: format!(
                     "attaches `{}`, whose synthesized `{synthesized}` tool collides with",
                     attached.value
                 ),
-            ));
+                repair: "rename the store",
+            });
         }
     }
     if offered.is_empty() {
@@ -591,22 +607,24 @@ fn server_tool_collisions(ctx: &mut Ctx, address: &str, agent: &Agent) {
             let Some(name) = super::providers::wire_name(provider.kind, server) else {
                 continue;
             };
-            for (local, at, subject) in offered.iter().filter(|(local, _, _)| *local == name) {
+            for entry in offered.iter().filter(|entry| entry.local == name) {
+                let local = &entry.local;
                 ctx.push(
                     Diagnostic::error(
                         DiagnosticCode::ToolNameCollision,
-                        at.clone(),
+                        entry.at.clone(),
                         format!(
-                            "`{address}` {subject} the `{local}` server tool \
-                             `{provider_address}` declares"
+                            "`{address}` {} the `{local}` server tool `{provider_address}` declares",
+                            entry.subject
                         ),
                     )
                     .with_label(server.span.clone(), "the server tool is declared here")
                     .with_help(format!(
                         "a server tool is appended to the `tools` of every request that \
                          connection serves, and the wire refuses an array carrying `{local}` \
-                         twice: rename the attachment, or declare the suite on a provider this \
-                         agent's model does not reach (grammar 12.1, 11.5, Decision D122)"
+                         twice: {}, or declare the suite on a provider this agent's model does \
+                         not reach (grammar 12.1, 11.5, Decision D122)",
+                        entry.repair
                     )),
                 );
             }
