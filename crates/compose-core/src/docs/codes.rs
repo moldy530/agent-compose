@@ -109,6 +109,9 @@ pub fn explanation(code: DiagnosticCode) -> &'static str {
             include_str!("codes/unsupported-server-tools.md")
         }
         DiagnosticCode::UnknownServerTool => include_str!("codes/unknown-server-tool.md"),
+        DiagnosticCode::UnknownServerToolField => {
+            include_str!("codes/unknown-server-tool-field.md")
+        }
         DiagnosticCode::MismatchedServerTools => {
             include_str!("codes/mismatched-server-tools.md")
         }

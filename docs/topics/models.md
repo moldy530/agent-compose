@@ -169,10 +169,11 @@ second provider. Providers are cheap.
 ### Two tiers of checking, and why
 
 The compiler keeps a curated table of the server tools each kind is known to
-serve. A `type:` **in** it is checked strictly — the fields it has, their types,
-their ranges, and the constraints the vendor states, like web search's allow-list
-and deny-list being mutually exclusive. A config the provider will refuse is
-otherwise a run that dies on its first model call with a 400 and no span.
+serve. A `type:` **in** it is checked strictly — the fields the table models,
+their types, their ranges, and the constraints the vendor states, like web
+search's allow-list and deny-list being mutually exclusive. A config the provider
+will refuse is otherwise a run that dies on its first model call with a 400 and
+no span.
 
 On the Messages wire that includes the `name:` beside the `type:`, which is not
 free text: Anthropic pairs each dated type with one fixed name and refuses a
@@ -198,6 +199,36 @@ be verified — here, that `web_search` is the OpenAI spelling and the Messages
 wire takes the dated `web_search_20250305` — and the point of the second tier is
 the case where the spelling is right and this release is simply older than the
 tool: a server tool the vendor ships tomorrow is usable the day it ships.
+
+A **key** the table does not name, inside a `type:` it does, is the same
+warning one level down:
+
+```yaml triggers unknown-server-tool-field
+version: "0.1"
+
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+  server_tools:
+    - type: web_search_20250305
+      name: web_search
+      max_uses: 5
+      result_freshness: week
+```
+
+The table's row for a tool is a snapshot of it taken when this compiler was
+released, and vendors add parameters to tools they already ship. Refusing
+`result_freshness:` would be the treadmill at field granularity — and there is no
+way out of it from the spec, since renaming the `type:` to reach the unchecked
+tier would change which tool runs. So the key is carried, and the warning is the
+record that it was. Where the spelling is close to a field the table does name,
+the diagnostic says which (`max_usages` → `max_uses`), because nothing in the
+compiler can tell a typo from a parameter it predates.
+
+What stays an **error** is what the table genuinely knows: a field it models
+given the wrong kind of value, a value outside a range or closed set the vendor
+states, a required field left out (`file_search` with no `vector_store_ids:`),
+and two fields the vendor refuses together.
 
 `azure_openai`, `bedrock` and `vertex` refuse the key outright
 (`unsupported-server-tools`): their wires have not been taught the shape, so a

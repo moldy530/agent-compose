@@ -1,0 +1,21 @@
+# rule: a field of a known `server_tools:` entry that the curated table does not name is warned about and carried, with the near miss named where there is one (grammar 12.1, Decision D122)
+# code: unknown-server-tool-field
+# message: server tool `web_search_20250305` of `provider.main` declares `max_usages`, which is not a field this compiler release knows it has: the value is unchecked and travels to the provider as written
+# at: main.yml:21:19
+# help: did you mean `max_uses`?
+#
+# The second tier of resolved q30's two, reached one level in from a `type:`
+# outside the table: the row is a snapshot of the tool taken at this compiler's
+# release, and a key it does not name is either a misspelling or a parameter the
+# vendor shipped since. Nothing here can tell which, so the near miss is named
+# and the key travels — the alternative is the treadmill at field granularity,
+# with no way for an author to opt one entry out of the strict tier.
+version: "0.1"
+
+provider.main:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+  server_tools:
+    - type: web_search_20250305
+      name: web_search
+      max_usages: 5

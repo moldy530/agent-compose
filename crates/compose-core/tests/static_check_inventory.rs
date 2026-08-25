@@ -301,11 +301,11 @@ const GRAMMAR: &[Check] = &[
         evidence: Evidence::Fixture,
     },
     Check {
-        rule: "a `server_tools:` entry in the kind's curated table is checked against it, and one outside it is carried with a warning (12.1, D122)",
+        rule: "a `server_tools:` entry in the kind's curated table is checked against it, and one outside it — tool or field — is carried with a warning (12.1, D122)",
         pass: "check/providers.rs",
         codes: &[
             "unknown-server-tool",
-            "unknown-key",
+            "unknown-server-tool-field",
             "missing-key",
             "conflicting-keys",
             "type-mismatch",

@@ -428,6 +428,12 @@ pub enum DiagnosticCode {
     /// table does not have, so nothing about its config could be verified — it
     /// travels to the wire verbatim (grammar 12.1, Decision D122).
     UnknownServerTool,
+    /// **Warning.** A `server_tools:` entry names a tool the kind's curated
+    /// table has, and gives it a field that table does not name — a vendor
+    /// parameter newer than this release, or a misspelling; nothing here can
+    /// tell which. The value is unchecked and travels to the wire verbatim
+    /// (grammar 12.1, Decision D122).
+    UnknownServerToolField,
     /// **Warning.** The members of a failover route declare different
     /// `server_tools:` suites, so which tools the model is offered depends on
     /// which member served the call (grammar 12.2, Decision D122).
@@ -527,6 +533,7 @@ impl DiagnosticCode {
         Self::MissingCapability,
         Self::UnsupportedServerTools,
         Self::UnknownServerTool,
+        Self::UnknownServerToolField,
         Self::MismatchedServerTools,
         Self::DeadEnd,
         Self::UnboundedCycle,
@@ -594,6 +601,7 @@ impl DiagnosticCode {
             Self::MissingCapability => "missing-capability",
             Self::UnsupportedServerTools => "unsupported-server-tools",
             Self::UnknownServerTool => "unknown-server-tool",
+            Self::UnknownServerToolField => "unknown-server-tool-field",
             Self::MismatchedServerTools => "mismatched-server-tools",
             Self::DeadEnd => "dead-end",
             Self::UnboundedCycle => "unbounded-cycle",

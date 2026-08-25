@@ -1601,7 +1601,7 @@
         }
       },
       "anthropicServerTool": {
-        "description": "A server tool on an `anthropic` provider: the Messages wire's suite. A `type` the curated table names is checked against its documented fields; anything else is carried unchecked (grammar 12.1 / Decision D122).",
+        "description": "A server tool on an `anthropic` provider: the Messages wire's suite. A `type` the curated table names has its documented fields checked; a `type` outside the table, and a key outside the row of one inside it, are carried unchecked — the vocabulary is the vendor's, and a parameter added after this release must not be a red squiggle (grammar 12.1 / Decision D122).",
         "allOf": [
           {
             "$ref": "#/$defs/serverToolConfig"
@@ -1644,8 +1644,7 @@
                     "type": {
                       "const": "ephemeral"
                     }
-                  },
-                  "additionalProperties": false
+                  }
                 },
                 "max_uses": {
                   "type": "integer",
@@ -1687,11 +1686,9 @@
                     "timezone": {
                       "$ref": "#/$defs/interpolatedString"
                     }
-                  },
-                  "additionalProperties": false
+                  }
                 }
               },
-              "additionalProperties": false,
               "allOf": [
                 {
                   "description": "One list is an allow-list and the other is a deny-list; a tool carrying both has no answer to which applies.",
@@ -1743,8 +1740,7 @@
                     "type": {
                       "const": "ephemeral"
                     }
-                  },
-                  "additionalProperties": false
+                  }
                 },
                 "max_uses": {
                   "type": "integer",
@@ -1773,15 +1769,13 @@
                     "enabled": {
                       "type": "boolean"
                     }
-                  },
-                  "additionalProperties": false
+                  }
                 },
                 "max_content_tokens": {
                   "type": "integer",
                   "minimum": 1
                 }
               },
-              "additionalProperties": false,
               "allOf": [
                 {
                   "description": "One list is an allow-list and the other is a deny-list; a tool carrying both has no answer to which applies.",
@@ -1835,17 +1829,15 @@
                     "type": {
                       "const": "ephemeral"
                     }
-                  },
-                  "additionalProperties": false
+                  }
                 }
-              },
-              "additionalProperties": false
+              }
             }
           }
         ]
       },
       "openaiServerTool": {
-        "description": "A server tool on an `openai` provider: the Responses API's built-in suite. Declaring any moves the connection onto `POST /v1/responses` for all of its calls, which is the wire that carries them (grammar 12.1 / Decision D122).",
+        "description": "A server tool on an `openai` provider: the Responses API's built-in suite. Declaring any moves the connection onto `POST /v1/responses` for all of its calls, which is the wire that carries them. A `type` the curated table names has its documented fields checked; a `type` outside the table, and a key outside the row of one inside it, are carried unchecked (grammar 12.1 / Decision D122).",
         "allOf": [
           {
             "$ref": "#/$defs/serverToolConfig"
@@ -1886,8 +1878,7 @@
                         "$ref": "#/$defs/interpolatedString"
                       }
                     }
-                  },
-                  "additionalProperties": false
+                  }
                 },
                 "search_context_size": {
                   "enum": [
@@ -1918,11 +1909,9 @@
                     "timezone": {
                       "$ref": "#/$defs/interpolatedString"
                     }
-                  },
-                  "additionalProperties": false
+                  }
                 }
-              },
-              "additionalProperties": false
+              }
             }
           },
           {
@@ -1957,6 +1946,9 @@
                     "$ref": "#/$defs/interpolatedString"
                   }
                 },
+                "filters": {
+                  "description": "A comparison filter over file attributes, or a compound one holding more filters. Carried verbatim: the shape is recursive, so the compiler states that the field exists rather than what is inside it."
+                },
                 "max_num_results": {
                   "type": "integer",
                   "minimum": 1,
@@ -1973,11 +1965,9 @@
                       "minimum": 0,
                       "maximum": 1
                     }
-                  },
-                  "additionalProperties": false
+                  }
                 }
-              },
-              "additionalProperties": false
+              }
             }
           },
           {
@@ -2027,13 +2017,11 @@
                             "$ref": "#/$defs/interpolatedString"
                           }
                         }
-                      },
-                      "additionalProperties": false
+                      }
                     }
                   ]
                 }
-              },
-              "additionalProperties": false
+              }
             }
           },
           {
@@ -2065,6 +2053,13 @@
                     "transparent",
                     "opaque",
                     "auto"
+                  ]
+                },
+                "input_fidelity": {
+                  "description": "How much of an input image the edit preserves.",
+                  "enum": [
+                    "high",
+                    "low"
                   ]
                 },
                 "model": {
@@ -2104,8 +2099,7 @@
                 "size": {
                   "$ref": "#/$defs/interpolatedString"
                 }
-              },
-              "additionalProperties": false
+              }
             }
           }
         ]

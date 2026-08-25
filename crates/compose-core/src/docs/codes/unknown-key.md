@@ -10,8 +10,13 @@ looks configured and is not.
 
 The same code covers several closed vocabularies: a top-level key that is
 neither a section nor a definition, a key a construct does not define, a
-provider key belonging to another `kind`'s row, a field a curated server tool
-does not have, and a store-op parameter its op does not take.
+provider key belonging to another `kind`'s row, and a store-op parameter its op
+does not take.
+
+A `server_tools:` entry is **not** one of them, closed as its curated shape
+looks: the vocabulary there is the vendor's rather than this grammar's, so a key
+the compiler's table does not name is a warning that carries it
+(`unknown-server-tool-field`), not a refusal.
 
 One of those vocabularies is decided by the **connection** rather than by its
 kind. An `openai` provider that declares `server_tools:` speaks the Responses
