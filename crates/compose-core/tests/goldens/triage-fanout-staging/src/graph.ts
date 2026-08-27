@@ -22,6 +22,7 @@ import {
   agentFixerOutput,
   agentSummarizerOutput,
   agentTriageOutput,
+  builtinReadFileInput,
   flowEnrichInputs,
   flowEnrichNodeFetchOutput,
   flowEnrichOutputs,
@@ -369,7 +370,7 @@ async function toolReviewQueue(args: unknown, context: runtime.RunContext): Prom
  */
 const agentFixer: runtime.AgentBinding = {
   address: "agent.fixer",
-  prompt: "You write minimal unified diffs. Fix exactly the described defect in the\nnamed file and change nothing else.\n",
+  prompt: "You write minimal unified diffs. Read the file, fix exactly the described\ndefect in it, and change nothing else.\n",
   model: modelFast,
   output: {
     name: "fixer_output",
@@ -393,7 +394,36 @@ const agentFixer: runtime.AgentBinding = {
       "type": "object"
     },
   },
-  tools: [],
+  tools: [
+    {
+      name: "read_file",
+      address: "builtin.read_file",
+      description: "Read one text file and return its contents. The path is relative to this agent's root directory, and a path that resolves outside it is refused.",
+      schema: {
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "description": "The file to read, relative to the tool's root directory.",
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      },
+      invoke: (args, context) =>
+        runtime.runBuiltin(
+          {
+            tool: "read_file",
+            root: [{ env: "REPO_ROOT", site: "agent.fixer.tools.builtin.read_file.root" }],
+          },
+          runtime.parseToolArguments(builtinReadFileInput, args, "the arguments `read_file` was called with"),
+          context,
+        ),
+    },
+  ],
   maxToolIterations: 8,
 };
 

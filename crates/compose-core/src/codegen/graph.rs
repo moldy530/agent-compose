@@ -119,7 +119,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ast::common::{Address, ControlTarget, EdgeSource, EdgeTarget, Interpolated};
-use crate::ast::definition::{ProviderKind, StoreKind};
+use crate::ast::definition::{Builtin, ProviderKind, StoreKind};
 use crate::ast::flow::FlowContext;
 // The SCC decomposition grammar 7.4 is checked over, reused rather than
 // reimplemented: the ceiling below is sized from the same clause-1 reading the
@@ -896,7 +896,7 @@ fn agents(
             json_literal(&schema::json_field_map(output.as_ref()), "    ")
         ));
         text.push_str("  },\n");
-        if agent.tools.is_empty() && agent.stores.is_empty() {
+        if agent.tools.is_empty() && agent.builtins.is_empty() && agent.stores.is_empty() {
             text.push_str("  tools: [],\n");
         } else {
             text.push_str("  tools: [\n");
@@ -966,6 +966,7 @@ fn agents(
                 ));
                 text.push_str("    },\n");
             }
+            text.push_str(&builtin_tools(names, surfaces, address, agent, imported));
             text.push_str(&store_tools(ir, names, surfaces, agent, imported));
             text.push_str("  ],\n");
         }
@@ -1060,6 +1061,107 @@ fn flow_tool(
     ));
     text.push_str("    },\n");
     text
+}
+
+/// The runtime built-ins an agent opted into, one `AgentTool` per entry
+/// (grammar 5.5, Decision D123, PRD resolved q31).
+///
+/// Everything about a built-in that varies is the **attachment's**: `root:`, and
+/// `builtin.bash`'s `timeout:`. Everything else — the name the model calls, the
+/// argument schema, what the call does — is this compiler's, so what is emitted
+/// here is a call to one runtime function carrying the bounds the entry wrote.
+///
+/// The `root:` is emitted **unresolved**, as the interpolation parts every other
+/// class-2 surface is (grammar 4.3): the value reaches the process at start, the
+/// artifact stays committable, and the journal keys the call on the root *as
+/// written* rather than on the directory one machine resolved it to
+/// (`docs/durability.md` §3.2).
+///
+/// They are appended after the declared `tool.*`/`flow.*` attachments and before
+/// the stores' synthesized tools, so a transcript reads in the order the
+/// composition declares: references first, then built-ins, then `stores:`.
+fn builtin_tools(
+    names: &Names,
+    surfaces: &[schema::Surface<'_>],
+    address: &str,
+    agent: &Agent,
+    imported: &mut Vec<String>,
+) -> String {
+    let mut text = String::new();
+    for builtin in &agent.builtins {
+        let tool = builtin.tool.value;
+        let path = format!("{}.input", tool.address());
+        let schema_name = names.value(&path).to_string();
+        imported.push(schema_name.clone());
+        let arguments = surface_fields(surfaces, &path);
+        text.push_str("    {\n");
+        text.push_str(&format!("      name: {},\n", names::string(tool.as_str())));
+        text.push_str(&format!(
+            "      address: {},\n",
+            names::string(tool.address())
+        ));
+        text.push_str(&format!(
+            "      description: {},\n",
+            names::string(&builtin_description(tool))
+        ));
+        text.push_str(&format!(
+            "      schema: {},\n",
+            json_literal(&schema::json_field_map(arguments.as_ref()), "      ")
+        ));
+        text.push_str(&format!(
+            "      invoke: (args, context) =>\n        runtime.runBuiltin(\n          \
+             {{\n            tool: {},\n            root: {},\n{}          }},\n          \
+             runtime.parseToolArguments({schema_name}, args, {}),\n          context,\n        ),\n",
+            names::string(tool.as_str()),
+            interpolation(
+                &builtin.root.value,
+                &format!("{address}.tools.{}.root", tool.address())
+            ),
+            builtin.timeout.as_ref().map_or_else(String::new, |timeout| {
+                format!(
+                    "            timeout: {{ millis: {}, written: {} }},\n",
+                    timeout.value.as_millis(),
+                    names::string(timeout.value.as_str())
+                )
+            }),
+            names::string(&format!(
+                "the arguments `{}` was called with",
+                tool.as_str()
+            ))
+        ));
+        text.push_str("    },\n");
+    }
+    text
+}
+
+/// What a runtime built-in tells the model it does.
+///
+/// The compiler's own text, because the tool is the compiler's: an author
+/// attaches a name and bounds it, and there is no `description:` on the entry to
+/// write one in. Each says the thing a model has to know to call it correctly —
+/// that paths are relative to a root it cannot see and cannot leave, and that
+/// `bash` is bounded by a deadline — because that is the difference between a
+/// model correcting itself and a model spending the loop's budget guessing
+/// (PRD G3, Decision D119).
+fn builtin_description(tool: Builtin) -> String {
+    match tool {
+        Builtin::Bash => "Run one `bash` command in this agent's root directory and return what \
+             it printed. The command runs under a deadline, and a command that \
+             exits nonzero or outruns it fails the node rather than answering."
+            .to_string(),
+        Builtin::ReadFile => "Read one text file and return its contents. The path is relative to \
+             this agent's root directory, and a path that resolves outside it is refused."
+            .to_string(),
+        Builtin::WriteFile => "Write one text file, replacing whatever it held, and return how \
+             many bytes were written. The path is relative to this agent's root directory, a \
+             path that resolves outside it is refused, and the directory it names must already \
+             exist."
+            .to_string(),
+        Builtin::List => "List the entries of one directory, optionally filtered by a glob. \
+             Paths are relative to this agent's root directory, a path that resolves outside it \
+             is refused, and a directory entry is reported with a trailing `/`."
+            .to_string(),
+    }
 }
 
 /// The tools an agent's attached stores synthesize (grammar 11.5, PRD 5.8).
@@ -1175,6 +1277,15 @@ fn output_tool_name(ir: &Ir, agent: &Agent, local: &str) -> String {
             })
         })
         .collect();
+    // A built-in is on the wire under its own name too (grammar 5.5), so an
+    // agent attaching `builtin.list` and called `agent.list` does not get to
+    // pin an output tool called `list`.
+    attached.extend(
+        agent
+            .builtins
+            .iter()
+            .map(|builtin| builtin.tool.value.as_str().to_string()),
+    );
     // The synthesized store tools are on the wire beside the declared ones
     // (grammar 11.5), so they are names the pinned output tool has to avoid too:
     // two tools of one name would make the pinned choice ambiguous.

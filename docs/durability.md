@@ -155,18 +155,18 @@ Every effect, and completeness is the invariant: **an effect that is not
 journaled is one a replay re-executes.** A reader verifies it the way the
 implementation enforces it — by finding the call sites. Every effect goes
 through `journaled(…)` or `EffectRecorder.claim(…)` in the emitted sources, and
-there are exactly six of them, in four kinds:
+there are exactly seven of them, in four kinds:
 
 | kind | site in the emitted project | what the record holds |
 |---|---|---|
 | `model` | `callModel` in `src/runtime.ts` | §3.1 |
-| `tool` | `runExec`, `runHttp`, `callFunction` in `src/runtime.ts` | §3.2 |
+| `tool` | `runExec`, `runBuiltin`, `runHttp`, `callFunction` in `src/runtime.ts` | §3.2 |
 | `store` | `runStoreOp` in `src/stores.ts` | §3.3 |
 | `human` | `runHuman` in `src/runtime.ts` | §3.4 |
 
 Three constructs record nothing of their own, and need none: a `flow:` node, a
 `map` dispatch, and a flow-as-tool call are *instantiations*, not effects. What
-they run is a graph whose nodes reach the four sites above under the
+they run is a graph whose nodes reach the sites above under the
 instantiation's own instance path — which is exactly how they trace
 (`docs/trace.md` §8) — so their effects are journaled without a record for the
 boundary itself.
@@ -175,17 +175,17 @@ That inventory is held **mechanically**, and by two tests in
 `crates/compose-core/src/codegen/journal.rs` that read it from opposite ends.
 
 `every_effect_site_reaches_the_journal_and_the_document_names_them_all` reads it
-from the seams: each of the six functions above is read out of the emitted
+from the seams: each of the seven functions above is read out of the emitted
 modules, and the test fails when one does not reach the journal, when this table
-does not name it, or when a seventh site exists that this table does not.
+does not name it, or when an eighth site exists that this table does not.
 
 `nothing_in_the_emitted_runtime_calls_the_world_except_under_a_journaled_seam`
 reads it from the **primitives**, which is the direction the first cannot see.
 A surface added to `src/runtime.ts` that calls the world and is not journaled is
-a replay that issues it twice — and it is not one of the six, contains no
+a replay that issues it twice — and it is not one of the seven, contains no
 `journaled(` and no `.claim(`, and is in no table, so nothing else in the
 repository would notice. So every call to the world in every emitted constant
-module is required to sit in a declaration the six transitively reach.
+module is required to sit in a declaration the seven transitively reach.
 
 What counts as a call to the world is **derived rather than listed**, because a
 list of spellings is only as complete as the last person to extend it: `spawn(`
@@ -304,6 +304,24 @@ and `expect_status:`, and on both the shape the declared `output:` decodes into.
 Each of them changes what the call is or what its answer means, so a binding
 that moved in any one of them is a call this run does not make and a recorded
 answer is not its.
+
+A **runtime built-in** (`docs/grammar.md` §5.5, Decision D123) is one more
+record of this kind, and is journaled for the reason the kind exists: a `bash`
+that appended a line to a file appended it once, whatever number of process
+generations the execution takes. A resumed generation is handed the recorded
+stdout and stderr and runs no command — the record is consumed exactly as an
+`exec:` tool's is, and replay is where a built-in and a hand-rolled `exec:`
+tool are indistinguishable.
+
+Its request identity is the **attachment** as the composition wrote it — which
+built-in, its `root:` unresolved, and `builtin.bash`'s `timeout:` as written —
+plus the arguments the model chose. Unresolved for the reason above; whole for
+the other one: a root that moved is a different directory to have read, and a
+timeout that moved is a different bound to have survived, so neither is a call
+this run makes under the recorded key. What the record holds is the tool's whole
+answer — a file's contents, a command's output — which is §8's posture and not
+the trace's: `docs/trace.md` §11 keeps a tool's answer out of the trace, and
+this record is private recovery data that a `run --format json` never carries.
 
 A **detached** `map` delivery (`docs/grammar.md` §8.6 rule 7) is journaled like
 any other effect under the dispatch's own instance path. Its outcome is never

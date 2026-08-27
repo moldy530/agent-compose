@@ -2,13 +2,13 @@
 
 use crate::ast::common::{Address, Namespace};
 use crate::ast::definition::{
-    AgentAccess, DefinitionBody, DirectModel, EmbedBlock, ModelDef, ProviderDef, ProviderKind,
-    RouteCondition, RouteModel, Settings, StoreDef, StoreKind, StoreScope, ToolDef,
-    ToolImplementation,
+    AgentAccess, Builtin, BuiltinAttachment, DefinitionBody, DirectModel, EmbedBlock, ModelDef,
+    ProviderDef, ProviderKind, RouteCondition, RouteModel, Settings, StoreDef, StoreKind,
+    StoreScope, ToolDef, ToolImplementation,
 };
 use crate::ast::schema::{FieldMap, Surface};
 use crate::diag::{Diagnostic, DiagnosticCode, Span, Spanned};
-use crate::yaml::Node;
+use crate::yaml::{Node, Yaml};
 
 use super::binding;
 use super::flow;
@@ -94,14 +94,7 @@ fn agent(fields: &mut Fields<'_>, subject: &str, cx: &mut Cx) -> crate::ast::def
         }
         Some(map)
     });
-    let tools = reference_list(
-        fields,
-        "tools",
-        &[Namespace::Tool, Namespace::Flow],
-        subject,
-        cx,
-    )
-    .values;
+    let (tools, builtins) = agent_tools(fields, subject, cx);
     let stores = reference_list(fields, "stores", &[Namespace::Store], subject, cx).values;
     let description = description(fields, cx);
     let max_tool_iterations = fields
@@ -114,10 +107,256 @@ fn agent(fields: &mut Fields<'_>, subject: &str, cx: &mut Cx) -> crate::ast::def
         output,
         input,
         tools,
+        builtins,
         stores,
         description,
         max_tool_iterations,
     }
+}
+
+/// Read an agent's `tools:` list, which carries two kinds of entry (grammar 5.4,
+/// 5.5, Decision D123).
+///
+/// A **scalar** entry is a `tool.*` or `flow.*` address, exactly as it always
+/// was. A **mapping** entry attaches one of the four runtime built-ins, under
+/// its own name, with the bounds that name requires beside it:
+///
+/// ```yaml
+/// tools:
+///   - tool.repo_grep
+///   - builtin.read_file: { root: "${WORKSPACE}" }
+///   - builtin.bash:      { root: "${WORKSPACE}", timeout: 30s }
+/// ```
+///
+/// One entry attaches one tool, which is why a mapping carrying two keys is
+/// refused rather than read as two attachments: PRD resolved q31 makes the
+/// opt-in "one tool name at a time … never a single switch that grants the set",
+/// and a shape that let one entry grant two would be the beginning of that
+/// switch.
+fn agent_tools(
+    fields: &mut Fields<'_>,
+    subject: &str,
+    cx: &mut Cx,
+) -> (Vec<Spanned<Address>>, Vec<BuiltinAttachment>) {
+    let mut references: Vec<Spanned<Address>> = Vec::new();
+    let mut builtins: Vec<BuiltinAttachment> = Vec::new();
+    let Some(node) = fields.take("tools") else {
+        return (references, builtins);
+    };
+    let Some(items) = expect_sequence(node, &format!("`tools` in {subject}"), cx) else {
+        return (references, builtins);
+    };
+    for item in items {
+        if item.as_mapping().is_some() {
+            if let Some(attachment) = builtin_attachment(item, subject, cx) {
+                if let Some(first) = builtins
+                    .iter()
+                    .find(|other| other.tool.value == attachment.tool.value)
+                {
+                    cx.push(
+                        Diagnostic::error(
+                            DiagnosticCode::InvalidValue,
+                            attachment.tool.span.clone(),
+                            format!("`tools` lists `{}` twice", attachment.tool.value.address()),
+                        )
+                        .with_label(first.tool.span.clone(), "first listed here")
+                        .with_help(format!(
+                            "one entry attaches one built-in under one set of bounds; a second \
+                             entry for the same name would offer the model two `{}` tools \
+                             (grammar 5.5, 11.5)",
+                            attachment.tool.value.as_str()
+                        )),
+                    );
+                    continue;
+                }
+                builtins.push(attachment);
+            }
+            continue;
+        }
+        // A built-in written as a bare address: the name is right and the shape
+        // is not, so the repair is the shape rather than the namespace list a
+        // reference diagnostic would print.
+        if let Yaml::String(text) = &item.value
+            && let Some(tool) = Builtin::from_address(text)
+        {
+            cx.push(
+                Diagnostic::error(
+                    DiagnosticCode::InvalidReference,
+                    item.span.clone(),
+                    format!("`{text}` is a built-in tool, not a definition to reference"),
+                )
+                .with_help(format!(
+                    "a built-in is attached as a mapping carrying its bounds: \
+                     `- {text}: {{ {} }}` (grammar 5.5)",
+                    if tool.runs_a_command() {
+                        "root: <directory>, timeout: 30s"
+                    } else {
+                        "root: <directory>"
+                    }
+                )),
+            );
+            continue;
+        }
+        let Some(reference) = lexical::reference(
+            item,
+            "each entry of `tools`",
+            &[Namespace::Tool, Namespace::Flow],
+            cx,
+        ) else {
+            continue;
+        };
+        if let Some(first) = references
+            .iter()
+            .find(|other| other.value == reference.value)
+        {
+            cx.push(
+                Diagnostic::error(
+                    DiagnosticCode::InvalidValue,
+                    reference.span.clone(),
+                    format!("`tools` lists `{}` twice", reference.value),
+                )
+                .with_label(first.span.clone(), "first listed here"),
+            );
+            continue;
+        }
+        references.push(reference);
+    }
+    (references, builtins)
+}
+
+/// Read one `builtin.*` entry of a `tools:` list (grammar 5.5, Decision D123).
+fn builtin_attachment(
+    item: &Node,
+    subject: &str,
+    cx: &mut Cx,
+) -> Option<crate::ast::definition::BuiltinAttachment> {
+    let entries = expect_mapping(item, "each entry of `tools`", cx)?.entries();
+    let names = || list(Builtin::ALL.iter().map(|tool| tool.address()));
+    let [entry] = entries else {
+        cx.push(
+            Diagnostic::error(
+                DiagnosticCode::InvalidValue,
+                item.span.clone(),
+                format!(
+                    "each entry of `tools` attaches one tool, and this one declares {}",
+                    if entries.is_empty() {
+                        "none".to_string()
+                    } else {
+                        format!("{}", entries.len())
+                    }
+                ),
+            )
+            .with_help(format!(
+                "a built-in is attached one name at a time — `- builtin.bash: {{ root: …, \
+                 timeout: 30s }}` — so that what an agent holds is readable off the entry that \
+                 holds it; the built-ins are {} (grammar 5.5)",
+                names()
+            )),
+        );
+        return None;
+    };
+    let key = &entry.key;
+    let Some(tool) = Builtin::from_address(&key.value) else {
+        cx.push(
+            Diagnostic::error(
+                DiagnosticCode::UnknownVariant,
+                key.span.clone(),
+                format!("`{}` is not a built-in tool", key.value),
+            )
+            .with_optional_help(
+                // Suggested on the **local** names, with the shared
+                // `builtin.` prefix taken off both sides. Left on, every pair
+                // of names is eight characters closer than it is, and the
+                // distance budget — a third of the length — is eight characters
+                // wider: `builtin.grep` comes back as "did you mean
+                // `builtin.bash`?", which is a nudge toward the one built-in
+                // nobody should be nudged toward by accident (PRD G3).
+                suggest(
+                    key.value.strip_prefix("builtin.").unwrap_or(&key.value),
+                    &Builtin::ALL
+                        .iter()
+                        .map(|tool| tool.as_str())
+                        .collect::<Vec<_>>(),
+                )
+                .map(|name| format!("did you mean `builtin.{name}`?"))
+                .or_else(|| {
+                    Some(format!(
+                        "the built-ins are {}; a `tool.*` or `flow.*` is attached as a bare \
+                         address instead (grammar 5.4, 5.5)",
+                        names()
+                    ))
+                }),
+            ),
+        );
+        return None;
+    };
+    let context = format!("`{}` in {subject}", tool.address());
+    let mapping = expect_mapping(&entry.value, &context, cx)?;
+    let mut fields = Fields::new(mapping, entry.value.span.clone(), &context);
+    // Required **and** non-empty. `root: ""` would satisfy the key check and
+    // then resolve, at the call, to whatever directory the runtime happened to
+    // be started in — the ambient capability D123 refuses in its own words, read
+    // off no entry and different on a developer's machine and a deployment's. A
+    // `${VAR}` that comes back empty is the same hole reached through the
+    // environment, and the runtime closes that half where it resolves the root.
+    let root = fields
+        .require("root", cx)
+        .and_then(|node| lexical::interpolated(node, "`root`", cx))
+        .filter(|root| {
+            if !root.value.as_str().is_empty() {
+                return true;
+            }
+            cx.push(
+                Diagnostic::error(
+                    DiagnosticCode::InvalidValue,
+                    root.span.clone(),
+                    format!("`root` in {context} must not be empty"),
+                )
+                .with_help(format!(
+                    "name the directory this tool is bounded to — `- {}: {{ root: ./workspace{} }}`; \
+                     an empty root would bound it to wherever the runtime was started instead \
+                     (grammar 5.5)",
+                    tool.address(),
+                    if tool.runs_a_command() {
+                        ", timeout: 30s"
+                    } else {
+                        ""
+                    }
+                )),
+            );
+            false
+        });
+    let timeout = if tool.runs_a_command() {
+        fields
+            .require("timeout", cx)
+            .and_then(|node| lexical::duration(node, "`timeout`", cx))
+    } else {
+        // Taken so `finish` does not report it as a plain unknown key: the
+        // sentence a reader needs here is why this tool has no timeout, not a
+        // list of the keys it does take.
+        if let Some(node) = fields.take("timeout") {
+            cx.push(
+                Diagnostic::error(
+                    DiagnosticCode::UnknownKey,
+                    node.span.clone(),
+                    format!("unknown key `timeout` in {context}"),
+                )
+                .with_help(
+                    "`timeout:` bounds the command `builtin.bash` runs; a file tool has no \
+                     command to bound, and a node-level `timeout:` bounds the whole agent node \
+                     (grammar 5.5, 9.2)",
+                ),
+            );
+        }
+        None
+    };
+    fields.finish(cx);
+    Some(crate::ast::definition::BuiltinAttachment {
+        tool: Spanned::new(tool, key.span.clone()),
+        root,
+        timeout,
+        span: item.span.clone(),
+    })
 }
 
 fn tool(fields: &mut Fields<'_>, subject: &str, cx: &mut Cx) -> ToolDef {

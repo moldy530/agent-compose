@@ -66,7 +66,9 @@ use crate::ast::common::{
     Address, Cel, ControlTarget, Duration, EdgeSource, EdgeTarget, EnvRef, Ident, Interpolated,
     Literal, PathExpr,
 };
-use crate::ast::definition::{AgentAccess, ProviderKind, RouteCondition, StoreKind, StoreScope};
+use crate::ast::definition::{
+    AgentAccess, Builtin, ProviderKind, RouteCondition, StoreKind, StoreScope,
+};
 use crate::ast::deploy::{BackendProvider, EventSourceKind, Network, PluginValue, Runtime};
 use crate::ast::document::Reduce;
 use crate::ast::flow::{FlowContext, StoreOp};
@@ -175,6 +177,16 @@ macro_rules! serialize_as_text {
 }
 
 serialize_as_text!(Cel, Duration, Ident, PathExpr);
+
+/// A built-in is written as the **address** its entry key spells —
+/// `builtin.bash`, not `bash` — because that key is what the author wrote and
+/// what `docs/trace.md` §7.3 records as the call's target. The local name is a
+/// wire fact derived from it (grammar 5.5, Decision D123).
+impl Serialize for Builtin {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.address())
+    }
+}
 
 impl Serialize for Address {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {

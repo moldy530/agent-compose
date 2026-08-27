@@ -69,6 +69,9 @@
 // `fetch` is global from Node 18 and the project's floor is 22.18.
 
 import { spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
 import process from "node:process";
 
 import { Command, GraphRecursionError, isInterrupted } from "@langchain/langgraph";
@@ -782,10 +785,21 @@ export function delivering(context: RunContext, site: DispatchSite): RunContext 
   return { ...context, idempotency_key: site.idempotencyKey };
 }
 
+/**
+ * What an aborted signal is raised as.
+ *
+ * A `reason` is whatever the aborting side passed, and the one this runtime
+ * passes is the node's own deadline failure — so it is re-raised as it came, and
+ * anything else becomes an `Error` rather than reaching a `catch` as a string.
+ */
+function abortReason(signal: AbortSignal): Error {
+  return signal.reason instanceof Error ? signal.reason : new Error("aborted");
+}
+
 const sleep = (ms: number, signal: AbortSignal): Promise<void> =>
   new Promise((resolve, reject) => {
     if (signal.aborted) {
-      reject(signal.reason instanceof Error ? signal.reason : new Error("aborted"));
+      reject(abortReason(signal));
       return;
     }
     const timer = setTimeout(() => {
@@ -794,7 +808,7 @@ const sleep = (ms: number, signal: AbortSignal): Promise<void> =>
     }, ms);
     const onAbort = () => {
       clearTimeout(timer);
-      reject(signal.reason instanceof Error ? signal.reason : new Error("aborted"));
+      reject(abortReason(signal));
     };
     signal.addEventListener("abort", onAbort, { once: true });
   });
@@ -808,8 +822,7 @@ const sleep = (ms: number, signal: AbortSignal): Promise<void> =>
  */
 function untilAborted(signal: AbortSignal): Promise<never> {
   return new Promise<never>((_, reject) => {
-    const fail = () =>
-      reject(signal.reason instanceof Error ? signal.reason : new Error("aborted"));
+    const fail = () => reject(abortReason(signal));
     if (signal.aborted) {
       fail();
       return;
@@ -3566,6 +3579,735 @@ async function runExecLive(
       stderr: result.stderr,
     },
     "trimmed",
+  );
+}
+
+// ---------------------------------------------------------------------------
+// The runtime built-ins (grammar 5.5, Decision D123, PRD resolved q31)
+// ---------------------------------------------------------------------------
+
+/** Which of the four built-ins one attachment offers (grammar 5.5). */
+export type BuiltinName = "bash" | "read_file" | "write_file" | "list";
+
+/**
+ * One `builtin.*` entry of an agent's `tools:`, with the bounds it declared.
+ *
+ * The bounds are the whole of what an attachment configures, and both are
+ * mandatory where they apply: PRD resolved q31 makes the curated set "bounded by
+ * a mandatory root and a timeout", so there is no shape here in which a built-in
+ * runs unbounded.
+ */
+export interface BuiltinBinding {
+  /** Which built-in. */
+  readonly tool: BuiltinName;
+  /**
+   * `root:` — the directory every path resolves inside, and `bash`'s working
+   * directory. Interpolation parts rather than a string, because the value
+   * reaches the process at start (grammar 4.3 class 2).
+   */
+  readonly root: readonly Interpolation[];
+  /**
+   * `timeout:` — how long `bash`'s command may run. `millis` is what the timer
+   * is set to and `written` is what a message quotes, so a failure reads in the
+   * author's own units.
+   *
+   * Absent on the file tools, which run no command.
+   */
+  readonly timeout?: { readonly millis: number; readonly written: string };
+}
+
+/**
+ * How many entries one `list` answers with before it reports that it stopped.
+ *
+ * Not containment — v1's containment is the root and the timeout, and nothing
+ * here narrows what the agent may reach: a directory with more entries than this
+ * is listed a subdirectory or a glob at a time. It is a bound on one *answer*,
+ * because a tool result is text a model reads, and an unbounded one would spend
+ * a context window rather than fail. `truncated` says so rather than leaving the
+ * model to infer completeness from a round number.
+ */
+const LISTING_LIMIT = 1000;
+
+/**
+ * How many entries one `list` matches before it hands the event loop back.
+ *
+ * The walk `await`s a `readdir` per directory, so a turn of the loop already
+ * falls between two directories; this is what puts one *inside* a directory too.
+ * Both halves of the work in that loop are a model's to size — how many entries
+ * the directory it named holds, and how long the glob it wrote is — and an
+ * emitted graph is embedded code: a `serve` process runs every other execution
+ * and its own listener on this same loop.
+ *
+ * It is also what lets the node's own `timeout:` (grammar 9.2) fire *during* a
+ * listing rather than after it. A deadline is a timer, and a timer cannot run
+ * inside a burst that never yields — so a walk that never breathed would
+ * overshoot the bound by the length of the burst, and [`walkListing`]'s abort
+ * check would not be reached until the burst it is meant to cut short had
+ * already finished.
+ */
+const LISTING_YIELD = 256;
+
+/**
+ * Run one built-in call (grammar 5.5, Decision D123).
+ *
+ * The seam every built-in goes through, journaled like every other tool
+ * execution: the record holds what the call answered, and a resumed generation
+ * is handed it back rather than running the command again
+ * (`docs/durability.md` §3.2). That is the whole of what durability owes a
+ * built-in — a `bash` that appended a line to a file appends it once across any
+ * number of process generations.
+ *
+ * The identity is the **attachment as the composition wrote it** plus the
+ * arguments the model chose: the tool, the `root:` unresolved, and `bash`'s
+ * `timeout:` as written. Unresolved for `runExec`'s reason — one composition
+ * derives one identity whatever machine it runs on — and *whole* for the other:
+ * a root that moved is a different directory to read, and a timeout that moved
+ * is a different bound to have survived, so neither is a call this run makes
+ * under the recorded key.
+ */
+export async function runBuiltin(
+  binding: BuiltinBinding,
+  args: Record<string, unknown>,
+  context: RunContext,
+): Promise<unknown> {
+  return await journaled(
+    context.effects,
+    "tool",
+    {
+      surface: "builtin",
+      tool: binding.tool,
+      root: asWritten(binding.root),
+      ...(binding.timeout === undefined ? {} : { timeout: binding.timeout.written }),
+      input: args,
+    },
+    () => runBuiltinLive(binding, args, context),
+  );
+}
+
+/** [`runBuiltin`] with nothing between it and the file system. */
+async function runBuiltinLive(
+  binding: BuiltinBinding,
+  args: Record<string, unknown>,
+  context: RunContext,
+): Promise<unknown> {
+  // The root is resolved once per call, before anything is touched: every path
+  // check below is against a directory that really exists, so a `root:` naming
+  // one that does not is reported as itself rather than as every path inside it
+  // failing to resolve.
+  const root = await builtinRoot(binding);
+  switch (binding.tool) {
+    case "bash":
+      return await runBuiltinBash(binding, root, String(args.command), context);
+    case "read_file":
+      return await readWithinRoot(binding, root, String(args.path));
+    case "write_file":
+      return await writeWithinRoot(binding, root, String(args.path), String(args.content));
+    case "list":
+      return await listWithinRoot(binding, root, String(args.path), String(args.glob), context);
+    default:
+      // Unreachable over a project this compiler emitted: the set is closed in
+      // the grammar and the emitter writes one of the four. Said rather than
+      // defaulted to a branch, because a fifth name reaching here should stop
+      // rather than quietly list a directory.
+      throw new Error(`\`builtin.${binding.tool}\` is not a built-in this runtime implements`);
+  }
+}
+
+/**
+ * The attachment's `root:`, resolved to a real directory.
+ *
+ * `realpath`, not a normalization: the containment rule of PRD resolved q31 is
+ * "resolution, not string prefix — symlinks and `..` count", and comparing a
+ * resolved target against an unresolved root would answer the question about two
+ * different directories. A root that is itself a symlink is perfectly legal; it
+ * is the *resolved* one that bounds the calls.
+ *
+ * A root that does not exist fails the call as an execution failure, so the
+ * node's `retry:`/`on_error:` decides it (Decision D119). The message quotes the
+ * root **as written**, which is what keeps a resolved `${WORKSPACE}` out of a
+ * field the trace carries (`docs/trace.md` §11.1).
+ *
+ * A root that resolves to **nothing** fails the same way, and is checked before
+ * anything else because it is the one empty answer the file system would accept:
+ * `path.resolve("")` is this process's working directory, so an attachment whose
+ * `${WORKSPACE}` came back empty would silently bound the tool to wherever the
+ * runtime happened to be started — the ambient capability grammar 5.5 and D123
+ * refuse in their own words. The parser refuses an empty `root:` as written; this
+ * is the same rule where only the environment can break it.
+ */
+async function builtinRoot(binding: BuiltinBinding): Promise<string> {
+  const written = asWritten(binding.root);
+  const declared = interpolate(binding.root);
+  if (declared.trim() === "") {
+    throw new Error(
+      `\`builtin.${binding.tool}\`'s \`root:\` \`${written}\` resolved to nothing, and a tool bounded to nothing would be bounded to whatever directory this process was started in`,
+    );
+  }
+  const resolved = await realpathOrAbsent(path.resolve(declared));
+  const directory =
+    resolved === undefined ? false : await fs.promises.stat(resolved).then(
+      (entry) => entry.isDirectory(),
+      () => false,
+    );
+  if (resolved === undefined || !directory) {
+    throw new Error(
+      `\`builtin.${binding.tool}\`'s \`root:\` \`${written}\` is not a directory that exists, and every path this tool takes resolves inside it`,
+    );
+  }
+  return resolved;
+}
+
+/**
+ * Whether a resolved path is the root or sits beneath it.
+ *
+ * Both sides are already `realpath`ed by the time this is asked, which is what
+ * makes a string comparison the right one *here* and the wrong one anywhere
+ * else: what is being compared is two real locations, not two spellings.
+ */
+function withinRoot(root: string, target: string): boolean {
+  if (target === root) return true;
+  const prefix = root.endsWith(path.sep) ? root : `${root}${path.sep}`;
+  return target.startsWith(prefix);
+}
+
+/**
+ * The real path one argument names, refused if it lands outside the root.
+ *
+ * Three cases, and the middle one is why this is not one `realpath` call:
+ *
+ *  * the path **exists** — it is resolved whole, symlinks and all, and checked;
+ *  * it does **not exist yet**, which is every `write_file` to a new file: its
+ *    *parent* is resolved and the last component appended, so a write through a
+ *    symlinked directory is still checked against where that directory really
+ *    is;
+ *  * its parent does not exist either, where there is nothing left to resolve
+ *    and the lexically-resolved path is checked. `path.resolve` has already
+ *    collapsed every `..`, so a climb out of the root is refused here as surely
+ *    as anywhere else, and the call then fails on the missing directory.
+ *
+ * A **dangling symlink** is refused rather than written through, and that is the
+ * case the middle branch would otherwise get wrong: `writeFile` follows a
+ * symlink, so a link inside the root pointing at a file outside it that does not
+ * exist yet would be a write outside the root with every check passed.
+ */
+async function targetWithinRoot(
+  binding: BuiltinBinding,
+  root: string,
+  requested: string,
+): Promise<string> {
+  const absolute = path.resolve(root, requested);
+  const resolved = await realpathOrAbsent(absolute);
+  let target = resolved;
+  if (target === undefined) {
+    const link = await fs.promises.lstat(absolute).then(
+      (entry) => entry.isSymbolicLink(),
+      () => false,
+    );
+    if (link) {
+      throw new Error(
+        `\`builtin.${binding.tool}\` will not follow \`${requested}\`: it is a symbolic link whose target does not exist, so where it points cannot be checked against \`root:\` \`${asWritten(binding.root)}\``,
+      );
+    }
+    const parent = await realpathOrAbsent(path.dirname(absolute));
+    target = parent === undefined ? absolute : path.join(parent, path.basename(absolute));
+  }
+  if (!withinRoot(root, target)) {
+    throw new Error(
+      `\`builtin.${binding.tool}\` refused \`${requested}\`: it resolves outside \`root:\` \`${asWritten(binding.root)}\`, which is the directory this tool is bounded to`,
+    );
+  }
+  return target;
+}
+
+/** A path's real location, or `undefined` where nothing is there to resolve. */
+async function realpathOrAbsent(target: string): Promise<string | undefined> {
+  return await fs.promises.realpath(target).then(
+    (resolved) => resolved,
+    () => undefined,
+  );
+}
+
+/**
+ * Kill a `builtin.bash` shell **and every process it started**.
+ *
+ * The shell is spawned `detached`, which on a POSIX host makes it the leader of
+ * a process group of its own; a signal sent to the negated pid goes to the whole
+ * group, which is where the command's real work lives. That distinction is the
+ * whole point of this function: `bash -c 'npm run build'` is a shell that forks,
+ * and a `SIGKILL` aimed at the shell's own pid ends the shell while the build
+ * keeps compiling — inside the very `root:` the attachment bounded it to, for as
+ * long after the node failed as it likes.
+ *
+ * What still escapes is what **left the group deliberately**: a command that
+ * calls `setsid`, a shell that turned job control on (`set -m`), a daemon that
+ * double-forks away. Those are the same processes a hand-rolled `exec:` tool
+ * would have left behind, and containing them is the distribution work's, not
+ * this bound's (grammar 5.5, Decision D124).
+ *
+ * The fallback is for the host where the group kill is not a thing —
+ * `process.kill` with a negative pid is a POSIX call, and Windows is a posture
+ * q31 defers — where killing the shell alone is still better than killing
+ * nothing. Both are guarded: a group that has already gone answers `ESRCH`, and
+ * a spawn that never started has no pid to aim at.
+ */
+function killCommandGroup(child: ChildProcess): void {
+  const pid = child.pid;
+  if (pid !== undefined) {
+    try {
+      process.kill(-pid, "SIGKILL");
+      return;
+    } catch {
+      // Already gone, or a host without process groups: fall through.
+    }
+  }
+  try {
+    child.kill("SIGKILL");
+  } catch {
+    // Already gone. The deadline's job is that nothing is left running, and
+    // nothing is.
+  }
+}
+
+/** The `builtin.bash` shells this process has running right now. */
+const runningCommands = new Set<ChildProcess>();
+
+/** The stop signals swept for, and the handlers installed for them. */
+const SWEPT_SIGNALS = ["SIGINT", "SIGTERM"] as const;
+const commandSweeps: (() => void)[] = [];
+
+/**
+ * Register a running command, and — while any is running — arrange for a stop
+ * signal to take its process group with it.
+ *
+ * A detached command is a command the **terminal** can no longer reach: its
+ * group is not the foreground one any more, so the `SIGINT` a person types
+ * reaches this process and nothing below it. Left there, `Ctrl-C` on a `run`
+ * would end the graph and leave the build it was in the middle of still writing
+ * into `root:` — a regression against a hand-rolled `exec:` tool, whose child
+ * *is* in that group and does die. So the group this call detached is swept
+ * here instead, and what the terminal used to do the runtime now does.
+ *
+ * Two properties keep this from being a runtime that seizes an embedder's
+ * signals. The handlers exist **only while a command does** — installed with the
+ * first, removed with the last, so a process that is not running one has exactly
+ * the disposition it had before this module was imported. And the sweep
+ * **re-raises**: it kills the groups, stands down, and delivers the same signal
+ * again, so whatever would have happened — `serve`'s own handler closing the app
+ * (`src/serve.ts`), or the default disposition ending the process — happens,
+ * unchanged and with the same exit status (grammar 5.5, Decision D124).
+ */
+function holdCommand(child: ChildProcess): void {
+  if (runningCommands.size === 0) {
+    for (const signal of SWEPT_SIGNALS) {
+      const sweep = (): void => {
+        for (const running of runningCommands) killCommandGroup(running);
+        runningCommands.clear();
+        standDown();
+        process.kill(process.pid, signal);
+      };
+      commandSweeps.push(() => process.removeListener(signal, sweep));
+      process.on(signal, sweep);
+    }
+  }
+  runningCommands.add(child);
+}
+
+/** Drop a command that has ended, and the sweep with the last of them. */
+function releaseCommand(child: ChildProcess): void {
+  runningCommands.delete(child);
+  if (runningCommands.size === 0) standDown();
+}
+
+/** Remove the sweep handlers, giving the process back the disposition it had. */
+function standDown(): void {
+  for (const remove of commandSweeps.splice(0)) remove();
+}
+
+/**
+ * Run one `builtin.bash` command (grammar 5.5, PRD resolved q31).
+ *
+ * `bash` is resolved from `PATH` at the call, which is the posture q31 fixes: a
+ * host with no shell fails the call as an execution failure naming the
+ * requirement, rather than the compiler deciding at build time what a deployment
+ * machine has.
+ *
+ * The command runs with the attachment's root as its working directory and
+ * under its `timeout:`. Both bounds are the attachment's and neither is the
+ * model's to move. A command that exits nonzero, or that outruns the timeout and
+ * is killed, **fails the node** — there is no `expect_exit:` here, because a
+ * built-in has no per-call configuration surface for one to sit on.
+ *
+ * There is no standard input: the argument is the command, and a shell reading
+ * from a stream nothing writes to would hang until the timeout took it.
+ */
+async function runBuiltinBash(
+  binding: BuiltinBinding,
+  root: string,
+  command: string,
+  context: RunContext,
+): Promise<unknown> {
+  const bound = binding.timeout;
+  const spawned = new Promise<{ code: number; stdout: string; stderr: string; expired: boolean }>(
+    (resolve, reject) => {
+      // `detached` is what makes the deadline below bound the **command** rather
+      // than the shell that happens to be typing it. On a POSIX host it puts the
+      // shell in a process group of its own, and the group is what gets killed:
+      // a shell alone is almost never where the work is — `npm run build`,
+      // `a | b`, `(cd sub && make)` are all bash *forking*, and a kill aimed at
+      // the shell's pid leaves every one of those children running, still
+      // writing inside `root:`, for as long as they like after the node they
+      // belonged to has already failed. Under `retry:` that is two generations
+      // of the same command in one root with the graph believing one is live.
+      // See [`killCommandGroup`] for what the kill is and what still escapes it.
+      const child = spawn("bash", ["-c", command], {
+        cwd: root,
+        stdio: ["ignore", "pipe", "pipe"],
+        detached: true,
+        signal: context.signal,
+      });
+      // …and detaching is also what puts the command out of the terminal's
+      // reach, which [`holdCommand`] is the answer to: while one is running,
+      // a stop signal this process is sent takes its group with it.
+      holdCommand(child);
+      let stdout = "";
+      let stderr = "";
+      let expired = false;
+      // The deadline is enforced here rather than through the platform's own
+      // `timeout` option, which the two supported runtimes do not implement
+      // alike. `SIGKILL` rather than `SIGTERM`: the bound is what an author was
+      // promised, and a command that traps the polite signal would outlive it.
+      //
+      // And the call is settled **here**, rather than left to the `close` event
+      // the ordinary path resolves on. `close` waits for the child's output
+      // pipes to close as well as for the child to exit, and a process that put
+      // itself in a process group of its own — `bash -c 'set -m; sleep 30 &
+      // wait'` is the shape, and a double-forking daemon is the other — is out
+      // of reach of the group kill and can still be holding them, so a deadline
+      // that waited for `close` would be the command's to honour rather than the
+      // composition's. Resolving twice is harmless: the first settlement is the
+      // promise's, and the `close` that may still arrive finds it settled.
+      //
+      // Settling early is only half of ending a call, though, and [`abandon`]
+      // is the other half: the *promise* is settled but such an escapee still
+      // holds the pipes this runtime is still reading, so the `data` handlers
+      // below would go on appending to a buffer nobody will ever read, and the
+      // open handles would go on holding the event loop. In a long-lived host —
+      // `serve`, or anything embedding a compiled graph — that is unbounded
+      // memory growth and a process that will not exit, both of them minutes
+      // after the call they belong to was reported as failed. So the streams are
+      // dropped rather than merely ignored: what the deadline ends is the call
+      // *and* this runtime's hold on what outlived it.
+      const abandon = (): void => {
+        for (const stream of [child.stdout, child.stderr]) {
+          if (stream === null || stream === undefined) continue;
+          stream.removeAllListeners("data");
+          stream.destroy();
+        }
+        child.unref();
+      };
+      const timer =
+        bound === undefined
+          ? undefined
+          : setTimeout(() => {
+              expired = true;
+              killCommandGroup(child);
+              abandon();
+              settle();
+              resolve({ code: -1, stdout, stderr, expired: true });
+            }, bound.millis);
+      // A node deadline (grammar 9.2) or a cancelled run aborts the spawn's
+      // signal, and the platform answers that by killing the **shell** — the
+      // one pid it knows about. The command's own children are this call's to
+      // end for the same reason the timeout's are: a run somebody cancelled
+      // must not leave a build still writing into `root:`. Registered after the
+      // spawn, so the platform's kill lands first and this one sweeps the group
+      // it left behind; `abandon` stays the `error` handler's, which is where
+      // the abort arrives.
+      const swept = (): void => killCommandGroup(child);
+      context.signal.addEventListener("abort", swept, { once: true });
+      const settle = (): void => {
+        if (timer !== undefined) clearTimeout(timer);
+        context.signal.removeEventListener("abort", swept);
+        releaseCommand(child);
+      };
+      child.stdout.on("data", (chunk: Buffer) => {
+        stdout += chunk.toString();
+      });
+      child.stderr.on("data", (chunk: Buffer) => {
+        stderr += chunk.toString();
+      });
+      child.on("error", (error) => {
+        settle();
+        // The same early settlement, reached the other way: the abort above
+        // rejects here while a process that left the group may still hold the
+        // pipes. A spawn that never started (no `bash` on `PATH`) has nothing to
+        // drop, which is what the guards in `abandon` are for.
+        abandon();
+        reject(error);
+      });
+      child.on("close", (code) => {
+        settle();
+        resolve({ code: code ?? -1, stdout, stderr, expired });
+      });
+    },
+  );
+
+  let result: { code: number; stdout: string; stderr: string; expired: boolean };
+  try {
+    result = await spawned;
+  } catch (error) {
+    // A deadline on the *node*, or a run somebody cancelled, arrives here as an
+    // abort rather than as this call's failure, and is raised as it came.
+    if (context.signal.aborted) throw error;
+    const code = (error as NodeJS.ErrnoException | null | undefined)?.code;
+    if (code === "ENOENT") {
+      throw new Error(
+        "`builtin.bash` could not be run: this host has no `bash` on `PATH`, which the tool resolves it from at the call",
+      );
+    }
+    throw new Error(
+      `\`builtin.bash\` could not be run${code === undefined ? "" : ` (${code})`}`,
+    );
+  }
+
+  if (result.expired) {
+    throw new Error(
+      `\`builtin.bash\` ran longer than \`${bound?.written ?? ""}\` and was killed${
+        result.stderr === "" ? "" : `: ${result.stderr.trim()}`
+      }`,
+    );
+  }
+  if (result.code !== 0) {
+    throw new Error(
+      `\`builtin.bash\` exited ${result.code}${result.stderr === "" ? "" : `: ${result.stderr.trim()}`}`,
+    );
+  }
+  return { stdout: result.stdout, stderr: result.stderr };
+}
+
+/** Read one file inside the root (grammar 5.5). */
+async function readWithinRoot(
+  binding: BuiltinBinding,
+  root: string,
+  requested: string,
+): Promise<unknown> {
+  const target = await targetWithinRoot(binding, root, requested);
+  try {
+    return { content: await fs.promises.readFile(target, "utf8") };
+  } catch (error) {
+    throw builtinFailure(binding, "read", requested, error);
+  }
+}
+
+/** Write one file inside the root, replacing it whole (grammar 5.5). */
+async function writeWithinRoot(
+  binding: BuiltinBinding,
+  root: string,
+  requested: string,
+  content: string,
+): Promise<unknown> {
+  const target = await targetWithinRoot(binding, root, requested);
+  try {
+    await fs.promises.writeFile(target, content, "utf8");
+  } catch (error) {
+    throw builtinFailure(binding, "write", requested, error);
+  }
+  return { bytes_written: Buffer.byteLength(content, "utf8") };
+}
+
+/**
+ * List a directory inside the root, optionally through a glob (grammar 5.5).
+ *
+ * With no glob the answer is the directory's own entries; with one it is a walk
+ * beneath it, matched segment by segment. Either way the paths are relative to
+ * the directory that was listed, a directory is reported with a trailing `/`,
+ * and the order is lexicographic — a listing a model reads twice reads the same
+ * both times.
+ *
+ * **Symlinked directories are not descended into.** A link inside the root may
+ * point anywhere, and a walk that followed one would report paths outside the
+ * root without any path check having been asked. The link itself is still an
+ * entry; reading it is a `read_file` call, where the check *is* asked.
+ */
+async function listWithinRoot(
+  binding: BuiltinBinding,
+  root: string,
+  requested: string,
+  glob: string,
+  context: RunContext,
+): Promise<unknown> {
+  const target = await targetWithinRoot(binding, root, requested);
+  const found: string[] = [];
+  // Split once per call rather than once per candidate: the pattern is as long
+  // as the *model* wrote it, and a walk that re-split it for every entry would
+  // multiply one long argument by the size of the tree.
+  const pattern = glob === "" ? undefined : globPattern(glob);
+  try {
+    await walkListing(target, "", pattern, found, context);
+  } catch (error) {
+    // A deadline on the *node*, or a run somebody cancelled, arrives here as an
+    // abort rather than as this call's failure, and is raised as it came —
+    // [`runBuiltinBash`]'s rule, for its reason.
+    if (context.signal.aborted) throw error;
+    throw builtinFailure(binding, "list", requested, error);
+  }
+  found.sort();
+  return {
+    entries: found.slice(0, LISTING_LIMIT),
+    truncated: found.length > LISTING_LIMIT,
+  };
+}
+
+/**
+ * One level of a listing, and every level beneath it when a glob asked for one.
+ *
+ * An **absent** `pattern` is the no-glob case rather than a separate function,
+ * because the two differ only in whether the walk goes on: the entry shapes, the
+ * trailing `/` and the relative spelling are the same answer either way.
+ *
+ * The walk stops where it is when the node's deadline runs out or the run is
+ * cancelled (grammar 9.2). How much work a listing is depends on a directory
+ * this runtime did not choose and a glob a *model* wrote, so a walk that only
+ * ever ran to completion would keep reading a tree for a node the graph had
+ * already reported as failed — the same hold on what outlived a call that
+ * [`runBuiltinBash`] refuses to leave behind.
+ */
+async function walkListing(
+  directory: string,
+  prefix: string,
+  pattern: readonly string[] | undefined,
+  found: string[],
+  context: RunContext,
+): Promise<void> {
+  const entries = await fs.promises.readdir(directory, { withFileTypes: true });
+  let seen = 0;
+  for (const entry of entries) {
+    if (context.signal.aborted) throw abortReason(context.signal);
+    // `isDirectory` is `lstat`'s answer here, so a symlink to a directory is a
+    // symlink: reported, not descended into.
+    const directoryEntry = entry.isDirectory();
+    const relative = prefix === "" ? entry.name : `${prefix}/${entry.name}`;
+    const listed = directoryEntry ? `${relative}/` : relative;
+    if (pattern === undefined || matchSegments(pattern, relative.split("/"))) found.push(listed);
+    if (pattern !== undefined && directoryEntry) {
+      await walkListing(path.join(directory, entry.name), relative, pattern, found, context);
+    }
+    seen += 1;
+    if (seen % LISTING_YIELD === 0) await sleep(0, context.signal);
+  }
+}
+
+/**
+ * A glob split into the segments [`matchSegments`] matches it as, with runs of
+ * `**` collapsed to one.
+ *
+ * `*` and `?` match within a single path segment and `**` matches across them,
+ * which is the spelling every tool a model has met uses. Written here rather
+ * than taken from a library for the reason this whole runtime is: one fewer
+ * pinned dependency, and a matcher whose behaviour is this project's to state
+ * (PRD 5.12).
+ *
+ * `**` is *zero or more* segments, so two of them in a row accept exactly what
+ * one of them accepts, and the only difference between the two spellings is what
+ * the match costs: each `**` is a place the matcher may have to give a segment
+ * back, and a run of them is the shape that makes it do so the most times.
+ * Collapsed here — once per call,
+ * over an argument a model chose — so the length of that run cannot become the
+ * length of the search. See [`matchSegments`].
+ */
+function globPattern(glob: string): readonly string[] {
+  return glob.split("/").filter((segment, at, all) => segment !== "**" || all[at - 1] !== "**");
+}
+
+/**
+ * [`globPattern`]'s segments against a candidate's, with `**` the one that may
+ * span several.
+ *
+ * Iterative, and for the reason [`matchSegment`] is: the pattern is a **model's**
+ * argument. The recursion this replaced tried every split of the target at every
+ * `**` and re-tried it under the next one, which is exponential in how many of
+ * them a glob holds — a pattern one line long and a directory twelve deep were
+ * hours of a core spent inside a call, and `**` is not even the only way to
+ * write that pattern. The walk here is the standard two-pointer one, which
+ * accepts the same language in `pattern.length × target.length` steps: the last
+ * `**` passed is remembered, and a mismatch after it hands that one more segment
+ * rather than starting the search again.
+ */
+function matchSegments(pattern: readonly string[], target: readonly string[]): boolean {
+  let patternAt = 0;
+  let targetAt = 0;
+  let star = -1;
+  let resume = 0;
+  while (targetAt < target.length) {
+    const head = patternAt < pattern.length ? pattern[patternAt] : undefined;
+    if (head === "**") {
+      star = patternAt;
+      resume = targetAt;
+      patternAt += 1;
+    } else if (head !== undefined && matchSegment(head, target[targetAt] ?? "")) {
+      patternAt += 1;
+      targetAt += 1;
+    } else if (star >= 0) {
+      // Backtrack: the last `**` spans one more segment.
+      patternAt = star + 1;
+      resume += 1;
+      targetAt = resume;
+    } else {
+      return false;
+    }
+  }
+  // A trailing `**` spans nothing, which is a match; anything else left over is
+  // a segment the candidate does not have.
+  while (pattern[patternAt] === "**") patternAt += 1;
+  return patternAt === pattern.length;
+}
+
+/** One segment against one name: `*` any run of characters, `?` exactly one. */
+function matchSegment(pattern: string, name: string): boolean {
+  let patternAt = 0;
+  let nameAt = 0;
+  let star = -1;
+  let resume = 0;
+  while (nameAt < name.length) {
+    const current = pattern[patternAt];
+    if (patternAt < pattern.length && (current === "?" || current === name[nameAt])) {
+      patternAt += 1;
+      nameAt += 1;
+    } else if (patternAt < pattern.length && current === "*") {
+      star = patternAt;
+      resume = nameAt;
+      patternAt += 1;
+    } else if (star >= 0) {
+      // Backtrack: the last `*` takes one more character.
+      patternAt = star + 1;
+      resume += 1;
+      nameAt = resume;
+    } else {
+      return false;
+    }
+  }
+  while (pattern[patternAt] === "*") patternAt += 1;
+  return patternAt === pattern.length;
+}
+
+/**
+ * What a file operation that failed says, in one sentence this runtime composes.
+ *
+ * The platform's own message quotes the **resolved** path — which is the
+ * directory a `${WORKSPACE}` resolved to on this machine, and so a value
+ * `docs/trace.md` §11.1 keeps out of a trace field. So the failure is restated:
+ * the path as the *model* asked for it, and the platform's error **code**, which
+ * says what went wrong without saying what it went wrong on.
+ */
+function builtinFailure(
+  binding: BuiltinBinding,
+  verb: string,
+  requested: string,
+  error: unknown,
+): Error {
+  const code = (error as NodeJS.ErrnoException | null | undefined)?.code;
+  return new Error(
+    `\`builtin.${binding.tool}\` could not ${verb} \`${requested}\`${code === undefined ? "" : ` (${code})`}`,
   );
 }
 

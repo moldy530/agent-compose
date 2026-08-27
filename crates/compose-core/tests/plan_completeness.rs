@@ -1643,6 +1643,20 @@ const CASES: &[Case] = &[
         after: &[("providers.yml", "      max_uses: 3", "      max_uses: 1")],
         differs: true,
     },
+    // A built-in's `root:` is the whole of what bounds it (grammar 5.5,
+    // Decision D123), so moving it changes what an agent may reach without
+    // touching a node, a prompt or a schema — the same shape of edit as the one
+    // above, on the side of the wire this runtime dispatches.
+    Case {
+        what: "a built-in's root widened",
+        before: &[],
+        after: &[(
+            "agents/fixer.yml",
+            "    - builtin.read_file: { root: \"${REPO_ROOT}\" }",
+            "    - builtin.read_file: { root: \"${REPO_ROOT}/src\" }",
+        )],
+        differs: true,
+    },
     Case {
         what: "a tool's signature and its binding retuned",
         before: &[],

@@ -34,7 +34,11 @@ agent.reviewer:
   prompt: |
     You are a meticulous technical reviewer.
     Approve only when the draft fully satisfies the goal.
-  tools: [tool.web_search]
+  tools:
+    - tool.web_search
+    # A runtime built-in, opted into by name and bounded by the directory it may
+    # not leave. See `agent-compose docs tools`.
+    - builtin.read_file: { root: "${WORKSPACE}" }
   input:
     goal:  { type: string }
     draft: { type: string }
@@ -71,7 +75,7 @@ flow.review:
 | `prompt` | **yes** | — | literal text, no interpolation |
 | `output` | **yes** | — | a result schema with **≥ 1 property** |
 | `input` | no | string-in | a field map; see below |
-| `tools` | no | `[]` | `tool.*` and `flow.*` addresses |
+| `tools` | no | `[]` | `tool.*` and `flow.*` addresses, and `builtin.*` entries carrying their bounds (`agent-compose docs tools`) |
 | `stores` | no | `[]` | `store.*` addresses |
 | `description` | no | — | documentation only; agents are not tools |
 | `max_tool_iterations` | no | `8` | integer 1..50, bounds the tool loop |

@@ -382,14 +382,14 @@ expression: "resolve_clean(\"examples/triage-fanout\", \"staging\")"
         "value": "agent.fixer",
         "span": "agents/fixer.yml:4:1..4:12"
       },
-      "span": "agents/fixer.yml:4:1..19:19",
+      "span": "agents/fixer.yml:4:1..26:19",
       "namespace": "agent",
       "model": {
         "value": "model.fast",
         "span": "agents/fixer.yml:6:10..6:20"
       },
       "prompt": {
-        "value": "You write minimal unified diffs. Fix exactly the described defect in the\nnamed file and change nothing else.\n",
+        "value": "You write minimal unified diffs. Read the file, fix exactly the described\ndefect in it, and change nothing else.\n",
         "span": "agents/fixer.yml:8:5..10:3"
       },
       "output": {
@@ -398,14 +398,14 @@ expression: "resolve_clean(\"examples/triage-fanout\", \"staging\")"
           {
             "name": {
               "value": "patch",
-              "span": "agents/fixer.yml:14:5..14:10"
+              "span": "agents/fixer.yml:21:5..21:10"
             },
             "type": {
               "description": {
                 "value": "A unified diff.",
-                "span": "agents/fixer.yml:15:20..15:35"
+                "span": "agents/fixer.yml:22:20..22:35"
               },
-              "span": "agents/fixer.yml:15:7..16:19",
+              "span": "agents/fixer.yml:22:7..23:19",
               "form": "scalar",
               "type": "string"
             }
@@ -413,20 +413,20 @@ expression: "resolve_clean(\"examples/triage-fanout\", \"staging\")"
           {
             "name": {
               "value": "explanation",
-              "span": "agents/fixer.yml:17:5..17:16"
+              "span": "agents/fixer.yml:24:5..24:16"
             },
             "type": {
               "description": {
                 "value": "One sentence describing the change.",
-                "span": "agents/fixer.yml:18:20..18:55"
+                "span": "agents/fixer.yml:25:20..25:55"
               },
-              "span": "agents/fixer.yml:18:7..19:19",
+              "span": "agents/fixer.yml:25:7..26:19",
               "form": "scalar",
               "type": "string"
             }
           }
         ],
-        "span": "agents/fixer.yml:14:5..19:19"
+        "span": "agents/fixer.yml:21:5..26:19"
       },
       "input": {
         "surface": "input",
@@ -434,10 +434,10 @@ expression: "resolve_clean(\"examples/triage-fanout\", \"staging\")"
           {
             "name": {
               "value": "file",
-              "span": "agents/fixer.yml:11:5..11:9"
+              "span": "agents/fixer.yml:18:5..18:9"
             },
             "type": {
-              "span": "agents/fixer.yml:11:11..11:27",
+              "span": "agents/fixer.yml:18:11..18:27",
               "form": "scalar",
               "type": "string"
             }
@@ -445,17 +445,35 @@ expression: "resolve_clean(\"examples/triage-fanout\", \"staging\")"
           {
             "name": {
               "value": "patch_hint",
-              "span": "agents/fixer.yml:12:5..12:15"
+              "span": "agents/fixer.yml:19:5..19:15"
             },
             "type": {
-              "span": "agents/fixer.yml:12:17..12:33",
+              "span": "agents/fixer.yml:19:17..19:33",
               "form": "scalar",
               "type": "string"
             }
           }
         ],
-        "span": "agents/fixer.yml:11:5..12:33"
+        "span": "agents/fixer.yml:18:5..19:33"
       },
+      "builtins": [
+        {
+          "tool": {
+            "value": "builtin.read_file",
+            "span": "agents/fixer.yml:16:7..16:24"
+          },
+          "root": {
+            "value": {
+              "text": "${REPO_ROOT}",
+              "env_refs": [
+                "REPO_ROOT"
+              ]
+            },
+            "span": "agents/fixer.yml:16:34..16:49"
+          },
+          "span": "agents/fixer.yml:16:7..16:50"
+        }
+      ],
       "description": {
         "value": "Produces a patch for one mechanically fixable finding.",
         "span": "agents/fixer.yml:5:16..5:70"
