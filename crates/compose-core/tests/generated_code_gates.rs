@@ -2,7 +2,7 @@
 //! the **real** pinned JavaScript toolchain — under **Bun**, which PRD §9.18
 //! makes the default runtime and package manager of every emitted project.
 //!
-//! Twenty-one gates. The first four are in increasing strength, each one
+//! Twenty-two gates. The first four are in increasing strength, each one
 //! existing because the one above it passes on code the one below it catches;
 //! the fifth is about a construct whose guarantees are only observable from
 //! inside the runtime; the next two are about the schemas rather than the graph;
@@ -13,9 +13,10 @@
 //! the sixteenth is about the storage underneath a `store.*`; the seventeenth is
 //! about the argument parser every launch of an emitted project goes through;
 //! the eighteenth is about what a failure *says*, which is the one subject here
-//! that is a published surface rather than a behaviour; and the last three are
+//! that is a published surface rather than a behaviour; the three after that are
 //! about a `human` pause — the board a run holds one on, the terminal it answers
-//! one at, and the process's own standard input that terminal really is:
+//! one at, and the process's own standard input that terminal really is; and the
+//! last is about the one built-in tool whose work is this process's own:
 //!
 //! 1. **`bun run typecheck`** — every golden project type-checks under its own
 //!    strict `tsconfig.json`, against installed `@langchain/langgraph`,
@@ -212,6 +213,22 @@
 //!     and the runner arms a timer of its own: a run that printed its answer and
 //!     then sat there is the one failure a passing test cannot tell from a slow
 //!     one. Gate 13 asks both cases of Node.
+//! 22. **What a listing costs and what stops it** — `builtin.list`, driven out
+//!     of a golden's own runtime. It is the one built-in whose work happens in
+//!     *this* process — `bash` is a child the runtime kills, the other two file
+//!     tools touch one path each — and both of its inputs are a **model's**: the
+//!     directory it names and the glob it writes. PRD resolved q31 bounds a
+//!     built-in with a root and a timeout, and grammar 5.5 gives a file tool no
+//!     `timeout:`, so what stands between one call and a spent machine is the
+//!     matcher's complexity and the walk's answer to `context.signal` — a search
+//!     exponential in how many `**` a pattern holds, or a walk that finishes a
+//!     tree the graph has already reported as failed, both look exactly like a
+//!     correct listing from outside. Three claims: a run of `**` over a deep
+//!     directory answers correctly and *quickly*, an aborted signal stops the
+//!     walk and is raised as it came rather than restated as a file-system
+//!     fault, and the glob table answers what it has always answered — which is
+//!     what keeps the first two from being bought with a matcher that matches
+//!     less.
 //!
 //! # The toolchain fixture
 //!
@@ -1328,12 +1345,12 @@ fn the_fan_out_runtime_bounds_orders_and_resolves_every_dispatch() {
 /// (grammar 8.7, 9.2, PRD 5.11).
 ///
 /// The acceptance suite answers, expires and addresses pauses through a served
-/// app, which is where the composition's behaviour is decided. Eleven claims are
+/// app, which is where the composition's behaviour is decided. Twelve claims are
 /// not decidable there — eight because the case that breaks them is a task
 /// **nobody is awaiting**, one because the case that breaks it is a bug in the
-/// runtime rather than anything a composition can ask for, and two because every
+/// runtime rather than anything a composition can ask for, two because every
 /// composition that can reach one declares an `on_error:` the orderings agree
-/// on:
+/// on, and one because it needs the journal's write to fail on command:
 ///
 ///   * **a pause is addressed by, and belongs to, an instance path.** A node
 ///     holds the pauses its own path is a prefix of, which is the whole of what
@@ -1377,6 +1394,13 @@ fn the_fan_out_runtime_bounds_orders_and_resolves_every_dispatch() {
 ///     absorbs an ordinary delivery failure at that same node. A served app
 ///     cannot tell the orderings apart: every fixture that reaches an expiry
 ///     resolves `on_error: fail`, where they agree;
+///   * **a settlement the journal cannot record fails the node.** The wait is
+///     marked settled before its record is written, so a write that threw out
+///     of the settlement would leave a wait nothing may settle again holding a
+///     promise nothing ever settles — a run that hangs rather than one that
+///     fails, on both settlements that are journaled. Deciding it needs the
+///     write to refuse on command, which is a stub recorder rather than a
+///     composition;
 ///   * **a released wait's expiry timer is cleared.** An `unref`ed timer keeps
 ///     nothing alive, so it is invisible to `process.getActiveResourcesInfo()`
 ///     and to the process exiting: the runner counts the global
@@ -1698,6 +1722,39 @@ fn the_wait_board_behaved(observed: &Value) {
         json!({ "ok": false, "reason": "settled" })
     );
     assert_eq!(observed["answering"]["still_published"], json!([]));
+
+    // …and a journal that refuses the settled wait's record fails the **node**
+    // rather than leaving the pause parked for ever. The wait is marked settled
+    // before the record is written, so a write that threw out of the settlement
+    // would leave a wait nothing may settle again holding a promise nothing ever
+    // settles — the `human` node's `await` never returns, and the run neither
+    // fails nor parks nor ends. Without the guard `settled` reads `"pending"`
+    // and the delivery reports the write's error as its own.
+    assert_eq!(
+        observed["unwritable_answer"],
+        json!({
+            "delivery": { "ok": true, "threw": null },
+            "settled": "Error",
+            "reported": "the journal refused this record",
+            "still_published": [],
+            "again": "settled",
+        }),
+        "a pause whose record could not be written left its node parked: {observed}"
+    );
+
+    // The same on the arm a `setTimeout` fires, where a throw is an uncaught
+    // exception rather than something a caller could report — and where the
+    // expiry must not route either, since `on_timeout:` taken past a wait whose
+    // expiry the journal does not hold is a budget the resume spends again.
+    assert_eq!(
+        observed["unwritable_expiry"],
+        json!({
+            "settled": "Error",
+            "reported": "the journal refused this record",
+            "still_published": [],
+        }),
+        "an expiry whose record could not be written did not fail its node: {observed}"
+    );
 
     // A run with no answer surface never registers a pause: an `agent-compose
     // run` whose standard input is not a terminal has no way to answer one, so
@@ -2458,6 +2515,14 @@ fn the_bound_object_arrived_as_parameters(answer: &Value) {
 /// here is the backend underneath it. Gate 13 runs the same runner under Node,
 /// because a WebAssembly SQLite over `node:fs` is exactly the kind of dependency
 /// that could behave differently on the fallback runtime.
+///
+/// One claim here is durability's rather than the catalogue's: **a lock a killed
+/// writer left behind does not seal the store**. The driver's virtual file
+/// system takes SQLite's lock as a directory beside the file, and a `run` killed
+/// inside a write never removes it — so the store a resume has to read past its
+/// frontier (`docs/durability.md` §5) is one a crash could otherwise render
+/// permanently unopenable. The lock is planted rather than raced for, because
+/// the window a real crash lands in is one statement wide.
 #[test]
 fn the_local_store_backends_partition_dedupe_and_encode_what_they_are_given() {
     let Some(root) = installed() else {
@@ -2697,6 +2762,31 @@ fn the_local_backends_behaved(answer: &Value) {
         "`.` and `/` are both encoded, so no key becomes a path that climbs out"
     );
 
+    // The lock a killed writer never gave back does not take the store with it.
+    // This driver takes SQLite's lock by creating `<file>.lock` as a directory
+    // and gives it back by removing it, so a `run` killed inside a write leaves
+    // one nothing else will ever remove — and left standing it refuses every
+    // later open of that store, the resume of the very execution the crash
+    // interrupted included (`docs/durability.md` §2, §5). Without the deadline
+    // and the break beneath it the write below fails `SQLITE_BUSY` at once and
+    // every later run of the project fails with it.
+    assert_eq!(
+        answer["sealedWrite"],
+        Value::Null,
+        "a store a crashed writer left locked refused the write that came next: {}",
+        answer["sealedWrite"]
+    );
+    assert_eq!(
+        answer["sealedRead"],
+        json!({ "value": { "theme": "dark" }, "found": true }),
+        "…and the write it took is the one a later read answers with"
+    );
+    assert_eq!(
+        answer["sealedLockGone"],
+        json!(true),
+        "…and the corpse is gone rather than waited out once per op"
+    );
+
     // A backend grammar 14.2 names and this release does not implement.
     let production = answer["productionBackend"]
         .as_str()
@@ -2705,6 +2795,162 @@ fn the_local_backends_behaved(answer: &Value) {
         production.contains("redis") && production.contains("M3"),
         "the refusal names the backend and the milestone that lands it: {production}"
     );
+}
+
+/// Gate 22: what a `builtin.list` costs, what stops one, and what it matches —
+/// `src/runtime.ts`, driven directly.
+///
+/// The listing is the one built-in whose work happens inside the runtime's own
+/// process, and both of its inputs belong to the **model**: the directory it
+/// names and the glob it writes. PRD resolved q31 bounds a built-in with a root
+/// and a timeout, and grammar 5.5 gives a file tool no `timeout:` — so what
+/// keeps one listing from spending a machine is the matcher's complexity and the
+/// walk's answer to `context.signal`, neither of which a golden diff or a
+/// happy-path listing can show.
+#[test]
+fn a_listing_is_bounded_work_a_deadline_can_stop() {
+    let Some(root) = installed() else {
+        return;
+    };
+    let project = staged(goldens::golden("triage-fanout"), root, "listing");
+    let trees = root.join("projects").join("listing").join("trees");
+    let _ = fs::remove_dir_all(&trees);
+    fs::create_dir_all(&trees).expect("the scratch area is writable");
+
+    let output = runner("builtin-listing.mjs")
+        .arg(&project)
+        .arg(&trees)
+        .output()
+        .expect("bun runs");
+    assert!(
+        output.status.success(),
+        "the listing runner failed:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let answer: Value =
+        serde_json::from_slice(&output.stdout).expect("the runner prints one JSON object");
+    the_listing_was_bounded_stoppable_and_unchanged(&answer);
+}
+
+/// What `builtin-listing.mjs` has to come back with.
+///
+/// The budget is wall-clock and it is deliberately loose: what it separates is
+/// not a fast matcher from a slow one but a **polynomial** search from an
+/// exponential one. Sixteen `**` over a directory twelve deep answered in
+/// single-digit milliseconds when this was written and took twelve seconds
+/// against the recursion it replaced — and sixteen is a number chosen to keep
+/// that failure *finite*, since a model can write thirty as easily and the
+/// search runs with the event loop held.
+fn the_listing_was_bounded_stoppable_and_unchanged(answer: &Value) {
+    // Sized by the runner, and read from its answer so the budget below is read
+    // against the pattern that was really matched.
+    let deep = &answer["deep"];
+    assert_eq!(
+        deep["entries"],
+        json!(["d0/d1/d2/d3/d4/d5/d6/d7/d8/d9/d10/d11/zzz.txt"]),
+        "a run of `**` reaches the file at the bottom — the answer is asserted beside the \
+         clock, because a matcher that got fast by matching less would pass a clock alone"
+    );
+    let elapsed = deep["elapsedMs"]
+        .as_u64()
+        .expect("the runner times the listing it made");
+    assert!(
+        elapsed < 3_000,
+        "{stars} `**` over a tree {depth} deep took {elapsed}ms: a listing is work proportional \
+         to the tree and the pattern, and nothing else bounds it (PRD resolved q31)",
+        stars = deep["stars"],
+        depth = deep["depth"],
+    );
+
+    // …and the walk observes the node's deadline rather than running to the end
+    // of a tree the graph has stopped waiting for (grammar 9.2, Decision D124).
+    let wide = &answer["wide"];
+    assert_eq!(
+        wide["completed"],
+        json!(false),
+        "an aborted signal stopped the walk: {wide}"
+    );
+    assert_eq!(
+        wide["raisedTheAbort"],
+        json!(true),
+        "…and what it raised is the abort's own reason, not a `could not list` restatement \
+         wearing a file-system error's clothes: {wide}"
+    );
+    assert_eq!(
+        (&wide["whole"], &wide["wholeTruncated"]),
+        (&json!(1000), &json!(true)),
+        "…over a tree the same call walks end to end when nothing aborts it — a full answer's \
+         worth of entries and more behind them — which is what makes the stop above a stop \
+         rather than an empty directory: {wide}"
+    );
+
+    // The table the two claims above could quietly break: `*` and `?` stay
+    // inside one path segment, `**` spans zero segments as readily as several,
+    // and a run of `**` says exactly what one says.
+    let shapes = &answer["shapes"];
+    for (glob, entries) in [
+        ("*.md", json!(["a.md"])),
+        ("?.md", json!(["a.md"])),
+        ("docs/*.md", json!(["docs/one.md"])),
+        ("docs", json!(["docs/"])),
+        (
+            "**/*.md",
+            json!([
+                "a.md",
+                "docs/deep/deeper/four.md",
+                "docs/deep/three.md",
+                "docs/one.md"
+            ]),
+        ),
+        (
+            "**/**/**/*.md",
+            json!([
+                "a.md",
+                "docs/deep/deeper/four.md",
+                "docs/deep/three.md",
+                "docs/one.md"
+            ]),
+        ),
+        (
+            "docs/**/*.md",
+            json!([
+                "docs/deep/deeper/four.md",
+                "docs/deep/three.md",
+                "docs/one.md"
+            ]),
+        ),
+        (
+            "docs/**",
+            json!([
+                "docs/",
+                "docs/deep/",
+                "docs/deep/deeper/",
+                "docs/deep/deeper/four.md",
+                "docs/deep/three.md",
+                "docs/one.md",
+                "docs/two.txt"
+            ]),
+        ),
+        (
+            "**/deep/**/*.md",
+            json!(["docs/deep/deeper/four.md", "docs/deep/three.md"]),
+        ),
+        (
+            "**",
+            json!([
+                "a.md",
+                "docs/",
+                "docs/deep/",
+                "docs/deep/deeper/",
+                "docs/deep/deeper/four.md",
+                "docs/deep/three.md",
+                "docs/one.md",
+                "docs/two.txt"
+            ]),
+        ),
+    ] {
+        assert_eq!(shapes[glob], entries, "`{glob}` matched something else");
+    }
 }
 
 /// The runner both `http:` request gates read, run once per gate so each one

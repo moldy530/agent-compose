@@ -140,9 +140,34 @@ fn agent(source: &ast_def::AgentDef) -> Option<ir::definition::Agent> {
         output: field_map(source.output.as_ref()?)?,
         input: optional(source.input.as_ref(), field_map)?,
         tools: source.tools.clone(),
+        builtins: source
+            .builtins
+            .iter()
+            .map(builtin)
+            .collect::<Option<Vec<_>>>()?,
         stores: source.stores.clone(),
         description: source.description.clone(),
         max_tool_iterations: source.max_tool_iterations.as_ref().map(|value| value.value),
+    })
+}
+
+/// One `builtin.*` attachment, with its bounds required (grammar 5.5,
+/// Decision D123).
+///
+/// `root:` is required of every built-in and `timeout:` of `builtin.bash`, so an
+/// attachment missing either is dropped exactly as an agent missing its `model:`
+/// is: the parser has already reported it, and the artifact only ever holds a
+/// composition that declared everything it needs.
+fn builtin(source: &ast_def::BuiltinAttachment) -> Option<ir::definition::BuiltinTool> {
+    let timeout = source.timeout.clone();
+    if source.tool.value.runs_a_command() && timeout.is_none() {
+        return None;
+    }
+    Some(ir::definition::BuiltinTool {
+        tool: source.tool.clone(),
+        root: source.root.clone()?,
+        timeout,
+        span: source.span.clone(),
     })
 }
 
@@ -206,8 +231,26 @@ fn provider(source: &ast_def::ProviderDef) -> Option<ir::definition::Provider> {
             project: source.project.clone(),
             profile: source.profile.clone(),
             headers: source.headers.iter().map(interpolated_entry).collect(),
+            server_tools: source.server_tools.iter().filter_map(server_tool).collect(),
         },
         description: source.description.clone(),
+    })
+}
+
+/// One `server_tools:` entry (grammar 12.1, Decision D122).
+///
+/// An entry whose `type:` did not read is dropped, like every other required
+/// key this pass finds absent: the parser has already reported it, and a
+/// composition with a diagnostic produces no artifact.
+fn server_tool(source: &ast_def::ServerToolDef) -> Option<ir::definition::ServerTool> {
+    Some(ir::definition::ServerTool {
+        type_name: source.type_name.clone()?,
+        config: source
+            .config
+            .iter()
+            .map(|entry| (entry.key.value.clone(), entry.value.clone()))
+            .collect(),
+        span: source.span.clone(),
     })
 }
 

@@ -106,6 +106,16 @@ impl References {
                         }
                     }
                     references.entries_of(&config.headers, &format!("{address}.headers"));
+                    // A server tool's config is grammar 4.3 class 2 like the
+                    // rest of a provider's non-secret keys, so a vector store id
+                    // or a gateway's container name can be an `${ENV}` the run
+                    // supplies (Decision D122).
+                    for (index, tool) in config.server_tools.iter().enumerate() {
+                        let site = format!("{address}.server_tools[{index}]");
+                        for (key, value) in &tool.config {
+                            references.plugin(&value.value, &format!("{site}.{key}"));
+                        }
+                    }
                 }
                 DefinitionBody::Tool(tool) => match &tool.implementation {
                     ToolImplementation::Exec { exec } => {
@@ -135,7 +145,19 @@ impl References {
                         }
                     }
                 }
-                DefinitionBody::Agent(_) | DefinitionBody::Store(_) | DefinitionBody::Model(_) => {}
+                DefinitionBody::Agent(agent) => {
+                    // A built-in's `root:` is grammar 4.3 class 2 like an
+                    // `exec:`'s `cwd:`, and for the same reason: where a graph
+                    // is allowed to read and write is a property of the machine
+                    // running it, not of the composition (Decision D123).
+                    for builtin in &agent.builtins {
+                        references.text(
+                            &builtin.root.value,
+                            &format!("{address}.tools.{}.root", builtin.tool.value.address()),
+                        );
+                    }
+                }
+                DefinitionBody::Store(_) | DefinitionBody::Model(_) => {}
             }
         }
 

@@ -1,0 +1,12 @@
+# rule: a built-in's bounds are a closed row; an unknown key is an error rather
+# rule: than a knob that does nothing (grammar 5.5, D50, D123)
+# code: unknown-key
+# message: unknown key `mode` in `builtin.read_file` in agent definition `agent.reviewer`
+# at: 10:44
+agent.reviewer:
+  model: model.smart
+  prompt: Review the draft.
+  tools:
+    - builtin.read_file: { root: "./work", mode: read }
+  output:
+    verdict: { enum: [approve, revise] }

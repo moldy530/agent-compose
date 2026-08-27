@@ -21,7 +21,7 @@
 //! D14, D75).
 
 use crate::ast::common::Namespace;
-use crate::ast::definition::{AgentAccess, StoreKind};
+use crate::ast::definition::{AgentAccess, ProviderKind, StoreKind};
 use crate::cel::Scope;
 use crate::cel::ty::Type;
 use crate::diag::{Diagnostic, DiagnosticCode, Span, Spanned};
@@ -361,7 +361,48 @@ pub(crate) fn agent_tools(ctx: &mut Ctx, address: &str, agent: &Agent) {
         );
     }
     attached_tool_collisions(ctx, address, agent);
+    builtin_tool_collisions(ctx, address, agent);
     store_tool_collisions(ctx, address, agent);
+    server_tool_collisions(ctx, address, agent);
+}
+
+/// A built-in's name is on the wire beside the agent's other tools, so a
+/// `tool.*` or `flow.*` whose local name is `bash`, `read_file`, `write_file` or
+/// `list` collides with the built-in of that name (grammar 5.5, 11.5,
+/// Decision D123).
+///
+/// The same rule as [`attached_tool_collisions`], reached from the entry that
+/// carries no address to compare: a built-in's name is fixed by this compiler
+/// rather than by an author's definition key, so the repair is on the *other*
+/// side — rename the definition, or drop one of the two attachments. Which entry
+/// the report underlines is the built-in's, because that is the entry a reader
+/// can see the name in without opening another file.
+fn builtin_tool_collisions(ctx: &mut Ctx, address: &str, agent: &Agent) {
+    for builtin in &agent.builtins {
+        let local = builtin.tool.value.as_str();
+        let Some(attached) = agent
+            .tools
+            .iter()
+            .find(|tool| tool.value.name.as_str() == local)
+        else {
+            continue;
+        };
+        ctx.push(
+            Diagnostic::error(
+                DiagnosticCode::ToolNameCollision,
+                builtin.tool.span.clone(),
+                format!(
+                    "`{address}` attaches `{}` and `{}`, which are one `{local}` tool on the model's side",
+                    builtin.tool.value.address(),
+                    attached.value
+                ),
+            )
+            .with_label(attached.span.clone(), "the other is attached here")
+            .with_help(
+                "an attached tool's name is its address's local name and a built-in's is fixed by the compiler (grammar 5.4, 5.5): rename the definition, or drop one of the two attachments",
+            ),
+        );
+    }
 }
 
 /// Two entries of one `tools:` list whose **local names** are equal are one tool
@@ -414,6 +455,13 @@ fn attached_tool_collisions(ctx: &mut Ctx, address: &str, agent: &Agent) {
 /// An attached tool's name is its address's local name — the only name it has
 /// on the model's side — so `tool.prefs_get` and the `prefs_get` a `kv`
 /// `store.prefs` synthesizes are two tools with one name.
+///
+/// The **built-ins** are deliberately not compared here, and that is a fact
+/// about the two name shapes rather than an omission: a synthesized name is
+/// `<store's local name>_<op>` over grammar 11.4's closed op list, and none of
+/// `bash`, `read_file`, `write_file` or `list` has that shape for a non-empty
+/// local name. `the_builtin_names_are_not_shapes_a_store_can_synthesize` is that
+/// premise, held where it can fail if either list moves (grammar 5.5, 11.5).
 fn store_tool_collisions(ctx: &mut Ctx, address: &str, agent: &Agent) {
     if agent.tools.is_empty() || agent.stores.is_empty() {
         return;
@@ -460,6 +508,130 @@ fn store_tool_collisions(ctx: &mut Ctx, address: &str, agent: &Agent) {
     }
 }
 
+/// A tool the agent's **connection** offers may not take a name the agent's own
+/// tools take (grammar 12.1, 11.5, Decision D122).
+///
+/// A provider's `server_tools:` suite is appended to the `tools` of every
+/// request that connection serves, after the agent's own — one array, one
+/// namespace. So `tool.web_search` on an agent whose provider declares
+/// `web_search_20250305` is the rule §11.5 already states, reached from the
+/// other side: the model is offered two different things under one name, and
+/// the Messages API answers such a request 400.
+///
+/// **The Messages wire only**, and that is the rule rather than a gap — which
+/// is why the loop below is keyed on [`ProviderKind::Anthropic`] rather than on
+/// whether a name is knowable. It is the one wire where a server tool and a
+/// client tool sit under the same key: a Responses built-in is addressed by its
+/// `type:` while a function tool carries a `name:`, two different keys that
+/// cannot collide. Chat Completions is the same shape one level down — a
+/// function tool's name lives at `tools[i].function.name` while a suite entry's
+/// `name:` is the entry's own key — and above that, no table could say what a
+/// gateway keys its vocabulary on, so `openai_compatible` is out for both
+/// reasons at once (`check::providers`'s `Slot`, grammar 12.1, D122).
+///
+/// A suite entry's `name:` is still compared against the **rest of its own
+/// suite** on every kind, which is a different claim and stays where it is
+/// (`check::providers`'s `suite_collisions`): two entries of one array under one
+/// key are two tools under one identity by the author's own reckoning, whatever
+/// the wire keys on.
+///
+/// Which providers the agent might reach is the ladder's whole width — a route's
+/// members each declare their own suite, and any of them may serve the call.
+fn server_tool_collisions(ctx: &mut Ctx, address: &str, agent: &Agent) {
+    /// One name this agent puts on the wire, and how a report talks about it.
+    struct Offered {
+        /// The name the model is offered it under.
+        local: String,
+        /// The entry that offers it — what the report underlines.
+        at: Span,
+        /// What the agent did, as the message's middle clause.
+        subject: String,
+        /// The repair on *this* side of the pair. It differs by kind: an
+        /// attachment can be renamed by renaming its definition, and a built-in
+        /// cannot — its name is the compiler's — so the only move left there is
+        /// to drop the entry (PRD G3).
+        repair: &'static str,
+    }
+
+    let mut offered: Vec<Offered> = agent
+        .tools
+        .iter()
+        .map(|tool| Offered {
+            local: tool.value.name.as_str().to_string(),
+            at: tool.span.clone(),
+            subject: format!("attaches `{}`, whose name collides with", tool.value),
+            repair: "rename the attachment",
+        })
+        .collect();
+    // A built-in reaches the same `tools` array under the same key, so a suite
+    // declaring `bash` and an agent holding `builtin.bash` is the same 400 as
+    // any other pair (grammar 5.5, Decision D123).
+    for builtin in &agent.builtins {
+        offered.push(Offered {
+            local: builtin.tool.value.as_str().to_string(),
+            at: builtin.tool.span.clone(),
+            subject: format!(
+                "attaches `{}`, whose name collides with",
+                builtin.tool.value.address()
+            ),
+            repair: "drop the built-in, whose name is not an author's to change",
+        });
+    }
+    for attached in &agent.stores {
+        let Some(store) = ctx.store(&attached.value) else {
+            continue;
+        };
+        let local = attached.value.name.as_str();
+        for suffix in synthesized_tools(store) {
+            let synthesized = format!("{local}_{suffix}");
+            offered.push(Offered {
+                local: synthesized.clone(),
+                at: attached.span.clone(),
+                subject: format!(
+                    "attaches `{}`, whose synthesized `{synthesized}` tool collides with",
+                    attached.value
+                ),
+                repair: "rename the store",
+            });
+        }
+    }
+    if offered.is_empty() {
+        return;
+    }
+    let providers = super::providers::providers_of(ctx, &agent.model.value);
+    for (provider_address, provider) in providers {
+        if provider.kind != ProviderKind::Anthropic {
+            continue;
+        }
+        for server in &provider.config.server_tools {
+            let Some(name) = super::providers::wire_name(provider.kind, server) else {
+                continue;
+            };
+            for entry in offered.iter().filter(|entry| entry.local == name) {
+                let local = &entry.local;
+                ctx.push(
+                    Diagnostic::error(
+                        DiagnosticCode::ToolNameCollision,
+                        entry.at.clone(),
+                        format!(
+                            "`{address}` {} the `{local}` server tool `{provider_address}` declares",
+                            entry.subject
+                        ),
+                    )
+                    .with_label(server.span.clone(), "the server tool is declared here")
+                    .with_help(format!(
+                        "a server tool is appended to the `tools` of every request that \
+                         connection serves, and the wire refuses an array carrying `{local}` \
+                         twice: {}, or declare the suite on a provider this agent's model does \
+                         not reach (grammar 12.1, 11.5, Decision D122)",
+                        entry.repair
+                    )),
+                );
+            }
+        }
+    }
+}
+
 /// The tool-name suffixes an attached store synthesizes, in the order grammar
 /// 11.5's table lists them.
 fn synthesized_tools(store: &Store) -> &'static [&'static str] {
@@ -487,6 +659,251 @@ pub(crate) fn tool_implementation(ctx: &mut Ctx, address: &str, tool: &Tool) {
     {
         for binding in &bindings.entries {
             expr::analyze(ctx, &binding.value, &scope);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Every code one composition reports, in the order the report is sorted
+    /// into. The `version:` line is prepended so a case is only its own shape.
+    fn codes(body: &str) -> Vec<String> {
+        let ir = crate::codegen::test_support::ir_of(&format!("version: \"0.1\"\n{body}"));
+        crate::check::check(&ir)
+            .iter()
+            .map(|diagnostic| diagnostic.code.to_string())
+            .collect()
+    }
+
+    /// A route's members each declare their own suite, so the names an agent's
+    /// tools may not take are the union over the whole ladder — not the first
+    /// member's alone.
+    ///
+    /// The failure this pins is the least observable one there is: a
+    /// composition that runs for months on its primary and 400s the first time
+    /// the fallback answers.
+    #[test]
+    fn a_suite_a_later_ladder_member_declares_is_read_too() {
+        assert_eq!(
+            codes(
+                r#"
+provider.primary:
+  kind: anthropic
+  api_key: ${K}
+provider.fallback:
+  kind: anthropic
+  api_key: ${K2}
+  server_tools:
+    - type: web_search_20250305
+      name: web_search
+model.primary:
+  provider: provider.primary
+  id: some-model
+model.fallback:
+  provider: provider.fallback
+  id: another-model
+model.m:
+  route: [model.primary, model.fallback]
+tool.web_search:
+  description: Search the web the long way round.
+  input:
+    query: { type: string }
+  output:
+    value: { type: string }
+  exec:
+    command: search-the-web
+agent.a:
+  model: model.m
+  prompt: Decide.
+  tools: [tool.web_search]
+  output:
+    verdict: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    n: { agent: agent.a, input: "'x'" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }
+"#
+            ),
+            ["mismatched-server-tools", "tool-name-collision"],
+            "the second member's suite is the one that collides, and the members \
+             declaring different suites at all is the other half of the same shape"
+        );
+    }
+
+    /// The rule is the Messages wire's, and is stated over it rather than left
+    /// unstated: a Responses built-in is addressed by its `type:` while a
+    /// function tool carries a `name:`, two keys that cannot collide, so an
+    /// `openai` connection declaring `web_search` beside a `tool.web_search` is
+    /// a composition this release does not refuse.
+    #[test]
+    fn the_responses_wire_addresses_its_two_kinds_of_tool_by_different_keys() {
+        assert_eq!(
+            codes(
+                r#"
+provider.o:
+  kind: openai
+  api_key: ${K}
+  server_tools:
+    - type: web_search
+model.m:
+  provider: provider.o
+  id: gpt-5
+tool.web_search:
+  description: Search the web the long way round.
+  input:
+    query: { type: string }
+  output:
+    value: { type: string }
+  exec:
+    command: search-the-web
+agent.a:
+  model: model.m
+  prompt: Decide.
+  tools: [tool.web_search]
+  output:
+    verdict: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    n: { agent: agent.a, input: "'x'" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }
+"#
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    /// …and the same over a **gateway**, which is the other half of the same
+    /// sentence and the one a compiler is likeliest to get wrong by accident.
+    ///
+    /// `openai_compatible` is off this rule for two reasons at once, either of
+    /// which is enough. No table could say what key a gateway addresses its
+    /// vocabulary on — that is the whole reason every entry on the kind is
+    /// second-tier — and the surface it rides is Chat Completions, where a
+    /// client tool's name lives at `tools[i].function.name` while a suite entry
+    /// carries its `name:` at the top of its own object: two keys, not one.
+    ///
+    /// The failure this pins is a legal composition refused with no workaround
+    /// but renaming, against a published grammar (§12.1, D122) that tells the
+    /// author it compiles. The entry's `unknown-server-tool` warning is the
+    /// whole of what this release has to say about it.
+    #[test]
+    fn a_gateways_suite_is_not_compared_with_the_agents_own_tools() {
+        assert_eq!(
+            codes(
+                r#"
+provider.g:
+  kind: openai_compatible
+  base_url: ${GATEWAY_URL}
+  server_tools:
+    - type: retrieval
+      name: search_docs
+model.m:
+  provider: provider.g
+  id: qwen3-coder-30b
+tool.search_docs:
+  description: Search the docs the long way round.
+  input:
+    query: { type: string }
+  output:
+    value: { type: string }
+  exec:
+    command: search-the-docs
+agent.a:
+  model: model.m
+  prompt: Decide.
+  tools: [tool.search_docs]
+  output:
+    verdict: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    n: { agent: agent.a, input: "'x'" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }
+"#
+            ),
+            ["unknown-server-tool"],
+            "a gateway's suite is carried unchecked, and that includes not \
+             deciding whose name space its `name:` lands in"
+        );
+    }
+
+    /// A **store**'s synthesized tools reach the same rule by the same route, so
+    /// the wire gate has to hold for them too: an `openai_compatible` connection
+    /// whose suite names `notes_get` beside an attached `store.notes` is the
+    /// same legal composition as the one above, spelled with the name the
+    /// runtime makes rather than one the author wrote.
+    #[test]
+    fn a_gateways_suite_is_not_compared_with_a_synthesized_store_tool_either() {
+        assert_eq!(
+            codes(
+                r#"
+provider.g:
+  kind: openai_compatible
+  base_url: ${GATEWAY_URL}
+  server_tools:
+    - type: retrieval
+      name: notes_get
+model.m:
+  provider: provider.g
+  id: qwen3-coder-30b
+store.notes:
+  kind: kv
+  scope: execution
+  description: What the run has been told.
+  agent_access: read
+  value_schema:
+    theme: { type: string }
+agent.a:
+  model: model.m
+  prompt: Decide.
+  stores: [store.notes]
+  output:
+    verdict: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    n: { agent: agent.a, input: "'x'" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }
+"#
+            ),
+            ["unknown-server-tool"]
+        );
+    }
+
+    /// No store can synthesize a tool called `bash`, `read_file`, `write_file`
+    /// or `list`, which is why [`super::store_tool_collisions`] does not compare
+    /// the built-ins.
+    ///
+    /// The premise is about two closed lists — the built-in names and grammar
+    /// 11.4's ops — so it is held here rather than asserted in a comment: a
+    /// built-in whose name were `notes_get`, or an op called `file`, would make
+    /// the collision writable, and this test is what would say so.
+    #[test]
+    fn the_builtin_names_are_not_shapes_a_store_can_synthesize() {
+        use crate::ast::definition::{Builtin, StoreKind};
+        for builtin in Builtin::ALL {
+            for kind in StoreKind::ALL {
+                for op in kind.operations() {
+                    let suffix = format!("_{op}");
+                    assert!(
+                        !builtin.as_str().ends_with(&suffix)
+                            || builtin.as_str().len() == suffix.len(),
+                        "`{}` is `<local>_{op}` for a non-empty local name, so a store could \
+                         synthesize it",
+                        builtin.as_str()
+                    );
+                }
+            }
         }
     }
 }

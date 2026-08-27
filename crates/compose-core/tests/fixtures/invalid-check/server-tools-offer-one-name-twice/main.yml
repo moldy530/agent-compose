@@ -1,0 +1,23 @@
+# rule: two `server_tools:` entries may not reach the wire as one tool (grammar 12.1, 11.5, Decision D122)
+# code: tool-name-collision
+# message: `provider.main` declares `code_execution_20250522` and `code_execution_20250825`, which are one `code_execution` tool on the model's side
+# at: main.yml:22:7
+# label: main.yml:20:7 the first is declared here
+# help: the wire pairs each dated `type:` with one fixed `name:` — both of these are `code_execution` — and refuses a `tools` array carrying one name twice: keep one of the two revisions (grammar 12.1, Decision D122)
+#
+# The strict tier checks each entry against its own row and would see nothing
+# wrong here: two real tools, two valid configs. What it cannot see on its own is
+# that the table pins **one** `name:` across both dated revisions, so the request
+# carries `code_execution` twice and the API answers 400 — the failure the
+# canonical-name pinning exists to move to compile time, whose other half is a
+# comparison between entries rather than inside one.
+version: "0.1"
+
+provider.main:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+  server_tools:
+    - type: code_execution_20250522
+      name: code_execution
+    - type: code_execution_20250825
+      name: code_execution

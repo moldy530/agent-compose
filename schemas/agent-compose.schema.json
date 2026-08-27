@@ -192,6 +192,61 @@
       "description": "An LLM-facing tool: a tool. definition, or a flow. definition used as a tool (flow-as-tool equivalence, PRD 5.1).",
       "anyOf": [{ "$ref": "#/$defs/toolRef" }, { "$ref": "#/$defs/flowRef" }]
     },
+    "builtinFileTool": {
+      "description": "The bounds a built-in file tool takes. Grammar 5.5.",
+      "type": "object",
+      "required": ["root"],
+      "properties": {
+        "root": {
+          "description": "REQUIRED, and non-empty. The directory this tool is bounded to. Every path the model supplies resolves inside it - resolution, not string prefix, so symlinks and .. count - and one that lands outside is refused. An empty root would bound the tool to whatever directory the runtime was started in, which is the ambient capability the per-entry bounds exist to refuse. Interpolable (grammar 4.3 class 2).",
+          "allOf": [{ "$ref": "#/$defs/interpolatedString" }, { "minLength": 1 }]
+        }
+      },
+      "additionalProperties": false
+    },
+    "builtinTool": {
+      "description": "One runtime built-in, attached under its own name with the bounds that name requires. Exactly one key per entry: the opt-in is one tool name at a time, never a switch that grants the set, so which capabilities an agent holds is readable off the entries that hold them. Grammar 5.5 / PRD resolved q31.",
+      "type": "object",
+      "minProperties": 1,
+      "maxProperties": 1,
+      "properties": {
+        "builtin.bash": {
+          "description": "Run one bash command with root: as its working directory, under timeout:. A model holding this holds arbitrary code execution on the host running the graph, which is why both bounds are required and neither is defaulted.",
+          "type": "object",
+          "required": ["root", "timeout"],
+          "properties": {
+            "root": {
+              "description": "REQUIRED, and non-empty. The working directory the command runs in. An empty root would hand the shell whatever directory the runtime was started in, which is the ambient capability every bound here is written out to refuse. Interpolable (grammar 4.3 class 2).",
+              "allOf": [{ "$ref": "#/$defs/interpolatedString" }, { "minLength": 1 }]
+            },
+            "timeout": {
+              "description": "REQUIRED. How long the command may run before it is killed and the call fails. This bounds one command; a node-level timeout: bounds the whole agent node (grammar 9.2).",
+              "$ref": "#/$defs/duration"
+            }
+          },
+          "additionalProperties": false
+        },
+        "builtin.read_file": {
+          "description": "Read one file inside root:.",
+          "$ref": "#/$defs/builtinFileTool"
+        },
+        "builtin.write_file": {
+          "description": "Write one file inside root:.",
+          "$ref": "#/$defs/builtinFileTool"
+        },
+        "builtin.list": {
+          "description": "List a directory inside root:, optionally through a glob.",
+          "$ref": "#/$defs/builtinFileTool"
+        }
+      },
+      "additionalProperties": false
+    },
+    "agentTool": {
+      "description": "One entry of an agent's tools: list - a tool./flow. address, or a runtime built-in attached with its bounds (grammar 5.4, 5.5). The two shapes are told apart by the entry's own type rather than by anyOf, so an editor reports the rule the entry really broke - a missing root:, a timeout: on a file tool - instead of \"not one of two alternatives\".",
+      "if": { "type": "object" },
+      "then": { "$ref": "#/$defs/builtinTool" },
+      "else": { "$ref": "#/$defs/toolOrFlowRef" }
+    },
     "mapTargetRef": {
       "description": "A map dispatch target: agent., tool., or flow. Map instances are isolated per-item invocations of a component, not nodes of the enclosing flow: they take no policy from `defaults:` (Decision D73) and each runs on a fresh conversation history that is discarded when it completes, never reading or appending to the enclosing flow's `messages` (grammar 8.6 rules 10 and 13, 10.4 / Decisions D29, D105). Grammar 8.6 / PRD 5.6.",
       "anyOf": [
@@ -224,6 +279,11 @@
     "interpolatedString": {
       "description": "A string on one of grammar 4.3's class 2 surfaces, where ${ENV_NAME} references may be embedded in text, e.g. \"https://${API_HOST}/v1\": http urls and headers, the whole exec block (command, args, cwd, env values), non-secret provider keys, and non-secret deploy config. Substitution happens at process start. Use $${ for a literal ${.",
       "type": "string"
+    },
+    "envRefString": {
+      "description": "A class 2 string that reaches for the environment: it carries at least one unescaped ${ENV_NAME} reference, so what it says is decided at process start rather than here. It is the second arm of every closed-set provider value the compiler leaves undecided for that reason - `search_context_size: ${SEARCH_DEPTH}` is a deployment knob, not a typo - and the pattern spells \"unescaped\" exactly as `noEnvRefString` does (Decision D108). A closed set the curated table pins to a single value has no such arm: that value is decided by the entry's own `type`, and an ${ENV_NAME} there is `unexpected-env-ref` (grammar 12.1, 4.3 / Decision D122).",
+      "type": "string",
+      "pattern": "(^|[^$])\\$\\{[A-Z_][A-Z0-9_]*\\}"
     },
     "noEnvRefString": {
       "description": "A string on one of the surfaces where environment references are illegal (grammar 4.3 class 3: prompts, descriptions, schemas, CEL, model and embedding model ids, trigger path/cron/timezone, content types, identifiers and references - anything the classification does not place in class 1 or 2). Nothing is interpolated here, so an unescaped ${ENV_NAME} token is an error rather than text that silently survives. Write $${ENV_NAME} for a literal ${ENV_NAME}. The pattern spells \"unescaped\" as an explicit alternation - at the start of the string, or after one character that is not the `$` of the `$${` escape - rather than as a lookbehind, which is outside the interoperable regex subset this schema keeps to (Decision D108).",
@@ -820,10 +880,10 @@
           "allOf": [{ "$ref": "#/$defs/fieldMap" }, { "minProperties": 1 }]
         },
         "tools": {
-          "description": "LLM-discovered tools: tool.* definitions and flow.* modules used as tools.",
+          "description": "LLM-discovered tools: tool.* definitions, flow.* modules used as tools, and runtime built-ins attached one name at a time with their bounds (grammar 5.4, 5.5).",
           "type": "array",
           "uniqueItems": true,
-          "items": { "$ref": "#/$defs/toolOrFlowRef" }
+          "items": { "$ref": "#/$defs/agentTool" }
         },
         "stores": {
           "description": "Attached stores; codegen synthesizes LLM-facing tools from each store's kind and schema (PRD 5.8).",
@@ -1586,6 +1646,566 @@
       ]
     },
 
+      "serverToolConfig": {
+        "description": "One entry of a provider's `server_tools:` \u2014 a tool the provider runs on its own side, in that provider's wire vocabulary. `type` is required and is the key the vocabulary is looked up under; every other key is the provider's and is carried verbatim (grammar 12.1 / Decision D122).",
+        "type": "object",
+        "required": [
+          "type"
+        ],
+        "properties": {
+          "type": {
+            "description": "The tool's wire type, exactly as the provider takes it \u2014 versioned where the vendor versions it, e.g. `web_search_20250305`. Never an ${ENV} reference: it is what the curated table is looked up under.",
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "anthropicServerTool": {
+        "description": "A server tool on an `anthropic` provider: the Messages wire's suite. A `type` the curated table names has its documented fields checked; a `type` outside the table, and a key outside the row of one inside it, are carried unchecked — the vocabulary is the vendor's, and a parameter added after this release must not be a red squiggle (grammar 12.1 / Decision D122).",
+        "allOf": [
+          {
+            "$ref": "#/$defs/serverToolConfig"
+          },
+          {
+            "if": {
+              "properties": {
+                "type": {
+                  "enum": [
+                    "web_search_20250305"
+                  ]
+                }
+              },
+              "required": [
+                "type"
+              ]
+            },
+            "then": {
+              "type": "object",
+              "required": [
+                "type",
+                "name"
+              ],
+              "properties": {
+                "type": {
+                  "enum": [
+                    "web_search_20250305"
+                  ]
+                },
+                "name": {
+                  "description": "The canonical name the Messages API pairs with this `type`. Required, and fixed: the service refuses a request whose two disagree.",
+                  "const": "web_search"
+                },
+                "cache_control": {
+                  "type": "object",
+                  "required": [
+                    "type"
+                  ],
+                  "properties": {
+                    "type": {
+                      "const": "ephemeral"
+                    }
+                  }
+                },
+                "max_uses": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "allowed_domains": {
+                  "description": "Only these domains are searched.",
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/interpolatedString"
+                  }
+                },
+                "blocked_domains": {
+                  "description": "These domains are never searched.",
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/interpolatedString"
+                  }
+                },
+                "user_location": {
+                  "description": "An approximate location the search is biased towards.",
+                  "type": "object",
+                  "required": [
+                    "type"
+                  ],
+                  "properties": {
+                    "type": {
+                      "const": "approximate"
+                    },
+                    "city": {
+                      "$ref": "#/$defs/interpolatedString"
+                    },
+                    "region": {
+                      "$ref": "#/$defs/interpolatedString"
+                    },
+                    "country": {
+                      "$ref": "#/$defs/interpolatedString"
+                    },
+                    "timezone": {
+                      "$ref": "#/$defs/interpolatedString"
+                    }
+                  }
+                }
+              },
+              "allOf": [
+                {
+                  "description": "One list is an allow-list and the other is a deny-list; a tool carrying both has no answer to which applies.",
+                  "not": {
+                    "required": [
+                      "allowed_domains",
+                      "blocked_domains"
+                    ]
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "type": {
+                  "enum": [
+                    "web_fetch_20250910"
+                  ]
+                }
+              },
+              "required": [
+                "type"
+              ]
+            },
+            "then": {
+              "type": "object",
+              "required": [
+                "type",
+                "name"
+              ],
+              "properties": {
+                "type": {
+                  "enum": [
+                    "web_fetch_20250910"
+                  ]
+                },
+                "name": {
+                  "description": "The canonical name the Messages API pairs with this `type`. Required, and fixed: the service refuses a request whose two disagree.",
+                  "const": "web_fetch"
+                },
+                "cache_control": {
+                  "type": "object",
+                  "required": [
+                    "type"
+                  ],
+                  "properties": {
+                    "type": {
+                      "const": "ephemeral"
+                    }
+                  }
+                },
+                "max_uses": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "allowed_domains": {
+                  "description": "Only these domains are fetched.",
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/interpolatedString"
+                  }
+                },
+                "blocked_domains": {
+                  "description": "These domains are never fetched.",
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/interpolatedString"
+                  }
+                },
+                "citations": {
+                  "type": "object",
+                  "required": [
+                    "enabled"
+                  ],
+                  "properties": {
+                    "enabled": {
+                      "type": "boolean"
+                    }
+                  }
+                },
+                "max_content_tokens": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              },
+              "allOf": [
+                {
+                  "description": "One list is an allow-list and the other is a deny-list; a tool carrying both has no answer to which applies.",
+                  "not": {
+                    "required": [
+                      "allowed_domains",
+                      "blocked_domains"
+                    ]
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "type": {
+                  "enum": [
+                    "code_execution_20250522",
+                    "code_execution_20250825"
+                  ]
+                }
+              },
+              "required": [
+                "type"
+              ]
+            },
+            "then": {
+              "type": "object",
+              "required": [
+                "type",
+                "name"
+              ],
+              "properties": {
+                "type": {
+                  "enum": [
+                    "code_execution_20250522",
+                    "code_execution_20250825"
+                  ]
+                },
+                "name": {
+                  "description": "The canonical name the Messages API pairs with this `type`. Required, and fixed: the service refuses a request whose two disagree.",
+                  "const": "code_execution"
+                },
+                "cache_control": {
+                  "type": "object",
+                  "required": [
+                    "type"
+                  ],
+                  "properties": {
+                    "type": {
+                      "const": "ephemeral"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        ]
+      },
+      "openaiServerTool": {
+        "description": "A server tool on an `openai` provider: the Responses API's built-in suite. Declaring any moves the connection onto `POST /v1/responses` for all of its calls, which is the wire that carries them. A `type` the curated table names has its documented fields checked; a `type` outside the table, and a key outside the row of one inside it, are carried unchecked (grammar 12.1 / Decision D122).",
+        "allOf": [
+          {
+            "$ref": "#/$defs/serverToolConfig"
+          },
+          {
+            "if": {
+              "properties": {
+                "type": {
+                  "enum": [
+                    "web_search",
+                    "web_search_preview"
+                  ]
+                }
+              },
+              "required": [
+                "type"
+              ]
+            },
+            "then": {
+              "type": "object",
+              "required": [
+                "type"
+              ],
+              "properties": {
+                "type": {
+                  "enum": [
+                    "web_search",
+                    "web_search_preview"
+                  ]
+                },
+                "filters": {
+                  "type": "object",
+                  "properties": {
+                    "allowed_domains": {
+                      "description": "Only these domains are searched.",
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/$defs/interpolatedString"
+                      }
+                    }
+                  }
+                },
+                "search_context_size": {
+                  "anyOf": [
+                    {
+                      "enum": [
+                        "low",
+                        "medium",
+                        "high"
+                      ]
+                    },
+                    {
+                      "$ref": "#/$defs/envRefString"
+                    }
+                  ]
+                },
+                "user_location": {
+                  "description": "An approximate location the search is biased towards.",
+                  "type": "object",
+                  "required": [
+                    "type"
+                  ],
+                  "properties": {
+                    "type": {
+                      "const": "approximate"
+                    },
+                    "city": {
+                      "$ref": "#/$defs/interpolatedString"
+                    },
+                    "region": {
+                      "$ref": "#/$defs/interpolatedString"
+                    },
+                    "country": {
+                      "$ref": "#/$defs/interpolatedString"
+                    },
+                    "timezone": {
+                      "$ref": "#/$defs/interpolatedString"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "type": {
+                  "enum": [
+                    "file_search"
+                  ]
+                }
+              },
+              "required": [
+                "type"
+              ]
+            },
+            "then": {
+              "type": "object",
+              "required": [
+                "type",
+                "vector_store_ids"
+              ],
+              "properties": {
+                "type": {
+                  "enum": [
+                    "file_search"
+                  ]
+                },
+                "vector_store_ids": {
+                  "description": "The vector stores to search. Required: a file search with nothing to search is refused.",
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/interpolatedString"
+                  }
+                },
+                "filters": {
+                  "description": "A comparison filter over file attributes, or a compound one holding more filters. Carried verbatim: the shape is recursive, so the compiler states that the field exists rather than what is inside it."
+                },
+                "max_num_results": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 50
+                },
+                "ranking_options": {
+                  "type": "object",
+                  "properties": {
+                    "ranker": {
+                      "$ref": "#/$defs/interpolatedString"
+                    },
+                    "score_threshold": {
+                      "type": "number",
+                      "minimum": 0,
+                      "maximum": 1
+                    }
+                  }
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "type": {
+                  "enum": [
+                    "code_interpreter"
+                  ]
+                }
+              },
+              "required": [
+                "type"
+              ]
+            },
+            "then": {
+              "type": "object",
+              "required": [
+                "type",
+                "container"
+              ],
+              "properties": {
+                "type": {
+                  "enum": [
+                    "code_interpreter"
+                  ]
+                },
+                "container": {
+                  "description": "A container id, or a request to make one.",
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/interpolatedString"
+                    },
+                    {
+                      "type": "object",
+                      "required": [
+                        "type"
+                      ],
+                      "properties": {
+                        "type": {
+                          "const": "auto"
+                        },
+                        "file_ids": {
+                          "description": "Files the new container is seeded with.",
+                          "type": "array",
+                          "items": {
+                            "$ref": "#/$defs/interpolatedString"
+                          }
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "type": {
+                  "enum": [
+                    "image_generation"
+                  ]
+                }
+              },
+              "required": [
+                "type"
+              ]
+            },
+            "then": {
+              "type": "object",
+              "required": [
+                "type"
+              ],
+              "properties": {
+                "type": {
+                  "enum": [
+                    "image_generation"
+                  ]
+                },
+                "background": {
+                  "anyOf": [
+                    {
+                      "enum": [
+                        "transparent",
+                        "opaque",
+                        "auto"
+                      ]
+                    },
+                    {
+                      "$ref": "#/$defs/envRefString"
+                    }
+                  ]
+                },
+                "input_fidelity": {
+                  "description": "How much of an input image the edit preserves.",
+                  "anyOf": [
+                    {
+                      "enum": [
+                        "high",
+                        "low"
+                      ]
+                    },
+                    {
+                      "$ref": "#/$defs/envRefString"
+                    }
+                  ]
+                },
+                "model": {
+                  "$ref": "#/$defs/interpolatedString"
+                },
+                "moderation": {
+                  "anyOf": [
+                    {
+                      "enum": [
+                        "auto",
+                        "low"
+                      ]
+                    },
+                    {
+                      "$ref": "#/$defs/envRefString"
+                    }
+                  ]
+                },
+                "output_compression": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 100
+                },
+                "output_format": {
+                  "anyOf": [
+                    {
+                      "enum": [
+                        "png",
+                        "webp",
+                        "jpeg"
+                      ]
+                    },
+                    {
+                      "$ref": "#/$defs/envRefString"
+                    }
+                  ]
+                },
+                "partial_images": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 3
+                },
+                "quality": {
+                  "anyOf": [
+                    {
+                      "enum": [
+                        "low",
+                        "medium",
+                        "high",
+                        "auto"
+                      ]
+                    },
+                    {
+                      "$ref": "#/$defs/envRefString"
+                    }
+                  ]
+                },
+                "size": {
+                  "$ref": "#/$defs/interpolatedString"
+                }
+              }
+            }
+          }
+        ]
+      },
     "providerDef": {
       "description": "An inference connection: kind plus connection config. Credentials are ${ENV} references, never literals. A kind's row in grammar 12.1 is closed: beyond `kind:` and `description:`, a provider takes exactly the keys its own kind admits, and a key belonging to another kind is an error rather than ignored config (Decision D106). Grammar 12.1 / PRD 5.9.",
       "type": "object",
@@ -1613,6 +2233,11 @@
           "propertyNames": { "type": "string", "pattern": "^[a-zA-Z0-9_-]+$" },
           "additionalProperties": { "$ref": "#/$defs/interpolatedString" }
         },
+        "server_tools": {
+          "description": "Tools the provider runs on its own side, inside the model call, appended to the `tools` of every request this connection serves. Written in the provider's own wire vocabulary: `type` is the only key this compiler reads, everything else travels verbatim, and string values may embed ${ENV} references. A `type` in the compiler's curated table for the kind is checked strictly; anything else is a warning and is carried unchanged, so a server tool the vendor ships later is usable the day it ships (grammar 12.1 / Decision D122).",
+          "type": "array",
+          "items": { "$ref": "#/$defs/serverToolConfig" }
+        },
         "description": { "description": "Documentation.", "type": "string" }
       },
       "additionalProperties": false,
@@ -1631,6 +2256,7 @@
               }
             ],
             "properties": {
+              "server_tools": { "items": { "$ref": "#/$defs/anthropicServerTool" } },
               "api_version": false,
               "organization": false,
               "region": false,
@@ -1658,6 +2284,7 @@
               }
             ],
             "properties": {
+              "server_tools": { "items": { "$ref": "#/$defs/openaiServerTool" } },
               "api_version": false,
               "region": false,
               "location": false,
@@ -1695,6 +2322,7 @@
             "description": "An `azure_openai` provider takes `base_url`, `api_key`, and `api_version` (all required) plus `headers`. Grammar 12.1 / Decision D106.",
             "required": ["base_url", "api_key", "api_version"],
             "properties": {
+              "server_tools": false,
               "organization": false,
               "region": false,
               "location": false,
@@ -1713,6 +2341,7 @@
             "description": "A `bedrock` provider takes `region` (required) plus the AWS credential keys `access_key_id`, `secret_access_key`, `session_token`, and `profile`. It is reached through the AWS SDK rather than a bare endpoint, so `base_url`, `api_key`, and `headers` are not its keys. Grammar 12.1 / Decision D106.",
             "required": ["region"],
             "properties": {
+              "server_tools": false,
               "api_key": false,
               "base_url": false,
               "api_version": false,
@@ -1730,6 +2359,7 @@
             "description": "A `vertex` provider takes `project` and `location` (both required) plus `credentials_json`. It is reached through the Google SDK rather than a bare endpoint, so `base_url`, `headers`, and the `api_key` credential form are not its keys. Grammar 12.1 / Decision D106.",
             "required": ["project", "location"],
             "properties": {
+              "server_tools": false,
               "api_key": false,
               "base_url": false,
               "api_version": false,

@@ -1,0 +1,20 @@
+# rule: a field of a known `server_tools:` entry with no near miss in the table is warned about with what this release does check on that tool (grammar 12.1, Decision D122)
+# code: unknown-server-tool-field
+# message: server tool `web_search` of `provider.main` declares `sources`, which is not a field this compiler release knows it has: the value is unchecked and travels to the provider as written
+# at: main.yml:20:16
+# help: the fields this release checks on `web_search` are `filters`, `search_context_size`, `user_location`; anything else is carried unchecked, so a parameter the vendor adds later works here the day it ships (grammar 12.1, Decision D122)
+#
+# The same rule as `server-tool-declares-a-field-this-release-cannot-check`, on
+# its other half: nothing here is close to a field the table names, so the help
+# has no repair to suggest and says what it does check instead. This is the case
+# the tier exists for — a parameter the vendor added to a tool it already ships
+# — and it is why the diagnostic cannot claim the key is wrong.
+version: "0.1"
+
+provider.main:
+  kind: openai
+  api_key: ${OPENAI_API_KEY}
+  server_tools:
+    - type: web_search
+      search_context_size: high
+      sources: [news]

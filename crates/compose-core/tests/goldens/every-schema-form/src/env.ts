@@ -40,6 +40,15 @@ export const environmentReferences: readonly EnvironmentReference[] = [
       "provider.p.base_url",
     ],
   },
+  {
+    name: "WORKSPACE",
+    sites: [
+      "agent.shaper.tools.builtin.read_file.root",
+      "agent.shaper.tools.builtin.write_file.root",
+      "agent.shaper.tools.builtin.list.root",
+      "agent.shaper.tools.builtin.bash.root",
+    ],
+  },
 ];
 
 /** Raised when the process starts without a variable the composition needs. */

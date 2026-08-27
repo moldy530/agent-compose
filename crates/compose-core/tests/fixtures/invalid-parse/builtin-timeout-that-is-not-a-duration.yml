@@ -1,0 +1,12 @@
+# rule: a built-in's `timeout:` is a grammar 4.4 duration like every other
+# rule: (grammar 5.5, D22, D123)
+# code: invalid-duration
+# message: `soon` is not a valid duration for `timeout`
+# at: 10:48
+agent.reviewer:
+  model: model.smart
+  prompt: Review the draft.
+  tools:
+    - builtin.bash: { root: "./work", timeout: soon }
+  output:
+    verdict: { enum: [approve, revise] }

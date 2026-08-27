@@ -369,6 +369,40 @@ export type ToolPingInput = z.infer<typeof toolPingInput>;
 export const toolPingOutput = z.object({}).strict();
 export type ToolPingOutput = z.infer<typeof toolPingOutput>;
 
+/**
+ * `builtin.bash` — the arguments of the runtime built-in of that name, which every attachment of it offers (grammar 5.5).
+ */
+export const builtinBashInput = z.object({
+  command: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }).describe("The shell command to run, as one line of `bash`."),
+}).strict();
+export type BuiltinBashInput = z.infer<typeof builtinBashInput>;
+
+/**
+ * `builtin.read_file` — the arguments of the runtime built-in of that name, which every attachment of it offers (grammar 5.5).
+ */
+export const builtinReadFileInput = z.object({
+  path: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }).describe("The file to read, relative to the tool's root directory."),
+}).strict();
+export type BuiltinReadFileInput = z.infer<typeof builtinReadFileInput>;
+
+/**
+ * `builtin.write_file` — the arguments of the runtime built-in of that name, which every attachment of it offers (grammar 5.5).
+ */
+export const builtinWriteFileInput = z.object({
+  path: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }).describe("The file to write, relative to the tool's root directory."),
+  content: z.string().describe("The bytes to write, replacing whatever the file held."),
+}).strict();
+export type BuiltinWriteFileInput = z.infer<typeof builtinWriteFileInput>;
+
+/**
+ * `builtin.list` — the arguments of the runtime built-in of that name, which every attachment of it offers (grammar 5.5).
+ */
+export const builtinListInput = z.object({
+  path: z.string().describe("The directory to list, relative to the tool's root directory.").default("."),
+  glob: z.string().describe("A glob to match entries against — `*` and `?` within one path segment, `**` across segments. Empty lists the directory's own entries.").default(""),
+}).strict();
+export type BuiltinListInput = z.infer<typeof builtinListInput>;
+
 /** State channel `anything` — its declared type (grammar 10.1). */
 export const stateAnything = z.string().regex(/(?:)/);
 export type StateAnything = z.infer<typeof stateAnything>;

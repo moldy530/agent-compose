@@ -119,7 +119,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ast::common::{Address, ControlTarget, EdgeSource, EdgeTarget, Interpolated};
-use crate::ast::definition::{ProviderKind, StoreKind};
+use crate::ast::definition::{Builtin, ProviderKind, StoreKind};
 use crate::ast::flow::FlowContext;
 // The SCC decomposition grammar 7.4 is checked over, reused rather than
 // reimplemented: the ceiling below is sized from the same clause-1 reading the
@@ -423,6 +423,31 @@ fn providers(ir: &Ir, names: &Names) -> String {
                 ));
             }
             text.push_str("    };\n  },\n");
+        }
+        if !config.server_tools.is_empty() {
+            text.push_str("  get serverTools(): readonly runtime.ServerToolConfig[] {\n");
+            text.push_str("    return [\n");
+            for (index, tool) in config.server_tools.iter().enumerate() {
+                let site = format!("{address}.server_tools[{index}]");
+                // Every key quoted, `type` included: a server tool's config keys
+                // are the provider's vocabulary rather than this grammar's, so
+                // they are arbitrary text — the same rule `names::literal`
+                // follows for a `settings:` mapping.
+                text.push_str(&format!(
+                    "      {{ {}: {}",
+                    names::string("type"),
+                    names::string(&tool.type_name.value)
+                ));
+                for (key, value) in &tool.config {
+                    text.push_str(&format!(
+                        ", {}: {}",
+                        names::string(key),
+                        plugin_value(&value.value, &format!("{site}.{key}"))
+                    ));
+                }
+                text.push_str(" },\n");
+            }
+            text.push_str("    ];\n  },\n");
         }
         text.push_str("};\n");
     }
@@ -871,7 +896,7 @@ fn agents(
             json_literal(&schema::json_field_map(output.as_ref()), "    ")
         ));
         text.push_str("  },\n");
-        if agent.tools.is_empty() && agent.stores.is_empty() {
+        if agent.tools.is_empty() && agent.builtins.is_empty() && agent.stores.is_empty() {
             text.push_str("  tools: [],\n");
         } else {
             text.push_str("  tools: [\n");
@@ -941,6 +966,7 @@ fn agents(
                 ));
                 text.push_str("    },\n");
             }
+            text.push_str(&builtin_tools(names, surfaces, address, agent, imported));
             text.push_str(&store_tools(ir, names, surfaces, agent, imported));
             text.push_str("  ],\n");
         }
@@ -1035,6 +1061,107 @@ fn flow_tool(
     ));
     text.push_str("    },\n");
     text
+}
+
+/// The runtime built-ins an agent opted into, one `AgentTool` per entry
+/// (grammar 5.5, Decision D123, PRD resolved q31).
+///
+/// Everything about a built-in that varies is the **attachment's**: `root:`, and
+/// `builtin.bash`'s `timeout:`. Everything else — the name the model calls, the
+/// argument schema, what the call does — is this compiler's, so what is emitted
+/// here is a call to one runtime function carrying the bounds the entry wrote.
+///
+/// The `root:` is emitted **unresolved**, as the interpolation parts every other
+/// class-2 surface is (grammar 4.3): the value reaches the process at start, the
+/// artifact stays committable, and the journal keys the call on the root *as
+/// written* rather than on the directory one machine resolved it to
+/// (`docs/durability.md` §3.2).
+///
+/// They are appended after the declared `tool.*`/`flow.*` attachments and before
+/// the stores' synthesized tools, so a transcript reads in the order the
+/// composition declares: references first, then built-ins, then `stores:`.
+fn builtin_tools(
+    names: &Names,
+    surfaces: &[schema::Surface<'_>],
+    address: &str,
+    agent: &Agent,
+    imported: &mut Vec<String>,
+) -> String {
+    let mut text = String::new();
+    for builtin in &agent.builtins {
+        let tool = builtin.tool.value;
+        let path = format!("{}.input", tool.address());
+        let schema_name = names.value(&path).to_string();
+        imported.push(schema_name.clone());
+        let arguments = surface_fields(surfaces, &path);
+        text.push_str("    {\n");
+        text.push_str(&format!("      name: {},\n", names::string(tool.as_str())));
+        text.push_str(&format!(
+            "      address: {},\n",
+            names::string(tool.address())
+        ));
+        text.push_str(&format!(
+            "      description: {},\n",
+            names::string(&builtin_description(tool))
+        ));
+        text.push_str(&format!(
+            "      schema: {},\n",
+            json_literal(&schema::json_field_map(arguments.as_ref()), "      ")
+        ));
+        text.push_str(&format!(
+            "      invoke: (args, context) =>\n        runtime.runBuiltin(\n          \
+             {{\n            tool: {},\n            root: {},\n{}          }},\n          \
+             runtime.parseToolArguments({schema_name}, args, {}),\n          context,\n        ),\n",
+            names::string(tool.as_str()),
+            interpolation(
+                &builtin.root.value,
+                &format!("{address}.tools.{}.root", tool.address())
+            ),
+            builtin.timeout.as_ref().map_or_else(String::new, |timeout| {
+                format!(
+                    "            timeout: {{ millis: {}, written: {} }},\n",
+                    timeout.value.as_millis(),
+                    names::string(timeout.value.as_str())
+                )
+            }),
+            names::string(&format!(
+                "the arguments `{}` was called with",
+                tool.as_str()
+            ))
+        ));
+        text.push_str("    },\n");
+    }
+    text
+}
+
+/// What a runtime built-in tells the model it does.
+///
+/// The compiler's own text, because the tool is the compiler's: an author
+/// attaches a name and bounds it, and there is no `description:` on the entry to
+/// write one in. Each says the thing a model has to know to call it correctly —
+/// that paths are relative to a root it cannot see and cannot leave, and that
+/// `bash` is bounded by a deadline — because that is the difference between a
+/// model correcting itself and a model spending the loop's budget guessing
+/// (PRD G3, Decision D119).
+fn builtin_description(tool: Builtin) -> String {
+    match tool {
+        Builtin::Bash => "Run one `bash` command in this agent's root directory and return what \
+             it printed. The command runs under a deadline, and a command that \
+             exits nonzero or outruns it fails the node rather than answering."
+            .to_string(),
+        Builtin::ReadFile => "Read one text file and return its contents. The path is relative to \
+             this agent's root directory, and a path that resolves outside it is refused."
+            .to_string(),
+        Builtin::WriteFile => "Write one text file, replacing whatever it held, and return how \
+             many bytes were written. The path is relative to this agent's root directory, a \
+             path that resolves outside it is refused, and the directory it names must already \
+             exist."
+            .to_string(),
+        Builtin::List => "List the entries of one directory, optionally filtered by a glob. \
+             Paths are relative to this agent's root directory, a path that resolves outside it \
+             is refused, and a directory entry is reported with a trailing `/`."
+            .to_string(),
+    }
 }
 
 /// The tools an agent's attached stores synthesize (grammar 11.5, PRD 5.8).
@@ -1150,6 +1277,15 @@ fn output_tool_name(ir: &Ir, agent: &Agent, local: &str) -> String {
             })
         })
         .collect();
+    // A built-in is on the wire under its own name too (grammar 5.5), so an
+    // agent attaching `builtin.list` and called `agent.list` does not get to
+    // pin an output tool called `list`.
+    attached.extend(
+        agent
+            .builtins
+            .iter()
+            .map(|builtin| builtin.tool.value.as_str().to_string()),
+    );
     // The synthesized store tools are on the wire beside the declared ones
     // (grammar 11.5), so they are names the pinned output tool has to avoid too:
     // two tools of one name would make the pinned choice ambiguous.
@@ -3367,6 +3503,15 @@ export function sessionRefusal(address: string, stores: readonly string[]): stri
  * surface (PRD §9.21): `src/serve.ts`, whose `POST /executions/:id/resume`
  * delivers the answer, and `src/cli.ts`, when the `run` it is serving may ask
  * at the terminal it was launched from.
+ *
+ * # Every invocation is journaled
+ *
+ * PRD resolved q26–q29: the run's effects are written to this project's journal
+ * as they happen, and `resume: true` re-runs the graph consuming that record
+ * read-only up to the frontier. Journaling is unconditional — every target this
+ * compiler builds is process-local and binds the SQLite journal beside the
+ * project (resolved q27) — so a caller that says nothing about durability still
+ * gets it. `docs/durability.md` is normative.
  */
 export async function runFlow(
   address: string,
@@ -3386,6 +3531,39 @@ export async function runFlow(
      * route.
      */
     readonly resumable?: boolean;
+    /**
+     * What started this execution, for the journal's lifecycle row.
+     *
+     * `manual` where nothing says otherwise, which is every `agent-compose run`
+     * and every `manual` trigger; `src/serve.ts` passes the `http` trigger's own
+     * name. Recorded and never dispatched on — recovery replays executions, it
+     * does not re-fire triggers (PRD resolved q28).
+     */
+    readonly trigger?: string;
+    /**
+     * The completion webhook of an `async` `http` trigger, resolved against the
+     * request that started this execution (grammar 13.3).
+     *
+     * `src/serve.ts` passes it and nothing else does. It goes on the journal's
+     * lifecycle row because the process that finishes an execution need not be
+     * the one that started it: a `serve` that restarts mid-run recovers the
+     * execution and has to be able to call the caller back
+     * (`docs/durability.md` §6.1).
+     */
+    readonly callback?: string;
+    /**
+     * Whether this is a **resumed** generation of an execution the journal
+     * already holds (PRD resolved q29).
+     *
+     * `true` makes every effect site consult the journal before it calls the
+     * world: a recorded answer is returned byte for byte and nothing is
+     * re-issued, until the frontier — the first effect the journal does not
+     * hold — where the execution goes live again. `executionId` names which
+     * execution, and `inputs`/`sessionKey` must be the ones the journal
+     * recorded, which is why the two callers that resume read them back off the
+     * lifecycle row rather than composing them again.
+     */
+    readonly resume?: boolean;
   } = {},
 ): Promise<FlowRun> {
   const flow = flows[address];
@@ -3409,14 +3587,114 @@ export async function runFlow(
     throw new Error(sessionRefusal(address, flow.sessionStores));
   }
   const executionId = options.executionId ?? `exec_${globalThis.crypto.randomUUID()}`;
+  // Before the graph is streamed, so an execution the process dies in the middle
+  // of already has a row saying it was open (PRD resolved q28).
+  await runtime.openExecution({
+    execution: executionId,
+    flow: address,
+    trigger: options.trigger ?? "manual",
+    inputs: parsed,
+    sessionKey,
+    ...(options.callback === undefined ? {} : { callback: options.callback }),
+    ...(options.resume === true ? { resuming: true } : {}),
+  });
+  try {
+    const produced = await quiesceFlow(address, flow, parsed, ceiling, sessionKey, executionId, options);
+    // A run that reached quiescence may still be holding a divergence raised
+    // where nothing could throw it — a detached `map` delivery, which grammar 8.6
+    // rule 7 says the flow instance does not wait for. PRD resolved q29 makes a
+    // divergence un-absorbable by any policy at any nesting depth, and `detach:`
+    // is one, so it fails the resume here rather than being reported as a
+    // completion the record does not support.
+    const diverged = runtime.latchedDivergence(executionId);
+    if (diverged !== undefined) throw diverged;
+    runtime.settleExecution(executionId);
+    return produced;
+  } catch (error) {
+    // Which of the three closing rows this is — `failed`, or none at all
+    // because the run is parked at a `human` pause and is exactly what a resume
+    // exists for — is `runtime.settleExecution`'s to decide, off the same
+    // `runtime.interruptOf` this function's own callers read.
+    runtime.settleExecution(executionId, error);
+    throw error;
+  } finally {
+    runtime.closeExecution(executionId);
+  }
+}
+
+/** [`runFlow`]'s body, with the journal's lifecycle row already open. */
+async function quiesceFlow(
+  address: string,
+  flow: CompiledFlow,
+  parsed: Record<string, unknown>,
+  ceiling: number,
+  sessionKey: string,
+  executionId: string,
+  options: { readonly resumable?: boolean; readonly resume?: boolean },
+): Promise<FlowRun> {
   // Opened before the graph is streamed, so a status route asked the instant
   // after `start` answered already has somewhere to read this run's pauses from
   // (grammar 8.7, PRD 5.11). Every instance nested inside the run registers
   // against the same execution id and is told apart by its instance path.
   runtime.openHumanWaits(executionId, options.resumable === true);
+  // `scope: execution` means what it says: whatever this run's own stores held
+  // is released when the run ends, however it ended (PRD 5.8, grammar 11.1).
+  // A `serve` process runs many executions, so a store that stayed open would
+  // be both a leak and a lifetime the composition did not declare. A pause the
+  // run was holding goes the same way and for the same reason: a wait that
+  // outlived its run would be one a resume could still be delivered to, with
+  // no graph left to receive it (grammar 8.7).
+  //
+  // **Unless the run has not ended.** An execution whose journal row stays open
+  // — parked at a `human` pause with nobody to answer it, or stopped by a
+  // divergence — is one a resume replays, and `runtime.staysOpen` is the very
+  // predicate `runtime.settleExecution` decides that by. What such a run owns
+  // *on disk* has to still be there when the resumed generation reads past the
+  // frontier: a replayed write is never applied a second time, so a partition
+  // this generation deleted would answer an empty `get` about something the
+  // execution wrote, with nothing comparing unequal to catch it
+  // (`docs/durability.md` §5).
+  const release = async (outcome: unknown): Promise<void> => {
+    runtime.releaseHumanWaits(executionId);
+    // And the deliveries nothing joined, on the two ways out where one still in
+    // flight can change what this function has to decide.
+    //
+    // A detached `map` delivery is journaled when it answers, so a generation
+    // that walks out from under one in flight leaves an effect with no record —
+    // which the generation that resumes this execution issues a second time
+    // (`docs/durability.md` §3.2). That is the **parked** half, and for a run
+    // that ended it costs nothing, because nothing will resume it.
+    //
+    // The **resuming** half is about the answer itself. A delivery is the one
+    // place a `runtime.ReplayDivergence` has nothing to be thrown to, so it is
+    // latched against the execution (PRD resolved q29) — and a latch is exactly
+    // what makes `runtime.staysOpen` true. A delivery still working through its
+    // permits when the graph quiesced can latch one *after* a reading taken
+    // here, and a reading taken before that is a run closed `completed` over a
+    // delivery the record describes and nobody made, or a `scope: execution`
+    // blob partition removed under the very resume §5 promises it to. So a
+    // generation that is consuming a record waits for them: a divergence can
+    // arise on no other kind (a first generation has no record to disagree
+    // with), which is why this is not a wait every run pays.
+    //
+    // Grammar 8.6 rule 7 is untouched either way: the join returned at
+    // dispatch, the trace entry was written without it, and this is `runFlow`
+    // on its way out of a run that has already stopped advancing.
+    if (runtime.staysOpen(executionId, outcome) || options.resume === true) {
+      await runtime.settleDetached(executionId);
+    }
+    // Read **after** the deliveries have settled, so it is the answer the whole
+    // execution gives rather than the one it gave at the instant the graph
+    // quiesced.
+    const parked = runtime.staysOpen(executionId, outcome);
+    stores.releaseExecution(executionId, parked);
+  };
   // `runtime.quiesce` keeps the last state each superstep produced, which is
   // what makes a failure's trace survive; the one failure it restates on the way
-  // out is LangGraph stopping the run at the ceiling.
+  // out is LangGraph stopping the run at the ceiling. Its answer carries the
+  // run's own failure rather than throwing it, so the release reads that error
+  // on the settled path and the thrown one on the other — the same outcome
+  // either way, which is what a `finally` could not have been told.
   const { state, error } = await runtime
     .quiesce(
       flow,
@@ -3429,17 +3707,16 @@ export async function runFlow(
       },
       ceiling,
     )
-    // `scope: execution` means what it says: whatever this run's own stores held
-    // is released when the run ends, however it ended (PRD 5.8, grammar 11.1).
-    // A `serve` process runs many executions, so a store that stayed open would
-    // be both a leak and a lifetime the composition did not declare. A pause the
-    // run was holding goes the same way and for the same reason: a wait that
-    // outlived its run would be one a resume could still be delivered to, with
-    // no graph left to receive it (grammar 8.7).
-    .finally(() => {
-      stores.releaseExecution(executionId);
-      runtime.releaseHumanWaits(executionId);
-    });
+    .then(
+      async (reached) => {
+        await release(reached.error);
+        return reached;
+      },
+      async (thrown: unknown) => {
+        await release(thrown);
+        throw thrown;
+      },
+    );
   if (error !== undefined) {
     throw new runtime.FlowFailure(
       address,
@@ -3623,6 +3900,55 @@ fn interpolation(text: &Interpolated, site: &str) -> String {
         parts.push(names::string(&literal));
     }
     format!("[{}]", parts.join(", "))
+}
+
+/// One open plugin-config value as TypeScript, with its strings interpolated at
+/// read time (grammar 4.3 class 2, Decision D122).
+///
+/// The shape of a `server_tools:` entry is the **provider's**, not this
+/// grammar's, so what is emitted is the value as written — a string that embeds
+/// an `${ENV}` becomes a call rather than a constant, and everything else is a
+/// literal. The whole object is behind a getter for that reason: an environment
+/// variable is read when a node calls the provider, never at import (PRD 5.9).
+fn plugin_value(value: &crate::ast::deploy::PluginValue, site: &str) -> String {
+    use crate::ast::deploy::PluginValue;
+    match value {
+        PluginValue::Null => "null".to_string(),
+        PluginValue::Bool(boolean) => boolean.to_string(),
+        PluginValue::Int(int) => int.to_string(),
+        PluginValue::Float(float) => float.to_string(),
+        PluginValue::Text(text) => {
+            if text.references.is_empty() {
+                names::string(text.as_str())
+            } else {
+                format!("runtime.interpolate({})", interpolation(text, site))
+            }
+        }
+        PluginValue::Sequence(items) => {
+            let rendered: Vec<String> = items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| plugin_value(&item.value, &format!("{site}[{index}]")))
+                .collect();
+            format!("[{}]", rendered.join(", "))
+        }
+        PluginValue::Mapping(entries) => {
+            if entries.is_empty() {
+                return "{}".to_string();
+            }
+            let rendered: Vec<String> = entries
+                .iter()
+                .map(|entry| {
+                    format!(
+                        "{}: {}",
+                        names::string(&entry.key.value),
+                        plugin_value(&entry.value.value, &format!("{site}.{}", entry.key.value))
+                    )
+                })
+                .collect();
+            format!("{{ {} }}", rendered.join(", "))
+        }
+    }
 }
 
 /// A JSON value as a TypeScript literal, indented to sit inside an object.

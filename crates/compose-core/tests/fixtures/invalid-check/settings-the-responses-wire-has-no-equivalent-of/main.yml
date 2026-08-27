@@ -1,0 +1,30 @@
+# rule: a `settings:` key the connection's wire has no equivalent of (grammar 12.1, 12.2, Decision D122)
+# code: unknown-key
+# message: `stop` is not a setting the `openai` provider plugin publishes on the Responses wire
+# at: main.yml:30:5
+# label: main.yml:26:13 `provider.searching` declares `server_tools:`, which moves every call it serves onto `POST /v1/responses`
+# help: the Responses API has no `stop`, and refuses a request carrying one: drop it from `model.smart`, or declare the suite on a second provider and leave this connection on Chat Completions (grammar 12.1, Decision D122)
+#
+# Which wire an `openai` connection speaks is the **compiler's** decision, not
+# the endpoint's: one key beside another moves every call this provider serves
+# onto the Responses API (Decision D122). Two of grammar 12.2's published
+# settings have no equivalent there, so a model bound to such a provider that
+# declares one has declared a knob nothing will read — a run that dies on its
+# first model call with a 400 and no span, which is exactly what the strict tier
+# of resolved q30 exists to move here. The same `stop:` on `provider.plain` is
+# legal, and stays legal: the key row belongs to the kind, and only the wire
+# moved.
+version: "0.1"
+
+provider.searching:
+  kind: openai
+  api_key: ${OPENAI_API_KEY}
+  server_tools:
+    - type: web_search
+
+model.smart:
+  provider: provider.searching
+  id: gpt-5
+  settings:
+    max_tokens: 512
+    stop: ["\n\n"]

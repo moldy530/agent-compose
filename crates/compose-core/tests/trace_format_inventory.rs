@@ -926,15 +926,18 @@ fn a_failure_the_platform_worded_is_restated_rather_than_quoted() {
     let source = runtime();
     for (site, header, restated, unguarded, what) in [
         (
-            "runExec",
-            "export async function runExec(",
+            // `runExec` and `runHttp` are journaling wrappers (`docs/durability.md`
+            // §3.2) over the bodies that reach the platform; the rule is about
+            // where the platform call is, so it is read off those bodies.
+            "runExecLive",
+            "async function runExecLive(",
             r"\`${asWritten(binding.command)}\` could not be run",
             "const result = await new Promise<",
             "a command the platform refused to spawn quotes the resolved path",
         ),
         (
-            "runHttp",
-            "export async function runHttp(",
+            "runHttpLive",
+            "async function runHttpLive(",
             r"\`${asWritten(binding.url)}\` is not a URL once its ",
             "const url = new URL(interpolate(binding.url));",
             "`new URL` quotes the resolved string it could not parse",
@@ -997,8 +1000,11 @@ fn an_unset_reference_is_resolved_outside_the_region_that_restates_a_failure() {
     let source = runtime();
     for (site, header, hoisted, opens, region, guarded, what) in [
         (
-            "runHttp",
-            "export async function runHttp(",
+            // The bodies that reach the platform, for the reason the sibling
+            // check above reads them: the exported names are the journaling
+            // wrappers (`docs/durability.md` §3.2).
+            "runHttpLive",
+            "async function runHttpLive(",
             "const resolved = interpolate(binding.url);",
             "try {",
             "the `try` that restates a URL which does not parse",
@@ -1006,8 +1012,8 @@ fn an_unset_reference_is_resolved_outside_the_region_that_restates_a_failure() {
             "an unset `url:` reference is restated as a URL that does not parse",
         ),
         (
-            "runExec",
-            "export async function runExec(",
+            "runExecLive",
+            "async function runExecLive(",
             "const cwd = binding.cwd === undefined ? undefined : interpolate(binding.cwd);",
             "const spawned = new Promise<",
             "the `new Promise` executor whose rejection is restated as a command that \

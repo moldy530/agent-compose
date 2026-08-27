@@ -10,11 +10,11 @@
 //! diagnostic registry, the skill from the CLI. A derivative drifts silently,
 //! and a released binary is the one artifact a reader cannot correct.
 //!
-//! It lives in this crate rather than in `compose-core` because two of the
-//! three binds need the **command line**: the clap command list, which only the
-//! binary has, and the sources of both crates.
+//! It lives in this crate rather than in `compose-core` because half the binds
+//! need the **command line**: the clap command list and the reports the binary
+//! writes, which only the binary has, and the sources of both crates.
 //!
-//! # The three binds
+//! # The binds
 //!
 //! **(a) Registry against directory.** Every file under `docs/topics/` is
 //! registered in `compose_core::docs::topics::TOPICS` and every registration
@@ -42,10 +42,11 @@
 //!
 //! **(c) The CLI's own vocabulary, both ways round.** The `cli` topic names
 //! every verb the binary has, read out of `--help` so it is clap's list rather
-//! than a second one; and every environment variable
+//! than a second one; every environment variable
 //! `compose_core::docs::ENVIRONMENT` declares, which is itself held to naming
-//! every `AGENT_COMPOSE_*` variable the sources mention. The skill is held to
-//! the verb half of the same rule, and to listing the curriculum. `--help`'s
+//! every `AGENT_COMPOSE_*` variable the sources mention; and every top-level key
+//! `--format json` writes, read out of the reports themselves. The skill is held
+//! to the verb half of the same rule, and to listing the curriculum. `--help`'s
 //! **order** is bound as well: clap prints subcommands in declaration order, so
 //! that order is where the two-group split — five verbs that act on a
 //! composition, then five that teach — is made rather than described, and it is
@@ -103,6 +104,19 @@
 //! `§8.7, §14`, so it counts like any other topic. Coverage is therefore owned
 //! by every topic except `trace` — which is what the failure below reports,
 //! rather than a count in this comment that a new topic would falsify.
+//!
+//! **(d) The PRD pointer at the top of the stack.** The grammar's decision log
+//! closes its entries with a rationale — `**Rationale**: PRD resolved q30` —
+//! and the sources and fixtures cite the same questions to say what authority
+//! a check is implementing. `prd.md` is this project's single source of truth
+//! for design decisions, and its §9 log is the inventory those pointers resolve
+//! against, so every `resolved q<n>` written anywhere under `docs/` or
+//! `crates/` names an entry that log records. This is bind (b) one layer up:
+//! a citation of a question the PRD never asked sends a reader who follows it
+//! to a document that says no such decision was ever taken — and it is the
+//! shape a feature implemented ahead of its ratification leaves behind, which
+//! `CLAUDE.md` forbids outright ("never implement against an unresolved
+//! question").
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -784,7 +798,7 @@ fn a_verb_is_not_documented_by_a_longer_one_that_starts_with_it() {
 /// [`every_grammar_section_is_claimed_by_a_topic`] applies to the grammar.
 #[test]
 fn the_help_lists_the_verbs_that_act_before_the_verbs_that_teach() {
-    const ACT: &[&str] = &["validate", "plan", "build", "run", "serve"];
+    const ACT: &[&str] = &["validate", "plan", "build", "resume", "run", "serve"];
     const TEACH: &[&str] = &["docs", "explain", "init", "schema", "skill"];
 
     let mut claimed: Vec<String> = ACT
@@ -1053,6 +1067,77 @@ fn the_cli_topic_names_every_environment_variable() {
     }
 }
 
+/// (c) The `cli` topic names every key the machine report writes.
+///
+/// `--format json` is a contract with a script, and the topic is where the
+/// script's author reads it. A key the report writes and the topic does not
+/// name is a field nobody knows to read; a key the topic *stops* naming — which
+/// is what happened when the report grew its `warnings` array and the paragraph
+/// describing it kept saying `{"diagnostics": [ … ]}` — is worse, because a
+/// reader who follows the documented shape concludes an empty `diagnostics`
+/// means nothing was reported.
+///
+/// The keys are read out of the binary's own reports rather than listed here,
+/// for [`verbs`]'s reason: a list in a test is a second inventory that can
+/// disagree with the first.
+#[test]
+fn the_cli_topic_names_every_key_the_json_report_writes() {
+    let topic = docs::topic("cli").expect("the curriculum has a `cli` topic");
+    let out =
+        std::env::temp_dir().join(format!("agent-compose-report-keys-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&out);
+    let reports = [
+        vec![
+            "validate",
+            "examples/review-loop/main.yml",
+            "--format",
+            "json",
+        ],
+        // `--check` writes nothing and reports the third key beside the two.
+        vec![
+            "build",
+            "examples/review-loop/main.yml",
+            "--out",
+            out.to_str().expect("a UTF-8 temporary path"),
+            "--check",
+            "--format",
+            "json",
+        ],
+    ];
+
+    let mut keys: BTreeSet<String> = BTreeSet::new();
+    for arguments in reports {
+        let output: Output = Command::cargo_bin("agent-compose")
+            .expect("the binary under test is built")
+            .current_dir(repository())
+            .args(&arguments)
+            .output()
+            .expect("the command runs");
+        let text = String::from_utf8(output.stdout).expect("the report is UTF-8");
+        let report: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|error| {
+            panic!("`{}` writes a JSON report: {error}", arguments.join(" "))
+        });
+        keys.extend(
+            report
+                .as_object()
+                .expect("the report is one object")
+                .keys()
+                .cloned(),
+        );
+    }
+    assert!(
+        keys.len() >= 3,
+        "the reports still carry their keys, found {keys:?}"
+    );
+
+    for key in &keys {
+        assert!(
+            topic.body.contains(&format!("`{key}`")) || topic.body.contains(&format!("\"{key}\"")),
+            "the `cli` topic does not name the report key `{key}`: {keys:?}"
+        );
+    }
+}
+
 /// (c) …and the list it is held to names every variable the sources mention.
 ///
 /// The other half of the environment bind, and the half that makes the first
@@ -1259,4 +1344,169 @@ fn the_skill_description_is_one_short_sentence() {
         interior.is_empty(),
         "it is one sentence, and a terminator at {interior:?} ends another: `{description}`"
     );
+}
+
+/// (d) Every PRD question this project cites is one the PRD's §9 log records.
+///
+/// The pointer is normative — `docs/grammar.md`'s decision entries close on it,
+/// the checks name it to say whose ruling they implement, and the fixtures name
+/// it to say what a diagnostic is defending — so it has to resolve. A citation
+/// of a question `prd.md` never asked is worse than no citation at all: the
+/// reader spends the trip, and what they find at the end is that the wording
+/// every rule is justified by exists nowhere they can consult or amend.
+///
+/// It is also the shape an area implemented ahead of its ratification leaves
+/// behind, which is the process `CLAUDE.md` states and this bind is the machine
+/// half of: a question is resolved into §9 *before* the affected area is built.
+#[test]
+fn every_prd_question_the_project_cites_is_one_the_prd_resolved() {
+    let resolved = prd_resolved_questions();
+    assert!(
+        resolved.len() >= 29,
+        "the PRD's §9 log is the inventory this bind reads, and it parsed as {resolved:?}"
+    );
+
+    let mut cited: BTreeMap<u32, String> = BTreeMap::new();
+    for root in ["docs", "crates"] {
+        prd_citations(&repository().join(root), &mut cited);
+    }
+    assert!(
+        cited.len() >= 10,
+        "the scan still finds this project's PRD citations, found {cited:?}"
+    );
+
+    for (question, file) in &cited {
+        assert!(
+            resolved.contains(question),
+            "{file} cites `resolved q{question}`, which the PRD's §9 log does not record. \
+             Resolve the question there — with the rationale in the section it belongs to — \
+             before the area that cites it (`CLAUDE.md`, PRD §10). Recorded: {resolved:?}"
+        );
+    }
+}
+
+/// Every question the PRD's resolved-questions log records.
+///
+/// §9 writes one per numbered list item — `29. **What does replay execute…` —
+/// so the log itself is the inventory and no list here can disagree with it.
+fn prd_resolved_questions() -> BTreeSet<u32> {
+    let prd = fs::read_to_string(repository().join("prd.md")).expect("the PRD is readable");
+    let mut inside = false;
+    let mut resolved = BTreeSet::new();
+    for line in prd.lines() {
+        if let Some(heading) = line.strip_prefix("## ") {
+            inside = heading.starts_with("9. Resolved Questions");
+            continue;
+        }
+        if !inside {
+            continue;
+        }
+        if let Some((number, _)) = line.split_once(". ")
+            && let Ok(number) = number.parse::<u32>()
+        {
+            resolved.insert(number);
+        }
+    }
+    resolved
+}
+
+/// Collect every PRD question cited under `directory`, with the first file that
+/// cites it.
+///
+/// Only the files this project writes: a lockfile's base64 is full of `q` runs
+/// followed by digits, and none of them is a claim about anything.
+fn prd_citations(directory: &Path, cited: &mut BTreeMap<u32, String>) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.is_dir() {
+            prd_citations(&path, cited);
+            continue;
+        }
+        if !path
+            .extension()
+            .is_some_and(|held| matches!(held.to_str(), Some("rs" | "md" | "yml" | "yaml" | "ts")))
+        {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let name = path
+            .strip_prefix(repository())
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        for question in questions(&text) {
+            cited.entry(question).or_insert_with(|| name.clone());
+        }
+    }
+}
+
+/// Every PRD question `text` cites, expanding lists and ranges.
+///
+/// The claim forms this project writes: `resolved q30`, `resolved q19 and q20`,
+/// `resolved q19/q20`, `resolved q26-q29`, and `PRD q24`. A bare `q29` inside a
+/// paragraph that has already cited it is prose rather than a claim, and is
+/// left alone — what is bound here is the form that says *the PRD settled this*,
+/// which is the form a reader follows.
+fn questions(text: &str) -> BTreeSet<u32> {
+    let mut cited = BTreeSet::new();
+    for marker in ["resolved q", "PRD q"] {
+        for at in text.match_indices(marker).map(|(at, _)| at) {
+            citation(&text[at + marker.len()..], &mut cited);
+        }
+    }
+    cited
+}
+
+/// One citation's run of numbers, from the first digit after its marker.
+fn citation(rest: &str, cited: &mut BTreeSet<u32>) {
+    let mut chars = rest.chars().peekable();
+    let mut ranged = false;
+    let mut previous = None;
+    loop {
+        let mut digits = String::new();
+        while chars.peek().is_some_and(char::is_ascii_digit) {
+            digits.push(chars.next().expect("the digit that was just peeked"));
+        }
+        let Ok(number) = digits.parse::<u32>() else {
+            return;
+        };
+        // A range covers its interior: `q26-q29` cites four questions, and the
+        // two it does not name are the two a renumbering would strand.
+        if ranged {
+            for held in previous.unwrap_or(number)..=number {
+                cited.insert(held);
+            }
+        }
+        cited.insert(number);
+        previous = Some(number);
+
+        // What may follow one number and still belong to the same citation. The
+        // `q` is required: `resolved q19 and the rest` ends at `19`, and only a
+        // second `q` says another number is coming.
+        let mut lookahead = chars.clone();
+        let mut joiner = String::new();
+        while let Some(&held) = lookahead.peek() {
+            lookahead.next();
+            if held == 'q' {
+                break;
+            }
+            joiner.push(held);
+            if joiner.chars().count() > 5 {
+                return;
+            }
+        }
+        if !matches!(
+            joiner.as_str(),
+            "-" | "\u{2013}" | "\u{2014}" | "/" | ", " | " and "
+        ) {
+            return;
+        }
+        ranged = matches!(joiner.as_str(), "-" | "\u{2013}" | "\u{2014}");
+        chars = lookahead;
+    }
 }

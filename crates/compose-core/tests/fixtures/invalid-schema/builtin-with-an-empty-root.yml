@@ -1,0 +1,10 @@
+# rule: a built-in's `root` is required and non-empty (grammar 5.5 / D123)
+# at: /agent.reviewer/tools/0/builtin.read_file/root
+# via: /$defs/builtinFileTool/properties/root/allOf/1/minLength
+agent.reviewer:
+  model: model.smart
+  prompt: Review the draft.
+  tools:
+    - builtin.read_file: { root: "" }
+  output:
+    verdict: { enum: [approve, revise] }

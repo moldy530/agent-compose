@@ -128,12 +128,15 @@ pub const FIXTURES: &[&str] = &[
     "agent-anthropic",
     "agent-openai",
     "bounded-cycle",
+    "builtin-tools",
+    "durability",
     "fanout",
     "flow-as-tool",
     "http-trigger",
     "keyless-gateway",
     "model-failover",
     "provider-kinds",
+    "server-tools",
     "stores",
 ];
 
@@ -155,6 +158,24 @@ pub const OPS_BIN: &str = "OPS_BIN";
 /// harness points it at the mock provider, whose control plane answers `GET
 /// /_mock/state` with JSON — a real round trip over a server the test owns.
 pub const OPS_URL: &str = "OPS_URL";
+/// The directory of shims the `durability` fixture's counting subprocess is in.
+///
+/// Supplied to **every** run for the reason [`OPS_BIN`] is: an `${ENV}` a
+/// composition references has to be set or the run is refused before it starts
+/// (PRD 5.9), whatever the test is about. `/bin` is the default and holds no
+/// `tally`, which is exactly right — the one test that runs the subprocess
+/// overrides this with a shim directory of its own, and every other test never
+/// reaches the node.
+pub const TALLY_BIN: &str = "TALLY_BIN";
+/// The file that shim appends one line to per run, so an effect that happened
+/// twice is a line count rather than an inference.
+pub const TALLY_LOG: &str = "TALLY_LOG";
+/// The directory of shims the `durability` fixture's **detached** sink is in,
+/// supplied to every run for [`TALLY_BIN`]'s reason.
+pub const RECEIPT_BIN: &str = "RECEIPT_BIN";
+/// The file that sink appends one line to per delivery — the only account there
+/// is of a dispatch nothing waits for (grammar 8.6 rule 7).
+pub const RECEIPT_LOG: &str = "RECEIPT_LOG";
 
 /// The compiler under test.
 fn agent_compose() -> Command {
@@ -202,7 +223,20 @@ pub fn environment(provider: &MockProvider) -> Vec<(String, String)> {
         (GATEWAY_TOKEN.to_string(), "mock-gateway-token".to_string()),
         (OPS_BIN.to_string(), "/bin".to_string()),
         (OPS_URL.to_string(), provider.base_url()),
+        (TALLY_BIN.to_string(), "/bin".to_string()),
+        (RECEIPT_BIN.to_string(), "/bin".to_string()),
     ]
+}
+
+/// How many lines a shim's log holds, and `0` where it has written none.
+///
+/// The one way this suite can see an effect that nothing reports: a subprocess
+/// that ran twice, or a detached delivery that was made twice, is a line count.
+pub fn lines_in(log: &Path) -> usize {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .count()
 }
 
 /// An executable script on `PATH`, for a composition that names a command.
@@ -843,6 +877,17 @@ pub fn run_answering(asked: Answering<'_>) -> Run {
         sealed.push((INTERACTIVE.to_string(), "1".to_string()));
     }
     seal(&mut command, &sealed);
+    answered(command, answers, afterwards)
+}
+
+/// Drive one command's `human` prompts from standard input, and answer with
+/// what it produced.
+///
+/// Split out of [`run_answering`] because [`resume_answering`] needs exactly it:
+/// a resumed execution that re-parks asks its question the same way, through the
+/// same wait board and the same prompt loop, and two copies of this would be two
+/// implementations of one surface.
+fn answered(mut command: Command, answers: &[&str], afterwards: Answers) -> Run {
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -884,6 +929,332 @@ pub fn run_answering(asked: Answering<'_>) -> Run {
             stderr: reading_err.join().expect("stderr is read"),
         },
     }
+}
+
+// ---------------------------------------------------------------------------
+// Durable executions (PRD resolved q26-q29, `docs/durability.md`)
+// ---------------------------------------------------------------------------
+
+/// Whether a project's journal **committed** a record under each of these keys.
+///
+/// The one way a test can wait for an effect nothing reports. A detached `map`
+/// delivery (grammar 8.6 rule 7) is journaled when it answers and the run waits
+/// for neither — so a kill predicate that watched the delivery's own shim and
+/// then slept would be racing the append that follows it, and on a loaded runner
+/// would sometimes kill the run first. Waiting for the record itself is the
+/// same condition without the clock.
+///
+/// Read off the file's bytes rather than through a driver, and deliberately: the
+/// journal's SQLite lives under a virtual file system with no cross-process
+/// locking (`docs/durability.md` §2), so a second process *opening* it while the
+/// run writes could roll back a transaction the run had in flight. A key is
+/// stored as plain text in a page, so a scan is enough to see one.
+///
+/// **Committed** is the load-bearing word. In rollback-journal mode SQLite
+/// writes the new page into the main file and only then removes the journal, so
+/// bytes alone would answer `true` for a row a crash would still roll back. A
+/// missing (or empty) `-journal` beside the file means no transaction is in
+/// flight, and everything the main file holds has been committed — a later
+/// transaction rolling back restores its own pages, never these.
+pub fn journal_holds(project: &Path, keys: &[&str]) -> bool {
+    let path = project.join(".agent-compose").join("journal.sqlite");
+    let hot = path.with_file_name("journal.sqlite-journal");
+    if std::fs::metadata(&hot).is_ok_and(|held| held.len() > 0) {
+        return false;
+    }
+    let Ok(bytes) = std::fs::read(&path) else {
+        return false;
+    };
+    keys.iter().all(|key| {
+        let wanted = key.as_bytes();
+        bytes.windows(wanted.len()).any(|window| window == wanted)
+    })
+}
+
+/// What a run that was **killed** left behind.
+pub struct Killed {
+    /// The execution id it printed before it died — what `resume` takes.
+    pub execution: String,
+    /// Everything it had written to stderr, for a failure message.
+    pub stderr: String,
+}
+
+/// Start a compiled project's own `run`, wait for `ready`, and kill it.
+///
+/// A crash, and a real one: `SIGKILL` to the process running the graph, with no
+/// unwinding, no `finally`, and nothing flushed that had not already been
+/// written. That is the event durability is for, and a harness that ended the
+/// run politely would be testing a different thing.
+///
+/// The emitted project is launched **directly** rather than through
+/// `agent-compose run`, because a signal has to reach the process running the
+/// graph: `agent-compose run` launches the project as a child and killing the
+/// command would leave that child alive to finish the very execution the test
+/// wants interrupted. What is launched is exactly the command `agent-compose
+/// run` launches (`bun src/index.ts run …`), so the run being killed is the run
+/// a user would have started.
+///
+/// `ready` is polled rather than slept on, so the crash lands at a point the
+/// test names — "the provider has been asked twice", "the terminal has been
+/// shown the pause" — rather than at a moment on the clock. It is handed every
+/// line the run has written to stderr so far, which is what lets the second of
+/// those be a condition at all.
+///
+/// Standard input is **piped and held open** until after the kill, so a run
+/// launched with `AGENT_COMPOSE_INTERACTIVE=1` really parks at a `human` pause
+/// instead of losing its answer surface to an inherited stdin that is already
+/// at end of file.
+///
+/// # Panics
+///
+/// Panics when `ready` never answers `true`, or when the run printed no
+/// execution id: both are broken tests rather than findings.
+pub fn crash_run(
+    project: &Path,
+    arguments: &[&str],
+    environment: &[(String, String)],
+    ready: impl Fn(&[String]) -> bool,
+) -> Killed {
+    crash_run_answering(project, arguments, environment, &[], ready)
+}
+
+/// [`crash_run`] with the pauses it reaches answered at standard input first.
+///
+/// The one shape a **journaled answer** can be set up in: a person answers, the
+/// run carries on, and the process dies past the pause rather than at it. The
+/// answers are written before the wait for `ready` starts, so the prompt loop
+/// has them the moment it asks; standard input stays open until after the kill,
+/// exactly as it does for a run with no answers at all, so a pause the script
+/// does not cover parks instead of losing its answer surface.
+///
+/// # Panics
+///
+/// Panics for [`crash_run`]'s two reasons.
+pub fn crash_run_answering(
+    project: &Path,
+    arguments: &[&str],
+    environment: &[(String, String)],
+    answers: &[&str],
+    ready: impl Fn(&[String]) -> bool,
+) -> Killed {
+    let mut command = bun();
+    command.arg(project.join("src/index.ts")).args(arguments);
+    seal(&mut command, environment);
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("bun runs");
+    let mut held_stdin = child.stdin.take().expect("stdin is piped");
+    for answer in answers {
+        let _ = writeln!(held_stdin, "{answer}");
+        let _ = held_stdin.flush();
+    }
+    let stdout = child.stdout.take().expect("stdout is piped");
+    let stderr = child.stderr.take().expect("stderr is piped");
+    let lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let collecting = Arc::clone(&lines);
+    let reading_err = std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            collecting
+                .lock()
+                .expect("the buffer is not poisoned")
+                .push(line);
+        }
+    });
+    let reading_out = std::thread::spawn(move || {
+        let mut held = Vec::new();
+        let mut stdout = stdout;
+        let _ = stdout.read_to_end(&mut held);
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let said = lines.lock().expect("the buffer is not poisoned").clone();
+        if ready(&said) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the run never reached the point this test kills it at; it said:\n{}",
+            said.join("\n")
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    drop(held_stdin);
+    reading_err.join().expect("stderr is read");
+    reading_out.join().expect("stdout is read");
+
+    let held = lines.lock().expect("the buffer is not poisoned").clone();
+    let execution = held
+        .iter()
+        .find_map(|line| line.strip_prefix("execution: "))
+        .unwrap_or_else(|| {
+            panic!(
+                "the run printed no execution id, so nothing could resume it; it said:\n{}",
+                held.join("\n")
+            )
+        })
+        .trim()
+        .to_string();
+    Killed {
+        execution,
+        stderr: held.join("\n"),
+    }
+}
+
+/// What a run that was asked to stop did about it.
+pub struct Stopped {
+    /// How it ended, or `None` where it had to be killed to end at all.
+    pub status: Option<std::process::ExitStatus>,
+    /// How long it took from the signal to that end.
+    pub took: Duration,
+}
+
+/// Start a compiled project's own `run`, wait for `ready`, and ask it to
+/// **stop** — the signal a person types, not the one a crash is.
+///
+/// [`crash_run`]'s counterpart, and the difference is the whole point: `SIGKILL`
+/// is the event durability is for, and this is the event a `Ctrl-C` is. A run
+/// that is asked to stop has to *end*, and end promptly — a runtime that installs
+/// a handler and then fails to hand the signal back would leave a person's
+/// terminal wedged — and it has to take what it started with it.
+///
+/// Launched directly rather than through `agent-compose run` for
+/// [`crash_run`]'s reason: the signal has to reach the process running the
+/// graph. `ready` takes no arguments and is polled, because what the caller is
+/// usually waiting for here is a fact on disk — a command has really started —
+/// rather than a line on stderr.
+///
+/// # Panics
+///
+/// Panics when `ready` never answers `true`, which is a broken test rather than
+/// a finding.
+#[cfg(unix)]
+pub fn stop_run(
+    project: &Path,
+    arguments: &[&str],
+    environment: &[(String, String)],
+    signal: libc::c_int,
+    ready: impl Fn() -> bool,
+) -> Stopped {
+    let mut command = bun();
+    command.arg(project.join("src/index.ts")).args(arguments);
+    seal(&mut command, environment);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = command.spawn().expect("bun runs");
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !ready() {
+        assert!(
+            Instant::now() < deadline,
+            "the run never reached the point this test stops it at"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let pid = i32::try_from(child.id()).expect("a pid fits in an i32");
+    // SAFETY: `pid` is a child this process spawned and has not yet reaped.
+    unsafe { libc::kill(pid, signal) };
+
+    let signalled = Instant::now();
+    let stop = signalled + Duration::from_secs(20);
+    let mut status = None;
+    while Instant::now() < stop {
+        match child.try_wait().expect("the child can be waited on") {
+            Some(ended) => {
+                status = Some(ended);
+                break;
+            }
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+    let took = signalled.elapsed();
+    if status.is_none() {
+        let _ = child.kill();
+    }
+    // Reaped on both paths, so a run that ignored the signal leaves no zombie
+    // behind for the rest of the suite: `wait` after a `try_wait` that already
+    // answered hands back the status it saw.
+    let _ = child.wait();
+    Stopped { status, took }
+}
+
+/// `agent-compose resume <fixture> <execution> --out <dir>`, pointed at a
+/// project a previous generation already built.
+pub fn resume(
+    out: &Path,
+    name: &str,
+    execution: &str,
+    format: Option<&str>,
+    environment: &[(String, String)],
+) -> Run {
+    let mut command = resume_command(out, name, execution, format);
+    seal(&mut command, environment);
+    let output = command.output().expect("the command runs");
+    Run { output }
+}
+
+/// The same, with the pauses it reaches answered at standard input.
+///
+/// [`run_answering`]'s counterpart for the other verb, and it shares the reason
+/// that helper exists: a resumed execution that re-parks writes its prompt
+/// before it reads, so a caller that wrote first would deadlock.
+pub fn resume_answering(
+    out: &Path,
+    name: &str,
+    execution: &str,
+    environment: &[(String, String)],
+    answers: &[&str],
+    afterwards: Answers,
+) -> Run {
+    let mut command = resume_command(out, name, execution, None);
+    let mut sealed: Vec<(String, String)> = environment.to_vec();
+    if !sealed.iter().any(|(named, _)| named == INTERACTIVE) {
+        sealed.push((INTERACTIVE.to_string(), "1".to_string()));
+    }
+    seal(&mut command, &sealed);
+    answered(command, answers, afterwards)
+}
+
+/// The same, for any composition on disk rather than a named fixture.
+///
+/// Which is what a **divergence** needs from this harness: the way a journal
+/// stops describing a run is that the composition moved under it, so the test
+/// resumes a real execution against a copy of its fixture with one line changed
+/// (`docs/durability.md` §7).
+pub fn resume_entrypoint(
+    out: &Path,
+    entrypoint: &Path,
+    execution: &str,
+    format: Option<&str>,
+    environment: &[(String, String)],
+) -> Run {
+    let mut command = agent_compose();
+    command.arg("resume").arg(entrypoint).arg(execution);
+    if let Some(format) = format {
+        command.args(["--format", format]);
+    }
+    command.arg("--out").arg(out);
+    seal(&mut command, environment);
+    let output = command.output().expect("the command runs");
+    Run { output }
+}
+
+/// `agent-compose resume …`, before its environment is sealed.
+fn resume_command(out: &Path, name: &str, execution: &str, format: Option<&str>) -> Command {
+    let mut command = agent_compose();
+    command.arg("resume").arg(fixture(name)).arg(execution);
+    if let Some(format) = format {
+        command.args(["--format", format]);
+    }
+    command.arg("--out").arg(out);
+    command
 }
 
 /// The variables that survive [`seal`], because they are the machine and not
@@ -1012,13 +1383,43 @@ impl Drop for Served {
 /// command — see there.
 pub fn serve(name: &str, provider: &MockProvider) -> Option<Served> {
     let out = scratch_project("serve")?;
+    serve_into(&out, name, &environment(provider))
+}
+
+/// The same, into a directory the **caller** owns and with the environment
+/// given explicitly.
+///
+/// Which is what durable recovery needs from this harness: a journal lives under
+/// the built project (`.agent-compose/journal.sqlite`), so "the app was
+/// restarted against the same journal" is two `serve` commands over one
+/// directory. Everything else takes a fresh one.
+pub fn serve_into(out: &Path, name: &str, environment: &[(String, String)]) -> Option<Served> {
+    serve_entrypoint_into(out, &fixture(name), environment)
+}
+
+/// The same again, for a composition that is **not** a fixture.
+///
+/// Which is what a restart across a *moved* composition needs: the whole point
+/// of a divergence is that the second `serve` is built from a source the first
+/// one was not, and a fixture edited in place would be edited for every other
+/// test in this suite. The journal is the directory's, so a scratch entrypoint
+/// served into the same `--out` meets the same executions.
+pub fn serve_entrypoint_into(
+    out: &Path,
+    entrypoint: &Path,
+    environment: &[(String, String)],
+) -> Option<Served> {
+    // The toolchain check `scratch_project` makes on the caller's behalf, made
+    // here too: this entry point is handed a directory rather than asking for
+    // one, and a run with no Bun has nothing to serve.
+    installed()?;
     let mut command = agent_compose();
     command
         .arg("serve")
-        .arg(fixture(name))
+        .arg(entrypoint)
         .args(["--port", "0"])
         .arg("--out")
-        .arg(&out)
+        .arg(out)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(unix)]
@@ -1026,7 +1427,7 @@ pub fn serve(name: &str, provider: &MockProvider) -> Option<Served> {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    seal(&mut command, &environment(provider));
+    seal(&mut command, environment);
     let mut child = command.spawn().expect("the command runs");
     let stdout = child.stdout.take().expect("stdout is piped");
     let mut line = String::new();

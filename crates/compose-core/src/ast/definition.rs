@@ -3,7 +3,7 @@
 use crate::diag::{Span, Spanned};
 
 use super::binding::{ExecBlock, FunctionBinding, HttpBlock, InterpolatedEntry};
-use super::common::{Address, Ident, Interpolated, LiteralEntry};
+use super::common::{Address, Duration, Ident, Interpolated, LiteralEntry};
 use super::flow::FlowDef;
 use super::schema::FieldMap;
 
@@ -64,12 +64,104 @@ pub struct AgentDef {
     pub input: Option<FieldMap>,
     /// `tools:` — `tool.*` and `flow.*` references.
     pub tools: Vec<Spanned<Address>>,
+    /// `tools:` — the `builtin.*` entries of the same list (grammar 5.5,
+    /// Decision D123).
+    ///
+    /// A second field rather than a second variant inside [`Self::tools`],
+    /// because the two are different things everywhere downstream: a reference
+    /// names a definition the resolver has to find and the reachability walk has
+    /// to cross, and a built-in names nothing — it is the runtime's own tool,
+    /// carrying the bounds the entry wrote. Every reader of `tools:` is asking
+    /// one of those two questions and none is asking both.
+    pub builtins: Vec<BuiltinAttachment>,
     /// `stores:` — `store.*` references.
     pub stores: Vec<Spanned<Address>>,
     /// `description:` — documentation only; agents are not tools.
     pub description: Option<Spanned<String>>,
     /// `max_tool_iterations:` — 1..=50, defaults to 8 (Decision D51).
     pub max_tool_iterations: Option<Spanned<i64>>,
+}
+
+/// One of the four runtime built-in tools (grammar 5.5, Decision D123,
+/// PRD resolved q31).
+///
+/// A curated set rather than an open one, and it grows by resolution rather than
+/// by drift: a model holding `bash` is arbitrary code execution on the host
+/// running the graph, so what the set holds is a decision with a record, not an
+/// implementation detail of whichever release added a name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Builtin {
+    /// `builtin.bash` — one shell command, run with `root:` as its working
+    /// directory and bounded by its `timeout:`.
+    Bash,
+    /// `builtin.read_file` — read one file inside `root:`.
+    ReadFile,
+    /// `builtin.write_file` — write one file inside `root:`.
+    WriteFile,
+    /// `builtin.list` — list a directory inside `root:`, optionally filtered by
+    /// a glob.
+    List,
+}
+
+impl Builtin {
+    /// Every built-in, in the order grammar 5.5 lists them.
+    pub const ALL: &'static [Self] = &[Self::Bash, Self::ReadFile, Self::WriteFile, Self::List];
+
+    /// The name the model calls it by — the entry's local name, exactly as an
+    /// attached `tool.*`'s is (grammar 5.4).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bash => "bash",
+            Self::ReadFile => "read_file",
+            Self::WriteFile => "write_file",
+            Self::List => "list",
+        }
+    }
+
+    /// The address the entry is written under, and the one
+    /// `docs/trace.md` §7.3's `target` records.
+    #[must_use]
+    pub const fn address(self) -> &'static str {
+        match self {
+            Self::Bash => "builtin.bash",
+            Self::ReadFile => "builtin.read_file",
+            Self::WriteFile => "builtin.write_file",
+            Self::List => "builtin.list",
+        }
+    }
+
+    /// The built-in that address names, if it names one.
+    #[must_use]
+    pub fn from_address(text: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|tool| tool.address() == text)
+    }
+
+    /// Whether this built-in runs a command, and so takes `timeout:`.
+    ///
+    /// Exactly `builtin.bash`: the file tools have no command to bound, so a
+    /// `timeout:` on one would be a key with nothing to do (Decision D50).
+    #[must_use]
+    pub const fn runs_a_command(self) -> bool {
+        matches!(self, Self::Bash)
+    }
+}
+
+/// One `builtin.*` entry of an agent's `tools:` list, with the bounds it wrote
+/// (grammar 5.5, Decision D123).
+#[derive(Clone, Debug, PartialEq)]
+pub struct BuiltinAttachment {
+    /// Which built-in, and the span of the key that named it.
+    pub tool: Spanned<Builtin>,
+    /// `root:` — required on every built-in; interpolable (grammar 4.3 class 2).
+    pub root: Option<Spanned<Interpolated>>,
+    /// `timeout:` — required on `builtin.bash`, illegal on the file tools.
+    pub timeout: Option<Spanned<Duration>>,
+    /// The whole entry, key and bounds together.
+    pub span: Span,
 }
 
 /// A `tool.*` definition: one implementation, two usage surfaces (grammar 6).
@@ -300,6 +392,27 @@ impl ProviderKind {
         }
     }
 
+    /// Whether this kind takes `server_tools:` (grammar 12.1, Decision D122).
+    ///
+    /// Three kinds do, and each for its own reason: `anthropic` carries the
+    /// suite on the Messages wire it already speaks, `openai` carries it on the
+    /// Responses wire a declared suite switches it to, and
+    /// `openai_compatible` carries it because a gateway may honour any
+    /// vocabulary at all and refusing the key would recreate the very support
+    /// treadmill resolved q30 exists to avoid.
+    ///
+    /// The other three are refused **outright** rather than warned: their wires
+    /// have not been taught the shape, so a config declared on one would be
+    /// dropped on the floor — a silent no-op, which is what
+    /// [D50](../../../docs/grammar.md) refuses everywhere else.
+    #[must_use]
+    pub const fn serves_server_tools(self) -> bool {
+        matches!(
+            self,
+            Self::Anthropic | Self::OpenAi | Self::OpenAiCompatible
+        )
+    }
+
     /// Every key this kind accepts, required ones included (grammar 12.1).
     ///
     /// `kind` and `description` are the two keys grammar 12.1 states are legal
@@ -314,16 +427,31 @@ impl ProviderKind {
     #[must_use]
     pub const fn keys(self) -> &'static [&'static str] {
         match self {
-            Self::Anthropic => &["kind", "api_key", "base_url", "headers", "description"],
+            Self::Anthropic => &[
+                "kind",
+                "api_key",
+                "base_url",
+                "headers",
+                "server_tools",
+                "description",
+            ],
             Self::OpenAi => &[
                 "kind",
                 "api_key",
                 "base_url",
                 "organization",
                 "headers",
+                "server_tools",
                 "description",
             ],
-            Self::OpenAiCompatible => &["kind", "base_url", "api_key", "headers", "description"],
+            Self::OpenAiCompatible => &[
+                "kind",
+                "base_url",
+                "api_key",
+                "headers",
+                "server_tools",
+                "description",
+            ],
             Self::AzureOpenAi => &[
                 "kind",
                 "base_url",
@@ -496,8 +624,32 @@ pub struct ProviderDef {
     pub profile: Option<Spanned<Interpolated>>,
     /// `headers:`
     pub headers: Vec<InterpolatedEntry>,
+    /// `server_tools:` — the tools this connection's provider runs on its own
+    /// side, in that provider's wire vocabulary (grammar 12.1, Decision D122).
+    pub server_tools: Vec<ServerToolDef>,
     /// `description:`
     pub description: Option<Spanned<String>>,
+}
+
+/// One entry of a provider's `server_tools:` array (grammar 12.1,
+/// Decision D122).
+///
+/// The entry is a **wire object**, not a construct of this grammar: `type:` is
+/// the only key the compiler requires, and everything beside it travels to the
+/// provider verbatim. Values are grammar 4.3 class 2 — non-secret provider
+/// config, so they may interpolate — which is why they are read as
+/// [`PluginValue`](super::deploy::PluginValue) rather than as
+/// [`Literal`](super::common::Literal).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ServerToolDef {
+    /// `type:` — required, and a plain string: it is the key the vendor's
+    /// vocabulary is looked up under, so an `${ENV}` here would be a tool whose
+    /// identity is not decidable at compile time.
+    pub type_name: Option<Spanned<String>>,
+    /// Every key of the entry beside `type:`, in declaration order.
+    pub config: Vec<super::deploy::PluginEntry>,
+    /// The entry's own span.
+    pub span: Span,
 }
 
 /// The conditions a model route fails over on (grammar 12.2).

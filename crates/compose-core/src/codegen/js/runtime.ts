@@ -63,12 +63,42 @@
 // `fetch` is global from Node 18 and the project's floor is 22.18.
 
 import { spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
 import process from "node:process";
 
 import { Command, GraphRecursionError, isInterrupted } from "@langchain/langgraph";
 
 import { CelError, bind, evaluate, evaluateGuard, toJson } from "./cel.ts";
 import type { CelValue, Roots, Shape } from "./cel.ts";
+import {
+  JOURNAL_VERSION,
+  ReplayDivergence,
+  closeSession,
+  journalExists,
+  journaled,
+  latchDivergence,
+  latchedDivergence,
+  openJournal,
+  openSession,
+  recordedAnswerOf,
+  recorderFor,
+  refuseRecorded,
+  replayedFailure,
+} from "./journal.ts";
+import type { EffectRecorder, ExecutionRow, Journal } from "./journal.ts";
+
+export {
+  JOURNAL_VERSION,
+  ReplayDivergence,
+  canonical,
+  journalExists,
+  journalPath,
+  latchedDivergence,
+  openJournal,
+} from "./journal.ts";
+export type { EffectKind, ExecutionRow, Journal, JournalRecord } from "./journal.ts";
 
 // ---------------------------------------------------------------------------
 // Failures
@@ -350,11 +380,37 @@ function describeIssues(value: unknown, issues: readonly ResultIssue[]): string 
 /**
  * Parse one result with the schema its contract declares, or say what was wrong
  * with it (PRD 5.2, and see [`ResultMismatch`]).
+ *
+ * This is also where resolved q29's **second** divergence is decided. A value
+ * the journal answered with is a value some earlier generation's world produced
+ * and this composition has since changed its mind about — "a recorded answer
+ * [that] fails the current contract" — and q29 says outright that such a
+ * divergence "fails the resume with a diagnostic naming the divergent step,
+ * rather than silently re-executing an effect the journal claimed to hold".
+ * A [`ResultMismatch`] would do exactly the thing it forbids: it is a node
+ * failure, so a `retry:` absorbs it and the second attempt claims an ordinal
+ * past the frontier and re-issues the effect **live** — the double side effect
+ * durability exists to prevent, reported as an ordinary bad answer. So the
+ * provenance of the value decides the class, and a [`ReplayDivergence`] travels
+ * past every policy (see [`runActivity`], [`runNode`], [`attemptItem`]).
+ *
+ * And this is where the *other* half of that decision is written down. A live
+ * answer this contract refuses is one a later generation will meet again, and
+ * whether it was refused **then** is the whole of what tells resolved q29's
+ * divergence from a mismatch the composition already had and already retried
+ * past. Only this generation can say so, so it says so on the record
+ * (`refuseRecorded` in `./journal.ts`) instead of leaving the next one to infer
+ * it from the records around it — which cannot be done, because a retried call
+ * and a repeated call leave the same sequence behind.
  */
 export function parseResult<T>(schema: ResultSchema<T>, value: unknown, subject: string): T {
   const parsed = schema.safeParse(value);
   if (parsed.success) return parsed.data as T;
-  throw new ResultMismatch(subject, value, parsed.error?.issues ?? []);
+  const refused = new ResultMismatch(subject, value, parsed.error?.issues ?? []);
+  const recorded = recordedAnswerOf(value, refused.message);
+  if (recorded !== undefined) throw recorded;
+  refuseRecorded(value);
+  throw refused;
 }
 
 /**
@@ -691,6 +747,23 @@ export interface RunContext {
    * node's entry or not depending on when the sink answered.
    */
   readonly toolDispatches?: DispatchRecord[];
+  /**
+   * Where every effect this site issues is journaled, and where a replay reads
+   * one back from (PRD resolved q26–q29, `docs/durability.md`).
+   *
+   * Rooted at the effect **site** — the instance path of grammar 9.4 this
+   * context belongs to — so the key an effect derives is the address
+   * `docs/trace.md` §8 already gives it plus the effect's kind and its ordinal
+   * at that site. [`runActivity`] creates one per node execution; [`runMap`]
+   * hands each dispatch a child rooted at the dispatch's own path, which is what
+   * keeps two items of one fan-out off each other's keys.
+   *
+   * Absent when nothing is journaling this execution — an ejected caller
+   * driving a compiled graph directly, or a unit test — and every effect site
+   * is written to work without one, which is what makes durability a property
+   * of the *invocation* rather than a dependency of the graph.
+   */
+  readonly effects?: EffectRecorder;
 }
 
 /**
@@ -706,10 +779,21 @@ export function delivering(context: RunContext, site: DispatchSite): RunContext 
   return { ...context, idempotency_key: site.idempotencyKey };
 }
 
+/**
+ * What an aborted signal is raised as.
+ *
+ * A `reason` is whatever the aborting side passed, and the one this runtime
+ * passes is the node's own deadline failure — so it is re-raised as it came, and
+ * anything else becomes an `Error` rather than reaching a `catch` as a string.
+ */
+function abortReason(signal: AbortSignal): Error {
+  return signal.reason instanceof Error ? signal.reason : new Error("aborted");
+}
+
 const sleep = (ms: number, signal: AbortSignal): Promise<void> =>
   new Promise((resolve, reject) => {
     if (signal.aborted) {
-      reject(signal.reason instanceof Error ? signal.reason : new Error("aborted"));
+      reject(abortReason(signal));
       return;
     }
     const timer = setTimeout(() => {
@@ -718,7 +802,7 @@ const sleep = (ms: number, signal: AbortSignal): Promise<void> =>
     }, ms);
     const onAbort = () => {
       clearTimeout(timer);
-      reject(signal.reason instanceof Error ? signal.reason : new Error("aborted"));
+      reject(abortReason(signal));
     };
     signal.addEventListener("abort", onAbort, { once: true });
   });
@@ -732,8 +816,7 @@ const sleep = (ms: number, signal: AbortSignal): Promise<void> =>
  */
 function untilAborted(signal: AbortSignal): Promise<never> {
   return new Promise<never>((_, reject) => {
-    const fail = () =>
-      reject(signal.reason instanceof Error ? signal.reason : new Error("aborted"));
+    const fail = () => reject(abortReason(signal));
     if (signal.aborted) {
       fail();
       return;
@@ -891,6 +974,11 @@ export async function runActivity<T>(
   // to it on every attempt, so a rejection nobody is waiting on is still a
   // handled one.
   const expiry = budget === undefined ? undefined : untilAborted(controller.signal);
+  // One recorder per node **execution**, not per attempt: the ordinals a key
+  // carries count every effect this site ever issues in this execution, so a
+  // second attempt's model call is a second record rather than a collision with
+  // the first attempt's (`docs/durability.md` §4).
+  const effects = recorderFor(execution.id, site);
 
   try {
     let last: unknown;
@@ -911,6 +999,7 @@ export async function runActivity<T>(
           ...(storeRecords === undefined ? {} : { storeRecords }),
           ...(modelCalls === undefined ? {} : { modelCalls }),
           ...(toolDispatches === undefined ? {} : { toolDispatches }),
+          ...(effects === undefined ? {} : { effects }),
         });
         // The loser of the race rejects with nobody awaiting it — an activity
         // that observes the abort, after the deadline has already answered for
@@ -958,6 +1047,19 @@ export async function runActivity<T>(
         // on bare rather than wrapped in a [`NodeFailure`]: by construction
         // there is nothing to report it to, which is what the class means.
         if (abandonedOf(error) !== undefined) throw error;
+        // A journal that does not describe this run is not an activity outcome
+        // either, and it is the one failure a `retry:` could make *worse*: every
+        // attempt would consume the next ordinal at this site, so a ladder of
+        // three would walk three recorded effects forward and report the last
+        // disagreement rather than the first. Thrown bare, past the policy and
+        // past `on_error:`, for the reason [`ReplayDivergence`] gives.
+        //
+        // Read off the **cause chain** rather than by class, because it travels:
+        // a divergence inside a `flow:` node's instance arrives here restated as
+        // a `SubflowFailure`, and one inside a dispatched item as an
+        // `ItemFailure`. A check on the class alone would let exactly those two
+        // be retried.
+        if (divergenceOf(error) !== undefined) throw error;
         if (expired) break;
         if (attempt === attempts) break;
         // This attempt is over, so every pause it left open below it is one
@@ -1031,6 +1133,21 @@ export type ProviderKind =
   | "bedrock"
   | "vertex";
 
+/**
+ * One entry of a provider's `server_tools:` — a tool the **provider** runs, on
+ * its own side, inside the model call (grammar 12.1, Decision D122).
+ *
+ * Written in that provider's own wire vocabulary and appended verbatim to the
+ * `tools` of every request the provider serves. Nothing here is dispatched by
+ * this runtime: a server tool's results arrive woven into the assistant's turn,
+ * which is why the type is an open record rather than anything with an
+ * `invoke`. `type` is the only key the compiler reads.
+ */
+export interface ServerToolConfig {
+  readonly type: string;
+  readonly [key: string]: unknown;
+}
+
 /** A resolved `provider.*` (grammar 12.1). Values are read when a node runs. */
 export interface ProviderBinding {
   readonly address: string;
@@ -1046,6 +1163,39 @@ export interface ProviderBinding {
   readonly apiVersion?: string;
   readonly organization?: string;
   readonly headers?: Readonly<Record<string, string>>;
+  /**
+   * `server_tools:`, where the composition declared any (Decision D122).
+   *
+   * **Absent** and **empty** are the same thing on the wire and are kept apart
+   * anyway: the emitter omits the key entirely for a provider that declares no
+   * suite, so a binding carrying `[]` is one whose array was emptied rather than
+   * one that never had it — and on an `openai` provider that distinction is
+   * load-bearing, since declaring a suite is what moves the connection onto the
+   * Responses wire ([`speaksResponses`]).
+   */
+  readonly serverTools?: readonly ServerToolConfig[];
+}
+
+/**
+ * Whether this connection speaks OpenAI's **Responses** API rather than Chat
+ * Completions (Decision D122).
+ *
+ * All-or-nothing per provider, and that is the seam an author meets: the
+ * built-in tool suite — web search, file search, code interpreter, image
+ * generation — is a Responses-API surface that Chat Completions does not carry,
+ * so an `openai` provider that declares `server_tools:` issues **every** one of
+ * its calls to `/v1/responses`, and one that declares none keeps Chat
+ * Completions exactly as before. One provider, one wire: a connection that
+ * switched per request would make "what did this model see" depend on which
+ * agent asked.
+ *
+ * `openai_compatible` is deliberately not here. A gateway's suite rides its
+ * Chat Completions `tools` array verbatim — many honour one — and moving a
+ * gateway onto a wire it may not implement at all would break the compositions
+ * that work today.
+ */
+function speaksResponses(provider: ProviderBinding): boolean {
+  return provider.kind === "openai" && (provider.serverTools ?? []).length > 0;
 }
 
 /** A resolved `model.*` in its direct form (grammar 12.2). */
@@ -1296,6 +1446,10 @@ export type Turn =
        * answer and a replay must be the answer.
        */
       readonly blocks?: readonly unknown[];
+      /**
+       * Which wire's vocabulary [`blocks`] is written in (see [`ContentWire`]).
+       */
+      readonly wire?: ContentWire;
     }
   | {
       readonly role: "tool";
@@ -1323,6 +1477,29 @@ export type Turn =
       }[];
     };
 
+/**
+ * Which wire's vocabulary a replayed assistant turn's blocks are written in.
+ *
+ * Two surfaces send an answer as a list of objects and each takes back **its
+ * own** list: the Messages wire's `text`/`tool_use`/`thinking` blocks and the
+ * Responses wire's `message`/`function_call`/`reasoning`/`*_call` items are
+ * disjoint vocabularies, and either one sent to the other is a 400 naming a
+ * type that surface has never heard of. A route may cross the two — each member
+ * of a ladder speaks its own provider's wire (Decision D122) — so a turn one
+ * member answered can be replayed to another, and the reader has to be able to
+ * tell whether the blocks in hand are its own. Where they are not, the turn is
+ * rebuilt from the `text` and `toolCalls` read out of them, which is what every
+ * wire can render.
+ *
+ * **Absent is `"messages"`,** and that is load-bearing rather than terse: a
+ * `Turn` is part of a journaled model call's request identity ([`callModel`]),
+ * so a key written onto every Messages turn would re-key every journal recorded
+ * before this wire existed. The Messages wire was the only one that ever
+ * produced blocks, so leaving its turns untagged keeps those identities exactly
+ * as they were and `JOURNAL_VERSION` where it is (`docs/durability.md` §11.2).
+ */
+export type ContentWire = "messages" | "responses";
+
 /** What a model answered. */
 export interface ModelAnswer {
   readonly text: string | null;
@@ -1341,6 +1518,11 @@ export interface ModelAnswer {
    * Completions, whose answer is a message rather than a block list).
    */
   readonly content?: readonly unknown[];
+  /**
+   * Which wire wrote `content`, where that is not the Messages wire
+   * ([`ContentWire`]).
+   */
+  readonly wire?: ContentWire;
   /**
    * The reason the model gave for declining, on a surface that states one.
    *
@@ -1581,6 +1763,146 @@ export async function callModel(
   },
   site: ModelSite,
 ): Promise<ModelResult> {
+  const recorder = site.effects;
+  if (recorder === undefined) return await callModelLive(selection, request, site);
+
+  // The identity of *this* call, which a recorded answer has to match: which
+  // `model.*` was asked, what it was asked, and which tools it was offered.
+  // The conversation is in it because it is what a ladder answered — a replay
+  // whose second call carries a different history is a different call, and
+  // handing it the first generation's answer would be exactly the silent
+  // re-keying resolved q29 refuses.
+  //
+  // The **server** tools are in it for the same reason the client ones are: a
+  // provider's suite is part of what the model was offered, and a resume whose
+  // provider gained or lost one is a resume of a different call — so it
+  // diverges at the first model call rather than replaying an answer produced
+  // under another tool surface (`docs/durability.md` §3.1, §7, Decision D122).
+  //
+  // Per **ladder member**, because that is the granularity the suite has: each
+  // provider in a route declares its own array, so which tools were on offer
+  // depends on which member served the call. And the key is **omitted
+  // entirely** where no member declares one, which is what keeps every
+  // composition that predates the key deriving the identity it already derived
+  // — an older journal still replays, and `JOURNAL_VERSION` does not move
+  // (`docs/durability.md` §11.2, §11.3).
+  const suites = ladder(selection).map((member) => member.provider.serverTools ?? []);
+  const slot = recorder.claim("model", {
+    model: selection.address,
+    system: request.system,
+    turns: request.turns,
+    tools: request.tools.map((tool) => tool.name),
+    ...(request.pinned === undefined ? {} : { pinned: request.pinned.name }),
+    ...(suites.some((suite) => suite.length > 0) ? { serverTools: suites } : {}),
+  });
+
+  if (slot.held !== undefined) {
+    // A recorded model call is replayed **whole**: the answer the loop accepted,
+    // and every `ModelCall` record the ladder filed on the way to it — the
+    // failovers a route spent, and the refusal that ended a call that answered
+    // nothing. Without the records the resumed generation's trace would say a
+    // node called no model at all (`docs/trace.md` §7.2). A call is always kept
+    // as a *value*, whichever way it went, so the error arm is unreachable and
+    // is answered rather than assumed away.
+    if (slot.held.kind === "error") throw replayedFailure(slot.held);
+    const held = slot.held.value as JournaledCall;
+    for (const call of held.calls) site.modelCalls?.push(call);
+    if (!held.ok) throw replayedFailure({ kind: "error", ...held.error });
+    // Which member answered, off the record's own field — and off the tail of
+    // `calls` where there is one, because those are the objects just pushed into
+    // the node's channel and the trace reconciles the two lists by **identity**
+    // ([`merged`]). The field is what makes the empty case answerable: `calls`
+    // is the *node execution's* collector, and a detached `map` delivery has
+    // none by construction (D94, and see [`runMap`]) — so its record holds an
+    // empty list, and a `served` inferred from that tail would fail a resume of
+    // a composition nobody had touched.
+    const served = held.calls[held.calls.length - 1] ?? held.served;
+    if (served === undefined) {
+      throw new ReplayDivergence(
+        slot,
+        "the journal recorded an answer with no record of which model served it",
+      );
+    }
+    return { answer: held.answer, served };
+  }
+
+  const before = site.modelCalls?.length ?? 0;
+  const filed = (): ModelCall[] => (site.modelCalls ?? []).slice(before);
+  try {
+    const result = await callModelLive(selection, request, site);
+    // The **kept** answer rather than the live one, which is the same statement
+    // the replay arm above makes and has to be: a model answer is the value that
+    // most often reaches a later effect's request identity — an agent's next turn
+    // carries it verbatim — so a generation that went on with a differently
+    // ordered copy of it would be reported as divergent by its own successor
+    // (`docs/durability.md` §11.1).
+    const kept = slot.keep({
+      ok: true,
+      answer: result.answer,
+      served: result.served,
+      calls: filed(),
+    } satisfies JournaledCall) as Extract<JournaledCall, { ok: true }>;
+    return { answer: kept.answer, served: result.served };
+  } catch (error) {
+    // Kept as a **value** rather than through the slot's error path, because a
+    // spent ladder is more than its message: the records it filed are what a
+    // reader of the failed node's entry reads, and they have to survive into
+    // the resumed generation's trace with it.
+    slot.keep({
+      ok: false,
+      error: { name: nameOf(error), message: messageOf(error) },
+      calls: filed(),
+    } satisfies JournaledCall);
+    throw error;
+  }
+}
+
+/**
+ * One model call as the journal keeps it (see [`callModel`]).
+ *
+ * `served` is the member of the route that answered, and `calls` is what the
+ * ladder filed on the node's own trace channel on the way there. They overlap
+ * wherever there *is* such a channel — the last of `calls` is this same call —
+ * and the reason both are here is the case where there is not: a detached `map`
+ * delivery runs with the node's collectors detached (D94), so `calls` is empty
+ * and `served` is the only account of who answered. It is optional because a
+ * record written before this field existed has none, which
+ * `docs/durability.md` §11.2 makes a compatible reading rather than a bump.
+ */
+type JournaledCall =
+  | {
+      readonly ok: true;
+      readonly answer: ModelAnswer;
+      readonly served?: ModelCall;
+      readonly calls: ModelCall[];
+    }
+  | {
+      readonly ok: false;
+      readonly error: { readonly name: string; readonly message: string };
+      readonly calls: ModelCall[];
+    };
+
+/** An error's class name, as `describe` reads it. */
+function nameOf(error: unknown): string {
+  return error instanceof Error ? error.name : "Error";
+}
+
+/** An error's message, as `describe` reads it. */
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** [`callModel`] with nothing between it and the provider. */
+async function callModelLive(
+  selection: ModelSelection,
+  request: {
+    readonly system: string;
+    readonly turns: readonly Turn[];
+    readonly tools: readonly ToolSpec[];
+    readonly pinned?: ToolSpec;
+  },
+  site: ModelSite,
+): Promise<ModelResult> {
   const members = ladder(selection);
   const routeOn: readonly RouteCondition[] = isRoute(selection) ? selection.routeOn : [];
   const failovers: Failover[] = [];
@@ -1649,6 +1971,14 @@ export interface ModelSite {
   readonly deadline?: number;
   /** Where this call is recorded, when the caller is collecting. */
   readonly modelCalls?: ModelCall[];
+  /**
+   * Where this call is **journaled**, when the execution is durable.
+   *
+   * [`RunContext.effects`], read through the same structural equivalence the
+   * three fields above are read through: a model call is an effect of the node
+   * that made it, and its site is that node's.
+   */
+  readonly effects?: EffectRecorder;
 }
 
 /**
@@ -1750,9 +2080,12 @@ async function callDirect(
       `\`${model.provider.address}\` is \`kind: ${model.provider.kind}\`, which is reached through a cloud SDK rather than an HTTP endpoint (grammar 12.1) and which this compiler release does not call: bind \`${model.address}\` to an \`anthropic\`, \`openai\`, \`openai_compatible\` or \`azure_openai\` provider`,
     );
   }
-  return model.provider.kind === "anthropic"
-    ? await callMessages(model, request, signal)
-    : await callChatCompletions(model, request, signal);
+  if (model.provider.kind === "anthropic") return await callMessages(model, request, signal);
+  // The one wire choice that is not the kind's alone: an `openai` provider
+  // carrying a server-tool suite speaks Responses for **every** call it makes
+  // (Decision D122, [`speaksResponses`]).
+  if (speaksResponses(model.provider)) return await callResponses(model, request, signal);
+  return await callChatCompletions(model, request, signal);
 }
 
 async function callMessages(
@@ -1769,10 +2102,14 @@ async function callMessages(
   const maxTokens = settings["max_tokens"] ?? ANTHROPIC_MAX_TOKENS;
   delete settings["max_tokens"];
 
-  const messages = request.turns.map((turn) => {
-    if (turn.role === "user") return { role: "user", content: turn.text };
+  const messages: Record<string, unknown>[] = [];
+  for (const turn of request.turns) {
+    if (turn.role === "user") {
+      messages.push({ role: "user", content: turn.text });
+      continue;
+    }
     if (turn.role === "tool") {
-      return {
+      messages.push({
         role: "user",
         content: turn.results.map((result) => ({
           type: "tool_result",
@@ -1787,20 +2124,50 @@ async function callMessages(
           // be sending a field no successful call has.
           ...(result.isError === true ? { is_error: true } : {}),
         })),
-      };
+      });
+      continue;
     }
-    // A turn the model sent goes back exactly as it came — thinking blocks and
+    // A turn *this* wire sent goes back exactly as it came — thinking blocks and
     // all, which the Messages API requires unaltered beside the `tool_use`
-    // blocks they preceded. Only a turn this runtime *composed* (the shared
-    // history channel of grammar 10.4) is rendered from its parts.
-    if (turn.blocks !== undefined) return { role: "assistant", content: [...turn.blocks] };
+    // blocks they preceded. Two turns are rendered from their parts instead: one
+    // this runtime *composed* (the shared history channel of grammar 10.4), and
+    // one another **wire** answered, whose items this surface has never heard of
+    // ([`ContentWire`]) — a route that fails over from a Responses member to an
+    // Anthropic one replays its history across that seam.
+    if (turn.blocks !== undefined && (turn.wire ?? "messages") === "messages") {
+      messages.push({ role: "assistant", content: [...turn.blocks] });
+      continue;
+    }
     const content: unknown[] = [];
     if (turn.text !== undefined && turn.text !== "") content.push({ type: "text", text: turn.text });
     for (const call of turn.toolCalls ?? []) {
       content.push({ type: "tool_use", id: call.id, name: call.name, input: call.args });
     }
-    return { role: "assistant", content };
-  });
+    if (content.length === 0) {
+      // Nothing of that turn has a spelling on this wire, and
+      // `{"role": "assistant", "content": []}` is a message the Messages API
+      // refuses (`content: List should have at least 1 item`) — the very 400
+      // [`replayed`] exists to keep this runtime from sending. The turn is
+      // dropped rather than padded with a text block the model never wrote,
+      // which is what [`callChatCompletions`] does with the same situation.
+      //
+      // It is reachable off the **other** block-carrying wire and nowhere else:
+      // a Responses member can end a turn having only run a server tool — a
+      // `web_search_call` item and no `output_text`, which is also the shape an
+      // answer cut short by `max_output_tokens` takes — and a ladder that then
+      // falls to an Anthropic member arrives here with a turn whose whole
+      // content is items this surface has no vocabulary for. Those items are
+      // lost across the seam either way; what the guard decides is whether the
+      // loss is silent or is a provider 400 about the wrong request.
+      //
+      // Roles still alternate for the mock and the API alike (`WIRE-NOTES`
+      // (18)): a turn this empty carried no tool call, so the loop ended on it
+      // and it is the **last** turn — the request that drops it ends on the
+      // user turn before it.
+      continue;
+    }
+    messages.push({ role: "assistant", content });
+  }
 
   const offered = [...request.tools, ...(request.pinned === undefined ? [] : [request.pinned])];
   const body: Record<string, unknown> = {
@@ -1810,12 +2177,22 @@ async function callMessages(
     messages,
     ...settings,
   };
-  if (offered.length > 0) {
-    body["tools"] = offered.map((tool) => ({
-      name: tool.name,
-      description: tool.description,
-      input_schema: tool.schema,
-    }));
+  // The agent's own tools first, then the provider's server tools — the order
+  // is pinned by the goldens rather than left to chance, because the array
+  // reaches the wire as written and a reader comparing two builds should not
+  // have to work out whether a reordering meant anything. Client tools lead
+  // because they are the ones this composition declares; a server tool is a
+  // property of the connection every agent on it shares.
+  const server = model.provider.serverTools ?? [];
+  if (offered.length > 0 || server.length > 0) {
+    body["tools"] = [
+      ...offered.map((tool) => ({
+        name: tool.name,
+        description: tool.description,
+        input_schema: tool.schema,
+      })),
+      ...server,
+    ];
   }
   if (request.pinned !== undefined) {
     body["tool_choice"] = { type: "tool", name: request.pinned.name };
@@ -1834,6 +2211,14 @@ async function callMessages(
 
   const blocks = (answer["content"] ?? []) as { type: string; [key: string]: unknown }[];
   const texts = blocks.filter((block) => block.type === "text").map((block) => block["text"]);
+  // `tool_use` **exactly**, which is what keeps a server tool out of the tool
+  // loop (Decision D122). A provider that ran one answers with a
+  // `server_tool_use` block and its paired `*_tool_result` beside it: the call
+  // already happened, on the provider's side, and there is nothing for this
+  // runtime to dispatch. Reading them as calls would send the loop looking for a
+  // tool the agent never declared, which since Decision D119 is a *refusal*
+  // bounced back to the model — an answer that worked, reported as a mistake.
+  // They travel instead on `content`, which [`replayed`] sends back unaltered.
   const uses = blocks.filter((block) => block.type === "tool_use");
   const pinnedUse =
     request.pinned === undefined
@@ -1926,11 +2311,24 @@ async function callChatCompletions(
   }
 
   const body: Record<string, unknown> = { model: model.id, messages, ...model.settings };
-  if (request.tools.length > 0) {
-    body["tools"] = request.tools.map((tool) => ({
-      type: "function",
-      function: { name: tool.name, description: tool.description, parameters: tool.schema },
-    }));
+  // The agent's own tools first, then the provider's server tools — the same
+  // order the other two wires use, and pinned by the goldens for the same
+  // reason. The only kind that reaches here carrying a suite is
+  // `openai_compatible`: an `openai` provider that declares one speaks Responses
+  // instead ([`speaksResponses`]), and the remaining kinds are refused the key
+  // at compile time. A gateway's suite rides this array verbatim — no table
+  // could be authoritative about what a gateway honours, so the compiler warns
+  // and carries, and dropping it here would make that warning a lie
+  // (Decision D122).
+  const server = model.provider.serverTools ?? [];
+  if (request.tools.length > 0 || server.length > 0) {
+    body["tools"] = [
+      ...request.tools.map((tool) => ({
+        type: "function",
+        function: { name: tool.name, description: tool.description, parameters: tool.schema },
+      })),
+      ...server,
+    ];
   }
   if (request.pinned !== undefined) {
     // `response_format` rather than a forced function: the schema shapes the
@@ -1973,6 +2371,251 @@ async function callChatCompletions(
     // only thing that tells a refusal from a `max_tokens` cut.
     refusal: (message["refusal"] as string | null) ?? null,
   };
+}
+
+/**
+ * OpenAI's **Responses** API: `POST /v1/responses` (Decision D122).
+ *
+ * The wire an `openai` provider moves to when it declares `server_tools:`, and
+ * the only one of OpenAI's two that carries the built-in tool suite at all —
+ * web search, file search, code interpreter, image generation. Everything else
+ * about the call is the same call: the same conversation, the same client
+ * function tools, the same structured-output posture, the same failover ladder
+ * around it.
+ *
+ * # What changes from Chat Completions
+ *
+ * * **The conversation is a list of items, not messages.** A user turn is a
+ *   `message` item; a function call is its own `function_call` item beside the
+ *   message rather than a field on it; a result is a `function_call_output`
+ *   item keyed by `call_id`. The system prompt is `instructions`, which is why
+ *   it is not the first item.
+ * * **An assistant turn goes back as the items it came as.** [`ModelAnswer`]
+ *   carries the raw `output` array, exactly as the Messages wire carries
+ *   content blocks, and a replay sends it unaltered — which is what keeps a
+ *   `web_search_call` item, a `reasoning` item, and the pairing between a
+ *   `function_call` and the output that answers it intact. A turn rebuilt from
+ *   `text` and `toolCalls` would drop every one of them.
+ * * **A tool is flat.** `{ type: "function", name, parameters }` rather than
+ *   `{ type: "function", function: { … } }`.
+ * * **Two settings are spelled differently**, and are translated here:
+ *   `max_tokens` is `max_output_tokens`, and `reasoning_effort` is
+ *   `reasoning: { effort }`. Everything else in `settings:` travels as written,
+ *   which means a knob this wire does not have (`stop`, `seed`) reaches the
+ *   service and is refused by it — visibly, in the run that declared it, rather
+ *   than dropped here into a request that quietly did something else.
+ *   `docs/topics/models.md` says so where an author meets the seam, and
+ *   `agent-compose validate` refuses those two on a provider that speaks this
+ *   wire rather than leaving them to the 400.
+ * * **`store` is the service's, and its default here is `true`** where Chat
+ *   Completions' is `false` — so a connection moved onto this wire has its
+ *   prompts and completions retained by the provider where before they were
+ *   not. This request does not pin the key, and that is a decision rather than
+ *   an omission: `store: false` makes the service refuse a replayed `reasoning`
+ *   item, which is exactly what the loop above sends back on every turn of a
+ *   reasoning model, so pinning it would trade a documented retention default
+ *   for a broken tool loop. `docs/topics/models.md` says what moving wires
+ *   changes about retention, where an author can act on it.
+ *
+ * # What does not change
+ *
+ * Structured output keeps the q16 posture exactly: what is **constrained** is
+ * what is **parsed**. `text.format` is the Responses spelling of Chat
+ * Completions' `response_format`, carrying the same schema under the same
+ * `strict` decision ([`strictable`]), and the object parsed back out is the
+ * assistant text that format shaped.
+ *
+ * And a function call is dispatched exactly as it is on the other two wires —
+ * the loop, the refusals of Decision D119, the ordinals of grammar 9.4 — because
+ * the loop is above this function and never learns which wire answered.
+ */
+async function callResponses(
+  model: ModelBinding,
+  request: {
+    readonly system: string;
+    readonly turns: readonly Turn[];
+    readonly tools: readonly ToolSpec[];
+    readonly pinned?: ToolSpec;
+  },
+  signal: AbortSignal,
+): Promise<ModelAnswer> {
+  const input: unknown[] = [];
+  for (const turn of request.turns) {
+    if (turn.role === "user") {
+      input.push({
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: turn.text }],
+      });
+      continue;
+    }
+    if (turn.role === "tool") {
+      for (const result of turn.results) {
+        // No error flag: a `function_call_output` is closed to its `call_id` and
+        // its `output`, so a refusal *is* the output text — the same concession
+        // Chat Completions makes, and for the same reason (Decision D119,
+        // `WIRE-NOTES` (18), (21)). Answering every call at all is the
+        // load-bearing half: an unanswered `call_id` is a request this surface
+        // refuses.
+        input.push({
+          type: "function_call_output",
+          call_id: result.id,
+          output: result.content,
+        });
+      }
+      continue;
+    }
+    // An answer **this** surface produced goes back as it came. Everything the
+    // reading below does not read — a `reasoning` item, a `web_search_call`,
+    // the annotations on an `output_text` — is in here and nowhere else.
+    //
+    // Blocks another wire wrote are not: the Messages wire's `text`/`tool_use`
+    // vocabulary is not an item type this surface has, and a ladder that failed
+    // over from an Anthropic member to this one replays exactly such a turn
+    // ([`ContentWire`]). Those are rebuilt below, from the reading — which is
+    // what the wire that produced them is *also* holding this turn to.
+    if (turn.blocks !== undefined && turn.wire === "responses") {
+      input.push(...turn.blocks);
+      continue;
+    }
+    // The turns this runtime composed rather than received: the shared history
+    // channel of grammar 10.4, and an answer off another wire.
+    const text = turn.text ?? "";
+    if (text !== "") {
+      input.push({
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text }],
+      });
+    }
+    for (const call of turn.toolCalls ?? []) {
+      input.push({
+        type: "function_call",
+        call_id: call.id,
+        name: call.name,
+        arguments: JSON.stringify(call.args),
+      });
+    }
+  }
+
+  const settings = { ...model.settings };
+  if (settings["max_tokens"] !== undefined) {
+    settings["max_output_tokens"] = settings["max_tokens"];
+    delete settings["max_tokens"];
+  }
+  if (settings["reasoning_effort"] !== undefined) {
+    settings["reasoning"] = { effort: settings["reasoning_effort"] };
+    delete settings["reasoning_effort"];
+  }
+
+  const body: Record<string, unknown> = {
+    model: model.id,
+    instructions: request.system,
+    input,
+    ...settings,
+  };
+  // Client tools first, then the provider's suite — the same order the Messages
+  // wire uses, pinned by the goldens for the same reason.
+  const server = model.provider.serverTools ?? [];
+  const functions = request.tools.map((tool) => ({
+    type: "function",
+    name: tool.name,
+    description: tool.description,
+    parameters: tool.schema,
+    strict: strictable(tool.schema),
+  }));
+  if (functions.length > 0 || server.length > 0) {
+    body["tools"] = [...functions, ...server];
+  }
+  if (request.pinned !== undefined) {
+    body["text"] = {
+      format: {
+        type: "json_schema",
+        name: request.pinned.name,
+        strict: strictable(request.pinned.schema),
+        schema: request.pinned.schema,
+      },
+    };
+  }
+
+  const { headers } = openAiRequest(model.provider);
+  const answer = await send(model, `${baseUrl(model.provider)}/v1/responses`, headers, body, signal);
+
+  const output = (answer["output"] ?? []) as Record<string, unknown>[];
+  // **Per message item**, not one flat list of parts. A turn on this wire can
+  // hold more than one `message` — a preamble the model wrote before a server
+  // tool ran, the shaped answer after it — and the two answer different
+  // questions. `text` is everything the assistant said, which is what a replay
+  // on another wire has to carry; the *structured* answer is the last message
+  // alone, because `text.format` shapes the turn's final message and says
+  // nothing about what precedes it. Flattening them and parsing the join is how
+  // `Let me look that up.{"answer":"…"}` reaches `JSON.parse`, and server tools
+  // are exactly what makes a multi-`message` turn reachable (Decision D122).
+  const said: string[] = [];
+  let refusal: string | null = null;
+  for (const item of output) {
+    if (item["type"] !== "message") continue;
+    const parts: string[] = [];
+    for (const part of (item["content"] ?? []) as Record<string, unknown>[]) {
+      if (part["type"] === "output_text") parts.push(String(part["text"] ?? ""));
+      // A stated decline, which is what tells a refusal from an answer cut
+      // short by `max_output_tokens` — both otherwise arrive as no structured
+      // output (`WIRE-NOTES` (3), (21)).
+      if (part["type"] === "refusal") refusal = String(part["refusal"] ?? "");
+    }
+    if (parts.length > 0) said.push(parts.join(""));
+  }
+  const calls = output
+    .filter((item) => item["type"] === "function_call")
+    .map((item) => ({
+      id: String(item["call_id"]),
+      name: String(item["name"]),
+      args: JSON.parse(String(item["arguments"] ?? "{}")) as unknown,
+    }));
+  const text = said.length > 0 ? said.join("") : null;
+  const shaped = said.length > 0 ? said[said.length - 1]! : null;
+  // `status` is the call's own outcome and `incomplete_details.reason` is why an
+  // incomplete one stopped; the narrower of the two is what a reader needs, so
+  // it wins where there is one.
+  const incomplete = (answer["incomplete_details"] ?? null) as Record<string, unknown> | null;
+  const stopReason =
+    incomplete !== null && incomplete["reason"] !== undefined
+      ? String(incomplete["reason"])
+      : ((answer["status"] as string | null) ?? null);
+  return {
+    text,
+    toolCalls: request.pinned === undefined ? calls : [],
+    structured: request.pinned === undefined ? null : shapedOutput(shaped),
+    stopReason,
+    content: output,
+    // …and whose vocabulary those are, because a failover ladder may hand this
+    // turn to a member on another wire ([`ContentWire`]).
+    wire: "responses",
+    refusal,
+  };
+}
+
+/**
+ * The structured answer a Responses turn's final message carries, or `null`.
+ *
+ * `text.format` shapes that message, so parsing it is parsing what the format
+ * constrained — but only the **service** guarantees the shape, and a turn that
+ * came back with prose where the schema was asked for is an answer this runtime
+ * cannot use rather than a call that failed. So the absence is reported as an
+ * absence, which is the same posture the Messages wire has when the pinned
+ * `tool_use` block is not in the turn: `callAgent` then names the agent, the
+ * output it asked for, and what the surface said about why — a stated refusal,
+ * or a `max_output_tokens` cut. A `SyntaxError` thrown from here would name
+ * none of those, and would be thrown *inside* the journaled model call, which
+ * would record a call that worked as a call that did not.
+ */
+function shapedOutput(text: string | null): unknown {
+  if (text === null) return null;
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -2339,7 +2982,9 @@ export async function callSubflowTool(
  *
  * Every loop answer is replayed by [`replayed`], which is where an answer that
  * carried nothing at all stops the node instead of becoming an empty turn the
- * next request could not legally carry.
+ * next request could not legally carry — and where the turn records which wire
+ * wrote it, so a ladder that fails over to a member on the *other* wire replays
+ * a turn that member can read ([`ContentWire`]).
  */
 export async function callAgent(
   agent: AgentBinding,
@@ -2620,6 +3265,11 @@ function replayed(agent: AgentBinding, answer: ModelAnswer): Turn {
     text: answer.text ?? "",
     ...(answer.toolCalls.length > 0 ? { toolCalls: answer.toolCalls } : {}),
     ...(blocks === undefined ? {} : { blocks }),
+    // Which wire's vocabulary those blocks are, where it is not the Messages
+    // one. Absent for a Messages answer on purpose — a key written there would
+    // re-key every journal recorded before the second wire existed
+    // ([`ContentWire`]).
+    ...(answer.wire === undefined ? {} : { wire: answer.wire }),
   };
 }
 
@@ -2744,6 +3394,41 @@ class ExecInputFailure extends Error {
 
 /** Run one `exec:` binding (grammar 6.1, 8.2). */
 export async function runExec(
+  binding: ExecBinding,
+  input: unknown,
+  context: RunContext,
+): Promise<unknown> {
+  // The identity is the **whole binding** as the composition wrote it, rather
+  // than as it resolved — which is `docs/trace.md` §11.1's discipline read where
+  // the reader is a replay: one composition derives one identity whatever
+  // environment it runs in, so an execution journaled on one machine is not
+  // reported as divergent on another for having a different `${TOOLBIN}`.
+  //
+  // Whole, and that is the load-bearing word (`docs/durability.md` §3.2). A
+  // `cwd:`, an `env:` entry, an `expect_exit:` and the `output:` shape all
+  // change what this call is and what its answer means, so a binding that moved
+  // in any of them is a call this run does not make and the recorded answer is
+  // not its. Leaving one out would hand the graph an answer recorded under a
+  // binding the composition no longer has, silently.
+  return await journaled(
+    context.effects,
+    "tool",
+    {
+      surface: "exec",
+      command: asWritten(binding.command),
+      args: binding.args.map((argument) => asWritten(argument)),
+      ...(binding.cwd === undefined ? {} : { cwd: asWritten(binding.cwd) }),
+      env: binding.env.map((entry) => ({ name: entry.name, value: asWritten(entry.value) })),
+      expectExit: binding.expectExit,
+      decoding: binding.decoding,
+      input,
+    },
+    () => runExecLive(binding, input, context),
+  );
+}
+
+/** [`runExec`] with nothing between it and the child process. */
+async function runExecLive(
   binding: ExecBinding,
   input: unknown,
   context: RunContext,
@@ -2891,6 +3576,735 @@ export async function runExec(
   );
 }
 
+// ---------------------------------------------------------------------------
+// The runtime built-ins (grammar 5.5, Decision D123, PRD resolved q31)
+// ---------------------------------------------------------------------------
+
+/** Which of the four built-ins one attachment offers (grammar 5.5). */
+export type BuiltinName = "bash" | "read_file" | "write_file" | "list";
+
+/**
+ * One `builtin.*` entry of an agent's `tools:`, with the bounds it declared.
+ *
+ * The bounds are the whole of what an attachment configures, and both are
+ * mandatory where they apply: PRD resolved q31 makes the curated set "bounded by
+ * a mandatory root and a timeout", so there is no shape here in which a built-in
+ * runs unbounded.
+ */
+export interface BuiltinBinding {
+  /** Which built-in. */
+  readonly tool: BuiltinName;
+  /**
+   * `root:` — the directory every path resolves inside, and `bash`'s working
+   * directory. Interpolation parts rather than a string, because the value
+   * reaches the process at start (grammar 4.3 class 2).
+   */
+  readonly root: readonly Interpolation[];
+  /**
+   * `timeout:` — how long `bash`'s command may run. `millis` is what the timer
+   * is set to and `written` is what a message quotes, so a failure reads in the
+   * author's own units.
+   *
+   * Absent on the file tools, which run no command.
+   */
+  readonly timeout?: { readonly millis: number; readonly written: string };
+}
+
+/**
+ * How many entries one `list` answers with before it reports that it stopped.
+ *
+ * Not containment — v1's containment is the root and the timeout, and nothing
+ * here narrows what the agent may reach: a directory with more entries than this
+ * is listed a subdirectory or a glob at a time. It is a bound on one *answer*,
+ * because a tool result is text a model reads, and an unbounded one would spend
+ * a context window rather than fail. `truncated` says so rather than leaving the
+ * model to infer completeness from a round number.
+ */
+const LISTING_LIMIT = 1000;
+
+/**
+ * How many entries one `list` matches before it hands the event loop back.
+ *
+ * The walk `await`s a `readdir` per directory, so a turn of the loop already
+ * falls between two directories; this is what puts one *inside* a directory too.
+ * Both halves of the work in that loop are a model's to size — how many entries
+ * the directory it named holds, and how long the glob it wrote is — and an
+ * emitted graph is embedded code: a `serve` process runs every other execution
+ * and its own listener on this same loop.
+ *
+ * It is also what lets the node's own `timeout:` (grammar 9.2) fire *during* a
+ * listing rather than after it. A deadline is a timer, and a timer cannot run
+ * inside a burst that never yields — so a walk that never breathed would
+ * overshoot the bound by the length of the burst, and [`walkListing`]'s abort
+ * check would not be reached until the burst it is meant to cut short had
+ * already finished.
+ */
+const LISTING_YIELD = 256;
+
+/**
+ * Run one built-in call (grammar 5.5, Decision D123).
+ *
+ * The seam every built-in goes through, journaled like every other tool
+ * execution: the record holds what the call answered, and a resumed generation
+ * is handed it back rather than running the command again
+ * (`docs/durability.md` §3.2). That is the whole of what durability owes a
+ * built-in — a `bash` that appended a line to a file appends it once across any
+ * number of process generations.
+ *
+ * The identity is the **attachment as the composition wrote it** plus the
+ * arguments the model chose: the tool, the `root:` unresolved, and `bash`'s
+ * `timeout:` as written. Unresolved for `runExec`'s reason — one composition
+ * derives one identity whatever machine it runs on — and *whole* for the other:
+ * a root that moved is a different directory to read, and a timeout that moved
+ * is a different bound to have survived, so neither is a call this run makes
+ * under the recorded key.
+ */
+export async function runBuiltin(
+  binding: BuiltinBinding,
+  args: Record<string, unknown>,
+  context: RunContext,
+): Promise<unknown> {
+  return await journaled(
+    context.effects,
+    "tool",
+    {
+      surface: "builtin",
+      tool: binding.tool,
+      root: asWritten(binding.root),
+      ...(binding.timeout === undefined ? {} : { timeout: binding.timeout.written }),
+      input: args,
+    },
+    () => runBuiltinLive(binding, args, context),
+  );
+}
+
+/** [`runBuiltin`] with nothing between it and the file system. */
+async function runBuiltinLive(
+  binding: BuiltinBinding,
+  args: Record<string, unknown>,
+  context: RunContext,
+): Promise<unknown> {
+  // The root is resolved once per call, before anything is touched: every path
+  // check below is against a directory that really exists, so a `root:` naming
+  // one that does not is reported as itself rather than as every path inside it
+  // failing to resolve.
+  const root = await builtinRoot(binding);
+  switch (binding.tool) {
+    case "bash":
+      return await runBuiltinBash(binding, root, String(args.command), context);
+    case "read_file":
+      return await readWithinRoot(binding, root, String(args.path));
+    case "write_file":
+      return await writeWithinRoot(binding, root, String(args.path), String(args.content));
+    case "list":
+      return await listWithinRoot(binding, root, String(args.path), String(args.glob), context);
+    default:
+      // Unreachable over a project this compiler emitted: the set is closed in
+      // the grammar and the emitter writes one of the four. Said rather than
+      // defaulted to a branch, because a fifth name reaching here should stop
+      // rather than quietly list a directory.
+      throw new Error(`\`builtin.${binding.tool}\` is not a built-in this runtime implements`);
+  }
+}
+
+/**
+ * The attachment's `root:`, resolved to a real directory.
+ *
+ * `realpath`, not a normalization: the containment rule of PRD resolved q31 is
+ * "resolution, not string prefix — symlinks and `..` count", and comparing a
+ * resolved target against an unresolved root would answer the question about two
+ * different directories. A root that is itself a symlink is perfectly legal; it
+ * is the *resolved* one that bounds the calls.
+ *
+ * A root that does not exist fails the call as an execution failure, so the
+ * node's `retry:`/`on_error:` decides it (Decision D119). The message quotes the
+ * root **as written**, which is what keeps a resolved `${WORKSPACE}` out of a
+ * field the trace carries (`docs/trace.md` §11.1).
+ *
+ * A root that resolves to **nothing** fails the same way, and is checked before
+ * anything else because it is the one empty answer the file system would accept:
+ * `path.resolve("")` is this process's working directory, so an attachment whose
+ * `${WORKSPACE}` came back empty would silently bound the tool to wherever the
+ * runtime happened to be started — the ambient capability grammar 5.5 and D123
+ * refuse in their own words. The parser refuses an empty `root:` as written; this
+ * is the same rule where only the environment can break it.
+ */
+async function builtinRoot(binding: BuiltinBinding): Promise<string> {
+  const written = asWritten(binding.root);
+  const declared = interpolate(binding.root);
+  if (declared.trim() === "") {
+    throw new Error(
+      `\`builtin.${binding.tool}\`'s \`root:\` \`${written}\` resolved to nothing, and a tool bounded to nothing would be bounded to whatever directory this process was started in`,
+    );
+  }
+  const resolved = await realpathOrAbsent(path.resolve(declared));
+  const directory =
+    resolved === undefined ? false : await fs.promises.stat(resolved).then(
+      (entry) => entry.isDirectory(),
+      () => false,
+    );
+  if (resolved === undefined || !directory) {
+    throw new Error(
+      `\`builtin.${binding.tool}\`'s \`root:\` \`${written}\` is not a directory that exists, and every path this tool takes resolves inside it`,
+    );
+  }
+  return resolved;
+}
+
+/**
+ * Whether a resolved path is the root or sits beneath it.
+ *
+ * Both sides are already `realpath`ed by the time this is asked, which is what
+ * makes a string comparison the right one *here* and the wrong one anywhere
+ * else: what is being compared is two real locations, not two spellings.
+ */
+function withinRoot(root: string, target: string): boolean {
+  if (target === root) return true;
+  const prefix = root.endsWith(path.sep) ? root : `${root}${path.sep}`;
+  return target.startsWith(prefix);
+}
+
+/**
+ * The real path one argument names, refused if it lands outside the root.
+ *
+ * Three cases, and the middle one is why this is not one `realpath` call:
+ *
+ *  * the path **exists** — it is resolved whole, symlinks and all, and checked;
+ *  * it does **not exist yet**, which is every `write_file` to a new file: its
+ *    *parent* is resolved and the last component appended, so a write through a
+ *    symlinked directory is still checked against where that directory really
+ *    is;
+ *  * its parent does not exist either, where there is nothing left to resolve
+ *    and the lexically-resolved path is checked. `path.resolve` has already
+ *    collapsed every `..`, so a climb out of the root is refused here as surely
+ *    as anywhere else, and the call then fails on the missing directory.
+ *
+ * A **dangling symlink** is refused rather than written through, and that is the
+ * case the middle branch would otherwise get wrong: `writeFile` follows a
+ * symlink, so a link inside the root pointing at a file outside it that does not
+ * exist yet would be a write outside the root with every check passed.
+ */
+async function targetWithinRoot(
+  binding: BuiltinBinding,
+  root: string,
+  requested: string,
+): Promise<string> {
+  const absolute = path.resolve(root, requested);
+  const resolved = await realpathOrAbsent(absolute);
+  let target = resolved;
+  if (target === undefined) {
+    const link = await fs.promises.lstat(absolute).then(
+      (entry) => entry.isSymbolicLink(),
+      () => false,
+    );
+    if (link) {
+      throw new Error(
+        `\`builtin.${binding.tool}\` will not follow \`${requested}\`: it is a symbolic link whose target does not exist, so where it points cannot be checked against \`root:\` \`${asWritten(binding.root)}\``,
+      );
+    }
+    const parent = await realpathOrAbsent(path.dirname(absolute));
+    target = parent === undefined ? absolute : path.join(parent, path.basename(absolute));
+  }
+  if (!withinRoot(root, target)) {
+    throw new Error(
+      `\`builtin.${binding.tool}\` refused \`${requested}\`: it resolves outside \`root:\` \`${asWritten(binding.root)}\`, which is the directory this tool is bounded to`,
+    );
+  }
+  return target;
+}
+
+/** A path's real location, or `undefined` where nothing is there to resolve. */
+async function realpathOrAbsent(target: string): Promise<string | undefined> {
+  return await fs.promises.realpath(target).then(
+    (resolved) => resolved,
+    () => undefined,
+  );
+}
+
+/**
+ * Kill a `builtin.bash` shell **and every process it started**.
+ *
+ * The shell is spawned `detached`, which on a POSIX host makes it the leader of
+ * a process group of its own; a signal sent to the negated pid goes to the whole
+ * group, which is where the command's real work lives. That distinction is the
+ * whole point of this function: `bash -c 'npm run build'` is a shell that forks,
+ * and a `SIGKILL` aimed at the shell's own pid ends the shell while the build
+ * keeps compiling — inside the very `root:` the attachment bounded it to, for as
+ * long after the node failed as it likes.
+ *
+ * What still escapes is what **left the group deliberately**: a command that
+ * calls `setsid`, a shell that turned job control on (`set -m`), a daemon that
+ * double-forks away. Those are the same processes a hand-rolled `exec:` tool
+ * would have left behind, and containing them is the distribution work's, not
+ * this bound's (grammar 5.5, Decision D124).
+ *
+ * The fallback is for the host where the group kill is not a thing —
+ * `process.kill` with a negative pid is a POSIX call, and Windows is a posture
+ * q31 defers — where killing the shell alone is still better than killing
+ * nothing. Both are guarded: a group that has already gone answers `ESRCH`, and
+ * a spawn that never started has no pid to aim at.
+ */
+function killCommandGroup(child: ChildProcess): void {
+  const pid = child.pid;
+  if (pid !== undefined) {
+    try {
+      process.kill(-pid, "SIGKILL");
+      return;
+    } catch {
+      // Already gone, or a host without process groups: fall through.
+    }
+  }
+  try {
+    child.kill("SIGKILL");
+  } catch {
+    // Already gone. The deadline's job is that nothing is left running, and
+    // nothing is.
+  }
+}
+
+/** The `builtin.bash` shells this process has running right now. */
+const runningCommands = new Set<ChildProcess>();
+
+/** The stop signals swept for, and the handlers installed for them. */
+const SWEPT_SIGNALS = ["SIGINT", "SIGTERM"] as const;
+const commandSweeps: (() => void)[] = [];
+
+/**
+ * Register a running command, and — while any is running — arrange for a stop
+ * signal to take its process group with it.
+ *
+ * A detached command is a command the **terminal** can no longer reach: its
+ * group is not the foreground one any more, so the `SIGINT` a person types
+ * reaches this process and nothing below it. Left there, `Ctrl-C` on a `run`
+ * would end the graph and leave the build it was in the middle of still writing
+ * into `root:` — a regression against a hand-rolled `exec:` tool, whose child
+ * *is* in that group and does die. So the group this call detached is swept
+ * here instead, and what the terminal used to do the runtime now does.
+ *
+ * Two properties keep this from being a runtime that seizes an embedder's
+ * signals. The handlers exist **only while a command does** — installed with the
+ * first, removed with the last, so a process that is not running one has exactly
+ * the disposition it had before this module was imported. And the sweep
+ * **re-raises**: it kills the groups, stands down, and delivers the same signal
+ * again, so whatever would have happened — `serve`'s own handler closing the app
+ * (`src/serve.ts`), or the default disposition ending the process — happens,
+ * unchanged and with the same exit status (grammar 5.5, Decision D124).
+ */
+function holdCommand(child: ChildProcess): void {
+  if (runningCommands.size === 0) {
+    for (const signal of SWEPT_SIGNALS) {
+      const sweep = (): void => {
+        for (const running of runningCommands) killCommandGroup(running);
+        runningCommands.clear();
+        standDown();
+        process.kill(process.pid, signal);
+      };
+      commandSweeps.push(() => process.removeListener(signal, sweep));
+      process.on(signal, sweep);
+    }
+  }
+  runningCommands.add(child);
+}
+
+/** Drop a command that has ended, and the sweep with the last of them. */
+function releaseCommand(child: ChildProcess): void {
+  runningCommands.delete(child);
+  if (runningCommands.size === 0) standDown();
+}
+
+/** Remove the sweep handlers, giving the process back the disposition it had. */
+function standDown(): void {
+  for (const remove of commandSweeps.splice(0)) remove();
+}
+
+/**
+ * Run one `builtin.bash` command (grammar 5.5, PRD resolved q31).
+ *
+ * `bash` is resolved from `PATH` at the call, which is the posture q31 fixes: a
+ * host with no shell fails the call as an execution failure naming the
+ * requirement, rather than the compiler deciding at build time what a deployment
+ * machine has.
+ *
+ * The command runs with the attachment's root as its working directory and
+ * under its `timeout:`. Both bounds are the attachment's and neither is the
+ * model's to move. A command that exits nonzero, or that outruns the timeout and
+ * is killed, **fails the node** — there is no `expect_exit:` here, because a
+ * built-in has no per-call configuration surface for one to sit on.
+ *
+ * There is no standard input: the argument is the command, and a shell reading
+ * from a stream nothing writes to would hang until the timeout took it.
+ */
+async function runBuiltinBash(
+  binding: BuiltinBinding,
+  root: string,
+  command: string,
+  context: RunContext,
+): Promise<unknown> {
+  const bound = binding.timeout;
+  const spawned = new Promise<{ code: number; stdout: string; stderr: string; expired: boolean }>(
+    (resolve, reject) => {
+      // `detached` is what makes the deadline below bound the **command** rather
+      // than the shell that happens to be typing it. On a POSIX host it puts the
+      // shell in a process group of its own, and the group is what gets killed:
+      // a shell alone is almost never where the work is — `npm run build`,
+      // `a | b`, `(cd sub && make)` are all bash *forking*, and a kill aimed at
+      // the shell's pid leaves every one of those children running, still
+      // writing inside `root:`, for as long as they like after the node they
+      // belonged to has already failed. Under `retry:` that is two generations
+      // of the same command in one root with the graph believing one is live.
+      // See [`killCommandGroup`] for what the kill is and what still escapes it.
+      const child = spawn("bash", ["-c", command], {
+        cwd: root,
+        stdio: ["ignore", "pipe", "pipe"],
+        detached: true,
+        signal: context.signal,
+      });
+      // …and detaching is also what puts the command out of the terminal's
+      // reach, which [`holdCommand`] is the answer to: while one is running,
+      // a stop signal this process is sent takes its group with it.
+      holdCommand(child);
+      let stdout = "";
+      let stderr = "";
+      let expired = false;
+      // The deadline is enforced here rather than through the platform's own
+      // `timeout` option, which the two supported runtimes do not implement
+      // alike. `SIGKILL` rather than `SIGTERM`: the bound is what an author was
+      // promised, and a command that traps the polite signal would outlive it.
+      //
+      // And the call is settled **here**, rather than left to the `close` event
+      // the ordinary path resolves on. `close` waits for the child's output
+      // pipes to close as well as for the child to exit, and a process that put
+      // itself in a process group of its own — `bash -c 'set -m; sleep 30 &
+      // wait'` is the shape, and a double-forking daemon is the other — is out
+      // of reach of the group kill and can still be holding them, so a deadline
+      // that waited for `close` would be the command's to honour rather than the
+      // composition's. Resolving twice is harmless: the first settlement is the
+      // promise's, and the `close` that may still arrive finds it settled.
+      //
+      // Settling early is only half of ending a call, though, and [`abandon`]
+      // is the other half: the *promise* is settled but such an escapee still
+      // holds the pipes this runtime is still reading, so the `data` handlers
+      // below would go on appending to a buffer nobody will ever read, and the
+      // open handles would go on holding the event loop. In a long-lived host —
+      // `serve`, or anything embedding a compiled graph — that is unbounded
+      // memory growth and a process that will not exit, both of them minutes
+      // after the call they belong to was reported as failed. So the streams are
+      // dropped rather than merely ignored: what the deadline ends is the call
+      // *and* this runtime's hold on what outlived it.
+      const abandon = (): void => {
+        for (const stream of [child.stdout, child.stderr]) {
+          if (stream === null || stream === undefined) continue;
+          stream.removeAllListeners("data");
+          stream.destroy();
+        }
+        child.unref();
+      };
+      const timer =
+        bound === undefined
+          ? undefined
+          : setTimeout(() => {
+              expired = true;
+              killCommandGroup(child);
+              abandon();
+              settle();
+              resolve({ code: -1, stdout, stderr, expired: true });
+            }, bound.millis);
+      // A node deadline (grammar 9.2) or a cancelled run aborts the spawn's
+      // signal, and the platform answers that by killing the **shell** — the
+      // one pid it knows about. The command's own children are this call's to
+      // end for the same reason the timeout's are: a run somebody cancelled
+      // must not leave a build still writing into `root:`. Registered after the
+      // spawn, so the platform's kill lands first and this one sweeps the group
+      // it left behind; `abandon` stays the `error` handler's, which is where
+      // the abort arrives.
+      const swept = (): void => killCommandGroup(child);
+      context.signal.addEventListener("abort", swept, { once: true });
+      const settle = (): void => {
+        if (timer !== undefined) clearTimeout(timer);
+        context.signal.removeEventListener("abort", swept);
+        releaseCommand(child);
+      };
+      child.stdout.on("data", (chunk: Buffer) => {
+        stdout += chunk.toString();
+      });
+      child.stderr.on("data", (chunk: Buffer) => {
+        stderr += chunk.toString();
+      });
+      child.on("error", (error) => {
+        settle();
+        // The same early settlement, reached the other way: the abort above
+        // rejects here while a process that left the group may still hold the
+        // pipes. A spawn that never started (no `bash` on `PATH`) has nothing to
+        // drop, which is what the guards in `abandon` are for.
+        abandon();
+        reject(error);
+      });
+      child.on("close", (code) => {
+        settle();
+        resolve({ code: code ?? -1, stdout, stderr, expired });
+      });
+    },
+  );
+
+  let result: { code: number; stdout: string; stderr: string; expired: boolean };
+  try {
+    result = await spawned;
+  } catch (error) {
+    // A deadline on the *node*, or a run somebody cancelled, arrives here as an
+    // abort rather than as this call's failure, and is raised as it came.
+    if (context.signal.aborted) throw error;
+    const code = (error as NodeJS.ErrnoException | null | undefined)?.code;
+    if (code === "ENOENT") {
+      throw new Error(
+        "`builtin.bash` could not be run: this host has no `bash` on `PATH`, which the tool resolves it from at the call",
+      );
+    }
+    throw new Error(
+      `\`builtin.bash\` could not be run${code === undefined ? "" : ` (${code})`}`,
+    );
+  }
+
+  if (result.expired) {
+    throw new Error(
+      `\`builtin.bash\` ran longer than \`${bound?.written ?? ""}\` and was killed${
+        result.stderr === "" ? "" : `: ${result.stderr.trim()}`
+      }`,
+    );
+  }
+  if (result.code !== 0) {
+    throw new Error(
+      `\`builtin.bash\` exited ${result.code}${result.stderr === "" ? "" : `: ${result.stderr.trim()}`}`,
+    );
+  }
+  return { stdout: result.stdout, stderr: result.stderr };
+}
+
+/** Read one file inside the root (grammar 5.5). */
+async function readWithinRoot(
+  binding: BuiltinBinding,
+  root: string,
+  requested: string,
+): Promise<unknown> {
+  const target = await targetWithinRoot(binding, root, requested);
+  try {
+    return { content: await fs.promises.readFile(target, "utf8") };
+  } catch (error) {
+    throw builtinFailure(binding, "read", requested, error);
+  }
+}
+
+/** Write one file inside the root, replacing it whole (grammar 5.5). */
+async function writeWithinRoot(
+  binding: BuiltinBinding,
+  root: string,
+  requested: string,
+  content: string,
+): Promise<unknown> {
+  const target = await targetWithinRoot(binding, root, requested);
+  try {
+    await fs.promises.writeFile(target, content, "utf8");
+  } catch (error) {
+    throw builtinFailure(binding, "write", requested, error);
+  }
+  return { bytes_written: Buffer.byteLength(content, "utf8") };
+}
+
+/**
+ * List a directory inside the root, optionally through a glob (grammar 5.5).
+ *
+ * With no glob the answer is the directory's own entries; with one it is a walk
+ * beneath it, matched segment by segment. Either way the paths are relative to
+ * the directory that was listed, a directory is reported with a trailing `/`,
+ * and the order is lexicographic — a listing a model reads twice reads the same
+ * both times.
+ *
+ * **Symlinked directories are not descended into.** A link inside the root may
+ * point anywhere, and a walk that followed one would report paths outside the
+ * root without any path check having been asked. The link itself is still an
+ * entry; reading it is a `read_file` call, where the check *is* asked.
+ */
+async function listWithinRoot(
+  binding: BuiltinBinding,
+  root: string,
+  requested: string,
+  glob: string,
+  context: RunContext,
+): Promise<unknown> {
+  const target = await targetWithinRoot(binding, root, requested);
+  const found: string[] = [];
+  // Split once per call rather than once per candidate: the pattern is as long
+  // as the *model* wrote it, and a walk that re-split it for every entry would
+  // multiply one long argument by the size of the tree.
+  const pattern = glob === "" ? undefined : globPattern(glob);
+  try {
+    await walkListing(target, "", pattern, found, context);
+  } catch (error) {
+    // A deadline on the *node*, or a run somebody cancelled, arrives here as an
+    // abort rather than as this call's failure, and is raised as it came —
+    // [`runBuiltinBash`]'s rule, for its reason.
+    if (context.signal.aborted) throw error;
+    throw builtinFailure(binding, "list", requested, error);
+  }
+  found.sort();
+  return {
+    entries: found.slice(0, LISTING_LIMIT),
+    truncated: found.length > LISTING_LIMIT,
+  };
+}
+
+/**
+ * One level of a listing, and every level beneath it when a glob asked for one.
+ *
+ * An **absent** `pattern` is the no-glob case rather than a separate function,
+ * because the two differ only in whether the walk goes on: the entry shapes, the
+ * trailing `/` and the relative spelling are the same answer either way.
+ *
+ * The walk stops where it is when the node's deadline runs out or the run is
+ * cancelled (grammar 9.2). How much work a listing is depends on a directory
+ * this runtime did not choose and a glob a *model* wrote, so a walk that only
+ * ever ran to completion would keep reading a tree for a node the graph had
+ * already reported as failed — the same hold on what outlived a call that
+ * [`runBuiltinBash`] refuses to leave behind.
+ */
+async function walkListing(
+  directory: string,
+  prefix: string,
+  pattern: readonly string[] | undefined,
+  found: string[],
+  context: RunContext,
+): Promise<void> {
+  const entries = await fs.promises.readdir(directory, { withFileTypes: true });
+  let seen = 0;
+  for (const entry of entries) {
+    if (context.signal.aborted) throw abortReason(context.signal);
+    // `isDirectory` is `lstat`'s answer here, so a symlink to a directory is a
+    // symlink: reported, not descended into.
+    const directoryEntry = entry.isDirectory();
+    const relative = prefix === "" ? entry.name : `${prefix}/${entry.name}`;
+    const listed = directoryEntry ? `${relative}/` : relative;
+    if (pattern === undefined || matchSegments(pattern, relative.split("/"))) found.push(listed);
+    if (pattern !== undefined && directoryEntry) {
+      await walkListing(path.join(directory, entry.name), relative, pattern, found, context);
+    }
+    seen += 1;
+    if (seen % LISTING_YIELD === 0) await sleep(0, context.signal);
+  }
+}
+
+/**
+ * A glob split into the segments [`matchSegments`] matches it as, with runs of
+ * `**` collapsed to one.
+ *
+ * `*` and `?` match within a single path segment and `**` matches across them,
+ * which is the spelling every tool a model has met uses. Written here rather
+ * than taken from a library for the reason this whole runtime is: one fewer
+ * pinned dependency, and a matcher whose behaviour is this project's to state
+ * (PRD 5.12).
+ *
+ * `**` is *zero or more* segments, so two of them in a row accept exactly what
+ * one of them accepts, and the only difference between the two spellings is what
+ * the match costs: each `**` is a place the matcher may have to give a segment
+ * back, and a run of them is the shape that makes it do so the most times.
+ * Collapsed here — once per call,
+ * over an argument a model chose — so the length of that run cannot become the
+ * length of the search. See [`matchSegments`].
+ */
+function globPattern(glob: string): readonly string[] {
+  return glob.split("/").filter((segment, at, all) => segment !== "**" || all[at - 1] !== "**");
+}
+
+/**
+ * [`globPattern`]'s segments against a candidate's, with `**` the one that may
+ * span several.
+ *
+ * Iterative, and for the reason [`matchSegment`] is: the pattern is a **model's**
+ * argument. The recursion this replaced tried every split of the target at every
+ * `**` and re-tried it under the next one, which is exponential in how many of
+ * them a glob holds — a pattern one line long and a directory twelve deep were
+ * hours of a core spent inside a call, and `**` is not even the only way to
+ * write that pattern. The walk here is the standard two-pointer one, which
+ * accepts the same language in `pattern.length × target.length` steps: the last
+ * `**` passed is remembered, and a mismatch after it hands that one more segment
+ * rather than starting the search again.
+ */
+function matchSegments(pattern: readonly string[], target: readonly string[]): boolean {
+  let patternAt = 0;
+  let targetAt = 0;
+  let star = -1;
+  let resume = 0;
+  while (targetAt < target.length) {
+    const head = patternAt < pattern.length ? pattern[patternAt] : undefined;
+    if (head === "**") {
+      star = patternAt;
+      resume = targetAt;
+      patternAt += 1;
+    } else if (head !== undefined && matchSegment(head, target[targetAt] ?? "")) {
+      patternAt += 1;
+      targetAt += 1;
+    } else if (star >= 0) {
+      // Backtrack: the last `**` spans one more segment.
+      patternAt = star + 1;
+      resume += 1;
+      targetAt = resume;
+    } else {
+      return false;
+    }
+  }
+  // A trailing `**` spans nothing, which is a match; anything else left over is
+  // a segment the candidate does not have.
+  while (pattern[patternAt] === "**") patternAt += 1;
+  return patternAt === pattern.length;
+}
+
+/** One segment against one name: `*` any run of characters, `?` exactly one. */
+function matchSegment(pattern: string, name: string): boolean {
+  let patternAt = 0;
+  let nameAt = 0;
+  let star = -1;
+  let resume = 0;
+  while (nameAt < name.length) {
+    const current = pattern[patternAt];
+    if (patternAt < pattern.length && (current === "?" || current === name[nameAt])) {
+      patternAt += 1;
+      nameAt += 1;
+    } else if (patternAt < pattern.length && current === "*") {
+      star = patternAt;
+      resume = nameAt;
+      patternAt += 1;
+    } else if (star >= 0) {
+      // Backtrack: the last `*` takes one more character.
+      patternAt = star + 1;
+      resume += 1;
+      nameAt = resume;
+    } else {
+      return false;
+    }
+  }
+  while (pattern[patternAt] === "*") patternAt += 1;
+  return patternAt === pattern.length;
+}
+
+/**
+ * What a file operation that failed says, in one sentence this runtime composes.
+ *
+ * The platform's own message quotes the **resolved** path — which is the
+ * directory a `${WORKSPACE}` resolved to on this machine, and so a value
+ * `docs/trace.md` §11.1 keeps out of a trace field. So the failure is restated:
+ * the path as the *model* asked for it, and the platform's error **code**, which
+ * says what went wrong without saying what it went wrong on.
+ */
+function builtinFailure(
+  binding: BuiltinBinding,
+  verb: string,
+  requested: string,
+  error: unknown,
+): Error {
+  const code = (error as NodeJS.ErrnoException | null | undefined)?.code;
+  return new Error(
+    `\`builtin.${binding.tool}\` could not ${verb} \`${requested}\`${code === undefined ? "" : ` (${code})`}`,
+  );
+}
+
 /** A resolved `http:` block. */
 export interface HttpBinding {
   readonly method: string;
@@ -2902,6 +4316,35 @@ export interface HttpBinding {
 
 /** Run one `http:` binding (grammar 6.1, 8.3). */
 export async function runHttp(
+  binding: HttpBinding,
+  request: { readonly query?: Record<string, unknown>; readonly body?: unknown },
+  context: RunContext,
+): Promise<unknown> {
+  return await journaled(
+    context.effects,
+    "tool",
+    {
+      surface: "http",
+      method: binding.method,
+      // The whole binding, as written — [`runExec`]'s rule and its reason. A
+      // changed `headers:` (a new `Authorization`, a bumped `x-api-version`), a
+      // changed `expect_status:` or a changed `output:` shape is a different
+      // call, and an answer recorded under the old one is not this call's.
+      url: asWritten(binding.url),
+      headers: binding.headers.map((header) => ({
+        name: header.name,
+        value: asWritten(header.value),
+      })),
+      expectStatus: binding.expectStatus,
+      decoding: binding.decoding,
+      request,
+    },
+    () => runHttpLive(binding, request, context),
+  );
+}
+
+/** [`runHttp`] with nothing between it and the network. */
+async function runHttpLive(
   binding: HttpBinding,
   request: { readonly query?: Record<string, unknown>; readonly body?: unknown },
   context: RunContext,
@@ -3066,7 +4509,18 @@ export async function callFunction(
       `no host function is registered as \`${name}\`: call \`registerFunction(${JSON.stringify(name)}, …)\` before running the graph`,
     );
   }
-  return await implementation(args, context);
+  // Journaled like the other two surfaces, and it is the one where the promise
+  // is worth stating outright: a host function is arbitrary caller code, so
+  // "replay does not re-run it" is what keeps a resumed execution from mailing
+  // a second invoice. What it answered has to be JSON, which grammar 6.1
+  // already requires of it — the answer is parsed against the binding's
+  // declared `output:`.
+  return await journaled(
+    context.effects,
+    "tool",
+    { surface: "function", name, args },
+    async () => await implementation(args, context),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -4811,6 +6265,16 @@ export async function runMap(
       get deadline(): number | undefined {
         return context.deadline;
       },
+      // And the instance's own effect site, which is what keeps two items of one
+      // fan-out off each other's journal keys: the dispatch's path is the
+      // frame `docs/trace.md` §8 gives it, `<node>/<traversal>/<index>`, and an
+      // effect under it derives its key from that rather than from the map
+      // node's. The counters stay the execution's, so a node `retry:` that
+      // re-runs the whole fan-out records a second set of effects instead of
+      // colliding with the first attempt's (`docs/durability.md` §4).
+      ...(context.effects === undefined
+        ? {}
+        : { effects: context.effects.child(site.path.join("/")) }),
     };
 
     if (route.detach) {
@@ -4854,7 +6318,7 @@ export async function runMap(
         modelCalls: undefined,
         toolDispatches: undefined,
       };
-      void (async () => {
+      const delivering = (async () => {
         // `max_concurrency` is an **admission** bound over every in-flight
         // dispatch, detached included (grammar 8.6's key table, D28): a detached
         // delivery waits for a node permit to *start*, exactly as a joined
@@ -4874,12 +6338,29 @@ export async function runMap(
           gate.release();
           retire(plan.admission, admission);
         }
-      })().catch(() => {
+      })().catch((error: unknown) => {
         // Nothing it does can fail the enclosing flow instance, which is what an
         // author asks for by writing the key (grammar 8.6 rule 7). Swallowing it
         // here is also what keeps an unhandled rejection from ending the process
         // long after the map node completed.
+        //
+        // With one exception, and it is resolved q29's: a divergence may not be
+        // absorbed "by `retry:`, `on_error:`, `on_item_error:`, or any policy at
+        // any nesting depth", and `detach: true` is a policy — this is the one
+        // nesting depth where a swallowed divergence would report a resume as
+        // complete while a delivery the record claims to hold was never made.
+        // Latched rather than rethrown, because there is nothing here to throw
+        // to: [`latchDivergence`] names the two readers that fail the execution
+        // on it.
+        const diverged = divergenceOf(error);
+        if (diverged !== undefined) latchDivergence(scoped.execution.id, diverged);
       });
+      // Held against the execution rather than let go of entirely. Rule 7 is
+      // about what the flow instance waits for, and it still waits for nothing:
+      // this promise is read by [`settleDetached`] alone, on the one way out
+      // where a delivery with no record is a delivery that happens **twice**
+      // (see there, and `docs/durability.md` §3.2).
+      holdDelivery(scoped.execution.id, delivering);
       continue;
     }
 
@@ -4948,6 +6429,11 @@ export async function runMap(
           // never happened — and would carry the fan-out past a human for the
           // reason above (see [`abandonedOf`]).
           if (abandonedOf(cause) !== undefined) throw error;
+          // Nor is a journal that does not describe this run. `skip` would carry
+          // the fan-out past an effect the record claims to hold, which is the
+          // one thing resolved q29 refuses outright — and it would do so while
+          // recording the item as absorbed, so nothing downstream would know.
+          if (divergenceOf(cause) !== undefined) throw error;
           failed.push({ index, target: route.target, attempts, error: cause });
           // A dispatched `flow.*` that failed still made a trace, exactly as one
           // that completed did, and under `on_item_error: skip` the run carries
@@ -5020,6 +6506,65 @@ export async function runMap(
   };
 }
 
+/**
+ * Every detached `map` delivery still in flight, by execution.
+ *
+ * A `Set` per execution because a fan-out dispatches many and each settles on
+ * its own, and keyed by execution because that is the scope the one reader cares
+ * about: [`settleDetached`] is asked about a run that has stopped, and a
+ * delivery under a `flow:` node or inside a flow a model called belongs to the
+ * same execution as the run that started it (see [`openSession`]).
+ */
+const detachedDeliveries = new Map<string, Set<Promise<void>>>();
+
+/** Note one delivery for as long as it is in flight. See [`settleDetached`]. */
+function holdDelivery(execution: string, delivery: Promise<void>): void {
+  let held = detachedDeliveries.get(execution);
+  if (held === undefined) {
+    held = new Set();
+    detachedDeliveries.set(execution, held);
+  }
+  held.add(delivery);
+  void delivery.finally(() => {
+    const still = detachedDeliveries.get(execution);
+    if (still === undefined) return;
+    still.delete(delivery);
+    if (still.size === 0) detachedDeliveries.delete(execution);
+  });
+}
+
+/**
+ * Wait for the detached deliveries of an execution whose row **stays open**
+ * (`docs/durability.md` §3.2).
+ *
+ * Grammar 8.6 rule 7 says nothing a detached delivery does may delay the
+ * enclosing flow instance, and nothing here does: the join returned long ago,
+ * the trace entry was written without it, and this is `runFlow` on its way out
+ * of a run that has already stopped advancing.
+ *
+ * What it buys is the sentence §3.2 makes about a delivery's record — "a replay
+ * does not deliver it twice". A delivery's row is written when the delivery
+ * answers, so a process that walks out from under one leaves an effect with no
+ * record, and the generation that resumes this execution issues it again. For a
+ * run that **ended** that costs nothing, because nothing will resume it. For a
+ * run that parked at a `human` pause — `agent-compose run`'s own exit-3 path,
+ * which is not a crash and not §2's one-statement window — it is a second
+ * delivery every time.
+ *
+ * Called after the wait board is released, so a delivery holding a pause of its
+ * own is already abandoned rather than something this could wait on for ever.
+ * The loop re-reads the map because a delivery may dispatch a fan-out of its
+ * own, and every promise here has its rejection already swallowed by the
+ * `.catch` rule 7 requires, so nothing this awaits can throw.
+ */
+export async function settleDetached(execution: string): Promise<void> {
+  for (;;) {
+    const held = detachedDeliveries.get(execution);
+    if (held === undefined || held.size === 0) return;
+    await Promise.all([...held]);
+  }
+}
+
 /** A failed item, carrying how many attempts its policy made. */
 class ItemAttempts extends Error {
   readonly attempts: number;
@@ -5070,6 +6615,10 @@ async function attemptItem(
       // on for: re-executing it would re-open the pause under a node that has
       // stopped waiting, on top of repeating every effect the instance issued.
       if (abandonedOf(error) !== undefined) throw new ItemAttempts(made, error);
+      // And a journal that does not describe this run, for [`runActivity`]'s
+      // reason: a second attempt would walk the next recorded effect forward and
+      // report a disagreement one step past the one that really happened.
+      if (divergenceOf(error) !== undefined) throw new ItemAttempts(made, error);
       if (attempt === allowed) break;
       // And the rule [`runActivity`]'s ladder follows between its attempts, for
       // the same reason and at the same seam: this attempt is over, the next one
@@ -5730,6 +7279,12 @@ export function humanWaits(execution: string): readonly HumanWait[] {
  * **A settled pause is settled.** Whichever of the two sides got there first —
  * an answer, or the budget running out — wins exactly once, so a resume racing
  * an expiry is decided rather than applied twice.
+ *
+ * **An answer this accepts can still fail the run.** The pause is journaled as
+ * it settles, and a journal that refuses the record leaves the answer accepted
+ * and the *node* failing with the write's own error (see [`runHuman`]): the turn
+ * was spent, so it is not offered again here, and the run stops rather than
+ * going on from a wait its own record does not hold.
  */
 export function deliverHumanAnswer(
   execution: string,
@@ -5892,12 +7447,76 @@ export async function runHuman(
     pausedAt,
     ...(expiresAt === undefined ? {} : { expiresAt }),
   };
-  const opened: HumanPause = { pausedAt, ...(expiresAt === undefined ? {} : { expiresAt }) };
+  // The two instants that describe the pause itself rather than its end. Kept
+  // apart from [`HumanPause`] because they are also what the **journal** holds:
+  // a replayed wait is dated by the generation that opened it, not by the one
+  // that read the record back (see [`JournaledWait`]).
+  const instants: Omit<JournaledInstants, "settledAt"> = {
+    pausedAt,
+    ...(expiresAt === undefined ? {} : { expiresAt }),
+  };
+  const opened: HumanPause = instants;
+
+  // A settled wait is an effect like any other, and the one whose payload
+  // `docs/trace.md` §11 most firmly keeps out of the trace: what a person
+  // answered. The journal is where it goes, because a replay that re-asked a
+  // question somebody has already answered would be a durability story that
+  // asks the human to do the work twice (`docs/durability.md` §3.4).
+  const slot = context.effects?.claim("human", { wait: id, node: descriptor.node, shown });
+  if (slot?.held !== undefined) {
+    if (slot.held.kind === "error") throw replayedFailure(slot.held);
+    const held = slot.held.value as JournaledWait;
+    // Every instant of the entry is the record's, `pausedAt` included: this
+    // process opened no wait, and dating one by its own clock would put the
+    // answer before the question (see [`JournaledWait`]).
+    const replayedPause: HumanPause = {
+      pausedAt: held.pausedAt,
+      ...(held.expiresAt === undefined ? {} : { expiresAt: held.expiresAt }),
+      settledAt: held.settledAt,
+      settled: held.settled,
+    };
+    if (held.settled === "resumed") {
+      // Held to the contract this build declares, exactly as the delivery that
+      // recorded it was ([`deliverHumanAnswer`] parses before it settles). This
+      // is resolved q29's **second** divergence at the one record kind whose
+      // answer a person gave: an `output:` the composition has since narrowed
+      // makes the recorded answer one this run may not go on with, and no other
+      // reader would catch it — a `human` answer reaches no `parseResult`, so
+      // the note [`recordedAnswerOf`] reads is never consulted, and the run
+      // would end reporting an output its own schema refuses.
+      //
+      // Raised as a [`ReplayDivergence`] rather than as the mismatch the parse
+      // threw, and off this slot rather than off the note, for that class's
+      // reason: it has to travel past every policy and name the step
+      // (`docs/durability.md` §7), and here the step is known outright.
+      try {
+        return { output: descriptor.parse(held.output), human: replayedPause };
+      } catch (error) {
+        throw new ReplayDivergence(
+          slot,
+          `the recorded answer no longer satisfies this run's contract: ${describe(error)}`,
+        );
+      }
+    }
+    // A wait that ran out its budget replays as one: the route is the
+    // composition's, so it is read off the descriptor rather than off the
+    // record, and what the record supplies is the instants the entry shows.
+    throw new HumanExpiry(
+      descriptor.flow,
+      descriptor.node,
+      id,
+      descriptor.timeoutMs ?? 0,
+      descriptor.onTimeout ?? END_NODE,
+      replayedPause,
+    );
+  }
 
   const board = humanBoards.get(context.execution.id);
   if (board === undefined || !board.resumable) {
     // The pause happened — it is on the trace entry either way — and there is
-    // nothing that could ever answer it.
+    // nothing that could ever answer it. **Nothing is journaled**: an
+    // unanswered wait is exactly what a resumed generation has to re-park, and
+    // a record here would settle it with an outcome nobody gave (resolved q28).
     throw new HumanInterrupt(descriptor.flow, descriptor.node, id, opened);
   }
 
@@ -5925,8 +7544,61 @@ export async function runHuman(
       // the node below it goes back to work (see [`humanWatchers`]).
       announce(wait.execution);
       if (outcome === "resumed") {
-        resolve({ output: value, human: { ...opened, ...stopped(outcome) } });
+        const ended = stopped(outcome);
+        let kept: Extract<JournaledWait, { settled: "resumed" }> | undefined;
+        try {
+          kept = slot?.keep({
+            ...instants,
+            settled: "resumed",
+            output: value,
+            settledAt: ended.settledAt,
+          } satisfies JournaledWait) as Extract<JournaledWait, { settled: "resumed" }> | undefined;
+        } catch (error) {
+          // **The parked promise is what a write failure leaves through**, and
+          // that is the whole of why the record is written inside a `try` here
+          // rather than beside every other `keep` in this file. The wait is
+          // already marked settled above — it has to be, or the answer and the
+          // expiry could both land — so a throw that escaped `settle`
+          // would leave a wait nothing may settle again holding a promise
+          // nothing ever settles: [`closeHumanWaits`] and [`releaseHumanWaits`]
+          // both skip a settled entry, a later [`deliverHumanAnswer`] refuses
+          // it, and the `human` node's `await` never returns. The run does not
+          // fail, does not park and does not end — it hangs, which is the one
+          // outcome a durable execution has no way back from.
+          //
+          // So the failure travels as the node's: the journal could not record
+          // what the person said, and a run that went on from a wait its own
+          // record does not hold is a run whose resume would ask them again
+          // (`docs/durability.md` §3.4).
+          reject(error);
+          return true;
+        }
+        // What the journal now holds, where it holds anything, for [`callModel`]'s
+        // reason: the answer a person gave is a value the rest of the graph reads
+        // and a later effect's identity may be built out of, so both generations
+        // are handed the same one (`docs/durability.md` §11.1).
+        resolve({
+          output: kept === undefined ? value : kept.output,
+          human: { ...opened, ...ended },
+        });
       } else if (outcome === "expired") {
+        const ended = stopped(outcome);
+        try {
+          slot?.keep({
+            ...instants,
+            settled: "expired",
+            settledAt: ended.settledAt,
+          } satisfies JournaledWait);
+        } catch (error) {
+          // The same rule on the other settlement, and the arm where escaping
+          // would cost more: this one is reached from a `setTimeout` callback,
+          // where a throw is an uncaught exception rather than something a
+          // caller could report. The expiry is not routed either — a run that
+          // took `on_timeout:` past a wait whose expiry the journal does not
+          // hold would re-park on the resume and spend the budget again.
+          reject(error);
+          return true;
+        }
         reject(
           new HumanExpiry(
             descriptor.flow,
@@ -5934,7 +7606,7 @@ export async function runHuman(
             id,
             descriptor.timeoutMs ?? 0,
             descriptor.onTimeout ?? END_NODE,
-            { ...opened, ...stopped(outcome) },
+            { ...opened, ...ended },
           ),
         );
       } else if (outcome === "interrupted") {
@@ -5973,9 +7645,41 @@ export async function runHuman(
 }
 
 /** How a pause that reached the trace stopped waiting, as the entry spells it. */
-function stopped(outcome: "resumed" | "expired"): Pick<HumanPause, "settledAt" | "settled"> {
+function stopped(outcome: "resumed" | "expired"): {
+  readonly settledAt: string;
+  readonly settled: "resumed" | "expired";
+} {
   return { settledAt: new Date().toISOString(), settled: outcome };
 }
+
+/**
+ * One settled wait as the journal keeps it (see [`runHuman`]).
+ *
+ * The answer itself is in it, which is the one payload `docs/trace.md` §11 is
+ * most explicit about keeping out of the trace — and the clearest statement of
+ * why the journal is a second artifact rather than the trace read twice
+ * (`docs/durability.md` §7).
+ *
+ * **All three instants** are in it, not only the settlement. A pause that a
+ * person answered at 10:05 is replayed by a process that started at 11:00, and
+ * an entry that took `pausedAt` from *this* process's clock and `settledAt` from
+ * the record would say the wait was answered five and fifty-five minutes before
+ * it began. `docs/durability.md` §9 promises the opposite — "a reader of the
+ * resumed document sees what the execution did, not what this process did" — so
+ * the whole `HumanPause` is the record's, and the resumed generation's clock
+ * reaches the entry nowhere.
+ */
+interface JournaledInstants {
+  /** When the wait began — the `pausedAt` of the entry the record replays as. */
+  readonly pausedAt: string;
+  /** When it would have expired, on the generation that opened it. */
+  readonly expiresAt?: string;
+  /** When it stopped waiting. */
+  readonly settledAt: string;
+}
+
+type JournaledWait = JournaledInstants &
+  ({ readonly settled: "resumed"; readonly output: unknown } | { readonly settled: "expired" });
 
 /** LangGraph's terminal pseudo-node, as a `goto` target spells it. */
 const END_NODE = "__end__";
@@ -6060,6 +7764,192 @@ function pauseOf(error: unknown, site: string): HumanPause | undefined {
 // ---------------------------------------------------------------------------
 // One node execution, end to end
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Durable executions (PRD 5.11, resolved q26–q29, `docs/durability.md`)
+// ---------------------------------------------------------------------------
+
+/**
+ * What a caller says about the execution it is starting or resuming.
+ *
+ * `runFlow` in `./graph.ts` is the one caller, and it passes what an invocation
+ * already knows: nothing here has to be re-derived from the composition.
+ */
+export interface ExecutionOpening {
+  readonly execution: string;
+  readonly flow: string;
+  /**
+   * What started it. `manual` for `agent-compose run` and for a `manual`
+   * trigger; an `http` trigger's own name where one did.
+   *
+   * Recorded and never dispatched on: resolved q28 makes recovery replay the
+   * executions that exist rather than re-fire the trigger that created them.
+   */
+  readonly trigger: string;
+  readonly inputs: Record<string, unknown>;
+  readonly sessionKey: string;
+  /**
+   * The completion webhook this invocation asked for, where it asked for one
+   * (grammar 13.3's `callback:`).
+   *
+   * `src/serve.ts` is the only caller that passes it, and it resolves the URL
+   * when the request arrives rather than when the run ends — because the run may
+   * end in a *different process* (`docs/durability.md` §6.1), and a URL nobody
+   * recorded is a caller nobody can call back.
+   */
+  readonly callback?: string;
+  /**
+   * Whether this generation is **resuming** an execution the journal already
+   * holds, rather than starting one.
+   *
+   * The only thing it changes is whether a recorded effect may be consumed: a
+   * generation that started the execution writes and never reads (there is
+   * nothing yet to read), and a resuming one consumes what the journal holds up
+   * to the frontier and then writes past it (resolved q29).
+   */
+  readonly resuming?: boolean;
+}
+
+/**
+ * Begin journaling one execution, and answer with the journal it will use.
+ *
+ * Called before the graph is streamed, so a record exists for an execution the
+ * process may die in the middle of — which is the whole point: a lifecycle row
+ * with `status: "open"` is what `serve`'s recovery and `agent-compose resume`
+ * enumerate.
+ *
+ * Every instance nested inside the run — a `flow:` node's, a `map`'s dispatch,
+ * a subflow a model called — finds this session by execution id rather than by
+ * being handed it, exactly as the wait board is found ([`openHumanWaits`]).
+ */
+export async function openExecution(opening: ExecutionOpening): Promise<void> {
+  const journal = await openJournal();
+  const resuming = opening.resuming === true;
+  if (resuming) {
+    const row = journal.execution(opening.execution);
+    if (row !== undefined && row.journalVersion !== JOURNAL_VERSION) {
+      throw new Error(
+        `\`${opening.execution}\` was journaled at version ${row.journalVersion} and this build reads version ${JOURNAL_VERSION}: a journal is read by the compiler release that wrote it (\`docs/durability.md\` §11)`,
+      );
+    }
+  } else {
+    journal.begin({
+      id: opening.execution,
+      flow: opening.flow,
+      trigger: opening.trigger,
+      inputs: opening.inputs,
+      sessionKey: opening.sessionKey,
+      ...(opening.callback === undefined ? {} : { callback: opening.callback }),
+      status: "open",
+      journalVersion: JOURNAL_VERSION,
+      startedAt: new Date().toISOString(),
+    });
+  }
+  openSession(opening.execution, journal, resuming);
+  settledJournals.set(opening.execution, journal);
+}
+
+/**
+ * Record how one execution ended — or that it has not ended at all.
+ *
+ * Three outcomes and only two of them close the row, which is resolved q28's
+ * scope read at the one place it is decided:
+ *
+ *  * **no error** — `completed`. Nothing left to replay.
+ *  * **an interrupt** — the run reached a `human` pause with nobody to answer
+ *    it (grammar 8.7). The row stays **open**, because that is precisely the
+ *    execution `agent-compose resume` and `serve`'s recovery exist for: the
+ *    wait id is deterministic, so a resumed generation re-parks under it.
+ *  * **a divergence** — the row stays **open** too, and this is the outcome that
+ *    is easiest to get wrong. A [`ReplayDivergence`] is not a statement about
+ *    the execution; it is a statement about the disagreement between the
+ *    execution's record and the composition *this build* is holding
+ *    (`docs/durability.md` §7: "the execution stays open"). Closing it `failed`
+ *    would record this build's disagreement as the execution's outcome and make
+ *    it unresumable for ever — and `serve` replays every open execution at every
+ *    start, so one deploy that moved a prompt would burn every open execution,
+ *    parked humans included, in a single restart.
+ *  * **anything else** — `failed`. A composition's own error policy has already
+ *    decided this run; replaying it would re-derive the same failure from the
+ *    same record.
+ */
+export function settleExecution(execution: string, error?: unknown): void {
+  const journal = settledJournals.get(execution);
+  if (journal === undefined) return;
+  if (staysOpen(execution, error)) return;
+  if (error === undefined) {
+    journal.end(execution, "completed");
+    return;
+  }
+  journal.end(execution, "failed", describe(error));
+}
+
+/**
+ * Whether an execution that stopped this way is one the journal keeps **open**
+ * — and so one a resume will replay.
+ *
+ * [`settleExecution`]'s first question, exported because it is also `runFlow`'s:
+ * a run whose row stays open has not finished with the world, so what it owns
+ * has to outlive it (`src/graph.ts`, `docs/durability.md` §5). Two functions
+ * deciding it separately would eventually decide it differently, and the way
+ * that failure shows up — a partition removed under an execution somebody
+ * resumes tomorrow — is one no test of either function alone would catch.
+ *
+ * Read off the **latch** as well as off the error, because the one divergence
+ * that has no error to travel on is a detached delivery's (see
+ * [`latchDivergence`]): a run whose only divergence was raised there is not one
+ * to be closed `completed` either.
+ */
+export function staysOpen(execution: string, error?: unknown): boolean {
+  if (divergenceOf(error) !== undefined || latchedDivergence(execution) !== undefined) return true;
+  return error !== undefined && interruptOf(error) !== undefined;
+}
+
+/**
+ * Every execution one process is journaling, so [`settleExecution`] can reach
+ * the handle without the caller carrying it through a `finally`.
+ */
+const settledJournals = new Map<string, Journal>();
+
+/** Release one execution's journaling state. The file stays the project's. */
+export function closeExecution(execution: string): void {
+  settledJournals.delete(execution);
+  closeSession(execution);
+}
+
+/**
+ * The [`ReplayDivergence`] on this error's `cause` chain, if it came out of one.
+ *
+ * [`interruptOf`]'s counterpart for the other outcome a run has that is not a
+ * failure of the composition: a resume whose journal does not describe this
+ * graph. It is read for the same reason — a reporting surface should say *what
+ * happened* rather than the class of wrapper the failure arrived in — and the
+ * two are the whole of why `src/cli.ts` looks past a `FlowFailure` at all.
+ */
+export function divergenceOf(error: unknown): ReplayDivergence | undefined {
+  for (let held: unknown = error; held !== undefined && held !== null; ) {
+    if (held instanceof ReplayDivergence) return held;
+    held = (held as { cause?: unknown }).cause;
+  }
+  return undefined;
+}
+
+/** One execution's lifecycle row, or `undefined` where the journal has none. */
+export async function journaledExecution(id: string): Promise<ExecutionRow | undefined> {
+  if (!journalExists()) return undefined;
+  return (await openJournal()).execution(id);
+}
+
+/**
+ * Every execution the journal holds open, oldest first.
+ *
+ * What `serve` replays on start (resolved q28), and what a reader is pointed at
+ * by an unknown-execution diagnostic.
+ */
+export async function openExecutions(): Promise<readonly ExecutionRow[]> {
+  if (!journalExists()) return [];
+  return (await openJournal()).openExecutions();
+}
 
 /** The graph state a node reads: the composition's channels, plus `$run`. */
 export type GraphStateLike = Readonly<Record<string, unknown>> & { readonly $run: RunChannel };
@@ -6522,6 +8412,15 @@ export async function runNode(
     // entry would belong to a task nothing is left to read (see
     // [`abandonPausesUnder`], [`HumanAbandoned`]).
     if (abandonedOf(error) !== undefined) throw error;
+    // A fourth is not an outcome either, and is the one an `on_error:` must not
+    // be allowed to absorb: a journal that does not describe this run
+    // (resolved q29). `skip` would carry this graph past an effect the record
+    // claims to hold, and a `fallback:` would route on a disagreement rather
+    // than on anything the composition declared. It carries the entry the
+    // aborting path builds, so a reader still sees which node it stopped at.
+    if (divergenceOf(error) !== undefined) {
+      throw carryEntry(error, aborted(error, failure?.attempts ?? 1));
+    }
     // An expiry never travels, which is what makes `expiry.route` safe to route
     // on here: this is where one is answered, by the very node that raised it,
     // and the answer is a `Command` rather than a throw, so — unlike an

@@ -191,6 +191,7 @@ Spec(
                             },
                         ),
                         tools: [],
+                        builtins: [],
                         stores: [
                             store.docs @ 15:12..15:22,
                         ],

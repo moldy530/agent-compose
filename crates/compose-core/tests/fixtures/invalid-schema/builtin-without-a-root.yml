@@ -1,0 +1,10 @@
+# rule: every built-in takes a mandatory `root` (grammar 5.5 / D123)
+# at: /agent.reviewer/tools/0/builtin.read_file
+# via: /$defs/builtinFileTool/required
+agent.reviewer:
+  model: model.smart
+  prompt: Review the draft.
+  tools:
+    - builtin.read_file: {}
+  output:
+    verdict: { enum: [approve, revise] }

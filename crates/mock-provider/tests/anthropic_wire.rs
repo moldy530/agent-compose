@@ -696,6 +696,211 @@ fn every_answer_carries_a_request_id_including_the_errors() {
     assert_eq!(malformed.json()["request_id"], "req_mock_00000004");
 }
 
+/// A provider's `server_tools:` ride the same `tools` array as the agent's own,
+/// arrive **verbatim**, and are recorded apart from what the graph dispatches
+/// (grammar 12.1, Decision D122).
+#[test]
+fn a_declared_server_tool_arrives_verbatim_and_is_recorded_as_one() {
+    let provider = MockProvider::start().expect("a port");
+    provider.enqueue(Script::new(
+        MODEL,
+        Outcome::structured(json!({ "verdict": "approve", "feedback": "" })),
+    ));
+
+    let web_search = json!({
+        "type": "web_search_20250305",
+        "name": "web_search",
+        "max_uses": 5,
+        "allowed_domains": ["docs.example.com"],
+    });
+    let mut tools = output_schema_tool();
+    tools
+        .as_array_mut()
+        .expect("a tool list")
+        .push(web_search.clone());
+    let response = send(
+        &provider.client(),
+        &structured_request(tools, "reviewer_output"),
+    );
+    assert_eq!(response.status, 200, "{}", response.json());
+
+    let recorded = provider.requests();
+    assert!(recorded[0].is_valid(), "{:?}", recorded[0].failures());
+    assert_eq!(recorded[0].tools, ["reviewer_output"]);
+    assert_eq!(recorded[0].server_tools, ["web_search_20250305"]);
+    // Verbatim, field for field: this is the assertion resolved q30's
+    // pass-through exists for.
+    assert_eq!(recorded[0].body()["tools"][1], web_search);
+}
+
+/// The `tools` array is one namespace, and a name in it twice is a 400 whichever
+/// side runs the tool (`WIRE-NOTES` (22)).
+///
+/// Both shapes the compiler's `tool-name-collision` rule now refuses are refused
+/// here too, which is what lets the acceptance harness witness that rule rather
+/// than take the compiler's word for it: two dated revisions of one server tool
+/// carry one canonical `name:`, and a client tool may take a name the
+/// connection's suite already spends.
+#[test]
+fn a_name_the_tools_array_already_carries_is_refused_whichever_side_runs_it() {
+    let provider = MockProvider::start().expect("a port");
+    let client = provider.client();
+
+    let mut both_revisions = output_schema_tool();
+    let array = both_revisions.as_array_mut().expect("a tool list");
+    array.push(json!({ "type": "code_execution_20250522", "name": "code_execution" }));
+    array.push(json!({ "type": "code_execution_20250825", "name": "code_execution" }));
+    let response = send(
+        &client,
+        &structured_request(both_revisions, "reviewer_output"),
+    );
+    assert_eq!(response.status, 400);
+    assert_eq!(response.header(HARNESS_HEADER), Some(REFUSED_INVALID));
+    assert!(
+        response.json()["error"]["message"]
+            .as_str()
+            .expect("a message")
+            .contains("Duplicate tool name `code_execution`"),
+        "{}",
+        response.json()
+    );
+
+    let mut against_a_client_tool = output_schema_tool();
+    let array = against_a_client_tool.as_array_mut().expect("a tool list");
+    array.push(json!({
+        "name": "web_search",
+        "description": "Search the web the long way round.",
+        "input_schema": { "type": "object" },
+    }));
+    array.push(json!({ "type": "web_search_20250305", "name": "web_search" }));
+    let response = send(
+        &client,
+        &structured_request(against_a_client_tool, "reviewer_output"),
+    );
+    assert_eq!(response.status, 400);
+    assert_eq!(response.header(HARNESS_HEADER), Some(REFUSED_INVALID));
+
+    let recorded = provider.requests();
+    assert_eq!(recorded.len(), 2);
+    assert_eq!(recorded[0].failures().len(), 1);
+    assert_eq!(recorded[0].failures()[0].pointer, "tools.2.name");
+    assert_eq!(recorded[1].failures().len(), 1);
+    assert_eq!(recorded[1].failures()[0].pointer, "tools.2.name");
+}
+
+/// A scripted server-tool use comes back as the pair of blocks the Messages wire
+/// answers with — the use, and the result the service produced for it — ahead of
+/// whatever the model then said. Nothing here is for the graph to run.
+#[test]
+fn a_scripted_server_tool_use_arrives_already_answered() {
+    let provider = MockProvider::start().expect("a port");
+    provider.enqueue(Script::new(
+        MODEL,
+        Outcome::structured(json!({ "verdict": "approve", "feedback": "" })).with_server_tools(
+            vec![mock_provider::ServerToolUse::new(
+                "web_search_20250305",
+                json!({ "query": "agent-compose" }),
+                json!([{ "type": "web_search_result", "url": "https://docs.example.com/a" }]),
+            )],
+        ),
+    ));
+
+    let mut tools = output_schema_tool();
+    tools.as_array_mut().expect("a tool list").push(json!({
+        "type": "web_search_20250305",
+        "name": "web_search",
+    }));
+    let body = send(
+        &provider.client(),
+        &structured_request(tools, "reviewer_output"),
+    )
+    .json();
+    let content = body["content"].as_array().expect("a content list");
+    assert_eq!(
+        content.len(),
+        3,
+        "use, result, then the answer: {content:?}"
+    );
+    assert_eq!(content[0]["type"], "server_tool_use");
+    assert_eq!(content[0]["name"], "web_search");
+    assert_eq!(content[1]["type"], "web_search_tool_result");
+    assert_eq!(content[1]["tool_use_id"], content[0]["id"]);
+    assert_eq!(content[2]["type"], "tool_use");
+    assert_eq!(content[2]["name"], "reviewer_output");
+}
+
+/// The turn above, replayed back on the next request — which is what a tool loop
+/// does — is accepted with its server-tool blocks intact.
+#[test]
+fn a_replayed_turn_carrying_server_tool_blocks_is_accepted() {
+    let provider = MockProvider::start().expect("a port");
+    provider.enqueue(Script::new(
+        MODEL,
+        Outcome::structured(json!({ "verdict": "approve", "feedback": "" })),
+    ));
+
+    let mut tools = output_schema_tool();
+    tools.as_array_mut().expect("a tool list").push(json!({
+        "type": "web_search_20250305",
+        "name": "web_search",
+    }));
+    let request = json!({
+        "model": MODEL,
+        "max_tokens": 4096,
+        "system": "You are a meticulous technical reviewer.",
+        "messages": [
+            { "role": "user", "content": "look it up" },
+            {
+                "role": "assistant",
+                "content": [
+                    { "type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search", "input": { "query": "x" } },
+                    { "type": "web_search_tool_result", "tool_use_id": "srvtoolu_1", "content": [] },
+                    { "type": "text", "text": "I looked it up." },
+                ],
+            },
+            { "role": "user", "content": "now answer" },
+        ],
+        "tools": tools,
+        "tool_choice": { "type": "tool", "name": "reviewer_output" },
+    });
+    let response = send(&provider.client(), &request);
+    assert_eq!(response.status, 200, "{}", response.json());
+    assert!(
+        provider.requests()[0].is_valid(),
+        "{:?}",
+        provider.requests()[0].failures()
+    );
+}
+
+/// A provider runs only the server tools it was given.
+#[test]
+fn a_server_tool_the_request_did_not_declare_is_refused() {
+    let provider = MockProvider::start().expect("a port");
+    provider.enqueue(Script::new(
+        MODEL,
+        Outcome::text("looked it up").with_server_tools(vec![mock_provider::ServerToolUse::new(
+            "web_fetch_20250910",
+            json!({}),
+            json!({}),
+        )]),
+    ));
+
+    let request = json!({
+        "model": MODEL,
+        "max_tokens": 4096,
+        "messages": [{ "role": "user", "content": "hello" }],
+    });
+    let response = send(&provider.client(), &request);
+    assert_eq!(response.status, HARNESS_STATUS);
+    assert!(
+        response.json()["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("web_fetch_20250910")),
+        "{}",
+        response.json()
+    );
+}
+
 /// The same script answered twice is the same bytes, which is what makes a
 /// transcript assertable and a golden run repeatable.
 #[test]

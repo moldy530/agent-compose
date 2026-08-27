@@ -1,0 +1,19 @@
+# rule: a known `server_tools:` entry names the tool the wire pairs with its `type:` (grammar 12.1, Decision D122)
+# code: unknown-variant
+# message: `name` of server tool `web_search_20250305` of `provider.main` is `search_the_web`, which the provider does not accept
+# at: main.yml:19:13
+# help: the accepted values are `web_search`
+#
+# The Messages API pairs each dated `type:` with one fixed `name:` — this one is
+# `web_search` — and answers a request whose two disagree with a 400. So the
+# curated table pins the name rather than only requiring one: a config renamed
+# on the way past is otherwise a run that dies on its first model call with no
+# span, which is the case the strict tier of resolved q30 exists for.
+version: "0.1"
+
+provider.main:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+  server_tools:
+    - type: web_search_20250305
+      name: search_the_web

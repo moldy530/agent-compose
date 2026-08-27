@@ -1,0 +1,44 @@
+# rule: a built-in's name is on the wire beside the agent's other tools, so a
+# rule: `tool.*` of that local name is one tool with it (grammar 5.5, 11.5, D123)
+# code: tool-name-collision
+# message: `agent.a` attaches `builtin.bash` and `tool.bash`, which are one `bash` tool on the model's side
+# at: main.yml:33:7
+# label: main.yml:32:7 the other is attached here
+# help: an attached tool's name is its address's local name and a built-in's is fixed by the compiler (grammar 5.4, 5.5): rename the definition, or drop one of the two attachments
+#
+# Not decidable in one file: the built-in's name is fixed by the compiler and
+# the name it collides with is the *definition key* of a `tool.*` declared
+# somewhere else in the composition. The repair is on the definition's side,
+# because a built-in has no other name to be renamed to.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+tool.bash:
+  description: Run a command the long way round.
+  input:
+    command: { type: string }
+  output:
+    value: { type: string }
+  exec:
+    command: run-it
+agent.a:
+  model: model.m
+  prompt: Decide.
+  tools:
+    - tool.bash
+    - builtin.bash: { root: "./work", timeout: 30s }
+  output:
+    verdict: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.a
+      input: "'x'"
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }
