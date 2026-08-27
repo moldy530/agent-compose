@@ -1,6 +1,6 @@
 # cli
 
-One static binary. Five verbs act on a composition; five teach you about
+One static binary. Six verbs act on a composition; five teach you about
 compositions in general and take no spec at all.
 
 ```
@@ -9,6 +9,8 @@ agent-compose plan <before> <after> [--format human|json]
 agent-compose build <path> [--target <name>] [--out <dir>] [--check] [--format human|json]
 agent-compose run <path> <flow> [--input k=v]... [--session <key>]
                                 [--target <name>] [--out <dir>] [--format human|json]
+agent-compose resume <path> <execution> [--target <name>] [--out <dir>]
+                                        [--format human|json]
 agent-compose serve <path> [--host <host>] [--port <port>]
                            [--target <name>] [--out <dir>] [--format human|json]
 
@@ -86,11 +88,56 @@ terminal — or `AGENT_COMPOSE_INTERACTIVE=1` — it renders the question, reads
 JSON value per line, validates it against the node's `output:`, and carries on
 in the same process.
 
+Every run is **journaled**, and under the human format the first line it writes
+to stderr is the id `resume` takes:
+
+```
+execution: exec_9f1c8a3e-…
+```
+
+Under `--format json` the whole answer is still the one document on stdout, and
+`execution_id` is a field of it on both of a run's ways out.
+
+## `resume`
+
+Carries on an execution this project's journal holds open — a `run` the machine
+lost, or one that stopped at a `human` pause with nobody to ask.
+
+```sh
+agent-compose resume main.yml exec_9f1c8a3e-1b7d-4a20-9d61-1f0e8a2c4d55
+```
+
+Same build as `run`, then the graph is re-executed from its entry with every
+recorded effect **consumed**: the model answers it got, the results its tools
+produced, what its stores read, and what a person answered. Only the frontier —
+the first effect the journal does not hold — reaches the network, so a resume
+costs what is left of an execution rather than what it had already paid for.
+
+It takes no `--input` and no `--session`: the invocation it replays is the one
+the journal recorded. A resumed execution that reaches a wait nobody has
+answered re-parks under its original wait id and prompts at the terminal exactly
+as an interactive `run` does, so its exit codes are `run`'s.
+
+A journal whose record no longer matches the composition — a changed prompt, a
+renamed tool — fails the resume naming the divergent step rather than re-running
+it. `agent-compose docs targets` has where the journal lives;
+`docs/durability.md` is normative.
+
 ## `serve`
 
 Same build, then starts the generated app for the project's `http` triggers:
 start, resume, and status routes. `--port 0` takes one the operating system
 picks. Its stdout is the app's readiness line.
+
+On start it **recovers** every execution the journal holds open, before it
+accepts a connection: an execution parked on a `human` pause re-parks under the
+same wait id, so a `POST /executions/:id/resume` prepared against the process
+that died still finds its wait. Triggers are not re-fired — recovery replays the
+executions that exist.
+
+It does not wait for those replays, so an answer can arrive while one is still on
+its way back to its pause: that request is refused with `recovering: true` and
+told to send it again, rather than told there is nothing waiting for it.
 
 ## `docs`
 
@@ -137,9 +184,9 @@ dropped would leave you believing something had been installed under `$HOME`.
 | code | meaning |
 |---|---|
 | `0` | clean: nothing was reported, or a `plan` was produced, or a document was printed |
-| `1` | diagnostics were reported, `build --check` found drift, a `run` produced no answer, a `plan`'s spec did not resolve, or a discovery verb found something already there and would not replace it |
-| `2` | the command could not run: bad usage, an unreadable entrypoint, an unwritable output directory, a missing or malformed environment variable, an uninstalled dependency set, or no JavaScript runtime to launch |
-| `3` | a `run` with nobody to ask stopped at a `human` pause |
+| `1` | diagnostics were reported, `build --check` found drift, a `run` produced no answer, a `resume` diverged from its journal, a `plan`'s spec did not resolve, or a discovery verb found something already there and would not replace it |
+| `2` | the command could not run: bad usage, an unreadable entrypoint, an unwritable output directory, a missing or malformed environment variable, an uninstalled dependency set, no JavaScript runtime to launch, or a `resume` naming an execution the journal does not hold open |
+| `3` | a `run` or `resume` with nobody to ask stopped at a `human` pause |
 
 The split between `1` and `2` is *the answer is no* versus *the command could
 not be run at all*. A missing `imports:` entry is the composition's problem and
@@ -165,11 +212,11 @@ requires no deploy file at all. See `agent-compose docs targets`.
 
 | variable | read by | meaning |
 |---|---|---|
-| `AGENT_COMPOSE_INTERACTIVE` | `run` | `1` answers `human` pauses at the terminal even when stdin is not one; `0` forces the exit-`3` path. Any other value is a usage error refused before the run starts |
-| `AGENT_COMPOSE_DATA_DIR` | the emitted project | moves the project's data directory — local stores, and the trace files under `.agent-compose/traces/` |
+| `AGENT_COMPOSE_INTERACTIVE` | `run`, `resume` | `1` answers `human` pauses at the terminal even when stdin is not one; `0` forces the exit-`3` path. Any other value is a usage error refused before the run starts |
+| `AGENT_COMPOSE_DATA_DIR` | the emitted project | moves the project's data directory — local stores, the execution journal, and the trace files under `.agent-compose/traces/` |
 | `NO_COLOR` | every verb that reports | any non-empty value turns styling off, whatever the stream is |
 
 Provider credentials reach a run the same way: an `${ENV}` reference in the spec
 is resolved from the process environment at start, never at build.
 
-Normative source: `docs/plan.md`, `docs/trace.md`, `docs/grammar.md` §8.7, §14
+Normative source: `docs/plan.md`, `docs/trace.md`, `docs/durability.md`, `docs/grammar.md` §8.7, §14

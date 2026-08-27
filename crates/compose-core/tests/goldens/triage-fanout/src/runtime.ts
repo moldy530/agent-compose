@@ -75,6 +75,33 @@ import { Command, GraphRecursionError, isInterrupted } from "@langchain/langgrap
 
 import { CelError, bind, evaluate, evaluateGuard, toJson } from "./cel.ts";
 import type { CelValue, Roots, Shape } from "./cel.ts";
+import {
+  JOURNAL_VERSION,
+  ReplayDivergence,
+  closeSession,
+  journalExists,
+  journaled,
+  latchDivergence,
+  latchedDivergence,
+  openJournal,
+  openSession,
+  recordedAnswerOf,
+  recorderFor,
+  refuseRecorded,
+  replayedFailure,
+} from "./journal.ts";
+import type { EffectRecorder, ExecutionRow, Journal } from "./journal.ts";
+
+export {
+  JOURNAL_VERSION,
+  ReplayDivergence,
+  canonical,
+  journalExists,
+  journalPath,
+  latchedDivergence,
+  openJournal,
+} from "./journal.ts";
+export type { EffectKind, ExecutionRow, Journal, JournalRecord } from "./journal.ts";
 
 // ---------------------------------------------------------------------------
 // Failures
@@ -356,11 +383,37 @@ function describeIssues(value: unknown, issues: readonly ResultIssue[]): string 
 /**
  * Parse one result with the schema its contract declares, or say what was wrong
  * with it (PRD 5.2, and see [`ResultMismatch`]).
+ *
+ * This is also where resolved q29's **second** divergence is decided. A value
+ * the journal answered with is a value some earlier generation's world produced
+ * and this composition has since changed its mind about — "a recorded answer
+ * [that] fails the current contract" — and q29 says outright that such a
+ * divergence "fails the resume with a diagnostic naming the divergent step,
+ * rather than silently re-executing an effect the journal claimed to hold".
+ * A [`ResultMismatch`] would do exactly the thing it forbids: it is a node
+ * failure, so a `retry:` absorbs it and the second attempt claims an ordinal
+ * past the frontier and re-issues the effect **live** — the double side effect
+ * durability exists to prevent, reported as an ordinary bad answer. So the
+ * provenance of the value decides the class, and a [`ReplayDivergence`] travels
+ * past every policy (see [`runActivity`], [`runNode`], [`attemptItem`]).
+ *
+ * And this is where the *other* half of that decision is written down. A live
+ * answer this contract refuses is one a later generation will meet again, and
+ * whether it was refused **then** is the whole of what tells resolved q29's
+ * divergence from a mismatch the composition already had and already retried
+ * past. Only this generation can say so, so it says so on the record
+ * (`refuseRecorded` in `./journal.ts`) instead of leaving the next one to infer
+ * it from the records around it — which cannot be done, because a retried call
+ * and a repeated call leave the same sequence behind.
  */
 export function parseResult<T>(schema: ResultSchema<T>, value: unknown, subject: string): T {
   const parsed = schema.safeParse(value);
   if (parsed.success) return parsed.data as T;
-  throw new ResultMismatch(subject, value, parsed.error?.issues ?? []);
+  const refused = new ResultMismatch(subject, value, parsed.error?.issues ?? []);
+  const recorded = recordedAnswerOf(value, refused.message);
+  if (recorded !== undefined) throw recorded;
+  refuseRecorded(value);
+  throw refused;
 }
 
 /**
@@ -697,6 +750,23 @@ export interface RunContext {
    * node's entry or not depending on when the sink answered.
    */
   readonly toolDispatches?: DispatchRecord[];
+  /**
+   * Where every effect this site issues is journaled, and where a replay reads
+   * one back from (PRD resolved q26–q29, `docs/durability.md`).
+   *
+   * Rooted at the effect **site** — the instance path of grammar 9.4 this
+   * context belongs to — so the key an effect derives is the address
+   * `docs/trace.md` §8 already gives it plus the effect's kind and its ordinal
+   * at that site. [`runActivity`] creates one per node execution; [`runMap`]
+   * hands each dispatch a child rooted at the dispatch's own path, which is what
+   * keeps two items of one fan-out off each other's keys.
+   *
+   * Absent when nothing is journaling this execution — an ejected caller
+   * driving a compiled graph directly, or a unit test — and every effect site
+   * is written to work without one, which is what makes durability a property
+   * of the *invocation* rather than a dependency of the graph.
+   */
+  readonly effects?: EffectRecorder;
 }
 
 /**
@@ -897,6 +967,11 @@ export async function runActivity<T>(
   // to it on every attempt, so a rejection nobody is waiting on is still a
   // handled one.
   const expiry = budget === undefined ? undefined : untilAborted(controller.signal);
+  // One recorder per node **execution**, not per attempt: the ordinals a key
+  // carries count every effect this site ever issues in this execution, so a
+  // second attempt's model call is a second record rather than a collision with
+  // the first attempt's (`docs/durability.md` §4).
+  const effects = recorderFor(execution.id, site);
 
   try {
     let last: unknown;
@@ -917,6 +992,7 @@ export async function runActivity<T>(
           ...(storeRecords === undefined ? {} : { storeRecords }),
           ...(modelCalls === undefined ? {} : { modelCalls }),
           ...(toolDispatches === undefined ? {} : { toolDispatches }),
+          ...(effects === undefined ? {} : { effects }),
         });
         // The loser of the race rejects with nobody awaiting it — an activity
         // that observes the abort, after the deadline has already answered for
@@ -964,6 +1040,19 @@ export async function runActivity<T>(
         // on bare rather than wrapped in a [`NodeFailure`]: by construction
         // there is nothing to report it to, which is what the class means.
         if (abandonedOf(error) !== undefined) throw error;
+        // A journal that does not describe this run is not an activity outcome
+        // either, and it is the one failure a `retry:` could make *worse*: every
+        // attempt would consume the next ordinal at this site, so a ladder of
+        // three would walk three recorded effects forward and report the last
+        // disagreement rather than the first. Thrown bare, past the policy and
+        // past `on_error:`, for the reason [`ReplayDivergence`] gives.
+        //
+        // Read off the **cause chain** rather than by class, because it travels:
+        // a divergence inside a `flow:` node's instance arrives here restated as
+        // a `SubflowFailure`, and one inside a dispatched item as an
+        // `ItemFailure`. A check on the class alone would let exactly those two
+        // be retried.
+        if (divergenceOf(error) !== undefined) throw error;
         if (expired) break;
         if (attempt === attempts) break;
         // This attempt is over, so every pause it left open below it is one
@@ -1587,6 +1676,130 @@ export async function callModel(
   },
   site: ModelSite,
 ): Promise<ModelResult> {
+  const recorder = site.effects;
+  if (recorder === undefined) return await callModelLive(selection, request, site);
+
+  // The identity of *this* call, which a recorded answer has to match: which
+  // `model.*` was asked, what it was asked, and which tools it was offered.
+  // The conversation is in it because it is what a ladder answered — a replay
+  // whose second call carries a different history is a different call, and
+  // handing it the first generation's answer would be exactly the silent
+  // re-keying resolved q29 refuses.
+  const slot = recorder.claim("model", {
+    model: selection.address,
+    system: request.system,
+    turns: request.turns,
+    tools: request.tools.map((tool) => tool.name),
+    ...(request.pinned === undefined ? {} : { pinned: request.pinned.name }),
+  });
+
+  if (slot.held !== undefined) {
+    // A recorded model call is replayed **whole**: the answer the loop accepted,
+    // and every `ModelCall` record the ladder filed on the way to it — the
+    // failovers a route spent, and the refusal that ended a call that answered
+    // nothing. Without the records the resumed generation's trace would say a
+    // node called no model at all (`docs/trace.md` §7.2). A call is always kept
+    // as a *value*, whichever way it went, so the error arm is unreachable and
+    // is answered rather than assumed away.
+    if (slot.held.kind === "error") throw replayedFailure(slot.held);
+    const held = slot.held.value as JournaledCall;
+    for (const call of held.calls) site.modelCalls?.push(call);
+    if (!held.ok) throw replayedFailure({ kind: "error", ...held.error });
+    // Which member answered, off the record's own field — and off the tail of
+    // `calls` where there is one, because those are the objects just pushed into
+    // the node's channel and the trace reconciles the two lists by **identity**
+    // ([`merged`]). The field is what makes the empty case answerable: `calls`
+    // is the *node execution's* collector, and a detached `map` delivery has
+    // none by construction (D94, and see [`runMap`]) — so its record holds an
+    // empty list, and a `served` inferred from that tail would fail a resume of
+    // a composition nobody had touched.
+    const served = held.calls[held.calls.length - 1] ?? held.served;
+    if (served === undefined) {
+      throw new ReplayDivergence(
+        slot,
+        "the journal recorded an answer with no record of which model served it",
+      );
+    }
+    return { answer: held.answer, served };
+  }
+
+  const before = site.modelCalls?.length ?? 0;
+  const filed = (): ModelCall[] => (site.modelCalls ?? []).slice(before);
+  try {
+    const result = await callModelLive(selection, request, site);
+    // The **kept** answer rather than the live one, which is the same statement
+    // the replay arm above makes and has to be: a model answer is the value that
+    // most often reaches a later effect's request identity — an agent's next turn
+    // carries it verbatim — so a generation that went on with a differently
+    // ordered copy of it would be reported as divergent by its own successor
+    // (`docs/durability.md` §11.1).
+    const kept = slot.keep({
+      ok: true,
+      answer: result.answer,
+      served: result.served,
+      calls: filed(),
+    } satisfies JournaledCall) as Extract<JournaledCall, { ok: true }>;
+    return { answer: kept.answer, served: result.served };
+  } catch (error) {
+    // Kept as a **value** rather than through the slot's error path, because a
+    // spent ladder is more than its message: the records it filed are what a
+    // reader of the failed node's entry reads, and they have to survive into
+    // the resumed generation's trace with it.
+    slot.keep({
+      ok: false,
+      error: { name: nameOf(error), message: messageOf(error) },
+      calls: filed(),
+    } satisfies JournaledCall);
+    throw error;
+  }
+}
+
+/**
+ * One model call as the journal keeps it (see [`callModel`]).
+ *
+ * `served` is the member of the route that answered, and `calls` is what the
+ * ladder filed on the node's own trace channel on the way there. They overlap
+ * wherever there *is* such a channel — the last of `calls` is this same call —
+ * and the reason both are here is the case where there is not: a detached `map`
+ * delivery runs with the node's collectors detached (D94), so `calls` is empty
+ * and `served` is the only account of who answered. It is optional because a
+ * record written before this field existed has none, which
+ * `docs/durability.md` §11.2 makes a compatible reading rather than a bump.
+ */
+type JournaledCall =
+  | {
+      readonly ok: true;
+      readonly answer: ModelAnswer;
+      readonly served?: ModelCall;
+      readonly calls: ModelCall[];
+    }
+  | {
+      readonly ok: false;
+      readonly error: { readonly name: string; readonly message: string };
+      readonly calls: ModelCall[];
+    };
+
+/** An error's class name, as `describe` reads it. */
+function nameOf(error: unknown): string {
+  return error instanceof Error ? error.name : "Error";
+}
+
+/** An error's message, as `describe` reads it. */
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** [`callModel`] with nothing between it and the provider. */
+async function callModelLive(
+  selection: ModelSelection,
+  request: {
+    readonly system: string;
+    readonly turns: readonly Turn[];
+    readonly tools: readonly ToolSpec[];
+    readonly pinned?: ToolSpec;
+  },
+  site: ModelSite,
+): Promise<ModelResult> {
   const members = ladder(selection);
   const routeOn: readonly RouteCondition[] = isRoute(selection) ? selection.routeOn : [];
   const failovers: Failover[] = [];
@@ -1655,6 +1868,14 @@ export interface ModelSite {
   readonly deadline?: number;
   /** Where this call is recorded, when the caller is collecting. */
   readonly modelCalls?: ModelCall[];
+  /**
+   * Where this call is **journaled**, when the execution is durable.
+   *
+   * [`RunContext.effects`], read through the same structural equivalence the
+   * three fields above are read through: a model call is an effect of the node
+   * that made it, and its site is that node's.
+   */
+  readonly effects?: EffectRecorder;
 }
 
 /**
@@ -2754,6 +2975,41 @@ export async function runExec(
   input: unknown,
   context: RunContext,
 ): Promise<unknown> {
+  // The identity is the **whole binding** as the composition wrote it, rather
+  // than as it resolved — which is `docs/trace.md` §11.1's discipline read where
+  // the reader is a replay: one composition derives one identity whatever
+  // environment it runs in, so an execution journaled on one machine is not
+  // reported as divergent on another for having a different `${TOOLBIN}`.
+  //
+  // Whole, and that is the load-bearing word (`docs/durability.md` §3.2). A
+  // `cwd:`, an `env:` entry, an `expect_exit:` and the `output:` shape all
+  // change what this call is and what its answer means, so a binding that moved
+  // in any of them is a call this run does not make and the recorded answer is
+  // not its. Leaving one out would hand the graph an answer recorded under a
+  // binding the composition no longer has, silently.
+  return await journaled(
+    context.effects,
+    "tool",
+    {
+      surface: "exec",
+      command: asWritten(binding.command),
+      args: binding.args.map((argument) => asWritten(argument)),
+      ...(binding.cwd === undefined ? {} : { cwd: asWritten(binding.cwd) }),
+      env: binding.env.map((entry) => ({ name: entry.name, value: asWritten(entry.value) })),
+      expectExit: binding.expectExit,
+      decoding: binding.decoding,
+      input,
+    },
+    () => runExecLive(binding, input, context),
+  );
+}
+
+/** [`runExec`] with nothing between it and the child process. */
+async function runExecLive(
+  binding: ExecBinding,
+  input: unknown,
+  context: RunContext,
+): Promise<unknown> {
   const environment: Record<string, string> = { ...(process.env as Record<string, string>) };
   // The delivery slot starts empty, whatever the process was started with. The
   // name grammar 9.4 fixes is a plain one, and a variable that happened to be in
@@ -2908,6 +3164,35 @@ export interface HttpBinding {
 
 /** Run one `http:` binding (grammar 6.1, 8.3). */
 export async function runHttp(
+  binding: HttpBinding,
+  request: { readonly query?: Record<string, unknown>; readonly body?: unknown },
+  context: RunContext,
+): Promise<unknown> {
+  return await journaled(
+    context.effects,
+    "tool",
+    {
+      surface: "http",
+      method: binding.method,
+      // The whole binding, as written — [`runExec`]'s rule and its reason. A
+      // changed `headers:` (a new `Authorization`, a bumped `x-api-version`), a
+      // changed `expect_status:` or a changed `output:` shape is a different
+      // call, and an answer recorded under the old one is not this call's.
+      url: asWritten(binding.url),
+      headers: binding.headers.map((header) => ({
+        name: header.name,
+        value: asWritten(header.value),
+      })),
+      expectStatus: binding.expectStatus,
+      decoding: binding.decoding,
+      request,
+    },
+    () => runHttpLive(binding, request, context),
+  );
+}
+
+/** [`runHttp`] with nothing between it and the network. */
+async function runHttpLive(
   binding: HttpBinding,
   request: { readonly query?: Record<string, unknown>; readonly body?: unknown },
   context: RunContext,
@@ -3072,7 +3357,18 @@ export async function callFunction(
       `no host function is registered as \`${name}\`: call \`registerFunction(${JSON.stringify(name)}, …)\` before running the graph`,
     );
   }
-  return await implementation(args, context);
+  // Journaled like the other two surfaces, and it is the one where the promise
+  // is worth stating outright: a host function is arbitrary caller code, so
+  // "replay does not re-run it" is what keeps a resumed execution from mailing
+  // a second invoice. What it answered has to be JSON, which grammar 6.1
+  // already requires of it — the answer is parsed against the binding's
+  // declared `output:`.
+  return await journaled(
+    context.effects,
+    "tool",
+    { surface: "function", name, args },
+    async () => await implementation(args, context),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -4817,6 +5113,16 @@ export async function runMap(
       get deadline(): number | undefined {
         return context.deadline;
       },
+      // And the instance's own effect site, which is what keeps two items of one
+      // fan-out off each other's journal keys: the dispatch's path is the
+      // frame `docs/trace.md` §8 gives it, `<node>/<traversal>/<index>`, and an
+      // effect under it derives its key from that rather than from the map
+      // node's. The counters stay the execution's, so a node `retry:` that
+      // re-runs the whole fan-out records a second set of effects instead of
+      // colliding with the first attempt's (`docs/durability.md` §4).
+      ...(context.effects === undefined
+        ? {}
+        : { effects: context.effects.child(site.path.join("/")) }),
     };
 
     if (route.detach) {
@@ -4860,7 +5166,7 @@ export async function runMap(
         modelCalls: undefined,
         toolDispatches: undefined,
       };
-      void (async () => {
+      const delivering = (async () => {
         // `max_concurrency` is an **admission** bound over every in-flight
         // dispatch, detached included (grammar 8.6's key table, D28): a detached
         // delivery waits for a node permit to *start*, exactly as a joined
@@ -4880,12 +5186,29 @@ export async function runMap(
           gate.release();
           retire(plan.admission, admission);
         }
-      })().catch(() => {
+      })().catch((error: unknown) => {
         // Nothing it does can fail the enclosing flow instance, which is what an
         // author asks for by writing the key (grammar 8.6 rule 7). Swallowing it
         // here is also what keeps an unhandled rejection from ending the process
         // long after the map node completed.
+        //
+        // With one exception, and it is resolved q29's: a divergence may not be
+        // absorbed "by `retry:`, `on_error:`, `on_item_error:`, or any policy at
+        // any nesting depth", and `detach: true` is a policy — this is the one
+        // nesting depth where a swallowed divergence would report a resume as
+        // complete while a delivery the record claims to hold was never made.
+        // Latched rather than rethrown, because there is nothing here to throw
+        // to: [`latchDivergence`] names the two readers that fail the execution
+        // on it.
+        const diverged = divergenceOf(error);
+        if (diverged !== undefined) latchDivergence(scoped.execution.id, diverged);
       });
+      // Held against the execution rather than let go of entirely. Rule 7 is
+      // about what the flow instance waits for, and it still waits for nothing:
+      // this promise is read by [`settleDetached`] alone, on the one way out
+      // where a delivery with no record is a delivery that happens **twice**
+      // (see there, and `docs/durability.md` §3.2).
+      holdDelivery(scoped.execution.id, delivering);
       continue;
     }
 
@@ -4954,6 +5277,11 @@ export async function runMap(
           // never happened — and would carry the fan-out past a human for the
           // reason above (see [`abandonedOf`]).
           if (abandonedOf(cause) !== undefined) throw error;
+          // Nor is a journal that does not describe this run. `skip` would carry
+          // the fan-out past an effect the record claims to hold, which is the
+          // one thing resolved q29 refuses outright — and it would do so while
+          // recording the item as absorbed, so nothing downstream would know.
+          if (divergenceOf(cause) !== undefined) throw error;
           failed.push({ index, target: route.target, attempts, error: cause });
           // A dispatched `flow.*` that failed still made a trace, exactly as one
           // that completed did, and under `on_item_error: skip` the run carries
@@ -5026,6 +5354,65 @@ export async function runMap(
   };
 }
 
+/**
+ * Every detached `map` delivery still in flight, by execution.
+ *
+ * A `Set` per execution because a fan-out dispatches many and each settles on
+ * its own, and keyed by execution because that is the scope the one reader cares
+ * about: [`settleDetached`] is asked about a run that has stopped, and a
+ * delivery under a `flow:` node or inside a flow a model called belongs to the
+ * same execution as the run that started it (see [`openSession`]).
+ */
+const detachedDeliveries = new Map<string, Set<Promise<void>>>();
+
+/** Note one delivery for as long as it is in flight. See [`settleDetached`]. */
+function holdDelivery(execution: string, delivery: Promise<void>): void {
+  let held = detachedDeliveries.get(execution);
+  if (held === undefined) {
+    held = new Set();
+    detachedDeliveries.set(execution, held);
+  }
+  held.add(delivery);
+  void delivery.finally(() => {
+    const still = detachedDeliveries.get(execution);
+    if (still === undefined) return;
+    still.delete(delivery);
+    if (still.size === 0) detachedDeliveries.delete(execution);
+  });
+}
+
+/**
+ * Wait for the detached deliveries of an execution whose row **stays open**
+ * (`docs/durability.md` §3.2).
+ *
+ * Grammar 8.6 rule 7 says nothing a detached delivery does may delay the
+ * enclosing flow instance, and nothing here does: the join returned long ago,
+ * the trace entry was written without it, and this is `runFlow` on its way out
+ * of a run that has already stopped advancing.
+ *
+ * What it buys is the sentence §3.2 makes about a delivery's record — "a replay
+ * does not deliver it twice". A delivery's row is written when the delivery
+ * answers, so a process that walks out from under one leaves an effect with no
+ * record, and the generation that resumes this execution issues it again. For a
+ * run that **ended** that costs nothing, because nothing will resume it. For a
+ * run that parked at a `human` pause — `agent-compose run`'s own exit-3 path,
+ * which is not a crash and not §2's one-statement window — it is a second
+ * delivery every time.
+ *
+ * Called after the wait board is released, so a delivery holding a pause of its
+ * own is already abandoned rather than something this could wait on for ever.
+ * The loop re-reads the map because a delivery may dispatch a fan-out of its
+ * own, and every promise here has its rejection already swallowed by the
+ * `.catch` rule 7 requires, so nothing this awaits can throw.
+ */
+export async function settleDetached(execution: string): Promise<void> {
+  for (;;) {
+    const held = detachedDeliveries.get(execution);
+    if (held === undefined || held.size === 0) return;
+    await Promise.all([...held]);
+  }
+}
+
 /** A failed item, carrying how many attempts its policy made. */
 class ItemAttempts extends Error {
   readonly attempts: number;
@@ -5076,6 +5463,10 @@ async function attemptItem(
       // on for: re-executing it would re-open the pause under a node that has
       // stopped waiting, on top of repeating every effect the instance issued.
       if (abandonedOf(error) !== undefined) throw new ItemAttempts(made, error);
+      // And a journal that does not describe this run, for [`runActivity`]'s
+      // reason: a second attempt would walk the next recorded effect forward and
+      // report a disagreement one step past the one that really happened.
+      if (divergenceOf(error) !== undefined) throw new ItemAttempts(made, error);
       if (attempt === allowed) break;
       // And the rule [`runActivity`]'s ladder follows between its attempts, for
       // the same reason and at the same seam: this attempt is over, the next one
@@ -5736,6 +6127,12 @@ export function humanWaits(execution: string): readonly HumanWait[] {
  * **A settled pause is settled.** Whichever of the two sides got there first —
  * an answer, or the budget running out — wins exactly once, so a resume racing
  * an expiry is decided rather than applied twice.
+ *
+ * **An answer this accepts can still fail the run.** The pause is journaled as
+ * it settles, and a journal that refuses the record leaves the answer accepted
+ * and the *node* failing with the write's own error (see [`runHuman`]): the turn
+ * was spent, so it is not offered again here, and the run stops rather than
+ * going on from a wait its own record does not hold.
  */
 export function deliverHumanAnswer(
   execution: string,
@@ -5898,12 +6295,76 @@ export async function runHuman(
     pausedAt,
     ...(expiresAt === undefined ? {} : { expiresAt }),
   };
-  const opened: HumanPause = { pausedAt, ...(expiresAt === undefined ? {} : { expiresAt }) };
+  // The two instants that describe the pause itself rather than its end. Kept
+  // apart from [`HumanPause`] because they are also what the **journal** holds:
+  // a replayed wait is dated by the generation that opened it, not by the one
+  // that read the record back (see [`JournaledWait`]).
+  const instants: Omit<JournaledInstants, "settledAt"> = {
+    pausedAt,
+    ...(expiresAt === undefined ? {} : { expiresAt }),
+  };
+  const opened: HumanPause = instants;
+
+  // A settled wait is an effect like any other, and the one whose payload
+  // `docs/trace.md` §11 most firmly keeps out of the trace: what a person
+  // answered. The journal is where it goes, because a replay that re-asked a
+  // question somebody has already answered would be a durability story that
+  // asks the human to do the work twice (`docs/durability.md` §3.4).
+  const slot = context.effects?.claim("human", { wait: id, node: descriptor.node, shown });
+  if (slot?.held !== undefined) {
+    if (slot.held.kind === "error") throw replayedFailure(slot.held);
+    const held = slot.held.value as JournaledWait;
+    // Every instant of the entry is the record's, `pausedAt` included: this
+    // process opened no wait, and dating one by its own clock would put the
+    // answer before the question (see [`JournaledWait`]).
+    const replayedPause: HumanPause = {
+      pausedAt: held.pausedAt,
+      ...(held.expiresAt === undefined ? {} : { expiresAt: held.expiresAt }),
+      settledAt: held.settledAt,
+      settled: held.settled,
+    };
+    if (held.settled === "resumed") {
+      // Held to the contract this build declares, exactly as the delivery that
+      // recorded it was ([`deliverHumanAnswer`] parses before it settles). This
+      // is resolved q29's **second** divergence at the one record kind whose
+      // answer a person gave: an `output:` the composition has since narrowed
+      // makes the recorded answer one this run may not go on with, and no other
+      // reader would catch it — a `human` answer reaches no `parseResult`, so
+      // the note [`recordedAnswerOf`] reads is never consulted, and the run
+      // would end reporting an output its own schema refuses.
+      //
+      // Raised as a [`ReplayDivergence`] rather than as the mismatch the parse
+      // threw, and off this slot rather than off the note, for that class's
+      // reason: it has to travel past every policy and name the step
+      // (`docs/durability.md` §7), and here the step is known outright.
+      try {
+        return { output: descriptor.parse(held.output), human: replayedPause };
+      } catch (error) {
+        throw new ReplayDivergence(
+          slot,
+          `the recorded answer no longer satisfies this run's contract: ${describe(error)}`,
+        );
+      }
+    }
+    // A wait that ran out its budget replays as one: the route is the
+    // composition's, so it is read off the descriptor rather than off the
+    // record, and what the record supplies is the instants the entry shows.
+    throw new HumanExpiry(
+      descriptor.flow,
+      descriptor.node,
+      id,
+      descriptor.timeoutMs ?? 0,
+      descriptor.onTimeout ?? END_NODE,
+      replayedPause,
+    );
+  }
 
   const board = humanBoards.get(context.execution.id);
   if (board === undefined || !board.resumable) {
     // The pause happened — it is on the trace entry either way — and there is
-    // nothing that could ever answer it.
+    // nothing that could ever answer it. **Nothing is journaled**: an
+    // unanswered wait is exactly what a resumed generation has to re-park, and
+    // a record here would settle it with an outcome nobody gave (resolved q28).
     throw new HumanInterrupt(descriptor.flow, descriptor.node, id, opened);
   }
 
@@ -5931,8 +6392,61 @@ export async function runHuman(
       // the node below it goes back to work (see [`humanWatchers`]).
       announce(wait.execution);
       if (outcome === "resumed") {
-        resolve({ output: value, human: { ...opened, ...stopped(outcome) } });
+        const ended = stopped(outcome);
+        let kept: Extract<JournaledWait, { settled: "resumed" }> | undefined;
+        try {
+          kept = slot?.keep({
+            ...instants,
+            settled: "resumed",
+            output: value,
+            settledAt: ended.settledAt,
+          } satisfies JournaledWait) as Extract<JournaledWait, { settled: "resumed" }> | undefined;
+        } catch (error) {
+          // **The parked promise is what a write failure leaves through**, and
+          // that is the whole of why the record is written inside a `try` here
+          // rather than beside every other `keep` in this file. The wait is
+          // already marked settled above — it has to be, or the answer and the
+          // expiry could both land — so a throw that escaped `settle`
+          // would leave a wait nothing may settle again holding a promise
+          // nothing ever settles: [`closeHumanWaits`] and [`releaseHumanWaits`]
+          // both skip a settled entry, a later [`deliverHumanAnswer`] refuses
+          // it, and the `human` node's `await` never returns. The run does not
+          // fail, does not park and does not end — it hangs, which is the one
+          // outcome a durable execution has no way back from.
+          //
+          // So the failure travels as the node's: the journal could not record
+          // what the person said, and a run that went on from a wait its own
+          // record does not hold is a run whose resume would ask them again
+          // (`docs/durability.md` §3.4).
+          reject(error);
+          return true;
+        }
+        // What the journal now holds, where it holds anything, for [`callModel`]'s
+        // reason: the answer a person gave is a value the rest of the graph reads
+        // and a later effect's identity may be built out of, so both generations
+        // are handed the same one (`docs/durability.md` §11.1).
+        resolve({
+          output: kept === undefined ? value : kept.output,
+          human: { ...opened, ...ended },
+        });
       } else if (outcome === "expired") {
+        const ended = stopped(outcome);
+        try {
+          slot?.keep({
+            ...instants,
+            settled: "expired",
+            settledAt: ended.settledAt,
+          } satisfies JournaledWait);
+        } catch (error) {
+          // The same rule on the other settlement, and the arm where escaping
+          // would cost more: this one is reached from a `setTimeout` callback,
+          // where a throw is an uncaught exception rather than something a
+          // caller could report. The expiry is not routed either — a run that
+          // took `on_timeout:` past a wait whose expiry the journal does not
+          // hold would re-park on the resume and spend the budget again.
+          reject(error);
+          return true;
+        }
         reject(
           new HumanExpiry(
             descriptor.flow,
@@ -5940,7 +6454,7 @@ export async function runHuman(
             id,
             descriptor.timeoutMs ?? 0,
             descriptor.onTimeout ?? END_NODE,
-            { ...opened, ...stopped(outcome) },
+            { ...opened, ...ended },
           ),
         );
       } else if (outcome === "interrupted") {
@@ -5979,9 +6493,41 @@ export async function runHuman(
 }
 
 /** How a pause that reached the trace stopped waiting, as the entry spells it. */
-function stopped(outcome: "resumed" | "expired"): Pick<HumanPause, "settledAt" | "settled"> {
+function stopped(outcome: "resumed" | "expired"): {
+  readonly settledAt: string;
+  readonly settled: "resumed" | "expired";
+} {
   return { settledAt: new Date().toISOString(), settled: outcome };
 }
+
+/**
+ * One settled wait as the journal keeps it (see [`runHuman`]).
+ *
+ * The answer itself is in it, which is the one payload `docs/trace.md` §11 is
+ * most explicit about keeping out of the trace — and the clearest statement of
+ * why the journal is a second artifact rather than the trace read twice
+ * (`docs/durability.md` §7).
+ *
+ * **All three instants** are in it, not only the settlement. A pause that a
+ * person answered at 10:05 is replayed by a process that started at 11:00, and
+ * an entry that took `pausedAt` from *this* process's clock and `settledAt` from
+ * the record would say the wait was answered five and fifty-five minutes before
+ * it began. `docs/durability.md` §9 promises the opposite — "a reader of the
+ * resumed document sees what the execution did, not what this process did" — so
+ * the whole `HumanPause` is the record's, and the resumed generation's clock
+ * reaches the entry nowhere.
+ */
+interface JournaledInstants {
+  /** When the wait began — the `pausedAt` of the entry the record replays as. */
+  readonly pausedAt: string;
+  /** When it would have expired, on the generation that opened it. */
+  readonly expiresAt?: string;
+  /** When it stopped waiting. */
+  readonly settledAt: string;
+}
+
+type JournaledWait = JournaledInstants &
+  ({ readonly settled: "resumed"; readonly output: unknown } | { readonly settled: "expired" });
 
 /** LangGraph's terminal pseudo-node, as a `goto` target spells it. */
 const END_NODE = "__end__";
@@ -6066,6 +6612,192 @@ function pauseOf(error: unknown, site: string): HumanPause | undefined {
 // ---------------------------------------------------------------------------
 // One node execution, end to end
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Durable executions (PRD 5.11, resolved q26–q29, `docs/durability.md`)
+// ---------------------------------------------------------------------------
+
+/**
+ * What a caller says about the execution it is starting or resuming.
+ *
+ * `runFlow` in `./graph.ts` is the one caller, and it passes what an invocation
+ * already knows: nothing here has to be re-derived from the composition.
+ */
+export interface ExecutionOpening {
+  readonly execution: string;
+  readonly flow: string;
+  /**
+   * What started it. `manual` for `agent-compose run` and for a `manual`
+   * trigger; an `http` trigger's own name where one did.
+   *
+   * Recorded and never dispatched on: resolved q28 makes recovery replay the
+   * executions that exist rather than re-fire the trigger that created them.
+   */
+  readonly trigger: string;
+  readonly inputs: Record<string, unknown>;
+  readonly sessionKey: string;
+  /**
+   * The completion webhook this invocation asked for, where it asked for one
+   * (grammar 13.3's `callback:`).
+   *
+   * `src/serve.ts` is the only caller that passes it, and it resolves the URL
+   * when the request arrives rather than when the run ends — because the run may
+   * end in a *different process* (`docs/durability.md` §6.1), and a URL nobody
+   * recorded is a caller nobody can call back.
+   */
+  readonly callback?: string;
+  /**
+   * Whether this generation is **resuming** an execution the journal already
+   * holds, rather than starting one.
+   *
+   * The only thing it changes is whether a recorded effect may be consumed: a
+   * generation that started the execution writes and never reads (there is
+   * nothing yet to read), and a resuming one consumes what the journal holds up
+   * to the frontier and then writes past it (resolved q29).
+   */
+  readonly resuming?: boolean;
+}
+
+/**
+ * Begin journaling one execution, and answer with the journal it will use.
+ *
+ * Called before the graph is streamed, so a record exists for an execution the
+ * process may die in the middle of — which is the whole point: a lifecycle row
+ * with `status: "open"` is what `serve`'s recovery and `agent-compose resume`
+ * enumerate.
+ *
+ * Every instance nested inside the run — a `flow:` node's, a `map`'s dispatch,
+ * a subflow a model called — finds this session by execution id rather than by
+ * being handed it, exactly as the wait board is found ([`openHumanWaits`]).
+ */
+export async function openExecution(opening: ExecutionOpening): Promise<void> {
+  const journal = await openJournal();
+  const resuming = opening.resuming === true;
+  if (resuming) {
+    const row = journal.execution(opening.execution);
+    if (row !== undefined && row.journalVersion !== JOURNAL_VERSION) {
+      throw new Error(
+        `\`${opening.execution}\` was journaled at version ${row.journalVersion} and this build reads version ${JOURNAL_VERSION}: a journal is read by the compiler release that wrote it (\`docs/durability.md\` §11)`,
+      );
+    }
+  } else {
+    journal.begin({
+      id: opening.execution,
+      flow: opening.flow,
+      trigger: opening.trigger,
+      inputs: opening.inputs,
+      sessionKey: opening.sessionKey,
+      ...(opening.callback === undefined ? {} : { callback: opening.callback }),
+      status: "open",
+      journalVersion: JOURNAL_VERSION,
+      startedAt: new Date().toISOString(),
+    });
+  }
+  openSession(opening.execution, journal, resuming);
+  settledJournals.set(opening.execution, journal);
+}
+
+/**
+ * Record how one execution ended — or that it has not ended at all.
+ *
+ * Three outcomes and only two of them close the row, which is resolved q28's
+ * scope read at the one place it is decided:
+ *
+ *  * **no error** — `completed`. Nothing left to replay.
+ *  * **an interrupt** — the run reached a `human` pause with nobody to answer
+ *    it (grammar 8.7). The row stays **open**, because that is precisely the
+ *    execution `agent-compose resume` and `serve`'s recovery exist for: the
+ *    wait id is deterministic, so a resumed generation re-parks under it.
+ *  * **a divergence** — the row stays **open** too, and this is the outcome that
+ *    is easiest to get wrong. A [`ReplayDivergence`] is not a statement about
+ *    the execution; it is a statement about the disagreement between the
+ *    execution's record and the composition *this build* is holding
+ *    (`docs/durability.md` §7: "the execution stays open"). Closing it `failed`
+ *    would record this build's disagreement as the execution's outcome and make
+ *    it unresumable for ever — and `serve` replays every open execution at every
+ *    start, so one deploy that moved a prompt would burn every open execution,
+ *    parked humans included, in a single restart.
+ *  * **anything else** — `failed`. A composition's own error policy has already
+ *    decided this run; replaying it would re-derive the same failure from the
+ *    same record.
+ */
+export function settleExecution(execution: string, error?: unknown): void {
+  const journal = settledJournals.get(execution);
+  if (journal === undefined) return;
+  if (staysOpen(execution, error)) return;
+  if (error === undefined) {
+    journal.end(execution, "completed");
+    return;
+  }
+  journal.end(execution, "failed", describe(error));
+}
+
+/**
+ * Whether an execution that stopped this way is one the journal keeps **open**
+ * — and so one a resume will replay.
+ *
+ * [`settleExecution`]'s first question, exported because it is also `runFlow`'s:
+ * a run whose row stays open has not finished with the world, so what it owns
+ * has to outlive it (`src/graph.ts`, `docs/durability.md` §5). Two functions
+ * deciding it separately would eventually decide it differently, and the way
+ * that failure shows up — a partition removed under an execution somebody
+ * resumes tomorrow — is one no test of either function alone would catch.
+ *
+ * Read off the **latch** as well as off the error, because the one divergence
+ * that has no error to travel on is a detached delivery's (see
+ * [`latchDivergence`]): a run whose only divergence was raised there is not one
+ * to be closed `completed` either.
+ */
+export function staysOpen(execution: string, error?: unknown): boolean {
+  if (divergenceOf(error) !== undefined || latchedDivergence(execution) !== undefined) return true;
+  return error !== undefined && interruptOf(error) !== undefined;
+}
+
+/**
+ * Every execution one process is journaling, so [`settleExecution`] can reach
+ * the handle without the caller carrying it through a `finally`.
+ */
+const settledJournals = new Map<string, Journal>();
+
+/** Release one execution's journaling state. The file stays the project's. */
+export function closeExecution(execution: string): void {
+  settledJournals.delete(execution);
+  closeSession(execution);
+}
+
+/**
+ * The [`ReplayDivergence`] on this error's `cause` chain, if it came out of one.
+ *
+ * [`interruptOf`]'s counterpart for the other outcome a run has that is not a
+ * failure of the composition: a resume whose journal does not describe this
+ * graph. It is read for the same reason — a reporting surface should say *what
+ * happened* rather than the class of wrapper the failure arrived in — and the
+ * two are the whole of why `src/cli.ts` looks past a `FlowFailure` at all.
+ */
+export function divergenceOf(error: unknown): ReplayDivergence | undefined {
+  for (let held: unknown = error; held !== undefined && held !== null; ) {
+    if (held instanceof ReplayDivergence) return held;
+    held = (held as { cause?: unknown }).cause;
+  }
+  return undefined;
+}
+
+/** One execution's lifecycle row, or `undefined` where the journal has none. */
+export async function journaledExecution(id: string): Promise<ExecutionRow | undefined> {
+  if (!journalExists()) return undefined;
+  return (await openJournal()).execution(id);
+}
+
+/**
+ * Every execution the journal holds open, oldest first.
+ *
+ * What `serve` replays on start (resolved q28), and what a reader is pointed at
+ * by an unknown-execution diagnostic.
+ */
+export async function openExecutions(): Promise<readonly ExecutionRow[]> {
+  if (!journalExists()) return [];
+  return (await openJournal()).openExecutions();
+}
 
 /** The graph state a node reads: the composition's channels, plus `$run`. */
 export type GraphStateLike = Readonly<Record<string, unknown>> & { readonly $run: RunChannel };
@@ -6528,6 +7260,15 @@ export async function runNode(
     // entry would belong to a task nothing is left to read (see
     // [`abandonPausesUnder`], [`HumanAbandoned`]).
     if (abandonedOf(error) !== undefined) throw error;
+    // A fourth is not an outcome either, and is the one an `on_error:` must not
+    // be allowed to absorb: a journal that does not describe this run
+    // (resolved q29). `skip` would carry this graph past an effect the record
+    // claims to hold, and a `fallback:` would route on a disagreement rather
+    // than on anything the composition declared. It carries the entry the
+    // aborting path builds, so a reader still sees which node it stopped at.
+    if (divergenceOf(error) !== undefined) {
+      throw carryEntry(error, aborted(error, failure?.attempts ?? 1));
+    }
     // An expiry never travels, which is what makes `expiry.route` safe to route
     // on here: this is where one is answered, by the very node that raised it,
     // and the answer is a `Command` rather than a throw, so — unlike an

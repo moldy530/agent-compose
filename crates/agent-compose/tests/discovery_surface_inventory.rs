@@ -784,7 +784,7 @@ fn a_verb_is_not_documented_by_a_longer_one_that_starts_with_it() {
 /// [`every_grammar_section_is_claimed_by_a_topic`] applies to the grammar.
 #[test]
 fn the_help_lists_the_verbs_that_act_before_the_verbs_that_teach() {
-    const ACT: &[&str] = &["validate", "plan", "build", "run", "serve"];
+    const ACT: &[&str] = &["validate", "plan", "build", "resume", "run", "serve"];
     const TEACH: &[&str] = &["docs", "explain", "init", "schema", "skill"];
 
     let mut claimed: Vec<String> = ACT

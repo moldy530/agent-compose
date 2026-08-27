@@ -1,5 +1,11 @@
-//! The M1 completion inventory: every criterion PRD §7 M1 promises, mapped to
-//! the acceptance test that decides it and to whether that test runs yet.
+//! The completion inventory: every criterion PRD §7 promises of a *running*
+//! compiled graph, mapped to the acceptance test that decides it and to whether
+//! that test runs yet.
+//!
+//! M1 is the bulk of it and is what the shape below is built around. M3's first
+//! bullet — durable execution — is here too, for the reason the file exists at
+//! all: it is a promise about what a compiled graph does when it runs, and the
+//! tests that decide it live in the same suite.
 //!
 //! `crates/compose-core/tests/static_check_inventory.rs` is the companion for M0, and this
 //! file is the same idea one milestone on: the PRD's own sentences, transcribed
@@ -52,6 +58,8 @@ enum Bullet {
     Harness,
     /// Not PRD §7 M1's own enumeration: CLAUDE.md's *Validation strategy*.
     Strategy,
+    /// PRD §7 M3's first bullet: "**Durable execution**: …".
+    Durability,
 }
 
 /// Whether a criterion's tests run today.
@@ -994,12 +1002,231 @@ const STRATEGY: &[Criterion] = &[
     },
 ];
 
+/// PRD §7 M3's first bullet, whose four clauses are the four claims durability
+/// makes: the record, what a resume does with it, the two recovery surfaces, and
+/// the failure that is not a re-execution.
+///
+/// The bullet is one sentence rather than an enumeration, so — like `HARNESS` —
+/// its phrases are held to it by containment rather than by splitting on `, `.
+/// The resolved questions behind it (q26–q29) are quoted in each test.
+const DURABILITY: &[Criterion] = &[
+    Criterion {
+        bullet: Bullet::Durability,
+        phrase: "a deploy-target-bound journal (SQLite locally, Postgres when distributed) records every effect",
+        tests: &[
+            // The two effect kinds a repeat is *visible* in, which is what makes
+            // "records every effect" a claim a test can decide rather than an
+            // inventory of call sites.
+            (
+                "a_replayed_prefix_re_issues_neither_its_store_write_nor_its_subprocess",
+                Status::Live,
+            ),
+            // …and the half a write cannot decide: a **read** is recorded too,
+            // and what it answers has to be what the generation that recorded it
+            // went on with, or the two generations compose different requests
+            // out of one composition (`docs/durability.md` §11.1).
+            (
+                "a_replayed_store_read_is_the_row_the_recording_generation_went_on_with",
+                Status::Live,
+            ),
+        ],
+    },
+    Criterion {
+        bullet: Bullet::Durability,
+        phrase: "a resumed execution replays that record read-only up to the frontier",
+        tests: &[
+            // The core assertion of resolved q29, decided by the provider's own
+            // request log: the recorded calls do not reach it a second time.
+            (
+                "a_resumed_run_consumes_its_recorded_model_answers_instead_of_asking_again",
+                Status::Live,
+            ),
+            // …and the failure that is *not* a re-execution: a journal that no
+            // longer describes this composition stops the resume naming the step
+            // it disagrees at.
+            (
+                "a_resume_whose_journal_no_longer_describes_the_run_names_the_divergent_step",
+                Status::Live,
+            ),
+            // …the other divergence resolved q29 names, which is not a request
+            // that moved but an answer this composition no longer accepts.
+            (
+                "a_recorded_answer_that_fails_the_current_contract_is_a_divergence_not_a_retry",
+                Status::Live,
+            ),
+            // …and its other side, which is what keeps that from breaking a
+            // composition nobody touched: a mismatch the recording generation's
+            // own ladder already absorbed is replayed, not re-decided.
+            (
+                "a_recorded_answer_the_original_retried_past_is_retried_past_again",
+                Status::Live,
+            ),
+            // …and what tells those two apart, at the site that has more than
+            // one effect of a kind. Nothing about the records *around* the
+            // answer can: two different tools at one site defeat counting, and
+            // one tool called twice with the same arguments defeats counting
+            // plus request identity, so the record says which it was.
+            (
+                "a_contract_that_moved_on_one_of_two_tools_at_a_site_is_not_read_as_a_retry",
+                Status::Live,
+            ),
+            (
+                "a_contract_that_moved_on_a_repeated_call_at_a_site_is_not_read_as_a_retry",
+                Status::Live,
+            ),
+            // …and the one world a live effect past the frontier cannot assume
+            // the record left behind: a store whose rows died with the process.
+            (
+                "a_store_that_died_with_the_process_refuses_the_resume_it_cannot_answer",
+                Status::Live,
+            ),
+            // …and its opposite, which is the premise the refusal is carved out
+            // of: a store that *does* outlive the process has to be there, so a
+            // run that only parked leaves its own `blob` partition alone.
+            (
+                "a_parked_runs_own_blob_store_is_there_for_the_generation_that_resumes",
+                Status::Live,
+            ),
+            // …and the second divergence at the one record kind that reaches no
+            // result parse: an answer a person gave, under an `output:` the
+            // composition has since narrowed.
+            (
+                "a_recorded_human_answer_the_composition_no_longer_admits_is_a_divergence",
+                Status::Live,
+            ),
+            // …and the three nesting depths a divergence may not be absorbed at:
+            // a dispatched subflow under `on_item_error: skip`, the item retry
+            // the other form of that key gives, and a delivery nothing waits for.
+            (
+                "a_divergence_inside_a_dispatched_subflow_is_not_absorbed_by_on_item_error",
+                Status::Live,
+            ),
+            (
+                "a_divergence_inside_a_dispatched_item_is_not_retried_by_its_item_policy",
+                Status::Live,
+            ),
+            (
+                "a_divergence_in_a_detached_delivery_fails_the_resume_it_cannot_be_thrown_out_of",
+                Status::Live,
+            ),
+            // …and the other half of that depth, which is the one a delivery's
+            // *own* record has to carry: nothing joins it, so none of the
+            // `ModelCall` entries a joined call files are filed at all, and a
+            // replay that inferred the answering member from them would report a
+            // composition nobody touched as divergent — permanently, because a
+            // divergence never closes the row.
+            (
+                "a_detached_delivery_that_called_a_model_is_replayed_rather_than_reported_as_divergent",
+                Status::Live,
+            ),
+            // …and the two refusals that come *before* a replay: an id the
+            // journal does not hold, and a project with no journal at all.
+            (
+                "a_resume_that_cannot_find_its_execution_says_what_the_journal_holds",
+                Status::Live,
+            ),
+        ],
+    },
+    Criterion {
+        bullet: Bullet::Durability,
+        phrase: "executions survive a process restart",
+        tests: &[
+            // The `run` half (resolved q28: "`run` journals but does not
+            // auto-resume"), including the wait id a second generation re-parks
+            // under.
+            (
+                "a_pause_killed_with_its_process_is_asked_again_under_the_same_wait_id",
+                Status::Live,
+            ),
+            // …and its other half, which is the promise a person can see: a
+            // pause somebody **answered** is replayed rather than put to them
+            // twice, dated by the generation that held it.
+            (
+                "an_answered_pause_is_replayed_rather_than_put_to_the_person_twice",
+                Status::Live,
+            ),
+            // …and the `serve` half, which recovers on its own.
+            (
+                "a_restarted_serve_recovers_its_open_executions_and_their_waits",
+                Status::Live,
+            ),
+            // …including the window recovering without waiting opens: an answer
+            // that arrives before the replay is back at its pause is told to
+            // send it again, rather than that there is nothing waiting for it.
+            (
+                "a_recovered_execution_still_catching_up_tells_a_resume_to_send_it_again",
+                Status::Live,
+            ),
+            // …and that the window is per **pause**: an execution holding two
+            // whose branches are not back at the same moment must not hand the
+            // second one's client the refusal the first one's arrival cleared.
+            (
+                "a_second_pause_still_being_replayed_to_is_told_to_send_its_answer_again",
+                Status::Live,
+            ),
+            // …including what an `async` caller was promised: the completion
+            // webhook is fired by the process that *finishes* the run, which is
+            // not the one that answered its `202`.
+            (
+                "a_recovered_execution_delivers_the_completion_webhook_its_caller_waits_for",
+                Status::Live,
+            ),
+            // …and the half of that promise a divergence would break twice
+            // over: a recovery that leaves the row open pushes nothing, so one
+            // execution is one completion whatever it took to reach it.
+            (
+                "a_diverged_recovery_delivers_no_webhook_and_the_repair_delivers_one",
+                Status::Live,
+            ),
+            // …and the same promise where the failure is not a divergence at
+            // all: a recovery refused before the execution is opened leaves the
+            // row open while carrying nothing the class of the error could say
+            // so, so the push is decided by reading the row.
+            (
+                "a_recovery_that_cannot_take_the_recorded_inputs_delivers_no_webhook",
+                Status::Live,
+            ),
+            // …and what a run that stops on its own must not leave behind: a
+            // detached delivery made with no record is one the resume makes
+            // again.
+            (
+                "a_detached_delivery_in_flight_when_a_run_parks_is_not_delivered_twice",
+                Status::Live,
+            ),
+            // …and what a **resumed** run must not decide while one is still in
+            // flight: a delivery is the one place a divergence has nothing to be
+            // thrown to, so the predicate that keeps the row open is still being
+            // decided until the deliveries are done.
+            (
+                "a_resumed_generation_does_not_end_with_a_detached_delivery_still_in_flight",
+                Status::Live,
+            ),
+            // …and what "survives" has to mean when a build disagrees with the
+            // record: an execution a divergence stopped is still open, because a
+            // resume against a `failed` row is refused by name and `serve`
+            // replays every open execution at every start.
+            (
+                "a_diverged_resume_leaves_the_execution_open_for_the_composition_that_fits_it",
+                Status::Live,
+            ),
+            // …and what a crash must not be able to do to the one artifact
+            // recovery reads: seal it. A writer killed inside a write leaves the
+            // driver's lock directory behind, and nothing else removes it.
+            (
+                "a_lock_a_killed_writer_left_behind_does_not_seal_the_journal",
+                Status::Live,
+            ),
+        ],
+    },
+];
+
 fn rows() -> impl Iterator<Item = &'static Criterion> {
     CODEGEN
         .iter()
         .chain(COMMANDS)
         .chain(HARNESS)
         .chain(STRATEGY)
+        .chain(DURABILITY)
 }
 
 fn repository() -> PathBuf {
@@ -1026,6 +1253,38 @@ fn bullet(opening: &str) -> String {
         .into_iter()
         .find(|line| line.starts_with(&format!("- {opening}")))
         .unwrap_or_else(|| panic!("PRD §7 M1 has a bullet opening `{opening}`"))
+}
+
+/// The text of PRD §7 M3 — everything between its heading and the next section.
+fn distribution() -> Vec<String> {
+    let prd = fs::read_to_string(repository().join("prd.md")).expect("the PRD is readable");
+    prd.lines()
+        .skip_while(|line| !line.starts_with("**M3 —"))
+        .take_while(|line| !line.starts_with("## "))
+        .map(str::to_string)
+        .collect()
+}
+
+/// One bullet of PRD §7 M3, **whole**.
+///
+/// M1's bullets each fit on a line; M3's do not, and a reader of this file
+/// should not have to know which. So a bullet is the line that opens it plus
+/// every wrapped continuation under it — the lines up to the next one that
+/// starts a bullet of its own — joined back into the sentence the PRD wrote.
+fn distribution_bullet(opening: &str) -> String {
+    let lines = distribution();
+    let at = lines
+        .iter()
+        .position(|line| line.starts_with(&format!("- {opening}")))
+        .unwrap_or_else(|| panic!("PRD §7 M3 has a bullet opening `{opening}`"));
+    let mut held = vec![lines[at].clone()];
+    for line in &lines[at + 1..] {
+        if line.starts_with("- ") || line.trim().is_empty() {
+            break;
+        }
+        held.push(line.clone());
+    }
+    held.join(" ")
 }
 
 /// A bullet's list of items: everything after the first `: ` (where the bullet
@@ -1166,6 +1425,25 @@ fn the_inventory_transcribes_the_prd_m1_bullets() {
         HARNESS[0].phrase,
         "the harness bullet and the inventory's transcription of it have diverged"
     );
+}
+
+/// M3's durability rows are the PRD's own phrases too.
+///
+/// Containment rather than a split, for `HARNESS`'s reason: the bullet is one
+/// sentence and not a list. It is normalized first because the PRD wraps its
+/// prose, so a phrase that reads as one clause spans two lines in the file —
+/// which is a fact about the margin rather than about the promise.
+#[test]
+fn the_durability_rows_transcribe_the_prd_m3_bullet() {
+    let bullet = distribution_bullet("**Durable execution**");
+    let flattened = bullet.split_whitespace().collect::<Vec<_>>().join(" ");
+    for criterion in DURABILITY {
+        assert!(
+            flattened.contains(criterion.phrase),
+            "`{}` is not a phrase of PRD §7 M3's durable-execution bullet: {flattened}",
+            criterion.phrase
+        );
+    }
 }
 
 /// The rows CLAUDE.md contributes are its own phrases too.
@@ -1329,6 +1607,11 @@ fn every_bullet_contributes_criteria() {
         (Bullet::Commands, 4, "the commands bullet's four items"),
         (Bullet::Harness, 1, "the harness bullet's single claim"),
         (Bullet::Strategy, 2, "CLAUDE.md's two generated-code gates"),
+        (
+            Bullet::Durability,
+            3,
+            "the durable-execution bullet's three claims",
+        ),
     ] {
         let count = rows()
             .filter(|criterion| criterion.bullet == bullet)

@@ -55,6 +55,7 @@ compiled project.
 | `plan <before> <after>` | diff two specs: components, topology, interfaces, validation |
 | `build <path>` | emit the TypeScript project; `--check` reports drift instead of writing |
 | `run <path> <flow>` | build, then run one flow; `--input k=v`, `--session <key>` |
+| `resume <path> <execution>` | build, then carry on a journaled execution — replaying its recorded effects rather than re-issuing them |
 | `serve <path>` | build, then serve the project's `http` triggers |
 | `docs [<topic>]` | the topic index, or one topic |
 | `explain <code>` | the expanded account of one diagnostic code |
@@ -63,20 +64,21 @@ compiled project.
 | `skill [--agent <name>] [--global]` | print this document, or install it; `--global` installs under `$HOME` |
 
 Add `--format json` to any verb that reports — `validate`, `plan`, `build`,
-`run`, `serve` — when a script is reading the output. Add `--target <name>` to
-the four verbs that resolve a composition against an environment — `validate`,
-`build`, `run`, `serve` — to select a `deploy/<name>.yml`; the built-in `local`
-target needs no deploy file and is what those four resolve when none is named.
-`plan` takes no `--target`: it answers what changed in the composition.
+`run`, `resume`, `serve` — when a script is reading the output. Add
+`--target <name>` to the five verbs that resolve a composition against an
+environment — `validate`, `build`, `run`, `resume`, `serve` — to select a
+`deploy/<name>.yml`; the built-in `local` target needs no deploy file and is
+what those five resolve when none is named. `plan` takes no `--target`: it
+answers what changed in the composition.
 
 ## Exit codes
 
 | code | meaning |
 |---|---|
 | `0` | clean, or a plan was produced, or a document was printed |
-| `1` | the answer is no: diagnostics, drift, a run with no answer, an occupied directory |
-| `2` | the command could not run at all: bad usage, unreadable entrypoint, missing dependency |
-| `3` | a `run` stopped at a `human` pause and had nobody to ask |
+| `1` | the answer is no: diagnostics, drift, a run with no answer, a resume that diverged from its journal, an occupied directory |
+| `2` | the command could not run at all: bad usage, unreadable entrypoint, missing dependency, an execution id the journal does not hold open |
+| `3` | a `run` or `resume` stopped at a `human` pause and had nobody to ask |
 
 Branch on these rather than on message text: codes and exit codes are stable,
 messages are improved between releases.
@@ -89,6 +91,23 @@ prompts for the answer; a script sets `AGENT_COMPOSE_INTERACTIVE=1` and writes
 `AGENT_COMPOSE_INTERACTIVE=0` forces the exit-`3` path, which is what a
 supervisor that must not block should set. What a pause asks for, and what
 becomes of an answer it will not take, is `agent-compose docs human`.
+
+## Resuming a run the machine lost
+
+Every run is journaled, and its first line on stderr is the id to resume it
+with:
+
+```
+execution: exec_9f1c8a3e-1b7d-4a20-9d61-1f0e8a2c4d55
+```
+
+`agent-compose resume main.yml <execution-id>` re-runs that execution's graph
+with every recorded effect **consumed** — the model answers it got, the results
+its tools produced, what its stores read, what a person answered — and only the
+work it had not yet done reaches the network. It takes no `--input` and no
+`--session`: the invocation it replays is the one the journal recorded. `serve`
+needs no such command; it recovers every open execution on start. See
+`agent-compose docs targets`.
 
 ## The topics
 

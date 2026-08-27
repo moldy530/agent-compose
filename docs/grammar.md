@@ -6215,6 +6215,38 @@ fall back to, so all three of its keys stay required;
 `bedrock` and `vertex` authenticate through their cloud's own credential chain
 with no header for this rule to be about. *PRD 5.9, G3.*
 
+### D121. Durability adds no grammar: journaling is unconditional and the target binds the backend
+
+Every invocation of every flow is **journaled**, with no key to turn it off and
+none to turn it on, and `--target local` binds a SQLite journal file beside the
+project. There is no `journal:` block, no deploy-file section, and no addition to
+the published schema. [`docs/durability.md`](durability.md) is normative for the
+record, its keys, and the replay that reads it back. **Rationale**: PRD resolved
+q27 makes the journal a *deploy-target slot*, exactly as `storage_backends` are —
+"the composition says nothing, the target binds it" — and every target this
+compiler release can build is process-local, so every one of them binds the same
+backend. A configuration surface is a choice expressed in grammar; with one
+backend there is no choice, and a key whose only legal value is its default is a
+key an author has to read and cannot use. resolved q27 also fixes the property
+that key would otherwise carry: durability is "durable by default, zero
+configuration, one file to delete".
+
+The deploy-level surface arrives with the **first non-local backend** — the
+Postgres journal a distributed target binds — which is the release where a
+choice exists to express, and it will land in §14 beside `storage_backends:`
+where it belongs. Reserving the key now would be reserving a shape nobody has
+had to write against a backend nobody has implemented, which is the one kind of
+forward-compatibility this document does not practise (§15's reserved
+constructs are all *fully specified*).
+
+Durability is **not** §14's checkpointing, and the two must not be read as one
+rule. "`local` is not durably checkpointed; every other target is" — the property
+`detach: true` keys off ([D59](#d59-checkpointing-is-a-target-property-and-detach-is-checked-per-target), §8.6 rule 7) — is
+about a LangGraph **checkpointer**, which PRD resolved q26 rules out as this
+project's durability mechanism in favour of journal + replay. `--target local` is
+still the un-checkpointed target, `detach: true` is still legal only there, and
+it is now also a durable one. *PRD 5.11, resolved q26–q29.*
+
 ---
 
 ## Appendix B — Editor integration

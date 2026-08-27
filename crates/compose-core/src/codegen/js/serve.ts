@@ -36,21 +36,24 @@
 // # What an execution is here, and what it is not
 //
 // Executions are tracked **in this process**: a `Map` from id to the run's state
-// and the promise it settles. That is what this milestone can honestly offer —
-// durable execution and checkpointers are M3 (PRD §7) — and it is why a status
-// route answers `404` for an id this process never started, including one it
-// started before it was restarted. The sync-timeout upgrade continues the same
-// in-process execution rather than resuming a checkpointed one.
+// and the promise it settles. The *record* is this process's; the **run** is
+// not — every execution is journaled as it goes (`./journal.ts`, PRD resolved
+// q26-q29), and [`recover`] puts every one the journal holds open back on this
+// map before the app accepts a connection. So a restart loses the reports of
+// executions that had already finished and keeps the ones that had not, which is
+// the half that matters: a status route answers `404` for an id neither this
+// process nor the journal knows, and the sync-timeout upgrade continues the same
+// in-process execution it started.
 //
 // **Nothing is evicted**, and that is a decision rather than an omission. The
-// map holds every execution this process started, with its outputs and its
-// trace, so a long-running `serve` grows with the number of requests it has
-// answered. The alternative is an eviction policy, and every policy this
+// map holds every execution this process started or recovered, with its outputs
+// and its trace, so a long-running `serve` grows with the number of requests it
+// has answered. The alternative is an eviction policy, and every policy this
 // milestone could write is a `404` for an execution that really ran — a caller
 // polling a status URL it was handed, told the run never existed. A retention
-// story needs somewhere for an evicted execution to *be*, which is the
-// checkpointer, so it is M3's to write; until then the boundary is stated here
-// and in the emitted `README.md` rather than approximated with a bound.
+// story needs somewhere for an evicted execution's *report* to be, which the
+// journal is not (it records effects, not reports), so the boundary is stated
+// here and in the emitted `README.md` rather than approximated with a bound.
 //
 // # Resume (grammar 8.7, PRD 5.11)
 //
@@ -79,17 +82,39 @@
 // refused as such, rather than joined into an id nothing is holding.
 //
 // **What durability there is.** The wait is a promise parked in this process,
-// like the execution table below: a `serve` restarted while a human was thinking
-// has lost it, and the emitted `README.md` says so. Checkpointed waits arrive
-// with durable execution (PRD §7, M3).
+// and a restarted `serve` does not *hold* it — it **replays** the execution out
+// of the journal and parks again, under the same `wait_id`, because that id is
+// the node's instance path (grammar 9.4) and no process generation is part of
+// it. So a `resume_url` handed out by the process that died answers in the one
+// that replaced it. What the journal holds no record of is a wait nobody
+// answered — there is nothing to record about one — which is exactly what makes
+// re-parking the right thing to do with it (PRD resolved q28,
+// `docs/durability.md` §3.4, §6.1).
+//
+// **Replaying back to it takes as long as it takes**, and recovery does not wait
+// for that (§6.1). So a resume can arrive while the wait is still ahead of the
+// replay, and that request is refused with a refusal of its own — `recovering:
+// true`, and a sentence that says to send it again — rather than with the
+// sentence that means the pause is over. It is the one refusal on this route
+// about *when* a request arrived rather than about what it addressed, and it is
+// decided per **pause** rather than per execution: two branches of one execution
+// reach their pauses independently, so one being back says nothing about the
+// other (see [`stillReplayingTo`]).
 
 import process from "node:process";
 
 import Fastify from "fastify";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
-import { type CompiledFlow, flows, runFlow } from "./graph.ts";
-import { TRACE_VERSION, deliverHumanAnswer, humanWaits } from "./runtime.ts";
+import { type CompiledFlow, type FlowRun, flows, runFlow } from "./graph.ts";
+import {
+  TRACE_VERSION,
+  deliverHumanAnswer,
+  humanWaits,
+  journaledExecution,
+  openExecutions,
+  watchHumanPauses,
+} from "./runtime.ts";
 import type * as runtime from "./runtime.ts";
 import { type HttpTrigger, httpTriggers } from "./triggers.ts";
 
@@ -112,6 +137,38 @@ interface Execution {
    * disagree, which a stored flag updated from two sides eventually would.
    */
   status: Exclude<ExecutionStatus, "interrupted">;
+  /**
+   * Whether this is an execution [`recover`] picked up whose replay is **still
+   * running**.
+   *
+   * `false` for every execution a request started, and for a recovered one from
+   * the moment its run ends.
+   *
+   * What it is for is one sentence on the resume route. Recovery does not wait
+   * for the replays it starts (`docs/durability.md` §6.1), so an execution is on
+   * this map as `running` while it is still consuming its recorded prefix — and
+   * a `POST /executions/:id/resume` prepared against the process that died can
+   * land in that window.
+   *
+   * It is deliberately **not** cleared when the execution re-parks. One
+   * execution can hold more than one pause (grammar 8.6), the branches reach
+   * them independently, and a branch whose prefix the crash left an effect of
+   * has to run that effect live before it re-parks at all — so the first pause
+   * back says nothing about the second. What decides whether a *particular*
+   * answer arrived early is [`stillReplayingTo`], off the pause it named.
+   */
+  recovering: boolean;
+  /**
+   * Whether this execution has held a pause since this process picked it up.
+   *
+   * The other half of [`stillReplayingTo`], and the half a wait id cannot
+   * supply: a resume that names **no** pause is not about any particular one, so
+   * the only thing that makes "there is nothing waiting" premature is a board
+   * that has held nothing at all. Read off the pauses the runtime publishes
+   * rather than asserted from the replay, for [`statusOf`]'s reason: the board
+   * is where a wait *is*.
+   */
+  parked: boolean;
   outputs?: Record<string, unknown>;
   trace?: readonly runtime.TraceEntry[];
   error?: string;
@@ -129,6 +186,39 @@ interface Execution {
 function statusOf(execution: Execution): ExecutionStatus {
   if (execution.status !== "running") return execution.status;
   return humanWaits(execution.id).length > 0 ? "interrupted" : "running";
+}
+
+/**
+ * Whether a resume this recovered execution could not deliver arrived **before
+ * the replay got to the pause it named** — the window `docs/durability.md` §6.1
+ * describes, decided per request rather than per execution.
+ *
+ * Per request because one execution can hold more than one pause and its
+ * branches reach them independently (grammar 8.6): a branch whose recorded
+ * prefix the crash left an effect of has to run that effect live before it
+ * re-parks, while a branch whose prefix is whole is back at once. A window that
+ * closed on the first pause the board saw would hand the second branch's client
+ * the final refusal this one exists to prevent.
+ *
+ * The two refusals it decides are decided differently, because only one of them
+ * names a pause.
+ *
+ *  * `no-such-wait` **is** the proof: a pause stays on the board once it opens,
+ *    answered or expired or still waiting (see `runtime.deliverHumanAnswer`,
+ *    which finds a settled one and says so). So an id the board does not know is
+ *    an id this generation has not reached, and while the replay runs it may
+ *    still reach it.
+ *  * `not-waiting` names nothing, so there is no pause to ask about. What makes
+ *    it premature is a board that has held **none at all**: once this generation
+ *    has published a pause, an unaddressed answer arriving to an empty board is
+ *    being told the truth about the board it was sent to.
+ */
+function stillReplayingTo(
+  execution: Execution,
+  reason: Extract<runtime.ResumeOutcome, { ok: false }>["reason"],
+): boolean {
+  if (reason === "no-such-wait") return true;
+  return reason === "not-waiting" && !execution.parked;
 }
 
 /** The payload shape grammar 13.3 fixes, as one request presents it. */
@@ -164,6 +254,17 @@ export function createApp(): FastifyInstance {
       handler: (request, reply) => start(executions, trigger, request, reply),
     });
   }
+
+  // Recovery, on the hook Fastify runs **before** the server accepts a
+  // connection: `onReady` is awaited by `listen`, so every execution the
+  // journal holds open has been put back on the board before the first request
+  // arrives (PRD resolved q28). A resume request that lands the instant after
+  // `listen` resolves therefore finds its wait, which is the whole promise —
+  // the wait id is deterministic (node path + ordinal), so it is the same id the
+  // caller was given by the process that died.
+  app.addHook("onReady", async () => {
+    await recover(executions);
+  });
 
   app.get("/executions/:id", (request, reply) => {
     const id = (request.params as { id: string }).id;
@@ -220,6 +321,26 @@ export function createApp(): FastifyInstance {
         wait: outcome.wait.id,
         status: statusOf(execution),
         status_url: `/executions/${id}`,
+      });
+    }
+    // **A recovered execution the replay has not brought back to this pause has
+    // refused nothing.** The two refusals below that mean "no such pause here" —
+    // there is none at all, or none under the id you named — are true of the
+    // board and false of the execution while a replay is still on its way to
+    // that wait ([`Execution.recovering`], `docs/durability.md` §6.1). Both
+    // sentences read as final, and one of them is the very sentence a *settled*
+    // pause is refused with, so a client holding a `resume_url` the dead process
+    // handed out would drop an answer nothing was wrong with. It is told to send
+    // it again instead, and given a key to decide that on rather than a sentence
+    // to match: this is the one refusal on this route that is about *when* the
+    // request arrived.
+    if (execution.recovering && stillReplayingTo(execution, outcome.reason)) {
+      return reply.code(409).send({
+        execution_id: id,
+        status: statusOf(execution),
+        ...(named === undefined ? {} : { wait: named }),
+        recovering: true,
+        error: `this execution is being recovered from the journal and has not come back to its pause yet, so this answer has not been refused: send it again`,
       });
     }
     return reply.code(outcome.reason === "mismatch" ? 400 : 409).send({
@@ -396,6 +517,123 @@ async function start(
 /** The `60s` grammar 13.3 defaults a sync trigger's response budget to. */
 const DEFAULT_SYNC_TIMEOUT_MS = 60_000;
 
+/**
+ * Put every execution this project's journal holds open back on the board
+ * (PRD resolved q28, `docs/durability.md` §6.1).
+ *
+ * "**`serve` auto-recovers**: on process start it replays every execution the
+ * journal holds open, including executions parked on `human` waits, which
+ * re-park with their wait ids intact." That is the whole of what happens here:
+ * each open execution is re-run under `resume: true`, so its recorded effects
+ * are consumed rather than re-issued and the run arrives back at the pause it
+ * was holding — under the same wait id, because a wait id is the node's
+ * instance path (grammar 9.4) and nothing about it depends on the process.
+ *
+ * Two things it deliberately does not do. It does not **re-fire triggers**: the
+ * lifecycle row records which trigger started an execution and nothing here
+ * reads it as an instruction, so a recovered `http` execution is the one that
+ * existed and never a second one (resolved q28). And it does not **wait** for
+ * the replays to finish — the executions it recovers are, by definition, ones
+ * that were still running, and the commonest of them is parked on a question
+ * nobody has answered yet. Registering them is what has to happen before the
+ * first request; finishing them is what the resume route is for.
+ *
+ * A replay that **diverges** (`runtime.ReplayDivergence`) is reported by the
+ * status route like any other failed replay, and recovery of one execution never
+ * stops the process from serving the others — but the execution's **journal row
+ * stays open** (`docs/durability.md` §7). The distinction is the point: what
+ * this process reports is what this build saw, while the row records the
+ * execution, and a build whose composition has moved under a journal has not
+ * decided anything about the executions that journal holds. Put the composition
+ * back and the next start recovers them.
+ */
+async function recover(executions: Map<string, Execution>): Promise<void> {
+  let open: readonly runtime.ExecutionRow[];
+  try {
+    open = await openExecutions();
+  } catch (error) {
+    // A journal that cannot be opened is a project that cannot recover, and it
+    // is not a reason to refuse to serve: the app starts, new executions
+    // journal (or fail loudly when they cannot), and this says what happened.
+    process.stderr.write(`this project's journal could not be read: ${message(error)}\n`);
+    return;
+  }
+  for (const row of open) {
+    // One generation of one execution per process. Nothing can be running yet —
+    // this hook is what runs before the first connection — so the guard is a
+    // statement rather than a fix: an execution this process is already replaying
+    // is never replayed a second time beside itself.
+    if (executions.has(row.id)) continue;
+    const flow = flows[row.flow];
+    if (flow === undefined) {
+      // The composition moved under a journal that still holds an execution of
+      // a flow it no longer declares. Said rather than crashed, and left open:
+      // a reader who puts the flow back can still resume it.
+      process.stderr.write(
+        `\`${row.id}\` was running \`${row.flow}\`, which this build does not declare: it stays open in the journal\n`,
+      );
+      continue;
+    }
+    resumeInto(executions, flow, row);
+    process.stderr.write(`recovered ${row.id} (${row.flow})\n`);
+  }
+}
+
+/** Re-run one journaled execution in this process, and track it like any other. */
+function resumeInto(
+  executions: Map<string, Execution>,
+  flow: CompiledFlow,
+  row: runtime.ExecutionRow,
+): Execution {
+  const execution: Execution = {
+    id: row.id,
+    flow: flow.address,
+    trigger: row.trigger,
+    status: "running",
+    // Until the replay stops. See [`Execution.recovering`] for what turns on the
+    // window and [`stillReplayingTo`] for what it decides.
+    recovering: true,
+    parked: false,
+    settled: Promise.resolve(),
+  };
+  // The replay has stopped: whatever it did or did not reach, nothing more is
+  // coming, so an answer that misses now misses for a reason of its own and the
+  // resume route stops saying "send it again".
+  //
+  // Watched rather than awaited, because recovery must not wait for the replays
+  // it starts (`docs/durability.md` §6.1) — the commonest execution it recovers
+  // is parked on a question nobody has answered, so awaiting one would be
+  // awaiting the person. The subscription is dropped when the run ends for the
+  // reason [`watchHumanPauses`] gives: a `serve` that has recovered many
+  // executions holds no listener per finished one.
+  function caughtUp(): void {
+    execution.recovering = false;
+    unwatch();
+  }
+  const unwatch = watchHumanPauses(row.id, () => {
+    if (humanWaits(row.id).length > 0) execution.parked = true;
+  });
+  execution.settled = settling(
+    execution,
+    runFlow(flow.address, row.inputs, {
+      executionId: row.id,
+      sessionKey: row.sessionKey,
+      resumable: true,
+      trigger: row.trigger,
+      resume: true,
+    }),
+    // The webhook the caller who started this execution is still waiting for.
+    // It is on the lifecycle row because *this* process is the one that will
+    // finish the run, and the request that named the URL reached the one that
+    // did not (`docs/durability.md` §6.1). A recovered execution that fired no
+    // webhook would leave a caller who was handed a `202` with no signal at all
+    // — the contract was push, so nobody is polling the status route.
+    row.callback,
+  ).then(caughtUp);
+  executions.set(row.id, execution);
+  return execution;
+}
+
 /** Start the run, and record what it does when it stops. */
 function register(
   executions: Map<string, Execution>,
@@ -411,48 +649,145 @@ function register(
     flow: flow.address,
     trigger: trigger.name,
     status: "running",
+    // This request is the execution's first generation, so there is nothing for
+    // it to catch up to: a pause it has not reached yet is one nobody has been
+    // handed a `resume_url` for. `parked` is what [`stillReplayingTo`] would
+    // read, and it is never asked about an execution that is not recovering.
+    recovering: false,
+    parked: false,
     // Replaced immediately below. The record has to exist before the run does,
     // because the run's own handlers write into it.
     settled: Promise.resolve(),
   };
+  const callback = callbackOf(trigger, payload);
   // `resumable: true` is what makes a `human` node a *pause* rather than the end
   // of the run: this app mounts the route that answers one (grammar 8.7,
   // PRD 5.11), which `agent-compose run` does not.
-  execution.settled = runFlow(flow.address, inputs, {
-    executionId: id,
-    sessionKey,
-    resumable: true,
-  })
-    .then((run) => {
+  execution.settled = settling(
+    execution,
+    runFlow(flow.address, inputs, {
+      executionId: id,
+      sessionKey,
+      resumable: true,
+      // Which trigger started it, for the journal's lifecycle row. Recorded so a
+      // reader of the journal can tell an `http` execution from a `run`; never
+      // re-fired on recovery (PRD resolved q28).
+      trigger: trigger.name,
+      // And where its completion webhook goes, on the same row and for the
+      // reason [`resumeInto`] reads it back: the process that finishes this
+      // execution may not be this one.
+      ...(callback === undefined ? {} : { callback }),
+    }),
+    callback,
+  );
+  executions.set(id, execution);
+  return execution;
+}
+
+/**
+ * The completion webhook this request asked for, where it asked for one
+ * (grammar 13.3's `callback:`).
+ *
+ * A URL the payload does not yield is **no webhook** rather than a bad request:
+ * a completion webhook is optional, and `callback: "payload.body.callback_url"`
+ * — the natural spelling, and the one the grammar's own example uses — reads a
+ * key most callers will not have sent (grammar 4.1, Decision D110). So a
+ * refusal here is an absence.
+ *
+ * Read when the request arrives rather than when the run ends, which is what
+ * lets it be **recorded**. `payload` is fixed the moment the route is entered,
+ * so the URL is the same either way; what differs is that a run finishing in
+ * another process can still deliver it (`docs/durability.md` §6.1).
+ */
+function callbackOf(trigger: HttpTrigger, payload: Payload): string | undefined {
+  if (trigger.callback === undefined) return undefined;
+  try {
+    return trigger.callback(payload);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Record what a run did on its execution, and deliver its completion webhook.
+ *
+ * One tail for both ways a run reaches this process — a request that started it
+ * and a recovery that picked it up — because the two differ in how a run
+ * *begins* and in nothing after it. An execution recovered at start finishes
+ * like any other, and a caller holding a `202` is owed the same push whichever
+ * process got there.
+ *
+ * **The webhook is owed to a run that finished**, which is not every run that
+ * stopped. A resume that meets a [`runtime.ReplayDivergence`] leaves the journal
+ * row **open** on purpose (`docs/durability.md` §7): the disagreement is this
+ * build's, not the execution's, so the composition can be put back and the next
+ * start replays it again. Reporting `failed` to the caller would be this
+ * process's opinion delivered as the execution's outcome — and then the recovery
+ * that completes it would deliver a *second* webhook for one execution, the
+ * first of them wrong. So the guard is the lifecycle row: what stays open sends
+ * nothing, and the process that finally closes the row is the one that pushes,
+ * once.
+ *
+ * **Which is read off the row itself**, rather than inferred from the error.
+ * "This error is not one that keeps the row open" is a different question from
+ * "this generation closed the row", and the two part company on every failure
+ * raised *before* [`runtime.openExecution`] — a recovered execution whose
+ * recorded inputs this build's `inputs:` no longer accept, a `session_key:` the
+ * composition has since started requiring, a journal written by another compiler
+ * release. Every one of those leaves the lifecycle row untouched and **open**,
+ * and every one of them is an ordinary `Error` that [`runtime.staysOpen`] says
+ * nothing about — so the inference pushes `failed`, and the start that finally
+ * replays the execution pushes again. The row is the fact; this asks it.
+ */
+function settling(
+  execution: Execution,
+  run: Promise<FlowRun>,
+  callback: string | undefined,
+): Promise<void> {
+  return run
+    .then((answer) => {
       execution.status = "completed";
-      execution.outputs = run.outputs;
-      execution.trace = run.trace;
+      execution.outputs = answer.outputs;
+      execution.trace = answer.trace;
+      return true;
     })
-    .catch((error: unknown) => {
+    .catch(async (error: unknown) => {
       execution.status = "failed";
       execution.error = message(error);
       const trace = (error as { trace?: readonly runtime.TraceEntry[] }).trace;
       if (trace !== undefined) execution.trace = trace;
+      // The status route still reports what *this* process saw — a reader
+      // polling it is asking about this build — and that is the whole of the
+      // difference: the report is this process's, the push is the execution's.
+      return !(await stillOpen(execution.id));
     })
-    .then(async () => {
-      // `callback:` is read **here** rather than at the start, and the
-      // difference is grammar 13.3's: a completion webhook is optional, and a
-      // request that carried no URL for one is a request with no webhook rather
-      // than a bad request. Evaluating it at the start would make
-      // `callback: "payload.body.callback_url"` — the natural spelling, and the
-      // one the grammar's own example uses — refuse every caller who did not
-      // want a callback (grammar 4.1, Decision D110).
-      if (trigger.callback === undefined) return;
-      let url: string;
-      try {
-        url = trigger.callback(payload);
-      } catch {
-        return;
-      }
-      await notify(url, execution);
+    .then(async (finished) => {
+      if (!finished || callback === undefined) return;
+      await notify(callback, execution);
     });
-  executions.set(id, execution);
-  return execution;
+}
+
+/**
+ * Whether the journal still holds this execution **open** — the one question
+ * [`settling`] has to answer before it pushes.
+ *
+ * An id the journal holds no row for is **not** open, and that is the right
+ * answer rather than a missing case: it is a request whose run failed before it
+ * could be journaled at all, so no start will ever recover it and the caller who
+ * was handed a `202` is owed the failure now. What has a row and is still open
+ * is the execution somebody else will finish.
+ *
+ * A journal this process cannot read answers `true`, because the honest reading
+ * of "I cannot tell" here is the conservative one: a push that should not have
+ * gone cannot be taken back, while a push that was owed is still delivered by
+ * whichever process does close the row.
+ */
+async function stillOpen(execution: string): Promise<boolean> {
+  try {
+    return (await journaledExecution(execution))?.status === "open";
+  } catch {
+    return true;
+  }
 }
 
 /** The completion webhook of an `async` trigger (grammar 13.3). */
