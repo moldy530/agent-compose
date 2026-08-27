@@ -48,6 +48,7 @@ const PARSER_CODES: &[&str] = &[
     "unknown-variant",
     "conflicting-keys",
     "missing-credential",
+    "unsupported-server-tools",
     "invalid-identifier",
     "invalid-reference",
     "invalid-duration",

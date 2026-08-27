@@ -35,7 +35,10 @@ compiled project.
 4. **Explain what it reported.** Every diagnostic carries a stable code.
    `agent-compose explain <code>` gives the expanded account: what the check
    protects, a minimal spec that triggers it, and the fix. Do this before
-   guessing.
+   guessing. Read its **severity** first: an error refuses the composition, a
+   warning does not — a spec reported with nothing but warnings is valid, exits
+   `0`, and builds and runs. Under `--format json` the two are separate keys,
+   `diagnostics` and `warnings`.
 5. **Read a topic** when a construct is unfamiliar. `agent-compose docs` lists
    them; `agent-compose docs <topic>` prints one.
 6. **Review the change.** `agent-compose plan <before> <after>` reports what
@@ -75,8 +78,8 @@ answers what changed in the composition.
 
 | code | meaning |
 |---|---|
-| `0` | clean, or a plan was produced, or a document was printed |
-| `1` | the answer is no: diagnostics, drift, a run with no answer, a resume that diverged from its journal, an occupied directory |
+| `0` | clean, or **warnings** only, or a plan was produced, or a document was printed |
+| `1` | the answer is no: **errors**, drift, a run with no answer, a resume that diverged from its journal, an occupied directory |
 | `2` | the command could not run at all: bad usage, unreadable entrypoint, missing dependency, an execution id the journal does not hold open |
 | `3` | a `run` or `resume` stopped at a `human` pause and had nobody to ask |
 

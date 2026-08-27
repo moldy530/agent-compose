@@ -77,7 +77,7 @@ use std::time::Duration;
 
 use mock_provider::{
     Client, HARNESS_HEADER, MockProvider, Outcome, REFUSED_INVALID, REFUSED_UNSCRIPTED,
-    RecordedRequest, Request, Script, StructuredOutput, Surface, ToolCall,
+    RecordedRequest, Request, Script, ServerToolUse, StructuredOutput, Surface, ToolCall,
 };
 use serde_json::{Value, json};
 
@@ -85,6 +85,10 @@ use serde_json::{Value, json};
 const SONNET: &str = "claude-sonnet-4-6";
 const HAIKU: &str = "claude-haiku-4-5";
 const LOCAL: &str = "qwen3-coder-30b";
+/// The `server-tools` fixture's two OpenAI models: one on each wire, which is
+/// the whole point of the pair (Decision D122).
+const GPT5: &str = "gpt-5";
+const GPT_MINI: &str = "gpt-4o-mini";
 /// The `provider-kinds` fixture's two models: one per Chat Completions kind that
 /// is neither `openai_compatible` nor already bound elsewhere.
 const AZURE_HOSTED: &str = "gpt-4o-mini";
@@ -93,6 +97,31 @@ const OPENAI_DIRECT: &str = "gpt-4o";
 // ---------------------------------------------------------------------------
 // PRD §7 M1, bullet 3 — "Mock provider server + e2e harness". Live.
 // ---------------------------------------------------------------------------
+
+/// The fixtures that validate with a **warning**, one entry per warning.
+///
+/// A warning is not a failure — the composition builds and runs — but it is also
+/// not something a fixture should acquire quietly, so the ones that carry any
+/// are named here with what they carry, repeats and all: the list's length is
+/// the count `validate` must report, which is what makes a *new* warning a test
+/// failure rather than a line nobody reads.
+///
+/// `server-tools` is the only entry and every one of its four is deliberate.
+/// Three are the routes that cross a wire seam — a member with a suite failing
+/// over to a member with a different one, which is the shape that makes
+/// "a failover across two wires composes" testable at all, and exactly what
+/// grammar 12.2 warns about. The fourth is `provider.searching_gateway`: every
+/// `openai_compatible` entry is second-tier by construction, since no table
+/// could be authoritative about what a gateway honours (Decision D122).
+const FIXTURES_WITH_A_WARNING: &[(&str, &[&str])] = &[(
+    "server-tools",
+    &[
+        "unknown-server-tool",
+        "mismatched-server-tools",
+        "mismatched-server-tools",
+        "mismatched-server-tools",
+    ],
+)];
 
 /// Every fixture the suite is written against is a valid composition **today**,
 /// under the real `validate`.
@@ -111,9 +140,47 @@ fn the_acceptance_fixtures_validate_clean() {
             Some(0),
             "the acceptance fixture `{name}` does not validate:\n{stderr}"
         );
+        let expected = FIXTURES_WITH_A_WARNING
+            .iter()
+            .find(|(fixture, _)| fixture == name)
+            .map(|(_, codes)| *codes)
+            .unwrap_or_default();
+        if expected.is_empty() {
+            assert!(
+                stderr.ends_with("is valid (target `local`)\n"),
+                "unexpected verdict for `{name}`: {stderr}"
+            );
+            continue;
+        }
         assert!(
-            stderr.ends_with("is valid (target `local`)\n"),
+            stderr.contains(&format!(
+                "is valid (target `local`), with {} warning{}\n",
+                expected.len(),
+                if expected.len() == 1 { "" } else { "s" }
+            )),
             "unexpected verdict for `{name}`: {stderr}"
+        );
+        for code in expected {
+            assert!(
+                stderr.contains(&format!("warning[{code}]")),
+                "`{name}` no longer carries the `{code}` warning it is written for:\n{stderr}"
+            );
+        }
+    }
+}
+
+/// The list above names fixtures that exist, so a renamed one cannot leave an
+/// entry excusing nothing.
+#[test]
+fn every_fixture_with_a_declared_warning_exists() {
+    for (fixture, codes) in FIXTURES_WITH_A_WARNING {
+        assert!(
+            harness::FIXTURES.contains(fixture),
+            "`{fixture}` is not an acceptance fixture"
+        );
+        assert!(
+            !codes.is_empty(),
+            "`{fixture}` names the warnings it carries"
         );
     }
 }
@@ -509,6 +576,1084 @@ fn a_scripted_delay_makes_completion_order_differ_from_item_order() {
         finished[1].1,
         finished[0].1
     );
+}
+
+/// A provider's `server_tools:` reach the Messages wire **verbatim**, beside the
+/// agent's own tools, and a scripted use of one flows through the loop without
+/// being dispatched (grammar 12.1, Decision D122, resolved q30).
+///
+/// Three claims in one run, and each is one a transcript can decide:
+///
+///  * the config the composition declared is the object on the wire, field for
+///    field — the whole of what q30's pass-through promises, and the thing a
+///    compiler that "supported" a tool by rewriting it would fail;
+///  * the suite is **appended** to the agent's own tools rather than replacing
+///    them, which is why the pinned output schema is still there;
+///  * a `server_tool_use` block and the result the provider paired with it come
+///    back inside the answer, and the agent completes. Nothing was dispatched:
+///    the tool ran on the provider's side, and a runtime that read the block as
+///    a tool call would have bounced it back as a refusal (Decision D119) and
+///    spent the loop.
+#[test]
+fn a_providers_server_tools_reach_the_messages_wire_verbatim() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "answer": "the docs say yes" })).with_server_tools(vec![
+            ServerToolUse::new(
+                "web_search_20250305",
+                json!({ "query": "does it?" }),
+                json!([{ "type": "web_search_result", "url": "https://docs.example.com/a" }]),
+            ),
+        ]),
+    ));
+
+    let Some(run) = harness::invoke(
+        "server-tools",
+        "flow.search",
+        &[("question", "does it?")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(run.outputs()["answer"], "the docs say yes");
+
+    let asked = provider.requests();
+    assert_eq!(asked.len(), 1, "one call, and its answer needed no second");
+    assert!(asked[0].is_valid(), "{:?}", asked[0].failures());
+    assert_eq!(asked[0].surface, Surface::Anthropic);
+    assert_eq!(
+        asked[0].server_tools,
+        ["web_search_20250305"],
+        "the provider's suite reached the request"
+    );
+    // Verbatim: what the spec declared, as JSON, unrewritten.
+    let tools = asked[0].body()["tools"]
+        .as_array()
+        .expect("a tool array")
+        .clone();
+    assert_eq!(
+        tools.last(),
+        Some(&json!({
+            "type": "web_search_20250305",
+            "name": "web_search",
+            "max_uses": 5,
+            "allowed_domains": ["docs.example.com"],
+        })),
+        "the server tool is the config the composition wrote: {tools:?}"
+    );
+    assert_eq!(
+        asked[0].tools,
+        ["searcher_output"],
+        "and it is appended to the agent's own tools rather than replacing them"
+    );
+    assert!(provider.snapshot().is_drained());
+}
+
+/// A `server_tool_use` block in an answer the tool loop is reading is **not**
+/// dispatched, and is **not** refused (Decision D122, over Decision D119).
+///
+/// This is the negative half of the pass-through, and it needs a loop to be
+/// visible at all: the answer carries a `server_tool_use` block beside a
+/// `tool_use` one, and only the second may reach the runtime. A runtime that
+/// read the first as a call would find no tool of that name on the agent and
+/// bounce it back as a refusal — a `refused` record in the trace, and a wasted
+/// turn — so the trace is what decides it. The block still has to *travel*: the
+/// next request replays the assistant turn whole, which is where the Messages
+/// API requires it back beside the `tool_use` it preceded.
+#[test]
+fn a_server_tool_block_is_neither_dispatched_nor_refused_by_the_loop() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new("lookup", json!({ "query": "what" }))])
+                .with_server_tools(vec![ServerToolUse::new(
+                    "web_search_20250305",
+                    json!({ "query": "what" }),
+                    json!([{ "type": "web_search_result", "url": "https://docs.example.com/a" }]),
+                )]),
+        ),
+        Script::new(SONNET, Outcome::text("I have what I need.")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "answer": "a looked-up snippet" })),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke(
+        "server-tools",
+        "flow.search_loop",
+        &[("question", "what?")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(run.outputs()["answer"], "a looked-up snippet");
+
+    // What the loop ran, as the trace records it (`docs/trace.md` §7.3): the
+    // agent's own tool, once, and nothing else. A refusal here would be the
+    // server tool having been read as a call.
+    let asked: Vec<(String, String)> = run
+        .entries("ask")
+        .iter()
+        .flat_map(|entry| {
+            entry["models"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+        })
+        .flat_map(|call| {
+            call["toolCalls"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+        })
+        .map(|record| {
+            (
+                record["name"].as_str().unwrap_or_default().to_string(),
+                record["outcome"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        asked,
+        [("lookup".to_string(), "completed".to_string())],
+        "the loop ran the agent's tool and nothing else: {asked:?}"
+    );
+
+    // …and the block travelled: the next request replays the assistant turn
+    // whole, `server_tool_use` and its result included.
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 3);
+    let replayed = requests[1].body()["messages"][1]["content"]
+        .as_array()
+        .expect("the assistant turn is a block list")
+        .iter()
+        .map(|block| block["type"].as_str().unwrap_or_default().to_string())
+        .collect::<Vec<_>>();
+    assert!(
+        replayed.contains(&"server_tool_use".to_string())
+            && replayed.contains(&"web_search_tool_result".to_string()),
+        "the answer went back as it came: {replayed:?}"
+    );
+    assert!(provider.snapshot().is_drained());
+}
+
+/// An `openai` provider that declares a suite speaks the **Responses** API for
+/// every call it makes, and everything else about the call still works there
+/// (Decision D122).
+///
+/// The seam is all-or-nothing per provider, so what this decides is that the
+/// whole conversation moved: the route the requests arrived at, the function
+/// tool the agent declares still being dispatched through its loop, and the
+/// structured output still parsing — on a wire where it is `text.format` rather
+/// than `response_format`.
+///
+/// It also pins the two keys the request does **not** carry, `store` and
+/// `previous_response_id`, which three documents state as behaviour and no other
+/// check can see.
+#[test]
+fn an_openai_provider_with_server_tools_runs_its_loop_on_the_responses_wire() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        // The loop's first turn: a server search the provider ran, and a call to
+        // the agent's own tool, which the runtime *does* dispatch.
+        Script::new(
+            GPT5,
+            Outcome::tool_calls(vec![ToolCall::new("lookup", json!({ "query": "what" }))])
+                .with_server_tools(vec![ServerToolUse::new(
+                    "web_search",
+                    json!({ "type": "search", "query": "what" }),
+                    json!([{ "url": "https://docs.example.com/a" }]),
+                )]),
+        ),
+        // The turn that ends the loop: prose, no calls (grammar 5, D51).
+        Script::new(GPT5, Outcome::text("I have what I need.")),
+        // …and the pinned call that answers the node.
+        Script::new(
+            GPT5,
+            Outcome::structured(json!({ "answer": "a looked-up snippet" })),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke(
+        "server-tools",
+        "flow.respond",
+        &[("question", "what?")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(run.outputs()["answer"], "a looked-up snippet");
+
+    let asked = provider.requests();
+    assert_eq!(asked.len(), 3, "the loop turned twice, then answered");
+    for request in &asked {
+        assert!(request.is_valid(), "{:?}", request.failures());
+        assert_eq!(
+            request.surface,
+            Surface::Responses,
+            "one provider, one wire: every call it serves is a Responses call"
+        );
+        assert_eq!(request.path, "/v1/responses");
+        assert_eq!(request.server_tools, ["web_search"]);
+        // …and both settings this wire spells differently arrived spelled its
+        // way (`WIRE-NOTES` (20)). `is_valid()` above is already the half that
+        // catches the untranslated spelling — the key list is closed — so what
+        // these pin is that the translation produced the right *value* rather
+        // than dropping the knob on the floor, which a closed list cannot see.
+        assert_eq!(
+            request.body()["max_output_tokens"],
+            json!(4096),
+            "`max_tokens` is `max_output_tokens` here: {}",
+            request.body_text
+        );
+        assert_eq!(
+            request.body()["reasoning"],
+            json!({ "effort": "high" }),
+            "…and `reasoning_effort` is `reasoning: {{ effort }}`: {}",
+            request.body_text
+        );
+        // …and the two keys this wire has that the emitted request deliberately
+        // does **not** carry. Both are documented as absences with consequences
+        // — `docs/topics/models.md` and `docs/grammar.md` D122 on retention,
+        // `WIRE-NOTES` (19) on why no request this server sees holds `store` —
+        // and neither is a thing the mock can decide: both are in
+        // `responses::REQUEST_KEYS` and `check_settings` takes `store` as any
+        // boolean, so a request that pinned either would validate. Pinning
+        // `store: false` is the regression that matters, and it is reachable
+        // only against the real service: it makes the API refuse a replayed
+        // `reasoning` item, so every reasoning-model tool loop on a real
+        // `openai` provider with a suite would break on its second turn, with
+        // this suite still green.
+        assert_eq!(
+            request.body()["store"],
+            Value::Null,
+            "`store` is left to the service's default rather than pinned: {}",
+            request.body_text
+        );
+        assert_eq!(
+            request.body()["previous_response_id"],
+            Value::Null,
+            "…and the conversation travels in `input`, not behind a continuity \
+             token the runtime does not hold (`docs/durability.md` §3.1): {}",
+            request.body_text
+        );
+    }
+    // The client tool is declared flat on this wire, and its call came back to
+    // the graph — a server tool in the same array changed neither.
+    assert_eq!(asked[0].tools, ["lookup"]);
+    assert!(
+        asked[1].body()["input"]
+            .as_array()
+            .expect("an input list")
+            .iter()
+            .any(|item| item["type"] == "function_call_output"),
+        "the dispatched tool's result went back as an item: {}",
+        asked[1].body_text
+    );
+    // …the server tool's own item is replayed beside it, and is answered by
+    // nothing: the provider already ran it (Decision D122).
+    assert!(
+        asked[1].body()["input"]
+            .as_array()
+            .expect("an input list")
+            .iter()
+            .any(|item| item["type"] == "web_search_call"),
+        "the server tool's record travelled back untouched: {}",
+        asked[1].body_text
+    );
+    // …and structured output is `text.format` here, and still parsed.
+    assert!(matches!(
+        asked[2].structured_output,
+        Some(StructuredOutput::JsonSchema { .. })
+    ));
+    assert!(provider.snapshot().is_drained());
+}
+
+/// A pinned Responses turn that carries **more than one** `message` is read at
+/// the message `text.format` shaped, not at the concatenation of all of them.
+///
+/// This is the one shape server tools make reachable and the other two wires
+/// cannot produce. The Messages wire reads the pinned `tool_use` block's `input`
+/// and Chat Completions parses the single `choices[0].message.content`; a
+/// Responses turn is a **list of items**, and a model that says something before
+/// its provider's search runs sends a preamble `message`, the `web_search_call`,
+/// and then the shaped `message`. Joining the two texts and parsing the join is
+/// `Let me look that up.{"answer":"…"}` reaching `JSON.parse` — a bare
+/// `SyntaxError` naming no agent and no model, thrown inside the journaled model
+/// call, so a resume replays a recorded failure and the run never recovers.
+///
+/// Served with [`Outcome::raw`] because it is precisely what the scripted
+/// shapes will not compose: `reply_answer` pushes at most one `message` item per
+/// answer, so the harness cannot script two.
+#[test]
+fn a_pinned_responses_turn_is_read_at_the_message_the_format_shaped() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        // The turn that ends the loop: prose, no calls.
+        Script::new(GPT5, Outcome::text("I have what I need.")),
+        // …and the pinned call, answered the way a turn with a server tool in it
+        // legitimately arrives.
+        Script::new(
+            GPT5,
+            Outcome::raw(
+                200,
+                json!({
+                    "id": "resp_preamble",
+                    "object": "response",
+                    "status": "completed",
+                    "model": GPT5,
+                    "output": [
+                        {
+                            "type": "message",
+                            "id": "msg_preamble",
+                            "status": "completed",
+                            "role": "assistant",
+                            "content": [{
+                                "type": "output_text",
+                                "text": "Let me look that up.",
+                                "annotations": [],
+                            }],
+                        },
+                        {
+                            "type": "web_search_call",
+                            "id": "srv_preamble",
+                            "status": "completed",
+                            "action": { "type": "search", "query": "what" },
+                        },
+                        {
+                            "type": "message",
+                            "id": "msg_answer",
+                            "status": "completed",
+                            "role": "assistant",
+                            "content": [{
+                                "type": "output_text",
+                                "text": "{\"answer\":\"a searched-for snippet\"}",
+                                "annotations": [],
+                            }],
+                        },
+                    ],
+                    "incomplete_details": null,
+                    "parallel_tool_calls": true,
+                }),
+            ),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke(
+        "server-tools",
+        "flow.respond",
+        &[("question", "what?")],
+        &provider,
+    ) else {
+        return;
+    };
+    // The node completed, and what it produced is the *second* message's object.
+    // A runtime reading the join fails the node instead, with a parser message.
+    run.succeeded();
+    assert_eq!(run.outputs()["answer"], "a searched-for snippet");
+    assert_eq!(
+        provider.requests().len(),
+        2,
+        "the loop turned once, then answered"
+    );
+    assert!(provider.snapshot().is_drained());
+}
+
+/// …and a pinned Responses turn that carried no parseable object at all fails
+/// the node with the sentence the other wires fail it with.
+///
+/// The other half of the reading above. `text.format` is the service's promise
+/// and not this runtime's, so a turn that came back with prose where the schema
+/// was asked for is an answer the node cannot use — reported as the *absence* of
+/// structured output, exactly as the Messages wire reports a turn missing its
+/// pinned `tool_use` block. What that buys is a node error naming the agent, the
+/// output it asked for, and what the surface said about why; a `SyntaxError`
+/// raised inside `callResponses` names none of the three, and is raised inside
+/// the journaled model call, so a resume would replay a recorded failure of a
+/// call that had in fact answered.
+#[test]
+fn a_pinned_responses_turn_carrying_no_object_is_reported_as_no_structured_output() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(GPT5, Outcome::text("I have what I need.")),
+        Script::new(
+            GPT5,
+            Outcome::raw(
+                200,
+                json!({
+                    "id": "resp_prose",
+                    "object": "response",
+                    "status": "completed",
+                    "model": GPT5,
+                    "output": [{
+                        "type": "message",
+                        "id": "msg_prose",
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "Sorry, I could not find anything.",
+                            "annotations": [],
+                        }],
+                    }],
+                    "incomplete_details": null,
+                    "parallel_tool_calls": true,
+                }),
+            ),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke(
+        "server-tools",
+        "flow.respond",
+        &[("question", "what?")],
+        &provider,
+    ) else {
+        return;
+    };
+    let failure = run.failed();
+    assert!(
+        failure.contains("`agent.responder` asked for")
+            && failure.contains("the answer carried no structured output"),
+        "the node error names the agent and what it asked for: {failure}"
+    );
+    assert!(
+        !failure.contains("SyntaxError"),
+        "…rather than the parser's message: {failure}"
+    );
+    assert!(provider.snapshot().is_drained());
+}
+
+/// A tool outside the compiler's curated table travels to the wire as written —
+/// the second tier of resolved q30, end to end.
+///
+/// `validate` warns and exits `0`, `build` emits, and the run puts the config on
+/// the request unchanged. That is the whole no-treadmill promise: a server tool
+/// the vendor ships after this compiler release is usable the day it ships.
+#[test]
+fn a_server_tool_outside_the_table_is_warned_about_and_still_reaches_the_wire() {
+    let scratch = harness::Scratch::new("server-tool-after-this-release");
+    let entrypoint = scratch.path().join("main.yml");
+    std::fs::write(
+        &entrypoint,
+        unverified_server_tool_spec("web_search_20260101"),
+    )
+    .expect("the scratch spec is writable");
+
+    let validated = harness::validate_entrypoint(&entrypoint, "local");
+    let stderr = String::from_utf8_lossy(&validated.stderr);
+    assert_eq!(
+        validated.status.code(),
+        Some(0),
+        "a warning does not refuse a composition:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("warning[unknown-server-tool]") && stderr.contains("web_search_20260101"),
+        "the warning names exactly what could not be verified:\n{stderr}"
+    );
+
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "answer": "carried anyway" })),
+    ));
+    let Some(run) = harness::invoke_entrypoint(
+        &entrypoint,
+        "server-tool-after-this-release",
+        "flow.search",
+        &json!({ "question": "does it?" }),
+        &harness::environment(&provider),
+        None,
+    ) else {
+        return;
+    };
+    run.succeeded();
+
+    let asked = provider.requests();
+    assert_eq!(
+        asked[0].server_tools,
+        ["web_search_20260101"],
+        "the unverified tool reached the wire"
+    );
+    assert_eq!(
+        asked[0].body()["tools"].as_array().expect("a tool array")[1]["max_uses"],
+        7,
+        "…with the config the compiler could not check, as written: {}",
+        asked[0].body_text
+    );
+}
+
+/// A **field** the compiler's table cannot check, on a tool it knows, travels to
+/// the wire as written — the second tier one level in (Decision D122).
+///
+/// A row is keyed on `type:` alone and is a snapshot of that tool at this
+/// compiler's release, so a parameter the vendor added since must not be a
+/// build-blocking error: there is no way to opt one entry out of the strict
+/// tier, and renaming the `type:` to reach the unchecked tier would change which
+/// tool runs. So `validate` warns and exits `0`, the strict half of the same
+/// entry is still checked, and the run puts the whole config on the request.
+#[test]
+fn a_server_tool_field_outside_the_table_is_warned_about_and_still_reaches_the_wire() {
+    let scratch = harness::Scratch::new("server-tool-field-after-this-release");
+    let entrypoint = scratch.path().join("main.yml");
+    std::fs::write(
+        &entrypoint,
+        server_tool_spec("web_search_20250305", "\n      result_freshness: week"),
+    )
+    .expect("the scratch spec is writable");
+
+    let validated = harness::validate_entrypoint(&entrypoint, "local");
+    let stderr = String::from_utf8_lossy(&validated.stderr);
+    assert_eq!(
+        validated.status.code(),
+        Some(0),
+        "a warning does not refuse a composition:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("warning[unknown-server-tool-field]")
+            && stderr.contains("result_freshness"),
+        "the warning names exactly the key that could not be verified:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("warning[unknown-server-tool]:"),
+        "the tool itself is one the table knows, and is not warned about:\n{stderr}"
+    );
+
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "answer": "carried anyway" })),
+    ));
+    let Some(run) = harness::invoke_entrypoint(
+        &entrypoint,
+        "server-tool-field-after-this-release",
+        "flow.search",
+        &json!({ "question": "does it?" }),
+        &harness::environment(&provider),
+        None,
+    ) else {
+        return;
+    };
+    run.succeeded();
+
+    let asked = provider.requests();
+    assert_eq!(asked[0].server_tools, ["web_search_20250305"]);
+    let declared = &asked[0].body()["tools"].as_array().expect("a tool array")[1];
+    assert_eq!(
+        declared["result_freshness"], "week",
+        "the key the compiler could not check reached the wire as written: {}",
+        asked[0].body_text
+    );
+    assert_eq!(
+        declared["max_uses"], 7,
+        "…beside the fields of the same entry that it could: {}",
+        asked[0].body_text
+    );
+}
+
+/// A failover route whose members are on **two different wires** composes: each
+/// attempt speaks its own provider's (Decision D122).
+///
+/// The first member's provider carries a suite, so its call goes to
+/// `/v1/responses`; the second's does not, so its call goes to
+/// `/v1/chat/completions`. A rate limit on the first is what moves the ladder,
+/// and the answer comes back off a wire the first attempt never touched. The
+/// differing suites are also what `validate` warns about, which
+/// `the_acceptance_fixtures_validate_clean` pins.
+#[test]
+fn a_failover_that_crosses_two_wires_composes() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(GPT5, Outcome::rate_limit()),
+        Script::new(
+            GPT_MINI,
+            Outcome::structured(json!({ "answer": "the fallback answered" })),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke(
+        "server-tools",
+        "flow.cross",
+        &[("question", "who answers?")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(run.outputs()["answer"], "the fallback answered");
+
+    let asked = provider.requests();
+    assert_eq!(
+        asked
+            .iter()
+            .map(|request| (request.surface, request.path.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (Surface::Responses, "/v1/responses"),
+            (Surface::OpenAi, "/v1/chat/completions"),
+        ],
+        "each member of the ladder spoke its own provider's wire"
+    );
+    assert_eq!(asked[0].server_tools, ["web_search"]);
+    assert!(
+        asked[1].server_tools.is_empty(),
+        "the fallback's provider declares none, and none was invented for it"
+    );
+    assert!(provider.snapshot().is_drained());
+}
+
+/// A gateway's suite rides its **Chat Completions** `tools` array, verbatim and
+/// beside the agent's own (grammar 12.1, Decision D122).
+///
+/// The third kind that takes the key, and the one with no curated table at all:
+/// every entry on an `openai_compatible` provider is second-tier, so `validate`
+/// warns and the array travels as written. That makes the runtime half the whole
+/// of the promise — a suite the compiler carried through validation and codegen
+/// and then dropped on the floor at the request would be the silent no-op D50
+/// refuses, and would make the warning's own sentence ("its config … travels to
+/// the provider as written") false.
+///
+/// This is also the one route of the three where the answer is not on a wire the
+/// suite moved the connection to: `openai_compatible` stays on Chat Completions
+/// precisely because moving a gateway onto a wire it may not implement would
+/// break the compositions that work today.
+#[test]
+fn a_gateways_server_tools_ride_its_chat_completions_tools_array() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        LOCAL,
+        Outcome::structured(json!({ "answer": "the gateway searched" })),
+    ));
+
+    let Some(run) = harness::invoke(
+        "server-tools",
+        "flow.gateway",
+        &[("question", "does it?")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(run.outputs()["answer"], "the gateway searched");
+
+    let asked = provider.requests();
+    assert_eq!(asked.len(), 1, "one call, and its answer needed no second");
+    assert!(asked[0].is_valid(), "{:?}", asked[0].failures());
+    assert_eq!(
+        (asked[0].surface, asked[0].path.as_str()),
+        (Surface::OpenAi, "/v1/chat/completions"),
+        "a gateway keeps the wire it had"
+    );
+    assert_eq!(
+        asked[0].server_tools,
+        ["web_search"],
+        "the suite the composition declared reached the request: {}",
+        asked[0].body_text
+    );
+    let tools = asked[0].body()["tools"]
+        .as_array()
+        .expect("a tool array")
+        .clone();
+    assert_eq!(
+        tools.last(),
+        Some(&json!({ "type": "web_search", "search_context_size": "medium" })),
+        "…as the config the composition wrote, unrewritten: {tools:?}"
+    );
+    assert!(provider.snapshot().is_drained());
+}
+
+/// A failover that crosses the two **block-carrying** wires replays a turn the
+/// member it landed on can read (Decision D122).
+///
+/// Both surfaces answer with a list of objects and both take their own list
+/// back — a `tool_use` block is not an item type the Responses API has, and a
+/// `function_call` item is not a content block the Messages API has — so a turn
+/// forwarded across the seam is a 400 naming a type the member never heard of.
+/// The turn is therefore *rendered* into the wire that is about to send it,
+/// out of the same reading its own composed turns are rendered from.
+///
+/// The loop is what makes this reachable and is why the agent carries a client
+/// tool: the failover has to happen on the **second** call, when there is an
+/// assistant turn to replay. `a_failover_that_crosses_two_wires_composes` above
+/// rate-limits the first call, where the history is one user turn and any wire
+/// can render it.
+#[test]
+fn a_failover_off_the_responses_wire_rewrites_the_turn_for_the_messages_one() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        // Turn one, on the Responses wire: a search the provider ran, and a call
+        // to the agent's own tool, which the runtime dispatches.
+        Script::new(
+            GPT5,
+            Outcome::tool_calls(vec![ToolCall::new("lookup", json!({ "query": "what" }))])
+                .with_server_tools(vec![ServerToolUse::new(
+                    "web_search",
+                    json!({ "type": "search", "query": "what" }),
+                    json!([{ "url": "https://docs.example.com/a" }]),
+                )]),
+        ),
+        // …and from here the first member refuses, so both remaining calls —
+        // the one that ends the loop and the pinned one that answers the node —
+        // are served by the Anthropic member, each replaying a history whose
+        // assistant turn came off the other wire.
+        Script::new(GPT5, Outcome::rate_limit()).times(2),
+        Script::new(SONNET, Outcome::text("I have what I need.")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "answer": "the fallback finished the loop" })),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke(
+        "server-tools",
+        "flow.cross_from_responses",
+        &[("question", "what?")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(run.outputs()["answer"], "the fallback finished the loop");
+
+    let asked = provider.requests();
+    assert_eq!(
+        asked
+            .iter()
+            .map(|request| (request.surface, request.path.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (Surface::Responses, "/v1/responses"),
+            (Surface::Responses, "/v1/responses"),
+            (Surface::Anthropic, "/v1/messages"),
+            (Surface::Responses, "/v1/responses"),
+            (Surface::Anthropic, "/v1/messages"),
+        ],
+        "each call starts at the head of the ladder and falls to the member that answers"
+    );
+
+    // The one this test exists for: the first Messages request, whose history
+    // holds a turn the Responses wire produced.
+    let replayed = &asked[2];
+    assert!(
+        replayed.is_valid(),
+        "the replayed turn is a Messages turn: {:?}\n{}",
+        replayed.failures(),
+        replayed.body_text
+    );
+    assert_eq!(
+        block_types(
+            replayed.body()["messages"]
+                .as_array()
+                .expect("a message list")
+        ),
+        [
+            vec!["<user>".to_string()],
+            vec!["tool_use".to_string()],
+            vec!["tool_result".to_string()],
+        ],
+        "the answer was rendered into this wire's vocabulary rather than forwarded: {}",
+        replayed.body_text
+    );
+    assert!(
+        !replayed.body_text.contains("web_search_call"),
+        "…and the Responses item that has no Messages spelling did not travel: {}",
+        replayed.body_text
+    );
+    assert!(provider.snapshot().is_drained());
+}
+
+/// A Responses turn whose **whole** content is items the Messages wire cannot
+/// spell is dropped from the replay rather than sent as an empty message
+/// (Decision D122).
+///
+/// The turn above carried a `tool_use` the rebuild had something to render. This
+/// one carries nothing: the provider ran its search and the model said no words,
+/// which is also the shape an answer cut short by `max_output_tokens` takes. The
+/// turn survives `replayed` — it has items, so the model did answer — and then
+/// reaches a member on the other wire, where `text` is `""` and there are no
+/// tool calls, so the rebuild has no block to emit.
+///
+/// `{"role": "assistant", "content": []}` is what a rebuild that emitted the
+/// turn anyway would send, and the Messages API refuses it (`content: List
+/// should have at least 1 item`) — so the node would die on a 400 about the
+/// *request*, one call after the model's empty answer, and `rate_limit` is not a
+/// status a `route_on:` catches. Dropping the turn keeps the conversation legal
+/// and leaves it opening on the user turn it already opened on.
+#[test]
+fn a_responses_turn_with_nothing_the_messages_wire_can_spell_is_not_replayed_empty() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        // Turn one, on the Responses wire: a search the provider ran, and not one
+        // word of prose beside it. No tool call, so the loop ends here.
+        Script::new(
+            GPT5,
+            Outcome::text("").with_server_tools(vec![ServerToolUse::new(
+                "web_search",
+                json!({ "type": "search", "query": "what" }),
+                json!([{ "url": "https://docs.example.com/a" }]),
+            )]),
+        ),
+        // The pinned call that answers the node falls to the Anthropic member,
+        // replaying a history whose only assistant turn is that one.
+        Script::new(GPT5, Outcome::rate_limit()),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "answer": "the fallback answered anyway" })),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke(
+        "server-tools",
+        "flow.cross_from_responses",
+        &[("question", "what?")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(run.outputs()["answer"], "the fallback answered anyway");
+
+    let asked = provider.requests();
+    assert_eq!(
+        asked
+            .iter()
+            .map(|request| (request.surface, request.path.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (Surface::Responses, "/v1/responses"),
+            (Surface::Responses, "/v1/responses"),
+            (Surface::Anthropic, "/v1/messages"),
+        ],
+        "the loop ended on the first answer, and the pinned call fell to the other wire"
+    );
+
+    let replayed = &asked[2];
+    assert!(
+        replayed.is_valid(),
+        "an empty assistant message would be refused here: {:?}\n{}",
+        replayed.failures(),
+        replayed.body_text
+    );
+    assert_eq!(
+        block_types(
+            replayed.body()["messages"]
+                .as_array()
+                .expect("a message list")
+        ),
+        [vec!["<user>".to_string()]],
+        "the unspellable turn was dropped, not padded and not emptied: {}",
+        replayed.body_text
+    );
+    assert!(provider.snapshot().is_drained());
+}
+
+/// The same seam, crossed the other way: a Messages answer replayed to the
+/// Responses wire (Decision D122).
+///
+/// The mirror is worth its own run because the two renderings are two pieces of
+/// code and the failure is asymmetric: a `tool_use` block sent to `/v1/responses`
+/// is refused by a closed item-type list, and a `function_call` item sent to
+/// `/v1/messages` is refused by a closed block-type list *and* leaves a
+/// `tool_result` answering a `tool_use` nothing asked for.
+#[test]
+fn a_failover_off_the_messages_wire_rewrites_the_turn_for_the_responses_one() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new("lookup", json!({ "query": "what" }))])
+                .with_server_tools(vec![ServerToolUse::new(
+                    "web_search_20250305",
+                    json!({ "query": "what" }),
+                    json!([{ "type": "web_search_result", "url": "https://docs.example.com/a" }]),
+                )]),
+        ),
+        Script::new(SONNET, Outcome::rate_limit()).times(2),
+        Script::new(GPT5, Outcome::text("I have what I need.")),
+        Script::new(
+            GPT5,
+            Outcome::structured(json!({ "answer": "the fallback finished the loop" })),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke(
+        "server-tools",
+        "flow.cross_from_messages",
+        &[("question", "what?")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(run.outputs()["answer"], "the fallback finished the loop");
+
+    let asked = provider.requests();
+    assert_eq!(
+        asked
+            .iter()
+            .map(|request| (request.surface, request.path.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (Surface::Anthropic, "/v1/messages"),
+            (Surface::Anthropic, "/v1/messages"),
+            (Surface::Responses, "/v1/responses"),
+            (Surface::Anthropic, "/v1/messages"),
+            (Surface::Responses, "/v1/responses"),
+        ],
+        "each call starts at the head of the ladder and falls to the member that answers"
+    );
+
+    let replayed = &asked[2];
+    assert!(
+        replayed.is_valid(),
+        "the replayed turn is a Responses input list: {:?}\n{}",
+        replayed.failures(),
+        replayed.body_text
+    );
+    assert_eq!(
+        replayed.body()["input"]
+            .as_array()
+            .expect("an input list")
+            .iter()
+            .map(|item| item["type"].as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>(),
+        ["message", "function_call", "function_call_output"],
+        "the answer was rendered into this wire's vocabulary rather than forwarded: {}",
+        replayed.body_text
+    );
+    assert!(
+        !replayed.body_text.contains("server_tool_use"),
+        "…and the Messages block that has no Responses spelling did not travel: {}",
+        replayed.body_text
+    );
+    assert!(provider.snapshot().is_drained());
+}
+
+/// The `type` of every content block of every Messages-wire message, in order.
+/// A message whose `content` is a bare string — which is what a user turn is —
+/// reports as `<user>`, since it has no blocks to name.
+fn block_types(messages: &[Value]) -> Vec<Vec<String>> {
+    messages
+        .iter()
+        .map(|message| match message["content"].as_array() {
+            None => vec!["<user>".to_string()],
+            Some(blocks) => blocks
+                .iter()
+                .map(|block| block["type"].as_str().unwrap_or_default().to_string())
+                .collect(),
+        })
+        .collect()
+}
+
+/// `server_tools:` on a kind whose wire this release has not been taught is an
+/// **error**, and the message says which kinds carry it.
+///
+/// The other half of the two-tier design, and the one that is not a warning: a
+/// suite declared here would be dropped on the floor rather than merely
+/// unverified, which is the silent no-op D50 refuses everywhere else.
+#[test]
+fn server_tools_on_a_kind_whose_wire_has_none_is_refused_by_name() {
+    let scratch = harness::Scratch::new("server-tools-on-azure");
+    let entrypoint = scratch.path().join("main.yml");
+    std::fs::write(
+        &entrypoint,
+        "version: \"0.1\"\n\nprovider.azure:\n  kind: azure_openai\n  base_url: ${AZURE_ENDPOINT}\n  \
+         api_key: ${AZURE_API_KEY}\n  api_version: \"2024-10-21\"\n  server_tools:\n    - type: web_search\n",
+    )
+    .expect("the scratch spec is writable");
+
+    let validated = harness::validate_entrypoint(&entrypoint, "local");
+    let stderr = String::from_utf8_lossy(&validated.stderr);
+    assert_eq!(validated.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains(
+            "error[unsupported-server-tools]: provider definition `provider.azure` declares \
+             `kind: azure_openai`, whose wire this compiler release does not carry server tools on"
+        ),
+        "the refusal names the kind:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "server tools launched on `kind: anthropic`, `kind: openai`, `kind: openai_compatible`"
+        ),
+        "…and the launch scope:\n{stderr}"
+    );
+}
+
+/// One spec whose provider declares a server tool the compiler's table does not
+/// name.
+fn unverified_server_tool_spec(type_name: &str) -> String {
+    server_tool_spec(type_name, "")
+}
+
+/// The same spec with one server tool of `type_name`, carrying `extra` as a
+/// further line of that entry's config.
+///
+/// The two callers are the two granularities the second tier is reached at: an
+/// unknown `type:`, and a key the row of a known one does not name.
+fn server_tool_spec(type_name: &str, extra: &str) -> String {
+    format!(
+        r#"version: "0.1"
+
+state:
+  answer:
+    type: string
+    default: nothing yet
+
+provider.searching:
+  kind: anthropic
+  api_key: ${{MOCK_API_KEY}}
+  base_url: ${{MOCK_BASE_URL}}
+  server_tools:
+    - type: {type_name}
+      name: web_search
+      max_uses: 7{extra}
+
+model.smart:
+  provider: provider.searching
+  id: {SONNET}
+
+agent.searcher:
+  description: Answers with whatever its provider found.
+  model: model.smart
+  prompt: |
+    You are a researcher. Answer the question.
+  input:
+    question:
+      description: What to answer.
+      type: string
+  output:
+    answer:
+      description: The answer, as text.
+      type: string
+
+flow.search:
+  description: One agent whose provider searches for it.
+  inputs:
+    question:
+      type: string
+      min_length: 1
+  outputs:
+    answer:
+      type: string
+  nodes:
+    ask:
+      agent: agent.searcher
+      input:
+        question: "input.question"
+  edges:
+    - {{ from: start, to: ask }}
+    - {{ from: ask, to: end }}
+"#
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -10852,6 +11997,534 @@ fn a_resumed_run_consumes_its_recorded_model_answers_instead_of_asking_again() {
          wrote: {}",
         asked[0].body_text
     );
+}
+
+/// The same claim over a composition whose provider runs **server tools**:
+/// replay is untouched, because the use happened inside the recorded model call
+/// (Decision D122, `docs/durability.md` §3.1).
+///
+/// This is the one durability question q30 raises and answers: a server tool is
+/// not an effect of its own, so it gets no journal record and no key — what is
+/// recorded is the model call it happened inside, whose answer already carries
+/// the `server_tool_use` block and the result the provider paired with it. A
+/// resumed generation therefore replays the whole turn, search and all, and the
+/// provider is asked once for the one call still ahead of the frontier.
+///
+/// It also exercises the half that *did* move: the recorded call's **request
+/// identity** now carries the provider's suite, so this is a resume where the
+/// suite matched. The other side — a suite that changed between generations —
+/// is a divergence by construction, and `docs/durability.md` §7 says so.
+#[test]
+fn a_resumed_run_replays_a_server_tools_answer_without_asking_again() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "answer": "the first finding" })).with_server_tools(vec![
+            ServerToolUse::new(
+                "web_search_20250305",
+                json!({ "query": "the question" }),
+                json!([{ "type": "web_search_result", "url": "https://docs.example.com/a" }]),
+            ),
+        ]),
+    ));
+    // Held past the kill, so the frontier lands exactly one effect in.
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "answer": "the second finding" }))
+            .after(Duration::from_secs(120)),
+    ));
+
+    let Some((project, built)) =
+        harness::build_under_toolchain("server-tools", "resume-server-tools")
+    else {
+        return;
+    };
+    assert!(
+        built.status.success(),
+        "the server-tools fixture did not build:\n{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+
+    let environment = harness::environment(&provider);
+    let killed = harness::crash_run(
+        &project,
+        &["run", "flow.relay", "--input", "question=does it?"],
+        &environment,
+        |_| provider.snapshot().requests >= 2,
+    );
+
+    provider.reset();
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "answer": "the second finding" })),
+    ));
+
+    let resumed = harness::resume(
+        &project,
+        "server-tools",
+        &killed.execution,
+        Some("json"),
+        &environment,
+    );
+    resumed.succeeded();
+    let answered = resumed.outputs();
+    assert_eq!(answered["status"], "completed", "{answered}");
+    assert_eq!(
+        answered["outputs"]["relayed"], "the first finding",
+        "the replayed call's answer — the one the search was woven into — reaches \
+         the resumed run's state: {answered}"
+    );
+    assert_eq!(
+        answered["outputs"]["final"], "the second finding",
+        "{answered}"
+    );
+
+    let asked = provider.requests();
+    assert_eq!(
+        asked.len(),
+        1,
+        "the recorded call is replayed rather than re-issued, server tool and all"
+    );
+    assert_eq!(
+        asked[0].server_tools,
+        ["web_search_20250305"],
+        "and the live call past the frontier still carries the provider's suite"
+    );
+    assert!(
+        asked[0].body_text.contains("the first finding"),
+        "the live call is the second node's, asked about what the replayed answer \
+         wrote: {}",
+        asked[0].body_text
+    );
+}
+
+/// …and the same claim on the **Responses** wire, which is the one the
+/// durability argument was otherwise only made about (Decision D122).
+///
+/// The wire matters to replay for a reason the Messages one does not raise:
+/// this surface answers with a list of items carrying service-minted ids — the
+/// `web_search_call`, the `message`, the `function_call` — and the runtime
+/// replays that list into the next request verbatim. Those ids are therefore
+/// inside the next call's **request identity** (`docs/durability.md` §11.1), so
+/// a resumed generation only derives the same identity if it went on with the
+/// recorded answer rather than a re-read of it. That is exactly what
+/// [`callModel`]'s "the kept answer, not the live one" rule buys, and it is
+/// unfalsifiable without a run: the composition is two calls in a row on this
+/// wire, killed between them.
+///
+/// Nothing Responses-specific is *added* to the identity beyond what the answer
+/// carries — no `previous_response_id`, no continuity token — which is why the
+/// journal's version does not move for this wire either.
+#[test]
+fn a_resumed_run_replays_a_responses_wire_answer_without_asking_again() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        GPT5,
+        Outcome::structured(json!({ "answer": "the first finding" })).with_server_tools(vec![
+            ServerToolUse::new(
+                "web_search",
+                json!({ "type": "search", "query": "the question" }),
+                json!([{ "url": "https://docs.example.com/a" }]),
+            ),
+        ]),
+    ));
+    // Held past the kill, so the frontier lands exactly one effect in.
+    provider.enqueue(Script::new(
+        GPT5,
+        Outcome::structured(json!({ "answer": "the second finding" }))
+            .after(Duration::from_secs(120)),
+    ));
+
+    let Some((project, built)) = harness::build_under_toolchain("server-tools", "resume-responses")
+    else {
+        return;
+    };
+    assert!(
+        built.status.success(),
+        "the server-tools fixture did not build:\n{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+
+    let environment = harness::environment(&provider);
+    let killed = harness::crash_run(
+        &project,
+        &[
+            "run",
+            "flow.relay_responses",
+            "--input",
+            "question=does it?",
+        ],
+        &environment,
+        |_| provider.snapshot().requests >= 2,
+    );
+
+    provider.reset();
+    provider.enqueue(Script::new(
+        GPT5,
+        Outcome::structured(json!({ "answer": "the second finding" })),
+    ));
+
+    let resumed = harness::resume(
+        &project,
+        "server-tools",
+        &killed.execution,
+        Some("json"),
+        &environment,
+    );
+    resumed.succeeded();
+    let answered = resumed.outputs();
+    assert_eq!(answered["status"], "completed", "{answered}");
+    assert_eq!(
+        answered["outputs"]["relayed"], "the first finding",
+        "the replayed Responses answer reaches the resumed run's state: {answered}"
+    );
+    assert_eq!(
+        answered["outputs"]["final"], "the second finding",
+        "{answered}"
+    );
+
+    let asked = provider.requests();
+    assert_eq!(
+        asked.len(),
+        1,
+        "the recorded call is replayed rather than re-issued, on this wire too"
+    );
+    assert_eq!(
+        (asked[0].surface, asked[0].path.as_str()),
+        (Surface::Responses, "/v1/responses"),
+        "…and the one live call is still this connection's wire"
+    );
+    assert_eq!(
+        asked[0].server_tools,
+        ["web_search"],
+        "…still carrying the provider's suite"
+    );
+    assert!(
+        asked[0].body_text.contains("the first finding"),
+        "the live call is the second node's, asked about what the replayed answer \
+         wrote: {}",
+        asked[0].body_text
+    );
+}
+
+/// The other side of the two above, and the one `docs/durability.md` §7 promises
+/// outright: **a resume whose provider lost a server tool diverges at the first
+/// model call.**
+///
+/// The suite is in the request identity because it is part of what the model was
+/// offered (Decision D122), and the consequence is the one resolved q29 intends:
+/// the recorded answer was produced by a model with a different tool surface, so
+/// handing it to a graph that would now ask differently is the silent re-keying
+/// q29 refuses. The resume fails, naming the step.
+///
+/// Both halves of the conditionality that makes that true are decided here, and
+/// only a run can decide either:
+///
+/// * the key is **present** when a member declares a suite — asserted off the
+///   journal's own bytes before the composition moves, since a `serverTools`
+///   that never reached the identity would make the divergence below happen for
+///   some other reason and this test pass on a build that had stopped keying on
+///   the suite at all;
+/// * and the identity really **turns on it** — the composition that moves under
+///   the journal moves in exactly one respect, the `server_tools:` array of the
+///   provider `flow.relay`'s two calls resolve to. Every other input to the
+///   identity (the `model.*` addressed, the system prompt, the conversation, the
+///   tool names, the pinned tool) is byte-for-byte what the killed generation
+///   recorded.
+///
+/// A regression that stopped emitting the key would pass every other test in
+/// this file — the two above included, since a suite that matches replays either
+/// way — and would replay an answer produced under a tool surface this build no
+/// longer offers.
+#[test]
+fn a_resume_whose_provider_lost_its_server_tools_diverges_at_the_first_model_call() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "answer": "the first finding" })).with_server_tools(vec![
+            ServerToolUse::new(
+                "web_search_20250305",
+                json!({ "query": "the question" }),
+                json!([{ "type": "web_search_result", "url": "https://docs.example.com/a" }]),
+            ),
+        ]),
+    ));
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "answer": "the second finding" }))
+            .after(Duration::from_secs(120)),
+    ));
+
+    let Some((project, built)) =
+        harness::build_under_toolchain("server-tools", "resume-suite-moved")
+    else {
+        return;
+    };
+    assert!(
+        built.status.success(),
+        "the server-tools fixture did not build:\n{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+
+    let environment = harness::environment(&provider);
+    let killed = harness::crash_run(
+        &project,
+        &["run", "flow.relay", "--input", "question=does it?"],
+        &environment,
+        |_| provider.snapshot().requests >= 2,
+    );
+
+    // The first half: the recorded identity carries the suite. Read off the
+    // journal's committed bytes, the way this harness reads every key.
+    assert!(
+        harness::journal_holds(&project, &["first/0#model/0"]),
+        "the killed generation committed the first node's model record"
+    );
+    assert!(
+        harness::journal_holds(&project, &["serverTools"]),
+        "a connection that declares a suite puts it in the request identity \
+         (`docs/durability.md` §7)"
+    );
+
+    // The composition moves, in the one respect this test is about: the
+    // provider behind `flow.relay` stops declaring a suite.
+    let moved = harness::Scratch::new("suite-moved");
+    let source = std::fs::read_to_string(harness::fixture("server-tools")).expect("the fixture");
+    let edited = source.replace(
+        "  base_url: ${MOCK_BASE_URL}\n  server_tools:\n    - type: web_search_20250305\n      \
+         name: web_search\n      max_uses: 5\n      allowed_domains: [\"docs.example.com\"]\n",
+        "  base_url: ${MOCK_BASE_URL}\n",
+    );
+    assert_ne!(
+        edited, source,
+        "the Messages provider's suite is the block being removed"
+    );
+    let entrypoint = moved.path().join("main.yml");
+    std::fs::write(&entrypoint, edited).expect("the scratch area is writable");
+
+    provider.reset();
+    let resumed = harness::resume_entrypoint(
+        &project,
+        &entrypoint,
+        &killed.execution,
+        Some("json"),
+        &environment,
+    );
+    let said_on_stderr = resumed.failed();
+    let answered = resumed.outputs();
+    assert_eq!(answered["status"], "failed", "{answered}\n{said_on_stderr}");
+    let said = answered["error"].as_str().expect("an error");
+    assert!(
+        said.starts_with("ReplayDivergence: "),
+        "a resume of an answer produced under another tool surface is a divergence: {said}"
+    );
+    assert!(
+        said.contains("first/0#model/0"),
+        "…naming the step that disagreed, which is the *first* model call: {said}"
+    );
+
+    assert_eq!(
+        provider.snapshot().requests,
+        0,
+        "a divergence re-executes nothing (PRD resolved q29)"
+    );
+}
+
+/// The arm the conditionality above buys, and the reason `JOURNAL_VERSION` did
+/// not move for any of it: a composition that declares **no** suite derives the
+/// identity it already derived.
+///
+/// `callModel` omits the `serverTools` key entirely where no ladder member
+/// declares one, rather than writing an empty array — and the difference is
+/// every journal written before the key existed. `canonical()` sorts keys and
+/// hashes the whole object, so an extra `"serverTools":[[]]` would be a
+/// different string and every pre-existing record would fail to match its own
+/// replay (`docs/durability.md` §11.2, §11.3).
+///
+/// This holds it off the journal's committed bytes, on the fixture whose
+/// providers declare nothing: the run above is the same shape and the same
+/// two-call frontier, so what differs between the two assertions is only the
+/// suite.
+#[test]
+fn a_composition_with_no_server_tools_keeps_the_identity_it_always_derived() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "note": "the first note" })),
+    ));
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "note": "the second note" })),
+    ));
+
+    let Some((project, built)) = harness::build_under_toolchain("durability", "identity-no-suite")
+    else {
+        return;
+    };
+    assert!(
+        built.status.success(),
+        "the durability fixture did not build:\n{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+
+    let environment = harness::environment(&provider);
+    let ran = harness::run_into(
+        &project,
+        "durability",
+        "flow.relay",
+        &[("topic", "durability")],
+        None,
+        &environment,
+    );
+    ran.succeeded();
+
+    assert!(
+        harness::journal_holds(&project, &["first/0#model/0", "second/0#model/0"]),
+        "both model records are committed, so the journal really is being read"
+    );
+    assert!(
+        !harness::journal_holds(&project, &["serverTools"]),
+        "no ladder member declares a suite, so the key is omitted from the request \
+         identity rather than written empty — which is what keeps a journal from \
+         before the key existed replaying, and `JOURNAL_VERSION` where it is"
+    );
+}
+
+/// The **second** key `JOURNAL_VERSION` did not move for, on the same terms as
+/// the one above: a conversation turn off the **Messages** wire is written
+/// untagged, so a tool loop on that wire derives the identity it always derived.
+///
+/// `docs/durability.md` §3.1: an assistant turn records which wire wrote its
+/// blocks, and the key "is written **only** for a Responses turn: the Messages
+/// wire was the only surface that ever produced blocks, so leaving its turns
+/// untagged keeps every identity an earlier build derived". One line of the
+/// emitted runtime makes that true — `replayed`'s `...(answer.wire === undefined
+/// ? {} : { wire: answer.wire })`, resting on `callMessages` returning no `wire`
+/// field — and losing it is invisible to every other test in this file. A
+/// `wire: "messages"` added to `callMessages` for symmetry would stamp the key
+/// onto every replayed Messages turn; `turns` is part of a model call's request
+/// identity, so every second-and-later call of every Messages tool loop would
+/// re-key, and `canonical()` hashes the whole object. Each resume test here
+/// resumes a journal its own build wrote, so both sides would carry the new key
+/// and agree — while an `agent-compose resume` of an execution begun under an
+/// earlier build would die with a `ReplayDivergence` at the loop's second model
+/// call, with no `JOURNAL_VERSION` bump to signal a migration.
+///
+/// Both halves of the conditionality are decided, for the reason the pair above
+/// decides both of its: a negative assertion on its own would also pass on a
+/// build whose identity had stopped carrying the conversation at all, or whose
+/// journal had stopped holding a request as text this scan can read.
+///
+/// * `flow.search_loop` is the Messages wire with a real loop — three model
+///   calls, the second and third of which replay an assistant turn — and its
+///   journal must hold no `wire` key anywhere;
+/// * `flow.respond` is the same shape on the wire that **does** tag its turns,
+///   and its journal must hold one, which is what makes the scan above a scan
+///   that can see the key at all.
+#[test]
+fn a_messages_wire_tool_loop_keeps_the_untagged_turns_it_always_derived() {
+    let provider = MockProvider::start().expect("a loopback port");
+    // The Messages loop: a server search and a client call in one turn, prose to
+    // end the loop, then the pinned answer.
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new("lookup", json!({ "query": "what" }))])
+                .with_server_tools(vec![ServerToolUse::new(
+                    "web_search_20250305",
+                    json!({ "query": "what" }),
+                    json!([{ "type": "web_search_result", "url": "https://docs.example.com/a" }]),
+                )]),
+        ),
+        Script::new(SONNET, Outcome::text("I have what I need.")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "answer": "a looked-up snippet" })),
+        ),
+    ]);
+
+    let Some((messages, built)) =
+        harness::build_under_toolchain("server-tools", "identity-messages-untagged")
+    else {
+        return;
+    };
+    assert!(
+        built.status.success(),
+        "the server-tools fixture did not build:\n{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+
+    let environment = harness::environment(&provider);
+    harness::run_into(
+        &messages,
+        "server-tools",
+        "flow.search_loop",
+        &[("question", "what?")],
+        None,
+        &environment,
+    )
+    .succeeded();
+
+    assert!(
+        harness::journal_holds(&messages, &["ask/0#model/0", "ask/0#model/2"]),
+        "the loop's model records are committed, so the journal really is being read"
+    );
+    assert!(
+        !harness::journal_holds(&messages, &["\"wire\""]),
+        "a Messages turn is replayed untagged, so the key reaches neither the \
+         recorded answer nor the request identity — which is what keeps a journal \
+         from before the second wire existed replaying, and `JOURNAL_VERSION` \
+         where it is (`docs/durability.md` §3.1, §11.2)"
+    );
+    assert!(provider.snapshot().is_drained());
+
+    // The positive half, on the wire whose turns *are* tagged: the same loop
+    // shape, three calls, replaying assistant turns the Responses wire wrote.
+    provider.reset();
+    provider.enqueue_all([
+        Script::new(
+            GPT5,
+            Outcome::tool_calls(vec![ToolCall::new("lookup", json!({ "query": "what" }))])
+                .with_server_tools(vec![ServerToolUse::new(
+                    "web_search",
+                    json!({ "type": "search", "query": "what" }),
+                    json!([{ "url": "https://docs.example.com/a" }]),
+                )]),
+        ),
+        Script::new(GPT5, Outcome::text("I have what I need.")),
+        Script::new(
+            GPT5,
+            Outcome::structured(json!({ "answer": "a looked-up snippet" })),
+        ),
+    ]);
+
+    let Some((responses, built)) =
+        harness::build_under_toolchain("server-tools", "identity-responses-tagged")
+    else {
+        return;
+    };
+    assert!(
+        built.status.success(),
+        "the server-tools fixture did not build:\n{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+
+    harness::run_into(
+        &responses,
+        "server-tools",
+        "flow.respond",
+        &[("question", "what?")],
+        None,
+        &environment,
+    )
+    .succeeded();
+
+    assert!(
+        harness::journal_holds(&responses, &["ask/0#model/0", "ask/0#model/2", "\"wire\""]),
+        "the same three-call loop on the Responses wire commits the key, so the \
+         assertion above is an absence this scan can tell from a presence"
+    );
+    assert!(provider.snapshot().is_drained());
 }
 
 /// A pause survives the process that opened it, and comes back under the **same

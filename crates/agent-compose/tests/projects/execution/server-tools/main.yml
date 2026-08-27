@@ -1,0 +1,514 @@
+# M3 acceptance fixture: server tools on both launch wires (grammar 12.1,
+# Decision D122, resolved q30).
+#
+# A **server tool** runs on the provider's side, inside the model call. The
+# runtime dispatches nothing: it appends the provider's `server_tools:` array to
+# the `tools` of every request that provider serves, and the results arrive
+# woven into the assistant's turn. So what this fixture is written to make
+# assertable is three things a transcript can see:
+#
+#   * the config reaches the wire **verbatim** — the whole of what q30's
+#     pass-through promises;
+#   * a scripted `server_tool_use` (Messages) or `web_search_call` (Responses)
+#     flows through the loop **without being dispatched**, and the agent still
+#     answers;
+#   * an `openai` provider carrying a suite issues its calls to `/v1/responses`
+#     rather than `/v1/chat/completions`, and everything else about the call —
+#     function tools, structured output — still works there.
+#
+# The two providers are the two wires, and `provider.searching_openai` is
+# deliberately the *only* difference from an ordinary `openai` provider: one key
+# moves the connection to another API (Decision D122's all-or-nothing seam).
+#
+# `tool.lookup` is an `exec` binding over `printf` for the reason every fixture's
+# is: the tool loop has to be runnable in CI with no infrastructure, and its
+# output is one string property, so the raw stdout binds to it (grammar 6.1).
+version: "0.1"
+
+# One channel, written by name from each agent's `answer` output field, so a
+# flow's `outputs:` has something to materialize from (grammar 7.5, D53).
+state:
+  answer:
+    description: What the agent answered, written by name from its output.
+    type: string
+    default: nothing yet
+  relayed:
+    description: What the first node of `flow.relay` answered.
+    type: string
+    default: nothing yet
+  final:
+    description: What its second node answered.
+    type: string
+    default: nothing yet
+
+provider.searching_anthropic:
+  kind: anthropic
+  api_key: ${MOCK_API_KEY}
+  base_url: ${MOCK_BASE_URL}
+  server_tools:
+    - type: web_search_20250305
+      name: web_search
+      max_uses: 5
+      allowed_domains: ["docs.example.com"]
+
+provider.searching_openai:
+  kind: openai
+  api_key: ${MOCK_API_KEY}
+  base_url: ${MOCK_BASE_URL}
+  server_tools:
+    - type: web_search
+      search_context_size: medium
+
+# The failover pair: one member searches, the other does not, and the two are on
+# different wires. `validate` warns about the differing suites (q30 makes that
+# visible rather than refused) and the run has to compose across the seam
+# anyway — each attempt speaks its own provider's wire.
+provider.plain_openai:
+  kind: openai
+  api_key: ${MOCK_API_KEY}
+  base_url: ${MOCK_BASE_URL}
+
+# The third kind that takes the key, and the one whose entries are **all**
+# second-tier: no table could be authoritative about what a gateway honours, so
+# `validate` warns (`unknown-server-tool`) and the array rides this connection's
+# Chat Completions `tools` verbatim. Dropping it there would be the silent no-op
+# D50 refuses everywhere else — and would make the warning's own sentence a lie.
+provider.searching_gateway:
+  kind: openai_compatible
+  api_key: ${MOCK_API_KEY}
+  base_url: ${MOCK_BASE_URL}
+  server_tools:
+    - type: web_search
+      search_context_size: medium
+
+model.searching_claude:
+  provider: provider.searching_anthropic
+  id: claude-sonnet-4-6
+  settings:
+    max_tokens: 4096
+
+model.searching_gpt:
+  provider: provider.searching_openai
+  id: gpt-5
+  # Both settings the runtime **renames** on its way to the Responses wire, on
+  # the one model that reaches it: `max_tokens` becomes `max_output_tokens` and
+  # `reasoning_effort` becomes `reasoning: { effort }` (`WIRE-NOTES` (20)). The
+  # mock's key list is closed and holds only the translated spellings, so a
+  # release that stopped translating either one is a 400 on the first call of
+  # every flow below rather than a knob the service silently ignored.
+  settings:
+    max_tokens: 4096
+    reasoning_effort: high
+
+model.plain_gpt:
+  provider: provider.plain_openai
+  id: gpt-4o-mini
+
+model.searching_local:
+  provider: provider.searching_gateway
+  id: qwen3-coder-30b
+
+model.crossing_wires:
+  description: A route whose members answer on two different wires.
+  route: [model.searching_gpt, model.plain_gpt]
+  route_on: [rate_limit]
+
+# The two ladders that cross the **block-carrying** wires, in both directions.
+#
+# `model.crossing_wires` above falls back onto Chat Completions, which rebuilds
+# every assistant turn from `text`/`toolCalls` and so cannot see the problem
+# these two are for: the Messages and Responses wires each answer with a list of
+# objects and each take back only their own vocabulary, so a ladder that replays
+# a conversation across the seam has to render the other wire's turn rather than
+# forward it. That is only observable once there *is* an assistant turn to
+# replay, which is why both agents below carry a client tool: the failover has
+# to happen on the loop's second call, not its first.
+model.responses_then_messages:
+  description: A route that answers on the Responses wire and falls back to the Messages one.
+  route: [model.searching_gpt, model.searching_claude]
+  route_on: [rate_limit]
+
+model.messages_then_responses:
+  description: The same seam, crossed in the other direction.
+  route: [model.searching_claude, model.searching_gpt]
+  route_on: [rate_limit]
+
+tool.lookup:
+  description: Look up one fact the answer depends on.
+  input:
+    query:
+      description: What to look up.
+      type: string
+      min_length: 1
+  output:
+    snippet:
+      description: The one fact found, as text.
+      type: string
+  exec:
+    command: printf
+    args: ["a looked-up snippet"]
+
+agent.searcher:
+  description: Answers with the web search its provider runs for it.
+  model: model.searching_claude
+  prompt: |
+    You are a researcher.
+
+    Search the web for whatever the question depends on, then answer it.
+  input:
+    question:
+      description: What to answer.
+      type: string
+  output:
+    answer:
+      description: The answer, as text.
+      type: string
+
+agent.responder:
+  description: The same, on the Responses wire, and with a client tool as well.
+  model: model.searching_gpt
+  prompt: |
+    You are a researcher.
+
+    Look up whatever the question depends on — with your own tool or with the
+    search your provider runs — then answer it.
+  tools: [tool.lookup]
+  max_tool_iterations: 3
+  input:
+    question:
+      description: What to answer.
+      type: string
+  output:
+    answer:
+      description: The answer, as text.
+      type: string
+
+agent.looping_searcher:
+  # The Messages-wire agent that has a **client** tool as well, so its loop
+  # really turns. That is what makes "a server tool is not dispatched" a claim a
+  # trace can decide: the answer carries a `server_tool_use` block beside a
+  # `tool_use` one, and only the second may reach the runtime. Reading the first
+  # as a call would bounce it back as a refusal (Decision D119) and show up in
+  # the trace as an outcome no correct run has.
+  description: Searches, calls its own tool, and answers.
+  model: model.searching_claude
+  prompt: |
+    You are a researcher.
+
+    Use the search your provider runs and your own lookup tool, then answer.
+  tools: [tool.lookup]
+  max_tool_iterations: 3
+  input:
+    question:
+      description: What to answer.
+      type: string
+  output:
+    answer:
+      description: The answer, as text.
+      type: string
+
+agent.crosser:
+  description: Answers through a route whose members are on two wires.
+  model: model.crossing_wires
+  prompt: |
+    You are a researcher. Answer the question.
+  input:
+    question:
+      description: What to answer.
+      type: string
+  output:
+    answer:
+      description: The answer, as text.
+      type: string
+
+agent.responses_relayer:
+  # The Responses-wire twin of `agent.searcher`: no client tool, so a node is one
+  # model call and a frontier is observable between two of them. It is what makes
+  # crash-and-resume decidable on *this* wire rather than argued from the other.
+  description: Answers on the Responses wire, with no tool loop in the way.
+  model: model.searching_gpt
+  prompt: |
+    You are a researcher. Answer the question.
+  input:
+    question:
+      description: What to answer.
+      type: string
+  output:
+    answer:
+      description: The answer, as text.
+      type: string
+
+agent.gateway_searcher:
+  description: Answers through a gateway that runs a search of its own.
+  model: model.searching_local
+  prompt: |
+    You are a researcher. Answer the question.
+  input:
+    question:
+      description: What to answer.
+      type: string
+  output:
+    answer:
+      description: The answer, as text.
+      type: string
+
+agent.responses_then_messages_crosser:
+  description: Loops on the Responses wire and finishes on the Messages one.
+  model: model.responses_then_messages
+  prompt: |
+    You are a researcher. Look something up, then answer.
+  tools: [tool.lookup]
+  max_tool_iterations: 3
+  input:
+    question:
+      description: What to answer.
+      type: string
+  output:
+    answer:
+      description: The answer, as text.
+      type: string
+
+agent.messages_then_responses_crosser:
+  description: The same, starting on the Messages wire.
+  model: model.messages_then_responses
+  prompt: |
+    You are a researcher. Look something up, then answer.
+  tools: [tool.lookup]
+  max_tool_iterations: 3
+  input:
+    question:
+      description: What to answer.
+      type: string
+  output:
+    answer:
+      description: The answer, as text.
+      type: string
+
+flow.search:
+  description: One agent whose provider searches the web for it.
+  inputs:
+    question:
+      type: string
+      min_length: 1
+  outputs:
+    answer:
+      type: string
+  nodes:
+    ask:
+      agent: agent.searcher
+      input:
+        question: "input.question"
+  edges:
+    - { from: start, to: ask }
+    - { from: ask, to: end }
+
+flow.search_loop:
+  description: The Messages wire with a tool loop, so both kinds of tool are in one turn.
+  inputs:
+    question:
+      type: string
+      min_length: 1
+  outputs:
+    answer:
+      type: string
+  nodes:
+    ask:
+      agent: agent.looping_searcher
+      input:
+        question: "input.question"
+  edges:
+    - { from: start, to: ask }
+    - { from: ask, to: end }
+
+flow.respond:
+  description: The same on the Responses wire, with a client tool in the loop.
+  inputs:
+    question:
+      type: string
+      min_length: 1
+  outputs:
+    answer:
+      type: string
+  nodes:
+    ask:
+      agent: agent.responder
+      input:
+        question: "input.question"
+  edges:
+    - { from: start, to: ask }
+    - { from: ask, to: end }
+
+flow.cross:
+  description: One agent whose route crosses from the Responses wire to Chat Completions.
+  inputs:
+    question:
+      type: string
+      min_length: 1
+  outputs:
+    answer:
+      type: string
+  nodes:
+    ask:
+      agent: agent.crosser
+      input:
+        question: "input.question"
+  edges:
+    - { from: start, to: ask }
+    - { from: ask, to: end }
+
+flow.gateway:
+  description: One agent on a gateway whose suite rides Chat Completions.
+  inputs:
+    question:
+      type: string
+      min_length: 1
+  outputs:
+    answer:
+      type: string
+  nodes:
+    ask:
+      agent: agent.gateway_searcher
+      input:
+        question: "input.question"
+  edges:
+    - { from: start, to: ask }
+    - { from: ask, to: end }
+
+flow.cross_from_responses:
+  description: A tool loop that starts on the Responses wire and fails over to the Messages one.
+  inputs:
+    question:
+      type: string
+      min_length: 1
+  outputs:
+    answer:
+      type: string
+  nodes:
+    ask:
+      agent: agent.responses_then_messages_crosser
+      input:
+        question: "input.question"
+  edges:
+    - { from: start, to: ask }
+    - { from: ask, to: end }
+
+flow.cross_from_messages:
+  description: The same seam, crossed the other way.
+  inputs:
+    question:
+      type: string
+      min_length: 1
+  outputs:
+    answer:
+      type: string
+  nodes:
+    ask:
+      agent: agent.messages_then_responses_crosser
+      input:
+        question: "input.question"
+  edges:
+    - { from: start, to: ask }
+    - { from: ask, to: end }
+
+flow.relay:
+  # Two model calls in a row on a provider that carries a server-tool suite —
+  # the smallest shape a *frontier* is observable in. Kill the run while the
+  # second call is in flight and the journal holds one recorded answer, so a
+  # resumed generation replays it instead of asking again: q30 leaves replay
+  # untouched, because the tool use happened inside the recorded model call
+  # (`docs/durability.md` §3.1).
+  description: Two searching calls in a row, the second asking about the first's answer.
+  inputs:
+    question:
+      type: string
+      min_length: 1
+  outputs:
+    relayed:
+      type: string
+    final:
+      type: string
+  nodes:
+    first:
+      agent: agent.searcher
+      input:
+        question: "input.question"
+      writes:
+        answer: relayed
+
+    second:
+      agent: agent.searcher
+      input:
+        question: "state.relayed"
+      writes:
+        answer: final
+
+  edges:
+    - { from: start, to: first }
+    - { from: first, to: second }
+    - { from: second, to: end }
+
+flow.relay_responses:
+  # The same shape on the **Responses** wire, so crash-and-resume is decided on
+  # both block-carrying surfaces rather than argued from one. It is the wire
+  # whose answer a journal now records the vocabulary of, and whose items — the
+  # `web_search_call`, the ids on every one of them — travel inside the recorded
+  # answer and therefore inside the next call's request identity
+  # (`docs/durability.md` §3.1, §11.1).
+  description: Two searching calls in a row on the Responses wire.
+  inputs:
+    question:
+      type: string
+      min_length: 1
+  outputs:
+    relayed:
+      type: string
+    final:
+      type: string
+  nodes:
+    first:
+      agent: agent.responses_relayer
+      input:
+        question: "input.question"
+      writes:
+        answer: relayed
+
+    second:
+      agent: agent.responses_relayer
+      input:
+        question: "state.relayed"
+      writes:
+        answer: final
+
+  edges:
+    - { from: start, to: first }
+    - { from: first, to: second }
+    - { from: second, to: end }
+
+triggers:
+  search:
+    type: manual
+    flow: flow.search
+  search_loop:
+    type: manual
+    flow: flow.search_loop
+  relay:
+    type: manual
+    flow: flow.relay
+  relay_responses:
+    type: manual
+    flow: flow.relay_responses
+  respond:
+    type: manual
+    flow: flow.respond
+  cross:
+    type: manual
+    flow: flow.cross
+  gateway:
+    type: manual
+    flow: flow.gateway
+  cross_from_responses:
+    type: manual
+    flow: flow.cross_from_responses
+  cross_from_messages:
+    type: manual
+    flow: flow.cross_from_messages

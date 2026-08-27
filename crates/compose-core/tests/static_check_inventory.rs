@@ -288,6 +288,60 @@ const GRAMMAR: &[Check] = &[
         codes: &["missing-credential"],
         evidence: Evidence::Fixture,
     },
+    // The two-tier rule of resolved q30, split across the two passes it is
+    // decidable in. The **kind gate** is one literal beside another in one
+    // mapping, so it is the parser's, exactly as D120's credential rule is; the
+    // **contents** need the kind's curated table read for a warning as well as
+    // for an error, which is the same shape of work `settings:` already does
+    // here.
+    Check {
+        rule: "`server_tools:` is declared on a kind whose wire carries them (12.1, D122)",
+        pass: "parse/definition.rs",
+        codes: &["unsupported-server-tools"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        rule: "a `server_tools:` entry in the kind's curated table is checked against it, and one outside it — tool or field — is carried with a warning (12.1, D122)",
+        pass: "check/providers.rs",
+        codes: &[
+            "unknown-server-tool",
+            "unknown-server-tool-field",
+            "missing-key",
+            "conflicting-keys",
+            "type-mismatch",
+            "unknown-variant",
+            "value-out-of-range",
+            // The two spellings of "this key is read at compile time, and an
+            // `${ENV}` reaches the wire as the string it expands to". A field
+            // the table types as a **non-string** cannot carry one at all
+            // (`type-mismatch`); a field it pins to a **single** string may
+            // only carry that string, since the value is decided by the
+            // entry's own `type:` and the service refuses any other
+            // (`unexpected-env-ref`). A closed set of more than one is a knob a
+            // deployment turns and interpolates like any class 2 value.
+            "unexpected-env-ref",
+        ],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        rule: "a route's members declare one `server_tools:` suite (12.2, D122)",
+        pass: "check/providers.rs",
+        codes: &["mismatched-server-tools"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        // §11.5's collision rule reached from the connection's side, which is
+        // why the citation carries both sections: the *reason* is §11.5's
+        // verbatim ("the model is offered two different things under one name")
+        // and the array the names share is §12.1's, since a suite is appended
+        // to the `tools` of every request the provider serves. Two sites,
+        // because a suite collides with itself in one provider definition and
+        // with a client tool only once an agent's model reaches that provider.
+        rule: "a `server_tools:` suite offers each name once, and none an agent's own tools take (12.1, 11.5, D122)",
+        pass: "check/providers.rs, check/bindings.rs",
+        codes: &["tool-name-collision"],
+        evidence: Evidence::Fixture,
+    },
     Check {
         rule: "a `method: GET` trigger does not read through `payload.body` (13.3, D117)",
         pass: "check/triggers.rs",

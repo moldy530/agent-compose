@@ -1120,6 +1120,21 @@ export type ProviderKind =
   | "bedrock"
   | "vertex";
 
+/**
+ * One entry of a provider's `server_tools:` — a tool the **provider** runs, on
+ * its own side, inside the model call (grammar 12.1, Decision D122).
+ *
+ * Written in that provider's own wire vocabulary and appended verbatim to the
+ * `tools` of every request the provider serves. Nothing here is dispatched by
+ * this runtime: a server tool's results arrive woven into the assistant's turn,
+ * which is why the type is an open record rather than anything with an
+ * `invoke`. `type` is the only key the compiler reads.
+ */
+export interface ServerToolConfig {
+  readonly type: string;
+  readonly [key: string]: unknown;
+}
+
 /** A resolved `provider.*` (grammar 12.1). Values are read when a node runs. */
 export interface ProviderBinding {
   readonly address: string;
@@ -1135,6 +1150,39 @@ export interface ProviderBinding {
   readonly apiVersion?: string;
   readonly organization?: string;
   readonly headers?: Readonly<Record<string, string>>;
+  /**
+   * `server_tools:`, where the composition declared any (Decision D122).
+   *
+   * **Absent** and **empty** are the same thing on the wire and are kept apart
+   * anyway: the emitter omits the key entirely for a provider that declares no
+   * suite, so a binding carrying `[]` is one whose array was emptied rather than
+   * one that never had it — and on an `openai` provider that distinction is
+   * load-bearing, since declaring a suite is what moves the connection onto the
+   * Responses wire ([`speaksResponses`]).
+   */
+  readonly serverTools?: readonly ServerToolConfig[];
+}
+
+/**
+ * Whether this connection speaks OpenAI's **Responses** API rather than Chat
+ * Completions (Decision D122).
+ *
+ * All-or-nothing per provider, and that is the seam an author meets: the
+ * built-in tool suite — web search, file search, code interpreter, image
+ * generation — is a Responses-API surface that Chat Completions does not carry,
+ * so an `openai` provider that declares `server_tools:` issues **every** one of
+ * its calls to `/v1/responses`, and one that declares none keeps Chat
+ * Completions exactly as before. One provider, one wire: a connection that
+ * switched per request would make "what did this model see" depend on which
+ * agent asked.
+ *
+ * `openai_compatible` is deliberately not here. A gateway's suite rides its
+ * Chat Completions `tools` array verbatim — many honour one — and moving a
+ * gateway onto a wire it may not implement at all would break the compositions
+ * that work today.
+ */
+function speaksResponses(provider: ProviderBinding): boolean {
+  return provider.kind === "openai" && (provider.serverTools ?? []).length > 0;
 }
 
 /** A resolved `model.*` in its direct form (grammar 12.2). */
@@ -1385,6 +1433,10 @@ export type Turn =
        * answer and a replay must be the answer.
        */
       readonly blocks?: readonly unknown[];
+      /**
+       * Which wire's vocabulary [`blocks`] is written in (see [`ContentWire`]).
+       */
+      readonly wire?: ContentWire;
     }
   | {
       readonly role: "tool";
@@ -1412,6 +1464,29 @@ export type Turn =
       }[];
     };
 
+/**
+ * Which wire's vocabulary a replayed assistant turn's blocks are written in.
+ *
+ * Two surfaces send an answer as a list of objects and each takes back **its
+ * own** list: the Messages wire's `text`/`tool_use`/`thinking` blocks and the
+ * Responses wire's `message`/`function_call`/`reasoning`/`*_call` items are
+ * disjoint vocabularies, and either one sent to the other is a 400 naming a
+ * type that surface has never heard of. A route may cross the two — each member
+ * of a ladder speaks its own provider's wire (Decision D122) — so a turn one
+ * member answered can be replayed to another, and the reader has to be able to
+ * tell whether the blocks in hand are its own. Where they are not, the turn is
+ * rebuilt from the `text` and `toolCalls` read out of them, which is what every
+ * wire can render.
+ *
+ * **Absent is `"messages"`,** and that is load-bearing rather than terse: a
+ * `Turn` is part of a journaled model call's request identity ([`callModel`]),
+ * so a key written onto every Messages turn would re-key every journal recorded
+ * before this wire existed. The Messages wire was the only one that ever
+ * produced blocks, so leaving its turns untagged keeps those identities exactly
+ * as they were and `JOURNAL_VERSION` where it is (`docs/durability.md` §11.2).
+ */
+export type ContentWire = "messages" | "responses";
+
 /** What a model answered. */
 export interface ModelAnswer {
   readonly text: string | null;
@@ -1430,6 +1505,11 @@ export interface ModelAnswer {
    * Completions, whose answer is a message rather than a block list).
    */
   readonly content?: readonly unknown[];
+  /**
+   * Which wire wrote `content`, where that is not the Messages wire
+   * ([`ContentWire`]).
+   */
+  readonly wire?: ContentWire;
   /**
    * The reason the model gave for declining, on a surface that states one.
    *
@@ -1679,12 +1759,28 @@ export async function callModel(
   // whose second call carries a different history is a different call, and
   // handing it the first generation's answer would be exactly the silent
   // re-keying resolved q29 refuses.
+  //
+  // The **server** tools are in it for the same reason the client ones are: a
+  // provider's suite is part of what the model was offered, and a resume whose
+  // provider gained or lost one is a resume of a different call — so it
+  // diverges at the first model call rather than replaying an answer produced
+  // under another tool surface (`docs/durability.md` §3.1, §7, Decision D122).
+  //
+  // Per **ladder member**, because that is the granularity the suite has: each
+  // provider in a route declares its own array, so which tools were on offer
+  // depends on which member served the call. And the key is **omitted
+  // entirely** where no member declares one, which is what keeps every
+  // composition that predates the key deriving the identity it already derived
+  // — an older journal still replays, and `JOURNAL_VERSION` does not move
+  // (`docs/durability.md` §11.2, §11.3).
+  const suites = ladder(selection).map((member) => member.provider.serverTools ?? []);
   const slot = recorder.claim("model", {
     model: selection.address,
     system: request.system,
     turns: request.turns,
     tools: request.tools.map((tool) => tool.name),
     ...(request.pinned === undefined ? {} : { pinned: request.pinned.name }),
+    ...(suites.some((suite) => suite.length > 0) ? { serverTools: suites } : {}),
   });
 
   if (slot.held !== undefined) {
@@ -1971,9 +2067,12 @@ async function callDirect(
       `\`${model.provider.address}\` is \`kind: ${model.provider.kind}\`, which is reached through a cloud SDK rather than an HTTP endpoint (grammar 12.1) and which this compiler release does not call: bind \`${model.address}\` to an \`anthropic\`, \`openai\`, \`openai_compatible\` or \`azure_openai\` provider`,
     );
   }
-  return model.provider.kind === "anthropic"
-    ? await callMessages(model, request, signal)
-    : await callChatCompletions(model, request, signal);
+  if (model.provider.kind === "anthropic") return await callMessages(model, request, signal);
+  // The one wire choice that is not the kind's alone: an `openai` provider
+  // carrying a server-tool suite speaks Responses for **every** call it makes
+  // (Decision D122, [`speaksResponses`]).
+  if (speaksResponses(model.provider)) return await callResponses(model, request, signal);
+  return await callChatCompletions(model, request, signal);
 }
 
 async function callMessages(
@@ -1990,10 +2089,14 @@ async function callMessages(
   const maxTokens = settings["max_tokens"] ?? ANTHROPIC_MAX_TOKENS;
   delete settings["max_tokens"];
 
-  const messages = request.turns.map((turn) => {
-    if (turn.role === "user") return { role: "user", content: turn.text };
+  const messages: Record<string, unknown>[] = [];
+  for (const turn of request.turns) {
+    if (turn.role === "user") {
+      messages.push({ role: "user", content: turn.text });
+      continue;
+    }
     if (turn.role === "tool") {
-      return {
+      messages.push({
         role: "user",
         content: turn.results.map((result) => ({
           type: "tool_result",
@@ -2008,20 +2111,50 @@ async function callMessages(
           // be sending a field no successful call has.
           ...(result.isError === true ? { is_error: true } : {}),
         })),
-      };
+      });
+      continue;
     }
-    // A turn the model sent goes back exactly as it came — thinking blocks and
+    // A turn *this* wire sent goes back exactly as it came — thinking blocks and
     // all, which the Messages API requires unaltered beside the `tool_use`
-    // blocks they preceded. Only a turn this runtime *composed* (the shared
-    // history channel of grammar 10.4) is rendered from its parts.
-    if (turn.blocks !== undefined) return { role: "assistant", content: [...turn.blocks] };
+    // blocks they preceded. Two turns are rendered from their parts instead: one
+    // this runtime *composed* (the shared history channel of grammar 10.4), and
+    // one another **wire** answered, whose items this surface has never heard of
+    // ([`ContentWire`]) — a route that fails over from a Responses member to an
+    // Anthropic one replays its history across that seam.
+    if (turn.blocks !== undefined && (turn.wire ?? "messages") === "messages") {
+      messages.push({ role: "assistant", content: [...turn.blocks] });
+      continue;
+    }
     const content: unknown[] = [];
     if (turn.text !== undefined && turn.text !== "") content.push({ type: "text", text: turn.text });
     for (const call of turn.toolCalls ?? []) {
       content.push({ type: "tool_use", id: call.id, name: call.name, input: call.args });
     }
-    return { role: "assistant", content };
-  });
+    if (content.length === 0) {
+      // Nothing of that turn has a spelling on this wire, and
+      // `{"role": "assistant", "content": []}` is a message the Messages API
+      // refuses (`content: List should have at least 1 item`) — the very 400
+      // [`replayed`] exists to keep this runtime from sending. The turn is
+      // dropped rather than padded with a text block the model never wrote,
+      // which is what [`callChatCompletions`] does with the same situation.
+      //
+      // It is reachable off the **other** block-carrying wire and nowhere else:
+      // a Responses member can end a turn having only run a server tool — a
+      // `web_search_call` item and no `output_text`, which is also the shape an
+      // answer cut short by `max_output_tokens` takes — and a ladder that then
+      // falls to an Anthropic member arrives here with a turn whose whole
+      // content is items this surface has no vocabulary for. Those items are
+      // lost across the seam either way; what the guard decides is whether the
+      // loss is silent or is a provider 400 about the wrong request.
+      //
+      // Roles still alternate for the mock and the API alike (`WIRE-NOTES`
+      // (18)): a turn this empty carried no tool call, so the loop ended on it
+      // and it is the **last** turn — the request that drops it ends on the
+      // user turn before it.
+      continue;
+    }
+    messages.push({ role: "assistant", content });
+  }
 
   const offered = [...request.tools, ...(request.pinned === undefined ? [] : [request.pinned])];
   const body: Record<string, unknown> = {
@@ -2031,12 +2164,22 @@ async function callMessages(
     messages,
     ...settings,
   };
-  if (offered.length > 0) {
-    body["tools"] = offered.map((tool) => ({
-      name: tool.name,
-      description: tool.description,
-      input_schema: tool.schema,
-    }));
+  // The agent's own tools first, then the provider's server tools — the order
+  // is pinned by the goldens rather than left to chance, because the array
+  // reaches the wire as written and a reader comparing two builds should not
+  // have to work out whether a reordering meant anything. Client tools lead
+  // because they are the ones this composition declares; a server tool is a
+  // property of the connection every agent on it shares.
+  const server = model.provider.serverTools ?? [];
+  if (offered.length > 0 || server.length > 0) {
+    body["tools"] = [
+      ...offered.map((tool) => ({
+        name: tool.name,
+        description: tool.description,
+        input_schema: tool.schema,
+      })),
+      ...server,
+    ];
   }
   if (request.pinned !== undefined) {
     body["tool_choice"] = { type: "tool", name: request.pinned.name };
@@ -2055,6 +2198,14 @@ async function callMessages(
 
   const blocks = (answer["content"] ?? []) as { type: string; [key: string]: unknown }[];
   const texts = blocks.filter((block) => block.type === "text").map((block) => block["text"]);
+  // `tool_use` **exactly**, which is what keeps a server tool out of the tool
+  // loop (Decision D122). A provider that ran one answers with a
+  // `server_tool_use` block and its paired `*_tool_result` beside it: the call
+  // already happened, on the provider's side, and there is nothing for this
+  // runtime to dispatch. Reading them as calls would send the loop looking for a
+  // tool the agent never declared, which since Decision D119 is a *refusal*
+  // bounced back to the model — an answer that worked, reported as a mistake.
+  // They travel instead on `content`, which [`replayed`] sends back unaltered.
   const uses = blocks.filter((block) => block.type === "tool_use");
   const pinnedUse =
     request.pinned === undefined
@@ -2147,11 +2298,24 @@ async function callChatCompletions(
   }
 
   const body: Record<string, unknown> = { model: model.id, messages, ...model.settings };
-  if (request.tools.length > 0) {
-    body["tools"] = request.tools.map((tool) => ({
-      type: "function",
-      function: { name: tool.name, description: tool.description, parameters: tool.schema },
-    }));
+  // The agent's own tools first, then the provider's server tools — the same
+  // order the other two wires use, and pinned by the goldens for the same
+  // reason. The only kind that reaches here carrying a suite is
+  // `openai_compatible`: an `openai` provider that declares one speaks Responses
+  // instead ([`speaksResponses`]), and the remaining kinds are refused the key
+  // at compile time. A gateway's suite rides this array verbatim — no table
+  // could be authoritative about what a gateway honours, so the compiler warns
+  // and carries, and dropping it here would make that warning a lie
+  // (Decision D122).
+  const server = model.provider.serverTools ?? [];
+  if (request.tools.length > 0 || server.length > 0) {
+    body["tools"] = [
+      ...request.tools.map((tool) => ({
+        type: "function",
+        function: { name: tool.name, description: tool.description, parameters: tool.schema },
+      })),
+      ...server,
+    ];
   }
   if (request.pinned !== undefined) {
     // `response_format` rather than a forced function: the schema shapes the
@@ -2194,6 +2358,251 @@ async function callChatCompletions(
     // only thing that tells a refusal from a `max_tokens` cut.
     refusal: (message["refusal"] as string | null) ?? null,
   };
+}
+
+/**
+ * OpenAI's **Responses** API: `POST /v1/responses` (Decision D122).
+ *
+ * The wire an `openai` provider moves to when it declares `server_tools:`, and
+ * the only one of OpenAI's two that carries the built-in tool suite at all —
+ * web search, file search, code interpreter, image generation. Everything else
+ * about the call is the same call: the same conversation, the same client
+ * function tools, the same structured-output posture, the same failover ladder
+ * around it.
+ *
+ * # What changes from Chat Completions
+ *
+ * * **The conversation is a list of items, not messages.** A user turn is a
+ *   `message` item; a function call is its own `function_call` item beside the
+ *   message rather than a field on it; a result is a `function_call_output`
+ *   item keyed by `call_id`. The system prompt is `instructions`, which is why
+ *   it is not the first item.
+ * * **An assistant turn goes back as the items it came as.** [`ModelAnswer`]
+ *   carries the raw `output` array, exactly as the Messages wire carries
+ *   content blocks, and a replay sends it unaltered — which is what keeps a
+ *   `web_search_call` item, a `reasoning` item, and the pairing between a
+ *   `function_call` and the output that answers it intact. A turn rebuilt from
+ *   `text` and `toolCalls` would drop every one of them.
+ * * **A tool is flat.** `{ type: "function", name, parameters }` rather than
+ *   `{ type: "function", function: { … } }`.
+ * * **Two settings are spelled differently**, and are translated here:
+ *   `max_tokens` is `max_output_tokens`, and `reasoning_effort` is
+ *   `reasoning: { effort }`. Everything else in `settings:` travels as written,
+ *   which means a knob this wire does not have (`stop`, `seed`) reaches the
+ *   service and is refused by it — visibly, in the run that declared it, rather
+ *   than dropped here into a request that quietly did something else.
+ *   `docs/topics/models.md` says so where an author meets the seam, and
+ *   `agent-compose validate` refuses those two on a provider that speaks this
+ *   wire rather than leaving them to the 400.
+ * * **`store` is the service's, and its default here is `true`** where Chat
+ *   Completions' is `false` — so a connection moved onto this wire has its
+ *   prompts and completions retained by the provider where before they were
+ *   not. This request does not pin the key, and that is a decision rather than
+ *   an omission: `store: false` makes the service refuse a replayed `reasoning`
+ *   item, which is exactly what the loop above sends back on every turn of a
+ *   reasoning model, so pinning it would trade a documented retention default
+ *   for a broken tool loop. `docs/topics/models.md` says what moving wires
+ *   changes about retention, where an author can act on it.
+ *
+ * # What does not change
+ *
+ * Structured output keeps the q16 posture exactly: what is **constrained** is
+ * what is **parsed**. `text.format` is the Responses spelling of Chat
+ * Completions' `response_format`, carrying the same schema under the same
+ * `strict` decision ([`strictable`]), and the object parsed back out is the
+ * assistant text that format shaped.
+ *
+ * And a function call is dispatched exactly as it is on the other two wires —
+ * the loop, the refusals of Decision D119, the ordinals of grammar 9.4 — because
+ * the loop is above this function and never learns which wire answered.
+ */
+async function callResponses(
+  model: ModelBinding,
+  request: {
+    readonly system: string;
+    readonly turns: readonly Turn[];
+    readonly tools: readonly ToolSpec[];
+    readonly pinned?: ToolSpec;
+  },
+  signal: AbortSignal,
+): Promise<ModelAnswer> {
+  const input: unknown[] = [];
+  for (const turn of request.turns) {
+    if (turn.role === "user") {
+      input.push({
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: turn.text }],
+      });
+      continue;
+    }
+    if (turn.role === "tool") {
+      for (const result of turn.results) {
+        // No error flag: a `function_call_output` is closed to its `call_id` and
+        // its `output`, so a refusal *is* the output text — the same concession
+        // Chat Completions makes, and for the same reason (Decision D119,
+        // `WIRE-NOTES` (18), (21)). Answering every call at all is the
+        // load-bearing half: an unanswered `call_id` is a request this surface
+        // refuses.
+        input.push({
+          type: "function_call_output",
+          call_id: result.id,
+          output: result.content,
+        });
+      }
+      continue;
+    }
+    // An answer **this** surface produced goes back as it came. Everything the
+    // reading below does not read — a `reasoning` item, a `web_search_call`,
+    // the annotations on an `output_text` — is in here and nowhere else.
+    //
+    // Blocks another wire wrote are not: the Messages wire's `text`/`tool_use`
+    // vocabulary is not an item type this surface has, and a ladder that failed
+    // over from an Anthropic member to this one replays exactly such a turn
+    // ([`ContentWire`]). Those are rebuilt below, from the reading — which is
+    // what the wire that produced them is *also* holding this turn to.
+    if (turn.blocks !== undefined && turn.wire === "responses") {
+      input.push(...turn.blocks);
+      continue;
+    }
+    // The turns this runtime composed rather than received: the shared history
+    // channel of grammar 10.4, and an answer off another wire.
+    const text = turn.text ?? "";
+    if (text !== "") {
+      input.push({
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text }],
+      });
+    }
+    for (const call of turn.toolCalls ?? []) {
+      input.push({
+        type: "function_call",
+        call_id: call.id,
+        name: call.name,
+        arguments: JSON.stringify(call.args),
+      });
+    }
+  }
+
+  const settings = { ...model.settings };
+  if (settings["max_tokens"] !== undefined) {
+    settings["max_output_tokens"] = settings["max_tokens"];
+    delete settings["max_tokens"];
+  }
+  if (settings["reasoning_effort"] !== undefined) {
+    settings["reasoning"] = { effort: settings["reasoning_effort"] };
+    delete settings["reasoning_effort"];
+  }
+
+  const body: Record<string, unknown> = {
+    model: model.id,
+    instructions: request.system,
+    input,
+    ...settings,
+  };
+  // Client tools first, then the provider's suite — the same order the Messages
+  // wire uses, pinned by the goldens for the same reason.
+  const server = model.provider.serverTools ?? [];
+  const functions = request.tools.map((tool) => ({
+    type: "function",
+    name: tool.name,
+    description: tool.description,
+    parameters: tool.schema,
+    strict: strictable(tool.schema),
+  }));
+  if (functions.length > 0 || server.length > 0) {
+    body["tools"] = [...functions, ...server];
+  }
+  if (request.pinned !== undefined) {
+    body["text"] = {
+      format: {
+        type: "json_schema",
+        name: request.pinned.name,
+        strict: strictable(request.pinned.schema),
+        schema: request.pinned.schema,
+      },
+    };
+  }
+
+  const { headers } = openAiRequest(model.provider);
+  const answer = await send(model, `${baseUrl(model.provider)}/v1/responses`, headers, body, signal);
+
+  const output = (answer["output"] ?? []) as Record<string, unknown>[];
+  // **Per message item**, not one flat list of parts. A turn on this wire can
+  // hold more than one `message` — a preamble the model wrote before a server
+  // tool ran, the shaped answer after it — and the two answer different
+  // questions. `text` is everything the assistant said, which is what a replay
+  // on another wire has to carry; the *structured* answer is the last message
+  // alone, because `text.format` shapes the turn's final message and says
+  // nothing about what precedes it. Flattening them and parsing the join is how
+  // `Let me look that up.{"answer":"…"}` reaches `JSON.parse`, and server tools
+  // are exactly what makes a multi-`message` turn reachable (Decision D122).
+  const said: string[] = [];
+  let refusal: string | null = null;
+  for (const item of output) {
+    if (item["type"] !== "message") continue;
+    const parts: string[] = [];
+    for (const part of (item["content"] ?? []) as Record<string, unknown>[]) {
+      if (part["type"] === "output_text") parts.push(String(part["text"] ?? ""));
+      // A stated decline, which is what tells a refusal from an answer cut
+      // short by `max_output_tokens` — both otherwise arrive as no structured
+      // output (`WIRE-NOTES` (3), (21)).
+      if (part["type"] === "refusal") refusal = String(part["refusal"] ?? "");
+    }
+    if (parts.length > 0) said.push(parts.join(""));
+  }
+  const calls = output
+    .filter((item) => item["type"] === "function_call")
+    .map((item) => ({
+      id: String(item["call_id"]),
+      name: String(item["name"]),
+      args: JSON.parse(String(item["arguments"] ?? "{}")) as unknown,
+    }));
+  const text = said.length > 0 ? said.join("") : null;
+  const shaped = said.length > 0 ? said[said.length - 1]! : null;
+  // `status` is the call's own outcome and `incomplete_details.reason` is why an
+  // incomplete one stopped; the narrower of the two is what a reader needs, so
+  // it wins where there is one.
+  const incomplete = (answer["incomplete_details"] ?? null) as Record<string, unknown> | null;
+  const stopReason =
+    incomplete !== null && incomplete["reason"] !== undefined
+      ? String(incomplete["reason"])
+      : ((answer["status"] as string | null) ?? null);
+  return {
+    text,
+    toolCalls: request.pinned === undefined ? calls : [],
+    structured: request.pinned === undefined ? null : shapedOutput(shaped),
+    stopReason,
+    content: output,
+    // …and whose vocabulary those are, because a failover ladder may hand this
+    // turn to a member on another wire ([`ContentWire`]).
+    wire: "responses",
+    refusal,
+  };
+}
+
+/**
+ * The structured answer a Responses turn's final message carries, or `null`.
+ *
+ * `text.format` shapes that message, so parsing it is parsing what the format
+ * constrained — but only the **service** guarantees the shape, and a turn that
+ * came back with prose where the schema was asked for is an answer this runtime
+ * cannot use rather than a call that failed. So the absence is reported as an
+ * absence, which is the same posture the Messages wire has when the pinned
+ * `tool_use` block is not in the turn: `callAgent` then names the agent, the
+ * output it asked for, and what the surface said about why — a stated refusal,
+ * or a `max_output_tokens` cut. A `SyntaxError` thrown from here would name
+ * none of those, and would be thrown *inside* the journaled model call, which
+ * would record a call that worked as a call that did not.
+ */
+function shapedOutput(text: string | null): unknown {
+  if (text === null) return null;
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -2560,7 +2969,9 @@ export async function callSubflowTool(
  *
  * Every loop answer is replayed by [`replayed`], which is where an answer that
  * carried nothing at all stops the node instead of becoming an empty turn the
- * next request could not legally carry.
+ * next request could not legally carry — and where the turn records which wire
+ * wrote it, so a ladder that fails over to a member on the *other* wire replays
+ * a turn that member can read ([`ContentWire`]).
  */
 export async function callAgent(
   agent: AgentBinding,
@@ -2841,6 +3252,11 @@ function replayed(agent: AgentBinding, answer: ModelAnswer): Turn {
     text: answer.text ?? "",
     ...(answer.toolCalls.length > 0 ? { toolCalls: answer.toolCalls } : {}),
     ...(blocks === undefined ? {} : { blocks }),
+    // Which wire's vocabulary those blocks are, where it is not the Messages
+    // one. Absent for a Messages answer on purpose — a key written there would
+    // re-key every journal recorded before the second wire existed
+    // ([`ContentWire`]).
+    ...(answer.wire === undefined ? {} : { wire: answer.wire }),
   };
 }
 

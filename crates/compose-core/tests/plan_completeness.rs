@@ -1633,6 +1633,16 @@ const CASES: &[Case] = &[
         )],
         differs: true,
     },
+    // A provider's server-tool suite is what the model is offered inside every
+    // call the connection serves (grammar 12.1, Decision D122), so tightening it
+    // changes what the graph can do without touching a node — exactly the kind
+    // of edit a plan exists to surface.
+    Case {
+        what: "a server tool's budget narrowed",
+        before: &[],
+        after: &[("providers.yml", "      max_uses: 3", "      max_uses: 1")],
+        differs: true,
+    },
     Case {
         what: "a tool's signature and its binding retuned",
         before: &[],

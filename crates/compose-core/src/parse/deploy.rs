@@ -274,7 +274,7 @@ fn plugin_config(
 /// there into JSON (grammar 3.8), which cannot write infinity or NaN, so one
 /// written here would otherwise reach the artifact as `null` — a value the
 /// author never wrote.
-fn plugin_value(node: &Node, subject: &str, cx: &mut Cx) -> Spanned<PluginValue> {
+pub(crate) fn plugin_value(node: &Node, subject: &str, cx: &mut Cx) -> Spanned<PluginValue> {
     let value = match &node.value {
         Yaml::Null => PluginValue::Null,
         Yaml::Bool(value) => PluginValue::Bool(*value),

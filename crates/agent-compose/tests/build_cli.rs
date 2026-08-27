@@ -130,6 +130,66 @@ fn build_writes_the_project_layout_where_out_points() {
     );
 }
 
+/// A **warning** does not refuse an emission: the files are written, the exit
+/// code is `0`, and the verdict counts the warnings onto it.
+///
+/// This is the severity's whole meaning, decided at the command that could most
+/// easily get it wrong — a build is where "the report was not clean" is the
+/// tempting place to stop. `unknown-server-tool` is what makes it load-bearing
+/// (grammar 12.1, Decision D122, PRD resolved q30): a provider declaring a
+/// server tool this release predates is a composition the compiler cannot fully
+/// check and must not refuse, or the second tier's no-treadmill promise is void
+/// — an author would be told to wait for a compiler release after all. The
+/// `cli` topic states it where an author reads it, and this is what holds the
+/// statement true.
+#[test]
+fn a_warning_does_not_refuse_an_emission() {
+    let out = scratch("warned");
+    let output = build(&[
+        "crates/agent-compose/tests/projects/one-unverifiable-server-tool/main.yml",
+        "--out",
+        out.to_str().expect("a UTF-8 scratch path"),
+    ]);
+    assert_eq!(
+        code(&output),
+        0,
+        "a warning is not a refusal: {}",
+        stderr(&output)
+    );
+    assert!(
+        stderr(&output).contains("warning[unknown-server-tool]"),
+        "the warning is still reported: {}",
+        stderr(&output)
+    );
+    assert!(
+        stderr(&output).contains("(target `local`), with 1 warning"),
+        "…and the verdict counts it onto the emission: {}",
+        stderr(&output)
+    );
+    assert!(
+        files_under(&out).contains(&"src/runtime.ts".to_string()),
+        "the project was written: {:?}",
+        files_under(&out)
+    );
+
+    // The machine report says the same thing in the shape the `cli` topic
+    // documents: the key that decides the verdict is empty, and the warning is
+    // under its own.
+    let output = build(&[
+        "crates/agent-compose/tests/projects/one-unverifiable-server-tool/main.yml",
+        "--out",
+        out.to_str().expect("a UTF-8 scratch path"),
+        "--format",
+        "json",
+    ]);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let report: serde_json::Value =
+        serde_json::from_str(stdout(&output)).expect("the report is JSON");
+    assert_eq!(report["diagnostics"], serde_json::json!([]));
+    assert_eq!(report["warnings"][0]["code"], "unknown-server-tool");
+    assert_eq!(report["drift"], serde_json::json!([]));
+}
+
 /// `build` reads no environment: every `${ENV}` the composition references is
 /// unset and it emits anyway, moving the check into the artifact.
 ///

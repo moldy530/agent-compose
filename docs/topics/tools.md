@@ -5,6 +5,11 @@ LLM-discovered and nondeterministic; the same `tool.*` reached from a
 `function:` node is graph-invoked and deterministic. The definition is shared;
 validation is surface-specific. That is the def/use split.
 
+Everything on this page is a tool **this runtime dispatches**. A tool the
+*provider* runs — web search, code execution — is a different thing and is
+declared on the connection rather than on the agent: see `server_tools:` in
+`agent-compose docs models`.
+
 ```yaml spec
 version: "0.1"
 

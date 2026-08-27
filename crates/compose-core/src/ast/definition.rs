@@ -300,6 +300,27 @@ impl ProviderKind {
         }
     }
 
+    /// Whether this kind takes `server_tools:` (grammar 12.1, Decision D122).
+    ///
+    /// Three kinds do, and each for its own reason: `anthropic` carries the
+    /// suite on the Messages wire it already speaks, `openai` carries it on the
+    /// Responses wire a declared suite switches it to, and
+    /// `openai_compatible` carries it because a gateway may honour any
+    /// vocabulary at all and refusing the key would recreate the very support
+    /// treadmill resolved q30 exists to avoid.
+    ///
+    /// The other three are refused **outright** rather than warned: their wires
+    /// have not been taught the shape, so a config declared on one would be
+    /// dropped on the floor — a silent no-op, which is what
+    /// [D50](../../../docs/grammar.md) refuses everywhere else.
+    #[must_use]
+    pub const fn serves_server_tools(self) -> bool {
+        matches!(
+            self,
+            Self::Anthropic | Self::OpenAi | Self::OpenAiCompatible
+        )
+    }
+
     /// Every key this kind accepts, required ones included (grammar 12.1).
     ///
     /// `kind` and `description` are the two keys grammar 12.1 states are legal
@@ -314,16 +335,31 @@ impl ProviderKind {
     #[must_use]
     pub const fn keys(self) -> &'static [&'static str] {
         match self {
-            Self::Anthropic => &["kind", "api_key", "base_url", "headers", "description"],
+            Self::Anthropic => &[
+                "kind",
+                "api_key",
+                "base_url",
+                "headers",
+                "server_tools",
+                "description",
+            ],
             Self::OpenAi => &[
                 "kind",
                 "api_key",
                 "base_url",
                 "organization",
                 "headers",
+                "server_tools",
                 "description",
             ],
-            Self::OpenAiCompatible => &["kind", "base_url", "api_key", "headers", "description"],
+            Self::OpenAiCompatible => &[
+                "kind",
+                "base_url",
+                "api_key",
+                "headers",
+                "server_tools",
+                "description",
+            ],
             Self::AzureOpenAi => &[
                 "kind",
                 "base_url",
@@ -496,8 +532,32 @@ pub struct ProviderDef {
     pub profile: Option<Spanned<Interpolated>>,
     /// `headers:`
     pub headers: Vec<InterpolatedEntry>,
+    /// `server_tools:` — the tools this connection's provider runs on its own
+    /// side, in that provider's wire vocabulary (grammar 12.1, Decision D122).
+    pub server_tools: Vec<ServerToolDef>,
     /// `description:`
     pub description: Option<Spanned<String>>,
+}
+
+/// One entry of a provider's `server_tools:` array (grammar 12.1,
+/// Decision D122).
+///
+/// The entry is a **wire object**, not a construct of this grammar: `type:` is
+/// the only key the compiler requires, and everything beside it travels to the
+/// provider verbatim. Values are grammar 4.3 class 2 — non-secret provider
+/// config, so they may interpolate — which is why they are read as
+/// [`PluginValue`](super::deploy::PluginValue) rather than as
+/// [`Literal`](super::common::Literal).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ServerToolDef {
+    /// `type:` — required, and a plain string: it is the key the vendor's
+    /// vocabulary is looked up under, so an `${ENV}` here would be a tool whose
+    /// identity is not decidable at compile time.
+    pub type_name: Option<Spanned<String>>,
+    /// Every key of the entry beside `type:`, in declaration order.
+    pub config: Vec<super::deploy::PluginEntry>,
+    /// The entry's own span.
+    pub span: Span,
 }
 
 /// The conditions a model route fails over on (grammar 12.2).

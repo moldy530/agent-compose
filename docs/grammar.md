@@ -3418,15 +3418,16 @@ that name it.
 | `api_key` | env-ref value | per kind (below) | never a literal (§4.3) |
 | `base_url` | env-ref value | per kind (below) | never a literal (§4.3) |
 | `headers` | map name→string (interpolable) | optional on the kinds that take it | extra request headers |
+| `server_tools` | array of wire config objects | optional on the kinds that take it | tools the **provider** runs, appended to every request it serves (below) |
 | kind-specific keys | per plugin | per kind (below) | validated against the plugin's published schema |
 
 v0 provider kinds and the keys each one takes, `kind:` and `description:` aside:
 
 | `kind` | Required | Optional |
 |---|---|---|
-| `anthropic` | `api_key` — **or** a `base_url` naming the gateway that holds one (below) | `api_key` (beside a `base_url`), `base_url`, `headers` |
-| `openai` | `api_key` — **or** a `base_url` naming the gateway that holds one (below) | `api_key` (beside a `base_url`), `base_url`, `headers`, `organization` |
-| `openai_compatible` | `base_url` | `api_key`, `headers` |
+| `anthropic` | `api_key` — **or** a `base_url` naming the gateway that holds one (below) | `api_key` (beside a `base_url`), `base_url`, `headers`, `server_tools` |
+| `openai` | `api_key` — **or** a `base_url` naming the gateway that holds one (below) | `api_key` (beside a `base_url`), `base_url`, `headers`, `organization`, `server_tools` |
+| `openai_compatible` | `base_url` | `api_key`, `headers`, `server_tools` |
 | `azure_openai` | `base_url`, `api_key`, `api_version` | `headers` |
 | `bedrock` | `region` | `access_key_id`, `secret_access_key`, `session_token`, `profile` |
 | `vertex` | `project`, `location` | `credentials_json` |
@@ -3472,6 +3473,100 @@ The two SDK-reached kinds are where the rows differ most visibly from the rest:
 connection made through a cloud SDK has no bare endpoint to point at and no
 request the spec composes headers onto. A deployment that genuinely needs either
 is reaching a compatible HTTP endpoint, which is what `openai_compatible` is for.
+
+**`server_tools` is a provider-side tool suite.** A *server tool* runs on the
+provider's side, inside the model call: the compiled runtime dispatches nothing,
+and the results arrive woven into the assistant's turn. The key holds an array
+of config objects written in **that provider's own wire vocabulary**, and the
+runtime appends them to the `tools` of every request that provider serves, after
+the agent's own tools.
+
+```yaml
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+  server_tools:
+    - type: web_search_20250305
+      name: web_search
+      max_uses: 5
+```
+
+Each entry MUST carry a string `type`, which is the key the provider's
+vocabulary is looked up under and is never interpolated. Every other key is the
+provider's, travels verbatim, and is grammar 4.3 class 2 — non-secret provider
+config, so its string values MAY interpolate. A key the curated table below
+types as anything but a string is read at compile time and takes a literal: an
+`${ENV}` there is a `type-mismatch` naming the rule, since interpolation
+produces a string and the wire is given the value. A key the table pins to a
+**single** value — the Messages wire's `name:`, and a nested object's `type:`
+(`user_location:`'s `approximate`, `cache_control:`'s `ephemeral`,
+`container:`'s `auto`) — takes that value: it is decided by the entry's own
+`type:` and the service refuses any other spelling, so an `${ENV}` there is
+`unexpected-env-ref` rather than a value read at process start. A closed set of
+*several* values is an ordinary class 2 string and interpolates
+(`search_context_size: ${SEARCH_DEPTH}`).
+
+**The array a request carries is one namespace.** A suite is appended to the
+`tools` of every request the connection serves, beside the agent's own tools, and
+the provider surfaces refuse a request offering two tools under one name. So two
+entries that reach the wire as one tool, and a server tool whose name an agent's
+attached or synthesized tool already takes, are a compile error
+(`tool-name-collision`) — §11.5's rule and §11.5's reason, reached from the
+connection's side. On the Messages wire the name is the one the table pairs with
+each dated `type`, which is what makes `code_execution_20250522` beside
+`code_execution_20250825` two types with one name; the within-a-suite half holds
+on every kind, since two entries of one array under one name are one tool twice
+by the author's own reckoning. The agent-side half is stated over the Messages
+wire **alone**: a Responses built-in is addressed by its `type` and a function
+tool by its `name`, Chat Completions nests a function tool's name inside its own
+object, and no table could say what a gateway keys its vocabulary on — so a
+`tool.*` whose name an `openai` or `openai_compatible` connection's suite also
+spells is not refused.
+
+The checking is **two-tier**, and the constraint behind it is that a server tool
+a vendor ships tomorrow must be usable the day it ships:
+
+- a `type` in the compiler's **curated table** for that kind is validated
+  strictly **against the fields that table models** — a mistyped value, a value
+  outside a stated range or a closed set, a missing required field, or a
+  constraint violation is an error naming the repair. On the Messages wire that
+  closed set includes the required `name`, which the API pairs with each dated
+  `type` and refuses a request that spells otherwise: `web_search_20250305` is
+  `web_search`, `web_fetch_20250910` is `web_fetch`, and either
+  `code_execution_*` is `code_execution`;
+- a `type` outside it is a **warning** (`unknown-server-tool`) naming exactly
+  what could not be verified, and the entry then travels to the wire as written.
+  The composition still builds and still runs;
+- a **key** outside the row of a `type` that is in the table is the same
+  warning one level down (`unknown-server-tool-field`), and travels the same
+  way. A row is keyed on `type` alone and is a snapshot of that tool taken at
+  the compiler's release, so a parameter the vendor adds afterwards would
+  otherwise block every author of a tool the table names — the treadmill again,
+  at field granularity, with no entry-level way out. The compiler cannot tell
+  such a key from a misspelling, so the diagnostic names the near miss where
+  there is one and claims nothing where there is not.
+
+The key is legal on the three kinds whose rows name it and is an error
+(`unsupported-server-tools`) on `azure_openai`, `bedrock` and `vertex`, whose
+wires this release has not been taught to carry it on. On `openai_compatible`
+every entry is second-tier: a gateway may honour any vocabulary at all.
+
+**The key can move the connection's wire, and §12.2's settings row moves with
+it.** An `openai` provider that declares `server_tools:` speaks the Responses
+API for all of its calls (D122), and two of §12.2's published `settings:` keys
+have no equivalent there: `stop:` and `seed:` are Chat Completions'. A model
+bound to such a provider that declares either is a compile error
+(`unknown-key`) naming the wire, rather than a request the service refuses on
+the first call — the same reasoning as the strict tier above. Both keys stay
+legal on an `openai` provider that declares no suite.
+
+**A suite belongs to a connection**, so every agent whose model resolves to that
+provider holds it; scoping a suite to one agent is done by defining a second
+provider. And because a failover route's members each name their own provider,
+which tools were on offer depends on which member answered — a route whose
+members declare different suites is a warning (`mismatched-server-tools`), not a
+refusal. Decision
+[D122](#d122-server-tools-are-provider-side-config-checked-in-two-tiers).
 
 ### 12.2 Model definitions
 
@@ -6246,6 +6341,94 @@ about a LangGraph **checkpointer**, which PRD resolved q26 rules out as this
 project's durability mechanism in favour of journal + replay. `--target local` is
 still the un-checkpointed target, `detach: true` is still legal only there, and
 it is now also a durable one. *PRD 5.11, resolved q26–q29.*
+
+### D122. Server tools are provider-side config, checked in two tiers
+
+A provider MAY declare `server_tools:`, an array of config objects in that
+provider's own wire vocabulary, and the runtime appends them to the `tools` of
+every request that provider serves. Each entry requires a string `type:`;
+everything else is the provider's and travels verbatim, as grammar 4.3 class 2
+values. The compiler keeps a **curated table** of the server tools each kind is
+known to serve: an entry naming one is checked strictly against it, and anything
+the table cannot speak for is a **warning** that says so and is carried to the
+wire unchanged. **Rationale**: PRD resolved q30. The governing constraint is *no
+manual support treadmill* — a server tool the vendor ships tomorrow must be
+usable the day it ships, without waiting for a compiler release — and the two
+tiers are how that coexists with G3 diagnostics: the table buys a real error
+message for what it knows, and buys nothing at the cost of a warning for what it
+does not. A table that *gated* would be the treadmill; no table at all would
+make a misspelled `max_uses` a 400 on the first live call, with no span.
+
+**"Anything the table cannot speak for" is two things, not one.** A `type` it
+does not name (`unknown-server-tool`), and a **key** it does not name inside a
+`type` it does (`unknown-server-tool-field`). The second is the same rule read
+at field granularity, and it has to be, for the same reason: a row is keyed on
+`type` alone and is a snapshot of one tool at one release, vendors add
+parameters to tools they already ship, and a strict tier nobody can opt an entry
+out of would refuse them until a new binary shipped. What stays an **error** is
+everything the table genuinely knows: a field it models given the wrong kind of
+value, a value outside a stated range or closed set, a required field left out,
+two fields the vendor refuses together. A field the vendor documents whose
+interior the compiler's vocabulary cannot state — `file_search`'s recursive
+`filters` — is *in* the row as an unconstrained key, since a documented
+parameter warned about is a diagnostic that teaches nothing.
+
+**The runtime dispatches nothing.** A server tool executes on the provider's
+side, inside the model call, and its results arrive woven into the assistant's
+turn — which is why the array is a wire object rather than a construct of this
+grammar, and why a `server_tool_use` block is *not* a tool call the agent's loop
+answers. It is also why replay is untouched: the use happens inside the recorded
+model call (`docs/durability.md` §3.1).
+
+**Launch scope is `anthropic` and `openai`, plus `openai_compatible`
+unverified.** For Anthropic's Messages wire the table holds web search, web
+fetch and code execution; for OpenAI it holds the built-in suite of the
+**Responses** API — web search, file search, code interpreter, image generation
+— which Chat Completions does not carry. So an `openai` provider that declares
+`server_tools:` speaks the Responses API for **all** of its calls, and one that
+declares none keeps Chat Completions: one provider, one wire, because a
+connection that switched per request would make "what did this model see" depend
+on which agent asked. `openai_compatible` takes the key with every entry
+second-tier — a gateway may honour any vocabulary, and refusing would recreate
+the treadmill — and rides its Chat Completions `tools` array. `azure_openai`,
+`bedrock` and `vertex` refuse it outright rather than dropping it silently
+(D50).
+
+**Moving the wire moves what that wire has.** Two of §12.2's `settings:` keys
+are Chat Completions' and have no Responses spelling — `stop:` and `seed:` — so
+declaring a suite makes them a compile error on the models that connection
+serves rather than a 400 on the first call. Two others change spelling and the
+runtime translates them (`max_tokens` → `max_output_tokens`, `reasoning_effort`
+→ `reasoning: { effort }`). One thing changes that the compiler does not decide:
+the Responses API's service-side default for `store` is `true` where Chat
+Completions' is `false`, so the provider retains prompts and completions for a
+connection that has moved. The emitted request does not pin the key, because
+`store: false` makes the service refuse a replayed `reasoning` item and a tool
+loop replays every turn; `docs/topics/models.md` says so where an author meets
+the seam.
+
+**A suite belongs to a connection.** Every agent whose model resolves to that
+provider holds it, and scoping a suite to one agent is done by defining a second
+provider — providers are cheap. Failover capability is therefore per-chain-member
+by construction, so `validate` **warns** when a route's members declare differing
+suites: which tools were on offer depends on which member answered, and that is
+a legal thing to want (a fallback vendor that has no web search is still a
+fallback) as well as a real thing to know.
+
+**One name, one tool — §11.5's rule, reached from the connection.** The suite is
+appended to the same `tools` array the agent's own tools land in, and the
+provider surfaces refuse a request offering two tools under one name, so
+`tool-name-collision` is an **error** on two more pairs: two entries of one suite
+that reach the wire as one tool, and a server tool whose name an attached
+`tool.*`/`flow.*` or a synthesized store tool already takes on an agent whose
+model reaches that provider. The first is what the Messages wire's canonical
+`name:` pinning makes decidable — both dated `code_execution_*` revisions *are*
+`code_execution`, so the strict tier checking each entry in isolation would let
+the pair through to a 400 with no span, which is the failure that pinning exists
+to prevent. The second is stated over the Messages wire alone: it is the wire
+where a server tool and a client tool sit under one key, a Responses built-in is
+addressed by its `type` while a function tool carries a `name`, and no table
+could say what a gateway keys its vocabulary on. *PRD 5.9, resolved q30.*
 
 ---
 

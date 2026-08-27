@@ -968,6 +968,78 @@ const HARNESS: &[Criterion] = &[Criterion {
             "a_scripted_delay_makes_completion_order_differ_from_item_order",
             Status::Live,
         ),
+        // The fixture list's own guard, which grew a second arm when the first
+        // fixture that validates with a *warning* arrived (Decision D122).
+        ("every_fixture_with_a_declared_warning_exists", Status::Live),
+        // Server tools (grammar 12.1, Decision D122, resolved q30), which are
+        // this bullet's criterion on both counts: they are what a scripted model
+        // response now has to be able to *carry*, and the Responses wire they
+        // move an `openai` provider onto is a surface the harness had to learn.
+        // Each is one claim a transcript decides.
+        (
+            "a_providers_server_tools_reach_the_messages_wire_verbatim",
+            Status::Live,
+        ),
+        (
+            "a_server_tool_block_is_neither_dispatched_nor_refused_by_the_loop",
+            Status::Live,
+        ),
+        (
+            "an_openai_provider_with_server_tools_runs_its_loop_on_the_responses_wire",
+            Status::Live,
+        ),
+        // …and the turn shape only that wire can produce: a preamble `message`
+        // before the shaped one, which is what a server tool running mid-turn
+        // leaves behind.
+        (
+            "a_pinned_responses_turn_is_read_at_the_message_the_format_shaped",
+            Status::Live,
+        ),
+        (
+            "a_pinned_responses_turn_carrying_no_object_is_reported_as_no_structured_output",
+            Status::Live,
+        ),
+        // …and the third route the key reaches, which is on neither of those
+        // two wires: a gateway keeps Chat Completions and its suite rides that
+        // request's own `tools` array.
+        (
+            "a_gateways_server_tools_ride_its_chat_completions_tools_array",
+            Status::Live,
+        ),
+        (
+            "a_server_tool_outside_the_table_is_warned_about_and_still_reaches_the_wire",
+            Status::Live,
+        ),
+        // …and the same tier one level in: a key the row of a *known* tool does
+        // not name, which a compiler that refused it would block every author of
+        // that tool over until a new binary shipped.
+        (
+            "a_server_tool_field_outside_the_table_is_warned_about_and_still_reaches_the_wire",
+            Status::Live,
+        ),
+        ("a_failover_that_crosses_two_wires_composes", Status::Live),
+        // …and the half of that seam a first-call failover cannot reach: a
+        // *replayed* assistant turn, which each wire will only take back in its
+        // own vocabulary.
+        (
+            "a_failover_off_the_responses_wire_rewrites_the_turn_for_the_messages_one",
+            Status::Live,
+        ),
+        (
+            "a_failover_off_the_messages_wire_rewrites_the_turn_for_the_responses_one",
+            Status::Live,
+        ),
+        // …and the turn that rewriting has *nothing* to write: a Responses
+        // answer that is all server-tool items, which the rebuild must drop
+        // rather than send as the empty message the Messages API refuses.
+        (
+            "a_responses_turn_with_nothing_the_messages_wire_can_spell_is_not_replayed_empty",
+            Status::Live,
+        ),
+        (
+            "server_tools_on_a_kind_whose_wire_has_none_is_refused_by_name",
+            Status::Live,
+        ),
     ],
 }];
 
@@ -1046,6 +1118,48 @@ const DURABILITY: &[Criterion] = &[
             // it disagrees at.
             (
                 "a_resume_whose_journal_no_longer_describes_the_run_names_the_divergent_step",
+                Status::Live,
+            ),
+            // …and the one composition shape that could have made replay a
+            // different question and does not: a provider that runs **server
+            // tools** (Decision D122). The use happens inside the recorded model
+            // call, so it gets no record and no key of its own, and the resumed
+            // generation replays the whole turn — search and all.
+            (
+                "a_resumed_run_replays_a_server_tools_answer_without_asking_again",
+                Status::Live,
+            ),
+            // …and the same claim on the second block-carrying wire, whose
+            // service-minted item ids travel inside the recorded answer and so
+            // inside the next call's request identity (Decision D122).
+            (
+                "a_resumed_run_replays_a_responses_wire_answer_without_asking_again",
+                Status::Live,
+            ),
+            // …and the promise `docs/durability.md` §7 makes about the other
+            // direction, which the two above cannot decide because a matching
+            // suite replays whether or not the identity keys on it: a resume
+            // whose provider *lost* a server tool diverges at the first model
+            // call rather than replaying an answer produced under another tool
+            // surface (Decision D122, resolved q29).
+            (
+                "a_resume_whose_provider_lost_its_server_tools_diverges_at_the_first_model_call",
+                Status::Live,
+            ),
+            // …and the arm that buys, which is why `JOURNAL_VERSION` did not
+            // move for any of it: a composition declaring no suite omits the key
+            // entirely and derives the identity it always derived, so a journal
+            // written before the key existed still replays.
+            (
+                "a_composition_with_no_server_tools_keeps_the_identity_it_always_derived",
+                Status::Live,
+            ),
+            // …and the same argument on the second key `JOURNAL_VERSION` did not
+            // move for: a Messages-wire turn is replayed untagged, so a tool loop
+            // on that wire puts no `wire` key in the identity either
+            // (`docs/durability.md` §3.1).
+            (
+                "a_messages_wire_tool_loop_keeps_the_untagged_turns_it_always_derived",
                 Status::Live,
             ),
             // …the other divergence resolved q29 names, which is not a request

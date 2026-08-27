@@ -21,6 +21,13 @@
 //! * ```` ```yaml triggers ```` — a complete spec that must **report** the code
 //!   its explanation file is named for. Anything else it reports is fine; a
 //!   minimal example of one failure often carries a second.
+//! * ```` ```yaml triggers <code> ```` — the same, in a **topic**, where there
+//!   is no file name to take the code from so the marker carries it. Topics are
+//!   example-led and their examples are held clean, which is exactly the wrong
+//!   discipline for the one thing a topic sometimes has to teach: what a
+//!   **warning** looks like. A warning's spec builds and runs, so a topic that
+//!   showed one as a bare fragment would be showing an unchecked block that
+//!   looks identical to a checked one.
 //! * an explanation may also carry a ```` ```yaml spec ```` block, which is its
 //!   **repair** written out: the triggering spec with the fix applied, held to
 //!   the same clean verdict a topic's example is. A fix stated only in prose is
@@ -146,6 +153,12 @@ const TOPICS_WITHOUT_A_RUNNABLE_EXAMPLE: &[(&str, &str)] = &[
 /// the next one. That last is the shape a bare fragment cannot carry at all:
 /// the repair is two edits in two places, and a one-line `over:` is only ever
 /// the second of them.
+///
+/// The last two are a different case and are here for a different reason: they
+/// are **warnings**, so their triggering example builds. A reader who is told
+/// "correct the spelling" or "drop the key" has no diagnostic to confirm they
+/// did — the report simply goes quiet — so the repaired spec is the only thing
+/// that says which edit produces the quiet report.
 const EXPLANATIONS_WITH_A_CORRECTED_EXAMPLE: &[&str] = &[
     "invalid-path-expression",
     "missing-capability",
@@ -153,6 +166,9 @@ const EXPLANATIONS_WITH_A_CORRECTED_EXAMPLE: &[&str] = &[
     "unbalanced-convergence",
     "undefined-channel",
     "unkeyed-map-write",
+    "unknown-server-tool",
+    "unknown-server-tool-field",
+    "unsupported-server-tools",
 ];
 
 /// The topics that teach a deploy file, and must keep one that resolves.
@@ -205,6 +221,37 @@ fn blocks(document: &str, marker: &str) -> Vec<String> {
             body.push('\n');
         }
         found.push(body);
+    }
+    found
+}
+
+/// Every fenced block whose info string is `yaml triggers <code>`, paired with
+/// the code it must report.
+///
+/// The explanations' `yaml triggers` takes its code from the file name; a topic
+/// has no such name, so the marker carries it — the same reason
+/// [`deploy_blocks`] takes an argument.
+fn topic_triggers_blocks(document: &str) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    let mut lines = document.lines();
+    while let Some(line) = lines.next() {
+        let Some(code) = line.trim_end().strip_prefix("```yaml triggers ") else {
+            continue;
+        };
+        let code = code.trim();
+        assert!(
+            !code.is_empty() && code.chars().all(|c| c.is_ascii_lowercase() || c == '-'),
+            "a topic's `yaml triggers` block names the code it reports, found `{code}`"
+        );
+        let mut body = String::new();
+        for line in lines.by_ref() {
+            if line.trim_end() == "```" {
+                break;
+            }
+            body.push_str(line);
+            body.push('\n');
+        }
+        found.push((code.to_string(), body));
     }
     found
 }
@@ -405,6 +452,75 @@ fn only_the_named_topics_lack_a_runnable_example() {
         without, expected,
         "a topic gained or lost a runnable example; if a topic is genuinely reference rather than \
          curriculum, add it to TOPICS_WITHOUT_A_RUNNABLE_EXAMPLE with the reason"
+    );
+}
+
+/// The topics that teach a diagnostic by showing the spec that reports it, and
+/// the codes they show.
+///
+/// A **set equality**, like every other list here: a topic that lost its marker
+/// would go unchecked while still reading as a worked example, and one that
+/// gained a block nobody listed would be teaching a code no reviewer chose.
+///
+/// The first two entries are warnings, which is why the marker exists at all: a
+/// warning's spec is a spec that *works*, so `yaml spec` — held to a clean
+/// verdict — is exactly what it cannot be marked as, and a bare fence would
+/// leave the blocks in the curriculum that report something checked by nothing.
+/// They are the two granularities of resolved q30's second tier: a `type:` the
+/// curated table does not name, and a key it does not name inside a `type:` it
+/// does. The third is an error, and is here for the neighbouring reason: it is
+/// the one settings key the topic teaches by showing a spec that does **not**
+/// compile — `stop:` on a connection a server-tool suite moved onto the
+/// Responses wire (Decision D122) — and `yaml spec` would hold that block to a
+/// clean verdict it is written to fail.
+const TOPICS_THAT_TRIGGER_A_CODE: &[(&str, &str)] = &[
+    ("models", "unknown-server-tool"),
+    ("models", "unknown-server-tool-field"),
+    ("models", "unknown-key"),
+    ("models", "tool-name-collision"),
+];
+
+/// A topic's `yaml triggers <code>` block reports the code it names.
+///
+/// The topic half of `every_explanation_example_reports_its_code`, and it exists
+/// for the same reason: a published example that stopped doing what it claims
+/// teaches a rule the compiler no longer has, and the reader has no way to tell.
+#[test]
+fn every_topic_triggers_example_reports_its_code() {
+    let known: Vec<&str> = compose_core::DiagnosticCode::ALL
+        .iter()
+        .map(|code| code.as_str())
+        .collect();
+    let mut carrying = Vec::new();
+    for (topic, document) in topics() {
+        for (index, (code, source)) in topic_triggers_blocks(&document).into_iter().enumerate() {
+            assert!(
+                known.contains(&code.as_str()),
+                "`{topic}` names `{code}`, which is not a diagnostic code"
+            );
+            carrying.push((topic.clone(), code.clone()));
+            let diagnostics = report(&format!("topic-{topic}-triggers-{index}"), &source);
+            let reported: Vec<&str> = diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code.as_str())
+                .collect();
+            assert!(
+                reported.contains(&code.as_str()),
+                "the block in `{topic}` does not report `{code}`; it reports {reported:?}\n{}",
+                render(&diagnostics)
+            );
+        }
+    }
+    carrying.sort();
+    let mut expected: Vec<(String, String)> = TOPICS_THAT_TRIGGER_A_CODE
+        .iter()
+        .map(|(topic, code)| ((*topic).to_string(), (*code).to_string()))
+        .collect();
+    expected.sort();
+    assert_eq!(
+        carrying, expected,
+        "a topic gained or lost a `yaml triggers <code>` block; \
+         TOPICS_THAT_TRIGGER_A_CODE is the list"
     );
 }
 

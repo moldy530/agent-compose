@@ -1,0 +1,28 @@
+# rule: a `server_tools:` field the curated table pins to one value takes that value literally (grammar 12.1, 4.3, Decision D122)
+# code: unexpected-env-ref
+# message: `name` of server tool `web_search_20250305` of `provider.main` is `${WEB_SEARCH_NAME}`, and this field takes one value: `web_search`
+# at: main.yml:28:13
+# help: the wire decides this key from the entry's `type:` and refuses a request that spells it otherwise, so it is read at compile time rather than at process start: write `web_search` (grammar 12.1, 4.3, Decision D122)
+#
+# The sibling of `server-tool-names-something-other-than-its-canonical-name`, and
+# the spelling that walks around it. The Messages API pairs each dated `type:`
+# with one fixed `name:` and answers a request whose two disagree with a 400 —
+# which is why the table pins the name rather than only requiring one — and a
+# closed set the compiler skips because the value carries an `${ENV}` reference
+# is that pin not holding.
+#
+# `server_tools:` is provider config, so grammar 4.3 class 2 does promise its
+# string values interpolate, and a closed set of *several* strings is a knob a
+# deployment may turn (`search_context_size: ${SEARCH_DEPTH}` validates). A
+# closed set of **one** is not a knob at all: the only legal value is a constant
+# this compiler already holds, decided by the entry's own `type:`, so a reference
+# here is redundant where the process happens to hold that constant and a
+# guaranteed refusal everywhere else.
+version: "0.1"
+
+provider.main:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+  server_tools:
+    - type: web_search_20250305
+      name: ${WEB_SEARCH_NAME}

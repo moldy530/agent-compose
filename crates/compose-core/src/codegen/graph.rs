@@ -424,6 +424,31 @@ fn providers(ir: &Ir, names: &Names) -> String {
             }
             text.push_str("    };\n  },\n");
         }
+        if !config.server_tools.is_empty() {
+            text.push_str("  get serverTools(): readonly runtime.ServerToolConfig[] {\n");
+            text.push_str("    return [\n");
+            for (index, tool) in config.server_tools.iter().enumerate() {
+                let site = format!("{address}.server_tools[{index}]");
+                // Every key quoted, `type` included: a server tool's config keys
+                // are the provider's vocabulary rather than this grammar's, so
+                // they are arbitrary text — the same rule `names::literal`
+                // follows for a `settings:` mapping.
+                text.push_str(&format!(
+                    "      {{ {}: {}",
+                    names::string("type"),
+                    names::string(&tool.type_name.value)
+                ));
+                for (key, value) in &tool.config {
+                    text.push_str(&format!(
+                        ", {}: {}",
+                        names::string(key),
+                        plugin_value(&value.value, &format!("{site}.{key}"))
+                    ));
+                }
+                text.push_str(" },\n");
+            }
+            text.push_str("    ];\n  },\n");
+        }
         text.push_str("};\n");
     }
     text
@@ -3764,6 +3789,55 @@ fn interpolation(text: &Interpolated, site: &str) -> String {
         parts.push(names::string(&literal));
     }
     format!("[{}]", parts.join(", "))
+}
+
+/// One open plugin-config value as TypeScript, with its strings interpolated at
+/// read time (grammar 4.3 class 2, Decision D122).
+///
+/// The shape of a `server_tools:` entry is the **provider's**, not this
+/// grammar's, so what is emitted is the value as written — a string that embeds
+/// an `${ENV}` becomes a call rather than a constant, and everything else is a
+/// literal. The whole object is behind a getter for that reason: an environment
+/// variable is read when a node calls the provider, never at import (PRD 5.9).
+fn plugin_value(value: &crate::ast::deploy::PluginValue, site: &str) -> String {
+    use crate::ast::deploy::PluginValue;
+    match value {
+        PluginValue::Null => "null".to_string(),
+        PluginValue::Bool(boolean) => boolean.to_string(),
+        PluginValue::Int(int) => int.to_string(),
+        PluginValue::Float(float) => float.to_string(),
+        PluginValue::Text(text) => {
+            if text.references.is_empty() {
+                names::string(text.as_str())
+            } else {
+                format!("runtime.interpolate({})", interpolation(text, site))
+            }
+        }
+        PluginValue::Sequence(items) => {
+            let rendered: Vec<String> = items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| plugin_value(&item.value, &format!("{site}[{index}]")))
+                .collect();
+            format!("[{}]", rendered.join(", "))
+        }
+        PluginValue::Mapping(entries) => {
+            if entries.is_empty() {
+                return "{}".to_string();
+            }
+            let rendered: Vec<String> = entries
+                .iter()
+                .map(|entry| {
+                    format!(
+                        "{}: {}",
+                        names::string(&entry.key.value),
+                        plugin_value(&entry.value.value, &format!("{site}.{}", entry.key.value))
+                    )
+                })
+                .collect();
+            format!("{{ {} }}", rendered.join(", "))
+        }
+    }
 }
 
 /// A JSON value as a TypeScript literal, indented to sit inside an object.

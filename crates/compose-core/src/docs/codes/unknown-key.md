@@ -13,6 +13,18 @@ neither a section nor a definition, a key a construct does not define, a
 provider key belonging to another `kind`'s row, and a store-op parameter its op
 does not take.
 
+A `server_tools:` entry is **not** one of them, closed as its curated shape
+looks: the vocabulary there is the vendor's rather than this grammar's, so a key
+the compiler's table does not name is a warning that carries it
+(`unknown-server-tool-field`), not a refusal.
+
+One of those vocabularies is decided by the **connection** rather than by its
+kind. An `openai` provider that declares `server_tools:` speaks the Responses
+API for all of its calls, and `stop:` and `seed:` are Chat Completions keys with
+no equivalent there — so a model bound to such a provider is refused those two,
+with a diagnostic naming the wire and the provider that moved it. Both stay
+legal on an `openai` provider with no suite.
+
 ## A spec that triggers it
 
 ```yaml triggers

@@ -240,8 +240,49 @@ which `docs/trace.md` §11 already keeps out of the trace and which only the
 human report prints.
 
 The **request identity** (§7) is the `model.*` addressed, the system prompt, the
-conversation as it stood, the tool names offered, and the pinned tool where
-there is one.
+conversation as it stood, the tool names offered, the pinned tool where there is
+one, and — where any member of the ladder declares one — the **server-tool
+suites** of the providers behind it (`docs/grammar.md` §12.1, Decision D122).
+
+A server tool is not an effect of its own and gets no record and no key: it runs
+on the provider's side, *inside* the call, and its `server_tool_use` block and
+the result the provider paired with it are part of the answer this record
+already holds. So a resumed generation replays the whole turn, search and all,
+and nothing reaches the network for it.
+
+Its **suite** is in the request identity for the same reason the client tool
+names are: it is part of what the model was offered. Per ladder member, because
+each provider in a route declares its own array and which tools were on offer
+depends on which member served the call. The consequence is the one resolved q29
+intends and is worth stating outright: **a resumed execution whose provider
+gained or lost a server tool between generations diverges at the first model
+call.** That is correct. The recorded answer was produced by a model with a
+different tool surface, and handing it to a graph that would now ask differently
+is exactly the silent re-keying q29 refuses — so the resume fails, naming the
+step, rather than continuing on an answer to a question this build no longer
+asks.
+
+The key is **omitted entirely** from the identity where no member declares a
+suite, which is what keeps every composition that predates it deriving the
+identity it already derived: a journal written by an earlier build still
+replays, and `JOURNAL_VERSION` does not move for it (§11.2).
+
+**The conversation carries which wire wrote it**, on a turn that came off one
+of the two surfaces that answer with a list of objects. The Messages and
+Responses vocabularies are disjoint, and a failover ladder may cross them, so an
+assistant turn records the wire that produced its blocks and each surface
+replays only its own — rendering the other's turn from the same reading it
+renders its own composed turns from. This is in the identity because it is in
+the conversation, and it is written **only** for a Responses turn: the Messages
+wire was the only surface that ever produced blocks, so leaving its turns
+untagged keeps every identity an earlier build derived, on the same terms as the
+paragraph above (§11.2).
+
+Nothing else about the Responses wire is in the identity. The runtime sends no
+`previous_response_id` and holds no continuity token, so what a resumed
+generation replays is the recorded answer's own items — ids and all, which is
+why it derives the same identity only by going on with the *kept* answer rather
+than a re-reading of it (§11.1).
 
 ### 3.2 A tool execution
 

@@ -348,7 +348,8 @@ fn the_json_report_is_one_object_of_diagnostics() {
       "severity": "error",
       "span": "models.yml:1:1..1:8"
     }
-  ]
+  ],
+  "warnings": []
 }
 "#
     );
@@ -356,17 +357,84 @@ fn the_json_report_is_one_object_of_diagnostics() {
     assert_eq!(code(&output), 1);
 }
 
+/// A composition reported with nothing but **warnings** is one this compiler
+/// accepts: the verdict says so, and the exit code is `0`.
+///
+/// This is the whole of what the severity means, pinned where a reader meets it
+/// (grammar 12.1, Decision D122 — `unknown-server-tool` is the first code to
+/// have it). The block above the verdict is rendered exactly as an error's is,
+/// under its own level; the line under it is the one every reported run ends
+/// with. A verdict that read "is not valid" here would tell an author their spec
+/// was refused by a compiler that had just accepted it.
+#[test]
+fn a_warning_is_reported_and_the_composition_is_still_valid() {
+    let output = validate(
+        &projects().join("one-unverifiable-server-tool"),
+        &["main.yml"],
+    );
+    assert_eq!(
+        stderr(&output),
+        "warning[unknown-server-tool]: `provider.p` declares the server tool \
+         `web_search_20260101`, which is not one this compiler release knows `anthropic` serves: \
+         its config is unchecked and travels to the provider as written\n  \
+         --> main.yml:12:13\n   \
+         |\n\
+         12 |     - type: web_search_20260101\n   \
+         |             ^^^^^^^^^^^^^^^^^^^\n   \
+         |\n   \
+         = help: did you mean `web_search_20250305`?\n\n\
+         warning: `main.yml` is valid (target `local`), with 1 warning\n\
+         for more about a code, run: agent-compose explain <code>\n"
+    );
+    assert_eq!(stdout(&output), "");
+    assert_eq!(code(&output), 0, "a warning does not refuse a composition");
+}
+
+/// The same run in the machine format: the warning is under its own key, and the
+/// key that decides the verdict is empty.
+#[test]
+fn a_warning_lands_under_its_own_key_in_the_json_report() {
+    let output = validate(
+        &projects().join("one-unverifiable-server-tool"),
+        &["main.yml", "--format", "json"],
+    );
+    assert_eq!(
+        stdout(&output),
+        r#"{
+  "diagnostics": [],
+  "warnings": [
+    {
+      "code": "unknown-server-tool",
+      "help": "did you mean `web_search_20250305`?",
+      "labels": [],
+      "message": "`provider.p` declares the server tool `web_search_20260101`, which is not one this compiler release knows `anthropic` serves: its config is unchecked and travels to the provider as written",
+      "severity": "warning",
+      "span": "main.yml:12:13..12:32"
+    }
+  ]
+}
+"#
+    );
+    assert_eq!(stderr(&output), "");
+    assert_eq!(code(&output), 0);
+}
+
 /// A clean run in the machine format is still one object, so a consumer parses
 /// one shape whatever the outcome.
+///
+/// **Two** arrays, both always present: `diagnostics` is what rejects the
+/// composition and `warnings` is what does not, so the question a machine reader
+/// asks first — "did this pass" — is answered by one array being empty rather
+/// than by filtering the other on `severity` (see `report::json`).
 #[test]
-fn a_clean_json_report_carries_an_empty_array() {
+fn a_clean_json_report_carries_empty_arrays() {
     let output = validate(
         &repo_root(),
         &["examples/review-loop/main.yml", "--format", "json"],
     );
     assert_eq!(
         stdout(&output),
-        "{\n  \"diagnostics\": []\n}\n",
+        "{\n  \"diagnostics\": [],\n  \"warnings\": []\n}\n",
         "a clean run still writes the enclosing object"
     );
     assert_eq!(stderr(&output), "");
