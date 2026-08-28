@@ -124,6 +124,12 @@ pub struct BearerAuth {
     /// survives unresolved into the artifact (grammar 4.3).
     pub token: Spanned<EnvRef>,
     /// `header:` — resolved; the default is `Authorization`.
+    ///
+    /// Carries the author's capitalisation, and is **matched
+    /// case-insensitively** on the way in: header names are case-insensitive by
+    /// definition and HTTP/2 lowercases every one on the wire, so a verifier
+    /// comparing the spelling would refuse every genuine call (grammar 13.3).
+    /// Outbound the name is written as it stands.
     pub header: String,
     /// `prefix:` — resolved; the default is `Bearer `, trailing space included.
     pub prefix: String,
@@ -135,7 +141,8 @@ pub struct HmacAuth {
     /// `secret:` — the signing key, an environment reference that survives
     /// unresolved into the artifact (grammar 4.3).
     pub secret: Spanned<EnvRef>,
-    /// `header:` — resolved; the default is `X-Signature`.
+    /// `header:` — resolved; the default is `X-Signature`. Matched
+    /// case-insensitively, for the reason [`BearerAuth::header`] is.
     pub header: String,
     /// `algorithm:` — resolved; the default is `sha256`.
     pub algorithm: HmacAlgorithm,

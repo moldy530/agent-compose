@@ -186,6 +186,9 @@ auth:                            # exactly ONE of bearer | hmac
 - A block declaring **neither** scheme and one declaring **both** are each a
   compile error. One request carries one credential, and a route verifying either
   would be as open as its weaker half.
+- `header:` is recorded as written and **matched case-insensitively**: HTTP/2
+  lowercases header names on the wire, which is why `payload.headers` shows them
+  lowercased too. `X-Hub-Signature-256` finds `x-hub-signature-256`.
 
 **`auth:` guards three routes.** `resume` *injects data into a parked run* —
 strictly more sensitive than starting one — so `resume` and `status` enforce the

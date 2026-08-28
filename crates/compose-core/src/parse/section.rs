@@ -624,11 +624,12 @@ fn bearer(
 /// Whether a `header:` names one HTTP header, in the form `headers:` keys take
 /// (grammar 12.1, `NameForm::HeaderLike`).
 ///
-/// The resolved name is what an inbound check reads a credential out of and what
-/// a delivery writes onto its own request, verbatim — codegen reads resolved
-/// values and re-derives nothing. So a space, a colon or a newline here does not
-/// name a header awkwardly, it forges a second one, and the value is held to a
-/// name's form for the reason `path:` above refuses whitespace.
+/// The resolved name is what an inbound check looks a credential up by — case-
+/// insensitively, as HTTP header names are — and what a delivery writes onto its
+/// own request, verbatim; codegen reads resolved values and re-derives nothing.
+/// So a space, a colon or a newline here does not name a header awkwardly, it
+/// forges a second one, and the value is held to a name's form for the reason
+/// `path:` above refuses whitespace.
 fn header_shape(header: &Spanned<String>, cx: &mut Cx) -> bool {
     if header
         .value

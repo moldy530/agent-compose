@@ -3965,6 +3965,15 @@ triggers:
   character**. Both resolved values are written onto a request as they stand, so
   a colon or a newline in either would forge a second header rather than name or
   introduce this one. Anything else is `invalid-value`.
+- **A header name is matched case-insensitively.** The name is recorded with the
+  author's capitalisation and *looked up* without it: header names are
+  case-insensitive by definition, HTTP/2 lowercases every one on the wire, and
+  `payload.headers` above presents them lowercased for the same reason. So
+  `header: X-Hub-Signature-256` finds the header a vendor sent as
+  `x-hub-signature-256`, and an inbound check that compared the spelling would
+  reject every genuine delivery over HTTP/2 while passing a `curl` that happened
+  to preserve case. Outbound the resolved name is *written* as authored —
+  capitalisation is the receiver's to read, never to match.
 - Schemes whose signed payload is more than the body — Stripe's timestamped
   `t.body` with a tolerance window — are **deferred**, not forgotten: each is a
   vendor-specific shape, and genericizing them now is the support treadmill
