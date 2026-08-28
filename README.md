@@ -33,7 +33,7 @@ Two things it takes:
 
 ```sh
 # a particular release rather than the latest
-sh install.sh 0.1.0
+sh install.sh 0.2.0
 
 # somewhere else to put it
 AGENT_COMPOSE_INSTALL="$HOME/bin" sh install.sh
@@ -65,7 +65,7 @@ The Linux binaries are statically linked against musl, so they run on an alpine
 container and on an old glibc alike.
 
 ```sh
-version=0.1.0
+version=0.2.0
 target=x86_64-unknown-linux-musl
 base="https://github.com/moldy530/agent-compose/releases/download/v$version"
 
@@ -89,7 +89,7 @@ agent-compose --version
 ```
 
 It prints the release, the commit it was built from, and the target it was built
-for — `agent-compose 0.1.0 (a1b2c3d, x86_64-unknown-linux-musl)` — which is what
+for — `agent-compose 0.2.0 (a1b2c3d, x86_64-unknown-linux-musl)` — which is what
 a bug report should carry. If the command is not found, the install directory is
 not on your `PATH`.
 
