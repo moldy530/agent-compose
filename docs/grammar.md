@@ -3910,11 +3910,10 @@ a flow input field can accept it.
 (§15): fully specified here, parsed, checked, and carried into the IR, and read
 by nothing the compiler generates yet. A served trigger declaring `auth:` is
 exactly as open as one declaring none, and a callback is still delivered to
-whatever URL the payload named. `validate` and `build` report an
-`unenforced-auth` **warning** on every trigger declaring one of the three, so
-the verdict says it too. Everything the rest of §13.3 states in the present
-tense is what the M3 runtime is written against — a deployment that needs the
-guarantee before then keeps its gateway.
+whatever URL the payload named. Everything the rest of §13.3 states in the
+present tense is what the M3 runtime is written against — a deployment that
+needs the guarantee before then keeps its gateway, and the block is the
+specification that gateway is configured to match.
 
 **Authenticating the caller: `auth:`.** v0's posture was "deploy behind your own
 gateway". Webhook-style events make the generated app the thing a vendor calls
@@ -4288,16 +4287,8 @@ the compiler's behaviour rather than left to a reviewer's memory:
 `crates/compose-core/tests/trigger_auth_surface.rs` asserts that a built project
 carries **none** of an authenticated trigger's material, and enumerates every
 document repeating the claim — here, §13.3, both topics, and the
-`missing-callback-allowlist` and `unenforced-auth` explanations. The commit that
-teaches `serve` to verify a caller fails that test until those sentences go with
-it.
-
-The binary says it too, rather than leaving it to the documents: a trigger
-declaring any of the three keys is reported by `validate` and by `build` as an
-`unenforced-auth` **warning**, so a composition whose only access control is
-inert does not report a clean verdict. That warning is deleted by the same
-commit — a report claiming a live control is unenforced is the same false claim
-pointing the other way.
+`missing-callback-allowlist` explanation. The commit that teaches `serve` to
+verify a caller fails that test until those sentences go with it.
 
 One **code** site is on the retraction list beside the documents, because what
 holds there today is an absence rather than a sentence:

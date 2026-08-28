@@ -129,7 +129,6 @@ pub fn explanation(code: DiagnosticCode) -> &'static str {
         DiagnosticCode::MissingCallbackAllowlist => {
             include_str!("codes/missing-callback-allowlist.md")
         }
-        DiagnosticCode::UnenforcedAuth => include_str!("codes/unenforced-auth.md"),
     }
 }
 

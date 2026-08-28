@@ -56,24 +56,23 @@ characters. A callback URL outside the list will be refused when it is read, at
 parking or at settle, and recorded as a refused delivery rather than as anybody's
 failure.
 
-**The host is literal, and a `*` in it is refused.** `*` runs over anything, `/`
-and `?` included, so `https://hooks.example.com/*` constrains a host and
-`https://*.hooks.example.com/*` constrains none: its leading `*` is free to
-swallow `attacker.test/collect?x=` on the way to the dot, and a payload naming
-that URL is admitted. `https://hooks.example.com*` admits
-`hooks.example.com.evil.test` the same way. An entry's host runs from the scheme
-to the first `/`, `?` or `#` and carries no wildcard — a list this check makes
-mandatory and `https://*` would satisfy is a ceremony rather than the guarantee.
-Give a second subdomain a second entry.
+**Write the host out, and read a wildcard in it for what it is.** `*` runs over
+anything, `/` and `?` included, so `https://hooks.example.com/*` constrains a
+host while `https://*.hooks.example.com/*` constrains none: its leading `*` is
+free to swallow `attacker.test/collect?x=` on the way to the dot, and a payload
+naming that URL is admitted. `https://hooks.example.com*` admits
+`hooks.example.com.evil.test` the same way. Both are legal entries — a wildcard
+bounded to one label of the authority is an open language question the PRD owns,
+not something this check answers — so a list that is a guarantee rather than a
+ceremony is one whose entries name their receivers. Give a second subdomain a
+second entry.
 
 **This check is live; the matching it demands is not.** `callback_auth:` and
 `callback_allow:` are reserved grammar in v0 (grammar §15): parsed, checked, and
 carried into the IR, and read by nothing generated yet — a built app signs no
 delivery and refuses no URL. Declaring them says what the deployment will
-enforce; anything that needs the guarantee today keeps a gateway in front. So
-the repaired spec below clears this error and reports `unenforced-auth`, which
-is a true statement about this release rather than a second thing to fix:
-`agent-compose explain unenforced-auth`.
+enforce; anything that needs the guarantee today keeps a gateway in front, which
+is what the block below is the specification of.
 
 **Or drop `callback_auth:`** when the trigger is a development or test entry
 point. Then the deployment signs nothing, claims nothing, and may POST wherever

@@ -153,10 +153,9 @@ the IR**, and nothing generated reads them yet: a served trigger declaring
 `auth:` is exactly as open as one declaring none, and a callback still POSTs
 wherever the payload pointed. Everything below is the contract the runtime is
 written against, not what `serve` enforces today — until it lands, a deployment
-that needs these guarantees puts a gateway in front. `validate` and `build` say
-so on every trigger that declares one of the three, as an `unenforced-auth`
-warning; the closing section, "What `reserved` means", is the same statement
-once for every construct in this topic.
+that needs these guarantees puts a gateway in front, and the block is what that
+gateway is configured to match. The closing section, "What `reserved` means", is
+the same statement once for every construct in this topic.
 
 A generated app is the thing a webhook vendor calls directly, so verifying
 callers is its job rather than a gateway's. Auth is **per trigger, never
@@ -331,11 +330,10 @@ caller and looks exactly like a guarded route. Read them as a declaration of
 what the deployment will enforce, and put a gateway in front of anything that
 needs the guarantee today.
 
-They are also the only reserved construct the report mentions, for that reason.
-This spec builds, and `validate` calls it valid **with one warning**,
-`unenforced-auth`, naming the trigger:
+The whole surface written out is a spec `validate` calls valid and `build` owes
+a project to — which is the point of declaring it now:
 
-```yaml triggers unenforced-auth
+```yaml spec
 version: "0.1"
 
 flow.support:
@@ -365,8 +363,7 @@ triggers:
       - "https://hooks.example.com/*"
 ```
 
-`agent-compose explain unenforced-auth` is the long form. Keep the block: it is
-what the gateway in front is configured to match, and the warning goes away with
-the release that makes it wrong.
+Keep the block: it is what the gateway in front is configured to match, and it
+is what the release that lands the runtime reads.
 
 Normative source: `docs/grammar.md` §9.4, §13, §13.1–13.5, §15

@@ -453,18 +453,6 @@ const GRAMMAR: &[Check] = &[
         evidence: Evidence::Fixture,
     },
     Check {
-        // The one row here that reports rather than refuses, and the reason it
-        // is a check at all: the three keys are reserved grammar (§15), so a
-        // trigger declaring them is a route that serves every caller and looks
-        // from outside exactly like a guarded one. The documents say so; this
-        // is the binary saying so, in the report an operator reads before a
-        // deploy. It is deleted by the change that lands the runtime.
-        rule: "an `http` trigger declaring `auth:`, `callback_auth:` or `callback_allow:` is warned that this release enforces none of them (15, 13.3)",
-        pass: "check/triggers.rs",
-        codes: &["unenforced-auth"],
-        evidence: Evidence::Fixture,
-    },
-    Check {
         rule: "every CEL surface: roots, paths, constructs, and result type (4.1)",
         pass: "cel/mod.rs, over check/expr.rs",
         codes: &[

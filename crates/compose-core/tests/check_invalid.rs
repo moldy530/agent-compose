@@ -88,7 +88,6 @@ const CHECK_CODES: &[&str] = &[
     "detached-interrupt",
     "conflicting-keys",
     "duplicate-route",
-    "unenforced-auth",
 ];
 
 struct Anchor {
