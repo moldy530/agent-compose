@@ -1,0 +1,174 @@
+# Acceptance fixture: the http-native events surface — who may call a trigger,
+# who a delivery says it is, and where it may go (grammar 13.3, PRD resolved
+# q32–q35).
+#
+# Every other fixture is about what a graph computes. This one is about the
+# *edges* of a served app: the request that starts an execution, the two routes
+# that reach one afterwards, and the webhooks that report its lifecycle. Each
+# trigger below is one claim that surface has to be able to make.
+#
+#   * `guarded` — a `bearer:` scheme over the header and prefix grammar 13.3
+#     defaults to. It is the shape a wrong, missing or truncated token is
+#     refused in, and its flow finishes on its own so the refusal is observable
+#     as "no execution started" rather than as a run that failed.
+#   * `signed` — an `hmac:` scheme over the **raw request body bytes**, which is
+#     the half a bearer token cannot stand in for: a body tampered with after
+#     signing verifies differently, and a check that hashed a re-serialized
+#     payload would accept it.
+#   * `open` — no `auth:` at all, on the flow that parks. An execution a no-auth
+#     trigger began keeps open routes, and that half of resolved q32 needs a
+#     trigger of its own: a test that only watched a guarded execution refuse
+#     could not tell enforcement from a route that refuses everybody.
+#   * `watched` — the whole thing at once: an authenticated start, a flow that
+#     parks, and callbacks that carry both outbound schemes to an allowlisted
+#     receiver. It is the trigger the lifecycle assertions are about — a parking
+#     webhook, a resume, a settle webhook, ordinals ascending — and the one a
+#     crash lands in the middle of.
+#   * `posted` — a `callback:` with no outbound auth and no allowlist, which is
+#     the documented test posture (resolved q33) and the shape a retry is
+#     cheapest to observe in: the flow does not park, so the only delivery is
+#     the settle.
+#
+# The allowlist is written with a wildcard where the **port** goes, because a
+# loopback receiver binds a port the operating system chose. That is the entry
+# an author writes for a receiver whose address is not fixed, and `/allowed*`
+# beside it is what makes a second path on the same host refusable — which is
+# how a test can point one delivery inside the list and one outside it without
+# needing two receivers.
+version: "0.1"
+
+state:
+  noted:
+    description: What the flow that does not pause answered.
+    type: string
+    default: nothing yet
+  decision:
+    description: What the person answered.
+    enum: [approve, reject]
+    default: reject
+
+flow.note:
+  description: One deterministic step — an execution that starts, finishes, and settles.
+  inputs:
+    topic:
+      type: string
+      min_length: 1
+  outputs:
+    noted:
+      type: string
+  nodes:
+    # A subprocess that counts its own executions rather than a bare `printf`,
+    # because "the refused request started **no** execution" is otherwise not an
+    # assertion a test can make: a `401` says what the route answered and says
+    # nothing about what ran behind it. The shim appends one line per run, so
+    # one accepted call and four refusals is a one-line log.
+    note:
+      exec:
+        command: "${TALLY_BIN}/tally"
+        output:
+          stdout: { type: string }
+      writes:
+        stdout: noted
+  edges:
+    - { from: start, to: note }
+    - { from: note, to: end }
+
+flow.review:
+  description: Park at a pause — the execution a lifecycle subscriber hears about twice.
+  inputs:
+    topic:
+      type: string
+      min_length: 1
+  outputs:
+    decision:
+      enum: [approve, reject]
+  nodes:
+    # No `timeout:`, so the wait is open until somebody answers it: a budget
+    # would make "the process was restarted" a race against the clock rather
+    # than the thing under test.
+    sign_off:
+      human:
+        input:
+          note: { type: string }
+        output:
+          decision: { enum: [approve, reject] }
+      input:
+        note: "input.topic"
+  edges:
+    - { from: start, to: sign_off }
+    - { from: sign_off, to: end }
+
+triggers:
+  guarded:
+    type: http
+    flow: flow.note
+    method: POST
+    path: /guarded
+    respond: async
+    input:
+      topic: "payload.body.topic"
+    auth:
+      bearer:
+        token: ${EVENTS_TOKEN}
+
+  signed:
+    type: http
+    flow: flow.note
+    method: POST
+    path: /signed
+    respond: async
+    input:
+      topic: "payload.body.topic"
+    auth:
+      hmac:
+        secret: ${EVENTS_SECRET}
+        header: X-Hub-Signature-256
+        algorithm: sha256
+        encoding: hex
+        prefix: "sha256="
+
+  open:
+    type: http
+    flow: flow.review
+    method: POST
+    path: /open
+    respond: async
+    input:
+      topic: "payload.body.topic"
+
+  watched:
+    type: http
+    flow: flow.review
+    method: POST
+    path: /watched
+    respond: async
+    input:
+      topic: "payload.body.topic"
+    callback: "payload.body.callback_url"
+    auth:
+      bearer:
+        token: ${EVENTS_TOKEN}
+    callback_auth:
+      # Both schemes together, which grammar 13.3 makes legal outbound and not
+      # inbound: a receiver that checks a token and a receiver that verifies a
+      # signature are two receivers, and one trigger may deliver to one that
+      # does both. The header and prefix are declared away from their defaults
+      # so an assertion can say which layer of the request a value came from.
+      bearer:
+        token: ${DELIVERY_TOKEN}
+        header: X-Delivery-Token
+        prefix: "Token "
+      hmac:
+        secret: ${DELIVERY_SECRET}
+    callback_allow:
+      - "http://127.0.0.1:*/allowed*"
+
+  posted:
+    type: http
+    flow: flow.note
+    method: POST
+    path: /posted
+    respond: async
+    input:
+      topic: "payload.body.topic"
+    callback: "payload.body.callback_url"

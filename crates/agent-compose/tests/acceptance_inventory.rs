@@ -69,6 +69,9 @@ enum Bullet {
     /// scripted answer has to be able to carry. This half changed what a
     /// compiled graph *does*, so it gets a heading of its own.
     BuiltinTools,
+    /// PRD §7 M3's fourth bullet: "**HTTP-native events** (resolved q32–q36):
+    /// …".
+    HttpEvents,
 }
 
 /// Whether a criterion's tests run today.
@@ -1487,6 +1490,127 @@ const BUILTINS: &[Criterion] = &[
     },
 ];
 
+/// PRD §7 M3's HTTP-native events bullet, whose five clauses are the five
+/// claims that pass makes: who may call, which routes the answer covers, what a
+/// delivery says it is and where it may go, when one fires, and what makes it
+/// survive a restart.
+///
+/// The bullet is one sentence rather than an enumeration, so — like `HARNESS`
+/// and `DURABILITY` — its phrases are held to it by containment rather than by
+/// splitting on `, `. The resolved questions behind it (q32–q35) are quoted in
+/// each test.
+const EVENTS: &[Criterion] = &[
+    Criterion {
+        bullet: Bullet::HttpEvents,
+        phrase: "declarative auth on `http` triggers — inbound `bearer`/`hmac`",
+        tests: &[
+            // Both schemes, every way each can be wrong, and the half a status
+            // code cannot say: the counting shim is what makes "no execution
+            // started" an assertion rather than an inference.
+            (
+                "an_authenticated_start_admits_the_credential_it_declares_and_refuses_every_other",
+                Status::Live,
+            ),
+        ],
+    },
+    Criterion {
+        bullet: Bullet::HttpEvents,
+        phrase: "an execution's resume/status routes enforcing the auth of the trigger that started it",
+        tests: &[
+            (
+                "an_executions_status_and_resume_enforce_the_auth_of_the_trigger_that_started_it",
+                Status::Live,
+            ),
+            // …and the half one process cannot decide: the trigger is on the
+            // journal's lifecycle row, so a `serve` restarted while somebody was
+            // thinking goes on refusing the same callers.
+            (
+                "a_delivery_a_restart_interrupted_completes_under_the_same_id",
+                Status::Live,
+            ),
+        ],
+    },
+    Criterion {
+        bullet: Bullet::HttpEvents,
+        phrase: "signed and allowlisted callbacks",
+        tests: &[
+            (
+                "a_delivery_carries_the_identity_its_trigger_declared_over_the_bytes_it_sent",
+                Status::Live,
+            ),
+            // …and what the allowlist does with a URL it admits nowhere, which
+            // is a recorded refusal rather than anybody's failure.
+            (
+                "a_callback_url_the_allowlist_admits_nowhere_is_refused_and_the_run_settles",
+                Status::Live,
+            ),
+            // The check behind the check: every signing assertion above compares
+            // against a digest this harness computed, which is worth something
+            // only if this side is right.
+            (
+                "the_harnesss_own_hmac_answers_the_published_vector",
+                Status::Live,
+            ),
+        ],
+    },
+    Criterion {
+        bullet: Bullet::HttpEvents,
+        phrase: "lifecycle webhooks (parkings and settle)",
+        tests: &[
+            (
+                "a_parking_and_a_settle_reach_the_callback_in_ascending_ordinals",
+                Status::Live,
+            ),
+            // The other half of "every quiescence that opened **new** pauses":
+            // a recovered execution re-parks under the ids its predecessor
+            // published and announces nothing, and a replay that diverges
+            // announces nothing either.
+            (
+                "a_recovered_execution_delivers_the_completion_webhook_its_caller_waits_for",
+                Status::Live,
+            ),
+            (
+                "a_diverged_recovery_delivers_no_webhook_and_the_repair_delivers_one",
+                Status::Live,
+            ),
+        ],
+    },
+    Criterion {
+        bullet: Bullet::HttpEvents,
+        phrase: "journal-backed at-least-once callback delivery",
+        tests: &[
+            (
+                "a_delivery_two_refusals_could_not_stop_lands_on_the_third_attempt",
+                Status::Live,
+            ),
+            // …and the bound on it: exhaustion is recorded and is never the
+            // execution's failure.
+            (
+                "a_delivery_no_attempt_lands_is_recorded_exhausted_and_leaves_the_run_alone",
+                Status::Live,
+            ),
+        ],
+    },
+];
+
+/// The http-native events rows are phrases of PRD §7 M3's fourth bullet.
+///
+/// Containment and normalization, for the reason the two siblings above give:
+/// the bullet is one sentence about five things, and the PRD wraps its prose, so
+/// a clause a reader hears as one spans two lines in the file.
+#[test]
+fn the_http_events_rows_transcribe_the_prd_m3_bullet() {
+    let bullet = distribution_bullet("**HTTP-native events**");
+    let flattened = bullet.split_whitespace().collect::<Vec<_>>().join(" ");
+    for criterion in EVENTS {
+        assert!(
+            flattened.contains(criterion.phrase),
+            "`{}` is not a phrase of PRD §7 M3's http-native events bullet: {flattened}",
+            criterion.phrase
+        );
+    }
+}
+
 fn rows() -> impl Iterator<Item = &'static Criterion> {
     CODEGEN
         .iter()
@@ -1495,6 +1619,7 @@ fn rows() -> impl Iterator<Item = &'static Criterion> {
         .chain(STRATEGY)
         .chain(DURABILITY)
         .chain(BUILTINS)
+        .chain(EVENTS)
 }
 
 fn repository() -> PathBuf {
@@ -1903,6 +2028,11 @@ fn every_bullet_contributes_criteria() {
             Bullet::BuiltinTools,
             3,
             "the built-in tools bullet's runtime half: the tools, the root, the timeout",
+        ),
+        (
+            Bullet::HttpEvents,
+            5,
+            "the http-native events bullet's five claims",
         ),
     ] {
         let count = rows()

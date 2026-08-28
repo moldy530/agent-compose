@@ -132,6 +132,7 @@ pub const FIXTURES: &[&str] = &[
     "durability",
     "fanout",
     "flow-as-tool",
+    "http-events",
     "http-trigger",
     "keyless-gateway",
     "model-failover",
@@ -176,6 +177,45 @@ pub const RECEIPT_BIN: &str = "RECEIPT_BIN";
 /// The file that sink appends one line to per delivery — the only account there
 /// is of a dispatch nothing waits for (grammar 8.6 rule 7).
 pub const RECEIPT_LOG: &str = "RECEIPT_LOG";
+/// The `${EVENTS_TOKEN}` an `http-events` trigger's inbound `bearer:` expects.
+pub const EVENTS_TOKEN: &str = "EVENTS_TOKEN";
+/// The `${EVENTS_SECRET}` its inbound `hmac:` verifies with.
+pub const EVENTS_SECRET: &str = "EVENTS_SECRET";
+/// The `${DELIVERY_TOKEN}` an outbound `bearer:` carries.
+///
+/// Four distinct values rather than one repeated, for [`GATEWAY_TOKEN`]'s
+/// reason: a delivery writes a token and signs a body, a caller sends a token
+/// and signs a body, and only distinct values let an assertion say which of the
+/// four a header carried. A build that crossed two of them would pass every
+/// test written against one.
+pub const DELIVERY_TOKEN: &str = "DELIVERY_TOKEN";
+/// The `${DELIVERY_SECRET}` an outbound `hmac:` signs with.
+pub const DELIVERY_SECRET: &str = "DELIVERY_SECRET";
+/// The variable that shortens the callback retry schedule
+/// (`docs/durability.md` §3.7).
+pub const CALLBACK_RETRY: &str = "AGENT_COMPOSE_CALLBACK_RETRY";
+
+/// What the four credential variables above are set to for every run.
+///
+/// Values rather than a generator, because two of them are what a test signs
+/// with: a harness that could not name the secret could not compute the
+/// signature an app is supposed to have produced.
+pub const CREDENTIALS: [(&str, &str); 4] = [
+    (EVENTS_TOKEN, "inbound-token-9f1c"),
+    (EVENTS_SECRET, "inbound-secret-4a2b"),
+    (DELIVERY_TOKEN, "outbound-token-7d3e"),
+    (DELIVERY_SECRET, "outbound-secret-1c8f"),
+];
+
+/// One of [`CREDENTIALS`] by name.
+pub fn credential(name: &str) -> &'static str {
+    CREDENTIALS
+        .iter()
+        .find(|(held, _)| *held == name)
+        .map(|(_, value)| *value)
+        .unwrap_or_else(|| panic!("`{name}` is one of the fixture's credentials"))
+}
+
 /// The compiler under test.
 fn agent_compose() -> Command {
     Command::new(env!("CARGO_BIN_EXE_agent-compose"))
@@ -225,6 +265,17 @@ pub fn environment(provider: &MockProvider) -> Vec<(String, String)> {
         (TALLY_BIN.to_string(), "/bin".to_string()),
         (RECEIPT_BIN.to_string(), "/bin".to_string()),
     ]
+    .into_iter()
+    // The `http-events` fixture's four credentials, supplied to **every** run
+    // for [`TALLY_BIN`]'s reason: an `${ENV}` a composition references has to be
+    // set or the process is refused before it serves anything (PRD 5.9), and
+    // that check does not care which test is running.
+    .chain(
+        CREDENTIALS
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), (*value).to_string())),
+    )
+    .collect()
 }
 
 /// How many lines a shim's log holds, and `0` where it has written none.
@@ -1514,6 +1565,24 @@ pub fn settled(app: &Client, execution: &str) -> Value {
     }
 }
 
+/// Poll `wanted` until it answers, or fail saying it never did.
+///
+/// [`settled`]'s shape for the assertions it cannot make: a status route that
+/// takes a credential cannot be polled by that function, and a *delivery* is not
+/// a run — it lands some time after the event it reports, which is what
+/// at-least-once with a retry schedule means. A test that read either straight
+/// after a `202` would be asserting about scheduling luck.
+pub fn until<T>(budget: Duration, wanted: impl Fn() -> Option<T>) -> T {
+    let deadline = Instant::now() + budget;
+    loop {
+        if let Some(answer) = wanted() {
+            return answer;
+        }
+        assert!(Instant::now() < deadline, "this never became true");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
 /// One callback delivery, as its receiver saw it.
 ///
 /// The **bytes** are kept beside the decoded body because a signature is over
@@ -1771,4 +1840,115 @@ fn deliver(stream: &mut TcpStream, status: u16) -> Option<Delivered> {
         body: serde_json::from_slice(&bytes).ok()?,
         bytes,
     })
+}
+
+// ---------------------------------------------------------------------------
+// HMAC-SHA256, independently
+// ---------------------------------------------------------------------------
+
+/// `HMAC-SHA256(key, message)`, in lowercase hex (RFC 2104, FIPS 180-4).
+///
+/// Both directions of grammar 13.3's signing need one, and it has to be an
+/// implementation this repository owns rather than the one under test: a
+/// signature verified with the emitted app's own code would agree with it
+/// whatever either of them computed. It is written out here instead of taken
+/// from a crate for the reason every dependency in this workspace is argued
+/// for — SHA-256 is sixty lines of shifts, and a test dependency is still a
+/// dependency somebody has to keep pinned — and it is held to a published
+/// vector by `the_harnesss_own_hmac_answers_the_published_vector`, so a mistake
+/// in it fails as itself rather than as a signature the app got wrong.
+pub fn hmac_sha256(key: &[u8], message: &[u8]) -> String {
+    const BLOCK: usize = 64;
+    let mut padded = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        padded[..32].copy_from_slice(&sha256(key));
+    } else {
+        padded[..key.len()].copy_from_slice(key);
+    }
+    let mut inner = Vec::with_capacity(BLOCK + message.len());
+    let mut outer = Vec::with_capacity(BLOCK + 32);
+    for byte in padded {
+        inner.push(byte ^ 0x36);
+        outer.push(byte ^ 0x5c);
+    }
+    inner.extend_from_slice(message);
+    outer.extend_from_slice(&sha256(&inner));
+    sha256(&outer)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// `SHA-256(message)`, as its thirty-two bytes.
+fn sha256(message: &[u8]) -> [u8; 32] {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let mut hash: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+
+    let mut padded = message.to_vec();
+    padded.push(0x80);
+    while padded.len() % 64 != 56 {
+        padded.push(0);
+    }
+    padded.extend_from_slice(&(message.len() as u64 * 8).to_be_bytes());
+
+    for block in padded.chunks_exact(64) {
+        let mut schedule = [0u32; 64];
+        for (index, word) in block.chunks_exact(4).enumerate() {
+            schedule[index] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+        }
+        for index in 16..64 {
+            let left = schedule[index - 15];
+            let right = schedule[index - 2];
+            let s0 = left.rotate_right(7) ^ left.rotate_right(18) ^ (left >> 3);
+            let s1 = right.rotate_right(17) ^ right.rotate_right(19) ^ (right >> 10);
+            schedule[index] = schedule[index - 16]
+                .wrapping_add(s0)
+                .wrapping_add(schedule[index - 7])
+                .wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = hash;
+        for index in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let choose = (e & f) ^ (!e & g);
+            let first = h
+                .wrapping_add(s1)
+                .wrapping_add(choose)
+                .wrapping_add(K[index])
+                .wrapping_add(schedule[index]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let majority = (a & b) ^ (a & c) ^ (b & c);
+            let second = s0.wrapping_add(majority);
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(first);
+            d = c;
+            c = b;
+            b = a;
+            a = first.wrapping_add(second);
+        }
+        for (held, computed) in hash.iter_mut().zip([a, b, c, d, e, f, g, h]) {
+            *held = held.wrapping_add(computed);
+        }
+    }
+
+    let mut digest = [0u8; 32];
+    for (index, word) in hash.iter().enumerate() {
+        digest[index * 4..index * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    digest
 }
