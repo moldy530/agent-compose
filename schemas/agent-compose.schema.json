@@ -2493,6 +2493,9 @@
         },
         "timeout": { "description": "Response budget for respond: sync (default 60s). On expiry the response upgrades to async (202 + execution id) and the execution continues durably. Illegal on an async trigger, which has already responded: there is no response left for a budget to bound.", "$ref": "#/$defs/duration" },
         "callback": { "description": "CEL over payload producing a completion webhook URL. Async only: `callback` with `respond: sync` is a compile error, since a synchronous response already returns the outputs.", "$ref": "#/$defs/cel" },
+        "auth": { "description": "How an inbound call to this trigger is authenticated, and with it the resume and status routes of every execution it starts. Absent means all three are open. Auth is per trigger, never server-wide: who may invoke this flow is readable off the trigger that exposes it (grammar 13.3 / PRD resolved q32).", "$ref": "#/$defs/inboundAuth" },
+        "callback_auth": { "description": "How a delivered callback identifies itself to its receiver. Opt-in, and declaring it makes callback_allow mandatory. Absent is the documented test posture: the deployment signs nothing and may POST wherever the payload said (grammar 13.3 / PRD resolved q33).", "$ref": "#/$defs/callbackAuth" },
+        "callback_allow": { "description": "The URL patterns this trigger's callback may point at, matched against the whole callback URL with * standing for any run of characters. Required wherever callback_auth is declared (grammar 13.3 / PRD resolved q33).", "$ref": "#/$defs/callbackAllow" },
         "description": { "description": "Documentation.", "type": "string" }
       },
       "additionalProperties": false,
@@ -2507,8 +2510,89 @@
             "description": "`respond:` defaults to async, and an async trigger has already responded with an execution id - so `timeout:` bounds nothing observable and is an error rather than a silently inert key (grammar 13.3, Decision D81).",
             "not": { "required": ["timeout"] }
           }
+        },
+        {
+          "if": { "anyOf": [{ "required": ["callback_auth"] }, { "required": ["callback_allow"] }] },
+          "then": {
+            "description": "Both keys describe how a completion webhook is delivered, and a trigger with no `callback:` delivers none - so each is inert there and is an error rather than a silently ignored key, the posture Decision D81 takes on `timeout:` (grammar 13.3).",
+            "required": ["callback"]
+          }
+        },
+        {
+          "if": { "required": ["callback_auth"] },
+          "then": {
+            "description": "The callback URL comes from the request payload and is attacker-controlled by construction, so a deployment careful enough to authenticate its deliveries must not send them wherever a payload said: declaring `callback_auth:` makes `callback_allow:` mandatory (grammar 13.3, Decision D126 / PRD resolved q33).",
+            "required": ["callback_allow"]
+          }
         }
       ]
+    },
+    "inboundAuth": {
+      "description": "An http trigger's inbound `auth:` block: exactly one scheme. A request carries one credential, so verifying either would leave the route as open as its weaker half. Both secrets are ${ENV} references - a secret never lives in the spec text (grammar 13.3, 4.3 / PRD resolved q32).",
+      "type": "object",
+      "properties": {
+        "bearer": { "description": "A static secret compared, in constant time, against a named header.", "$ref": "#/$defs/bearerAuth" },
+        "hmac": { "description": "A signature over the raw request body - the GitHub-shaped family most webhook vendors speak.", "$ref": "#/$defs/inboundHmac" }
+      },
+      "additionalProperties": false,
+      "oneOf": [{ "required": ["bearer"] }, { "required": ["hmac"] }]
+    },
+    "bearerAuth": {
+      "description": "A static-token scheme, inbound or outbound: one shape and one pair of defaults, because it is the same convention in both directions (grammar 13.3).",
+      "type": "object",
+      "required": ["token"],
+      "properties": {
+        "token": { "description": "The credential, as an ${ENV} reference. Never a literal (grammar 4.3, Decision D41).", "$ref": "#/$defs/envRef" },
+        "header": {
+          "description": "The header the token is read from, or written to (default Authorization).",
+          "allOf": [{ "$ref": "#/$defs/noEnvRefString" }, { "minLength": 1 }]
+        },
+        "prefix": { "description": "What precedes the token in that header (default \"Bearer \", trailing space included).", "$ref": "#/$defs/noEnvRefString" }
+      },
+      "additionalProperties": false
+    },
+    "inboundHmac": {
+      "description": "The inbound hmac scheme: a signature over the RAW request body, verified with the digest, encoding and prefix the calling vendor uses (grammar 13.3 / PRD resolved q32).",
+      "type": "object",
+      "required": ["secret"],
+      "properties": {
+        "secret": { "description": "The signing key, as an ${ENV} reference. Never a literal (grammar 4.3, Decision D41).", "$ref": "#/$defs/envRef" },
+        "header": {
+          "description": "The header the signature arrives in (default X-Signature).",
+          "allOf": [{ "$ref": "#/$defs/noEnvRefString" }, { "minLength": 1 }]
+        },
+        "algorithm": { "description": "The digest (default sha256).", "enum": ["sha1", "sha256", "sha512"] },
+        "encoding": { "description": "How the signature is written on the wire (default hex).", "enum": ["hex", "base64"] },
+        "prefix": { "description": "What precedes the signature in that header, e.g. \"sha256=\" (default: the empty string).", "$ref": "#/$defs/noEnvRefString" }
+      },
+      "additionalProperties": false
+    },
+    "callbackAuth": {
+      "description": "An http trigger's outbound `callback_auth:` block: at least one scheme, and both together are legal. Some receivers verify a static token more readily than a signature, and one trigger may deliver to a receiver that wants both (grammar 13.3 / PRD resolved q33).",
+      "type": "object",
+      "properties": {
+        "bearer": { "description": "A static token on every delivery.", "$ref": "#/$defs/bearerAuth" },
+        "hmac": { "description": "A signature over the delivered body.", "$ref": "#/$defs/callbackHmac" }
+      },
+      "additionalProperties": false,
+      "anyOf": [{ "required": ["bearer"] }, { "required": ["hmac"] }]
+    },
+    "callbackHmac": {
+      "description": "The outbound hmac scheme: one key, because outbound signing is not configurable. A delivery is signed with HMAC-SHA256, written in hex, and carried as `X-AgentCompose-Signature: sha256=<hex>`, so one verification recipe serves every agent-compose deployment (grammar 13.3 / PRD resolved q33).",
+      "type": "object",
+      "required": ["secret"],
+      "properties": {
+        "secret": { "description": "The signing key, as an ${ENV} reference. Never a literal (grammar 4.3, Decision D41).", "$ref": "#/$defs/envRef" }
+      },
+      "additionalProperties": false
+    },
+    "callbackAllow": {
+      "description": "URL patterns a callback may point at: absolute http or https URLs with * standing for any run of characters, matched against the whole callback URL. http stays legal - localhost development is the common first case. An empty list admits nothing and so refuses every delivery, which is a webhook that can never fire (grammar 13.3 / PRD resolved q33).",
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "allOf": [{ "$ref": "#/$defs/noEnvRefString" }, { "pattern": "^https?://\\S+$" }]
+      }
     },
     "scheduleTrigger": {
       "description": "RESERVED grammar: parsed and validated in v0, executed in M3. Grammar 13.4 / PRD 5.11.",

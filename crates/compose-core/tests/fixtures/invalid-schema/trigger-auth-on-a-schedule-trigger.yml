@@ -1,0 +1,11 @@
+# rule: `auth:`, `callback_auth:` and `callback_allow:` are keys of `http` triggers alone (grammar 13.3 / PRD resolved q32)
+# at: /triggers/nightly
+# via: /$defs/scheduleTrigger/additionalProperties
+triggers:
+  nightly:
+    type: schedule
+    flow: flow.support
+    cron: "0 3 * * *"
+    auth:
+      bearer:
+        token: ${WEBHOOK_TOKEN}

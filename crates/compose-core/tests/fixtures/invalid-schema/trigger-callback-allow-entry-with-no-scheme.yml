@@ -1,0 +1,10 @@
+# rule: a `callback_allow:` entry is an absolute http or https URL pattern (grammar 13.3 / PRD resolved q33)
+# at: /triggers/intake/callback_allow/0
+# via: /$defs/callbackAllow/items/allOf/1/pattern
+triggers:
+  intake:
+    type: http
+    flow: flow.support
+    callback: "payload.body.callback_url"
+    callback_allow:
+      - "hooks.example.com/*"

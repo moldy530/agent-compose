@@ -558,6 +558,112 @@ fn the_published_schema_accepts_a_keyless_provider_that_names_its_endpoint() {
     }
 }
 
+/// Grammar 13.3's authentication surface in the direction the negative corpus
+/// cannot reach: the shapes the schema must **accept**.
+///
+/// Nine fixtures under `invalid-schema/` pin the refusals, and every one of them
+/// is a conditional — a `oneOf`, an `anyOf`, two `if`/`then` pairs — where the
+/// accepting direction is the one that breaks silently. Tighten `callbackAuth`'s
+/// `anyOf` into `inboundAuth`'s `oneOf` by a copy-paste slip and the schema
+/// refuses a trigger that signs *and* tokens its deliveries, which resolved q33
+/// spells "and/or"; hoist `callback_allow` out of its `if` and the schema
+/// refuses every unauthenticated callback, which is the documented test posture.
+/// Both leave this workspace green and put a red squiggle on correct YAML in
+/// somebody's editor.
+///
+/// Each instance is also run through the parser, because Appendix B's
+/// relationship binds in this direction too: the schema is the editor-facing
+/// approximation of `validate`, and a shape the compiler accepts and the schema
+/// refuses is the pair disagreeing about the language.
+#[test]
+fn the_published_schema_accepts_the_whole_trigger_auth_surface() {
+    let validator = compile_schema();
+    let legal = [
+        // Inbound: each scheme alone, one bare and one with every optional key.
+        json!({ "type": "http", "flow": "flow.f", "auth": { "bearer": { "token": "${WEBHOOK_TOKEN}" } } }),
+        json!({
+            "type": "http",
+            "flow": "flow.f",
+            "auth": { "bearer": {
+                "token": "${WEBHOOK_TOKEN}",
+                "header": "X-Delivery-Token",
+                "prefix": "Token ",
+            } },
+        }),
+        json!({ "type": "http", "flow": "flow.f", "auth": { "hmac": { "secret": "${WEBHOOK_SECRET}" } } }),
+        json!({
+            "type": "http",
+            "flow": "flow.f",
+            "auth": { "hmac": {
+                "secret": "${WEBHOOK_SECRET}",
+                "header": "X-Hub-Signature-256",
+                "algorithm": "sha512",
+                "encoding": "base64",
+                "prefix": "sha512=",
+            } },
+        }),
+        // Inbound auth is orthogonal to the response mode.
+        json!({
+            "type": "http",
+            "flow": "flow.f",
+            "respond": "sync",
+            "timeout": "30s",
+            "auth": { "hmac": { "secret": "${WEBHOOK_SECRET}" } },
+        }),
+        // Outbound: either scheme, and — the asymmetry with `auth:` — both.
+        json!({
+            "type": "http",
+            "flow": "flow.f",
+            "callback": "payload.body.callback_url",
+            "callback_auth": { "hmac": { "secret": "${CALLBACK_SECRET}" } },
+            "callback_allow": ["https://hooks.example.com/*"],
+        }),
+        json!({
+            "type": "http",
+            "flow": "flow.f",
+            "callback": "payload.body.callback_url",
+            "callback_auth": {
+                "bearer": { "token": "${CALLBACK_TOKEN}" },
+                "hmac": { "secret": "${CALLBACK_SECRET}" },
+            },
+            "callback_allow": ["https://hooks.example.com/*", "http://localhost:9000/*"],
+        }),
+        // The documented test posture: a callback that signs nothing, and so
+        // needs no allowlist…
+        json!({ "type": "http", "flow": "flow.f", "callback": "payload.body.callback_url" }),
+        // …and an allowlist without outbound auth, which is legal in the
+        // direction the mandatory rule does not run.
+        json!({
+            "type": "http",
+            "flow": "flow.f",
+            "callback": "payload.body.callback_url",
+            "callback_allow": ["https://hooks.example.com/*"],
+        }),
+    ];
+    for trigger in legal {
+        let instance = json!({ "triggers": { "intake": trigger } });
+        let errors = validation_errors(&validator, &instance);
+        assert!(
+            errors.is_empty(),
+            "the published schema must accept this legal trigger:\n{}\n{}",
+            serde_json::to_string_pretty(&instance).expect("a printable instance"),
+            errors.join("\n")
+        );
+        let source = serde_yaml_ng::to_string(&instance).expect("a printable document");
+        let parsed = compose_core::parse_str(&source, "main.yml");
+        assert!(
+            parsed.diagnostics.is_empty(),
+            "the parser must accept what the published schema accepts:\n{source}\n{}",
+            parsed
+                .diagnostics
+                .iter()
+                .map(|diagnostic| format!("  [{}] {}", diagnostic.code, diagnostic.message))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+}
+
 /// Every built-in the compiler admits is one the published schema admits, with
 /// the bounds that name requires and nothing else (grammar 5.5, Decision D123).
 ///

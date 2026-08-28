@@ -1,0 +1,11 @@
+# rule: a `callback_auth:` block declares at least one scheme (grammar 13.3 / PRD resolved q33)
+# at: /triggers/intake/callback_auth
+# via: /$defs/callbackAuth/anyOf
+triggers:
+  intake:
+    type: http
+    flow: flow.support
+    callback: "payload.body.callback_url"
+    callback_auth: {}
+    callback_allow:
+      - "https://hooks.example.com/*"
