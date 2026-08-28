@@ -478,6 +478,15 @@ pub enum DiagnosticCode {
     /// [`MissingCredential`](Self::MissingCredential) is: what is absent is
     /// decided by a sibling value, and the repair is a choice of two.
     MissingCallbackAllowlist,
+    /// **Warning.** An `http` trigger declares `auth:`, `callback_auth:` or
+    /// `callback_allow:`, which this compiler release parses, checks, and
+    /// carries into the IR without generating anything that enforces them
+    /// (grammar 15, PRD resolved q32/q33). A reserved construct that ran
+    /// nothing would be visibly inert; an access control that runs nothing
+    /// looks, from outside, exactly like one that works — so the report says so
+    /// rather than leaving it to the documents. The runtime that enforces the
+    /// keys deletes this code with the same change.
+    UnenforcedAuth,
 }
 
 impl DiagnosticCode {
@@ -553,6 +562,7 @@ impl DiagnosticCode {
         Self::DuplicateRoute,
         Self::ConflictingSessionKey,
         Self::MissingCallbackAllowlist,
+        Self::UnenforcedAuth,
     ];
 
     /// The stable kebab-case spelling of this code.
@@ -622,6 +632,7 @@ impl DiagnosticCode {
             Self::DuplicateRoute => "duplicate-route",
             Self::ConflictingSessionKey => "conflicting-session-key",
             Self::MissingCallbackAllowlist => "missing-callback-allowlist",
+            Self::UnenforcedAuth => "unenforced-auth",
         }
     }
 }
@@ -854,7 +865,7 @@ mod tests {
         }
         assert_eq!(
             DiagnosticCode::ALL.len(),
-            DiagnosticCode::MissingCallbackAllowlist as usize + 1,
+            DiagnosticCode::UnenforcedAuth as usize + 1,
             "`DiagnosticCode::ALL` stops short of the last declared variant"
         );
     }

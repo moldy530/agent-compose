@@ -70,7 +70,10 @@ Give a second subdomain a second entry.
 `callback_allow:` are reserved grammar in v0 (grammar §15): parsed, checked, and
 carried into the IR, and read by nothing generated yet — a built app signs no
 delivery and refuses no URL. Declaring them says what the deployment will
-enforce; anything that needs the guarantee today keeps a gateway in front.
+enforce; anything that needs the guarantee today keeps a gateway in front. So
+the repaired spec below clears this error and reports `unenforced-auth`, which
+is a true statement about this release rather than a second thing to fix:
+`agent-compose explain unenforced-auth`.
 
 **Or drop `callback_auth:`** when the trigger is a development or test entry
 point. Then the deployment signs nothing, claims nothing, and may POST wherever

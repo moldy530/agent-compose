@@ -172,6 +172,21 @@ const EXPLANATIONS_WITH_A_CORRECTED_EXAMPLE: &[&str] = &[
     "unsupported-server-tools",
 ];
 
+/// The repairs that clear their own error and land on a **warning** that is
+/// true.
+///
+/// One entry, and it is the reserved-grammar case: `missing-callback-allowlist`
+/// is repaired by declaring `callback_allow:`, and every declaration of that key
+/// is `unenforced-auth` until the runtime lands (grammar §15). Holding the
+/// repaired spec to silence would mean writing a repair that does not repair, or
+/// dropping the only check a repair has.
+///
+/// A pair rather than a bare exemption, so the warning is asserted **by name**
+/// and on its own: a repair that started reporting a second thing, or something
+/// else entirely, fails here rather than passing under a blanket allowance.
+const CORRECTED_EXAMPLES_THAT_STILL_WARN: &[(&str, &str)] =
+    &[("missing-callback-allowlist", "unenforced-auth")];
+
 /// The topics that teach a deploy file, and must keep one that resolves.
 ///
 /// A deploy file is the one document kind a reader cannot check on its own —
@@ -474,11 +489,18 @@ fn only_the_named_topics_lack_a_runnable_example() {
 /// compile — `stop:` on a connection a server-tool suite moved onto the
 /// Responses wire (Decision D122) — and `yaml spec` would hold that block to a
 /// clean verdict it is written to fail.
+///
+/// The fourth is a warning again, and the reason the `triggers` topic needs one
+/// at all: an `http` trigger's authentication surface is reserved grammar
+/// (grammar §15), so the spec that declares it builds, serves every caller, and
+/// reports `unenforced-auth` — which is the one thing about that surface a
+/// reader has to see happen rather than be told.
 const TOPICS_THAT_TRIGGER_A_CODE: &[(&str, &str)] = &[
     ("models", "unknown-server-tool"),
     ("models", "unknown-server-tool-field"),
     ("models", "unknown-key"),
     ("models", "tool-name-collision"),
+    ("triggers", "unenforced-auth"),
 ];
 
 /// A topic's `yaml triggers <code>` block reports the code it names.
@@ -612,6 +634,10 @@ fn every_explanation_example_reports_its_code() {
 /// repair that satisfies the rule it is about and then fails a neighbouring one
 /// is worse than no repair: the reader has followed the instruction they were
 /// given and is now holding a second diagnostic.
+///
+/// [`CORRECTED_EXAMPLES_THAT_STILL_WARN`] is the one shape that cannot be held
+/// to silence and is held to an exact warning instead — a repair whose result is
+/// correct and *reserved*, which is a true report rather than a second problem.
 #[test]
 fn every_corrected_explanation_example_validates_clean() {
     let mut carrying = Vec::new();
@@ -621,8 +647,28 @@ fn every_corrected_explanation_example_validates_clean() {
             continue;
         }
         carrying.push(code.clone());
+        let tolerated = CORRECTED_EXAMPLES_THAT_STILL_WARN
+            .iter()
+            .find_map(|(explanation, warning)| (*explanation == code).then_some(*warning));
         for (index, source) in corrections.into_iter().enumerate() {
-            validates(&format!("explain-corrected-{code}-{index}"), &source);
+            let name = format!("explain-corrected-{code}-{index}");
+            match tolerated {
+                None => validates(&name, &source),
+                Some(warning) => {
+                    let diagnostics = report(&name, &source);
+                    let reported: Vec<&str> = diagnostics
+                        .iter()
+                        .map(|diagnostic| diagnostic.code.as_str())
+                        .collect();
+                    assert_eq!(
+                        reported,
+                        vec![warning],
+                        "the repair in `{code}.md` clears its own error and carries exactly the \
+                         one warning this file names:\n{}",
+                        render(&diagnostics)
+                    );
+                }
+            }
         }
     }
     carrying.sort();

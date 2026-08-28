@@ -1,0 +1,38 @@
+# rule: an `http` trigger's authentication surface is reserved grammar, and a declaration of it is reported rather than enforced (grammar 15, PRD resolved q32/q33)
+# code: unenforced-auth
+# message: the trigger `intake` declares `auth`, `callback_auth` and `callback_allow`, which this compiler release parses and checks and does not enforce
+# at: main.yml:28:5
+# help: the keys are reserved grammar: the route serves every caller and a callback still goes wherever the payload said, so a deployment that needs the guarantee before the runtime lands keeps a gateway in front of the generated app — keep the block, which is the specification that gateway is configured to match (grammar 15, PRD resolved q32/q33)
+#
+# The one reserved construct that reports itself. A `schedule` that never fires
+# is noticed the first morning; a declared `auth:` that verifies nobody looks,
+# from outside, exactly like one that does — so the composition builds and the
+# report says so. All three keys are written here because the message lists the
+# ones a trigger declares, and the three-key sentence is the one worth pinning.
+version: "0.1"
+
+flow.support:
+  outputs: {}
+  nodes:
+    approve:
+      human:
+        input: {}
+        output:
+          decision: { enum: [approve, reject] }
+  edges:
+    - { from: start, to: approve }
+    - { from: approve, to: end }
+
+triggers:
+  intake:
+    type: http
+    flow: flow.support
+    callback: "payload.body.callback_url"
+    auth:
+      hmac:
+        secret: ${WEBHOOK_SECRET}
+    callback_auth:
+      hmac:
+        secret: ${CALLBACK_SECRET}
+    callback_allow:
+      - "https://hooks.example.com/*"

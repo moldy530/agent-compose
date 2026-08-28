@@ -126,6 +126,12 @@ fn source() -> String {
 }
 
 /// The parser accepts every key of the surface, written out and left out.
+///
+/// The check pass reports one thing and only one thing: that the surface is
+/// reserved. `unenforced-auth` is a **warning** about this release rather than
+/// about the spec, so the composition still validates and still builds — and
+/// the assertion is exact, because a second diagnostic arriving here would mean
+/// a legal trigger had become unwritable and no negative fixture would notice.
 #[test]
 fn the_whole_auth_surface_parses_and_resolves_clean() {
     let parsed = parse_str(&source(), "main.yml");
@@ -134,13 +140,30 @@ fn the_whole_auth_surface_parses_and_resolves_clean() {
         "the auth surface should parse cleanly, got:\n{}",
         render(&parsed.diagnostics)
     );
-    // …and checks clean, which is the pass that would refuse a trigger for what
-    // its flow is rather than for what it declares.
+    // …and checks with nothing but the reserved-grammar warning, which is the
+    // pass that would refuse a trigger for what its flow is rather than for what
+    // it declares.
     let ir = resolve_clean("surface", &source());
     let diagnostics = compose_core::check(&ir);
-    assert!(
-        diagnostics.is_empty(),
-        "the auth surface should check cleanly, got:\n{}",
+    let reported: Vec<(&str, &str)> = diagnostics
+        .iter()
+        .map(|diagnostic| (diagnostic.code.as_str(), diagnostic.message.as_str()))
+        .collect();
+    assert_eq!(
+        reported,
+        vec![
+            (
+                "unenforced-auth",
+                "the trigger `intake` declares `auth`, `callback_auth` and `callback_allow`, \
+                 which this compiler release parses and checks and does not enforce"
+            ),
+            (
+                "unenforced-auth",
+                "the trigger `minimal` declares `auth`, `callback_auth` and `callback_allow`, \
+                 which this compiler release parses and checks and does not enforce"
+            ),
+        ],
+        "the auth surface should check with the reserved warning and nothing else, got:\n{}",
         render(&diagnostics)
     );
     // A composition `validate` accepts is one `build` owes a project to, and
@@ -387,7 +410,8 @@ fn a_delivery_header_is_refused_outbound_and_stays_legal_inbound() {
 /// missing-callback-allowlist` that nothing is enforced while the served app
 /// enforces both. This test is what makes that a build failure rather than a
 /// reviewer's memory. When the runtime lands, the first half fails, and these
-/// are the five places to unwind:
+/// are the six places to unwind — four documents, one code and its explanation,
+/// and one pass:
 ///
 /// * `docs/grammar.md` §13.3 ("reserved grammar in v0") and §15 (three rows)
 /// * `docs/topics/triggers.md` ("All three keys below are reserved in v0" and
@@ -395,6 +419,20 @@ fn a_delivery_header_is_refused_outbound_and_stays_legal_inbound() {
 /// * `docs/topics/targets.md` (three rows)
 /// * `crates/compose-core/src/docs/codes/missing-callback-allowlist.md`
 ///   ("This check is live; the matching it demands is not")
+/// * `crates/compose-core/src/docs/codes/unenforced-auth.md`, and the
+///   `unenforced-auth` warning itself — which the runtime commit **deletes**
+///   rather than edits, since a report saying a live control is unenforced is
+///   the same false claim in the other direction
+/// * `crates/compose-core/src/codegen/env.rs`, `References::of` — the walk that
+///   builds `src/env.ts`. It visits `ir.definitions` and `ir.deploy` and never
+///   `ir.triggers`, which is why the four env refs of an authenticated trigger
+///   reach no generated file: the assertion below is what holds that today. The
+///   commit that teaches `serve` to read `process.env.WEBHOOK_TOKEN` has to
+///   teach that walk the same names in the same change, or a deployment missing
+///   the variable starts clean — `readEnvironment()` reports only what
+///   `environmentReferences` lists — and then fails on every real delivery,
+///   which is exactly the promise that module's own header makes ("the set of
+///   variables an isolated deployment needs is computable from it, statically").
 #[test]
 fn the_auth_surface_is_reserved_grammar_and_every_document_saying_so_is_listed_here() {
     let ir = resolve_clean("reserved", &source());
@@ -421,6 +459,20 @@ fn the_auth_surface_is_reserved_grammar_and_every_document_saying_so_is_listed_h
         }
     }
 
+    // …and the report, which is the one place the claim is made by the compiler
+    // rather than by a document: every trigger of the surface carries the
+    // reserved-grammar warning and nothing else, so a release that enforces the
+    // keys cannot keep the warning by accident.
+    let reported = compose_core::check(&ir);
+    assert!(
+        !reported.is_empty()
+            && reported
+                .iter()
+                .all(|diagnostic| diagnostic.code.as_str() == "unenforced-auth"),
+        "the surface is reserved, so `check` says so on every trigger declaring it, got:\n{}",
+        render(&reported)
+    );
+
     // …and the documents that say it. Each is checked for the sentence that
     // would become false, so one deleted early fails here rather than silently.
     let triggers = compose_core::docs::topic("triggers").expect("the `triggers` topic ships");
@@ -428,6 +480,9 @@ fn the_auth_surface_is_reserved_grammar_and_every_document_saying_so_is_listed_h
     let allowlist = compose_core::docs::explanation(
         compose_core::docs::codes::named("missing-callback-allowlist")
             .expect("the code is registered"),
+    );
+    let unenforced = compose_core::docs::explanation(
+        compose_core::docs::codes::named("unenforced-auth").expect("the code is registered"),
     );
     let grammar = fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -453,6 +508,7 @@ fn the_auth_surface_is_reserved_grammar_and_every_document_saying_so_is_listed_h
             allowlist,
             "This check is live; the matching it demands is not",
         ),
+        (unenforced, "read by nothing this release generates"),
     ] {
         assert!(
             document.contains(claim),
@@ -494,6 +550,14 @@ fn an_allowlist_without_outbound_auth_is_legal() {
 /// port, a query string, and an exact URL with no wildcard at all are all legal
 /// hosts, and refusing one of them makes a correct allowlist unwritable while
 /// every negative fixture still passes.
+///
+/// `https://*.hooks.example.com/*` is in the refused list rather than the legal
+/// one **pending a language decision**, not because the shape is wrong to want:
+/// a wildcard bounded to one label of the authority would mean what an author
+/// intends by it, and that is a second wildcard kind, which is the PRD's to
+/// settle (D127 states the asymmetry that makes refusing the reversible half).
+/// If a resolved question admits it, this list is where the pattern moves — and
+/// nothing else about the entry rules changes.
 #[test]
 fn an_allowlist_entry_writes_its_host_out_literally() {
     let allowlist = |pattern: &str| {

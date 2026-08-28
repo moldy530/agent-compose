@@ -20,6 +20,15 @@
 //! `payload.body`, which is `{}` on every request such a trigger can receive,
 //! so the read fails every time (grammar 13.3, Decision D117).
 //!
+//! One rule reports rather than refuses. An `http` trigger's `auth:`,
+//! `callback_auth:` and `callback_allow:` are reserved grammar (grammar 15):
+//! parsed, checked, carried into the IR, and enforced by nothing this release
+//! generates. Every other reserved construct leaves that to a document, and can
+//! afford to — a `schedule` that never fires is noticed. A declared `auth:`
+//! that verifies nobody is not, so the trigger carries an `unenforced-auth`
+//! **warning** and a composition whose only access control is inert does not
+//! report a clean verdict ([`unenforced_auth`]).
+//!
 //! Two rules are about the entry a trigger declares rather than about what it
 //! reads. An `http` trigger's `method:`/`path:` pair MUST be free — unclaimed by
 //! another trigger, and not one of the two the generated app mounts for itself
@@ -277,6 +286,9 @@ fn route_span(trigger: &Trigger, http: &HttpTrigger) -> Span {
 
 fn one(ctx: &mut Ctx, trigger: &Trigger) {
     let name = text(&trigger.name);
+    if let TriggerKind::Http(http) = &trigger.kind {
+        unenforced_auth(ctx, trigger, http);
+    }
     let scope = expr::trigger_scope(&trigger.kind, format!("the trigger `{name}`"));
     let bindings = match &trigger.kind {
         TriggerKind::Manual => None,
@@ -322,6 +334,76 @@ fn one(ctx: &mut Ctx, trigger: &Trigger) {
     };
     let inputs = definition.inputs.clone();
     check_bindings(ctx, trigger, bindings, inputs.as_ref(), &flow, &scope);
+}
+
+/// An `http` trigger declaring an authentication surface nothing enforces yet
+/// (grammar 15, PRD resolved q32/q33).
+///
+/// The three keys are reserved grammar: specified, parsed, checked, carried into
+/// the IR, and read by nothing this release generates. Every other reserved
+/// construct is content to say that in a document, because every other one is
+/// *visibly* inert — a `schedule` that runs nothing is noticed the first morning
+/// it does not fire. An access control that runs nothing shows nothing: the
+/// route answers, the flow starts, and from outside it is indistinguishable
+/// from a route that verifies its callers. So the report says it, where an
+/// operator running `validate` before a deploy meets it, rather than only in the
+/// documents that also say it.
+///
+/// A **warning** rather than an error, because declaring the keys is right: the
+/// spec records what the deployment will enforce, and §13.3 is what the M3
+/// runtime is written against. Refusing them would make the language unable to
+/// say the thing it is about to be able to do.
+///
+/// One diagnostic per trigger rather than one per key, spanning the trigger
+/// object: the finding is about *this trigger's* posture, and three warnings
+/// about one trigger would read as three problems.
+///
+/// The change that lands the runtime **deletes** this check and its code — a
+/// report claiming a live control is unenforced is the same false claim pointing
+/// the other way — and `tests/trigger_auth_surface.rs` names it among the sites
+/// to unwind.
+fn unenforced_auth(ctx: &mut Ctx, trigger: &Trigger, http: &HttpTrigger) {
+    let declared: Vec<&str> = [
+        ("auth", http.auth.is_some()),
+        ("callback_auth", http.callback_auth.is_some()),
+        ("callback_allow", http.callback_allow.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(key, written)| written.then_some(key))
+    .collect();
+    let Some(keys) = and_list(&declared) else {
+        return;
+    };
+    let name = text(&trigger.name);
+    ctx.push(
+        Diagnostic::warning(
+            DiagnosticCode::UnenforcedAuth,
+            trigger.span.clone(),
+            format!(
+                "the trigger `{name}` declares {keys}, which this compiler release parses and \
+                 checks and does not enforce"
+            ),
+        )
+        .with_help(
+            "the keys are reserved grammar: the route serves every caller and a callback still goes wherever the payload said, so a deployment that needs the guarantee before the runtime lands keeps a gateway in front of the generated app — keep the block, which is the specification that gateway is configured to match (grammar 15, PRD resolved q32/q33)",
+        ),
+    );
+}
+
+/// `` `a` ``, `` `a` and `b` ``, `` `a`, `b` and `c` `` — and [`None`] for the
+/// empty list, which is the case with no sentence to be part of.
+fn and_list(items: &[&str]) -> Option<String> {
+    match items {
+        [] => None,
+        [only] => Some(format!("`{only}`")),
+        [rest @ .., last] => Some(format!(
+            "{} and `{last}`",
+            rest.iter()
+                .map(|item| format!("`{item}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
 }
 
 fn check_bindings(

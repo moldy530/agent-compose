@@ -3910,9 +3910,11 @@ a flow input field can accept it.
 (§15): fully specified here, parsed, checked, and carried into the IR, and read
 by nothing the compiler generates yet. A served trigger declaring `auth:` is
 exactly as open as one declaring none, and a callback is still delivered to
-whatever URL the payload named. Everything the rest of §13.3 states in the
-present tense is what the M3 runtime is written against — a deployment that needs
-the guarantee before then keeps its gateway.
+whatever URL the payload named. `validate` and `build` report an
+`unenforced-auth` **warning** on every trigger declaring one of the three, so
+the verdict says it too. Everything the rest of §13.3 states in the present
+tense is what the M3 runtime is written against — a deployment that needs the
+guarantee before then keeps its gateway.
 
 **Authenticating the caller: `auth:`.** v0's posture was "deploy behind your own
 gateway". Webhook-style events make the generated app the thing a vendor calls
@@ -4045,6 +4047,20 @@ the first `/`, `?` or `#` and carries no `*` — `https://hooks.example.com/*`,
 An allowlist made mandatory by
 [D126](#d126-callback_auth-makes-callback_allow-mandatory) and satisfiable by
 `https://*` would be a ceremony rather than a guarantee.
+
+That refusal is **narrow on purpose, and it leaves a question open.**
+`https://*.hooks.example.com/*` is the entry an author arriving from any other
+allowlist writes first, and there is a reading of `*` under which it means what
+they intend: a wildcard that stops at `.`, `:`, `@` and `/` inside the authority
+constrains the host to one label of a named tree, and neither attack above
+survives it. That reading is a **second wildcard kind** — one meaning inside the
+authority, another after it — which is a language decision this grammar has not
+taken, and one the PRD owns rather than the compiler. Until it is taken the
+entry is refused, because refusing is the only choice that keeps both readings
+reachable: admitting it under "any run of characters" ships a pattern that
+constrains nothing, and narrowing it afterwards would silently change what an
+already compiling spec admits. Relaxing later admits strictly more entries and
+changes no entry's meaning.
 
 **The delivery wire.** A callback fires on lifecycle events — every quiescence
 that opened new pauses, and settle — carrying the status route's report plus
@@ -4272,8 +4288,27 @@ the compiler's behaviour rather than left to a reviewer's memory:
 `crates/compose-core/tests/trigger_auth_surface.rs` asserts that a built project
 carries **none** of an authenticated trigger's material, and enumerates every
 document repeating the claim — here, §13.3, both topics, and the
-`missing-callback-allowlist` explanation. The commit that teaches `serve` to
-verify a caller fails that test until those sentences go with it.
+`missing-callback-allowlist` and `unenforced-auth` explanations. The commit that
+teaches `serve` to verify a caller fails that test until those sentences go with
+it.
+
+The binary says it too, rather than leaving it to the documents: a trigger
+declaring any of the three keys is reported by `validate` and by `build` as an
+`unenforced-auth` **warning**, so a composition whose only access control is
+inert does not report a clean verdict. That warning is deleted by the same
+commit — a report claiming a live control is unenforced is the same false claim
+pointing the other way.
+
+One **code** site is on the retraction list beside the documents, because what
+holds there today is an absence rather than a sentence:
+`crates/compose-core/src/codegen/env.rs` builds `src/env.ts` by walking
+`definitions` and the deploy layer, never `triggers`, so an authenticated
+trigger's four `${ENV}` references reach no generated file — consistent while
+the keys are inert, and wrong the moment `serve` reads one. §4.3's promise is
+that the variables a deployment needs are computable from the artifact
+statically; a runtime that read `process.env.WEBHOOK_TOKEN` without teaching
+that walk the same name would let a deployment missing the variable start clean
+and fail on every real delivery instead.
 
 `human` nodes were on this list and have left it: the runtime landed in M2, so a
 compiled project really pauses, publishes the question, and resumes (§8.7). What
@@ -6976,8 +7011,26 @@ wherever a payload said, and a mandatory list whose every entry may be
 that reads like a constraint and is not one, refused in the pass that reads it.
 The rule is about the *entry*, not about matching: `*` still crosses every
 delimiter wherever it is legal, because the alternative — a wildcard that stopped
-at one — is the second wildcard kind this entry just refused. *Scheme-anchored*,
-because a match that could not name the scheme would
+at one — is the second wildcard kind this entry just refused.
+
+*And that refusal is the narrow half of an open question,* stated here so the
+next reader meets it as one. `https://*.hooks.example.com/*` is the entry an
+author arriving from another allowlist writes first, and a wildcard bounded to a
+single label inside the authority — stopping at `.`, `:`, `@` and `/` — would
+mean what they intend and defeat both attacks above. What it costs is one
+wildcard with two meanings, which is a language decision, and PRD discipline
+puts a language decision in the PRD before an implementation. So v1 refuses the
+shape rather than guessing at it, on the one asymmetry that makes refusing the
+reversible choice: admitting the entry under "any run of characters" ships a
+pattern that constrains nothing and can only be narrowed by changing what an
+already compiling spec admits, while a later resolution admitting the bounded
+reading accepts strictly more entries and leaves every entry legal today meaning
+exactly what it means today. The diagnostic says which repair is which, because
+the repair an author reaches for on their own is dropping `callback_auth:` —
+which D126 makes the only other way to keep the trigger compiling, and which
+trades a narrow allowlist for no allowlist and no signature at all.
+
+*Scheme-anchored*, because a match that could not name the scheme would
 let one entry admit URLs that merely begin with the same characters. *`http`
 stays legal*: localhost development is the common first case, and refusing it
 would push every author to a workaround worse than the rule. *Non-empty*,
