@@ -478,3 +478,40 @@ fn an_allowlist_without_outbound_auth_is_legal() {
         render(&parsed.diagnostics)
     );
 }
+
+/// The outbound `hmac:` takes `secret:` and nothing else (grammar 13.3,
+/// Decision D127).
+///
+/// The failure this guards is a symmetry edit. The inbound `hmac:` takes
+/// `header:`, `algorithm:`, `encoding:` and `prefix:` because there a vendor
+/// made those choices; outbound they are the deployment's own, and fixing them
+/// at HMAC-SHA256/hex under `X-AgentCompose-Signature` is what lets one
+/// verification recipe serve every agent-compose deployment. Adding them here
+/// "for symmetry" would ship a spec that validates and then signs its
+/// deliveries with a digest no receiver written against the published header
+/// table can verify — so each of the four is refused by name, and
+/// `trigger-callback-auth-hmac-choosing-an-algorithm.yml` pins the message.
+#[test]
+fn an_outbound_hmac_takes_a_secret_and_nothing_else() {
+    for (key, value) in [
+        ("header", "X-Delivery-Signature"),
+        ("algorithm", "sha512"),
+        ("encoding", "base64"),
+        ("prefix", "\"sha512=\""),
+    ] {
+        let source = format!(
+            "version: \"0.1\"\n{FLOW}\ntriggers:\n  intake:\n    type: http\n    flow: flow.support\n    callback: \"payload.body.callback_url\"\n    callback_allow:\n      - \"https://hooks.example.com/*\"\n    callback_auth:\n      hmac:\n        secret: ${{CALLBACK_SECRET}}\n        {key}: {value}\n"
+        );
+        let parsed = parse_str(&source, "main.yml");
+        let expected =
+            format!("unknown key `{key}` in the `hmac` of the `callback_auth` of trigger `intake`");
+        assert!(
+            parsed
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message == expected),
+            "an outbound `hmac:` takes no `{key}:`, got:\n{}",
+            render(&parsed.diagnostics)
+        );
+    }
+}
