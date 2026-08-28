@@ -269,6 +269,22 @@ export interface DeliveryAttempt {
  */
 export interface DeliveryIntent {
   readonly execution: string;
+  /**
+   * The trigger whose `callback_auth:` signs this delivery and whose
+   * `callback_allow:` admits its URL (grammar 13.3).
+   *
+   * Recorded **on the delivery** rather than read off the execution's lifecycle
+   * row, because there is one delivery whose execution has no lifecycle row: a
+   * `settled` intent journaled for a run that failed before it was journaled at
+   * all (`docs/durability.md` §3.7). A start that could not name that row's
+   * trigger could neither deliver it nor end it, so it would be read, logged and
+   * skipped at every start for the life of the journal — and `pending` is
+   * neither of the two ends §3.7 gives a delivery.
+   *
+   * Absent only on a row written before this field was, where the lifecycle row
+   * is what names it.
+   */
+  readonly trigger?: string;
   readonly event: DeliveryEvent;
   readonly url: string;
   readonly body: string;
@@ -425,7 +441,14 @@ export interface Journal {
    * an outcome another process wrote exactly as it is.
    */
   exhaustRecorded(execution: string, ordinal: number, reason: string): void;
-  /** Record what one attempt did, and where the delivery stands after it. */
+  /**
+   * Record what one attempt did, and where the delivery stands after it.
+   *
+   * A row that is no longer `pending` is left exactly as it is, for the reason
+   * the two above are: a delivery has one outcome, and an attempt landing after
+   * it would write `pending` back over a row a receiver has already taken —
+   * which the next start would read as a webhook it still owes.
+   */
   recordAttempt(
     execution: string,
     ordinal: number,
@@ -498,17 +521,18 @@ CREATE TABLE IF NOT EXISTS effects (
   PRIMARY KEY (execution, key)
 );
 CREATE TABLE IF NOT EXISTS deliveries (
-  execution   TEXT NOT NULL,
-  ordinal     INTEGER NOT NULL,
-  event       TEXT NOT NULL,
-  url         TEXT NOT NULL,
-  body        TEXT NOT NULL,
-  pauses      TEXT NOT NULL,
-  status      TEXT NOT NULL,
-  attempts    TEXT NOT NULL,
-  intended_at TEXT NOT NULL,
-  settled_at  TEXT,
-  detail      TEXT,
+  execution    TEXT NOT NULL,
+  ordinal      INTEGER NOT NULL,
+  trigger_kind TEXT,
+  event        TEXT NOT NULL,
+  url          TEXT NOT NULL,
+  body         TEXT NOT NULL,
+  pauses       TEXT NOT NULL,
+  status       TEXT NOT NULL,
+  attempts     TEXT NOT NULL,
+  intended_at  TEXT NOT NULL,
+  settled_at   TEXT,
+  detail       TEXT,
   PRIMARY KEY (execution, ordinal)
 );
 CREATE INDEX IF NOT EXISTS effects_of_execution ON effects (execution);
@@ -665,11 +689,12 @@ class SqliteJournal implements Journal {
     };
     this.#database.run(
       `INSERT INTO deliveries
-         (execution, ordinal, event, url, body, pauses, status, attempts, intended_at, settled_at, detail)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (execution, ordinal, trigger_kind, event, url, body, pauses, status, attempts, intended_at, settled_at, detail)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         record.execution,
         record.ordinal,
+        record.trigger ?? null,
         record.event,
         record.url,
         record.body,
@@ -711,13 +736,22 @@ class SqliteJournal implements Journal {
     status: DeliveryStatus,
   ): void {
     const held = this.#database.get(
-      "SELECT attempts FROM deliveries WHERE execution = ? AND ordinal = ?",
+      "SELECT attempts, status FROM deliveries WHERE execution = ? AND ordinal = ?",
       [execution, ordinal],
     ) as Row | null;
-    if (held === null) return;
+    // **A row that already has an outcome is not reopened by a late attempt**,
+    // which is the predicate the two statements above carry and this one needs
+    // for the same reason: an attempt recorded against a `delivered` row would
+    // write `pending` back over it, and the next start would read a webhook the
+    // receiver already took as one it still owes — past the bounded number of
+    // attempts `docs/durability.md` §3.7 promises.
+    if (held === null || held["status"] !== "pending") return;
     const attempts = [...(JSON.parse(String(held["attempts"])) as DeliveryAttempt[]), attempt];
+    // The read and the write are one synchronous step (see [`#openDelivery`]),
+    // so the predicate repeats what the guard above decided rather than closing
+    // a window between them — and it is what a second writer would meet.
     this.#database.run(
-      "UPDATE deliveries SET attempts = ?, status = ?, settled_at = ?, detail = ? WHERE execution = ? AND ordinal = ?",
+      "UPDATE deliveries SET attempts = ?, status = ?, settled_at = ?, detail = ? WHERE execution = ? AND ordinal = ? AND status = 'pending'",
       [
         JSON.stringify(attempts),
         status,
@@ -749,12 +783,17 @@ class SqliteJournal implements Journal {
 function deliveryOf(row: Row): DeliveryRecord {
   const settledAt = row["settled_at"];
   const detail = row["detail"];
+  const trigger = row["trigger_kind"];
   const execution = String(row["execution"]);
   const ordinal = Number(row["ordinal"]);
   return {
     execution,
     ordinal,
     id: `${execution}:${ordinal}`,
+    // A row written before the ledger recorded it answers nothing here, and the
+    // lifecycle row is what names such a delivery's trigger (see
+    // [`DeliveryIntent.trigger`]).
+    ...(trigger === null || trigger === undefined ? {} : { trigger: String(trigger) }),
     event: String(row["event"]) as DeliveryEvent,
     url: String(row["url"]),
     body: String(row["body"]),
@@ -905,6 +944,15 @@ async function migrated(
       const effects = database.all("PRAGMA table_info(effects)") as Row[];
       if (!effects.some((column) => column["name"] === "refused")) {
         database.exec("ALTER TABLE effects ADD COLUMN refused INTEGER NOT NULL DEFAULT 0;");
+      }
+      // The delivery's own trigger, added to the ledger after it: nullable
+      // because a row written before it cannot be backfilled — nothing in the
+      // file says what trigger that delivery was for — and a row that answers
+      // `null` is read off the lifecycle row instead (see
+      // [`DeliveryIntent.trigger`]).
+      const deliveries = database.all("PRAGMA table_info(deliveries)") as Row[];
+      if (!deliveries.some((column) => column["name"] === "trigger_kind")) {
+        database.exec("ALTER TABLE deliveries ADD COLUMN trigger_kind TEXT;");
       }
       // A whole *table* the schema grew needs no probe of its own: `CREATE
       // TABLE IF NOT EXISTS` above created `deliveries` in a file written

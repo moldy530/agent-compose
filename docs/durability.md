@@ -459,6 +459,7 @@ What is recorded, and in this order (PRD resolved q35):
 | `execution`, `ordinal` | who it is about, and which of that execution's lifecycle events it is. The ordinal is **monotonically increasing per execution across both kinds** and is allocated in the journal, so a restart cannot reuse one |
 | `id` | `<execution_id>:<ordinal>` — the `X-AgentCompose-Delivery` header, and what a receiver dedupes on. The same on every attempt |
 | `event` | `parked` or `settled` |
+| `trigger` | the trigger whose `callback_auth:` signs this delivery and whose `callback_allow:` admits its URL (`docs/grammar.md` §13.3). On the delivery rather than read off the execution's lifecycle row when it is picked up, because one delivery has no lifecycle row to read: the `settled` journaled for a run that failed **before** it was journaled at all. A start that could not name that row's trigger could neither send it nor end it, and `pending` is neither of the two ends below |
 | `url` | the callback URL the request payload named, resolved when the request arrived (§3.5) |
 | `body` | the exact bytes every attempt POSTs. Bytes rather than a value, because a signature is over what is sent: a body re-serialized on a later attempt, or in a later process, would be a second delivery wearing the first one's id |
 | `pauses` | which pauses a `parked` delivery reported, by wait id; empty on a `settled` one. What keeps a **recovered** execution from re-announcing a question already asked — it re-parks under the same wait ids (§6.1), so a parking fires only where a quiescence opened a pause this set does not hold |
@@ -531,7 +532,8 @@ open execution of a flow this build no longer declares: a delivery whose
 identity that trigger's `callback_auth:` promised its receiver, and delivering
 without it is a request a receiver written against the promise refuses — or
 worse, accepts. So the row stays `pending` for a build that declares the
-trigger, and the reason is written on stderr. The row is **written** either way:
+trigger, and the reason is written on stderr — a wait for a trigger the row
+itself names, which is why waiting is enough. The row is **written** either way:
 an event that happened and was recorded nowhere would be both unrecoverable and
 invisible — no restart could find it and the status route would show a settle
 nobody was ever told about — so the intent goes down under its ordinal like any
@@ -1092,7 +1094,9 @@ real journal — the file a build before this one wrote — and restarts `serve`
 over it, which is the only way to find out that a compatible change stayed
 compatible. A column added to an existing table is the case that is *not*
 covered by `CREATE TABLE IF NOT EXISTS`, and needs the `PRAGMA table_info` probe
-the two migrations beside it use.
+the migrations beside it use — the delivery's own `trigger` is one such column,
+added to the ledger after it and nullable because no file written before it says
+what trigger a delivery it holds was for.
 
 ### 11.3 What requires a version bump
 

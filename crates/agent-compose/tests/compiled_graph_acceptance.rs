@@ -18499,7 +18499,15 @@ fn a_journal_written_before_the_delivery_ledger_opens_and_serves_under_this_buil
 /// cannot be named, so the delivery stays pending). What has no posture until
 /// one is written is a read that *throws*, which is what any transient journal
 /// failure looks like from inside the loop.
+///
+/// The delivery's own `trigger` is cleared beside it, and that is what leaves
+/// the lifecycle row as the only thing that can name this delivery's trigger: a
+/// row that names its own is picked up without reading an execution at all
+/// (`docs/durability.md` §3.7). So this is also the older shape of a delivery —
+/// a row written before the ledger recorded that field — met by the start that
+/// cannot read the execution behind it.
 const JOURNAL_WITH_AN_UNREADABLE_EXECUTION: &str = "\
+UPDATE deliveries SET trigger_kind = NULL;
 CREATE TABLE unreadable (
   id              TEXT PRIMARY KEY,
   flow            TEXT NOT NULL,
@@ -18533,10 +18541,12 @@ ALTER TABLE unreadable RENAME TO executions;
 /// the status route backstops", would take down a service that owes one.
 ///
 /// A contended file cannot be scripted, so the read is made to fail the way a
-/// contended one does: the lifecycle row the pending delivery belongs to is
-/// rebuilt without the column its reader parses. What is asserted is that the
-/// app serves — a `401` from a guarded route is a route answering — and that the
-/// row is left exactly as it was found, for a start that can read it.
+/// contended one does: the delivery is put back into the shape that has to read
+/// an execution at all — the older row, carrying no trigger of its own — and the
+/// lifecycle row it belongs to is rebuilt without the column its reader parses.
+/// What is asserted is that the app serves — a `401` from a guarded route is a
+/// route answering — and that the row is left exactly as it was found, for a
+/// start that can read it.
 #[test]
 fn a_delivery_whose_execution_cannot_be_read_leaves_the_app_serving() {
     let provider = MockProvider::start().expect("a loopback port");
@@ -18599,6 +18609,110 @@ fn a_delivery_whose_execution_cannot_be_read_leaves_the_app_serving() {
         held[0]["status"], "pending",
         "the row is left as it was found, for a start that can read it: {held:?}"
     );
+    drop(second);
+}
+
+/// A delivery whose execution the journal does **not** hold is still finished,
+/// because the row names its own trigger (`docs/durability.md` §3.7).
+///
+/// The shape this is about is the one settle the `closing` hook is never reached
+/// for: a run that failed **before** it was journaled at all — its recorded
+/// inputs refused by a narrowed `inputs:`, a `session_key:` the composition has
+/// since started requiring — leaves no lifecycle row, so no start will ever
+/// recover it and the caller holding a `202` is owed the failure by the process
+/// that saw it. That delivery is journaled like any other, and a start that read
+/// its trigger off the execution would find no execution, name no trigger, and
+/// neither send the row nor end it: it would be read, logged and skipped at
+/// every start for the life of the journal, which is neither of the two ends
+/// §3.7 gives a delivery.
+///
+/// A run that fails that early cannot be scripted, so the state one leaves is
+/// made instead: an ordinary settle is journaled and left owed by a receiver
+/// answering `500`, and then the lifecycle row is taken out from under it. What
+/// the restart meets is exactly what that run leaves behind — a `pending`
+/// delivery about an execution the journal does not hold — and the delivery
+/// still lands, under the id it was allocated.
+#[test]
+fn a_settle_journaled_for_an_execution_the_journal_never_held_is_still_delivered() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_shims, _log, base) = events_environment(&provider, "events-orphan-settle");
+    let receiver = harness::Receiver::start().expect("a loopback receiver");
+    // One attempt, refused, and the next an hour away: the process is killed
+    // holding a delivery nothing has taken.
+    receiver.always(500);
+    let Some(project) = harness::scratch_project("events-orphan-settle") else {
+        return;
+    };
+
+    let mut stalled = base.clone();
+    stalled.push((harness::CALLBACK_RETRY.to_string(), "0s,1h".to_string()));
+    let execution;
+    {
+        let Some(first) = harness::serve_into(&project, "http-events", &stalled) else {
+            return;
+        };
+        let app = Client::new(&first.base_url).expect("a client for the generated app");
+        let started = app
+            .post_json(
+                "/posted",
+                &json!({
+                    "topic": "orphaned",
+                    "callback_url": format!("{}/anywhere", receiver.base_url),
+                }),
+            )
+            .expect("the trigger's route answers");
+        assert_eq!(started.status, 202, "{}", started.text());
+        execution = started.json()["execution_id"]
+            .as_str()
+            .expect("an execution id")
+            .to_string();
+        receiver.wait_for_event("settled", 1, Duration::from_secs(30));
+        let finished = harness::settled(&app, &execution);
+        assert_eq!(finished["status"], "completed", "{finished}");
+    }
+
+    // The lifecycle row goes and the delivery it is about stays: the file now
+    // holds what a settle journaled for a never-journaled run leaves behind.
+    harness::journal_sql(
+        &project,
+        &format!("DELETE FROM executions WHERE id = '{execution}';"),
+    );
+    let owed = journaled_deliveries(&project, &execution);
+    assert_eq!(owed.len(), 1, "one settle, still owed: {owed:?}");
+    assert_eq!(owed[0]["status"], "pending", "{owed:?}");
+
+    receiver.always(200);
+    let mut prompt = base;
+    prompt.push((harness::CALLBACK_RETRY.to_string(), "0s,0s".to_string()));
+    let Some(second) = harness::serve_into(&project, "http-events", &prompt) else {
+        return;
+    };
+    let app = Client::new(&second.base_url).expect("a client for the generated app");
+
+    let taken = harness::until(Duration::from_secs(30), || {
+        let held: Vec<harness::Delivered> = receiver
+            .of_event("settled")
+            .into_iter()
+            .filter(|one| one.header("x-agentcompose-delivery") == Some(&format!("{execution}:0")))
+            .collect();
+        (held.len() >= 2).then_some(held)
+    });
+    assert_eq!(
+        taken[1].bytes, taken[0].bytes,
+        "the delivery a start with no execution to read picked up is the same delivery"
+    );
+    let ended = harness::until(Duration::from_secs(30), || {
+        let held = journaled_deliveries(&project, &execution);
+        (held.first().map(|row| row["status"] == "delivered") == Some(true)).then_some(held)
+    });
+    assert_eq!(ended[0]["event"], "settled", "{ended:?}");
+
+    // …and the execution really is one nothing in this file describes: the row
+    // a build would have read the trigger off is gone.
+    let unknown = app
+        .get(&format!("/executions/{execution}"))
+        .expect("the status route answers");
+    assert_eq!(unknown.status, 404, "{}", unknown.text());
     drop(second);
 }
 

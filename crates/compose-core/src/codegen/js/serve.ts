@@ -1392,6 +1392,12 @@ async function opening(
   const trigger = httpTriggers.find((one) => one.name === execution.trigger);
   const intent = {
     execution: execution.id,
+    // On the row itself, because the one delivery whose execution has **no**
+    // lifecycle row to read it off is journaled here: [`settling`] fires a
+    // `settled` for a run that failed before it was journaled at all, and a
+    // later start that could not name that row's trigger could neither deliver
+    // it nor end it (`docs/durability.md` §3.7, [`resumeDelivery`]).
+    trigger: execution.trigger,
     event,
     url,
     body: JSON.stringify(await report(execution)),
@@ -1447,49 +1453,78 @@ function refusedUrl(trigger: string): string {
  * delivery two ends and staying `pending` is neither, so the row is ended rather
  * than left for the status route to keep reporting as owed at every start for
  * the rest of the journal's life.
+ *
+ * **One loop per delivery in one process**, which is what [`working`] says. Two
+ * of them over one row would POST it twice and then disagree in the journal
+ * about what the receiver did with it.
  */
 async function attempts(record: runtime.DeliveryRecord, trigger: HttpTrigger): Promise<void> {
-  const schedule = retrySchedule();
-  const intended = Date.parse(record.intendedAt);
-  if (record.attempts.length >= schedule.length) {
-    try {
-      await exhaustRecordedDelivery(
-        record.execution,
-        record.ordinal,
-        `the schedule this process runs under names ${schedule.length} attempt${
-          schedule.length === 1 ? "" : "s"
-        } and ${record.attempts.length} were already made`,
-      );
-    } catch (error) {
-      process.stderr.write(
-        `\`${record.id}\`'s exhaustion could not be journaled: ${message(error)}\n`,
-      );
+  if (working.has(record.id)) return;
+  working.add(record.id);
+  try {
+    const schedule = retrySchedule();
+    const intended = Date.parse(record.intendedAt);
+    if (record.attempts.length >= schedule.length) {
+      try {
+        await exhaustRecordedDelivery(
+          record.execution,
+          record.ordinal,
+          `the schedule this process runs under names ${schedule.length} attempt${
+            schedule.length === 1 ? "" : "s"
+          } and ${record.attempts.length} were already made`,
+        );
+      } catch (error) {
+        process.stderr.write(
+          `\`${record.id}\`'s exhaustion could not be journaled: ${message(error)}\n`,
+        );
+      }
+      return;
     }
-    return;
-  }
-  for (let index = record.attempts.length; index < schedule.length; index += 1) {
-    await pause(intended + (schedule[index] ?? 0) - Date.now());
-    const outcome = await attemptDelivery(record, trigger);
-    const last = index === schedule.length - 1;
-    try {
-      await recordDeliveryAttempt(
-        record.execution,
-        record.ordinal,
-        {
-          at: new Date().toISOString(),
-          outcome: outcome.ok ? "delivered" : "failed",
-          detail: outcome.detail,
-        },
-        outcome.ok ? "delivered" : last ? "exhausted" : "pending",
-      );
-    } catch (error) {
-      process.stderr.write(
-        `\`${record.id}\`'s attempt could not be journaled: ${message(error)}\n`,
-      );
+    for (let index = record.attempts.length; index < schedule.length; index += 1) {
+      await pause(intended + (schedule[index] ?? 0) - Date.now());
+      const outcome = await attemptDelivery(record, trigger);
+      const last = index === schedule.length - 1;
+      try {
+        await recordDeliveryAttempt(
+          record.execution,
+          record.ordinal,
+          {
+            at: new Date().toISOString(),
+            outcome: outcome.ok ? "delivered" : "failed",
+            detail: outcome.detail,
+          },
+          outcome.ok ? "delivered" : last ? "exhausted" : "pending",
+        );
+      } catch (error) {
+        process.stderr.write(
+          `\`${record.id}\`'s attempt could not be journaled: ${message(error)}\n`,
+        );
+      }
+      if (outcome.ok) return;
     }
-    if (outcome.ok) return;
+  } finally {
+    working.delete(record.id);
   }
 }
+
+/**
+ * The deliveries this process is working, by delivery id.
+ *
+ * **A row can reach [`attempts`] from two directions in one start.** `recover`
+ * walks the open executions first and does not wait for the replays it starts
+ * (`docs/durability.md` §6.1), so an execution that re-parks with a pause
+ * nothing announced journals a `parked` intent and sets its schedule going while
+ * that walk is still going on — and [`resumeDeliveries`], which reads every
+ * `pending` row after it, then reads the row that was written a moment ago.
+ *
+ * Two loops over one delivery would POST it twice under one id, which a receiver
+ * dedupes, and would each record their attempts against one row, which nothing
+ * dedupes: the journal would hold a delivery that made more attempts than the
+ * schedule §3.7 bounds, and the two would disagree about where it ended. The set
+ * is this process's only — one process at a time writes a project's journal
+ * (§2), and a row's own `status` is what a later start reads.
+ */
+const working = new Set<string>();
 
 /**
  * POST one delivery, and say what the receiver did with it.
@@ -1627,15 +1662,24 @@ async function resumeDeliveries(): Promise<void> {
 
 /** One owed delivery, put back on its schedule. See [`resumeDeliveries`]. */
 async function resumeDelivery(record: runtime.DeliveryRecord): Promise<void> {
-  const row = await journaledExecution(record.execution);
-  const trigger = httpTriggers.find((one) => one.name === row?.trigger);
+  // A row this start has already put on its schedule is not put on a second one.
+  // See [`working`] for how one delivery reaches this from two directions.
+  if (working.has(record.id)) return;
+  // **Off the delivery row**, which is what lets a delivery be finished without
+  // its execution: a `settled` journaled for a run that failed before it was
+  // journaled at all has no lifecycle row, and reading the trigger there would
+  // leave that row `pending` at every start for ever (`docs/durability.md`
+  // §3.7). The lifecycle row is the fallback for a delivery written before the
+  // ledger recorded its trigger, which is the only row that answers nothing.
+  const named = record.trigger ?? (await journaledExecution(record.execution))?.trigger;
+  const trigger = httpTriggers.find((one) => one.name === named);
   if (trigger === undefined) {
     // The trigger that promised this delivery its identity is not one this
     // build has, so the row stays pending for a build that does — the posture
     // [`opening`] takes, and the one `recover` takes for a flow it no longer
     // declares.
     process.stderr.write(
-      `\`${record.id}\` was to be delivered for \`${row?.trigger ?? "an unknown trigger"}\`, which this build does not declare: it stays undelivered in the journal\n`,
+      `\`${record.id}\` was to be delivered for \`${named ?? "an unknown trigger"}\`, which this build does not declare: it stays undelivered in the journal\n`,
     );
     return;
   }

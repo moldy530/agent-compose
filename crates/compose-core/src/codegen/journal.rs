@@ -246,6 +246,76 @@ mod tests {
         }
     }
 
+    /// **One loop per delivery, and one outcome per row**
+    /// (`docs/durability.md` §3.7).
+    ///
+    /// The sibling above binds the *order* of a delivery's two journal writes.
+    /// This binds who may make them, which is the half a restart puts under
+    /// pressure: one start reaches [`attempts`] from two directions. `recover`
+    /// walks the open executions without waiting for the replays it starts
+    /// (§6.1), so an execution that re-parks journals a `parked` intent and sets
+    /// its schedule going while that walk is still going on — and the walk over
+    /// every `pending` row that follows it then reads the row written a moment
+    /// ago.
+    ///
+    /// Two loops over one row would POST it twice under one id, which a receiver
+    /// dedupes, and would each append attempts to one row, which nothing
+    /// dedupes: the journal would hold a delivery that made more attempts than
+    /// the schedule §3.7 bounds, and a loop writing `pending` after the other
+    /// wrote `delivered` would leave the next start owing a webhook already
+    /// taken. So the claim is read off the app — a row is claimed before it is
+    /// attempted and released when the loop ends — and the guard under it off
+    /// the journal: **every** statement that moves a delivery row carries the
+    /// predicate that it is still `pending`, so a late writer meets a row with
+    /// an outcome and changes nothing.
+    #[test]
+    fn one_delivery_is_worked_once_and_a_row_that_ended_is_not_reopened() {
+        let serve = include_str!("js/serve.ts");
+        let journal = include_str!("js/journal.ts");
+
+        let attempts = function_body(serve, "attempts");
+        let claimed = attempts
+            .find("working.add(")
+            .expect("a delivery is claimed by the loop that works it");
+        let attempted = attempts
+            .find("attemptDelivery(")
+            .expect("…which is the loop that sends it");
+        assert!(
+            claimed < attempted,
+            "a delivery is claimed **before** it is attempted, or the second loop over one row \
+             is already sending it by the time the first says so (`docs/durability.md` §3.7)"
+        );
+        assert!(
+            attempts.contains("working.delete("),
+            "a claim that is never released is a delivery this process would not pick up again"
+        );
+        assert!(
+            function_body(serve, "resumeDelivery").contains("working.has("),
+            "the start's walk over every `pending` row is the second direction one delivery is \
+             reached from, so it is the one that has to ask whether the row is already being \
+             worked"
+        );
+
+        let moved: Vec<&str> = journal
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("\"UPDATE deliveries SET"))
+            .collect();
+        assert_eq!(
+            moved.len(),
+            3,
+            "the three ways a delivery row moves are a refusal, an exhaustion and an attempt: \
+             {moved:?}"
+        );
+        for statement in moved {
+            assert!(
+                statement.contains("AND status = 'pending'"),
+                "a delivery has one outcome, so a row that already reached one is left as it is: \
+                 {statement}"
+            );
+        }
+    }
+
     /// The seven journaled seams, by the name each is declared under.
     const SEAMS: [&str; 7] = [
         "callModel",

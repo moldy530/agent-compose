@@ -555,6 +555,13 @@ async function owed(job: Job, produced: FlowRun | undefined, error: unknown): Pr
         : produced.trace;
     await intendDelivery({
       execution: job.execution,
+      // Which trigger's identity the app that finally sends this row is to sign
+      // it with, written beside the row for the reason `src/serve.ts` writes it:
+      // a delivery names its own trigger rather than depending on a lifecycle
+      // row being readable when it is picked up (`docs/durability.md` §3.7).
+      // A `run` names no trigger and never reaches here, because a `callback:`
+      // arrives only on a row a resume read.
+      ...(job.trigger === undefined ? {} : { trigger: job.trigger }),
       event: "settled",
       url,
       body: JSON.stringify(

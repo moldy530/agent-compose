@@ -1679,6 +1679,14 @@ const EVENTS: &[Criterion] = &[
                 "a_delivery_whose_execution_cannot_be_read_leaves_the_app_serving",
                 Status::Live,
             ),
+            // …and the row a start has nothing to read the trigger off: a
+            // delivery names its own, so the settle journaled for a run that
+            // failed before it was journaled at all is still one a later start
+            // can finish rather than one it skips for ever.
+            (
+                "a_settle_journaled_for_an_execution_the_journal_never_held_is_still_delivered",
+                Status::Live,
+            ),
         ],
     },
 ];
