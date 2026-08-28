@@ -1511,6 +1511,14 @@ const EVENTS: &[Criterion] = &[
                 "an_authenticated_start_admits_the_credential_it_declares_and_refuses_every_other",
                 Status::Live,
             ),
+            // …and the credential that is *present* and verifies nothing, which
+            // §4.3's presence check counts as set: an empty token is equal to
+            // the empty token an anonymous caller sends, so the app refuses to
+            // start rather than serving a route that looks guarded.
+            (
+                "a_credential_set_to_nothing_refuses_the_app_at_launch",
+                Status::Live,
+            ),
         ],
     },
     Criterion {
@@ -1544,6 +1552,14 @@ const EVENTS: &[Criterion] = &[
                 "a_callback_url_the_allowlist_admits_nowhere_is_refused_and_the_run_settles",
                 Status::Live,
             ),
+            // The list is matched **whenever** the URL is read, which includes
+            // the reading a restart does of a row an earlier build wrote: a
+            // deployment that narrows its allowlist does not deliver what the
+            // narrower list admits nowhere.
+            (
+                "a_pending_delivery_the_allowlist_no_longer_admits_is_refused_rather_than_sent",
+                Status::Live,
+            ),
             // The check behind the check: every signing assertion above compares
             // against a digest this harness computed, which is worth something
             // only if this side is right.
@@ -1573,6 +1589,13 @@ const EVENTS: &[Criterion] = &[
                 "a_diverged_recovery_delivers_no_webhook_and_the_repair_delivers_one",
                 Status::Live,
             ),
+            // …and the claim no single-pause flow can make: **one** webhook per
+            // quiescence, listing every pause it opened, however far apart in
+            // time the branches reached them (resolved q34).
+            (
+                "one_quiescence_that_opened_many_pauses_is_one_parked_delivery",
+                Status::Live,
+            ),
         ],
     },
     Criterion {
@@ -1587,6 +1610,34 @@ const EVENTS: &[Criterion] = &[
             // execution's failure.
             (
                 "a_delivery_no_attempt_lands_is_recorded_exhausted_and_leaves_the_run_alone",
+                Status::Live,
+            ),
+            // The same bound in wall-clock time, which the row above cannot
+            // reach: its receiver refuses promptly, and a schedule of five
+            // prompt refusals is bounded however long one attempt may take.
+            (
+                "a_receiver_that_never_answers_does_not_hold_a_delivery_open",
+                Status::Live,
+            ),
+            // The schedule itself is a setting somebody has to be able to trust:
+            // one that could not be read is refused at launch rather than
+            // ignored (Decision D50).
+            (
+                "a_callback_retry_schedule_that_is_not_one_refuses_the_app_at_launch",
+                Status::Live,
+            ),
+            // …and the ledger the deliveries live in is a *compatible* change to
+            // the journal, which is only true if a journal written before it
+            // still opens (`docs/durability.md` §11.2).
+            (
+                "a_journal_written_before_the_delivery_ledger_opens_and_serves_under_this_build",
+                Status::Live,
+            ),
+            // The event a build cannot deliver is journaled rather than dropped,
+            // which is what makes "the row stays `pending` for a build that
+            // declares the trigger" a promise about something that exists.
+            (
+                "a_delivery_journaled_without_its_trigger_is_finished_by_a_build_that_declares_it",
                 Status::Live,
             ),
         ],

@@ -712,6 +712,50 @@ fn the_auth_surface_reaches_the_generated_app_and_every_document_says_so() {
     }
 }
 
+/// A project in the **committed golden corpus** populates all three keys, so
+/// the generated-code gates type-check the values the emitter writes.
+///
+/// `tests/generated_code_gates.rs` runs `tsc` over every golden, and what that
+/// buys for this surface depends entirely on a golden carrying a *value*: a
+/// corpus in which no trigger declares `auth:` type-checks the `InboundAuth` and
+/// `CallbackAuth` declarations against nothing. An emitter that wrote `secret:`
+/// where the interface says `secretEnv:` — a plausible symmetry edit, since the
+/// inbound block spells the same credential differently — would then be caught
+/// by no gate at all: the string-matching tests in `codegen::trigger` move with
+/// it, and the acceptance suite that would meet the failure at runtime returns
+/// early on a machine with no JavaScript toolchain. A contributor without Bun
+/// would see a fully green `cargo test` for a build whose served app throws on
+/// its first signed delivery.
+///
+/// So the corpus property is asserted here rather than left to whoever next
+/// edits `tests/projects/every-schema-form/main.yml`.
+#[test]
+fn a_golden_project_carries_a_populated_auth_table() {
+    let goldens = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/goldens");
+    let tables: Vec<String> = fs::read_dir(&goldens)
+        .expect("the golden corpus exists")
+        .filter_map(|entry| {
+            let path = entry
+                .expect("a readable entry")
+                .path()
+                .join("src/triggers.ts");
+            fs::read_to_string(path).ok()
+        })
+        .collect();
+    assert!(
+        !tables.is_empty(),
+        "no golden emits `src/triggers.ts`, so nothing type-checks the trigger table at all"
+    );
+    for populated in ["    auth: {", "    callbackAuth: {", "    callbackAllow: ["] {
+        assert!(
+            tables.iter().any(|table| table.contains(populated)),
+            "no golden's `src/triggers.ts` contains `{populated}`, so `tsc` checks the \
+             declaration of this key against no value the emitter ever wrote: give a golden \
+             project's `http` trigger the key back (grammar 13.3)"
+        );
+    }
+}
+
 /// `callback_allow:` without `callback_auth:` is legal too: an allowlist bounds
 /// where a webhook may go whether or not the delivery is signed, and the
 /// mandatory direction is only the other one.

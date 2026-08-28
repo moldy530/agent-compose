@@ -1532,6 +1532,93 @@ pub fn serve_refused_entrypoint(
     Some(command.output().expect("the command runs"))
 }
 
+/// The same again, with the **environment** given explicitly.
+///
+/// Which is what a launch refusal about the environment needs and the two above
+/// cannot give: what makes the app refuse is a variable — a credential set to
+/// nothing, a retry schedule that is not one — so the thing under test is the
+/// environment rather than the composition or the port. The port is `0`, because
+/// nothing here ever reaches a bind.
+pub fn serve_refused_with(
+    purpose: &str,
+    name: &str,
+    environment: &[(String, String)],
+) -> Option<Output> {
+    let out = scratch_project(purpose)?;
+    let mut command = agent_compose();
+    command
+        .arg("serve")
+        .arg(fixture(name))
+        .args(["--port", "0"])
+        .arg("--out")
+        .arg(&out);
+    seal(&mut command, environment);
+    Some(command.output().expect("the command runs"))
+}
+
+/// Run one SQL script against a built project's journal, through the driver the
+/// emitted `src/journal.ts` itself opens it with.
+///
+/// What it is for is the one claim `docs/durability.md` §11.2 makes that no
+/// ordinary test can reach: that a journal written by an **older build** opens
+/// unchanged under this one. There is no older build to run, so the file such a
+/// build would have left is made out of a real one — its `deliveries` table
+/// dropped, its lifecycle row's `callback` column gone — and this is what does
+/// the surgery. The script runs *inside* the project so `node-sqlite3-wasm`
+/// resolves the way the emitted modules resolve it, rather than against whatever
+/// a second SQLite in this repository would have been.
+pub fn journal_sql(project: &Path, sql: &str) -> Output {
+    journal_driver(project, sql, false)
+}
+
+/// Read rows out of a built project's journal, as JSON.
+///
+/// The companion of [`journal_sql`], for the claims whose only surface is the
+/// file. A build that does not declare an execution's trigger records that
+/// execution's delivery and **refuses its status route** (grammar 13.3: the
+/// guard is the starting trigger's, and this build cannot read it), so "the row
+/// was written" cannot be asked of the app — which is also the position a reader
+/// debugging one is in. The journal is where they would look, so it is where
+/// this looks.
+pub fn journal_rows(project: &Path, query: &str) -> Value {
+    let output = journal_driver(project, query, true);
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "the journal query answered no JSON ({error}): {}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    })
+}
+
+fn journal_driver(project: &Path, sql: &str, query: bool) -> Output {
+    let driver = project.join("journal-sql.mjs");
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/compiled_graph_acceptance/journal-sql.mjs"),
+        &driver,
+    )
+    .expect("the driver is copied into the project");
+    let script = project.join("journal-sql.sql");
+    std::fs::write(&script, sql).expect("the project directory is writable");
+    let mut command = bun();
+    command
+        .arg(&driver)
+        .arg(project.join(".agent-compose").join("journal.sqlite"))
+        .arg(&script);
+    if query {
+        command.arg("--query");
+    }
+    seal(&mut command, &[]);
+    let output = command.output().expect("bun runs");
+    assert!(
+        output.status.success(),
+        "the journal script did not run:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    output
+}
+
 /// The states a status report can be asserted about: an execution has either
 /// finished, or stopped at an interrupt waiting for a resume.
 const SETTLED: &[&str] = &["completed", "interrupted", "failed"];
@@ -1792,6 +1879,75 @@ impl Receiver {
 }
 
 impl Drop for Receiver {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// A socket that takes a delivery and **never answers it**.
+///
+/// [`Receiver`]'s opposite, and the one thing it cannot be scripted into being:
+/// its loop answers every connection before it takes the next, so a receiver
+/// that held one open would stop being a receiver. This one accepts and holds,
+/// which is the ordinary shape of an unreachable endpoint — a load balancer with
+/// nothing behind it, a process wedged after `accept` — and the shape a delivery
+/// with no per-attempt timeout waits on for ever.
+pub struct Blackhole {
+    /// The base URL to build a `callback_url` from.
+    pub base_url: String,
+    reached: Arc<AtomicU32>,
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Blackhole {
+    /// Bind one on loopback.
+    pub fn start() -> std::io::Result<Self> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let base_url = format!("http://{}", listener.local_addr()?);
+        listener.set_nonblocking(true)?;
+        let reached = Arc::new(AtomicU32::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let reached = Arc::clone(&reached);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                // Held rather than dropped: a closed socket is an answer of its
+                // own — the delivery would fail at once and be retried, which is
+                // the behaviour a timeout is *not* needed for.
+                let mut held: Vec<TcpStream> = Vec::new();
+                while !stop.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            reached.fetch_add(1, Ordering::Relaxed);
+                            held.push(stream);
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            })
+        };
+        Ok(Self {
+            base_url,
+            reached,
+            stop,
+            thread: Some(thread),
+        })
+    }
+
+    /// How many connections have been taken and left unanswered.
+    pub fn reached(&self) -> u32 {
+        self.reached.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for Blackhole {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
