@@ -630,12 +630,14 @@ fn bearer(
 /// So a space, a colon or a newline here does not name a header awkwardly, it
 /// forges a second one, and the value is held to a name's form for the reason
 /// `path:` above refuses whitespace.
+///
+/// The form is [`NameForm::HeaderLike`] itself rather than a copy of its
+/// predicate: the help below tells an author this is "the form a provider's
+/// `headers:` keys take", and grammar 13.3 says the same, so a widening there —
+/// a `.`, say, which RFC 7230 does admit in a token — must reach here or ship
+/// those two sentences false.
 fn header_shape(header: &Spanned<String>, cx: &mut Cx) -> bool {
-    if header
-        .value
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
-    {
+    if NameForm::HeaderLike.accepts(&header.value) {
         return true;
     }
     cx.push(

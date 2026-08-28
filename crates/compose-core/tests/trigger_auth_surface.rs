@@ -318,6 +318,60 @@ fn a_forged_header_or_prefix_is_refused_on_every_block_that_takes_one() {
     }
 }
 
+/// A trigger's `header:` takes exactly the form a provider's `headers:` keys
+/// take — the claim two shipped documents make, held to the surfaces that make
+/// it (grammar 13.3, 12.1).
+///
+/// The diagnostic tells an author their header must be "the form a provider's
+/// `headers:` keys take", and §13.3 says it again in the key table. Neither is
+/// a comparison a reader can run: they are one sentence about two call sites,
+/// and the sentence is what an author navigates by when the form is wider than
+/// they expected. Widen `NameForm::HeaderLike` so a provider may declare
+/// `headers: { X.Sig: … }` — `.` is an RFC 7230 token character, so this is a
+/// change someone will want — and the trigger surface either follows or ships
+/// both sentences false, refusing under a help text that names a surface which
+/// accepts.
+///
+/// So the two are compared on the spellings that straddle the form's edges,
+/// verdict against verdict rather than message against message: the messages
+/// differ by design (a key names a header, a value is one), and what has to
+/// agree is which spellings are headers at all.
+#[test]
+fn a_triggers_header_takes_the_form_a_providers_headers_keys_take() {
+    for spelling in [
+        "X-Hub-Signature-256",
+        "Authorization",
+        "x_signature",
+        // The token characters HTTP allows and this form does not — the
+        // widening this test exists to catch, whichever surface it reaches.
+        "X.Sig",
+        "X+Sig",
+        // And the spellings that forge a second header rather than name one.
+        "X Sig",
+        "X-Sig:",
+        "X-Sig\r\nInjected: 1",
+        "",
+    ] {
+        let written = format!("{spelling:?}");
+        let provider = format!(
+            "version: \"0.1\"\nprovider.vendor:\n  kind: openai\n  api_key: ${{OPENAI_API_KEY}}\n  headers:\n    {written}: \"v\"\n"
+        );
+        let trigger = format!(
+            "version: \"0.1\"\n{FLOW}\ntriggers:\n  intake:\n    type: http\n    flow: flow.support\n    auth:\n      hmac:\n        secret: ${{WEBHOOK_SECRET}}\n        header: {written}\n"
+        );
+        let as_a_key = parse_str(&provider, "main.yml");
+        let as_a_value = parse_str(&trigger, "main.yml");
+        assert_eq!(
+            as_a_key.diagnostics.is_empty(),
+            as_a_value.diagnostics.is_empty(),
+            "`{spelling}` is a header name on one surface and not on the other:\n  \
+             as a provider `headers:` key:\n{}\n  as a trigger `header:`:\n{}",
+            render(&as_a_key.diagnostics),
+            render(&as_a_value.diagnostics)
+        );
+    }
+}
+
 /// The delivery's own header namespace is reserved against an outbound
 /// `bearer:` — and against nothing else (grammar 13.3, Decision D127).
 ///
