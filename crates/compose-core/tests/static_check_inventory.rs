@@ -442,7 +442,7 @@ const GRAMMAR: &[Check] = &[
         // The outbound half. `missing-callback-allowlist` is its own code for
         // the reason `missing-credential` is: what is absent is decided by a
         // sibling, and the repair is a choice of two.
-        rule: "a `callback_auth:` block declares a scheme, brings a non-empty `callback_allow:` of absolute http/https patterns whose hosts are literal, and neither key stands without a `callback:` (13.3, D126, D127)",
+        rule: "a `callback_auth:` block declares a scheme, brings a non-empty `callback_allow:` of absolute http/https patterns each naming a host, and neither key stands without a `callback:` (13.3, D126, D127)",
         pass: "parse/section.rs",
         codes: &[
             "missing-key",

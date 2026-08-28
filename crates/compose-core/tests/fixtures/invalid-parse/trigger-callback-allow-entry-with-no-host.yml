@@ -1,6 +1,6 @@
-# rule: a `callback_allow:` entry is one URL pattern, and a run of spaces is not one (grammar 13.3, PRD resolved q33)
+# rule: a `callback_allow:` entry names the host it admits (grammar 13.3, Decision D127)
 # code: invalid-value
-# message: "   " is not a `callback_allow` pattern of trigger `intake`: it contains whitespace
+# message: "https:///deliveries" is not a `callback_allow` pattern of trigger `intake`: it names no host between `https://` and the `/` that follows it
 # at: 12:9
 # help: an entry is an absolute URL naming a host, with `*` standing for any run of characters, matched against the whole callback URL — `https://hooks.example.com/*`; `http` stays legal, which is what makes localhost development work (grammar 13.3, PRD resolved q33)
 triggers:
@@ -9,4 +9,4 @@ triggers:
     flow: flow.support
     callback: "payload.body.callback_url"
     callback_allow:
-      - "   "
+      - "https:///deliveries"

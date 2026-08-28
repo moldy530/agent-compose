@@ -847,7 +847,7 @@ fn callback_allow(
         let Some(pattern) = lexical::text(item, "each entry of `callback_allow`", cx) else {
             continue;
         };
-        if let Some((problem, help)) = allow_problem(&pattern.value) {
+        if let Some(problem) = allow_problem(&pattern.value) {
             cx.push(
                 Diagnostic::error(
                     DiagnosticCode::InvalidValue,
@@ -857,7 +857,7 @@ fn callback_allow(
                         pattern.value
                     ),
                 )
-                .with_help(help),
+                .with_help(ALLOW_HELP),
             );
             continue;
         }
@@ -876,97 +876,64 @@ fn callback_allow(
 /// above: an empty pattern and a pattern that is three spaces are both things an
 /// author writes, and only quoting shows the difference between them.
 ///
-/// The scheme and the host are the whole of the check. A pattern is matched
+/// The scheme and a host are the whole of the check. A pattern is matched
 /// against the URL a payload supplied, so a match that could not name the
 /// scheme would let `https://hooks.example.com/*` admit `javascript:` or
-/// `file:` URLs beginning with the same characters — and a match whose *host*
-/// is not literal names no receiver at all, which is the one shape of this key
-/// that reads like a constraint and is not one (Decision D127). `*` is any run
-/// of characters and crosses `/` and `?` like any other, so
-/// `https://*.hooks.example.com/*` is satisfied by
-/// `https://attacker.test/collect?x=.hooks.example.com/y`, and
-/// `https://hooks.example.com*` by `https://hooks.example.com.evil.test/collect`.
-/// Refusing both is what makes [`require_callback_allow`] a guarantee rather
-/// than a ceremony: a mandatory list every entry of which may be a wildcard is
-/// a mandatory list of nothing.
+/// `file:` URLs beginning with the same characters — and an entry that names no
+/// host, `https:///deliveries`, names no receiver for the list to admit, which
+/// is the one shape of this key that reads like a constraint and is not one
+/// (Decision D127).
 ///
-/// The refusal is deliberately the *narrow* half of a question the grammar
-/// leaves open. A wildcard bounded to one label of the authority would make
-/// `https://*.hooks.example.com/*` mean what its author intends and defeat both
-/// attacks above — and would be a second wildcard kind, which is a language
-/// decision the PRD owns rather than this pass. Refusing is the reversible
-/// choice: a later resolution admitting the bounded reading accepts strictly
-/// more entries and changes no entry's meaning, while admitting it now under
-/// "any run of characters" could only be narrowed by changing what an already
-/// compiling spec admits (D127).
+/// What a legal entry *means* is not this pass's to narrow. `*` is any run of
+/// characters and crosses `/` and `?` like every other, so
+/// `https://*.hooks.example.com/*` admits more URLs than the author of a
+/// subdomain tree intends, and §13.3 says so where an author writes one.
+/// Refusing the shape would settle the open question the other way: a wildcard
+/// bounded inside the authority is a second wildcard kind, which the PRD owns,
+/// and on a signed trigger the only compiling repair left would be dropping
+/// `callback_auth:` — the posture [`require_callback_allow`] exists to prevent
+/// (D127).
 ///
 /// The arms are ordered so each one is the *only* answer to some entry — an
 /// empty entry names the emptiness, a blank one names the whitespace — because
 /// an arm no entry reaches is a message no fixture pins and no reader has read.
-///
-/// Two helps rather than one, because the host arms refuse a shape an author
-/// meant rather than a shape they mistyped: `https://*.hooks.example.com/*` is
-/// what an author arriving from any other allowlist writes first, and a repair
-/// line about absolute URLs answers a question they did not ask (see
-/// [`ALLOW_HOST_HELP`] and Decision D127).
-fn allow_problem(pattern: &str) -> Option<(String, &'static str)> {
+fn allow_problem(pattern: &str) -> Option<String> {
     if pattern.is_empty() {
-        return Some(("is empty".to_string(), ALLOW_HELP));
+        return Some("is empty".to_string());
     }
     if pattern.chars().any(char::is_whitespace) {
-        return Some(("contains whitespace".to_string(), ALLOW_HELP));
+        return Some("contains whitespace".to_string());
     }
     let Some((scheme, rest)) = pattern.split_once("://") else {
-        return Some((
-            "names no scheme, and a callback URL is absolute".to_string(),
-            ALLOW_HELP,
-        ));
+        return Some("names no scheme, and a callback URL is absolute".to_string());
     };
     if !matches!(scheme, "http" | "https") {
-        return Some((
-            format!(
-                "names the scheme `{scheme}`, and a callback is delivered over `http` or `https`"
-            ),
-            ALLOW_HELP,
+        return Some(format!(
+            "names the scheme `{scheme}`, and a callback is delivered over `http` or `https`"
         ));
     }
     if rest.is_empty() {
-        return Some(("names a scheme and nothing else".to_string(), ALLOW_HELP));
+        return Some("names a scheme and nothing else".to_string());
     }
     // The host runs from the scheme to whichever of `/`, `?` and `#` ends it —
-    // the same three delimiters that end an authority in a URL, and the ones a
-    // `*` would otherwise cross unnoticed.
+    // the same three delimiters that end an authority in a URL. Only its
+    // emptiness is read: a delimiter sitting where the host should be is an
+    // entry no callback URL was ever meant to match.
     let host = rest.find(['/', '?', '#']).map_or(rest, |end| &rest[..end]);
-    match host.find('*') {
-        // A host written out and then extended: the repair is a character
-        // rather than a rewrite, so it gets a message that names the character.
-        Some(star) if star + 1 == host.len() && star > 0 && host.len() == rest.len() => Some((
-            format!(
-                "ends its host {:?} with a `*` rather than with a `/`, so every host that one begins is admitted",
-                &host[..star]
-            ),
-            ALLOW_HOST_HELP,
-        )),
-        Some(_) => Some((
-            format!("wildcards its host {host:?}, and a `*` there crosses `/` and bounds no host"),
-            ALLOW_HOST_HELP,
-        )),
-        None => None,
+    if host.is_empty() {
+        let delimiter = rest
+            .chars()
+            .next()
+            .expect("a non-empty rest has a first character");
+        return Some(format!(
+            "names no host between `{scheme}://` and the `{delimiter}` that follows it"
+        ));
     }
+    None
 }
 
-/// What an entry is, for every refusal that is not about its host.
-const ALLOW_HELP: &str = "an entry is an absolute URL with `*` standing for any run of characters, matched against the whole callback URL, and its host is written out literally from the scheme to the first `/` — `https://hooks.example.com/*`; `http` stays legal, which is what makes localhost development work (grammar 13.3, PRD resolved q33)";
-
-/// What an entry is, for the two refusals that are.
-///
-/// It names the enumeration *and* what it costs, because the alternative repair
-/// an author reaches for is dropping `callback_auth:` — which
-/// [`require_callback_allow`] then makes the only way to keep the trigger
-/// compiling, and which trades a narrow allowlist for no allowlist and no
-/// signature. That is the worse end of a rule meant to prevent exactly it, so
-/// the message says which repair is which (Decision D127).
-const ALLOW_HOST_HELP: &str = "one entry names one host, written out from the scheme to the first `/` — `https://hooks.example.com/*`, with a second entry for a second subdomain; a wildcard that stopped at a `.` would let one entry stand for a whole subdomain tree, and admitting one is an open language question rather than something this release chose against. Enumerate the receivers rather than dropping `callback_auth:`, which is the same trigger with no allowlist and no signature (grammar 13.3, PRD resolved q33)";
+/// What an entry is, for every refusal.
+const ALLOW_HELP: &str = "an entry is an absolute URL naming a host, with `*` standing for any run of characters, matched against the whole callback URL — `https://hooks.example.com/*`; `http` stays legal, which is what makes localhost development work (grammar 13.3, PRD resolved q33)";
 
 /// A `callback_auth:`/`callback_allow:` on a trigger that delivers no webhook
 /// (grammar 13.3).

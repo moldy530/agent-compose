@@ -224,14 +224,15 @@ localhost receiver is the common first case. An empty list is an error: an
 allowlist admitting nothing refuses every delivery. Either key on a trigger with
 no `callback:` is an error too — it describes a delivery that never happens.
 
-**The host is literal, and a `*` in it is a compile error.** `*` crosses `/` and
-`?` like any other character, so `https://hooks.example.com/*` constrains a host
-and `https://*.hooks.example.com/*` constrains none: that leading `*` swallows
-`attacker.test/collect?x=` on its way to the dot, and the payload naming it is
-admitted. `https://hooks.example.com*` constrains none either — it admits
-`hooks.example.com.evil.test`. Both are refused, along with `https://*`: an
-entry's host runs from the scheme to the first `/`, `?` or `#` and carries no
-wildcard. One entry per subdomain.
+**Write the host out.** `*` crosses `/` and `?` like any other character, so
+`https://hooks.example.com/*` constrains a host and `https://*.hooks.example.com/*`
+constrains none: that leading `*` swallows `attacker.test/collect?x=` on its way
+to the dot, and the payload naming it is admitted. `https://hooks.example.com*`
+constrains none either — it admits `hooks.example.com.evil.test`. Both compile,
+because a wildcard bounded to one label of the authority is a second wildcard
+kind and the PRD's question to settle, not the compiler's; what an entry must
+carry is a scheme and a host, so `https:///deliveries` is the error. One entry
+per subdomain is what makes the list a guarantee.
 
 **A `callback:` with no `callback_auth:` is a documented test posture**: it signs
 nothing, claims nothing, needs no allowlist, and may POST anywhere. Choose it

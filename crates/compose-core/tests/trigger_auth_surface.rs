@@ -535,55 +535,55 @@ fn an_allowlist_without_outbound_auth_is_legal() {
     );
 }
 
-/// An allowlist entry writes its host out literally, and every shape that reads
-/// like a constraint without being one is refused (grammar 13.3, Decision D127).
+/// An allowlist entry is an absolute URL that names a host, and shape is the
+/// whole of what this pass reads (grammar 13.3, Decision D127).
 ///
-/// This is the rule that decides whether D126's mandatory allowlist is a
-/// guarantee or a ceremony. A `*` is any run of characters and crosses `/` and
-/// `?`, so one reaching the host bounds nothing: an author who wrote
-/// `https://*` — or either of the two shapes that merely look narrower — has
-/// said where a token-carrying delivery may go and has said nowhere, which is
-/// the state the mandatory rule exists to prevent.
+/// The refusals are the entries that name no receiver at all: no scheme, a
+/// scheme this delivery cannot speak, and — the shape the schema's own pattern
+/// has always refused — a delimiter sitting where the host should be, which the
+/// three-delimiter scan would otherwise walk straight past with an empty host in
+/// hand. A fixture pins each exact message.
 ///
-/// Two fixtures pin the exact messages. What they cannot pin is the other half,
-/// and it is where a rule written one character too tight does its damage: a
-/// port, a query string, and an exact URL with no wildcard at all are all legal
-/// hosts, and refusing one of them makes a correct allowlist unwritable while
-/// every negative fixture still passes.
+/// What the legal list is for is the other half, and it is where a rule written
+/// one character too tight does its damage: a port, a query string, an exact URL
+/// carrying no wildcard, and a wildcard **inside the host** are all entries an
+/// author writes, and refusing one of them makes a correct allowlist unwritable
+/// while every negative fixture still passes.
 ///
-/// `https://*.hooks.example.com/*` is in the refused list rather than the legal
-/// one **pending a language decision**, not because the shape is wrong to want:
-/// a wildcard bounded to one label of the authority would mean what an author
-/// intends by it, and that is a second wildcard kind, which is the PRD's to
-/// settle (D127 states the asymmetry that makes refusing the reversible half).
-/// If a resolved question admits it, this list is where the pattern moves — and
-/// nothing else about the entry rules changes.
+/// `https://*.hooks.example.com/*` is legal, and §13.3 is where what it *means*
+/// is said: `*` is any run of characters and crosses `/` and `?`, so that entry
+/// admits `https://attacker.test/collect?x=.hooks.example.com/y` too. Narrowing
+/// a wildcard inside the authority is a second wildcard kind — a language
+/// decision the PRD owns rather than this pass, and one whose only compiling
+/// repair on a signed trigger would be dropping `callback_auth:`, the posture
+/// D126 exists to prevent. Matching is runtime's; entry shape is all `validate`
+/// owns (D127).
 #[test]
-fn an_allowlist_entry_writes_its_host_out_literally() {
+fn an_allowlist_entry_is_an_absolute_url_that_names_a_host() {
     let allowlist = |pattern: &str| {
         format!(
             "version: \"0.1\"\n{FLOW}\ntriggers:\n  intake:\n    type: http\n    flow: flow.support\n    callback: \"payload.body.callback_url\"\n    callback_allow:\n      - \"{pattern}\"\n"
         )
     };
     for pattern in [
-        // Bounds nothing whatsoever.
-        "https://*",
-        // Satisfied by `https://attacker.test/collect?x=.hooks.example.com/y`.
-        "https://*.hooks.example.com/*",
-        // Satisfied by `https://hooks.example.com.evil.test/collect`: a name is
-        // a prefix of longer ones.
-        "https://hooks.example.com*",
-        // The same wildcard with a path written after it — still in the host,
-        // because the `*` before the `/` is what decides that.
-        "https://hooks.example.com*/deliveries",
-        "http://*.localhost:9000/*",
+        // No scheme, and a callback URL is absolute.
+        "hooks.example.com/*",
+        // A scheme no callback is delivered over.
+        "ftp://hooks.example.com/*",
+        // A scheme and nothing at all after it…
+        "https://",
+        // …and the three ways a host can be missing from something that has an
+        // authority-shaped delimiter after the scheme.
+        "https:///deliveries",
+        "https://?tenant=acme",
+        "https://#fragment",
     ] {
         let parsed = parse_str(&allowlist(pattern), "main.yml");
         assert!(
             parsed.diagnostics.iter().any(|diagnostic| diagnostic
                 .message
                 .contains("is not a `callback_allow` pattern of trigger `intake`")),
-            "`{pattern}` names no host and must be refused, got:\n{}",
+            "`{pattern}` names no receiver and must be refused, got:\n{}",
             render(&parsed.diagnostics)
         );
     }
@@ -594,11 +594,17 @@ fn an_allowlist_entry_writes_its_host_out_literally() {
         "https://hooks.example.com/webhooks/intake",
         "https://hooks.example.com?tenant=*",
         "https://hooks.example.com",
+        // A wildcard in the host is legal grammar, and §13.3 says what it
+        // admits rather than the parser refusing the shape.
+        "https://*.hooks.example.com/*",
+        "https://hooks.example.com*",
+        "http://*.localhost:9000/*",
+        "https://*",
     ] {
         let parsed = parse_str(&allowlist(pattern), "main.yml");
         assert!(
             parsed.diagnostics.is_empty(),
-            "`{pattern}` names one host and is legal, got:\n{}",
+            "`{pattern}` names a host and is legal, got:\n{}",
             render(&parsed.diagnostics)
         );
     }

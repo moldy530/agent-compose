@@ -3860,7 +3860,7 @@ defaulted `session_key:`, exists implicitly for every flow (§13 preamble).
 | `callback` | CEL over `payload` → string | no | — | completion webhook; `async` only |
 | `auth` | block; exactly one of `bearer:`/`hmac:` | no | — | how an inbound call is authenticated; absent leaves the route open |
 | `callback_auth` | block; at least one of `bearer:`/`hmac:`, both legal | no | — | how a delivery identifies itself; requires `callback:`, and makes `callback_allow:` MANDATORY |
-| `callback_allow` | non-empty list of URL patterns, each with a literal host | with `callback_auth` | — | where a callback may point; requires `callback:` |
+| `callback_allow` | non-empty list of URL patterns, each naming a scheme and a host | with `callback_auth` | — | where a callback may point; requires `callback:` |
 
 `payload` shape: `payload.body` (decoded JSON object), `payload.query` (map of
 string), `payload.headers` (map of string, lowercase names), `payload.path`
@@ -4021,46 +4021,46 @@ that need one.
 
 **Allowlist patterns** (Decision
 [D127](#d127-a-callback-allowlist-entry-is-a-wildcard-url-and-the-delivery-wire-is-fixed)):
-each entry is an absolute URL whose scheme is `http` or `https`, with `*` meaning
-"any run of characters" — one wildcard kind, matched against the **whole**
-callback URL string, with no `**` distinction (a URL is not a path tree). An
-entry naming no scheme, an unsupported scheme, an empty or whitespace-bearing
-value, or a `*` anywhere in its **host** is a compile error, and so is an
-**empty list**: an allowlist that admits
+each entry is an absolute URL whose scheme is `http` or `https` and which names
+a host, with `*` meaning "any run of characters" — one wildcard kind, matched
+against the **whole** callback URL string, with no `**` distinction (a URL is
+not a path tree). An entry naming no scheme, an unsupported scheme, no host at
+all (`https:///deliveries`), or an empty or whitespace-bearing value is a
+compile error, and so is an **empty list**: an allowlist that admits
 nothing refuses every delivery, which is a webhook that can never fire.
 `callback_auth:` or `callback_allow:` on a trigger with **no `callback:`** is a
 compile error too, the mirror of `timeout:` on an async trigger
 ([D81](#d81-timeout-is-illegal-on-an-async-http-trigger)): the key describes a
 delivery this trigger never makes.
 
-**The host is written out literally, and that is a compile error to get wrong.**
-`*` is *any* run of characters, and it crosses `/` and `?` like any other —
-there is no delimiter it stops at. So a wildcard reaching the host constrains no
-host: `https://*.hooks.example.com/*` is matched by
+**Write the host out, and read a wildcard in it for what it is.** `*` is *any*
+run of characters, and it crosses `/` and `?` like any other — there is no
+delimiter it stops at. So a wildcard reaching the host constrains no host:
+`https://*.hooks.example.com/*` is matched by
 `https://attacker.test/collect?x=.hooks.example.com/y`, where the leading `*`
 consumed a host, a path and a query on its way to the literal after it, and
 `https://hooks.example.com*` is matched by
 `https://hooks.example.com.evil.test/collect`, where the trailing one simply
-continued the name. Both are refused: an entry's host runs from the scheme to
-the first `/`, `?` or `#` and carries no `*` — `https://hooks.example.com/*`,
-`https://hooks.example.com:9000/*` — and a second subdomain gets a second entry.
-An allowlist made mandatory by
-[D126](#d126-callback_auth-makes-callback_allow-mandatory) and satisfiable by
-`https://*` would be a ceremony rather than a guarantee.
+continued the name. Both are **legal entries** that admit far more than their
+author means, so an allowlist that is a guarantee rather than a ceremony is one
+whose entries write their hosts out — `https://hooks.example.com/*`,
+`https://hooks.example.com:9000/*` — with a second subdomain getting a second
+entry.
 
-That refusal is **narrow on purpose, and it leaves a question open.**
-`https://*.hooks.example.com/*` is the entry an author arriving from any other
-allowlist writes first, and there is a reading of `*` under which it means what
-they intend: a wildcard that stops at `.`, `:`, `@` and `/` inside the authority
-constrains the host to one label of a named tree, and neither attack above
-survives it. That reading is a **second wildcard kind** — one meaning inside the
-authority, another after it — which is a language decision this grammar has not
-taken, and one the PRD owns rather than the compiler. Until it is taken the
-entry is refused, because refusing is the only choice that keeps both readings
-reachable: admitting it under "any run of characters" ships a pattern that
-constrains nothing, and narrowing it afterwards would silently change what an
-already compiling spec admits. Relaxing later admits strictly more entries and
-changes no entry's meaning.
+The compiler refuses the *shape* and not the *breadth*, and the difference is a
+question the PRD owns. `https://*.hooks.example.com/*` is the entry an author
+arriving from any other allowlist writes first, and there is a reading of `*`
+under which it means what they intend: a wildcard that stops at `.`, `:`, `@`
+and `/` inside the authority constrains the host to one label of a named tree,
+and neither match above survives it. That reading is a **second wildcard kind** —
+one meaning inside the authority, another after it — which is a language
+decision this grammar has not taken. Refusing the entry until it is taken would
+be taking it: on a trigger whose `callback_auth:` makes the list mandatory, the
+only other compiling repair is dropping the outbound auth, which is the posture
+[D126](#d126-callback_auth-makes-callback_allow-mandatory) exists to prevent. So
+the entry compiles, the reading it compiles under is stated here, and a resolved
+question that bounds the wildcard narrows a meaning rather than unbanning a
+shape (Decision [D127](#d127-a-callback-allowlist-entry-is-a-wildcard-url-and-the-delivery-wire-is-fixed)).
 
 **The delivery wire.** A callback fires on lifecycle events — every quiescence
 that opened new pauses, and settle — carrying the status route's report plus
@@ -6986,10 +6986,10 @@ rather than silence. *PRD resolved q33, §13.3, G3.*
 ### D127. A callback allowlist entry is a wildcard URL, and the delivery wire is fixed
 
 A `callback_allow:` entry is an absolute `http`/`https` URL in which `*` matches
-any run of characters, matched against the whole callback URL; its host — the
-run from the scheme to the first `/`, `?` or `#` — is literal, and a `*` there
-is a compile error; the list is non-empty. Every delivery carries the
-`X-AgentCompose-*` headers §13.3 tabulates, and outbound `hmac:` signing is
+any run of characters, matched against the whole callback URL; it names a host —
+the run from the scheme to the first `/`, `?` or `#` — and an entry where that
+run is empty is a compile error; the list is non-empty. Every delivery carries
+the `X-AgentCompose-*` headers §13.3 tabulates, and outbound `hmac:` signing is
 HMAC-SHA256 in hex with no keys of its own (§13.3).
 
 **Rationale**. *One wildcard kind*, unlike §5.5's `glob:`: `**` earns its
@@ -7003,32 +7003,29 @@ constrains no host at all: `https://*.hooks.example.com/*` is satisfied by
 free to consume a host, a path and a query on its way to the literal that
 follows, and `https://hooks.example.com*` by
 `https://hooks.example.com.evil.test/collect`, because a name is a prefix of
-longer ones. *A literal host*, then, and refused at compile time rather than
-warned about in prose: [D126](#d126-callback_auth-makes-callback_allow-mandatory)
-makes the list mandatory precisely so an authenticated deployment cannot deliver
-wherever a payload said, and a mandatory list whose every entry may be
-`https://*` is a ceremony rather than that guarantee — the one shape of this key
-that reads like a constraint and is not one, refused in the pass that reads it.
-The rule is about the *entry*, not about matching: `*` still crosses every
-delimiter wherever it is legal, because the alternative — a wildcard that stopped
-at one — is the second wildcard kind this entry just refused.
+longer ones. §13.3 states that where an author writes one, and *`validate` does
+not refuse it*, because refusing would be taking the language decision that
+question belongs to. A wildcard bounded to a single label inside the authority —
+stopping at `.`, `:`, `@` and `/` — would make that first entry mean what its
+author intends, and it is one wildcard with two meanings, which the PRD owns and
+CLAUDE.md's PRD discipline puts there before an implementation. Refusing looks
+like the conservative half and is not: the entry an author writes for a
+multi-tenant receiver has no compiling enumeration, so on a trigger whose
+`callback_auth:` makes the list mandatory
+([D126](#d126-callback_auth-makes-callback_allow-mandatory)) the only repair
+left is dropping the outbound auth — trading a broad allowlist for no allowlist
+and no signature, which is the posture D126 exists to prevent. And the direction
+of a later change is safe: bounding the wildcard narrows what an already
+compiling entry matches, so a resolved question refuses deliveries that were
+admitted rather than admitting deliveries that were refused.
 
-*And that refusal is the narrow half of an open question,* stated here so the
-next reader meets it as one. `https://*.hooks.example.com/*` is the entry an
-author arriving from another allowlist writes first, and a wildcard bounded to a
-single label inside the authority — stopping at `.`, `:`, `@` and `/` — would
-mean what they intend and defeat both attacks above. What it costs is one
-wildcard with two meanings, which is a language decision, and PRD discipline
-puts a language decision in the PRD before an implementation. So v1 refuses the
-shape rather than guessing at it, on the one asymmetry that makes refusing the
-reversible choice: admitting the entry under "any run of characters" ships a
-pattern that constrains nothing and can only be narrowed by changing what an
-already compiling spec admits, while a later resolution admitting the bounded
-reading accepts strictly more entries and leaves every entry legal today meaning
-exactly what it means today. The diagnostic says which repair is which, because
-the repair an author reaches for on their own is dropping `callback_auth:` —
-which D126 makes the only other way to keep the trigger compiling, and which
-trades a narrow allowlist for no allowlist and no signature at all.
+*A host, though*, because that much is not about breadth: the run from the
+scheme to the first `/`, `?` or `#` is what names a receiver, and
+`https:///deliveries` names none — an entry no callback URL was written to
+match, which is the same statically visible dead surface the empty list is. The
+rule is about the *entry*, not about matching: `*` crosses every delimiter
+wherever it is legal, because the alternative — a wildcard that stopped at one —
+is the second kind this entry leaves to the PRD.
 
 *Scheme-anchored*, because a match that could not name the scheme would
 let one entry admit URLs that merely begin with the same characters. *`http`
