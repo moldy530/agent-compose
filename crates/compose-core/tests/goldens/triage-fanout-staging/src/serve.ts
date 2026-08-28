@@ -514,20 +514,32 @@ function refuse(reply: FastifyReply, trigger: string, refusal: Refusal): unknown
 function verified(trigger: HttpTrigger, request: FastifyRequest): Refusal | undefined {
   const auth = trigger.auth;
   if (auth === undefined) return undefined;
-  const sent = header(request, auth.header);
-  if (sent === undefined) {
+  const sent = headerValues(request, auth.header);
+  if (sent.length === 0) {
     return {
       scheme: auth.scheme,
       detail: `no \`${auth.header}\` header carried a credential`,
     };
   }
-  if (!sent.startsWith(auth.prefix)) {
+  // **A credential offered twice is not one this route can say it verified.**
+  // Which of two values a reader takes is a thing runtimes and the proxies in
+  // front of them disagree about ([`headerValues`]), and a request whose
+  // credential depends on who resolved that disagreement has not presented one.
+  // Refused before the comparison, so nothing about either value is measurable.
+  if (sent.length > 1) {
+    return {
+      scheme: auth.scheme,
+      detail: `the \`${auth.header}\` header arrived ${sent.length} times, and a request offering more than one credential is not one this trigger can say it verified`,
+    };
+  }
+  const only = sent[0] ?? "";
+  if (!only.startsWith(auth.prefix)) {
     return {
       scheme: auth.scheme,
       detail: `the \`${auth.header}\` header does not begin with the expected prefix`,
     };
   }
-  const offered = sent.slice(auth.prefix.length);
+  const offered = only.slice(auth.prefix.length);
   // **A credential that resolved to nothing verifies nothing.** `createApp`
   // refuses to start a deployment holding one ([`blankCredentials`]), so this
   // is the guard for the window that check cannot cover — an environment edited
@@ -628,20 +640,34 @@ function guarded(execution: Execution, request: FastifyRequest): Refusal | undef
 }
 
 /**
- * One request header by name, matched **case-insensitively** (grammar 13.3).
+ * Every value this request carried under `name`, matched **case-insensitively**
+ * (grammar 13.3), in the order it carried them.
  *
  * Header names are case-insensitive by definition and HTTP/2 lowercases every
  * one on the wire, so a check that compared the author's capitalisation would
  * refuse every genuine delivery over HTTP/2 while passing a `curl` that
- * happened to preserve case. The framework presents them lowercased, which is
- * the same reason `payload.headers` does.
+ * happened to preserve case.
  *
- * A header sent **more than once** carries no credential: the values arrive as
- * a list, and a request offering two is one this route cannot say verified.
+ * Read off `raw.rawHeaders` — the list as it arrived — rather than off the
+ * parsed `request.headers`, which is what makes "sent more than once" a thing
+ * this surface can see at all. The parsed map holds **one** value per name, and
+ * the two runtimes this project runs under disagree about which: Node keeps the
+ * first `authorization` and drops the rest, Bun keeps the last, and both join
+ * repeats of any other name with `", "`. So a route reading that map verifies a
+ * different credential depending on what the app was launched with, and a proxy
+ * in front of it normalising on the other value is the whole of a
+ * header-smuggling differential. The arrival list has no opinion to disagree
+ * with, and [`verified`] refuses a credential that appears in it twice.
  */
-function header(request: FastifyRequest, name: string): string | undefined {
-  const value = request.headers[name.toLowerCase()];
-  return typeof value === "string" ? value : undefined;
+function headerValues(request: FastifyRequest, name: string): readonly string[] {
+  const wanted = name.toLowerCase();
+  // A flat `[name, value, name, value, …]` list, which is why the step is two.
+  const arrived = request.raw.rawHeaders;
+  const values: string[] = [];
+  for (let index = 0; index + 1 < arrived.length; index += 2) {
+    if ((arrived[index] ?? "").toLowerCase() === wanted) values.push(arrived[index + 1] ?? "");
+  }
+  return values;
 }
 
 /**
@@ -1591,9 +1617,28 @@ async function attemptDelivery(
       // webhook. An attempt that runs out is a failed attempt like any other and
       // the schedule carries on to the next offset.
       signal: AbortSignal.timeout(DELIVERY_TIMEOUT_MS),
+      // **A redirect is not followed**, which `fetch`'s default of `follow`
+      // would do (grammar 13.3, Decision D127). `callback_allow:` is the whole
+      // of where a signed delivery may go, and it is matched against the URL the
+      // trigger produced — so following a `Location:` would carry this report,
+      // its `X-AgentCompose-Signature` and a `callback_auth: bearer` under its
+      // author's own header name to a host the list admits nowhere. What a
+      // cross-origin redirect strips is a fixed list of standard credential
+      // headers — never a name a composition chose, and never the body's
+      // signature. The second half is quieter and worse: a `301`, `302` or
+      // `303` rewrites the request to a bodyless `GET`, so an allowlisted
+      // receiver that redirects to itself would answer `2xx` to a request
+      // carrying no report and the row would be journaled `delivered`.
+      redirect: "manual",
     });
     const ok = answered.status >= 200 && answered.status < 300;
-    return { ok, detail: `the receiver answered ${answered.status}` };
+    const moved = answered.status >= 300 && answered.status < 400;
+    return {
+      ok,
+      detail: moved
+        ? `the receiver answered ${answered.status} and a delivery follows no redirect: it goes where \`callback_allow:\` admits it or nowhere`
+        : `the receiver answered ${answered.status}`,
+    };
   } catch (error) {
     // Named rather than left as the runtime's own wording, which differs
     // between them: what a reader of the journal needs to know is that the

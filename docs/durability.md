@@ -478,7 +478,10 @@ arrival.
 
 **The retry schedule is normative**: five attempts, at **`+0s`, `+15s`, `+60s`,
 `+240s` and `+600s` from the intent**. Only a network error or a non-2xx status
-is retried; a `2xx` is delivered and stops the schedule. The offsets are
+is retried; a `2xx` is delivered and stops the schedule. A `3xx` is one of those
+non-2xx statuses rather than a hop to take: a delivery follows no redirect, so
+the allowlist bounds where it lands and not merely where it was aimed
+(`docs/grammar.md` §13.3). The offsets are
 measured from the recorded intent rather than from the last attempt, which is
 what lets a restart resume a delivery where it left off — a row with two
 attempts on it resumes at the third offset, due at `intendedAt + 60s`, which may

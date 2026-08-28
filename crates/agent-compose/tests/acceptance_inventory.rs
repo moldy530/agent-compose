@@ -1519,6 +1519,15 @@ const EVENTS: &[Criterion] = &[
                 "a_credential_set_to_nothing_refuses_the_app_at_launch",
                 Status::Live,
             ),
+            // …and the request carrying *two*, which is the case a parsed
+            // header map cannot report: the runtimes a generated project runs
+            // under disagree about which of two values under one name they
+            // keep, so a route deciding on one of them admits a request whose
+            // credential depends on the launch.
+            (
+                "a_credential_a_request_carried_twice_verifies_nothing",
+                Status::Live,
+            ),
         ],
     },
     Criterion {
@@ -1566,6 +1575,13 @@ const EVENTS: &[Criterion] = &[
             // answers every route.
             (
                 "a_long_callback_url_is_refused_without_wedging_the_app",
+                Status::Live,
+            ),
+            // …and the hop after the one the list matched: an admitted receiver
+            // answering `3xx` would otherwise carry the report, its signature
+            // and its token wherever its `Location:` named.
+            (
+                "a_receiver_that_redirects_a_delivery_sends_it_nowhere_else",
                 Status::Live,
             ),
             // The check behind the check: every signing assertion above compares

@@ -4020,6 +4020,19 @@ host a payload named. A URL outside the list is refused **when it is read**, at
 parking or at settle rather than at start, and recorded as a refused delivery
 rather than as anybody's failure.
 
+**A delivery follows no redirect**, which is the same guarantee read one step
+further. The list is matched against the URL the trigger produced, so a receiver
+answering `3xx` must not be able to pass this report — with its signature, and a
+`callback_auth: bearer` token written under the header name its author chose — on
+to a `Location:` the list admits nowhere: what a cross-origin redirect strips is
+a fixed list of standard credential headers, never a name a composition chose and
+never the body's signature. The quieter
+half is that a `301`, `302` or `303` rewrites the request to a bodyless `GET`, so
+an allowlisted receiver redirecting to itself would answer `2xx` to a request
+carrying no report at all. A `3xx` is a failed attempt like any other non-2xx
+status (`docs/durability.md` §3.7); a receiver that has moved is a `callback:`
+naming where it moved to.
+
 **A trigger with a `callback:` and no `callback_auth:` is a documented test
 posture**: it signs nothing, claims nothing, and may POST anywhere. That is the
 shape a localhost receiver wants, it needs no allowlist, and it is stated here

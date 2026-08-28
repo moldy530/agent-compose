@@ -221,6 +221,13 @@ read** — at a parking or at settle, not at start — and recorded as a refused
 delivery rather than as anybody's failure: nothing is sent, nothing is retried,
 and the refusal is on the execution's status report.
 
+**A delivery follows no redirect** either, or the list would bound only the first
+hop: a receiver answering `3xx` would otherwise pass the report — signature,
+token and all — to whatever host its `Location:` named, and a `301`/`302`/`303`
+would rewrite the POST into a bodyless GET besides. The `3xx` is a failed attempt
+like any other non-2xx status, and a receiver that has moved is a `callback:`
+naming where it moved to.
+
 An entry is an absolute `http`/`https` URL with `*` standing for any run of
 characters, matched against the whole callback URL. Write the scheme lowercase:
 the entry is compared as written, so `HTTPS://…` matches nothing and is refused

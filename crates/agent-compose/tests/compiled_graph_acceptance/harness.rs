@@ -1731,6 +1731,8 @@ pub struct Receiver {
     script: Arc<Mutex<std::collections::VecDeque<u16>>>,
     /// What to answer once the script is spent.
     fallback: Arc<AtomicU32>,
+    /// The `Location:` every answer carries, where one has been set.
+    location: Arc<Mutex<Option<String>>>,
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -1744,11 +1746,13 @@ impl Receiver {
         let delivered = Arc::new(Mutex::new(Vec::new()));
         let script = Arc::new(Mutex::new(std::collections::VecDeque::new()));
         let fallback = Arc::new(AtomicU32::new(200));
+        let location: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
         let thread = {
             let delivered = Arc::clone(&delivered);
             let script = Arc::clone(&script);
             let fallback = Arc::clone(&fallback);
+            let location = Arc::clone(&location);
             let stop = Arc::clone(&stop);
             std::thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
@@ -1761,7 +1765,8 @@ impl Receiver {
                                 .unwrap_or_else(|| {
                                     u16::try_from(fallback.load(Ordering::Relaxed)).unwrap_or(200)
                                 });
-                            if let Some(held) = deliver(&mut stream, answer) {
+                            let moved = location.lock().expect("the location").clone();
+                            if let Some(held) = deliver(&mut stream, answer, moved.as_deref()) {
                                 delivered.lock().expect("the deliveries").push(held);
                             }
                         }
@@ -1780,6 +1785,7 @@ impl Receiver {
             delivered,
             script,
             fallback,
+            location,
             stop,
             thread: Some(thread),
         })
@@ -1794,6 +1800,20 @@ impl Receiver {
     /// Answer every request from now on with this status.
     pub fn always(&self, status: u16) {
         self.fallback.store(u32::from(status), Ordering::Relaxed);
+    }
+
+    /// Answer every request from now on with `status` and a `Location:` naming
+    /// `elsewhere` — the shape of a receiver that moved.
+    ///
+    /// A redirect is the one answer a receiver can give that asks the *client*
+    /// to do something, and what a delivery client does with it is the whole of
+    /// whether `callback_allow:` bounds where a signed report lands or only
+    /// where it was aimed (`docs/grammar.md` §13.3, Decision D127). So it is
+    /// scriptable here beside the statuses, and a test points `elsewhere`
+    /// somewhere the list admits nowhere.
+    pub fn redirecting_to(&self, status: u16, elsewhere: &str) {
+        *self.location.lock().expect("the location") = Some(elsewhere.to_string());
+        self.always(status);
     }
 
     /// Every delivery so far, in arrival order.
@@ -1956,8 +1976,9 @@ impl Drop for Blackhole {
     }
 }
 
-/// Read one HTTP request off `stream`, answer it `status`, and hand it back.
-fn deliver(stream: &mut TcpStream, status: u16) -> Option<Delivered> {
+/// Read one HTTP request off `stream`, answer it `status` — under `location`,
+/// where one was given — and hand it back.
+fn deliver(stream: &mut TcpStream, status: u16, location: Option<&str>) -> Option<Delivered> {
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("a read budget");
@@ -1987,8 +2008,13 @@ fn deliver(stream: &mut TcpStream, status: u16) -> Option<Delivered> {
             Ok(read) => buffer.extend_from_slice(&chunk[..read]),
         }
     }
+    let moved = match location {
+        Some(url) => format!("location: {url}\r\n"),
+        None => String::new(),
+    };
     let _ = stream.write_all(
-        format!("HTTP/1.1 {status} \r\ncontent-length: 0\r\nconnection: close\r\n\r\n").as_bytes(),
+        format!("HTTP/1.1 {status} \r\n{moved}content-length: 0\r\nconnection: close\r\n\r\n")
+            .as_bytes(),
     );
     let start = head?;
     let head_text = String::from_utf8_lossy(&buffer[..start.saturating_sub(4)]).to_string();

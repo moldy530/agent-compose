@@ -16953,6 +16953,111 @@ fn an_authenticated_start_admits_the_credential_it_declares_and_refuses_every_ot
     );
 }
 
+/// A credential a request carried **twice** verifies nothing, on either scheme
+/// (grammar 13.3, PRD resolved q32).
+///
+/// Which of two values under one name a verifier reads is a thing HTTP stacks
+/// disagree about, and the two runtimes a generated project supports disagree
+/// with each other: Node's parsed headers keep the **first** `authorization` and
+/// drop the rest, Bun's keep the **last**, and both join repeats of every other
+/// name with `", "`. So a route deciding on the parsed map admits a request
+/// whose credential depends on which runtime the app was launched with — and a
+/// proxy in front of it that normalises on the other value is a header-smuggling
+/// differential in which the pair `<valid>, <junk>` and the pair `<junk>,
+/// <valid>` are the same request to two readers.
+///
+/// The pairs are sent in both orders for exactly that reason: an app that took
+/// the first value passes the second case and an app that took the last passes
+/// the first, and only a refusal passes both. The counting shim says the other
+/// half — a request offering two credentials starts nothing, like every other
+/// refusal on this route.
+#[test]
+fn a_credential_a_request_carried_twice_verifies_nothing() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_shims, log, environment) = events_environment(&provider, "events-repeated-credential");
+    let Some(project) = harness::scratch_project("events-repeated-credential") else {
+        return;
+    };
+    let Some(served) = harness::serve_into(&project, "http-events", &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+    let body = json!({ "topic": "repeats" });
+
+    let token = harness::credential(harness::EVENTS_TOKEN);
+    let junk = format!("Bearer {token}-and-more");
+    for (what, first, second) in [
+        ("the real credential first", events_bearer(), junk.clone()),
+        ("the real credential last", junk, events_bearer()),
+        // Two copies of the *same* valid credential, which is the case a rule
+        // written as "the values must agree" would still admit: a request
+        // carrying one credential carries it once.
+        (
+            "the same credential twice",
+            events_bearer(),
+            events_bearer(),
+        ),
+    ] {
+        let refused = app
+            .send(
+                Request::post("/guarded")
+                    .json(&body)
+                    .header("authorization", first)
+                    .header("authorization", second),
+            )
+            .expect("the trigger's route answers");
+        assert_eq!(refused.status, 401, "{what}: {}", refused.text());
+        let said = refused.json();
+        assert_eq!(said["scheme"], "bearer", "{what}: {said}");
+        assert!(
+            !refused.text().contains(token),
+            "{what}: a refusal never echoes credential material: {}",
+            refused.text()
+        );
+    }
+
+    // The signed scheme reaches the same lookup, so a rule applied to the bearer
+    // half alone would leave the header a vendor's signature arrives under
+    // resolved by whichever stack read it.
+    let bytes = serde_json::to_vec(&body).expect("a JSON body");
+    let signature = harness::hmac_sha256(
+        harness::credential(harness::EVENTS_SECRET).as_bytes(),
+        &bytes,
+    );
+    let signed = format!("sha256={signature}");
+    for (what, first, second) in [
+        (
+            "the real signature first",
+            signed.clone(),
+            "sha256=00".to_string(),
+        ),
+        ("the real signature last", "sha256=00".to_string(), signed),
+    ] {
+        let refused = app
+            .send(
+                Request::post("/signed")
+                    .header("content-type", "application/json")
+                    .header("X-Hub-Signature-256", first)
+                    .header("X-Hub-Signature-256", second)
+                    .bytes(bytes.clone()),
+            )
+            .expect("the trigger's route answers");
+        assert_eq!(refused.status, 401, "{what}: {}", refused.text());
+        assert_eq!(
+            refused.json()["scheme"],
+            "hmac",
+            "{what}: {}",
+            refused.text()
+        );
+    }
+
+    assert_eq!(
+        harness::lines_in(&log),
+        0,
+        "every request offered two credentials and none of them started an execution"
+    );
+}
+
 /// An execution's `status` and `resume` routes enforce the auth of the trigger
 /// that **started** it, and an execution a no-auth trigger began keeps them open
 /// (grammar 13.3's "covers three routes, not one", PRD resolved q32).
@@ -17354,6 +17459,129 @@ fn a_callback_url_the_allowlist_admits_nowhere_is_refused_and_the_run_settles() 
         receiver.delivered().is_empty(),
         "nothing was sent: {:?}",
         receiver.delivered()
+    );
+}
+
+/// A receiver that answers a delivery with a **redirect** sends it nowhere else
+/// (grammar 13.3, Decision D127).
+///
+/// `callback_allow:` is matched against the URL the trigger produced, so a
+/// delivery that followed a `Location:` would make the list a bound on the first
+/// hop rather than on where a signed report lands. And the list admits an open
+/// redirect as readily as any other path: `http://127.0.0.1:*/allowed*` is
+/// satisfied by `…/allowed?to=https://attacker.test/collect`, which is a URL an
+/// author's own receiver may well answer `307` to. What would travel is this
+/// execution's whole report — outputs, trace, and every human answer — under
+/// `X-AgentCompose-Signature` and a `callback_auth: bearer` token written to a
+/// header name of the composition's choosing — what a cross-origin redirect
+/// strips is a fixed list of standard credential headers, never a name a
+/// composition chose and never the body's signature.
+///
+/// The blackhole is the assertion, and it counts **connections** rather than
+/// deliveries: a `301`, `302` or `303` rewrites the POST into a bodyless `GET`,
+/// which reaches a host without looking like a delivery at all — and which is
+/// the quieter half of the same bug, since an allowlisted receiver redirecting
+/// to itself would then answer `2xx` to a request carrying no report and the row
+/// would be journaled `delivered`.
+///
+/// The `307` is a failed attempt like any other non-2xx, so the schedule runs
+/// out and the row is `exhausted` — and the execution parks, is answered and
+/// completes regardless, which is what a webhook being a courtesy means.
+#[test]
+fn a_receiver_that_redirects_a_delivery_sends_it_nowhere_else() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_shims, _log, mut environment) = events_environment(&provider, "events-redirect");
+    environment.push((harness::CALLBACK_RETRY.to_string(), "0s,0s".to_string()));
+    let elsewhere = harness::Blackhole::start().expect("a loopback socket");
+    let receiver = harness::Receiver::start().expect("a loopback receiver");
+    // `307` preserves the method and the body, which is the redirect that would
+    // carry the report itself. The bodyless-`GET` rewrite of a `303` is the same
+    // root cause and is covered by the same assertion.
+    receiver.redirecting_to(307, &format!("{}/collect", elsewhere.base_url));
+    let Some(project) = harness::scratch_project("events-redirect") else {
+        return;
+    };
+    let Some(served) = harness::serve_into(&project, "http-events", &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+
+    let started = app
+        .send(
+            Request::post("/watched")
+                .json(&json!({
+                    "topic": "redirect",
+                    "callback_url": format!("{}/allowed/deliveries", receiver.base_url),
+                }))
+                .header("authorization", events_bearer()),
+        )
+        .expect("the trigger's route answers");
+    assert_eq!(started.status, 202, "{}", started.text());
+    let execution = started.json()["execution_id"]
+        .as_str()
+        .expect("an execution id")
+        .to_string();
+
+    // Both attempts of the parking, so what is asserted below is the whole of
+    // the schedule rather than whichever attempt happened to have landed.
+    let attempted = receiver.wait_for_event("parked", 2, Duration::from_secs(30));
+    assert!(
+        attempted[0].header("x-agentcompose-signature").is_some()
+            && attempted[0].header("x-delivery-token").is_some(),
+        "the delivery the receiver redirected carried both credentials: {:?}",
+        attempted[0].headers
+    );
+
+    let poll = format!("/executions/{execution}");
+    let owed = harness::until(Duration::from_secs(30), || {
+        let report = app
+            .send(Request::get(&poll).header("authorization", events_bearer()))
+            .expect("the status route answers")
+            .json();
+        (report["deliveries"][0]["status"] == "exhausted").then_some(report)
+    });
+    let recorded = &owed["deliveries"][0];
+    assert_eq!(
+        recorded["attempts"].as_array().map(Vec::len),
+        Some(2),
+        "a `3xx` is a failed attempt and the schedule ran out on it: {recorded}"
+    );
+    for attempt in recorded["attempts"].as_array().expect("the attempts") {
+        assert_eq!(attempt["outcome"], "failed", "{recorded}");
+        let detail = attempt["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains("307") && detail.contains("redirect"),
+            "…and it says what the receiver asked for and was not given: {recorded}"
+        );
+    }
+
+    // The execution is untouched by any of it.
+    let resume_url = owed["interrupts"].as_array().expect("the pauses")[0]["resume_url"]
+        .as_str()
+        .expect("a resume url")
+        .to_string();
+    let answered = app
+        .send(
+            Request::post(&resume_url)
+                .json(&json!({ "decision": "approve" }))
+                .header("authorization", events_bearer()),
+        )
+        .expect("the resume route answers");
+    assert_eq!(answered.status, 202, "{}", answered.text());
+    let finished = completed(&app, &execution, |request| {
+        request.header("authorization", events_bearer())
+    });
+    assert_eq!(finished["outputs"]["decision"], "approve", "{finished}");
+
+    // …and the settle is redirected too, so the count below is taken once every
+    // delivery this execution owes has been through its whole schedule.
+    receiver.wait_for_event("settled", 2, Duration::from_secs(30));
+    assert_eq!(
+        elsewhere.reached(),
+        0,
+        "a delivery goes where `callback_allow:` admits it or nowhere: {} connection(s) \
+         reached the host the receiver named",
+        elsewhere.reached()
     );
 }
 
