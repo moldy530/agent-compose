@@ -346,11 +346,17 @@ mod tests {
     ///    execution as owing a webhook for ever, and the next start resumes the
     ///    delivery below the offset it really reached and POSTs past the bound
     ///    §3.7 calls normative.
+    ///  * a **settle announced to nobody**. `closed` journals its intent in the
+    ///    last moment the lifecycle row is open, and the row closes as it
+    ///    returns: after that `recover` walks no `open` execution for it and the
+    ///    walk over `pending` rows finds none, so an intent the journal refused
+    ///    once is a settle nothing will ever send — to a caller holding a `202`
+    ///    who, by resolved q34's reasoning, is not polling either.
     ///
-    /// So both are read off the seams: the marks come back off where the intent
-    /// did not go down, and an attempt the journal refused is **carried** rather
-    /// than dropped — kept for the write that does land, and insisted on where
-    /// nothing later would come back to it.
+    /// So all three are read off the seams: the marks come back off where the
+    /// intent did not go down, an attempt the journal refused is **carried**
+    /// rather than dropped — kept for the write that does land — and the two
+    /// writes nothing would ever come back to are insisted on where they stand.
     #[test]
     fn a_write_the_journal_refuses_leaves_neither_a_lost_event_nor_a_row_that_never_ends() {
         let serve = include_str!("js/serve.ts");
@@ -416,6 +422,17 @@ mod tests {
             "an attempt the journal refused is dropped anyway, so the row under-counts its \
              attempts and the next start POSTs past the bound §3.7 states"
         );
+        let closed = function_body(serve, "closed");
+        let insisted = closed
+            .find("insisting(")
+            .expect("the settle's intent is insisted on, not tried once");
+        assert!(
+            closed[insisted..].contains("deliver(execution, \"settled\""),
+            "`closed` journals the settle's intent with a write nothing observes: the lifecycle \
+             row closes as it returns, so a journal that says no once loses the settle for the \
+             life of the journal (`docs/durability.md` §3.7)"
+        );
+
         assert!(
             function_body(serve, "insisting").contains("JOURNAL_RETRY_MS["),
             "the ladder a refused write is retried on is unbounded, which is a queue rather \

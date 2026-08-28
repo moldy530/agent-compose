@@ -1243,6 +1243,10 @@ function recorded(execution: Execution, answer: FlowRun | undefined, error: unkn
  * Only the **intent** is waited for. The attempts are not — [`opening`] sets
  * them going and returns — so a run does not stay `running` to a reader for as
  * long as a receiver takes to answer.
+ *
+ * And the intent is **insisted on** rather than tried once, because this is the
+ * last moment anything comes back to it: see [`insisting`] and the comment on
+ * the write itself.
  */
 async function closed(
   execution: Execution,
@@ -1261,7 +1265,22 @@ async function closed(
   // announcing a second one here would tell a receiver that an execution
   // finished twice.
   if (await settledAlready(execution.id)) return;
-  await deliver(execution, "settled", []);
+  // **The one write in this file that nothing at all would come back to**, and
+  // so the one that is insisted on where it stands rather than left for a later
+  // write to carry ([`insisting`]). The row closes as this returns: after that
+  // `recover` walks no `open` execution for it and [`resumeDeliveries`] finds no
+  // `pending` row, so an intent the journal would not take here — a second
+  // process holding the file past the lock wait, a disk momentarily full, both
+  // states `docs/durability.md` §2 says a healthy deployment reaches — is a
+  // settle nothing ever announces, owed to a caller who was handed a `202` and
+  // by resolved q34's own reasoning is not polling.
+  //
+  // The ladder runs **while the row is still open**, which is also what makes a
+  // process killed part-way through it recoverable: the execution is still
+  // `open`, so the next start replays it to the same end and reaches this hook
+  // again. Bounded like every other ladder here (§3.7): its end is a sentence on
+  // stderr and a status route that still holds the answer.
+  await insisting(() => deliver(execution, "settled", []));
 }
 
 /**
@@ -1728,9 +1747,11 @@ async function journaling(
  * Make one journal write, waiting out a journal that is briefly not there.
  *
  * The writes this is for are the ones **nothing comes back to**: the end of a
- * delivery's schedule, and the intent of a parking whose execution is now
- * waiting on a person ([`announcing`], which runs its own ladder because the
- * body it would resend has to be taken again each round). Every other write in
+ * delivery's schedule, and the intent of a settle whose lifecycle row closes the
+ * moment it returns ([`closed`]). A parking's intent is the third and runs its
+ * own ladder ([`announcing`]) because it has more to do at the end of one than
+ * give up — the marks it left on the execution have to come back off, and a
+ * round is worth taking only while the run is still going. Every other write in
  * this file is followed by another that would carry it.
  *
  * The `write` says whether it landed rather than raising, because each of them
