@@ -46,6 +46,16 @@ triggers:
     session_key: "payload.headers['x-session-id']"
     respond: async
     callback: "payload.body.callback_url"
+    auth:
+      hmac:
+        secret: ${WEBHOOK_SECRET}
+        header: X-Hub-Signature-256
+        prefix: "sha256="
+    callback_auth:
+      hmac:
+        secret: ${CALLBACK_SECRET}
+    callback_allow:
+      - "https://hooks.example.com/*"
 ```
 
 ## One entry exists without being declared
@@ -108,6 +118,9 @@ satisfiable with no binding. Supplying the value is a run-time requirement:
 | `respond` | no | `async` | `sync` \| `async` |
 | `timeout` | `sync` only | `60s` | the response budget; **illegal** with `respond: async` |
 | `callback` | no | — | a completion webhook; `async` only |
+| `auth` | no | — | how an inbound call is authenticated; exactly one of `bearer:`/`hmac:` |
+| `callback_auth` | no | — | how a delivery identifies itself; `bearer:`, `hmac:`, or both |
+| `callback_allow` | with `callback_auth` | — | where a callback may point |
 
 `payload` is `payload.body` (a decoded JSON object), `payload.query`,
 `payload.headers` (lowercase names), `payload.path`, `payload.method`.
@@ -137,6 +150,81 @@ and cannot dispatch one pair two ways.
 
 Generated apps expose `start`, `resume` and `status` routes; resume payloads are
 validated against the interrupting `human` node's output schema.
+
+## Authenticating an `http` trigger
+
+A generated app is the thing a webhook vendor calls directly, so it verifies
+callers itself. Auth is **per trigger, never server-wide**: who may invoke this
+flow is readable off the trigger that exposes it.
+
+```yaml
+auth:                            # exactly ONE of bearer | hmac
+  hmac:
+    secret: ${WEBHOOK_SECRET}    # required; ${ENV} only, never a literal
+    header: X-Hub-Signature-256  # default X-Signature
+    algorithm: sha256            # sha1 | sha256 | sha512; default sha256
+    encoding: hex                # hex | base64; default hex
+    prefix: "sha256="            # default "" (empty)
+```
+
+- **`bearer`** compares a static secret against a named header — `Authorization`
+  with a `Bearer ` prefix by default — in **constant time**.
+- **`hmac`** verifies a signature over the **raw request body bytes**, which is
+  the GitHub-shaped family most vendors speak.
+- Both secrets are `${ENV}` references and nothing else: a literal is
+  `invalid-env-ref`, because a secret never lives in the spec text.
+- A block declaring **neither** scheme and one declaring **both** are each a
+  compile error. One request carries one credential, and a route verifying either
+  would be as open as its weaker half.
+
+**`auth:` guards three routes.** `resume` *injects data into a parked run* —
+strictly more sensitive than starting one — so `resume` and `status` enforce the
+auth of the trigger that **started that execution**. An execution an
+authenticated trigger began never answers an unauthenticated poll; one a no-auth
+trigger began keeps open routes.
+
+## Identifying a callback delivery
+
+Outbound auth mirrors the inbound pair, so one verification recipe serves both
+directions — but here **both schemes together are legal**, because a receiver may
+want a token and a signature.
+
+```yaml
+callback: "payload.body.callback_url"
+callback_auth:
+  bearer:
+    token: ${CALLBACK_TOKEN}
+  hmac:
+    secret: ${CALLBACK_SECRET}   # signing is fixed HMAC-SHA256/hex: no other keys
+callback_allow:
+  - "https://hooks.example.com/*"
+```
+
+**Declaring `callback_auth:` makes `callback_allow:` mandatory** — a compile
+error, `missing-callback-allowlist`, not a warning. The callback URL comes from
+the payload and is attacker-controlled by construction, so a deployment careful
+enough to authenticate its deliveries must not hand them, credential and all, to
+whatever host a payload named. A URL outside the list is refused when it is read,
+at parking or settle, and recorded as a refused delivery.
+
+An entry is an absolute `http`/`https` URL with `*` standing for any run of
+characters, matched against the whole callback URL. `http` stays legal — a
+localhost receiver is the common first case. An empty list is an error: an
+allowlist admitting nothing refuses every delivery. Either key on a trigger with
+no `callback:` is an error too — it describes a delivery that never happens.
+
+**A `callback:` with no `callback_auth:` is a documented test posture**: it signs
+nothing, claims nothing, needs no allowlist, and may POST anywhere. Choose it
+deliberately.
+
+**The delivery wire.** A callback fires on lifecycle events — every quiescence
+that opened new pauses (`parked`) and settle (`settled`) — carrying the status
+route's report plus `X-AgentCompose-Event`, `X-AgentCompose-Delivery`
+(`<execution_id>:<ordinal>`), `X-AgentCompose-Ordinal` and
+`X-AgentCompose-Timestamp`; with `callback_auth.hmac`, also
+`X-AgentCompose-Signature: sha256=<hex>`. Deliveries are journaled and
+at-least-once, so they can arrive out of order: **order by ordinal, never by
+arrival**.
 
 ## `schedule` and `event` — reserved
 

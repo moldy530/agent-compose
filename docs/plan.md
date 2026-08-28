@@ -675,6 +675,18 @@ The class is not these three: it is every key `docs/grammar.md` gives a default 
 `respond: async`, `unique_items: false`, `agent_access: read_write`,
 `timezone: UTC` and the rest all read the same way.
 
+**One family is the exception, and it is deliberate.** The scheme parameters
+*inside* an `http` trigger's `auth:` and `callback_auth:` blocks — `header:`,
+`algorithm:`, `encoding:`, `prefix:` — are materialized into the artifact
+(grammar 13.3, Decision D125): a declared scheme lands resolved, because those
+four decide whether a credential verifies and a later reader re-deriving one
+differently would not fail a build, it would accept the wrong request. So
+`header: X-Signature` written out where the default already supplies it is the
+one default this command reports **nothing** about, and that is the plan telling
+the truth about two artifacts that really are identical. What is still the
+author's is the block's *presence*: a trigger with no `auth:` carries none, and
+adding one is an ordinary reported change.
+
 §3's rule that an absent `before` or `after` key means **not declared** is that
 representation seen from the format's side, and §3's example is worth reading
 against this table rather than as a case of it: an absent `timeout:` is not the

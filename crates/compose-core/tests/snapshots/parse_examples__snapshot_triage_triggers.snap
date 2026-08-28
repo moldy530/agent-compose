@@ -66,6 +66,9 @@ Spec(
                                     callback: Some(
                                         cel("payload.body.callback_url") @ 20:15..20:42,
                                     ),
+                                    auth: None,
+                                    callback_auth: None,
+                                    callback_allow: None,
                                 },
                             ),
                         ),

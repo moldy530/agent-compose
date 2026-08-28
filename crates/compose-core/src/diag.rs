@@ -472,6 +472,12 @@ pub enum DiagnosticCode {
     /// Two `manual` triggers name one flow and declare different `session_key:`
     /// expressions, which are two answers for one CLI entry (grammar 13.2).
     ConflictingSessionKey,
+    /// An `http` trigger declares `callback_auth:` and no `callback_allow:`
+    /// (grammar 13.3, PRD resolved q33). Its own class rather than a
+    /// [`MissingKey`](Self::MissingKey), for the reason
+    /// [`MissingCredential`](Self::MissingCredential) is: what is absent is
+    /// decided by a sibling value, and the repair is a choice of two.
+    MissingCallbackAllowlist,
 }
 
 impl DiagnosticCode {
@@ -546,6 +552,7 @@ impl DiagnosticCode {
         Self::DetachedInterrupt,
         Self::DuplicateRoute,
         Self::ConflictingSessionKey,
+        Self::MissingCallbackAllowlist,
     ];
 
     /// The stable kebab-case spelling of this code.
@@ -614,6 +621,7 @@ impl DiagnosticCode {
             Self::DetachedInterrupt => "detached-interrupt",
             Self::DuplicateRoute => "duplicate-route",
             Self::ConflictingSessionKey => "conflicting-session-key",
+            Self::MissingCallbackAllowlist => "missing-callback-allowlist",
         }
     }
 }
@@ -846,7 +854,7 @@ mod tests {
         }
         assert_eq!(
             DiagnosticCode::ALL.len(),
-            DiagnosticCode::ConflictingSessionKey as usize + 1,
+            DiagnosticCode::MissingCallbackAllowlist as usize + 1,
             "`DiagnosticCode::ALL` stops short of the last declared variant"
         );
     }

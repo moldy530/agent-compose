@@ -60,8 +60,9 @@ pub use schema::{
     Surface, TypeForm, TypeNode, UnionType, UnionVariant,
 };
 pub use trigger::{
-    EventTrigger, HttpTrigger, Respond, ScheduleTrigger, TRIGGER_TYPES, Trigger, TriggerKind,
-    TriggerMethod, TriggersSection,
+    AuthScheme, BearerAuth, CallbackAllow, CallbackAuth, CallbackHmac, EventTrigger, HmacAlgorithm,
+    HmacAuth, HttpTrigger, Respond, ScheduleTrigger, SignatureEncoding, TRIGGER_TYPES, Trigger,
+    TriggerKind, TriggerMethod, TriggersSection,
 };
 
 #[cfg(test)]
@@ -95,6 +96,15 @@ mod keyword_tests {
 
         assert_eq!(Respond::Sync.as_str(), "sync");
         assert_eq!(Respond::Async.as_str(), "async");
+
+        assert_eq!(HmacAlgorithm::Sha1.as_str(), "sha1");
+        assert_eq!(HmacAlgorithm::Sha256.as_str(), "sha256");
+        assert_eq!(HmacAlgorithm::Sha512.as_str(), "sha512");
+        assert_eq!(HmacAlgorithm::DEFAULT, HmacAlgorithm::Sha256);
+
+        assert_eq!(SignatureEncoding::Hex.as_str(), "hex");
+        assert_eq!(SignatureEncoding::Base64.as_str(), "base64");
+        assert_eq!(SignatureEncoding::DEFAULT, SignatureEncoding::Hex);
 
         assert_eq!(schema::Surface::Input.as_str(), "input");
         assert_eq!(schema::Surface::Result.as_str(), "result");

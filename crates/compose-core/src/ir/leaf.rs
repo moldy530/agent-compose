@@ -73,7 +73,7 @@ use crate::ast::deploy::{BackendProvider, EventSourceKind, Network, PluginValue,
 use crate::ast::document::Reduce;
 use crate::ast::flow::{FlowContext, StoreOp};
 use crate::ast::schema::{Number, ScalarKind, StringFormat, Surface};
-use crate::ast::trigger::{Respond, TriggerMethod};
+use crate::ast::trigger::{HmacAlgorithm, Respond, SignatureEncoding, TriggerMethod};
 use crate::diag::{Position, Span, Spanned};
 
 /// Write a span the way the IR records it: `<file>:<line>:<col>..<line>:<col>`.
@@ -146,6 +146,7 @@ serialize_as_keyword!(
     BackendProvider,
     EventSourceKind,
     FlowContext,
+    HmacAlgorithm,
     HttpMethod,
     Network,
     ProviderKind,
@@ -154,6 +155,7 @@ serialize_as_keyword!(
     RouteCondition,
     Runtime,
     ScalarKind,
+    SignatureEncoding,
     StoreKind,
     StoreOp,
     StoreScope,

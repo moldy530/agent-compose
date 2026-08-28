@@ -1,0 +1,13 @@
+# rule: declaring `callback_auth:` makes `callback_allow:` mandatory (grammar 13.3, PRD resolved q33)
+# code: missing-callback-allowlist
+# message: trigger `intake` declares `callback_auth` and no `callback_allow`
+# at: 11:5
+# help: the callback URL comes from the request payload and is attacker-controlled by construction, so a deployment careful enough to authenticate its deliveries must not send them wherever a payload said: declare `callback_allow:` with the URL patterns this trigger may POST to, or drop `callback_auth:` and take the documented test posture, which may POST anywhere (grammar 13.3, PRD resolved q33)
+triggers:
+  intake:
+    type: http
+    flow: flow.support
+    callback: "payload.body.callback_url"
+    callback_auth:
+      hmac:
+        secret: ${CALLBACK_SECRET}

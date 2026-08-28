@@ -5,10 +5,11 @@ use crate::ast::common::Namespace;
 use crate::ast::document::{Channel, ImportPath, ImportsSection, Reduce, StateSection};
 use crate::ast::schema::{Surface, TypeForm, TypeNode};
 use crate::ast::trigger::{
-    EventTrigger, HttpTrigger, Respond, ScheduleTrigger, TRIGGER_TYPES, Trigger, TriggerKind,
-    TriggerMethod, TriggersSection,
+    AuthScheme, BearerAuth, CallbackAllow, CallbackAuth, CallbackHmac, EventTrigger, HmacAlgorithm,
+    HmacAuth, HttpTrigger, Respond, ScheduleTrigger, SignatureEncoding, TRIGGER_TYPES, Trigger,
+    TriggerKind, TriggerMethod, TriggersSection,
 };
-use crate::diag::{Diagnostic, DiagnosticCode, Spanned};
+use crate::diag::{Diagnostic, DiagnosticCode, Span, Spanned};
 use crate::yaml::Node;
 
 use super::binding::{self, NameForm};
@@ -250,6 +251,17 @@ const TRIGGER_METHODS: &[(&str, TriggerMethod)] = &[
 
 const RESPOND_MODES: &[(&str, Respond)] = &[("sync", Respond::Sync), ("async", Respond::Async)];
 
+const HMAC_ALGORITHMS: &[(&str, HmacAlgorithm)] = &[
+    ("sha1", HmacAlgorithm::Sha1),
+    ("sha256", HmacAlgorithm::Sha256),
+    ("sha512", HmacAlgorithm::Sha512),
+];
+
+const SIGNATURE_ENCODINGS: &[(&str, SignatureEncoding)] = &[
+    ("hex", SignatureEncoding::Hex),
+    ("base64", SignatureEncoding::Base64),
+];
+
 /// Read the `triggers:` section (grammar 13).
 pub(crate) fn triggers(node: &Node, cx: &mut Cx) -> Option<TriggersSection> {
     let mapping = expect_mapping(node, "`triggers`", cx)?;
@@ -436,6 +448,21 @@ fn http_trigger(fields: &mut Fields<'_>, subject: &str, cx: &mut Cx) -> HttpTrig
             lexical::cel(&entry.value, "`callback`", cx)
         });
 
+    let auth = inbound_auth(fields, subject, cx);
+    // Whether the author *wrote* a `callback:`, not whether one survived: a
+    // `callback:` refused for its own reason above is still a webhook the author
+    // declared, and reporting these two keys as inert on top of that would be a
+    // report about a key that is there. Decided from `contains` for the reason
+    // the provider credential rule is (grammar 12.1, Decision D120).
+    let declares_callback = fields.contains("callback");
+    let callback_auth = callback_auth(fields, subject, declares_callback, cx);
+    let callback_allow = callback_allow(fields, subject, declares_callback, cx);
+    // A `callback_auth:` on a trigger with no webhook has already been refused,
+    // and the allowlist it would demand is an allowlist for nothing.
+    if declares_callback {
+        require_callback_allow(fields, subject, cx);
+    }
+
     HttpTrigger {
         path,
         method,
@@ -443,7 +470,358 @@ fn http_trigger(fields: &mut Fields<'_>, subject: &str, cx: &mut Cx) -> HttpTrig
         respond,
         timeout,
         callback,
+        auth,
+        callback_auth,
+        callback_allow,
     }
+}
+
+/// Read `auth:` — how an inbound call to this trigger is authenticated
+/// (grammar 13.3, PRD resolved q32).
+///
+/// Exactly one scheme, which is the same shape a `tool.*` implementation
+/// binding takes and is refused the same way (Decision D25): a block declaring
+/// none is a `missing-key` naming both spellings, a block declaring both is a
+/// `conflicting-keys` on the second. A request carries one credential, so
+/// "verify either" is not a posture this grammar can express — it would leave
+/// the deployment as open as its weaker half.
+fn inbound_auth(
+    fields: &mut Fields<'_>,
+    subject: &str,
+    cx: &mut Cx,
+) -> Option<Spanned<AuthScheme>> {
+    let entry = fields.take_entry("auth")?;
+    let mapping = expect_mapping(&entry.value, &format!("the `auth` of {subject}"), cx)?;
+    let context = format!("the `auth` of {subject}");
+    let mut block = Fields::new(mapping, entry.value.span.clone(), &context);
+    block.note_known(AuthScheme::KEYS);
+    let declared: Vec<&str> = AuthScheme::KEYS
+        .iter()
+        .copied()
+        .filter(|key| block.contains(key))
+        .collect();
+
+    let scheme = match declared.as_slice() {
+        [] => {
+            cx.push(
+                Diagnostic::error(
+                    DiagnosticCode::MissingKey,
+                    entry.key.span.clone(),
+                    format!(
+                        "{context} declares no scheme: an inbound `auth` carries exactly one of {}",
+                        list(AuthScheme::KEYS)
+                    ),
+                )
+                .with_help(
+                    "`bearer` compares a static secret against a named header, `hmac` verifies a signature over the raw request body — drop `auth:` altogether to leave the route open (grammar 13.3, PRD resolved q32)",
+                ),
+            );
+            None
+        }
+        [single] => auth_scheme(&mut block, single, &context, cx),
+        [first, rest @ ..] => {
+            for key in rest {
+                let span = block
+                    .take_entry(key)
+                    .map_or_else(|| block.span.clone(), |entry| entry.key.span.clone());
+                cx.push(
+                    Diagnostic::error(
+                        DiagnosticCode::ConflictingKeys,
+                        span,
+                        format!(
+                            "{context} declares both `{first}` and `{key}`; an inbound `auth` carries exactly one scheme"
+                        ),
+                    )
+                    .with_help(
+                        "one request carries one credential, so a route verifying either would be exactly as open as its weaker half: keep the scheme the caller actually sends (grammar 13.3, PRD resolved q32)",
+                    ),
+                );
+            }
+            auth_scheme(&mut block, first, &context, cx)
+        }
+    };
+    block.finish(cx);
+    scheme.map(|scheme| Spanned::new(scheme, entry.value.span.clone()))
+}
+
+/// The one scheme an `auth:` block declares, read under its own key.
+fn auth_scheme(
+    block: &mut Fields<'_>,
+    key: &str,
+    context: &str,
+    cx: &mut Cx,
+) -> Option<AuthScheme> {
+    match key {
+        "bearer" => bearer(block, "bearer", context, cx).map(AuthScheme::Bearer),
+        "hmac" => {
+            let node = block.take("hmac")?;
+            let context = format!("the `hmac` of {context}");
+            let mapping = expect_mapping(node, &context, cx)?;
+            let mut scheme = Fields::new(mapping, node.span.clone(), &context);
+            let secret = scheme
+                .require("secret", cx)
+                .and_then(|node| lexical::env_ref(node, "`secret`", cx));
+            let header = scheme
+                .take("header")
+                .and_then(|node| lexical::non_empty_text(node, "`header`", cx));
+            let algorithm = scheme
+                .take("algorithm")
+                .and_then(|node| lexical::keyword(node, "`algorithm`", HMAC_ALGORITHMS, cx));
+            let encoding = scheme
+                .take("encoding")
+                .and_then(|node| lexical::keyword(node, "`encoding`", SIGNATURE_ENCODINGS, cx));
+            // A prefix is legitimately empty — that is the default — so it is
+            // read as plain text rather than as a non-empty value.
+            let prefix = scheme
+                .take("prefix")
+                .and_then(|node| lexical::text(node, "`prefix`", cx));
+            scheme.finish(cx);
+            Some(AuthScheme::Hmac(HmacAuth {
+                secret,
+                header,
+                algorithm,
+                encoding,
+                prefix,
+            }))
+        }
+        other => unreachable!("`{other}` is not one of `AuthScheme::KEYS`"),
+    }
+}
+
+/// Read a `bearer:` block, inbound or outbound: one shape, one pair of defaults
+/// (grammar 13.3).
+fn bearer(
+    fields: &mut Fields<'_>,
+    key: &'static str,
+    context: &str,
+    cx: &mut Cx,
+) -> Option<BearerAuth> {
+    let node = fields.take(key)?;
+    let context = format!("the `{key}` of {context}");
+    let mapping = expect_mapping(node, &context, cx)?;
+    let mut scheme = Fields::new(mapping, node.span.clone(), &context);
+    let token = scheme
+        .require("token", cx)
+        .and_then(|node| lexical::env_ref(node, "`token`", cx));
+    let header = scheme
+        .take("header")
+        .and_then(|node| lexical::non_empty_text(node, "`header`", cx));
+    let prefix = scheme
+        .take("prefix")
+        .and_then(|node| lexical::text(node, "`prefix`", cx));
+    scheme.finish(cx);
+    Some(BearerAuth {
+        token,
+        header,
+        prefix,
+    })
+}
+
+/// Read `callback_auth:` — how a delivery identifies itself to its receiver
+/// (grammar 13.3, PRD resolved q33).
+///
+/// **At least** one scheme, unlike inbound `auth:`: a delivery is this
+/// deployment's own request, so signing it and carrying a token are two things
+/// one receiver may both want, and the resolved question says "and/or".
+fn callback_auth(
+    fields: &mut Fields<'_>,
+    subject: &str,
+    declares_callback: bool,
+    cx: &mut Cx,
+) -> Option<Spanned<CallbackAuth>> {
+    let entry = fields.take_entry("callback_auth")?;
+    if !declares_callback {
+        cx.push(inert_callback_key(
+            &entry.key.span,
+            "callback_auth",
+            subject,
+        ));
+        return None;
+    }
+    let context = format!("the `callback_auth` of {subject}");
+    let mapping = expect_mapping(&entry.value, &context, cx)?;
+    let mut block = Fields::new(mapping, entry.value.span.clone(), &context);
+    block.note_known(CallbackAuth::KEYS);
+    if !CallbackAuth::KEYS.iter().any(|key| block.contains(key)) {
+        cx.push(
+            Diagnostic::error(
+                DiagnosticCode::MissingKey,
+                entry.key.span.clone(),
+                format!(
+                    "{context} declares no scheme: a `callback_auth` carries {}, or both",
+                    list(CallbackAuth::KEYS)
+                ),
+            )
+            .with_help(
+                "`hmac` signs the delivered body and `bearer` sends a static token; a delivery that carries neither is what leaving `callback_auth:` out already means, and that posture needs no allowlist (grammar 13.3, PRD resolved q33)",
+            ),
+        );
+        block.finish(cx);
+        return None;
+    }
+    let bearer = bearer(&mut block, "bearer", &context, cx);
+    let hmac = block.take("hmac").and_then(|node| {
+        let context = format!("the `hmac` of {context}");
+        let mapping = expect_mapping(node, &context, cx)?;
+        let mut scheme = Fields::new(mapping, node.span.clone(), &context);
+        // One key, and the omission is the decision: outbound signing is fixed
+        // HMAC-SHA256 in hex under `X-AgentCompose-Signature`, so a receiver
+        // verifying one agent-compose deployment verifies them all.
+        let secret = scheme
+            .require("secret", cx)
+            .and_then(|node| lexical::env_ref(node, "`secret`", cx));
+        scheme.finish(cx);
+        Some(CallbackHmac { secret })
+    });
+    block.finish(cx);
+    Some(Spanned::new(
+        CallbackAuth { bearer, hmac },
+        entry.value.span.clone(),
+    ))
+}
+
+/// Read `callback_allow:` — the URL patterns a callback may point at
+/// (grammar 13.3, PRD resolved q33).
+///
+/// Entry *shape* only: whether a URL the payload supplied matches one of these
+/// is decided when it is read, at parking or settle, since the URL does not
+/// exist until then.
+fn callback_allow(
+    fields: &mut Fields<'_>,
+    subject: &str,
+    declares_callback: bool,
+    cx: &mut Cx,
+) -> Option<CallbackAllow> {
+    let entry = fields.take_entry("callback_allow")?;
+    if !declares_callback {
+        cx.push(inert_callback_key(
+            &entry.key.span,
+            "callback_allow",
+            subject,
+        ));
+        return None;
+    }
+    let items = expect_sequence(
+        &entry.value,
+        &format!("the `callback_allow` of {subject}"),
+        cx,
+    )?;
+    if items.is_empty() {
+        cx.push(
+            Diagnostic::error(
+                DiagnosticCode::InvalidValue,
+                entry.value.span.clone(),
+                format!("the `callback_allow` of {subject} admits no URL"),
+            )
+            .with_help(
+                "an allowlist matched against every callback URL and satisfied by none refuses every delivery, so an empty list is a webhook that can never fire: name the patterns this trigger may POST to, or drop `callback_allow:` and `callback_auth:` together (grammar 13.3, PRD resolved q33)",
+            ),
+        );
+        return None;
+    }
+    let mut patterns = Vec::new();
+    for item in items {
+        // The patterns are part of what the composition *is* and are shape-
+        // checked here, so they are class-3 strings: a `${NAME}` token is an
+        // error rather than a value that only exists at process start
+        // (grammar 4.3, Decision D92).
+        let Some(pattern) = lexical::text(item, "each entry of `callback_allow`", cx) else {
+            continue;
+        };
+        if let Some(problem) = allow_problem(&pattern.value) {
+            cx.push(
+                Diagnostic::error(
+                    DiagnosticCode::InvalidValue,
+                    pattern.span.clone(),
+                    format!(
+                        "`{}` is not a `callback_allow` pattern of {subject}: it {problem}",
+                        pattern.value
+                    ),
+                )
+                .with_help(
+                    "an entry is an absolute URL with `*` standing for any run of characters, matched against the whole callback URL — `https://hooks.example.com/*`; `http` stays legal, which is what makes localhost development work (grammar 13.3, PRD resolved q33)",
+                ),
+            );
+            continue;
+        }
+        patterns.push(pattern);
+    }
+    Some(CallbackAllow {
+        patterns,
+        span: entry.value.span.clone(),
+    })
+}
+
+/// Why a `callback_allow:` entry is not a legal URL pattern, if it is not.
+///
+/// Completes ``` `<entry>` is not a `callback_allow` pattern of …: it … ```.
+/// The scheme is the whole of the check: a pattern is matched against the URL a
+/// payload supplied, and a match that could not name the scheme would let
+/// `https://hooks.example.com/*` admit `javascript:` or `file:` URLs beginning
+/// with the same characters.
+fn allow_problem(pattern: &str) -> Option<String> {
+    if pattern.trim().is_empty() {
+        return Some("is empty".to_string());
+    }
+    if pattern.chars().any(char::is_whitespace) {
+        return Some("contains whitespace".to_string());
+    }
+    let Some((scheme, rest)) = pattern.split_once("://") else {
+        return Some("names no scheme, and a callback URL is absolute".to_string());
+    };
+    if !matches!(scheme, "http" | "https") {
+        return Some(format!(
+            "names the scheme `{scheme}`, and a callback is delivered over `http` or `https`"
+        ));
+    }
+    if rest.is_empty() {
+        return Some("names a scheme and nothing else".to_string());
+    }
+    None
+}
+
+/// A `callback_auth:`/`callback_allow:` on a trigger that delivers no webhook
+/// (grammar 13.3).
+///
+/// The mirror of `timeout:` on an async trigger (Decision D81) and of
+/// `callback:` on a synchronous one: the key describes a delivery this trigger
+/// never makes, so it changes nothing observable and gets a diagnostic rather
+/// than silence.
+fn inert_callback_key(span: &Span, key: &str, subject: &str) -> Diagnostic {
+    Diagnostic::error(
+        DiagnosticCode::ConflictingKeys,
+        span.clone(),
+        format!("`{key}` is not legal on {subject}, which declares no `callback`"),
+    )
+    .with_help(
+        "both keys describe how a completion webhook is delivered, and a trigger with no `callback:` delivers none: declare the webhook, or drop the key (grammar 13.3, PRD resolved q33)",
+    )
+}
+
+/// Declaring `callback_auth:` makes `callback_allow:` mandatory
+/// (grammar 13.3, PRD resolved q33).
+///
+/// Read from `contains` rather than from the parsed blocks, so a `callback_auth`
+/// refused for its own reason still demands the allowlist it would have needed:
+/// what the rule is about is the author having declared outbound authentication
+/// at all.
+fn require_callback_allow(fields: &Fields<'_>, subject: &str, cx: &mut Cx) {
+    if !fields.contains("callback_auth") || fields.contains("callback_allow") {
+        return;
+    }
+    let span = fields
+        .span_of("callback_auth")
+        .unwrap_or_else(|| fields.span.clone());
+    cx.push(
+        Diagnostic::error(
+            DiagnosticCode::MissingCallbackAllowlist,
+            span,
+            format!("{subject} declares `callback_auth` and no `callback_allow`"),
+        )
+        .with_help(
+            "the callback URL comes from the request payload and is attacker-controlled by construction, so a deployment careful enough to authenticate its deliveries must not send them wherever a payload said: declare `callback_allow:` with the URL patterns this trigger may POST to, or drop `callback_auth:` and take the documented test posture, which may POST anywhere (grammar 13.3, PRD resolved q33)",
+        ),
+    );
 }
 
 fn schedule_trigger(fields: &mut Fields<'_>, cx: &mut Cx) -> ScheduleTrigger {

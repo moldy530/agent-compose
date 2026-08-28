@@ -749,6 +749,7 @@ compile error (Decision [D41](#d41-env-ref-forms-and-the-secret-field-list)):
 |---|---|
 | `api_key`, `api_secret`, `token`, `password`, `access_key_id`, `secret_access_key`, `session_token`, `credentials_json` | `provider.*`, `storage_backends.*`, `event_sources.*` |
 | `url`, `base_url`, `endpoint`, `dsn` | `provider.*`, `storage_backends.*`, `event_sources.*` |
+| `token`, `secret` | an `http` trigger's `auth:` and `callback_auth:` blocks (§13.3) |
 
 The table classifies these field *names* wherever they occur; it never makes one
 legal where its section's own key rules do not admit it. A `provider.*` takes
@@ -776,8 +777,9 @@ expressions on every surface; model `id` and every value inside `settings:`;
 `embed.model` (§11.2); every identifier and reference position (node ids,
 channel names, typed addresses, a store's `backend:` alias, a tool's
 `function.name`, an event trigger's `source:`); `version:`; `imports:` entries;
-a trigger's `path:`, `cron:`, and `timezone:` (§13.3, §13.4); a `blob put`'s
-`content_type:` (§11.4); and every enum-valued key.
+a trigger's `path:`, `cron:`, and `timezone:` (§13.3, §13.4); the `header:` and
+`prefix:` of an `auth:`/`callback_auth:` scheme and every `callback_allow:` entry
+(§13.3); a `blob put`'s `content_type:` (§11.4); and every enum-valued key.
 
 Nothing is interpolated in class 3, so an unescaped token there is an error
 rather than text that silently survives into the output — the author who wrote
@@ -3856,6 +3858,9 @@ defaulted `session_key:`, exists implicitly for every flow (§13 preamble).
 | `respond` | `sync` \| `async` | no | `async` | |
 | `timeout` | duration | `sync` only | `60s` | the response budget; ILLEGAL with `respond: async` (explicit or defaulted) |
 | `callback` | CEL over `payload` → string | no | — | completion webhook; `async` only |
+| `auth` | block; exactly one of `bearer:`/`hmac:` | no | — | how an inbound call is authenticated; absent leaves the route open |
+| `callback_auth` | block; at least one of `bearer:`/`hmac:`, both legal | no | — | how a delivery identifies itself; requires `callback:`, and makes `callback_allow:` MANDATORY |
+| `callback_allow` | non-empty list of URL patterns | with `callback_auth` | — | where a callback may point; requires `callback:` |
 
 `payload` shape: `payload.body` (decoded JSON object), `payload.query` (map of
 string), `payload.headers` (map of string, lowercase names), `payload.path`
@@ -3900,6 +3905,128 @@ a flow input field can accept it.
   (Decision [D81](#d81-timeout-is-illegal-on-an-async-http-trigger)).
 - Generated apps expose `start`, `resume`, and `status` routes; resume payloads
   are validated against the interrupting `human` node's output schema (PRD 5.11).
+
+**Authenticating the caller: `auth:`.** v0's posture was "deploy behind your own
+gateway". Webhook-style events make the generated app the thing a vendor calls
+directly, so it verifies callers itself (PRD resolved q32). Auth is declared
+**per trigger, never server-wide**, for the reason a built-in is declared per
+node (§5.5): who may invoke this flow must be readable off the trigger that
+exposes it.
+
+```yaml
+triggers:
+  intake:
+    type: http
+    flow: flow.support
+    respond: async
+    callback: "payload.body.callback_url"
+    auth:                            # exactly ONE of bearer | hmac
+      hmac:
+        secret: ${WEBHOOK_SECRET}    # required; env-ref value form only
+        header: X-Hub-Signature-256  # default X-Signature
+        algorithm: sha256            # sha1 | sha256 | sha512; default sha256
+        encoding: hex                # hex | base64; default hex
+        prefix: "sha256="            # default "" (empty)
+    callback_auth:                   # at least one of bearer/hmac; BOTH legal
+      bearer:
+        token: ${CALLBACK_TOKEN}     # required; env-ref value form only
+        header: Authorization        # default Authorization
+        prefix: "Bearer "            # default "Bearer "
+      hmac:
+        secret: ${CALLBACK_SECRET}   # required; env-ref value form only
+    callback_allow:
+      - "https://hooks.example.com/*"
+```
+
+- **`bearer`** compares a static secret against a named header — `Authorization`
+  with a `Bearer ` prefix by default. The comparison is **constant-time**: a
+  byte-by-byte early return leaks the secret to a caller who can time it.
+- **`hmac`** verifies a signature over the **raw request body bytes**, before any
+  JSON decoding and after none of it — a re-serialized body is a different byte
+  string and would fail every signature a vendor computed. `algorithm:`,
+  `encoding:`, `header:` and `prefix:` together spell the GitHub-shaped family
+  most webhook vendors speak.
+- **The secrets are `${ENV}` references** and nothing else, in both blocks and
+  both directions: a literal is a compile error, because a secret never lives in
+  the spec text (§4.3, Decision [D41](#d41-env-ref-forms-and-the-secret-field-list)).
+- **Exactly one scheme.** A block declaring neither, and a block declaring both,
+  are both compile errors: one request carries one credential, and a route that
+  verified either would be exactly as open as its weaker half.
+- Schemes whose signed payload is more than the body — Stripe's timestamped
+  `t.body` with a tolerance window — are **deferred**, not forgotten: each is a
+  vendor-specific shape, and genericizing them now is the support treadmill
+  resolved q30 refused. Vendor presets can grow later as a curated table on q30's
+  terms.
+
+**`auth:` covers three routes, not one.** The `resume` and `status` routes are
+per-execution, and resume *injects data into a parked run* — strictly more
+sensitive than starting one. So both enforce the auth of **the trigger that
+started that execution**: an execution an authenticated trigger began never
+answers an unauthenticated poll or resume, and an execution a no-auth trigger
+began keeps open routes (PRD resolved q32). `run` is untouched — no server, no
+caller to verify.
+
+**Identifying the delivery: `callback_auth:` and `callback_allow:`.** Outbound
+auth is opt-in and mirrors the inbound pair, so one verification recipe serves
+both directions. `bearer` sends a static token on every delivery; `hmac` signs
+the delivered body. Unlike `auth:`, **both together are legal** — a receiver that
+checks a token and a receiver that verifies a signature are two receivers, and
+one trigger may deliver to a receiver that does both (PRD resolved q33).
+
+**Declaring `callback_auth:` makes `callback_allow:` mandatory**, and that is a
+compile error rather than a warning
+(Decision [D126](#d126-callback_auth-makes-callback_allow-mandatory)). The
+callback URL comes from the trigger payload
+([D110](#d110-an-absent-value-fails-the-read-and-an-absent-output-field-writes-nothing))
+and is attacker-controlled by construction, so a deployment careful enough to
+authenticate its deliveries must not hand them — credential and all — to whatever
+host a payload named. A URL outside the list is refused **when it is read**, at
+parking or at settle rather than at start, and recorded as a refused delivery
+rather than as anybody's failure.
+
+**A trigger with a `callback:` and no `callback_auth:` is a documented test
+posture**: it signs nothing, claims nothing, and may POST anywhere. That is the
+shape a localhost receiver wants, it needs no allowlist, and it is stated here
+because shipping it is a choice rather than an oversight. `http` URLs stay legal
+in the allowlist for the same reason. Private-IP and DNS-rebinding hardening is
+**out of v1 scope**: SSRF-hardened egress is the gateway's job in the deployments
+that need one.
+
+**Allowlist patterns** (Decision
+[D127](#d127-a-callback-allowlist-entry-is-a-wildcard-url-and-the-delivery-wire-is-fixed)):
+each entry is an absolute URL whose scheme is `http` or `https`, with `*` meaning
+"any run of characters" — one wildcard kind, matched against the **whole**
+callback URL string, with no `**` distinction (a URL is not a path tree). An
+entry naming no scheme, an unsupported scheme, or an empty or whitespace-bearing
+value is a compile error, and so is an **empty list**: an allowlist that admits
+nothing refuses every delivery, which is a webhook that can never fire.
+`callback_auth:` or `callback_allow:` on a trigger with **no `callback:`** is a
+compile error too, the mirror of `timeout:` on an async trigger
+([D81](#d81-timeout-is-illegal-on-an-async-http-trigger)): the key describes a
+delivery this trigger never makes.
+
+**The delivery wire.** A callback fires on lifecycle events — every quiescence
+that opened new pauses, and settle — carrying the status route's report plus
+delivery metadata (PRD resolved q34, q35). Every delivery carries these headers,
+and they are normative:
+
+| Header | Value |
+|---|---|
+| `X-AgentCompose-Event` | `parked` or `settled` |
+| `X-AgentCompose-Delivery` | the delivery id, `<execution_id>:<ordinal>` |
+| `X-AgentCompose-Ordinal` | the event ordinal, an integer |
+| `X-AgentCompose-Timestamp` | ISO-8601 |
+| `X-AgentCompose-Signature` | `sha256=<hex hmac-sha256 of the body>` — with `callback_auth.hmac` only |
+
+With `callback_auth.bearer`, the configured `header:` carries `prefix:` followed
+by the token. Outbound `hmac:` takes **no** keys but `secret:`: signing is fixed
+at HMAC-SHA256 written in hex, so one receiver-side recipe verifies every
+agent-compose deployment. Deliveries are journaled and at-least-once with bounded
+retry, so a parking delivery and a settle delivery **can arrive out of order**:
+receivers order by `X-AgentCompose-Ordinal`, never by arrival (PRD resolved q35).
+
+The runtime half of all of this — verifying, signing, matching, delivering — is
+M3's; §13.3 is the grammar it is written against.
 
 ### 13.4 `schedule` (RESERVED grammar — parsed and validated, no-op in v0)
 
@@ -6684,6 +6811,103 @@ embedded code, so a listing left running is a core taken from every other
 execution in the same process. The walk also hands the event loop back as it
 goes, because a deadline is a timer and a timer cannot fire inside work that
 never yields. *PRD resolved q31, §5.5, §9.2.*
+
+### D125. Inbound `auth:` is one scheme per trigger, with env-ref secrets
+
+An `http` trigger's `auth:` block declares **exactly one** of `bearer:` and
+`hmac:`; a block declaring neither and a block declaring both are each a compile
+error naming the repair, and both blocks' secrets take the env-ref value form
+alone (§13.3, §4.3).
+
+**Rationale**. PRD resolved q32 settles the two kinds and settles that auth is
+**per trigger**; what this entry fixes is the shape. *Exactly one* rather than a
+set, because one request carries one credential: a route that accepted either a
+bearer token or a signature would be exactly as open as its weaker half, and
+"which one did this caller use" is not a question the deployment gets to answer
+after the fact. It is the shape a `tool.*` implementation binding already takes
+([D25](#d25-tool-defs-require-description-input-and-output-and-exactly-one-binding)),
+and it is refused the same way — `missing-key` naming both spellings,
+`conflicting-keys` on the second — so an author meets one rule twice rather than
+two rules once each. *Env refs only* is [D41](#d41-env-ref-forms-and-the-secret-field-list)
+applied to two new field names: a `token:` or `secret:` written as a literal is
+a credential committed to a repository, which is the failure §4.3 exists to
+prevent, and the value form is what makes `validate` able to say so without ever
+holding the secret.
+
+**Why not vendor presets** — `auth: { github: … }`, `auth: { stripe: … }` —
+which is the shape an author coming from a webhook vendor's documentation would
+reach for first. That is the **support treadmill** resolved q30 refused for
+server tools, arriving through a second door: a preset is a promise to track a
+vendor's signing scheme across releases, and a vendor that changes one leaves
+every deployment pinned to a compiler release rather than to a configuration.
+The configurable `hmac:` covers the GitHub-shaped family — digest, encoding,
+header, prefix — which is what most vendors actually speak, and the schemes it
+cannot express (Stripe's timestamped `t.body` with a tolerance window) are named
+out of scope in §13.3 rather than half-modelled. Presets can grow later as a
+curated table on q30's own terms, and adding one then breaks nothing written
+against this shape. *PRD resolved q32, §13.3, §4.3, G3.*
+
+### D126. `callback_auth:` makes `callback_allow:` mandatory
+
+Declaring `callback_auth:` on an `http` trigger makes `callback_allow:` a
+required key of that trigger, reported as its own diagnostic class,
+`missing-callback-allowlist` (§13.3). Neither key is legal on a trigger with no
+`callback:`.
+
+**Rationale**. PRD resolved q33 ratifies the rule; this entry records that it is
+an **error rather than a warning**, and why the asymmetry with a plain callback
+is the right one. The callback URL is read from the request payload
+([D110](#d110-an-absent-value-fails-the-read-and-an-absent-output-field-writes-nothing)),
+so it is attacker-controlled by construction. A deployment that attaches a
+credential to its deliveries and does not say where they may go will hand that
+credential to whichever host a payload named — and a warning is precisely the
+wrong instrument for it, because the composition that ships is the one that
+validated. A trigger declaring **no** outbound auth is untouched: it signs
+nothing, claims nothing, may POST anywhere, and §13.3 says so in as many words,
+because the test posture is worth being able to write and worth recognising in
+review.
+
+The code is its own rather than a `missing-key` for the reason
+`missing-credential` is
+([D120](#d120-a-keyless-anthropic-or-openai-provider-names-its-endpoint)): what
+is absent is decided by a sibling value, and the repair is a choice of two —
+declare the allowlist, or drop the auth. The **no-`callback:`** half is
+[D81](#d81-timeout-is-illegal-on-an-async-http-trigger)'s posture rather than a
+new one: a key describing a delivery the trigger never makes changes nothing
+observable, and a key whose author expected it to do something gets a diagnostic
+rather than silence. *PRD resolved q33, §13.3, G3.*
+
+### D127. A callback allowlist entry is a wildcard URL, and the delivery wire is fixed
+
+A `callback_allow:` entry is an absolute `http`/`https` URL in which `*` matches
+any run of characters, matched against the whole callback URL; the list is
+non-empty. Every delivery carries the `X-AgentCompose-*` headers §13.3
+tabulates, and outbound `hmac:` signing is HMAC-SHA256 in hex with no keys of
+its own (§13.3).
+
+**Rationale**. *One wildcard kind*, unlike §6.1's glob surfaces: `**` earns its
+existence where a path tree has a directory boundary to be significant about,
+and a URL has no such boundary — `*` against the whole string is what an author
+writing `https://hooks.example.com/*` already means, and a second wildcard would
+only invite the question of what it did differently. *Scheme-anchored*, because
+a match that could not name the scheme would let one entry admit URLs that merely
+begin with the same characters. *`http` stays legal*: localhost development is
+the common first case, and refusing it would push every author to a workaround
+worse than the rule. *Non-empty*, because an allowlist satisfied by nothing
+refuses every delivery — a statically visible webhook that can never fire, and
+the same guaranteed-dead-end posture §7.6.3 takes. Matching itself is a
+**runtime** rule: the URL does not exist until the payload arrives, so `validate`
+owns entry shape and nothing more.
+
+*The delivery wire is normative in the grammar* rather than left to the emitter
+because it is the half a **receiver** implements, and a receiver is code nobody
+in this repository writes. PRD resolved q34 and q35 fix what a delivery carries
+and that retries make ordering by arrival wrong; naming the exact headers here
+is what lets a receiver be written against the language rather than against an
+observed release. Outbound signing takes no `algorithm:`/`encoding:` for the same
+reason: one recipe verifying every agent-compose deployment is worth more than a
+knob, and the inbound block is where a vendor's choices have to be matched
+because there the vendor made them. *PRD resolved q33, q34, q35, §13.3.*
 
 ---
 

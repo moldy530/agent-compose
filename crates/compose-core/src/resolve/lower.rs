@@ -641,6 +641,12 @@ fn trigger(source: &ast_trigger::Trigger) -> Option<ir::Trigger> {
                 respond: http.respond.as_ref().map(|respond| respond.value),
                 timeout: http.timeout.clone(),
                 callback: http.callback.clone(),
+                auth: optional(http.auth.as_ref(), inbound_auth)?,
+                callback_auth: optional(http.callback_auth.as_ref(), callback_auth)?,
+                callback_allow: http
+                    .callback_allow
+                    .as_ref()
+                    .map(|allow| allow.patterns.clone()),
             })
         }
         ast_trigger::TriggerKind::Schedule(schedule) => {
@@ -666,6 +672,69 @@ fn trigger(source: &ast_trigger::Trigger) -> Option<ir::Trigger> {
         span: source.span.clone(),
         kind,
     })
+}
+
+/// Lower an inbound `auth:` block, applying grammar 13.3's defaults.
+///
+/// This is where the defaults land, rather than being left to whoever reads the
+/// artifact: a header name, a digest, an encoding and a prefix together decide
+/// whether a caller's credential verifies, and a reader that re-derived one of
+/// them differently would not fail a build — it would accept the wrong request
+/// (PRD resolved q32).
+fn inbound_auth(source: &Spanned<ast_trigger::AuthScheme>) -> Option<ir::trigger::InboundAuth> {
+    Some(match &source.value {
+        ast_trigger::AuthScheme::Bearer(bearer) => {
+            ir::trigger::InboundAuth::Bearer(bearer_auth(bearer)?)
+        }
+        ast_trigger::AuthScheme::Hmac(hmac) => {
+            ir::trigger::InboundAuth::Hmac(ir::trigger::HmacAuth {
+                secret: hmac.secret.clone()?,
+                header: text_or(hmac.header.as_ref(), ast_trigger::HmacAuth::DEFAULT_HEADER),
+                algorithm: hmac
+                    .algorithm
+                    .as_ref()
+                    .map_or(ast_trigger::HmacAlgorithm::DEFAULT, |value| value.value),
+                encoding: hmac
+                    .encoding
+                    .as_ref()
+                    .map_or(ast_trigger::SignatureEncoding::DEFAULT, |value| value.value),
+                prefix: text_or(hmac.prefix.as_ref(), ast_trigger::HmacAuth::DEFAULT_PREFIX),
+            })
+        }
+    })
+}
+
+/// Lower a `bearer:` block, inbound or outbound: one shape, one pair of defaults
+/// (grammar 13.3).
+fn bearer_auth(source: &ast_trigger::BearerAuth) -> Option<ir::trigger::BearerAuth> {
+    Some(ir::trigger::BearerAuth {
+        token: source.token.clone()?,
+        header: text_or(
+            source.header.as_ref(),
+            ast_trigger::BearerAuth::DEFAULT_HEADER,
+        ),
+        prefix: text_or(
+            source.prefix.as_ref(),
+            ast_trigger::BearerAuth::DEFAULT_PREFIX,
+        ),
+    })
+}
+
+/// Lower a `callback_auth:` block (grammar 13.3, PRD resolved q33).
+fn callback_auth(source: &Spanned<ast_trigger::CallbackAuth>) -> Option<ir::trigger::CallbackAuth> {
+    Some(ir::trigger::CallbackAuth {
+        bearer: optional(source.value.bearer.as_ref(), bearer_auth)?,
+        hmac: optional(source.value.hmac.as_ref(), |hmac| {
+            Some(ir::trigger::CallbackHmac {
+                secret: hmac.secret.clone()?,
+            })
+        })?,
+    })
+}
+
+/// A declared string, or the default the grammar gives it when it is absent.
+fn text_or(declared: Option<&Spanned<String>>, default: &str) -> String {
+    declared.map_or_else(|| default.to_owned(), |value| value.value.clone())
 }
 
 // --- the deploy layer -----------------------------------------------------

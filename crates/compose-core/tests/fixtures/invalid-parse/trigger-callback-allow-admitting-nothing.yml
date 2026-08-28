@@ -1,0 +1,11 @@
+# rule: a `callback_allow:` list admits at least one URL (grammar 13.3, PRD resolved q33)
+# code: invalid-value
+# message: the `callback_allow` of trigger `intake` admits no URL
+# at: 11:21
+# help: an allowlist matched against every callback URL and satisfied by none refuses every delivery, so an empty list is a webhook that can never fire: name the patterns this trigger may POST to, or drop `callback_allow:` and `callback_auth:` together (grammar 13.3, PRD resolved q33)
+triggers:
+  intake:
+    type: http
+    flow: flow.support
+    callback: "payload.body.callback_url"
+    callback_allow: []

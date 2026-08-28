@@ -1,0 +1,12 @@
+# rule: `callback_auth:` needs a `callback:` to authenticate (grammar 13.3, PRD resolved q33)
+# code: conflicting-keys
+# message: `callback_auth` is not legal on trigger `intake`, which declares no `callback`
+# at: 10:5
+# help: both keys describe how a completion webhook is delivered, and a trigger with no `callback:` delivers none: declare the webhook, or drop the key (grammar 13.3, PRD resolved q33)
+triggers:
+  intake:
+    type: http
+    flow: flow.support
+    callback_auth:
+      hmac:
+        secret: ${CALLBACK_SECRET}
