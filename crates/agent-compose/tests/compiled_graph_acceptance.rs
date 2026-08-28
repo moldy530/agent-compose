@@ -16760,6 +16760,23 @@ fn completed(app: &Client, execution: &str, credential: impl Fn(Request) -> Requ
     })
 }
 
+/// The `X-Hub-Signature-256` the `signed` and `sealed` triggers expect over
+/// these bytes — the prefix, algorithm and encoding both declare.
+///
+/// The argument is **bytes** and never a `Value`, because the whole property
+/// under test is that the digest is over what a request carried rather than over
+/// something either side re-serialized: a helper taking a value would hash a
+/// string the app never saw, and would agree with a build that hashed one too.
+fn events_signature(bytes: &[u8]) -> String {
+    format!(
+        "sha256={}",
+        harness::hmac_sha256(
+            harness::credential(harness::EVENTS_SECRET).as_bytes(),
+            bytes,
+        )
+    )
+}
+
 /// A request to the `signed` trigger, signed the way its `hmac:` expects.
 ///
 /// The signature is over the **bytes this request carries** rather than over a
@@ -16768,13 +16785,10 @@ fn completed(app: &Client, execution: &str, credential: impl Fn(Request) -> Requ
 /// string, and a verifier that did that would refuse every genuine delivery.
 fn signed_request(path: &str, body: &Value) -> Request {
     let bytes = serde_json::to_vec(body).expect("a JSON body");
-    let signature = harness::hmac_sha256(
-        harness::credential(harness::EVENTS_SECRET).as_bytes(),
-        &bytes,
-    );
+    let signature = events_signature(&bytes);
     Request::post(path)
         .header("content-type", "application/json")
-        .header("X-Hub-Signature-256", format!("sha256={signature}"))
+        .header("X-Hub-Signature-256", signature)
         .bytes(bytes)
 }
 
@@ -17170,6 +17184,129 @@ fn an_executions_status_and_resume_enforce_the_auth_of_the_trigger_that_started_
     );
 }
 
+/// A **signed** execution's status and resume routes verify a signature over
+/// the body of the request that arrived — which, for a `GET`, is no body at all
+/// (grammar 13.3's "covers three routes, not one", PRD resolved q32).
+///
+/// The pair above runs entirely on `bearer`, where all three routes take one
+/// value and a build could read it from anywhere. `hmac` is the half where "the
+/// auth of the trigger that started this execution" is a *different* credential
+/// per request, and two plausible builds satisfy every bearer assertion in this
+/// suite: one that verifies the resume route over the decoded-and-re-serialized
+/// payload, and one that verifies it over the empty body the status route signs.
+/// Both are offered here and both have to be refused, over a body whose bytes no
+/// serializer would emit — the spaces are the point, because they are what makes
+/// the payload as sent and the payload as decoded two different byte strings.
+///
+/// The refusals are also checked for what they left behind: the pause is still
+/// waiting afterwards, so a wrong digest consumed no turn.
+#[test]
+fn a_signed_executions_status_and_resume_verify_over_each_requests_own_body() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_shims, _log, environment) = events_environment(&provider, "events-signed-routes");
+    let Some(project) = harness::scratch_project("events-signed-routes") else {
+        return;
+    };
+    let Some(served) = harness::serve_into(&project, "http-events", &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+
+    let topic = json!({ "topic": "signed routes" });
+    let started = app
+        .send(signed_request("/sealed", &topic))
+        .expect("the trigger's route answers");
+    assert_eq!(started.status, 202, "{}", started.text());
+    let execution = started.json()["execution_id"]
+        .as_str()
+        .expect("an execution id")
+        .to_string();
+    let poll = format!("/executions/{execution}");
+
+    let unsigned = app.get(&poll).expect("the status route answers");
+    assert_eq!(unsigned.status, 401, "{}", unsigned.text());
+    assert_eq!(unsigned.json()["scheme"], "hmac", "{}", unsigned.text());
+    assert_eq!(unsigned.json()["trigger"], "sealed", "{}", unsigned.text());
+
+    // A signature over the payload that *started* the execution is a signature
+    // over a body this request does not carry — the shape a client that reused
+    // the start request's header would send.
+    let stale = events_signature(&serde_json::to_vec(&topic).expect("a JSON body"));
+    let wrong = app
+        .send(Request::get(&poll).header("X-Hub-Signature-256", stale))
+        .expect("the status route answers");
+    assert_eq!(wrong.status, 401, "{}", wrong.text());
+
+    // A `GET` carries no body, so what it signs is none of it.
+    let nothing = events_signature(b"");
+    let published = harness::until(Duration::from_secs(30), || {
+        let held = app
+            .send(Request::get(&poll).header("X-Hub-Signature-256", nothing.clone()))
+            .expect("the status route answers");
+        assert_eq!(held.status, 200, "{}", held.text());
+        let report = held.json();
+        (report["status"] == "interrupted").then_some(report)
+    });
+    let resume_url = published["interrupts"].as_array().expect("the pauses")[0]["resume_url"]
+        .as_str()
+        .expect("a resume url")
+        .to_string();
+
+    let answer = br#"{ "decision" : "approve" }"#;
+    let decoded = br#"{"decision":"approve"}"#;
+    for (what, signature) in [
+        (
+            "a digest over the payload as a decoder hands it back",
+            events_signature(decoded),
+        ),
+        (
+            "a digest over the empty body the status route signs",
+            nothing.clone(),
+        ),
+    ] {
+        let refused = app
+            .send(
+                Request::post(&resume_url)
+                    .header("content-type", "application/json")
+                    .header("X-Hub-Signature-256", signature)
+                    .bytes(answer.to_vec()),
+            )
+            .expect("the resume route answers");
+        assert_eq!(refused.status, 401, "{what}: {}", refused.text());
+        assert_eq!(
+            refused.json()["scheme"],
+            "hmac",
+            "{what}: {}",
+            refused.text()
+        );
+    }
+
+    let still = app
+        .send(Request::get(&poll).header("X-Hub-Signature-256", nothing.clone()))
+        .expect("the status route answers");
+    assert_eq!(
+        still.json()["status"],
+        "interrupted",
+        "a refused answer consumed no turn: {}",
+        still.text()
+    );
+
+    let answered = app
+        .send(
+            Request::post(&resume_url)
+                .header("content-type", "application/json")
+                .header("X-Hub-Signature-256", events_signature(answer))
+                .bytes(answer.to_vec()),
+        )
+        .expect("the resume route answers");
+    assert_eq!(answered.status, 202, "{}", answered.text());
+
+    let finished = completed(&app, &execution, |request| {
+        request.header("X-Hub-Signature-256", events_signature(b""))
+    });
+    assert_eq!(finished["outputs"]["decision"], "approve", "{finished}");
+}
+
 /// One parking, one settle, in ascending ordinals, each carrying the report the
 /// status route serves (grammar 13.3, PRD resolved q34).
 ///
@@ -17459,6 +17596,131 @@ fn a_callback_url_the_allowlist_admits_nowhere_is_refused_and_the_run_settles() 
         receiver.delivered().is_empty(),
         "nothing was sent: {:?}",
         receiver.delivered()
+    );
+}
+
+/// A callback URL that hides its host behind **userinfo** is a refused delivery,
+/// whatever the text of the list says about it (grammar 13.3, Decision D127).
+///
+/// `callback_allow:` is matched against the URL as a string, and a string is not
+/// where a URL's authority ends: everything before an `@` is userinfo, and the
+/// host is what follows it. So `http://127.0.0.1:9000@elsewhere/allowed` begins
+/// with `http://127.0.0.1:` and holds `/allowed`, which is every literal the
+/// entry `http://127.0.0.1:*/allowed*` asks for — the entry this fixture writes
+/// because a loopback receiver binds a port the operating system chose, and the
+/// entry any deployment with a per-tenant or per-environment port writes too.
+/// What would travel to the host after the `@` is the execution's whole report,
+/// under `X-AgentCompose-Signature` and a `callback_auth: bearer` token written
+/// to a header name of the composition's choosing.
+///
+/// The two runtimes a built project runs under do not even agree what such a URL
+/// means — one drops the userinfo and delivers, the other refuses to construct
+/// the request — so the assertion is on the *refusal* rather than on a
+/// blackhole staying quiet alone: a build that happened to throw would leave a
+/// `pending` row and an attempt, and a build that delivered would leave a
+/// `delivered` one. The detail is checked for **not** being the list's own
+/// refusal sentence, because an entry that stopped matching this URL's text
+/// would make the whole test pass for the wrong reason.
+#[test]
+fn a_callback_url_that_hides_its_host_behind_userinfo_is_refused() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_shims, _log, mut environment) = events_environment(&provider, "events-userinfo");
+    // One offset, so a build that *did* send would exhaust rather than spend
+    // fifteen minutes proving it.
+    environment.push((harness::CALLBACK_RETRY.to_string(), "0s".to_string()));
+    let elsewhere = harness::Blackhole::start().expect("a loopback socket");
+    let Some(project) = harness::scratch_project("events-userinfo") else {
+        return;
+    };
+    let Some(served) = harness::serve_into(&project, "http-events", &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+
+    let host = elsewhere
+        .base_url
+        .strip_prefix("http://")
+        .expect("the blackhole's base url names its scheme");
+    let callback = format!("http://127.0.0.1:9000@{host}/allowed");
+    let started = app
+        .send(
+            Request::post("/watched")
+                .json(&json!({ "topic": "userinfo", "callback_url": callback }))
+                .header("authorization", events_bearer()),
+        )
+        .expect("the trigger's route answers");
+    assert_eq!(
+        started.status,
+        202,
+        "the URL is read at the delivery, not at the start: {}",
+        started.text()
+    );
+    let execution = started.json()["execution_id"]
+        .as_str()
+        .expect("an execution id")
+        .to_string();
+
+    let poll = format!("/executions/{execution}");
+    let refused = harness::until(Duration::from_secs(30), || {
+        let report = app
+            .send(Request::get(&poll).header("authorization", events_bearer()))
+            .expect("the status route answers")
+            .json();
+        (report["deliveries"].as_array().map(Vec::len) == Some(1)).then_some(report)
+    });
+    let recorded = &refused["deliveries"].as_array().expect("the deliveries")[0];
+    assert_eq!(recorded["status"], "refused", "{recorded}");
+    assert_eq!(recorded["event"], "parked", "{recorded}");
+    assert!(
+        recorded["attempts"].as_array().is_some_and(Vec::is_empty),
+        "a refused delivery was never attempted: {recorded}"
+    );
+    let detail = recorded["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("userinfo"),
+        "…and it says which rule refused it: {recorded}"
+    );
+    assert!(
+        !detail.contains("matches no `callback_allow` entry"),
+        "the list admits this URL's text — the list's own refusal here would mean the entry \
+         `http://127.0.0.1:*/allowed*` stopped matching and this test proves nothing: {recorded}"
+    );
+
+    let resume_url = refused["interrupts"].as_array().expect("the pauses")[0]["resume_url"]
+        .as_str()
+        .expect("a resume url")
+        .to_string();
+    let answered = app
+        .send(
+            Request::post(&resume_url)
+                .json(&json!({ "decision": "approve" }))
+                .header("authorization", events_bearer()),
+        )
+        .expect("the resume route answers");
+    assert_eq!(answered.status, 202, "{}", answered.text());
+
+    let finished = harness::until(Duration::from_secs(30), || {
+        let report = app
+            .send(Request::get(&poll).header("authorization", events_bearer()))
+            .expect("the status route answers")
+            .json();
+        (report["status"] == "completed"
+            && report["deliveries"].as_array().map(Vec::len) == Some(2))
+        .then_some(report)
+    });
+    assert_eq!(
+        finished["deliveries"].as_array().expect("the deliveries")[1]["status"],
+        "refused",
+        "{finished}"
+    );
+    assert_eq!(
+        finished["outputs"]["decision"], "approve",
+        "a refused delivery is nobody's failure: {finished}"
+    );
+    assert_eq!(
+        elsewhere.reached(),
+        0,
+        "the host after the `@` was never connected to"
     );
 }
 

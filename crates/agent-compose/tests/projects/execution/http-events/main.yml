@@ -15,6 +15,12 @@
 #     the half a bearer token cannot stand in for: a body tampered with after
 #     signing verifies differently, and a check that hashed a re-serialized
 #     payload would accept it.
+#   * `sealed` — the same `hmac:` scheme on the flow that **parks**, which is
+#     what `signed` cannot be: a signature covers three routes and not one, and
+#     what that costs a client differs per route because the credential is a
+#     digest of the request's own body. Only an execution that stays open long
+#     enough to be polled and answered can say what the status and resume routes
+#     ask for, and `signed`'s flow finishes before either is reachable.
 #   * `open` — no `auth:` at all, on the flow that parks. An execution a no-auth
 #     trigger began keeps open routes, and that half of resolved q32 needs a
 #     trigger of its own: a test that only watched a guarded execution refuse
@@ -284,6 +290,26 @@ triggers:
     flow: flow.note
     method: POST
     path: /signed
+    respond: async
+    input:
+      topic: "payload.body.topic"
+    auth:
+      hmac:
+        secret: ${EVENTS_SECRET}
+        header: X-Hub-Signature-256
+        algorithm: sha256
+        encoding: hex
+        prefix: "sha256="
+
+  # `signed`'s scheme on a flow that stays open, so the status and resume routes
+  # of one of its executions can be asked what an `hmac:` credential is on a
+  # route that carries no body and on one that carries a different body than the
+  # start did.
+  sealed:
+    type: http
+    flow: flow.review
+    method: POST
+    path: /sealed
     respond: async
     input:
       topic: "payload.body.topic"

@@ -1538,6 +1538,14 @@ const EVENTS: &[Criterion] = &[
                 "an_executions_status_and_resume_enforce_the_auth_of_the_trigger_that_started_it",
                 Status::Live,
             ),
+            // …and the scheme for which "the same auth" is a different
+            // credential on every request: an `hmac` signature is over the body
+            // that arrived, so the status route signs the empty one a `GET`
+            // carries and the resume route signs the answer exactly as sent.
+            (
+                "a_signed_executions_status_and_resume_verify_over_each_requests_own_body",
+                Status::Live,
+            ),
             // …and the half one process cannot decide: the trigger is on the
             // journal's lifecycle row, so a `serve` restarted while somebody was
             // thinking goes on refusing the same callers.
@@ -1559,6 +1567,14 @@ const EVENTS: &[Criterion] = &[
             // is a recorded refusal rather than anybody's failure.
             (
                 "a_callback_url_the_allowlist_admits_nowhere_is_refused_and_the_run_settles",
+                Status::Live,
+            ),
+            // …and the URL whose text the list admits and whose *host* it never
+            // named: everything before an `@` is userinfo, so an entry with a
+            // wildcard where the port goes matches a string that resolves
+            // somewhere else entirely.
+            (
+                "a_callback_url_that_hides_its_host_behind_userinfo_is_refused",
                 Status::Live,
             ),
             // The list is matched **whenever** the URL is read, which includes
