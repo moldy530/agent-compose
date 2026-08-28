@@ -483,6 +483,15 @@ what lets a restart resume a delivery where it left off — a row with two
 attempts on it resumes at the third offset, due at `intendedAt + 60s`, which may
 already be in the past.
 
+**One attempt waits ten seconds for a receiver**, and that bound is normative
+too. A schedule is only bounded if its attempts are: a receiver that completes
+the connection and never answers would otherwise hold one attempt open for the
+life of the process, leaving a delivery neither retried nor exhausted and an
+execution that finished minutes ago reported as still owing a webhook. An
+attempt that runs out of time is a failed attempt like any other — recorded, and
+followed by the next offset. Nothing configures it; a deployment that needed a
+longer one is a deployment whose receiver is the thing to fix.
+
 **`AGENT_COMPOSE_CALLBACK_RETRY` overrides the schedule** with a comma-separated
 list of `docs/grammar.md` §4.4 durations — `AGENT_COMPOSE_CALLBACK_RETRY=0s,1s,2s`
 is three attempts, the first at once. It is a **diagnostic and test surface**
@@ -517,7 +526,28 @@ open execution of a flow this build no longer declares: a delivery whose
 identity that trigger's `callback_auth:` promised its receiver, and delivering
 without it is a request a receiver written against the promise refuses — or
 worse, accepts. So the row stays `pending` for a build that declares the
-trigger, and the reason is written on stderr.
+trigger, and the reason is written on stderr. The row is **written** either way:
+an event that happened and was recorded nowhere would be both unrecoverable and
+invisible — no restart could find it and the status route would show a settle
+nobody was ever told about — so the intent goes down under its ordinal like any
+other and only the sending waits.
+
+Which is also where such a row meets `callback_allow:`. The allowlist belongs to
+the trigger, so a row journaled by a build that had none of it has never been
+matched against one; the build that declares the trigger again matches it as it
+picks the row up, and a URL the list admits nowhere becomes `refused` **on that
+row** rather than as a second event. The ordinal counts lifecycle events, and the
+event did not happen twice.
+
+**The `settled` intent is recorded before the lifecycle row closes.** It is the
+same rule as "before the first attempt", one step further back, and it is what
+`recover` needs to be able to help: an execution whose row is already
+`completed` is one no start will replay, so a delivery first journaled *after*
+the close and interrupted before it lands is owed to a caller who — having been
+handed a `202` under `respond: async` — is not polling. The emitted `runFlow`
+takes a `closing` hook for it, called on exactly the paths that close the row,
+which is also what keeps §7's divergence silent: a row that stays open never
+reaches one.
 
 **Where it is implemented.** `deliver`, `opening`, `attempts` and
 `attemptDelivery` in the emitted `src/serve.ts`, over the delivery interface of
@@ -526,7 +556,9 @@ that reaches the network for a delivery, which is why §3's primitive walk names
 it as an exemption and
 `crates/compose-core/src/codegen/journal.rs`'s
 `a_delivery_is_journaled_before_it_is_attempted` binds the order this section
-states.
+states. What the deliveries *report* — one webhook per parking, listing every
+pause then open — is `serve.ts`'s `parking` over `runtime.quiescent`, and PRD
+resolved q34 is where that rule is stated.
 
 ## 4. Keys
 
@@ -1019,6 +1051,15 @@ which is the failure §11.3's last bullet is about. What such an execution does
 not have is a record of the deliveries an older build never made, so its first
 parking under this build announces the pauses it is holding. That is a webhook a
 receiver dedupes or ignores, not a replay that re-issues an effect.
+
+That claim is **executed rather than asserted**: `crates/agent-compose`'s
+`a_journal_written_before_the_delivery_ledger_opens_and_serves_under_this_build`
+strips the `deliveries` table and the lifecycle row's `callback` column from a
+real journal — the file a build before this one wrote — and restarts `serve`
+over it, which is the only way to find out that a compatible change stayed
+compatible. A column added to an existing table is the case that is *not*
+covered by `CREATE TABLE IF NOT EXISTS`, and needs the `PRAGMA table_info` probe
+the two migrations beside it use.
 
 ### 11.3 What requires a version bump
 

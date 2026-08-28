@@ -401,6 +401,17 @@ export interface Journal {
    * simply was not one this deployment may deliver to.
    */
   refuseDelivery(intent: DeliveryIntent, reason: string): DeliveryRecord;
+  /**
+   * Refuse a delivery this journal already holds **pending**, without an
+   * attempt.
+   *
+   * The one row that reaches this is the one a build with no declaration of the
+   * execution's trigger recorded and could not match: the allowlist belongs to
+   * that trigger, so the URL is held against it by the first build that has it
+   * (`docs/durability.md` §3.7). A row already delivered, refused or exhausted
+   * is left as it is — an outcome is not overwritten by a later reading of it.
+   */
+  refuseRecorded(execution: string, ordinal: number, reason: string): void;
   /** Record what one attempt did, and where the delivery stands after it. */
   recordAttempt(
     execution: string,
@@ -658,6 +669,16 @@ class SqliteJournal implements Journal {
       ],
     );
     return record;
+  }
+
+  refuseRecorded(execution: string, ordinal: number, reason: string): void {
+    // `status = 'pending'` in the predicate rather than read first: a row that
+    // has already been delivered, refused or exhausted has an outcome, and one
+    // statement that will not touch it is better than two that could race.
+    this.#database.run(
+      "UPDATE deliveries SET status = 'refused', settled_at = ?, detail = ? WHERE execution = ? AND ordinal = ? AND status = 'pending'",
+      [new Date().toISOString(), reason, execution, ordinal],
+    );
   }
 
   recordAttempt(

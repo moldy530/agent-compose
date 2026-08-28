@@ -114,6 +114,12 @@
 // trigger and the scheme and **nothing else** — echoing any part of a
 // credential, even the one that arrived, would put it in a log somebody ships.
 //
+// A credential that resolved to the **empty string** is refused at launch rather
+// than served: `src/env.ts` counts an empty variable as present, which is the
+// right rule for a region or a base URL and the wrong one for a token that would
+// then compare equal to the one every anonymous caller sends (see
+// [`blankCredentials`]).
+//
 // The subtle clause is that `auth:` covers **three** routes rather than one.
 // `resume` injects data into a parked run and `status` publishes what a run is
 // holding, and both are per execution rather than per trigger — so each enforces
@@ -127,11 +133,14 @@
 //
 // A trigger's `callback:` is a subscription to the execution's **lifecycle**
 // rather than only to its end. Two events reach it: a **parking**, one webhook
-// per quiescence listing every pause then open, and the **settle** that closes
-// the lifecycle row. Each carries the report the status route serves and the
-// `X-AgentCompose-*` headers grammar 13.3 tabulates, signed and identified by
-// `callback_auth:` where the trigger declares one, and refused before it is
-// sent where `callback_allow:` admits its URL nowhere.
+// per quiescence listing every pause then open — a quiescence being the moment
+// every branch of the execution has parked or finished, which
+// `runtime.quiescent` decides and [`parking`] waits for — and the **settle**,
+// journaled by the run itself immediately before it closes the lifecycle row.
+// Each carries the report the status route serves and the `X-AgentCompose-*`
+// headers grammar 13.3 tabulates, signed and identified by `callback_auth:`
+// where the trigger declares one, and refused before it is sent where
+// `callback_allow:` admits its URL nowhere.
 //
 // Deliveries are **journaled effects of their own** (`docs/durability.md` §3.7):
 // the intent is recorded before the first attempt, each attempt's outcome after
@@ -155,10 +164,13 @@ import {
   intendDelivery,
   journaledExecution,
   openExecutions,
+  quiescent,
   recordDeliveryAttempt,
   refuseDelivery,
+  refuseRecordedDelivery,
   undeliveredDeliveries,
   watchHumanPauses,
+  watchQuiescence,
 } from "./runtime.ts";
 import type * as runtime from "./runtime.ts";
 import { type HttpTrigger, httpTriggers } from "./triggers.ts";
@@ -244,6 +256,16 @@ interface Execution {
    * tells receivers that deliveries can arrive out of order.
    */
   deliveries: Promise<void>;
+  /**
+   * Whether this execution's `settled` delivery has already been queued.
+   *
+   * Written by [`closed`], which runs **inside** the run, before the lifecycle
+   * row closes. What reads it is [`settling`]'s tail, whose subject is the one
+   * settle the hook is never reached for: a run that failed before it was
+   * journaled at all. Without it that tail would push a second `settled` webhook
+   * for every ordinary run.
+   */
+  announced: boolean;
   outputs?: Record<string, unknown>;
   trace?: readonly runtime.TraceEntry[];
   error?: string;
@@ -324,6 +346,11 @@ export function createApp(): FastifyInstance {
   // that could not be run rather than a schedule nobody notices until the first
   // delivery is already late (Decision D50, `docs/durability.md` §3.7).
   retrySchedule();
+  // And, for the same reason one line up, a credential that resolved to nothing:
+  // a route mounted over one is open to everybody and says nothing about it
+  // (see [`blankCredentials`]).
+  const blank = blankCredentials();
+  if (blank.length > 0) throw new BlankCredentialError(blank);
   decodeBodies(app);
 
   for (const trigger of httpTriggers) {
@@ -500,8 +527,22 @@ function verified(trigger: HttpTrigger, request: FastifyRequest): Refusal | unde
     };
   }
   const offered = sent.slice(auth.prefix.length);
+  // **A credential that resolved to nothing verifies nothing.** `createApp`
+  // refuses to start a deployment holding one ([`blankCredentials`]), so this
+  // is the guard for the window that check cannot cover — an environment edited
+  // under a running process — and it is stated here as well as there because
+  // the two failures it prevents are the whole of what `auth:` is for: an empty
+  // expected token is equal to the empty token every anonymous caller can send,
+  // and an empty HMAC key signs a body anybody can sign.
+  const resolved = secret(auth.scheme === "bearer" ? auth.tokenEnv : auth.secretEnv);
+  if (resolved === "") {
+    return {
+      scheme: auth.scheme,
+      detail: "the credential this trigger verifies against is not set in this process",
+    };
+  }
   if (auth.scheme === "bearer") {
-    return equal(offered, secret(auth.tokenEnv))
+    return equal(offered, resolved)
       ? undefined
       : { scheme: "bearer", detail: "the credential does not match" };
   }
@@ -509,12 +550,51 @@ function verified(trigger: HttpTrigger, request: FastifyRequest): Refusal | unde
   // decoding and after none of it (grammar 13.3): a re-serialized body is a
   // different byte string and would fail every signature a vendor computed. See
   // [`decodeBodies`], which is what keeps those bytes.
-  const signed = createHmac(auth.algorithm, secret(auth.secretEnv))
-    .update(raw(request))
-    .digest(auth.encoding);
+  const signed = createHmac(auth.algorithm, resolved).update(raw(request)).digest(auth.encoding);
   return equal(offered, signed)
     ? undefined
     : { scheme: "hmac", detail: "the signature does not verify over this request's body" };
+}
+
+/**
+ * Every credential this composition's triggers declare that resolved to
+ * **nothing**, by variable name.
+ *
+ * `src/env.ts` decides *presence*, and presence there is `!== undefined`: a
+ * variable set to the empty string is set (grammar 4.3). That is the right rule
+ * for the class of value it is written about — a `base_url:`, a region — and the
+ * wrong one for a credential, because an empty one is not a missing setting but
+ * an **open door**: an empty bearer token compares equal to the empty token any
+ * caller can send, and an HMAC key of no bytes signs a body anybody can sign. So
+ * the four surfaces of grammar 13.3 are held to more than presence, and they are
+ * held to it at launch — one refusal a deployment meets on its first start,
+ * rather than a route that answers `401` to the caller holding the right token
+ * or a delivery signed with nothing.
+ */
+function blankCredentials(): readonly string[] {
+  const blank: string[] = [];
+  const named = (variable: string): void => {
+    if (secret(variable) === "" && !blank.includes(variable)) blank.push(variable);
+  };
+  for (const trigger of httpTriggers) {
+    const auth = trigger.auth;
+    if (auth?.scheme === "bearer") named(auth.tokenEnv);
+    if (auth?.scheme === "hmac") named(auth.secretEnv);
+    const delivery = trigger.callbackAuth;
+    if (delivery?.bearer !== undefined) named(delivery.bearer.tokenEnv);
+    if (delivery?.hmac !== undefined) named(delivery.hmac.secretEnv);
+  }
+  return blank;
+}
+
+/** What a trigger's `auth:` or `callback_auth:` named and this process cannot use. */
+export class BlankCredentialError extends Error {
+  constructor(blank: readonly string[]) {
+    super(
+      `${blank.map((name) => `\`${name}\``).join(", ")} ${blank.length === 1 ? "is" : "are"} set to the empty string, and a trigger of this composition ${blank.length === 1 ? "verifies or signs with it" : "verifies or signs with them"}: an empty credential admits every caller and signs every delivery, so this app refuses to serve until ${blank.length === 1 ? "it is given a value" : "they are given values"} (grammar 13.3)`,
+    );
+    this.name = "BlankCredentialError";
+  }
 }
 
 /**
@@ -572,6 +652,11 @@ function header(request: FastifyRequest, name: string): string | undefined {
  * PRD resolved q15). The fallback is what keeps a comparison constant-time
  * rather than a `TypeError` that would answer `500` on the one request that
  * mattered.
+ *
+ * What that presence check does **not** cover is a variable set to the empty
+ * string, which it counts as set — so the empty string this answers is a real
+ * answer rather than only the unreachable one, and it is refused wherever it is
+ * read (see [`blankCredentials`], [`verified`]).
  */
 function secret(variable: string): string {
   return process.env[variable] ?? "";
@@ -593,6 +678,12 @@ function secret(variable: string): string {
  * what the requirement is about.
  */
 function equal(offered: string, expected: string): boolean {
+  // An expected credential of **no bytes** is equal to the credential an
+  // anonymous caller sends, so it is refused before the comparison rather than
+  // handed to one that would answer `true`. [`verified`] has already refused it
+  // by then; this is the statement made where the comparison is, so that no
+  // later caller of this can reintroduce it.
+  if (expected.length === 0) return false;
   const left = new TextEncoder().encode(offered);
   const right = new TextEncoder().encode(expected);
   if (left.length !== right.length) return false;
@@ -900,6 +991,7 @@ function resumeInto(
     ...(row.callback === undefined ? {} : { callback: row.callback }),
     reported,
     deliveries: Promise.resolve(),
+    announced: false,
     settled: Promise.resolve(),
   };
   // The replay has stopped: whatever it did or did not reach, nothing more is
@@ -921,6 +1013,10 @@ function resumeInto(
       resumable: true,
       trigger: row.trigger,
       resume: true,
+      // The `settled` webhook, journaled before this generation closes the row
+      // it recovered — see [`closed`]. A recovered execution owes the same push
+      // as any other and is the one most likely to be interrupted again.
+      closing: (produced, error) => closed(execution, produced, error),
     }),
   )
     .then(() => {
@@ -957,6 +1053,7 @@ function register(
     // Nothing has been announced about an execution that is one line old.
     reported: new Set<string>(),
     deliveries: Promise.resolve(),
+    announced: false,
     // Replaced immediately below. The record has to exist before the run does,
     // because the run's own handlers write into it.
     settled: Promise.resolve(),
@@ -981,6 +1078,8 @@ function register(
       // reason [`resumeInto`] reads it back: the process that finishes this
       // execution may not be this one.
       ...(callback === undefined ? {} : { callback }),
+      // The `settled` webhook, journaled before the row closes — see [`closed`].
+      closing: (produced, error) => closed(execution, produced, error),
     }),
   ).finally(unwatch);
   executions.set(id, execution);
@@ -1027,70 +1126,135 @@ function callbackOf(trigger: HttpTrigger, payload: Payload): string | undefined 
  * start replays it again. Reporting `failed` to the caller would be this
  * process's opinion delivered as the execution's outcome — and then the recovery
  * that completes it would deliver a *second* webhook for one execution, the
- * first of them wrong. So the guard is the lifecycle row: what stays open sends
- * nothing, and the process that finally closes the row is the one that pushes,
- * once.
+ * first of them wrong.
  *
- * **Which is read off the row itself**, rather than inferred from the error.
- * "This error is not one that keeps the row open" is a different question from
- * "this generation closed the row", and the two part company on every failure
- * raised *before* [`runtime.openExecution`] — a recovered execution whose
- * recorded inputs this build's `inputs:` no longer accept, a `session_key:` the
- * composition has since started requiring, a journal written by another compiler
- * release. Every one of those leaves the lifecycle row untouched and **open**,
- * and every one of them is an ordinary `Error` that [`runtime.staysOpen`] says
- * nothing about — so the inference pushes `failed`, and the start that finally
- * replays the execution pushes again. The row is the fact; this asks it.
+ * **So the push happens where the row closes**, which is inside the run:
+ * [`closed`] is `runFlow`'s `closing` hook, reached only on the paths that close
+ * the lifecycle row, and it journals the delivery's intent before the row goes.
+ * A process killed a millisecond later leaves a `pending` row a later start
+ * finishes; one that journaled the intent *after* the close would leave nothing
+ * at all, for an execution `recover` will never look at again.
+ *
+ * What is left for this tail is the one run the hook is never reached for: a
+ * failure raised **before** [`runtime.openExecution`] — a recovered execution
+ * whose recorded inputs this build's `inputs:` no longer accept, a
+ * `session_key:` the composition has since started requiring, a journal that
+ * could not be opened. Nothing is journaled about such a run at all, so nothing
+ * will ever recover it, and the absence of a row is exactly what says so.
  */
 function settling(execution: Execution, run: Promise<FlowRun>): Promise<void> {
   return run
     .then((answer) => {
-      execution.status = "completed";
-      execution.outputs = answer.outputs;
-      execution.trace = answer.trace;
-      return true;
+      recorded(execution, answer, undefined);
     })
     .catch(async (error: unknown) => {
-      execution.status = "failed";
-      execution.error = message(error);
-      const trace = (error as { trace?: readonly runtime.TraceEntry[] }).trace;
-      if (trace !== undefined) execution.trace = trace;
       // The status route still reports what *this* process saw — a reader
       // polling it is asking about this build — and that is the whole of the
       // difference: the report is this process's, the push is the execution's.
-      return !(await stillOpen(execution.id));
-    })
-    .then((finished) => {
-      if (!finished) return;
-      // Queued rather than awaited, for [`Execution.deliveries`]'s reason and
-      // for one more: a run must not stay `running` to a reader of
-      // [`Execution.settled`] for as long as a receiver takes to answer, and a
-      // receiver that never does would otherwise hold a recovery's
-      // catching-up window open for the whole retry schedule.
-      deliver(execution, "settled", []);
+      recorded(execution, undefined, error);
+      if (execution.announced) return;
+      // The one settle [`closed`] never hears about: a run that failed **before
+      // it was journaled at all** — its inputs refused by a flow whose
+      // `inputs:` this build has narrowed, a `session_key:` the composition has
+      // since started requiring, a journal that could not be opened. No row
+      // means no start will ever recover it, so the caller holding a `202` is
+      // owed the failure now and this process is the only one that can push it.
+      if (await unjournaled(execution.id)) deliver(execution, "settled", []);
     });
 }
 
 /**
- * Whether the journal still holds this execution **open** — the one question
- * [`settling`] has to answer before it pushes.
+ * Record what the run did on the execution's own report.
  *
- * An id the journal holds no row for is **not** open, and that is the right
- * answer rather than a missing case: it is a request whose run failed before it
- * could be journaled at all, so no start will ever recover it and the caller who
- * was handed a `202` is owed the failure now. What has a row and is still open
- * is the execution somebody else will finish.
- *
- * A journal this process cannot read answers `true`, because the honest reading
- * of "I cannot tell" here is the conservative one: a push that should not have
- * gone cannot be taken back, while a push that was owed is still delivered by
- * whichever process does close the row.
+ * Said in two places for one reason: [`closed`] makes this statement while the
+ * lifecycle row is still open, because the webhook it journals carries the
+ * report and the report is this. [`settling`] makes it again off the settled
+ * promise, which is where a run that never reached the hook — one that failed
+ * before it was journaled — is recorded. The two agree by construction: the same
+ * answer, written the same way.
  */
-async function stillOpen(execution: string): Promise<boolean> {
+function recorded(execution: Execution, answer: FlowRun | undefined, error: unknown): void {
+  if (answer !== undefined) {
+    execution.status = "completed";
+    execution.outputs = answer.outputs;
+    execution.trace = answer.trace;
+    return;
+  }
+  execution.status = "failed";
+  execution.error = message(error);
+  const trace = (error as { trace?: readonly runtime.TraceEntry[] }).trace;
+  if (trace !== undefined) execution.trace = trace;
+}
+
+/**
+ * Record this run's outcome and journal its `settled` delivery, **while the
+ * lifecycle row is still open**.
+ *
+ * `runFlow`'s `closing` hook, and the order is what it is for (resolved q35,
+ * `docs/durability.md` §3.7). A delivery whose intent went down *after* the row
+ * closed is one no restart can find: `recover` sees no open execution and the
+ * ledger holds no row, so a process killed in that window would owe a caller a
+ * push nothing would ever send — and by q34's own reasoning that caller is not
+ * polling, because the contract it was handed was a push.
+ *
+ * It is also what makes "a replay divergence fires nothing" (resolved q29)
+ * structural rather than checked: the hook is only reached where the row is
+ * about to close, and a divergence leaves it open.
+ *
+ * Only the **intent** is waited for. The attempts are not — [`opening`] sets
+ * them going and returns — so a run does not stay `running` to a reader for as
+ * long as a receiver takes to answer.
+ */
+async function closed(
+  execution: Execution,
+  produced: FlowRun | undefined,
+  error: unknown,
+): Promise<void> {
+  recorded(execution, produced, error);
+  execution.announced = true;
+  // **A settle is once per execution**, and the journal is what says so across
+  // generations — [`Execution.announced`] only knows about this one. The window
+  // this closes is the one the ordering above opens: a process killed between
+  // the intent going down and the row closing leaves an execution that is still
+  // `open` *and* already has its `settled` row, so the start that recovers it
+  // replays it to the same end. Its predecessor's row is picked up by
+  // [`resumeDeliveries`] and delivered under the ordinal it was allocated;
+  // announcing a second one here would tell a receiver that an execution
+  // finished twice.
+  if (await settledAlready(execution.id)) return;
+  await deliver(execution, "settled", []);
+}
+
+/**
+ * Whether this execution's `settled` delivery is already in the journal.
+ *
+ * A journal this process cannot read answers `false`, for [`unjournaled`]'s
+ * reason turned the other way: the delivery contract is at-least-once and
+ * receivers dedupe, so an event announced twice is the recoverable half.
+ */
+async function settledAlready(execution: string): Promise<boolean> {
   try {
-    return (await journaledExecution(execution))?.status === "open";
+    return (await deliveriesOf(execution)).some((record) => record.event === "settled");
   } catch {
-    return true;
+    return false;
+  }
+}
+
+/**
+ * Whether the journal holds **no row at all** for this execution.
+ *
+ * [`settling`]'s question about a run that failed before it could be journaled,
+ * which is the one settle [`closed`] is not reached for. A journal this process
+ * cannot read answers `false`, because the honest reading of "I cannot tell" is
+ * the conservative one: a push that should not have gone cannot be taken back,
+ * while a push that was owed is still delivered by whichever process does close
+ * the row.
+ */
+async function unjournaled(execution: string): Promise<boolean> {
+  try {
+    return (await journaledExecution(execution)) === undefined;
+  } catch {
+    return false;
   }
 }
 
@@ -1099,34 +1263,36 @@ async function stillOpen(execution: string): Promise<boolean> {
 // ---------------------------------------------------------------------------
 
 /**
- * Be told when this execution's set of open pauses moves, and answer the
- * unsubscribe.
+ * Be told when this execution's set of open pauses moves **or its work runs
+ * out**, and answer the unsubscribe.
  *
- * Two things read that. [`Execution.parked`] is one, and it is the board's own
- * fact rather than an assertion about the replay. The other is the **parking
- * webhook**: a quiescence that opened pauses nothing has announced is the event
- * resolved q34 says a receiver subscribes to.
+ * Two things read the first of those. [`Execution.parked`] is one, and it is
+ * the board's own fact rather than an assertion about the replay. The other is
+ * the **parking webhook**: a quiescence that opened pauses nothing has announced
+ * is the event resolved q34 says a receiver subscribes to — and a quiescence is
+ * why the second subscription is here, because the moment an execution becomes
+ * one is often a branch *finishing* rather than a pause opening.
  */
 function watchPauses(execution: Execution): () => void {
-  let scheduled = false;
-  return watchHumanPauses(execution.id, () => {
+  const consider = (): void => {
     if (humanWaits(execution.id).length > 0) execution.parked = true;
-    if (execution.callback === undefined || scheduled) return;
-    // **One webhook per parking, not one per pause** (resolved q34): a `map`
-    // over a flow with `human` nodes opens N pauses inside one quiescence, and
-    // a delivery per pause would spray a receiver with N reports of one event.
-    // So the announcements of a turn are coalesced and the report is taken once
-    // the turn has run out — every pause that opened in it is then on the board
-    // together, and the body lists them all.
-    scheduled = true;
-    const timer: unknown = setTimeout(() => {
-      scheduled = false;
-      parking(execution);
-    }, 0);
-    if (typeof (timer as { unref?: () => void }).unref === "function") {
-      (timer as { unref: () => void }).unref();
-    }
-  });
+    if (execution.callback === undefined) return;
+    parking(execution);
+  };
+  // **Two subscriptions, because a quiescence is not a pause event**
+  // (resolved q34). A `map` over a flow with `human` nodes opens N pauses in one
+  // quiescence, and the webhook owed is one listing all N — so the report has to
+  // be taken once the *last* branch has parked, and that branch may be the one
+  // whose model call was still running when the first pause opened. The pause
+  // watch says a pause moved; the quiescence watch says a unit of work
+  // finished; and `runtime.quiescent` is what decides, off the work in flight,
+  // whether either of them was the last thing this execution was going to do.
+  const unpause = watchHumanPauses(execution.id, consider);
+  const unquiet = watchQuiescence(execution.id, consider);
+  return () => {
+    unpause();
+    unquiet();
+  };
 }
 
 /**
@@ -1146,6 +1312,12 @@ function watchPauses(execution: Execution): () => void {
  */
 function parking(execution: Execution): void {
   if (execution.status !== "running") return;
+  // **One webhook per parking, not one per pause** (resolved q34): until every
+  // branch of this execution has parked or finished, a pause that just opened is
+  // one of a set still being assembled, and a delivery taken now would report a
+  // growing prefix of it — N reports of one event to a receiver building its
+  // view from the push.
+  if (!quiescent(execution.id)) return;
   const open = humanWaits(execution.id).map((wait) => wait.id);
   if (open.length === 0 || open.every((id) => execution.reported.has(id))) return;
   for (const id of open) execution.reported.add(id);
@@ -1159,12 +1331,17 @@ function parking(execution: Execution): void {
  * is serialized per execution; the attempts are not, because a delivery that is
  * retrying for ten minutes must not hold up the next event's ordinal and
  * receivers are already told that deliveries can arrive out of order.
+ *
+ * The chain is answered as well as extended, for [`closed`]: the one caller that
+ * has to *wait* for a delivery to be journaled is the one holding a lifecycle
+ * row open until it is. It resolves when the intent is recorded, never when the
+ * receiver answers.
  */
 function deliver(
   execution: Execution,
   event: runtime.DeliveryEvent,
   pauses: readonly string[],
-): void {
+): Promise<void> {
   execution.deliveries = execution.deliveries
     .then(() => opening(execution, event, pauses))
     .catch((error: unknown) => {
@@ -1176,6 +1353,7 @@ function deliver(
         `\`${execution.id}\`'s \`${event}\` webhook could not be journaled: ${message(error)}\n`,
       );
     });
+  return execution.deliveries;
 }
 
 /**
@@ -1186,6 +1364,16 @@ function deliver(
  * then is anything sent. The intent goes down **before** the first attempt so
  * that a process which dies mid-attempt leaves a row a later start finishes,
  * under the delivery id the receiver dedupes on.
+ *
+ * **A trigger this build no longer declares leaves a `pending` row** rather than
+ * nothing at all, which is what `docs/durability.md` §3.7 promises about it: the
+ * event happened, this process cannot say what identity that trigger's
+ * `callback_auth:` promised its receiver, and a build that declares it again
+ * picks the row up ([`resumeDeliveries`]). Recording nothing would make the
+ * event unrecoverable *and* invisible — the status route would show a settle
+ * nobody was told about — so the row is written and the reason is said on
+ * stderr. The allowlist is that trigger's too, so it is matched by the build
+ * that has one, never skipped.
  */
 async function opening(
   execution: Execution,
@@ -1195,18 +1383,6 @@ async function opening(
   const url = execution.callback;
   if (url === undefined) return;
   const trigger = httpTriggers.find((one) => one.name === execution.trigger);
-  if (trigger === undefined) {
-    // The composition moved under an execution that still owes a delivery. Said
-    // rather than sent: this build cannot know what identity that trigger's
-    // `callback_auth:` promised its receiver, and delivering without it would be
-    // a request the receiver is written to refuse — or worse, to accept. Left
-    // for a build that declares the trigger, which is what `recover` does with
-    // an execution of a flow it no longer has.
-    process.stderr.write(
-      `\`${execution.id}\` was started by \`${execution.trigger}\`, which this build does not declare: its \`${event}\` webhook is not delivered\n`,
-    );
-    return;
-  }
   const intent = {
     execution: execution.id,
     event,
@@ -1214,20 +1390,34 @@ async function opening(
     body: JSON.stringify(await report(execution)),
     pauses,
   };
+  if (trigger === undefined) {
+    // The composition moved under an execution that still owes a delivery.
+    // Journaled and said rather than sent: delivering without the identity that
+    // trigger promised would be a request the receiver is written to refuse — or
+    // worse, to accept — and the row left behind is what `recover` leaves for an
+    // execution of a flow this build no longer has.
+    await intendDelivery(intent);
+    process.stderr.write(
+      `\`${execution.id}\` was started by \`${execution.trigger}\`, which this build does not declare: its \`${event}\` webhook stays undelivered in the journal\n`,
+    );
+    return;
+  }
   // **Matched when the URL is read**, which is at the delivery rather than at
   // the start (grammar 13.3, Decision D110, D127): the callback URL comes out of
   // the request payload and is attacker-controlled by construction. A URL the
   // list admits nowhere is a *refused delivery* — journaled, visible on the
   // status route, never retried, and never anybody's failure.
   if (trigger.callbackAllow !== undefined && !admits(trigger.callbackAllow, url)) {
-    await refuseDelivery(
-      intent,
-      `the callback URL matches no \`callback_allow\` entry of the trigger \`${trigger.name}\``,
-    );
+    await refuseDelivery(intent, refusedUrl(trigger.name));
     return;
   }
   const record = await intendDelivery(intent);
   void attempts(record, trigger);
+}
+
+/** Why a delivery was refused, in the one sentence both places that refuse use. */
+function refusedUrl(trigger: string): string {
+  return `the callback URL matches no \`callback_allow\` entry of the trigger \`${trigger}\``;
 }
 
 /**
@@ -1318,13 +1508,45 @@ async function attemptDelivery(
       method: "POST",
       headers,
       body: record.body,
+      // **A bounded schedule has to be bounded in wall-clock time too**
+      // (resolved q35). A receiver that completes the handshake and never
+      // answers is the ordinary shape of an unreachable one, and the runtime
+      // this app is pinned to gives `fetch` no timeout of its own — so without
+      // this an attempt never returns, the row stays `pending` for the life of
+      // the process, and the delivery is neither retried nor exhausted while the
+      // status route reports an execution that finished minutes ago as owing a
+      // webhook. An attempt that runs out is a failed attempt like any other and
+      // the schedule carries on to the next offset.
+      signal: AbortSignal.timeout(DELIVERY_TIMEOUT_MS),
     });
     const ok = answered.status >= 200 && answered.status < 300;
     return { ok, detail: `the receiver answered ${answered.status}` };
   } catch (error) {
-    return { ok: false, detail: message(error) };
+    // Named rather than left as the runtime's own wording, which differs
+    // between them: what a reader of the journal needs to know is that the
+    // receiver was reached and said nothing, not which class the abort arrived
+    // in.
+    const out = (error as { name?: unknown } | null)?.name === "TimeoutError";
+    return {
+      ok: false,
+      detail: out
+        ? `the receiver did not answer within ${DELIVERY_TIMEOUT_MS / 1000}s`
+        : message(error),
+    };
   }
 }
+
+/**
+ * How long one attempt waits for a receiver, in milliseconds
+ * (`docs/durability.md` §3.7).
+ *
+ * Normative and not configurable: a webhook is a courtesy the status route
+ * backstops, and ten seconds is what the receivers of the world are written
+ * against. `AGENT_COMPOSE_CALLBACK_RETRY` shortens the *schedule* for a
+ * diagnostic run; nothing shortens this, because a deployment that needed to
+ * would be a deployment whose receiver is the thing to fix.
+ */
+const DELIVERY_TIMEOUT_MS = 10_000;
 
 /**
  * Pick up every delivery the journal still holds pending
@@ -1357,6 +1579,19 @@ async function resumeDeliveries(): Promise<void> {
       process.stderr.write(
         `\`${record.id}\` was to be delivered for \`${row?.trigger ?? "an unknown trigger"}\`, which this build does not declare: it stays undelivered in the journal\n`,
       );
+      continue;
+    }
+    // **The allowlist is matched here too**, and this is where a row [`opening`]
+    // could not match one against reaches its trigger's list at last: a delivery
+    // journaled by a build with no declaration of the trigger has never been
+    // held to it, and picking it up unchecked would POST an attacker-supplied
+    // URL that the trigger admits nowhere (grammar 13.3, Decision D127). The
+    // refusal is written onto the row it is about rather than opened as a second
+    // event: the ordinal is the lifecycle event's, and the event has not
+    // happened twice.
+    if (trigger.callbackAllow !== undefined && !admits(trigger.callbackAllow, record.url)) {
+      await refuseRecordedDelivery(record.execution, record.ordinal, refusedUrl(trigger.name));
+      process.stderr.write(`refused delivery ${record.id} (${record.event})\n`);
       continue;
     }
     void attempts(record, trigger);
@@ -1410,7 +1645,18 @@ function literally(text: string): string {
  */
 function retrySchedule(): readonly number[] {
   const written = process.env[CALLBACK_RETRY];
-  if (written === undefined || written === "") return CALLBACK_SCHEDULE;
+  if (written === undefined) return CALLBACK_SCHEDULE;
+  // **Set to nothing is set**, and it is the empty list `docs/durability.md`
+  // §3.7 refuses by name. Read as unset it would be the quietest form of the
+  // failure D50 is about: `AGENT_COMPOSE_CALLBACK_RETRY=$SHORT_SCHEDULE` with
+  // the variable unset in the wrapper starts clean on the fifteen-minute
+  // schedule, and the diagnostic run somebody wrote it for waits ten minutes for
+  // a retry they believed was a second away.
+  if (written.trim() === "") {
+    throw new CallbackRetryError(
+      `\`${CALLBACK_RETRY}\` is set to an empty list, which names no attempt at all: give it at least one offset, such as \`0s\`, or unset it for the schedule \`docs/durability.md\` states`,
+    );
+  }
   const offsets: number[] = [];
   for (const entry of written.split(",")) {
     const matched = /^([0-9]+)(ms|s|m|h)$/.exec(entry.trim());
@@ -1422,11 +1668,8 @@ function retrySchedule(): readonly number[] {
     }
     offsets.push(Number(matched[1]) * unit);
   }
-  if (offsets.length === 0) {
-    throw new CallbackRetryError(
-      `\`${CALLBACK_RETRY}\` names no attempt at all: give it at least one offset, such as \`0s\`, or unset it for the schedule \`docs/durability.md\` states`,
-    );
-  }
+  // No empty-list case below: `split(",")` answers at least one entry for every
+  // string, and the one string whose entry is empty was refused above.
   return offsets;
 }
 

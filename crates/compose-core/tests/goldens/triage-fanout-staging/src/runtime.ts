@@ -1003,6 +1003,10 @@ export async function runActivity<T>(
   // second attempt's model call is a second record rather than a collision with
   // the first attempt's (`docs/durability.md` §4).
   const effects = recorderFor(execution.id, site);
+  // What this node execution is, to a reader asking whether the execution has
+  // stopped advancing: one unit of concurrent work, in flight until the
+  // `finally` below (PRD resolved q34, and see [`quiescent`]).
+  const busy = working(execution.id, site);
 
   try {
     let last: unknown;
@@ -1126,6 +1130,10 @@ export async function runActivity<T>(
     // tick a pause was opening: every other way one node execution ends is one
     // where the instance below it had already finished.
     abandonPausesUnder(execution.id, site);
+    // …and the work is no longer in flight, which is announced **after** the
+    // pauses are abandoned so that a reader woken by it sees the board this
+    // node execution left rather than the one it was holding.
+    busy();
   }
 }
 
@@ -6624,43 +6632,59 @@ async function attemptItem(
   // the item reached once describes a run that did not happen.
   let made = 0;
   let last: unknown;
-  for (let attempt = 1; attempt <= allowed; attempt += 1) {
-    made = attempt;
-    try {
-      return { value: await instance.route.run(instance.input, context, instance.site), attempts: attempt };
-    } catch (error) {
-      last = error;
-      // The rule [`runActivity`]'s ladder follows, for the ladder rule 10 gives
-      // an item: a pause this run has no way to answer is not something the
-      // instance did wrong, and re-executing it would repeat every effect it
-      // issued on the way to asking a question that still cannot be delivered.
-      if (interruptOf(error) !== undefined) throw new ItemAttempts(made, error);
-      // And the same rule for a pause this instance is no longer being waited
-      // on for: re-executing it would re-open the pause under a node that has
-      // stopped waiting, on top of repeating every effect the instance issued.
-      if (abandonedOf(error) !== undefined) throw new ItemAttempts(made, error);
-      // And a journal that does not describe this run, for [`runActivity`]'s
-      // reason: a second attempt would walk the next recorded effect forward and
-      // report a disagreement one step past the one that really happened.
-      if (divergenceOf(error) !== undefined) throw new ItemAttempts(made, error);
-      if (attempt === allowed) break;
-      // And the rule [`runActivity`]'s ladder follows between its attempts, for
-      // the same reason and at the same seam: this attempt is over, the next one
-      // re-executes the instance at **this very site**, and a pause a settled
-      // branch of the failed attempt left open would share its id with the pause
-      // the next attempt opens there. Two waits at one id settle each other (see
-      // [`abandonPausesUnder`]). The pause the *last* attempt leaves is the node
-      // execution's to abandon, which `runActivity`'s `finally` does for every
-      // instance this fan-out dispatched.
-      abandonPausesUnder(context.execution.id, instance.site.path.join("/"));
+  // The instance is a unit of concurrent work in its own right, and the one the
+  // map node's own registration cannot stand in for: this instance runs a graph
+  // of its own and advances while a sibling instance is parked, so an execution
+  // is quiescent only once every one of them has parked or finished (PRD
+  // resolved q34, and see [`quiescent`]). Held across the whole ladder rather
+  // than per attempt, because between two attempts the item is still work this
+  // execution is doing.
+  const busy = working(context.execution.id, instance.site.path.join("/"));
+  try {
+    for (let attempt = 1; attempt <= allowed; attempt += 1) {
+      made = attempt;
       try {
-        await sleep(backoffFor(retry!, attempt), context.signal);
-      } catch {
-        break;
+        return {
+          value: await instance.route.run(instance.input, context, instance.site),
+          attempts: attempt,
+        };
+      } catch (error) {
+        last = error;
+        // The rule [`runActivity`]'s ladder follows, for the ladder rule 10
+        // gives an item: a pause this run has no way to answer is not something
+        // the instance did wrong, and re-executing it would repeat every effect
+        // it issued on the way to asking a question that still cannot be
+        // delivered.
+        if (interruptOf(error) !== undefined) throw new ItemAttempts(made, error);
+        // And the same rule for a pause this instance is no longer being waited
+        // on for: re-executing it would re-open the pause under a node that has
+        // stopped waiting, on top of repeating every effect the instance issued.
+        if (abandonedOf(error) !== undefined) throw new ItemAttempts(made, error);
+        // And a journal that does not describe this run, for [`runActivity`]'s
+        // reason: a second attempt would walk the next recorded effect forward
+        // and report a disagreement one step past the one that really happened.
+        if (divergenceOf(error) !== undefined) throw new ItemAttempts(made, error);
+        if (attempt === allowed) break;
+        // And the rule [`runActivity`]'s ladder follows between its attempts,
+        // for the same reason and at the same seam: this attempt is over, the
+        // next one re-executes the instance at **this very site**, and a pause a
+        // settled branch of the failed attempt left open would share its id with
+        // the pause the next attempt opens there. Two waits at one id settle
+        // each other (see [`abandonPausesUnder`]). The pause the *last* attempt
+        // leaves is the node execution's to abandon, which `runActivity`'s
+        // `finally` does for every instance this fan-out dispatched.
+        abandonPausesUnder(context.execution.id, instance.site.path.join("/"));
+        try {
+          await sleep(backoffFor(retry!, attempt), context.signal);
+        } catch {
+          break;
+        }
       }
     }
+    throw new ItemAttempts(made, last);
+  } finally {
+    busy();
   }
-  throw new ItemAttempts(made, last);
 }
 
 /**
@@ -7165,6 +7189,124 @@ export function watchHumanPauses(execution: string, listener: () => void): () =>
     // has answered many runs is not left holding one per execution id.
     if (held.size === 0 && humanWatchers.get(execution) === held) {
       humanWatchers.delete(execution);
+    }
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Quiescence (PRD resolved q34)
+// ---------------------------------------------------------------------------
+
+/**
+ * The concurrent work each execution has in flight, by the site running it.
+ *
+ * One entry per unit of work that can reach a `human` node **on its own** —
+ * which is a node execution ([`runActivity`]) and a dispatched `map` instance
+ * ([`attemptItem`]), and nothing else. Those two are the only places this
+ * runtime forks: an instance dispatched by a `map` runs its own graph inside
+ * the map node's task (`src/graph.ts`'s
+ * `a-dispatch-runs-inside-the-map-nodes-task`), so the map node's site alone
+ * could not say whether item 2 was still working while item 1 was parked. A
+ * subflow a `flow:` node or an agent's `tools:` instantiates is one per node
+ * execution and needs no entry of its own — the node's does for it.
+ *
+ * A **detached** dispatch is deliberately absent (grammar 8.6 rule 7): nothing
+ * waits for it, Decision D118 refuses a `human` node under one, so it can open
+ * no pause — and counting it would hold a parking webhook back for the whole of
+ * work the flow instance itself does not wait for.
+ */
+const inFlight = new Map<string, Map<string, number>>();
+
+/** Who is told when one execution's in-flight work changes. See [`quiescent`]. */
+const quietWatchers = new Map<string, Set<() => void>>();
+
+/**
+ * Note one unit of concurrent work for as long as it runs, and answer its
+ * release.
+ *
+ * Counted rather than held as a set, because one site runs more than once in
+ * sequence — both retry ladders re-execute an instance at the site its
+ * predecessor ran at ([`runActivity`], [`attemptItem`]) — and a release that
+ * deleted the entry would drop a live registration if the two ever overlapped.
+ */
+function working(execution: string, site: string): () => void {
+  let sites = inFlight.get(execution);
+  if (sites === undefined) {
+    sites = new Map();
+    inFlight.set(execution, sites);
+  }
+  const held = sites;
+  held.set(site, (held.get(site) ?? 0) + 1);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    const count = (held.get(site) ?? 0) - 1;
+    if (count > 0) held.set(site, count);
+    else held.delete(site);
+    if (held.size === 0 && inFlight.get(execution) === held) inFlight.delete(execution);
+    const watchers = quietWatchers.get(execution);
+    if (watchers === undefined) return;
+    for (const watcher of [...watchers]) watcher();
+  };
+}
+
+/**
+ * Whether `execution` has stopped advancing on its own — every unit of work it
+ * is running is waiting on a human (PRD resolved q34).
+ *
+ * This is what "one webhook per **parking**" is decided by, and the reason it
+ * cannot be decided by a timer: a `map` over a flow with `human` nodes opens N
+ * pauses in one quiescence, and the item that opens the first may be a hundred
+ * milliseconds ahead of the item that opens the third. A debounce would deliver
+ * one webhook per item; this waits for the last of them.
+ *
+ * What makes the reading safe *between* two nodes of one branch is LangGraph's
+ * own superstep barrier: a step's tasks all run to completion before the next
+ * step is scheduled, so while any task is parked no sibling task can start a
+ * node — and a branch with nothing in flight is a branch that cannot open a
+ * pause until somebody answers one. What is **not** covered by that barrier is
+ * a dispatched instance, which runs a graph of its own inside the map node's
+ * task and advances while a sibling instance is parked; that is exactly why
+ * [`inFlight`] holds an entry per instance as well as per node execution.
+ *
+ * An execution with nothing in flight is quiescent, which is the answer a run
+ * that has ended needs: nothing more will open.
+ */
+export function quiescent(execution: string): boolean {
+  const sites = inFlight.get(execution);
+  if (sites === undefined) return true;
+  for (const site of sites.keys()) {
+    if (pausesUnder(execution, site) === 0) return false;
+  }
+  return true;
+}
+
+/**
+ * Be told whenever one of `execution`'s units of work finishes; answers the
+ * unsubscribe.
+ *
+ * The companion of [`watchHumanPauses`] and the half it cannot supply: the last
+ * unparked branch of a quiescence **ends** rather than opening a pause, so the
+ * moment an execution becomes quiescent is a moment no pause event announces.
+ * Both are subscribed to by the one reader that decides a parking webhook
+ * (`src/serve.ts`).
+ */
+export function watchQuiescence(execution: string, listener: () => void): () => void {
+  let watchers = quietWatchers.get(execution);
+  if (watchers === undefined) {
+    watchers = new Set();
+    quietWatchers.set(execution, watchers);
+  }
+  const held = watchers;
+  held.add(listener);
+  return () => {
+    held.delete(listener);
+    // The empty set goes with the last subscriber, for [`watchHumanPauses`]'s
+    // reason: a `serve` that has answered many runs holds no listener per
+    // finished one.
+    if (held.size === 0 && quietWatchers.get(execution) === held) {
+      quietWatchers.delete(execution);
     }
   };
 }
@@ -8004,6 +8146,19 @@ export async function refuseDelivery(
   reason: string,
 ): Promise<DeliveryRecord> {
   return (await openJournal()).refuseDelivery(intent, reason);
+}
+
+/**
+ * Record the same refusal against a delivery the journal already holds pending
+ * — the row a build that did not declare the execution's trigger left for one
+ * that does (`docs/durability.md` §3.7).
+ */
+export async function refuseRecordedDelivery(
+  execution: string,
+  ordinal: number,
+  reason: string,
+): Promise<void> {
+  (await openJournal()).refuseRecorded(execution, ordinal, reason);
 }
 
 /** Record what one attempt did, and where the delivery stands after it. */

@@ -28,6 +28,12 @@
 #     the documented test posture (resolved q33) and the shape a retry is
 #     cheapest to observe in: the flow does not park, so the only delivery is
 #     the settle.
+#   * `fanned` — one execution that parks **several times at once**: a `map`
+#     over a flow whose items linger for different lengths of time before they
+#     reach their `human` node. A quiescence is the moment the last of them
+#     parks, and resolved q34 owes it one webhook listing every pause — which
+#     is a claim no single-pause flow above can make, and the one a coalescing
+#     rule written as a debounce fails.
 #
 # The allowlist is written with a wildcard where the **port** goes, because a
 # loopback receiver binds a port the operating system chose. That is the entry
@@ -46,6 +52,12 @@ state:
     description: What the person answered.
     enum: [approve, reject]
     default: reject
+  verdicts:
+    description: One element per dispatched instance, in source-item order.
+    type: array
+    max_items: 8
+    items: { enum: [approve, reject] }
+    reduce: append
 
 flow.note:
   description: One deterministic step — an execution that starts, finishes, and settles.
@@ -60,8 +72,8 @@ flow.note:
     # A subprocess that counts its own executions rather than a bare `printf`,
     # because "the refused request started **no** execution" is otherwise not an
     # assertion a test can make: a `401` says what the route answered and says
-    # nothing about what ran behind it. The shim appends one line per run, so
-    # one accepted call and four refusals is a one-line log.
+    # nothing about what ran behind it. The shim appends one line per run, so a
+    # log of admitted calls and no refusals is what a test counts.
     note:
       exec:
         command: "${TALLY_BIN}/tally"
@@ -97,6 +109,77 @@ flow.review:
   edges:
     - { from: start, to: sign_off }
     - { from: sign_off, to: end }
+
+flow.consider:
+  description: Linger, then park — one item of a fan-out that parks several times over.
+  inputs:
+    topic:
+      type: string
+      min_length: 1
+    linger:
+      type: string
+      min_length: 1
+  outputs:
+    decision:
+      enum: [approve, reject]
+  nodes:
+    # The awaited work that makes the parkings **stagger**. Every item of the
+    # fan-out below opens its pause at a different moment, which is the shape a
+    # coalescing rule written as a debounce gets wrong: one webhook goes out per
+    # item, each listing a growing prefix of one quiescence's pauses.
+    linger:
+      exec:
+        command: "${TALLY_BIN}/linger"
+        output:
+          stdout: { type: string }
+      input:
+        pause_for: "input.linger"
+      writes:
+        stdout: noted
+    sign_off:
+      human:
+        input:
+          note: { type: string }
+        output:
+          decision: { enum: [approve, reject] }
+      input:
+        note: "input.topic"
+  edges:
+    - { from: start, to: linger }
+    - { from: linger, to: sign_off }
+    - { from: sign_off, to: end }
+
+flow.stagger:
+  description: One quiescence holding several pauses — the `map` over a flow that parks.
+  inputs:
+    items:
+      type: array
+      max_items: 8
+      items:
+        type: object
+        properties:
+          topic: { type: string }
+          linger: { type: string }
+  outputs:
+    verdicts:
+      type: array
+      max_items: 8
+      items: { enum: [approve, reject] }
+  nodes:
+    review:
+      map:
+        over: input.items
+        as: one
+        node: flow.consider
+        max_concurrency: 4
+        input:
+          topic: "one.topic"
+          linger: "one.linger"
+        writes:
+          decision: verdicts
+  edges:
+    - { from: start, to: review }
+    - { from: review, to: end }
 
 triggers:
   guarded:
@@ -172,3 +255,21 @@ triggers:
     input:
       topic: "payload.body.topic"
     callback: "payload.body.callback_url"
+
+  # The fan-out that parks: one execution holding several pauses opened at
+  # different moments, subscribed to by a receiver. Its `callback:` carries no
+  # outbound auth — the documented test posture (resolved q33) — because what
+  # it is here to say is *how many* deliveries a quiescence makes, and the
+  # signing half is `watched`'s to say.
+  fanned:
+    type: http
+    flow: flow.stagger
+    method: POST
+    path: /fanned
+    respond: async
+    input:
+      items: "payload.body.items"
+    callback: "payload.body.callback_url"
+    auth:
+      bearer:
+        token: ${EVENTS_TOKEN}

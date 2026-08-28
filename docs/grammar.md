@@ -3961,6 +3961,13 @@ triggers:
 - **The secrets are `${ENV}` references** and nothing else, in both blocks and
   both directions: a literal is a compile error, because a secret never lives in
   the spec text (§4.3, Decision [D41](#d41-env-ref-forms-and-the-secret-field-list)).
+  A reference that resolves to the **empty string** refuses the app at launch,
+  naming the variable. §4.3's presence check counts an empty variable as set,
+  which is right for a `base_url:` and wrong for a credential: an empty expected
+  token compares equal to the empty token every anonymous caller can send, and an
+  HMAC key of no bytes signs a body anybody can sign — so an unexpanded `${TOKEN}`
+  in a launch wrapper is a route that is open and says nothing about it, which
+  the refusal turns into one sentence on the first start.
 - **Exactly one scheme.** A block declaring neither, and a block declaring both,
   are both compile errors: one request carries one credential, and a route that
   verified either would be exactly as open as its weaker half.
@@ -4070,8 +4077,10 @@ shape (Decision [D127](#d127-a-callback-allowlist-entry-is-a-wildcard-url-and-th
 
 **The delivery wire.** A callback fires on lifecycle events — every quiescence
 that opened new pauses, and settle — carrying the status route's report plus
-delivery metadata (PRD resolved q34, q35). Every delivery carries these headers,
-and they are normative:
+delivery metadata (PRD resolved q34, q35). A quiescence is the moment every
+branch of the execution has parked or finished, so a `map` over a flow with
+`human` nodes is **one** delivery listing all of its pauses rather than one per
+item. Every delivery carries these headers, and they are normative:
 
 | Header | Value |
 |---|---|

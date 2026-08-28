@@ -965,7 +965,7 @@ async function serveVerb(argv: readonly string[]): Promise<number> {
   // HTTP framework and a project used as a library never loads it at all. Only
   // the app: `./triggers.ts` is the composition's own table and is imported
   // above, because `run` reads it too.
-  const { CallbackRetryError, serve } = await import("./serve.ts");
+  const { BlankCredentialError, CallbackRetryError, serve } = await import("./serve.ts");
   if (httpTriggers.length === 0) {
     throw new UsageError(
       "this composition declares no `http` triggers, so the generated app exposes no routes: declare one in `triggers:` (grammar 13.3)",
@@ -1000,6 +1000,13 @@ async function serveVerb(argv: readonly string[]): Promise<number> {
     // words, rather than dressed as a port that would not bind (Decision D50,
     // `docs/durability.md` §3.7).
     if (error instanceof CallbackRetryError) throw new UsageError(error.message);
+    // And a third: a credential a trigger declares that resolved to the empty
+    // string. `src/env.ts` counts it as present (grammar 4.3), and for a
+    // credential it is not — an empty token admits every caller — so the app
+    // refuses to mount rather than serving an open route (grammar 13.3). It is
+    // the environment's to fix, like a missing variable, so it is a `2` and a
+    // sentence naming what to set.
+    if (error instanceof BlankCredentialError) throw new UsageError(error.message);
     if ((error as { code?: unknown } | null)?.code === "FST_ERR_DUPLICATED_ROUTE") {
       throw new UsageError(
         `the app could not mount its routes: ${describe(error)}. Two routes of this composition are one route to the router — an \`http\` trigger's \`path:\` and \`method:\`, or one of the app's own \`GET /executions/:id\` and \`POST /executions/:id/resume\` — so give one of them a path the other cannot be read as (grammar 13.3)`,

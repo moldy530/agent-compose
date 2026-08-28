@@ -180,6 +180,58 @@ export interface ManualTrigger {
 }
 
 export const httpTriggers: readonly HttpTrigger[] = [
+  {
+    name: "signed_in",
+    flow: "flow.shape",
+    path: "/shape",
+    method: "POST",
+    respond: "async",
+    readsBody: true,
+    input: (payload) => {
+      const bound = roots(payload);
+      return {
+        "goal": runtime.toJson(runtime.evaluate("payload.body.goal", bound)),
+        "goals": runtime.toJson(runtime.evaluate("payload.body.goals", bound)),
+      };
+    },
+    callback: (payload) => text("payload.body.callback_url", roots(payload), "`callback` of the trigger `signed_in`"),
+    auth: {
+      scheme: "bearer",
+      header: "Authorization",
+      prefix: "Bearer ",
+      tokenEnv: "SHAPE_TOKEN",
+    },
+    callbackAuth: {
+      bearer: { header: "X-Delivery-Token", prefix: "Token ", tokenEnv: "SHAPE_CALLBACK_TOKEN" },
+      hmac: { secretEnv: "SHAPE_CALLBACK_SECRET" },
+    },
+    callbackAllow: [
+      "https://hooks.example.com/*",
+    ],
+  },
+  {
+    name: "vendor_signed",
+    flow: "flow.shape",
+    path: "/shape/hook",
+    method: "POST",
+    respond: "async",
+    readsBody: true,
+    input: (payload) => {
+      const bound = roots(payload);
+      return {
+        "goal": runtime.toJson(runtime.evaluate("payload.body.goal", bound)),
+        "goals": runtime.toJson(runtime.evaluate("payload.body.goals", bound)),
+      };
+    },
+    auth: {
+      scheme: "hmac",
+      header: "X-Hub-Signature-256",
+      algorithm: "sha256",
+      encoding: "hex",
+      prefix: "sha256=",
+      secretEnv: "SHAPE_SECRET",
+    },
+  },
 ];
 
 export const manualTriggers: readonly ManualTrigger[] = [

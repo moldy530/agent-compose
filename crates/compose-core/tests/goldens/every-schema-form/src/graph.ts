@@ -1252,6 +1252,30 @@ export async function runFlow(
      * lifecycle row rather than composing them again.
      */
     readonly resume?: boolean;
+    /**
+     * Called once, **immediately before this run closes its lifecycle row**,
+     * and awaited.
+     *
+     * The one caller is `src/serve.ts`, and what it does with it is journal the
+     * `settled` webhook's intent while the row is still open
+     * (`docs/durability.md` §3.7): a delivery recorded after the row closed is
+     * one no restart can find — `recover` sees no open execution and the
+     * delivery ledger has no row — so a process killed in that window would owe
+     * a caller a push nothing would ever send. It is passed what the run
+     * produced, or the error that ended it, because the report a webhook
+     * carries is that answer and this is the last moment it exists inside the
+     * run.
+     *
+     * It is **not** called for a run whose row stays open — a `human` pause
+     * nobody could answer, a replay divergence — which is what keeps resolved
+     * q29's "a divergence fires nothing" a property of the structure rather
+     * than of a check somebody remembered to write.
+     *
+     * Its own failure is its own: a webhook that could not be recorded is not
+     * the run's outcome, and letting it through here would replace what a run
+     * really did with what a receiver's ledger could not hold.
+     */
+    readonly closing?: (produced: FlowRun | undefined, error: unknown) => Promise<void>;
   } = {},
 ): Promise<FlowRun> {
   const flow = flows[address];
@@ -1296,6 +1320,17 @@ export async function runFlow(
     // completion the record does not support.
     const diverged = runtime.latchedDivergence(executionId);
     if (diverged !== undefined) throw diverged;
+    // The last moment before the row closes, and what `closing` is for. Its own
+    // failure is swallowed rather than allowed to travel: it would report a run
+    // that produced its outputs as one that failed, over a webhook the status
+    // route backstops (see the option's own comment).
+    if (options.closing !== undefined) {
+      try {
+        await options.closing(produced, undefined);
+      } catch {
+        // Said by the hook, where a hook has something to say.
+      }
+    }
     runtime.settleExecution(executionId);
     return produced;
   } catch (error) {
@@ -1303,6 +1338,18 @@ export async function runFlow(
     // because the run is parked at a `human` pause and is exactly what a resume
     // exists for — is `runtime.settleExecution`'s to decide, off the same
     // `runtime.interruptOf` this function's own callers read.
+    //
+    // …which is also what decides whether anything is *closing*: the hook is
+    // the last moment before a row closes, and a row that stays open has not
+    // reached one. `runtime.staysOpen` is the predicate `settleExecution` is
+    // about to ask, asked here so the two cannot answer differently.
+    if (options.closing !== undefined && !runtime.staysOpen(executionId, error)) {
+      try {
+        await options.closing(undefined, error);
+      } catch {
+        // …and here it would replace the error the run really produced.
+      }
+    }
     runtime.settleExecution(executionId, error);
     throw error;
   } finally {

@@ -178,7 +178,10 @@ auth:                            # exactly ONE of bearer | hmac
   signature for a body they chose, and a request forged with it is accepted
   without the caller ever holding the secret.
 - Both secrets are `${ENV}` references and nothing else: a literal is
-  `invalid-env-ref`, because a secret never lives in the spec text.
+  `invalid-env-ref`, because a secret never lives in the spec text. A variable
+  set to the **empty string** refuses the app at launch, naming it — an empty
+  token is equal to the empty token an anonymous caller sends, so an unexpanded
+  `${TOKEN}` in a launch wrapper would be an open route that looks guarded.
 - A block declaring **neither** scheme and one declaring **both** are each a
   compile error. One request carries one credential, and a route verifying either
   would be as open as its weaker half.
@@ -250,8 +253,14 @@ at-least-once — the intent is recorded before the first attempt, the schedule 
 five attempts across fifteen minutes, and a restarted `serve` finishes what is
 still pending — so one can arrive twice and two can arrive out of order:
 **dedupe on `X-AgentCompose-Delivery`, order by ordinal, never by arrival**. A
-delivery that exhausts its schedule is recorded and shows on the status report,
-and is never the execution's failure.
+delivery that exhausts its schedule — five failed attempts, or a receiver that
+answered none of them inside the ten seconds one attempt waits — is recorded and
+shows on the status report, and is never the execution's failure.
+
+A quiescence is the moment **every** branch has parked or finished, so a `map`
+over a flow with `human` nodes announces one `parked` delivery listing all of
+its pauses rather than one per item: what a receiver is subscribed to is the
+event, not the pause.
 
 Those names are the receiver's contract, so the `X-AgentCompose-` namespace is
 reserved: a `callback_auth.bearer.header:` inside it is a compile error, since
