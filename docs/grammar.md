@@ -7077,16 +7077,21 @@ required key that is *conditional*, an `anthropic` or `openai` provider's
 `api_key:` where no `base_url:` names a gateway (§12.1, D120), which is a second
 `if`/`then` on the same object rather than a rule about another file — trigger
 keys per `type` (§13) including the `respond`/`timeout` and `respond`/`callback`
-pairings (§13.3), the map form rules and the `on_item_error` shape (§8.6) —
-including the confinement of `input:`/`writes:`/`detach:` to the homogeneous form
-(rule 7, D85) and the absence of any `context:` key, which is a `flow:` node's
-alone because a dispatch's history isolation is unconditional (rule 13, D105) —
+pairings, the scheme counts on both auth blocks — exactly one on `auth:`, at
+least one on `callback_auth:` — and the two conditionals the callback keys carry:
+`callback_auth:` or `callback_allow:` requiring a `callback:` for either to
+describe, and `callback_auth:` requiring `callback_allow:`, which is that same
+conditional-required-key shape a second time (§13.3, D126, D127), the map form
+rules and the `on_item_error` shape (§8.6) — including the confinement of
+`input:`/`writes:`/`detach:` to the homogeneous form (rule 7, D85) and the
+absence of any `context:` key, which is a `flow:` node's alone because a
+dispatch's history isolation is unconditional (rule 13, D105) —
 the field-map-only `input:` on the node kinds that name their
 fields (§8.0, D88), the non-empty `expect_exit`/`expect_status` lists (§6.1), the
 direct-XOR-route split on model definitions (§12.2), the built-in entries of an
 agent's `tools:` — one name per entry over the closed four, `root:` required on
 every one of them and `timeout:` required on `builtin.bash` and refused on the
-file tools (§5.5, D123), which is a third `if`/`then`, keyed on the entry's own
+file tools (§5.5, D123), which is an `if`/`then` keyed on the entry's own
 *type* rather than on a sibling literal: a string is an address and a mapping is
 a built-in, so an editor underlines the missing `root:` rather than reporting
 that the entry is neither kind of thing — the `human` timeout/route
@@ -7104,12 +7109,13 @@ the presence of one unconditional-or-`else` edge leaving
 the reserved-root exclusions on node ids, edge endpoints, control targets, and a
 map's `as:` (§2.5), and the absence of `${ENV}` tokens on the surfaces where §4.3
 makes them illegal and a single string is the whole surface (`prompt:`, model
-`id:`, `embed.model:`, a trigger's `path:`/`cron:`/`timezone:`, and a
-`blob put`'s `content_type:` — §4.3 class 3, D92). The validator owns the rest of
-class 3: CEL surfaces need the expression grammar, and descriptions and schema
-literals would need the same `not` repeated on dozens of properties, which the
-one-directional invariant does not require — a file the schema lets through is
-still rejected by `validate`.
+`id:`, `embed.model:`, a trigger's `path:`/`cron:`/`timezone:`, the `header:` and
+`prefix:` of an `auth:`/`callback_auth:` scheme and every `callback_allow:`
+entry (§13.3), and a `blob put`'s `content_type:` — §4.3 class 3, D92). The
+validator owns the rest of class 3: CEL surfaces need the expression grammar,
+and descriptions and schema literals would need the same `not` repeated on
+dozens of properties, which the one-directional invariant does not require — a
+file the schema lets through is still rejected by `validate`.
 
 **Diagnostics.** Where a construct has variants, the schema branches on the
 literal that selects the variant — a node's kind key, a trigger's `type:`, a
