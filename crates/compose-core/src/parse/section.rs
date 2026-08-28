@@ -797,7 +797,7 @@ fn callback_allow(
                     DiagnosticCode::InvalidValue,
                     pattern.span.clone(),
                     format!(
-                        "`{}` is not a `callback_allow` pattern of {subject}: it {problem}",
+                        "{:?} is not a `callback_allow` pattern of {subject}: it {problem}",
                         pattern.value
                     ),
                 )
@@ -817,13 +817,21 @@ fn callback_allow(
 
 /// Why a `callback_allow:` entry is not a legal URL pattern, if it is not.
 ///
-/// Completes ``` `<entry>` is not a `callback_allow` pattern of …: it … ```.
+/// Completes ``` "<entry>" is not a `callback_allow` pattern of …: it … ```.
+/// The entry is quoted rather than backticked, as `header:` and `prefix:` are
+/// above: an empty pattern and a pattern that is three spaces are both things an
+/// author writes, and only quoting shows the difference between them.
+///
 /// The scheme is the whole of the check: a pattern is matched against the URL a
 /// payload supplied, and a match that could not name the scheme would let
 /// `https://hooks.example.com/*` admit `javascript:` or `file:` URLs beginning
 /// with the same characters.
+///
+/// The arms are ordered so each one is the *only* answer to some entry — an
+/// empty entry names the emptiness, a blank one names the whitespace — because
+/// an arm no entry reaches is a message no fixture pins and no reader has read.
 fn allow_problem(pattern: &str) -> Option<String> {
-    if pattern.trim().is_empty() {
+    if pattern.is_empty() {
         return Some("is empty".to_string());
     }
     if pattern.chars().any(char::is_whitespace) {
