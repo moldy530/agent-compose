@@ -1,0 +1,11 @@
+# rule: `callback_auth:` is a key of `http` triggers alone (grammar 13.3, PRD resolved q33)
+# code: unknown-key
+# message: unknown key `callback_auth` in trigger `cli`
+# at: 9:5
+triggers:
+  cli:
+    type: manual
+    flow: flow.support
+    callback_auth:
+      hmac:
+        secret: ${CALLBACK_SECRET}

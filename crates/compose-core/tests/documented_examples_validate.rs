@@ -161,6 +161,7 @@ const TOPICS_WITHOUT_A_RUNNABLE_EXAMPLE: &[(&str, &str)] = &[
 /// that says which edit produces the quiet report.
 const EXPLANATIONS_WITH_A_CORRECTED_EXAMPLE: &[&str] = &[
     "invalid-path-expression",
+    "missing-callback-allowlist",
     "missing-capability",
     "missing-credential",
     "unbalanced-convergence",

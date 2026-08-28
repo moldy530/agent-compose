@@ -23,6 +23,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use compose_core::ast::definition::{Builtin, ProviderKind};
+use compose_core::ast::{HmacAlgorithm, SignatureEncoding};
 use jsonschema::Validator;
 use serde_json::{Value, json};
 
@@ -555,6 +556,267 @@ fn the_published_schema_accepts_a_keyless_provider_that_names_its_endpoint() {
                 errors.join("\n")
             );
         }
+    }
+}
+
+/// Grammar 13.3's authentication surface in the direction the negative corpus
+/// cannot reach: the shapes the schema must **accept**.
+///
+/// The `trigger-auth-*`, `trigger-callback-*` and `trigger-hmac-*` fixtures
+/// under `invalid-schema/` pin the refusals — the env-ref rule on every secret,
+/// the header and prefix shapes, the closed sets of `algorithm:`/`encoding:`,
+/// the allowlist entry pattern, and four conditionals: `inboundAuth`'s `oneOf`,
+/// `callbackAuth`'s `anyOf`, and the two `if`/`then` pairs that bind the
+/// callback keys. The conditionals are where the accepting direction breaks
+/// silently. Tighten `callbackAuth`'s `anyOf` into `inboundAuth`'s `oneOf` by a
+/// copy-paste slip and the schema
+/// refuses a trigger that signs *and* tokens its deliveries, which resolved q33
+/// spells "and/or"; hoist `callback_allow` out of its `if` and the schema
+/// refuses every unauthenticated callback, which is the documented test posture.
+/// Both leave this workspace green and put a red squiggle on correct YAML in
+/// somebody's editor.
+///
+/// Each instance is also run through the parser, because Appendix B's
+/// relationship binds in this direction too: the schema is the editor-facing
+/// approximation of `validate`, and a shape the compiler accepts and the schema
+/// refuses is the pair disagreeing about the language.
+#[test]
+fn the_published_schema_accepts_the_whole_trigger_auth_surface() {
+    let validator = compile_schema();
+    let legal = [
+        // Inbound: each scheme alone, one bare and one with every optional key.
+        json!({ "type": "http", "flow": "flow.f", "auth": { "bearer": { "token": "${WEBHOOK_TOKEN}" } } }),
+        json!({
+            "type": "http",
+            "flow": "flow.f",
+            "auth": { "bearer": {
+                "token": "${WEBHOOK_TOKEN}",
+                "header": "X-Delivery-Token",
+                "prefix": "Token ",
+            } },
+        }),
+        json!({ "type": "http", "flow": "flow.f", "auth": { "hmac": { "secret": "${WEBHOOK_SECRET}" } } }),
+        json!({
+            "type": "http",
+            "flow": "flow.f",
+            "auth": { "hmac": {
+                "secret": "${WEBHOOK_SECRET}",
+                "header": "X-Hub-Signature-256",
+                "algorithm": "sha512",
+                "encoding": "base64",
+                "prefix": "sha512=",
+            } },
+        }),
+        // Inbound auth is orthogonal to the response mode.
+        json!({
+            "type": "http",
+            "flow": "flow.f",
+            "respond": "sync",
+            "timeout": "30s",
+            "auth": { "hmac": { "secret": "${WEBHOOK_SECRET}" } },
+        }),
+        // The `X-AgentCompose-` namespace is reserved *outbound* only: a trigger
+        // that receives another deployment's deliveries verifies them by naming
+        // the delivery's own signature header, exactly as it would name any
+        // other vendor's (grammar 13.3, Decision D127).
+        json!({
+            "type": "http",
+            "flow": "flow.f",
+            "auth": { "hmac": {
+                "secret": "${WEBHOOK_SECRET}",
+                "header": "X-AgentCompose-Signature",
+                "prefix": "sha256=",
+            } },
+        }),
+        // Outbound: either scheme, and — the asymmetry with `auth:` — both.
+        json!({
+            "type": "http",
+            "flow": "flow.f",
+            "callback": "payload.body.callback_url",
+            "callback_auth": { "hmac": { "secret": "${CALLBACK_SECRET}" } },
+            "callback_allow": ["https://hooks.example.com/*"],
+        }),
+        json!({
+            "type": "http",
+            "flow": "flow.f",
+            "callback": "payload.body.callback_url",
+            "callback_auth": {
+                "bearer": { "token": "${CALLBACK_TOKEN}" },
+                "hmac": { "secret": "${CALLBACK_SECRET}" },
+            },
+            "callback_allow": ["https://hooks.example.com/*", "http://localhost:9000/*"],
+        }),
+        // The reservation on an outbound `header:` is one prefix and three whole
+        // names (Decision D127), and a receiver's own header that merely looks
+        // like one of them collides with nothing: a pattern written without its
+        // `$` refuses these, and only this direction sees it.
+        json!({
+            "type": "http",
+            "flow": "flow.f",
+            "callback": "payload.body.callback_url",
+            "callback_auth": {
+                "bearer": { "token": "${CALLBACK_TOKEN}", "header": "X-Content-Type" },
+            },
+            "callback_allow": ["https://hooks.example.com/*"],
+        }),
+        json!({
+            "type": "http",
+            "flow": "flow.f",
+            "callback": "payload.body.callback_url",
+            "callback_auth": {
+                "bearer": { "token": "${CALLBACK_TOKEN}", "header": "Content-Type-Signature" },
+            },
+            "callback_allow": ["https://hooks.example.com/*"],
+        }),
+        // The documented test posture: a callback that signs nothing, and so
+        // needs no allowlist…
+        json!({ "type": "http", "flow": "flow.f", "callback": "payload.body.callback_url" }),
+        // …and an allowlist without outbound auth, which is legal in the
+        // direction the mandatory rule does not run.
+        json!({
+            "type": "http",
+            "flow": "flow.f",
+            "callback": "payload.body.callback_url",
+            "callback_allow": ["https://hooks.example.com/*"],
+        }),
+        // The allowlist shapes the entry pattern must not take with it
+        // (Decision D127): a port, a query string, an exact URL carrying no
+        // wildcard at all, and a wildcard inside the host — legal grammar, whose
+        // meaning §13.3 states rather than the pattern refusing the shape. The
+        // refusals are fixtures; a pattern written one character too tight
+        // refuses these instead, and only this direction sees it.
+        json!({
+            "type": "http",
+            "flow": "flow.f",
+            "callback": "payload.body.callback_url",
+            "callback_allow": [
+                "https://hooks.example.com:9000/*",
+                "https://hooks.example.com?tenant=*",
+                "https://hooks.example.com/webhooks/intake",
+                "https://*.hooks.example.com/*",
+                "https://hooks.example.com*",
+            ],
+        }),
+    ];
+    for trigger in legal {
+        let instance = json!({ "triggers": { "intake": trigger } });
+        let errors = validation_errors(&validator, &instance);
+        assert!(
+            errors.is_empty(),
+            "the published schema must accept this legal trigger:\n{}\n{}",
+            serde_json::to_string_pretty(&instance).expect("a printable instance"),
+            errors.join("\n")
+        );
+        let source = serde_yaml_ng::to_string(&instance).expect("a printable document");
+        let parsed = compose_core::parse_str(&source, "main.yml");
+        assert!(
+            parsed.diagnostics.is_empty(),
+            "the parser must accept what the published schema accepts:\n{source}\n{}",
+            parsed
+                .diagnostics
+                .iter()
+                .map(|diagnostic| format!("  [{}] {}", diagnostic.code, diagnostic.message))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+}
+
+/// The two closed sets an inbound `hmac:` chooses between are one table each,
+/// written twice: once as the parser's keywords and once as an `enum` in the
+/// published schema (grammar 13.3, PRD resolved q32).
+///
+/// Neither corpus can see them drift. `md5` and `base64url` are pinned as
+/// fixtures, so the *narrowing* direction is covered — but a third digest or a
+/// third encoding added to `HmacAlgorithm::ALL` or `SignatureEncoding::ALL` and
+/// forgotten here leaves `agent-compose validate` accepting a value the schema
+/// squiggles in the author's editor, which is the direction Appendix B forbids
+/// outright; and a value added to the `enum` alone leaves the editor blessing
+/// YAML the compiler refuses. Both are invisible to a corpus of examples: the
+/// keyword that would have caught them is the one nobody wrote yet.
+///
+/// So the sets are compared as sets, and then each keyword is put through both
+/// authorities — the tables are what a signature is verified with, and a
+/// keyword either half cannot read is one a deployment cannot use.
+#[test]
+fn the_published_schema_pins_the_signature_keywords_the_compilers_tables_do() {
+    let schema = read_schema();
+    let validator = compile_schema();
+    let hmac = |key: &str, value: &str| {
+        json!({ "triggers": { "intake": {
+            "type": "http",
+            "flow": "flow.f",
+            "auth": { "hmac": { "secret": "${WEBHOOK_SECRET}", key: value } },
+        } } })
+    };
+
+    let algorithms: BTreeSet<String> = HmacAlgorithm::ALL
+        .iter()
+        .map(|algorithm| algorithm.as_str().to_string())
+        .collect();
+    let encodings: BTreeSet<String> = SignatureEncoding::ALL
+        .iter()
+        .map(|encoding| encoding.as_str().to_string())
+        .collect();
+
+    for (key, table, outside) in [
+        ("algorithm", &algorithms, "md5"),
+        ("encoding", &encodings, "base64url"),
+    ] {
+        assert!(
+            !table.is_empty(),
+            "the `{key}` table is what this test quantifies over"
+        );
+        let published = variants(&schema["$defs"]["inboundHmac"]["properties"][key])
+            .unwrap_or_else(|| panic!("`{key}` must stay a closed set in the published schema"));
+        assert_eq!(
+            &published, table,
+            "the published schema and the compiler's table disagree about `{key}`"
+        );
+
+        for keyword in table {
+            let instance = hmac(key, keyword);
+            let errors = validation_errors(&validator, &instance);
+            assert!(
+                errors.is_empty(),
+                "`{key}: {keyword}` is one the compiler reads, so the editor must not \
+                 squiggle it:\n{}",
+                errors.join("\n")
+            );
+            let source = serde_yaml_ng::to_string(&instance).expect("a printable document");
+            let parsed = compose_core::parse_str(&source, "main.yml");
+            assert!(
+                parsed.diagnostics.is_empty(),
+                "`{key}: {keyword}` is one the published schema accepts, so the parser must \
+                 too:\n{source}\n{}",
+                parsed
+                    .diagnostics
+                    .iter()
+                    .map(|diagnostic| format!("  [{}] {}", diagnostic.code, diagnostic.message))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+        }
+
+        // And the closure holds in both authorities on the same spelling: a
+        // digest neither can verify with, an encoding neither can read.
+        assert!(
+            !table.contains(outside),
+            "`{outside}` is the spelling this half needs to be outside the set"
+        );
+        let instance = hmac(key, outside);
+        assert!(
+            !validation_errors(&validator, &instance).is_empty(),
+            "`{key}: {outside}` names nothing the runtime has, so the published schema must \
+             refuse it"
+        );
+        let source = serde_yaml_ng::to_string(&instance).expect("a printable document");
+        assert!(
+            !compose_core::parse_str(&source, "main.yml")
+                .diagnostics
+                .is_empty(),
+            "`{key}: {outside}` names nothing the runtime has, so the parser must refuse it"
+        );
     }
 }
 

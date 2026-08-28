@@ -1,0 +1,11 @@
+# rule: a `bearer:` `prefix:` is literal text, in either direction; nothing on it is interpolated (grammar 4.3 class 3, 13.3 / Decision D92)
+# at: /triggers/intake/auth/bearer/prefix
+# via: /$defs/noEnvRefString/not
+triggers:
+  intake:
+    type: http
+    flow: flow.support
+    auth:
+      bearer:
+        token: ${WEBHOOK_TOKEN}
+        prefix: "${TOKEN_SCHEME}"

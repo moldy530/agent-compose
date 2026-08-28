@@ -1,0 +1,13 @@
+# rule: an `auth:` `prefix:` sits in a header value, and no header value carries a carriage return — outbound it would end the field and begin another, inbound it could match nothing a caller sent (grammar 13.3)
+# code: invalid-value
+# message: `prefix` must not contain control characters, found "sha256=\r\nX-Injected: 1"
+# at: 13:17
+# help: the prefix stands between the header and the credential — written ahead of it outbound, expected ahead of it inbound — and a carriage return or newline is neither: outbound it ends that header field and begins another, inbound it is a byte no header value a caller sent can carry; keep it to visible characters and spaces, as in `Bearer ` or `sha256=`
+triggers:
+  intake:
+    type: http
+    flow: flow.support
+    auth:
+      hmac:
+        secret: ${WEBHOOK_SECRET}
+        prefix: "sha256=\r\nX-Injected: 1"

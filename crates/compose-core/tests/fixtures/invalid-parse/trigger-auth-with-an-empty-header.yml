@@ -1,0 +1,12 @@
+# rule: an `auth:` `header:` names the header a credential arrives in, and the empty string names none (grammar 13.3)
+# code: invalid-value
+# message: `header` must not be empty
+# at: 12:17
+triggers:
+  intake:
+    type: http
+    flow: flow.support
+    auth:
+      hmac:
+        secret: ${WEBHOOK_SECRET}
+        header: ""

@@ -416,6 +416,45 @@ const GRAMMAR: &[Check] = &[
         evidence: Evidence::Fixture,
     },
     Check {
+        // The inbound half of grammar 13.3's authentication surface. Two rules
+        // in one row because they are one shape read twice: an `auth:` block
+        // declares exactly one scheme, and both schemes' secrets take the
+        // env-ref value form §4.3 fixes for every credential in this grammar.
+        rule: "an inbound `auth:` block declares exactly one scheme, whose secret is an `${ENV}` reference (13.3, 4.3, D41, D125)",
+        pass: "parse/section.rs",
+        codes: &["missing-key", "conflicting-keys", "invalid-env-ref"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        // The shape of the two keys every scheme block shares. A row of its own
+        // rather than a clause on the two beside it, because it is the only
+        // rule here about what a *resolved* value does downstream: a delivery
+        // writes `header:` and `prefix:` onto its own request verbatim, so a
+        // colon or a carriage return in either forges a second header — and a
+        // name the delivery already writes, inside its own `X-AgentCompose-`
+        // namespace or among the `Content-Type`, `Content-Length` and `Host` any
+        // POST of a JSON body carries, collides with a header the same request
+        // already sends (D127).
+        rule: "an auth block's `header:` is one HTTP header name that no delivery already writes, and its `prefix:` carries no control character, inbound and outbound alike (13.3, 12.1, D127)",
+        pass: "parse/section.rs",
+        codes: &["invalid-value", "unexpected-env-ref"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        // The outbound half. `missing-callback-allowlist` is its own code for
+        // the reason `missing-credential` is: what is absent is decided by a
+        // sibling, and the repair is a choice of two.
+        rule: "a `callback_auth:` block declares a scheme, brings a non-empty `callback_allow:` of absolute http/https patterns each naming a host, and neither key stands without a `callback:` (13.3, D126, D127)",
+        pass: "parse/section.rs",
+        codes: &[
+            "missing-key",
+            "missing-callback-allowlist",
+            "conflicting-keys",
+            "invalid-value",
+        ],
+        evidence: Evidence::Fixture,
+    },
+    Check {
         rule: "every CEL surface: roots, paths, constructs, and result type (4.1)",
         pass: "cel/mod.rs, over check/expr.rs",
         codes: &[

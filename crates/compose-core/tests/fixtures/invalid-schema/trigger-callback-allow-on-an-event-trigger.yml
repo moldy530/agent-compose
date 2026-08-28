@@ -1,0 +1,10 @@
+# rule: `callback_allow:` is a key of `http` triggers alone (grammar 13.3 / PRD resolved q33)
+# at: /triggers/ingest
+# via: /$defs/eventTrigger/additionalProperties
+triggers:
+  ingest:
+    type: event
+    flow: flow.support
+    source: bug_reports
+    callback_allow:
+      - "https://hooks.example.com/*"

@@ -1,0 +1,14 @@
+# rule: a `header:` names one HTTP header, and a name carrying a colon would forge a second on every delivery (grammar 13.3, 12.1)
+# at: /triggers/intake/callback_auth/bearer/header
+# via: /$defs/bearerAuth/properties/header/allOf/1/pattern
+triggers:
+  intake:
+    type: http
+    flow: flow.support
+    callback: "payload.body.callback_url"
+    callback_auth:
+      bearer:
+        token: ${CALLBACK_TOKEN}
+        header: "X-Token: forged"
+    callback_allow:
+      - "https://hooks.example.com/*"

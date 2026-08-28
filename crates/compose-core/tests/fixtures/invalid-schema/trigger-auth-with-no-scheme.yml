@@ -1,0 +1,8 @@
+# rule: an inbound `auth:` block declares a scheme; an empty one authenticates nothing (grammar 13.3 / PRD resolved q32)
+# at: /triggers/intake/auth
+# via: /$defs/inboundAuth/oneOf
+triggers:
+  intake:
+    type: http
+    flow: flow.support
+    auth: {}

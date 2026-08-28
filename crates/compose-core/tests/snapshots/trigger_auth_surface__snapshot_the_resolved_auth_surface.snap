@@ -1,0 +1,115 @@
+---
+source: crates/compose-core/tests/trigger_auth_surface.rs
+expression: "serde_json::to_string_pretty(&artifact[\"triggers\"]).expect(\"a printable trigger table\")"
+---
+{
+  "entries": {
+    "intake": {
+      "auth": {
+        "algorithm": "sha512",
+        "encoding": "base64",
+        "header": "X-Hub-Signature-256",
+        "prefix": "sha512=",
+        "scheme": "hmac",
+        "secret": {
+          "span": "main.yml:23:17..23:34",
+          "value": {
+            "env_ref": "WEBHOOK_SECRET"
+          }
+        }
+      },
+      "callback": {
+        "span": "main.yml:20:15..20:42",
+        "value": "payload.body.callback_url"
+      },
+      "callback_allow": [
+        {
+          "span": "main.yml:36:9..36:38",
+          "value": "https://hooks.example.com/*"
+        },
+        {
+          "span": "main.yml:37:9..37:34",
+          "value": "http://localhost:9000/*"
+        }
+      ],
+      "callback_auth": {
+        "bearer": {
+          "header": "X-Delivery-Token",
+          "prefix": "Token ",
+          "token": {
+            "span": "main.yml:30:16..30:33",
+            "value": {
+              "env_ref": "CALLBACK_TOKEN"
+            }
+          }
+        },
+        "hmac": {
+          "secret": {
+            "span": "main.yml:34:17..34:35",
+            "value": {
+              "env_ref": "CALLBACK_SECRET"
+            }
+          }
+        }
+      },
+      "flow": {
+        "span": "main.yml:18:11..18:23",
+        "value": "flow.support"
+      },
+      "name": {
+        "span": "main.yml:16:3..16:9",
+        "value": "intake"
+      },
+      "path": {
+        "span": "main.yml:19:11..19:18",
+        "value": "/intake"
+      },
+      "span": "main.yml:17:5..37:34",
+      "type": "http"
+    },
+    "minimal": {
+      "auth": {
+        "header": "Authorization",
+        "prefix": "Bearer ",
+        "scheme": "bearer",
+        "token": {
+          "span": "main.yml:45:16..45:32",
+          "value": {
+            "env_ref": "WEBHOOK_TOKEN"
+          }
+        }
+      },
+      "callback": {
+        "span": "main.yml:42:15..42:42",
+        "value": "payload.body.callback_url"
+      },
+      "callback_allow": [
+        {
+          "span": "main.yml:50:9..50:38",
+          "value": "https://hooks.example.com/*"
+        }
+      ],
+      "callback_auth": {
+        "hmac": {
+          "secret": {
+            "span": "main.yml:48:17..48:35",
+            "value": {
+              "env_ref": "CALLBACK_SECRET"
+            }
+          }
+        }
+      },
+      "flow": {
+        "span": "main.yml:41:11..41:23",
+        "value": "flow.support"
+      },
+      "name": {
+        "span": "main.yml:39:3..39:10",
+        "value": "minimal"
+      },
+      "span": "main.yml:40:5..50:38",
+      "type": "http"
+    }
+  },
+  "span": "main.yml:16:3..50:38"
+}

@@ -77,6 +77,20 @@ impl<'a> Fields<'a> {
         self.mapping.contains_key(key)
     }
 
+    /// The span of this key, without consuming it.
+    ///
+    /// For the rules that are about a key having been *written* — a conditional
+    /// requirement decided by a sibling — and so read the mapping through
+    /// [`Self::contains`] rather than through a parsed value, but still want to
+    /// underline the sibling that decided it.
+    pub(crate) fn span_of(&self, key: &str) -> Option<Span> {
+        self.mapping
+            .entries()
+            .iter()
+            .find(|entry| entry.key.value == key)
+            .map(|entry| entry.key.span.clone())
+    }
+
     /// The entry under this key, marking it consumed.
     pub(crate) fn take_entry(&mut self, key: &'static str) -> Option<&'a Entry> {
         if !self.known.contains(&key) {

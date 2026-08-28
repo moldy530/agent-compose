@@ -1,0 +1,10 @@
+# rule: a `callback_allow:` entry is a pattern the composition carries, and nothing on it is interpolated (grammar 4.3 class 3, 13.3 / Decision D92)
+# at: /triggers/intake/callback_allow/0
+# via: /$defs/noEnvRefString/not
+triggers:
+  intake:
+    type: http
+    flow: flow.support
+    callback: "payload.body.callback_url"
+    callback_allow:
+      - "https://${HOOK_HOST}/*"

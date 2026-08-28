@@ -1,0 +1,14 @@
+# rule: an outbound `hmac:` carries `secret:` and nothing else — signing a delivery is HMAC-SHA256 in hex, so one recipe verifies every deployment (grammar 13.3 / Decision D127)
+# at: /triggers/intake/callback_auth/hmac
+# via: /$defs/callbackHmac/additionalProperties
+triggers:
+  intake:
+    type: http
+    flow: flow.support
+    callback: "payload.body.callback_url"
+    callback_auth:
+      hmac:
+        secret: ${CALLBACK_SECRET}
+        algorithm: sha512
+    callback_allow:
+      - "https://hooks.example.com/*"

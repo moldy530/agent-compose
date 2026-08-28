@@ -24,7 +24,11 @@ pub(crate) enum NameForm {
 }
 
 impl NameForm {
-    fn accepts(self, text: &str) -> bool {
+    /// Whether one written name takes this form. Public within the crate
+    /// because `section::header_shape` holds a trigger's `header:` to
+    /// [`Self::HeaderLike`] — the same form, read from the same place, so the
+    /// two surfaces cannot drift apart.
+    pub(crate) fn accepts(self, text: &str) -> bool {
         match self {
             Self::Identifier => lexical::is_identifier(text),
             Self::HeaderLike => {

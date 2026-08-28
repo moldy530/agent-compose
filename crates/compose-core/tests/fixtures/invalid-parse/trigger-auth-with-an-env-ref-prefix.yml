@@ -1,0 +1,13 @@
+# rule: an `auth:` `prefix:` is literal text; nothing on it is interpolated (grammar 4.3 class 3, 13.3, Decision D92)
+# code: unexpected-env-ref
+# message: `prefix` never interpolates environment references, but it contains `${SIG_PREFIX}`
+# at: 13:17
+# help: write `$${SIG_PREFIX}` for a literal `${SIG_PREFIX}`
+triggers:
+  intake:
+    type: http
+    flow: flow.support
+    auth:
+      hmac:
+        secret: ${WEBHOOK_SECRET}
+        prefix: "${SIG_PREFIX}"
