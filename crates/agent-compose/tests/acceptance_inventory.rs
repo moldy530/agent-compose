@@ -1604,6 +1604,14 @@ const EVENTS: &[Criterion] = &[
                 "one_quiescence_that_opened_many_pauses_is_one_parked_delivery",
                 Status::Live,
             ),
+            // …and the work a quiescence is **not** about: a detached dispatch
+            // runs its sink's nodes under this execution's id, and grammar 8.6
+            // rule 7 says nothing it does may delay the enclosing instance —
+            // the webhook included.
+            (
+                "a_parking_is_delivered_while_a_detached_dispatch_is_still_running",
+                Status::Live,
+            ),
         ],
     },
     Criterion {
@@ -1661,6 +1669,14 @@ const EVENTS: &[Criterion] = &[
             // rather than left owed for the life of the journal.
             (
                 "a_pending_delivery_a_shorter_schedule_leaves_no_attempt_for_is_exhausted",
+                Status::Live,
+            ),
+            // …and the bound on what picking one up may cost: a webhook is a
+            // courtesy the status route backstops, so a journal read that fails
+            // while the owed ones are enumerated leaves one delivery owed rather
+            // than a deployment that never binds its port.
+            (
+                "a_delivery_whose_execution_cannot_be_read_leaves_the_app_serving",
                 Status::Live,
             ),
         ],

@@ -1595,6 +1595,17 @@ const DELIVERY_TIMEOUT_MS = 10_000;
  * died, so there is nothing to recover and something still to send. Its
  * remaining schedule is computed from the recorded intent, so a delivery whose
  * next offset has already passed goes at once.
+ *
+ * **One row's failure is one delivery left owed, never a process that refuses to
+ * serve.** This runs in the `onReady` hook, so a rejection out of here is an
+ * `app.listen()` that rejects — a deployment whose executions, routes and
+ * journal are otherwise healthy would not bind a port. Every read below can fail
+ * transiently for a reason that has nothing to do with the row it was about: a
+ * second process on the same project contends the file, and `docs/durability.md`
+ * §2 and §12 both make that a state a healthy deployment reaches. So each row is
+ * picked up inside its own guard, in the posture [`recoverExecutions`] takes for
+ * the read it guards and §3.7 takes for a webhook — a courtesy the status route
+ * backstops, and one the next start picks up again.
  */
 async function resumeDeliveries(): Promise<void> {
   let pending: readonly runtime.DeliveryRecord[];
@@ -1607,34 +1618,48 @@ async function resumeDeliveries(): Promise<void> {
     return;
   }
   for (const record of pending) {
-    const row = await journaledExecution(record.execution);
-    const trigger = httpTriggers.find((one) => one.name === row?.trigger);
-    if (trigger === undefined) {
-      // The trigger that promised this delivery its identity is not one this
-      // build has, so the row stays pending for a build that does — the posture
-      // [`opening`] takes, and the one `recover` takes for a flow it no longer
-      // declares.
+    try {
+      await resumeDelivery(record);
+    } catch (error) {
+      // The row is left as this start found it — a delivery it could not read is
+      // one it does not rewrite — so the next start reads the same `pending` row
+      // and picks it up from the same recorded intent.
       process.stderr.write(
-        `\`${record.id}\` was to be delivered for \`${row?.trigger ?? "an unknown trigger"}\`, which this build does not declare: it stays undelivered in the journal\n`,
+        `\`${record.id}\` could not be picked up and stays undelivered in the journal: ${message(error)}\n`,
       );
-      continue;
     }
-    // **The allowlist is matched here too**, and this is where a row [`opening`]
-    // could not match one against reaches its trigger's list at last: a delivery
-    // journaled by a build with no declaration of the trigger has never been
-    // held to it, and picking it up unchecked would POST an attacker-supplied
-    // URL that the trigger admits nowhere (grammar 13.3, Decision D127). The
-    // refusal is written onto the row it is about rather than opened as a second
-    // event: the ordinal is the lifecycle event's, and the event has not
-    // happened twice.
-    if (trigger.callbackAllow !== undefined && !admits(trigger.callbackAllow, record.url)) {
-      await refuseRecordedDelivery(record.execution, record.ordinal, refusedUrl(trigger.name));
-      process.stderr.write(`refused delivery ${record.id} (${record.event})\n`);
-      continue;
-    }
-    void attempts(record, trigger);
-    process.stderr.write(`resumed delivery ${record.id} (${record.event})\n`);
   }
+}
+
+/** One owed delivery, put back on its schedule. See [`resumeDeliveries`]. */
+async function resumeDelivery(record: runtime.DeliveryRecord): Promise<void> {
+  const row = await journaledExecution(record.execution);
+  const trigger = httpTriggers.find((one) => one.name === row?.trigger);
+  if (trigger === undefined) {
+    // The trigger that promised this delivery its identity is not one this
+    // build has, so the row stays pending for a build that does — the posture
+    // [`opening`] takes, and the one `recover` takes for a flow it no longer
+    // declares.
+    process.stderr.write(
+      `\`${record.id}\` was to be delivered for \`${row?.trigger ?? "an unknown trigger"}\`, which this build does not declare: it stays undelivered in the journal\n`,
+    );
+    return;
+  }
+  // **The allowlist is matched here too**, and this is where a row [`opening`]
+  // could not match one against reaches its trigger's list at last: a delivery
+  // journaled by a build with no declaration of the trigger has never been
+  // held to it, and picking it up unchecked would POST an attacker-supplied
+  // URL that the trigger admits nowhere (grammar 13.3, Decision D127). The
+  // refusal is written onto the row it is about rather than opened as a second
+  // event: the ordinal is the lifecycle event's, and the event has not
+  // happened twice.
+  if (trigger.callbackAllow !== undefined && !admits(trigger.callbackAllow, record.url)) {
+    await refuseRecordedDelivery(record.execution, record.ordinal, refusedUrl(trigger.name));
+    process.stderr.write(`refused delivery ${record.id} (${record.event})\n`);
+    return;
+  }
+  void attempts(record, trigger);
+  process.stderr.write(`resumed delivery ${record.id} (${record.event})\n`);
 }
 
 /** Wait out one retry offset, without holding the process open for it. */

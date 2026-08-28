@@ -6350,25 +6350,39 @@ export async function runMap(
         modelCalls: undefined,
         toolDispatches: undefined,
       };
+      // And off the **quiescence** reading, which is the same statement about a
+      // third reader. A `flow.*` sink runs its own nodes under this execution's
+      // id, so a parking webhook that waited for them would wait for exactly the
+      // work rule 7 says nothing waits for — a subscriber told about a pause it
+      // could have answered when the delivery finally released (see
+      // [`inFlight`], [`quiescent`], and `src/serve.ts`'s `parking`). The mark
+      // goes down before the delivery is issued, so a sink that reaches its first
+      // node in this tick is already inside it, and comes off however the
+      // delivery ends — including before `route.run` is reached.
+      const undetach = detaching(scoped.execution.id, site.path.join("/"));
       const delivering = (async () => {
-        // `max_concurrency` is an **admission** bound over every in-flight
-        // dispatch, detached included (grammar 8.6's key table, D28): a detached
-        // delivery waits for a node permit to *start*, exactly as a joined
-        // instance does. It waits for it **behind the join**, though — rule 7's
-        // "nothing it does can delay the enclosing flow instance" is a statement
-        // about the permit queue as much as about the outcome. Both gates are
-        // taken after the barrier and as a `"detached"` waiter, so a joined
-        // instance of this call never queues behind this delivery and a later
-        // execution of this node never queues behind it either.
-        await joinedAdmitted;
-        await gate.acquire("detached");
-        await node.acquire("detached");
         try {
-          await route.run(instance.input, delivery, site);
+          // `max_concurrency` is an **admission** bound over every in-flight
+          // dispatch, detached included (grammar 8.6's key table, D28): a
+          // detached delivery waits for a node permit to *start*, exactly as a
+          // joined instance does. It waits for it **behind the join**, though —
+          // rule 7's "nothing it does can delay the enclosing flow instance" is
+          // a statement about the permit queue as much as about the outcome.
+          // Both gates are taken after the barrier and as a `"detached"` waiter,
+          // so a joined instance of this call never queues behind this delivery
+          // and a later execution of this node never queues behind it either.
+          await joinedAdmitted;
+          await gate.acquire("detached");
+          await node.acquire("detached");
+          try {
+            await route.run(instance.input, delivery, site);
+          } finally {
+            node.release();
+            gate.release();
+            retire(plan.admission, admission);
+          }
         } finally {
-          node.release();
-          gate.release();
-          retire(plan.admission, admission);
+          undetach();
         }
       })().catch((error: unknown) => {
         // Nothing it does can fail the enclosing flow instance, which is what an
@@ -7210,15 +7224,76 @@ export function watchHumanPauses(execution: string, listener: () => void): () =>
  * subflow a `flow:` node or an agent's `tools:` instantiates is one per node
  * execution and needs no entry of its own — the node's does for it.
  *
- * A **detached** dispatch is deliberately absent (grammar 8.6 rule 7): nothing
- * waits for it, Decision D118 refuses a `human` node under one, so it can open
- * no pause — and counting it would hold a parking webhook back for the whole of
- * work the flow instance itself does not wait for.
+ * A **detached** dispatch is absent (grammar 8.6 rule 7), and keeping it absent
+ * takes bookkeeping rather than silence. Nothing waits for a delivery and
+ * Decision D118 refuses a `human` node under one, so it can open no pause — but
+ * its *sink* is a graph like any other: a `flow.*` reached that way runs its
+ * nodes under this execution's id ([`runSubflow`] is handed `site.execution`),
+ * and every one of them would register here. Counting them would hold a parking
+ * webhook back for the whole of work the flow instance itself does not wait for
+ * — a `map` with `detach: true` to a flow whose `http:` node carries a
+ * thirty-minute budget would keep a subscriber from being told about a pause it
+ * could answer at once, which is rule 7's "nothing it does can delay the
+ * enclosing flow instance" broken at the one surface that reads this map.
+ * [`detaching`] marks the delivery's whole subtree and [`working`] reads the
+ * mark.
  */
 const inFlight = new Map<string, Map<string, number>>();
 
 /** Who is told when one execution's in-flight work changes. See [`quiescent`]. */
 const quietWatchers = new Map<string, Set<() => void>>();
+
+/**
+ * Every **detached** dispatch in flight, by the instance path its sink runs
+ * under.
+ *
+ * A delivery's work is named the way a pause is (grammar 9.4): the dispatch's
+ * instance path is a prefix of every site inside its sink — the nodes of a
+ * `flow.*` it instantiates, and the subflows an `agent.*` reached that way calls
+ * from its `tools:`. So one entry answers for a whole subtree, and nothing has
+ * to be threaded across a boundary that rebuilds its context from `$run`.
+ *
+ * Counted for [`working`]'s reason and one of its own: a node `retry:` that
+ * re-executes a `map` issues the next attempt's deliveries at the very paths the
+ * failed attempt's are still being delivered at, and nothing cancels those.
+ */
+const detachedSites = new Map<string, Map<string, number>>();
+
+/**
+ * Mark everything under one instance path as a detached dispatch's work for as
+ * long as the delivery runs, and answer its release.
+ *
+ * Called by [`runMap`] before the delivery is issued, so a sink that reaches its
+ * first node in the same tick is already inside the mark.
+ */
+function detaching(execution: string, site: string): () => void {
+  let sites = detachedSites.get(execution);
+  if (sites === undefined) {
+    sites = new Map();
+    detachedSites.set(execution, sites);
+  }
+  const held = sites;
+  held.set(site, (held.get(site) ?? 0) + 1);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    const count = (held.get(site) ?? 0) - 1;
+    if (count > 0) held.set(site, count);
+    else held.delete(site);
+    if (held.size === 0 && detachedSites.get(execution) === held) detachedSites.delete(execution);
+  };
+}
+
+/** Whether `site` is at, or inside, a detached dispatch. See [`detaching`]. */
+function detachedWork(execution: string, site: string): boolean {
+  const sites = detachedSites.get(execution);
+  if (sites === undefined) return false;
+  for (const root of sites.keys()) {
+    if (under(site, root)) return true;
+  }
+  return false;
+}
 
 /**
  * Note one unit of concurrent work for as long as it runs, and answer its
@@ -7228,8 +7303,15 @@ const quietWatchers = new Map<string, Set<() => void>>();
  * sequence — both retry ladders re-execute an instance at the site its
  * predecessor ran at ([`runActivity`], [`attemptItem`]) — and a release that
  * deleted the entry would drop a live registration if the two ever overlapped.
+ *
+ * Work inside a **detached** dispatch registers nothing at all: it is not work
+ * the enclosing instance is waiting for, and a quiescence that waited for it
+ * would be waiting for the one thing grammar 8.6 rule 7 says nothing waits for
+ * (see [`inFlight`]). The release such a caller is handed does nothing, because
+ * there is nothing to release and no reader whose answer its finishing changes.
  */
 function working(execution: string, site: string): () => void {
+  if (detachedWork(execution, site)) return () => {};
   let sites = inFlight.get(execution);
   if (sites === undefined) {
     sites = new Map();
@@ -7269,6 +7351,11 @@ function working(execution: string, site: string): () => void {
  * a dispatched instance, which runs a graph of its own inside the map node's
  * task and advances while a sibling instance is parked; that is exactly why
  * [`inFlight`] holds an entry per instance as well as per node execution.
+ *
+ * What the reading is **about** is the work the flow instance waits for, so a
+ * detached dispatch and everything under it is outside it: an execution whose
+ * only unparked work is a delivery has stopped advancing on its own, whatever
+ * that delivery is still doing (grammar 8.6 rule 7, and see [`detaching`]).
  *
  * An execution with nothing in flight is quiescent, which is the answer a run
  * that has ended needs: nothing more will open.

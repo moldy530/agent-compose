@@ -717,7 +717,12 @@ on:
 * every delivery the journal holds `pending` is **picked up** (§3.7), beside the
   executions and separately from them: a delivery reports on an execution that
   may have ended in the process that died, and its remaining schedule is
-  computed from the recorded intent rather than started again;
+  computed from the recorded intent rather than started again — each row on its
+  own, so a read that fails while they are enumerated leaves **one delivery**
+  owed rather than an `onReady` hook that rejects and a process that never binds
+  its port. What failed is written on stderr and the row stays `pending` for the
+  next start, which is §3.7's posture for a webhook and this section's for a
+  journal it cannot read;
 * an execution that re-parks under wait ids a `parked` delivery already reported
   fires **no** parking webhook: re-parking is what recovery is, and nothing was
   asked that had not been asked (PRD resolved q35);

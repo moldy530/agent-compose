@@ -16701,6 +16701,27 @@ fn events_environment(
         "linger",
         "sleep \"${PAUSE_FOR:-0}\"\nprintf 'lingered'\n",
     );
+    // The third: work that runs until the test says otherwise, which is what a
+    // **detached** delivery has to be for an assertion about a parking made
+    // while one is in flight to be a fact rather than a race against a sleep.
+    // The line goes down before the wait starts, so a test that has seen it
+    // knows the sink is inside the loop, and only a file the test creates lets
+    // it out.
+    harness::shim(
+        shims.path(),
+        "hold",
+        "printf 'holding\\n' >> \"$TALLY_LOG.hold\"\n\
+         until [ -e \"$TALLY_LOG.released\" ]; do sleep 0.05; done\n\
+         printf 'held'\n",
+    );
+    // …and its other half, which the flow that dispatched the delivery runs
+    // before it parks: it returns once the sink is inside its wait, so the pause
+    // opens with the delivery in flight rather than racing it.
+    harness::shim(
+        shims.path(),
+        "escorting",
+        "until [ -e \"$TALLY_LOG.hold\" ]; do sleep 0.05; done\nprintf 'escorting'\n",
+    );
     let mut environment = harness::environment(provider);
     environment.push((
         harness::TALLY_BIN.to_string(),
@@ -18052,6 +18073,114 @@ fn one_quiescence_that_opened_many_pauses_is_one_parked_delivery() {
     );
 }
 
+/// A **detached** delivery still running does not hold a parking's webhook back
+/// (grammar 8.6 rule 7, PRD resolved q34).
+///
+/// Rule 7 says nothing a detached dispatch does may delay the enclosing flow
+/// instance, and a *quiescence* is one of the things that can be delayed: the
+/// sink of a detached dispatch to a `flow.*` runs its own nodes under this
+/// execution's id, so a reading of "every unit of work is waiting on a human"
+/// that counted them would answer `false` for as long as the delivery ran.
+/// D118 refuses a `human` node under a detached target, so that work can never
+/// park — the answer would be `false` until the delivery finished, whatever
+/// that took. Concretely: a receiver subscribed to a flow that detaches a slow
+/// sink is told about a pause it could have answered at once only when the
+/// delivery releases, minutes later.
+///
+/// Nothing here is timed. `flow.escorted` runs a node that waits for the sink's
+/// own line before it reaches the pause, so the parking happens with the
+/// delivery **provably** in flight; the sink cannot leave its wait until this
+/// test writes the file it is watching for, which it does after the webhook has
+/// arrived. A build that waited for the delivery delivers no `parked` webhook
+/// at all inside the budget below.
+#[test]
+fn a_parking_is_delivered_while_a_detached_dispatch_is_still_running() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_shims, log, environment) = events_environment(&provider, "events-detached-parking");
+    let receiver = harness::Receiver::start().expect("a loopback receiver");
+    let Some(project) = harness::scratch_project("events-detached-parking") else {
+        return;
+    };
+    let Some(served) = harness::serve_into(&project, "http-events", &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+
+    let started = app
+        .send(
+            Request::post("/escorted")
+                .json(&json!({
+                    "topic": "escorted",
+                    "topics": ["one"],
+                    "callback_url": format!("{}/anywhere", receiver.base_url),
+                }))
+                .header("authorization", events_bearer()),
+        )
+        .expect("the trigger's route answers");
+    assert_eq!(started.status, 202, "{}", started.text());
+    let execution = started.json()["execution_id"]
+        .as_str()
+        .expect("an execution id")
+        .to_string();
+
+    // The delivery is running: its subprocess has written its line, and the only
+    // way out of the wait it is now in is a file this test has not created.
+    let holding = log.with_extension("log.hold");
+    let release = log.with_extension("log.released");
+    wait_for_lines(&holding, 1);
+
+    let parked = receiver.wait_for_event("parked", 1, Duration::from_secs(60));
+    assert!(
+        !release.exists(),
+        "the parking webhook arrived while the detached delivery was still in flight, \
+         and nothing has released it"
+    );
+    assert_eq!(parked[0].header("x-agentcompose-ordinal"), Some("0"));
+    let interrupts = parked[0].body["interrupts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a parking webhook carries its pauses: {:?}", parked[0].body))
+        .clone();
+    assert_eq!(
+        interrupts.len(),
+        1,
+        "the pause the flow parked at, and nothing the delivery opened: {:?}",
+        parked[0].body
+    );
+    let resume_url = interrupts[0]["resume_url"]
+        .as_str()
+        .expect("a resume url")
+        .to_string();
+
+    // Released before the answer, because a run on its way out **does** wait for
+    // its detached deliveries (`docs/durability.md` §3.2): rule 7 is about the
+    // flow instance, and this is the one place a delivery with no record would
+    // be a delivery made twice.
+    std::fs::write(&release, "").expect("the release file is writable");
+    let answered = app
+        .send(
+            Request::post(&resume_url)
+                .json(&json!({ "decision": "approve" }))
+                .header("authorization", events_bearer()),
+        )
+        .expect("the resume route answers");
+    assert_eq!(answered.status, 202, "{}", answered.text());
+
+    let settled = receiver.wait_for_event("settled", 1, Duration::from_secs(60));
+    assert_eq!(settled[0].header("x-agentcompose-ordinal"), Some("1"));
+    assert_eq!(
+        settled[0].body["outputs"]["decision"],
+        json!("approve"),
+        "{:?}",
+        settled[0].body
+    );
+    assert_eq!(
+        receiver.distinct("parked"),
+        [format!("{execution}:0")],
+        "one parking, delivered once: {:?}",
+        receiver.distinct("parked")
+    );
+}
+
 /// A credential set to the **empty string** refuses the app at launch, naming
 /// the variable (grammar 13.3, PRD resolved q32).
 ///
@@ -18356,6 +18485,121 @@ fn a_journal_written_before_the_delivery_ledger_opens_and_serves_under_this_buil
         (held["deliveries"][0]["status"] == "delivered").then_some(held)
     });
     assert_eq!(report["deliveries"][0]["ordinal"], 0, "{report}");
+}
+
+/// A lifecycle row this build cannot read, under a delivery it still owes.
+///
+/// `inputs` is the column taken away because reading it is what fails: the
+/// journal's queries are `SELECT *`, so a missing column is a missing *field*,
+/// and the one field the row's reader parses rather than copies is this one.
+/// Every other column would be read as `"undefined"` and hurt nothing.
+///
+/// The row is kept rather than deleted, because a row that is **not there** is
+/// an answer the picker-up already has a posture for (the execution's trigger
+/// cannot be named, so the delivery stays pending). What has no posture until
+/// one is written is a read that *throws*, which is what any transient journal
+/// failure looks like from inside the loop.
+const JOURNAL_WITH_AN_UNREADABLE_EXECUTION: &str = "\
+CREATE TABLE unreadable (
+  id              TEXT PRIMARY KEY,
+  flow            TEXT NOT NULL,
+  trigger_kind    TEXT NOT NULL,
+  session_key     TEXT NOT NULL,
+  callback        TEXT,
+  status          TEXT NOT NULL,
+  journal_version INTEGER NOT NULL,
+  started_at      TEXT NOT NULL,
+  ended_at        TEXT,
+  error           TEXT
+);
+INSERT INTO unreadable
+  SELECT id, flow, trigger_kind, session_key, callback, status, journal_version, started_at, ended_at, error
+  FROM executions;
+DROP TABLE executions;
+ALTER TABLE unreadable RENAME TO executions;
+";
+
+/// A journal read that fails while owed deliveries are being picked up leaves
+/// **one delivery** owed, not a deployment that will not start
+/// (`docs/durability.md` §3.7, §6.1).
+///
+/// Picking the owed webhooks up happens in the `onReady` hook, so a rejection
+/// out of that walk is an `app.listen()` that rejects: the process exits without
+/// binding a port, and the executions, routes and journal it was going to serve
+/// go with it. The reads in that walk can fail for reasons that have nothing to
+/// do with the deployment's health — §2 and §12 both make a second process
+/// contending the file a state a healthy project reaches, and a `SELECT` that
+/// waits out `busy_timeout` throws — so a webhook, which §3.7 calls "a courtesy
+/// the status route backstops", would take down a service that owes one.
+///
+/// A contended file cannot be scripted, so the read is made to fail the way a
+/// contended one does: the lifecycle row the pending delivery belongs to is
+/// rebuilt without the column its reader parses. What is asserted is that the
+/// app serves — a `401` from a guarded route is a route answering — and that the
+/// row is left exactly as it was found, for a start that can read it.
+#[test]
+fn a_delivery_whose_execution_cannot_be_read_leaves_the_app_serving() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_shims, _log, base) = events_environment(&provider, "events-unreadable-row");
+    let receiver = harness::Receiver::start().expect("a loopback receiver");
+    // Refused, so the delivery is still owed when the process ends: one attempt
+    // is made at `0s` and the next is an hour away.
+    receiver.always(500);
+    let Some(project) = harness::scratch_project("events-unreadable-row") else {
+        return;
+    };
+    let mut environment = base;
+    environment.push((harness::CALLBACK_RETRY.to_string(), "0s,1h".to_string()));
+
+    let execution;
+    {
+        let Some(first) = harness::serve_into(&project, "http-events", &environment) else {
+            return;
+        };
+        let app = Client::new(&first.base_url).expect("a client for the generated app");
+        let started = app
+            .post_json(
+                "/posted",
+                &json!({
+                    "topic": "unreadable",
+                    "callback_url": format!("{}/anywhere", receiver.base_url),
+                }),
+            )
+            .expect("the trigger's route answers");
+        assert_eq!(started.status, 202, "{}", started.text());
+        execution = started.json()["execution_id"]
+            .as_str()
+            .expect("an execution id")
+            .to_string();
+        receiver.wait_for_event("settled", 1, Duration::from_secs(30));
+        let finished = harness::settled(&app, &execution);
+        assert_eq!(finished["status"], "completed", "{finished}");
+    }
+
+    harness::journal_sql(&project, JOURNAL_WITH_AN_UNREADABLE_EXECUTION);
+
+    // The start enumerates the owed delivery, cannot read the execution it
+    // reports on — and binds its port anyway.
+    let Some(second) = harness::serve_into(&project, "http-events", &environment) else {
+        return;
+    };
+    let app = Client::new(&second.base_url).expect("a client for the generated app");
+    let refused = app
+        .post_json("/guarded", &json!({ "topic": "unreadable" }))
+        .expect("the trigger's route answers");
+    assert_eq!(
+        refused.status,
+        401,
+        "the app is serving its routes: {}",
+        refused.text()
+    );
+
+    let held = journaled_deliveries(&project, &execution);
+    assert_eq!(
+        held[0]["status"], "pending",
+        "the row is left as it was found, for a start that can read it: {held:?}"
+    );
+    drop(second);
 }
 
 /// The `http-events` fixture with one trigger renamed, so a build meets an

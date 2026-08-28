@@ -28,6 +28,12 @@
 #     the documented test posture (resolved q33) and the shape a retry is
 #     cheapest to observe in: the flow does not park, so the only delivery is
 #     the settle.
+#   * `escorted` — a parking with a **detached** delivery still running under it.
+#     Grammar 8.6 rule 7 says nothing a detached dispatch does may delay the
+#     enclosing instance, and a quiescence is one of the things that can be
+#     delayed: its sink is a `flow.*` whose node blocks until this test releases
+#     it, so an execution that owes a parking webhook owes it while work of that
+#     kind is in flight.
 #   * `fanned` — one execution that parks **several times at once**: a `map`
 #     over a flow whose items linger for different lengths of time before they
 #     reach their `human` node. A quiescence is the moment the last of them
@@ -108,6 +114,85 @@ flow.review:
         note: "input.topic"
   edges:
     - { from: start, to: sign_off }
+    - { from: sign_off, to: end }
+
+flow.escort:
+  description: The sink of a detached dispatch — work that runs until it is released.
+  inputs:
+    topic:
+      type: string
+      min_length: 1
+  # Nothing comes back out: a detached dispatch is resolved the moment it is
+  # issued, so a sink that wrote state would be writing it after everything that
+  # reads it (grammar 8.6 rule 7, Decisions D31, D94).
+  outputs: {}
+  nodes:
+    # A subprocess that blocks until this test releases it, which is what makes
+    # "the delivery was still running when the webhook arrived" a fact rather
+    # than a race: the shim writes its line before it starts waiting, and it
+    # cannot exit until a file the test creates exists.
+    hold:
+      exec:
+        command: "${TALLY_BIN}/hold"
+        output:
+          stdout: { type: string }
+  edges:
+    - { from: start, to: hold }
+    - { from: hold, to: end }
+
+flow.escorted:
+  description: Detach a long sink, then park — a parking the sink may not hold back.
+  inputs:
+    topic:
+      type: string
+      min_length: 1
+    topics:
+      description: One detached delivery per element.
+      type: array
+      max_items: 4
+      items: { type: string }
+  outputs:
+    decision:
+      enum: [approve, reject]
+  nodes:
+    # The sink is a `flow.*` rather than a `tool.*` because that is the shape
+    # the reading is about: a dispatched subflow runs *nodes*, under this
+    # execution's id, and a quiescence that counted them would wait for work
+    # grammar 8.6 rule 7 says nothing waits for. A detached `tool.*` runs no
+    # node and could not tell the two readings apart.
+    escort:
+      map:
+        over: input.topics
+        as: one
+        node: flow.escort
+        max_concurrency: 2
+        detach: true
+        input:
+          topic: "one"
+    # What makes the pause below open **with the delivery in flight** rather
+    # than racing it: this shim waits for the line the sink writes before it
+    # blocks. Without it a test would be asserting about which of the two
+    # reached its first `await` first, and a build that held the parking back
+    # would pass whenever the pause won.
+    escorting:
+      exec:
+        command: "${TALLY_BIN}/escorting"
+        output:
+          stdout: { type: string }
+      writes:
+        stdout: noted
+    sign_off:
+      human:
+        input:
+          note: { type: string }
+        output:
+          decision: { enum: [approve, reject] }
+      input:
+        note: "input.topic"
+  edges:
+    - { from: start, to: escort }
+    - { from: escort, to: escorting }
+    - { from: escorting, to: sign_off }
     - { from: sign_off, to: end }
 
 flow.consider:
@@ -255,6 +340,24 @@ triggers:
     input:
       topic: "payload.body.topic"
     callback: "payload.body.callback_url"
+
+  # The execution whose parking a **detached** delivery must not hold back
+  # (grammar 8.6 rule 7, resolved q34): the sink is still running when the pause
+  # opens, and the webhook the subscriber is owed is owed then rather than when
+  # the delivery finally releases.
+  escorted:
+    type: http
+    flow: flow.escorted
+    method: POST
+    path: /escorted
+    respond: async
+    input:
+      topic: "payload.body.topic"
+      topics: "payload.body.topics"
+    callback: "payload.body.callback_url"
+    auth:
+      bearer:
+        token: ${EVENTS_TOKEN}
 
   # The fan-out that parks: one execution holding several pauses opened at
   # different moments, subscribed to by a receiver. Its `callback:` carries no
