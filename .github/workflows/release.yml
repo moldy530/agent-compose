@@ -9,6 +9,12 @@ name: Release
 # The smoke test still holds every binary's `--version` to the number its
 # archive is named for (PRD §9.24, owner correction 2026-08-28).
 #
+# This is the MANUAL path. The normal one is `auto-release.yml`: a merge to
+# `main` whose conventional commits earn a bump is released without anyone
+# touching a tag. Push a tag by hand to override it — skip a number, or re-cut
+# a release whose run failed. The two share `release-artifacts.yml`, and their
+# publish jobs are deliberate twins: an edit to one belongs in the other.
+#
 # The build steps are not written here. They are `release-artifacts.yml`, which
 # every pull request runs too (`release-dry-run.yml`), so the day a release is
 # cut is not the day the pipeline is first exercised.
