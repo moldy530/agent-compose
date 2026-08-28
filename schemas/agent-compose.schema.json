@@ -2584,12 +2584,21 @@
       "anyOf": [{ "required": ["bearer"] }, { "required": ["hmac"] }]
     },
     "callbackBearerAuth": {
-      "description": "The outbound bearer scheme: a bearerAuth whose header: may not be one the delivery already writes. Every delivery carries X-AgentCompose-Event, -Delivery, -Ordinal and -Timestamp, and a signed one carries -Signature; those names are normative for the receiver, so a token carried under one of them replaces or joins the value the receiver reads (grammar 13.3, Decision D127).",
+      "description": "The outbound bearer scheme: a bearerAuth whose header: may not be one the delivery already writes. Every delivery carries X-AgentCompose-Event, -Delivery, -Ordinal and -Timestamp, and a signed one carries -Signature - normative names a receiver is written against - and, being a POST of a JSON body to the host the allowlist admitted, it writes Content-Type, Content-Length and Host as well. A token carried under any of them replaces the value the delivery wrote or arrives joined to it: the receiver's signature check then fails on every legitimate delivery, or the delivery is refused before any receiver code runs. The namespace is matched as a prefix, the three transport names whole - X-Content-Type is the receiver's own (grammar 13.3, Decision D127).",
       "allOf": [
         { "$ref": "#/$defs/bearerAuth" },
         {
           "properties": {
-            "header": { "not": { "pattern": "^[Xx]-[Aa][Gg][Ee][Nn][Tt][Cc][Oo][Mm][Pp][Oo][Ss][Ee]-" } }
+            "header": {
+              "not": {
+                "anyOf": [
+                  { "pattern": "^[Xx]-[Aa][Gg][Ee][Nn][Tt][Cc][Oo][Mm][Pp][Oo][Ss][Ee]-" },
+                  { "pattern": "^[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Tt][Yy][Pp][Ee]$" },
+                  { "pattern": "^[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ll][Ee][Nn][Gg][Tt][Hh]$" },
+                  { "pattern": "^[Hh][Oo][Ss][Tt]$" }
+                ]
+              }
+            }
           }
         }
       ]

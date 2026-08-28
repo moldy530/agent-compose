@@ -376,6 +376,122 @@ fn a_delivery_header_is_refused_outbound_and_stays_legal_inbound() {
     );
 }
 
+/// The namespace is not the whole of what a delivery writes, and the rule is
+/// about the collision rather than the spelling (grammar 13.3, Decision D127).
+///
+/// A delivery is a POST of the status route's report, as JSON, to the host the
+/// allowlist admitted — so it writes `Content-Type`, `Content-Length` and `Host`
+/// on its own request whatever the wire table says. A token asked for under one
+/// of those is the same two-values-one-name failure the namespace rule refuses,
+/// and a worse one to debug: the receiver answers 415 on a content type that is
+/// a credential, or reads a body framed by a token's length, or is never reached
+/// because `Host` named somewhere else. Every `parked` and `settled` delivery
+/// for that trigger is lost, and `validate` had said the spec was good.
+///
+/// The three are matched **whole**, unlike the namespace's prefix: a receiver's
+/// own `X-Content-Type` or `Content-Type-Signature` collides with nothing, and a
+/// rule that swallowed them would refuse a working configuration. And **outbound
+/// only**, like the namespace rule and through the same shared reader: inbound,
+/// `header:` is the name a caller's header is looked up by, and this deployment
+/// writes nothing on a request it received.
+#[test]
+fn a_transport_header_is_refused_outbound_and_stays_legal_inbound() {
+    let outbound = |header: &str| {
+        format!(
+            "version: \"0.1\"\n{FLOW}\ntriggers:\n  intake:\n    type: http\n    flow: flow.support\n    callback: \"payload.body.callback_url\"\n    callback_allow:\n      - \"https://hooks.example.com/*\"\n    callback_auth:\n      bearer:\n        token: ${{CALLBACK_TOKEN}}\n        header: \"{header}\"\n"
+        )
+    };
+    for (header, named) in [
+        ("Content-Type", "Content-Type"),
+        ("content-type", "Content-Type"),
+        ("Content-Length", "Content-Length"),
+        ("host", "Host"),
+    ] {
+        let parsed = parse_str(&outbound(header), "main.yml");
+        let expected =
+            format!("`header` must not name `{named}`, which every delivery writes itself");
+        assert!(
+            parsed
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.starts_with(&expected)),
+            "a delivery may not carry its token under `{header}`, got:\n{}",
+            render(&parsed.diagnostics)
+        );
+    }
+
+    for header in ["X-Content-Type", "Content-Type-Signature", "Hosting"] {
+        let parsed = parse_str(&outbound(header), "main.yml");
+        assert!(
+            parsed.diagnostics.is_empty(),
+            "`{header}` is a receiver's own header and collides with nothing, got:\n{}",
+            render(&parsed.diagnostics)
+        );
+    }
+
+    let inbound = format!(
+        "version: \"0.1\"\n{FLOW}\ntriggers:\n  intake:\n    type: http\n    flow: flow.support\n    auth:\n      bearer:\n        token: ${{WEBHOOK_TOKEN}}\n        header: Content-Type\n"
+    );
+    let parsed = parse_str(&inbound, "main.yml");
+    assert!(
+        parsed.diagnostics.is_empty(),
+        "inbound the name is looked up in what a caller sent, and this deployment writes \
+         nothing on that request, got:\n{}",
+        render(&parsed.diagnostics)
+    );
+}
+
+/// Both inbound schemes state the **constant-time** requirement, in both
+/// documents an implementer reads (grammar 13.3, PRD resolved q32).
+///
+/// §13.3 opens by saying it is "what the M3 runtime is written against", and the
+/// runtime half of this surface is written from these two bullets alone. State
+/// the requirement under `bearer` only — which is what both documents did — and
+/// the implementer writes `timingSafeEqual` for the token and `computed ===
+/// provided` for the signature, because only one bullet asked. A caller who can
+/// time the response then recovers the expected digest for a body of their
+/// choosing byte by byte and forges a validly signed request without ever
+/// holding `${WEBHOOK_SECRET}`: the whole scheme defeated, by an asymmetry
+/// nothing else in this repository can see.
+///
+/// The bullet is located rather than the document searched, because the failure
+/// is exactly a claim living under the *other* scheme.
+#[test]
+fn both_inbound_schemes_require_a_constant_time_comparison() {
+    let grammar = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("the manifest directory has a grandparent")
+            .join("docs/grammar.md"),
+    )
+    .expect("the grammar is readable");
+    let topic = compose_core::docs::topic("triggers").expect("the `triggers` topic ships");
+
+    /// The list item opening `- **\`<scheme>\`**`, up to the next one.
+    fn bullet<'a>(document: &'a str, scheme: &str) -> &'a str {
+        let opener = format!("- **`{scheme}`**");
+        let start = document
+            .find(&opener)
+            .unwrap_or_else(|| panic!("a document states what `{scheme}` does"));
+        let rest = &document[start + opener.len()..];
+        rest.find("\n- ").map_or(rest, |end| &rest[..end])
+    }
+
+    for (document, source) in [
+        (grammar.as_str(), "grammar 13.3"),
+        (topic.body, "the topic"),
+    ] {
+        for scheme in ["bearer", "hmac"] {
+            assert!(
+                bullet(document, scheme).contains("constant"),
+                "{source}'s `{scheme}` bullet no longer requires a constant-time comparison, \
+                 and it is the only place the runtime is told to make one"
+            );
+        }
+    }
+}
+
 /// The reserved claim, bound to the thing it claims — and the list of what to
 /// unwind when it stops holding.
 ///

@@ -695,30 +695,61 @@ fn prefix_shape(prefix: &Spanned<String>, cx: &mut Cx) -> bool {
 /// wrote, or in place of it, and the receiver's check then fails on every
 /// legitimate delivery or passes on one whose signature was never read.
 ///
+/// The namespace is not the whole of what a delivery writes, and the rule is
+/// about the *collision* rather than about the spelling: a delivery is a POST of
+/// a JSON body to the host the allowlist admitted, so it writes `Content-Type`,
+/// `Content-Length` and `Host` by construction too. A token asked for under one
+/// of those is the same two-values-one-name failure read from the transport's
+/// side — the receiver answers 415, or reads a body whose length is a
+/// credential, or never receives the request at all.
+///
 /// Only outbound, and deliberately: a trigger that *receives* agent-compose
 /// deliveries verifies them by naming `X-AgentCompose-Signature` in its inbound
 /// `auth:`, exactly as it would name any other vendor's header.
 fn delivery_header_is_free(header: &Spanned<String>, cx: &mut Cx) -> bool {
     let prefix = CallbackAuth::DELIVERY_HEADER_PREFIX;
-    if !header
+    if header
         .value
         .get(..prefix.len())
         .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
     {
-        return true;
+        cx.push(
+            Diagnostic::error(
+                DiagnosticCode::InvalidValue,
+                header.span.clone(),
+                format!(
+                    "`header` must not name an `{prefix}` delivery header, found {:?}",
+                    header.value
+                ),
+            )
+            .with_help(
+                "every delivery already writes `X-AgentCompose-Event`, `-Delivery`, `-Ordinal` and `-Timestamp`, and a signed one writes `-Signature`; those names are the receiver's contract, so a token carried under one of them replaces or joins the value the receiver reads — name the header the receiver expects the token on (grammar 13.3, Decision D127)",
+            ),
+        );
+        return false;
     }
+    // Case-insensitively, because a header name is: `content-type` names the
+    // field the delivery writes as surely as `Content-Type` does, and outbound
+    // the resolved name is written onto the request as authored.
+    let Some(written) = CallbackAuth::TRANSPORT_HEADERS
+        .iter()
+        .find(|name| name.eq_ignore_ascii_case(&header.value))
+    else {
+        return true;
+    };
     cx.push(
         Diagnostic::error(
             DiagnosticCode::InvalidValue,
             header.span.clone(),
             format!(
-                "`header` must not name an `{prefix}` delivery header, found {:?}",
+                "`header` must not name `{written}`, which every delivery writes itself, found {:?}",
                 header.value
             ),
         )
-        .with_help(
-            "every delivery already writes `X-AgentCompose-Event`, `-Delivery`, `-Ordinal` and `-Timestamp`, and a signed one writes `-Signature`; those names are the receiver's contract, so a token carried under one of them replaces or joins the value the receiver reads — name the header the receiver expects the token on (grammar 13.3, Decision D127)",
-        ),
+        .with_help(format!(
+            "a delivery POSTs its report as JSON to the host the allowlist admitted, so it writes headers of its own — {} — and a token carried under one of them replaces the value the delivery wrote or arrives joined to it: the receiver refuses the content type, mis-frames the body, or is never reached at all; name the header the receiver expects the token on, `Authorization` by default (grammar 13.3, Decision D127)",
+            list(CallbackAuth::TRANSPORT_HEADERS)
+        )),
     );
     false
 }

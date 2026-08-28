@@ -254,9 +254,12 @@ arrival**.
 
 Those names are the receiver's contract, so the `X-AgentCompose-` namespace is
 reserved: a `callback_auth.bearer.header:` inside it is a compile error, since
-two values under one header name is not something a receiver can read. Inbound
-`auth:` may name them freely — that is how a trigger verifies deliveries from
-*another* agent-compose deployment.
+two values under one header name is not something a receiver can read. The same
+error covers the three a delivery writes without being asked — `Content-Type`,
+`Content-Length` and `Host`, matched whole, since a POST of a JSON body carries
+them all — because a token under one of those is refused before any receiver
+code runs. Inbound `auth:` may name any of them freely — that is how a trigger
+verifies deliveries from *another* agent-compose deployment.
 
 ## `schedule` and `event` — reserved
 

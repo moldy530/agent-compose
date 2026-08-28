@@ -431,9 +431,11 @@ const GRAMMAR: &[Check] = &[
         // rule here about what a *resolved* value does downstream: a delivery
         // writes `header:` and `prefix:` onto its own request verbatim, so a
         // colon or a carriage return in either forges a second header — and a
-        // name inside the delivery's own `X-AgentCompose-` namespace collides
-        // with a header the same request already carries (D127).
-        rule: "an auth block's `header:` is one HTTP header name outside the delivery's reserved namespace and its `prefix:` carries no control character, inbound and outbound alike (13.3, 12.1, D127)",
+        // name the delivery already writes, inside its own `X-AgentCompose-`
+        // namespace or among the `Content-Type`, `Content-Length` and `Host` any
+        // POST of a JSON body carries, collides with a header the same request
+        // already sends (D127).
+        rule: "an auth block's `header:` is one HTTP header name that no delivery already writes, and its `prefix:` carries no control character, inbound and outbound alike (13.3, 12.1, D127)",
         pass: "parse/section.rs",
         codes: &["invalid-value", "unexpected-env-ref"],
         evidence: Evidence::Fixture,

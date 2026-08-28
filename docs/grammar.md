@@ -4084,15 +4084,22 @@ and they are normative:
 | `X-AgentCompose-Signature` | `sha256=<hex hmac-sha256 of the body>` — with `callback_auth.hmac` only |
 
 With `callback_auth.bearer`, the configured `header:` carries `prefix:` followed
-by the token — and that header may **not** be one of the five above: the
-`X-AgentCompose-` namespace belongs to the wire contract, and a
-`callback_auth.bearer.header:` inside it is a compile error
+by the token — and that header may **not** be one the delivery already writes:
+the `X-AgentCompose-` namespace belongs to the wire contract, and a delivery is
+a POST of a JSON body to the host the allowlist admitted, so it writes
+`Content-Type`, `Content-Length` and `Host` on its own request too. A
+`callback_auth.bearer.header:` naming any of them is a compile error
 (`invalid-value`). A token written under a name the delivery already writes
-arrives joined to that value or in place of it, and a receiver following this
-table then fails its signature check on every legitimate delivery — or passes on
-one whose signature it never read. The reservation is **outbound only**: an
-inbound `auth:` may name `X-AgentCompose-Signature` freely, which is exactly how
-a trigger that *receives* another deployment's callbacks verifies them.
+arrives joined to that value or in place of it: a receiver following this table
+then fails its signature check on every legitimate delivery — or passes on one
+whose signature it never read — and a receiver reading a `Content-Type` that is
+a credential answers 415 and never sees the report at all. The three transport
+names are matched **whole** (`X-Content-Type` and `Content-Type-Signature` are
+headers of the receiver's own and stay legal); the namespace is matched as a
+prefix, so a sixth `X-AgentCompose-` header on the wire needs no second rule. The
+reservation is **outbound only**: an inbound `auth:` may name
+`X-AgentCompose-Signature` freely, which is exactly how a trigger that *receives*
+another deployment's callbacks verifies them.
 
 Outbound `hmac:` takes **no** keys but `secret:`: signing is fixed at
 HMAC-SHA256 written in hex, so one receiver-side recipe verifies every
@@ -6985,12 +6992,15 @@ rather than silence. *PRD resolved q33, §13.3, G3.*
 
 ### D127. A callback allowlist entry is a wildcard URL, and the delivery wire is fixed
 
-A `callback_allow:` entry is an absolute `http`/`https` URL in which `*` matches
-any run of characters, matched against the whole callback URL; it names a host —
-the run from the scheme to the first `/`, `?` or `#` — and an entry where that
-run is empty is a compile error; the list is non-empty. Every delivery carries
-the `X-AgentCompose-*` headers §13.3 tabulates, and outbound `hmac:` signing is
-HMAC-SHA256 in hex with no keys of its own (§13.3).
+A `callback_allow:` entry is an absolute `http`/`https` URL — the scheme spelled
+lowercase, as the match will read it — in which `*` matches any run of
+characters, matched against the whole callback URL; it names a host — the run
+from the scheme to the first `/`, `?` or `#` — and an entry where that run is
+empty is a compile error; the list is non-empty. Every delivery carries the
+`X-AgentCompose-*` headers §13.3 tabulates, over the `Content-Type`,
+`Content-Length` and `Host` any POST of a JSON body carries, and a
+`callback_auth.bearer.header:` naming one of those is a compile error; outbound
+`hmac:` signing is HMAC-SHA256 in hex with no keys of its own (§13.3).
 
 **Rationale**. *One wildcard kind*, unlike §5.5's `glob:`: `**` earns its
 existence where a path tree has a directory boundary to be significant about,
@@ -7063,7 +7073,19 @@ stop a trigger from contradicting it. The prefix rather than the five spellings,
 so a sixth header added to the wire needs no second rule; **outbound only**, so
 that an inbound `auth:` naming `X-AgentCompose-Signature` — a trigger receiving
 another deployment's callbacks — stays exactly as writable as one naming
-GitHub's. *PRD resolved q33, q34, q35, §13.3.*
+GitHub's.
+
+*And the reservation is about the collision, not the namespace*, so it covers
+the three headers a delivery writes without this table's help:
+`Content-Type: application/json`, the `Content-Length` that frames the report,
+and the `Host` the allowlist admitted. A token asked for under one of those is
+the same two-values-one-name failure read from the transport's side, and a worse
+one to debug, because the delivery is refused before any receiver code runs —
+415, a body framed by a credential's length, or a request that reached a
+different host entirely. Those three are matched **whole** rather than as a
+prefix, since `X-Content-Type` and `Content-Type-Signature` are the receiver's
+own names and a rule that swallowed them would refuse a configuration that
+collides with nothing. *PRD resolved q33, q34, q35, §13.3.*
 
 ---
 

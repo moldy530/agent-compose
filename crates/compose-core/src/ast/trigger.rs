@@ -298,6 +298,19 @@ impl CallbackAuth {
     /// token asked for under one of them collides with a value the delivery
     /// already writes.
     pub const DELIVERY_HEADER_PREFIX: &'static str = "X-AgentCompose-";
+
+    /// The rest of what a delivery writes, outside its own namespace: the three
+    /// fields a POST of a JSON body carries by construction.
+    ///
+    /// Reserved for the same reason and by the same rule (grammar 13.3,
+    /// Decision D127). `Content-Type` is `application/json` on every delivery,
+    /// `Content-Length` frames the body, and `Host` is the receiver the
+    /// allowlist admitted — so a token asked for under one of them replaces a
+    /// value the request cannot go without, or arrives joined to it, and the
+    /// receiver answers 415, fails to decode the report, or never sees the
+    /// request at all.
+    pub const TRANSPORT_HEADERS: &'static [&'static str] =
+        &["Content-Type", "Content-Length", "Host"];
 }
 
 /// The outbound `hmac:` scheme: one key, because the algorithm and the encoding

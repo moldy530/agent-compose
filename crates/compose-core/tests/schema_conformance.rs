@@ -645,6 +645,28 @@ fn the_published_schema_accepts_the_whole_trigger_auth_surface() {
             },
             "callback_allow": ["https://hooks.example.com/*", "http://localhost:9000/*"],
         }),
+        // The reservation on an outbound `header:` is one prefix and three whole
+        // names (Decision D127), and a receiver's own header that merely looks
+        // like one of them collides with nothing: a pattern written without its
+        // `$` refuses these, and only this direction sees it.
+        json!({
+            "type": "http",
+            "flow": "flow.f",
+            "callback": "payload.body.callback_url",
+            "callback_auth": {
+                "bearer": { "token": "${CALLBACK_TOKEN}", "header": "X-Content-Type" },
+            },
+            "callback_allow": ["https://hooks.example.com/*"],
+        }),
+        json!({
+            "type": "http",
+            "flow": "flow.f",
+            "callback": "payload.body.callback_url",
+            "callback_auth": {
+                "bearer": { "token": "${CALLBACK_TOKEN}", "header": "Content-Type-Signature" },
+            },
+            "callback_allow": ["https://hooks.example.com/*"],
+        }),
         // The documented test posture: a callback that signs nothing, and so
         // needs no allowlist…
         json!({ "type": "http", "flow": "flow.f", "callback": "payload.body.callback_url" }),
